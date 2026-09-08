@@ -114,11 +114,14 @@ current experimental boundary.
 
 ### Persist reusable class-set and procedure knowledge
 
-**Status: Direction.** Complete content-keyed summaries could reduce repeated
-receiver, type, and procedure analysis. Shipping them requires stable identity,
-dependency closure, complete witness semantics, and safe invalidation. Type-flow
-results remain experimental and are often partial or inconclusive on broad
-corpora.
+**Status: Partially implemented.** Complete acyclic class-set procedure
+summaries now use procedure-local identity, normalized exact dependency/read
+evidence, demand-scoped reverse maintenance, and fresh witness reconstruction
+when a finding is possible. Recursive groups and other analysis dimensions
+remain in memory, and type-flow results remain experimental and are often
+partial or inconclusive on broad corpora. Fixed-corpus performance evidence is
+still required before treating this first durable dimension as the general
+procedure-summary answer.
 [Summary Identity and Reuse](../semantic-models/#summary-identity-and-reuse)
 specifies the model-side identity gate, while
 [Summary Lifetimes](../dataflow-engine/#summary-lifetimes)

@@ -1,9 +1,9 @@
 use super::{
     TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType, candidates_outcome,
-    candidates_outcome_with_target_kind, no_type, type_reference_outcome,
+    candidates_outcome_with_target_kind, no_type, semantic_model_lookup_type,
+    type_reference_outcome,
 };
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
-use crate::analyzer::model::CodeUnitType;
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelSymbol,
 };
@@ -426,18 +426,7 @@ fn model_type_outcome(
         && records[0].provenance.completeness == SemanticModelCompleteness::Complete;
     let types = records
         .into_iter()
-        .map(|symbol| TypeLookupType {
-            fqn: symbol.qualified_name.clone(),
-            definitions: vec![CodeUnit::with_signature(
-                file.clone(),
-                CodeUnitType::Class,
-                "",
-                symbol.qualified_name.clone(),
-                symbol.signature.clone(),
-                true,
-            )],
-            semantic_model_id: Some(symbol.id.clone()),
-        })
+        .map(|symbol| semantic_model_lookup_type(file, symbol))
         .collect::<Vec<_>>();
     let mut outcome = TypeLookupOutcome {
         status: if types.len() == 1 {

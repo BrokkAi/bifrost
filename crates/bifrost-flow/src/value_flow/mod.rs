@@ -34,14 +34,17 @@ pub use backward_client::{
     solve_value_flow_backward_with_snapshot,
 };
 pub(crate) use client::kills_target as rule_kills_target;
-pub(crate) use client::solve_value_flow_with_reusable_summaries;
 pub use client::{
     ValueFlowFact, ValueFlowProblem, ValueFlowSolveError, ValueFlowUncertainty,
     solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
 };
+pub(crate) use client::{
+    solve_value_flow_entry_with_reusable_summaries, solve_value_flow_with_reusable_summaries,
+};
 pub use discovery::{
-    BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchStatus,
-    DurableProcedureKey, SkipReason, discover_closure, discover_closure_with,
+    BindingCoverage, CallSiteCoverage, ClosureCutDecider, ClosureLimits, DiscoveredClosure,
+    DispatchStatus, DurableProcedureKey, HydratedProcedureSurface, SkipReason, discover_closure,
+    discover_closure_with, discover_closure_with_cuts,
 };
 pub(crate) use model::semantic_locator_heap_bytes;
 pub use model::{
@@ -50,12 +53,12 @@ pub use model::{
     ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkId, ValueFlowSinkSpec,
     ValueFlowSourceId, ValueFlowSourceSpec,
 };
-pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
 pub use plan::{
     AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec, ValueFlowIncompleteCause,
     ValueFlowInput, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
     ValueFlowSummaryLocationBinding,
 };
+pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity};
 pub use planned::{
     ValueFlowCanonicalMeeting, ValueFlowDirectionPlan, ValueFlowDirectionPlanError,
     ValueFlowPlannedEvidence, ValueFlowPlannedResult, ValueFlowPlannedSolveError,

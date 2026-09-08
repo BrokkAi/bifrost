@@ -154,12 +154,16 @@ fn find_import_graph_candidates(
     // resolves every Rust file's imports first and then repeats the same walk.
     // The standalone provider has no prepared phase, so it retains this path.
     let rust_prepared_query_owns_importers = target_language == Language::Rust && scope.is_some();
-    // Some languages own a structured transitive reverse-import relation that is both
+    // Some languages own a structured reverse-reference relation that is both
     // more complete and cheaper than the generic workspace-wide importer walk. Dispatch
     // through the language registry so this framework stays independent of its providers.
+    // The answer is target-directed: a language that can prove from structure that a
+    // reachable file cannot spell the target returns the narrowed set, which is what
+    // keeps a very common member name on a widely included owner inside the file budget
+    // instead of admitting the whole include closure (#3093).
     let language_importers_own_candidates = language_support(target_language)
         .and_then(|support| {
-            support.transitive_referencing_files(analyzer, &source_files, cancellation)
+            support.referencing_candidate_files(analyzer, target, &source_files, cancellation)
         })
         .is_some_and(|importers| {
             candidates.extend(importers);
@@ -384,7 +388,7 @@ fn find_direct_importers_with_cancellation(
     importers.into_inner().expect("importers set poisoned")
 }
 
-fn find_transitive_importers_with_cancellation(
+pub(super) fn find_transitive_importers_with_cancellation(
     files: impl IntoIterator<Item = ProjectFile>,
     import_provider: &dyn ImportAnalysisProvider,
     token: QueryToken<'_>,

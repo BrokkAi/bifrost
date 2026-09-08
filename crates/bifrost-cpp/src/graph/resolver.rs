@@ -14,7 +14,10 @@ use crate::declarations::{
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
-use crate::graph::syntax::object_macro_replacement_type_references;
+use crate::graph::syntax::{
+    function_macro_replacement_span, normalize_macro_continuations,
+    object_macro_replacement_type_references,
+};
 use crate::graph_support::CppSource;
 use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
@@ -27,8 +30,10 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::field_name_in_parent;
 use brokk_bifrost_core::analyzer::tree_walk::{
-    ParentIndex, WalkControl, node_for_exact_range, walk_named_tree_preorder,
+    ParentIndex, WalkControl, children_iter, named_children_iter, node_for_exact_range,
+    push_named_children_reversed, walk_named_tree_preorder,
 };
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -638,6 +643,9 @@ pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
 type MacroEnvironmentCheckpointCell = Arc<OnceLock<MacroEnvironmentCheckpoints>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
+type MacroLexicalTemplateCache =
+    HashMap<(ProjectFile, usize), Option<crate::graph::macro_lexical::MacroTemplate>>;
+
 type MacroLocalBindingTemplateCache =
     HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
 type MacroReplacementBodyCache = HashMap<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>;
@@ -805,6 +813,10 @@ pub struct OrdinaryTypeImport {
 pub struct ConditionalIncludeProjection {
     pub activation_byte: usize,
     pub required_guards: HashSet<PreprocessorGuard>,
+    /// The subset of `required_guards` a lone `#if` contributes: a branch no
+    /// sibling `#else` completes, so no configuration is obliged to take it.
+    /// [`IncludePathAdmission::Compatible`] still demands those.
+    pub partial_guards: HashSet<PreprocessorGuard>,
 }
 
 #[derive(Default)]
@@ -878,6 +890,50 @@ struct ExtractedComparable {
 /// cycle; this stops an adversarially long chain from costing a lookup per hop.
 const MAX_COMPARABLE_ALIAS_HOPS: usize = 32;
 
+/// Which comparison a conditional `#include` path's guards face before the
+/// header it reaches counts as visible at a reference.
+///
+/// `Proven` is the build's rule: `compile_commands.json` covers the
+/// reference's translation unit, so the reference's active guards plus the
+/// defines the build proves must imply every guard on the path, and a
+/// platform macro the build does not prove keeps the header invisible
+/// (#2011).
+///
+/// `Compatible` is the rule for a translation unit no build describes. A
+/// complete `#if`/`#else` family is a case analysis every configuration takes
+/// one branch of, so a branch of one is admitted unless its guards contradict
+/// the reference's own -- the rule the resolver already applies to a
+/// declaration's own guards (#2988). A lone `#if` is a different claim: no
+/// configuration is obliged to take it, so its guards stay strictly required
+/// and an unprovable one still reports `missing_compile_context` (#2011).
+///
+/// Without the first half, libuv's `uv/threadpool.h`, which `uv.h` includes
+/// from both arms of `#if defined(_WIN32)`, and `uv/unix.h`, which it includes
+/// from the `#else` arm, are invisible to every unguarded reference in the
+/// project (#3088).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncludePathAdmission {
+    Proven,
+    Compatible,
+}
+
+impl IncludePathAdmission {
+    fn admits(
+        self,
+        required: &HashSet<PreprocessorGuard>,
+        partial: &HashSet<PreprocessorGuard>,
+        reference_guards: Option<&HashSet<PreprocessorGuard>>,
+    ) -> bool {
+        match self {
+            Self::Proven => guard_requirements_hold_at_reference(required, reference_guards),
+            Self::Compatible => {
+                guard_requirements_hold_at_reference(partial, reference_guards)
+                    && guards_compatible_at_reference(required, reference_guards)
+            }
+        }
+    }
+}
+
 /// Per-query C++ visibility facts.
 ///
 /// The analyzer is *borrowed*, never cloned: `TreeSitterAnalyzer::clone` gives
@@ -909,6 +965,7 @@ pub struct VisibilityIndex<'a> {
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     compile_proven_guard_cells: Mutex<HashMap<ProjectFile, Arc<HashSet<PreprocessorGuard>>>>,
+    include_path_admission_cells: Mutex<HashMap<ProjectFile, IncludePathAdmission>>,
     conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
     #[cfg(any(test, feature = "test-support"))]
     conditional_include_projection_index_build_count: AtomicUsize,
@@ -955,6 +1012,7 @@ pub struct VisibilityIndex<'a> {
     macro_environment_checkpoints: Mutex<HashMap<ProjectFile, MacroEnvironmentCheckpointCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
     macro_local_binding_templates: Mutex<MacroLocalBindingTemplateCache>,
+    pub(crate) macro_lexical_templates: Mutex<MacroLexicalTemplateCache>,
     macro_replacement_bodies: Mutex<MacroReplacementBodyCache>,
     macro_type_parameters: Mutex<MacroTypeParameterCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
@@ -1227,6 +1285,11 @@ pub struct ParsedReplacementBody {
     pub tree: Tree,
     pub body_offset: usize,
     pub parameters: Vec<String>,
+    /// For a normal parse this is an identity map. A constrained statement
+    /// recovery may insert separators after a macro formal; each boundary in
+    /// this map points back to the corresponding byte in the original
+    /// replacement, keeping source-backed ranges exact after substitution.
+    original_offsets: Box<[usize]>,
 }
 
 impl ParsedReplacementBody {
@@ -1238,13 +1301,33 @@ impl ParsedReplacementBody {
 
     /// The byte range `node` occupies in the file that defines the macro.
     ///
-    /// `replacement_start` is the defining `preproc_arg`'s start byte. The
-    /// replacement is copied into the sentinel verbatim, so subtracting the
-    /// body offset and adding that start is exact.
+    /// `replacement_start` is the logical replacement span's start byte.
+    /// The origin map accounts for continuation whitespace and any synthetic
+    /// statement separators inserted while parsing the replacement.
     pub fn file_range(&self, node: Node<'_>, replacement_start: usize) -> std::ops::Range<usize> {
-        debug_assert!(node.start_byte() >= self.body_offset);
-        let start = replacement_start + (node.start_byte() - self.body_offset);
-        start..start + (node.end_byte() - node.start_byte())
+        assert!(
+            node.start_byte() >= self.body_offset,
+            "synthetic sentinel node cannot be mapped to a macro replacement"
+        );
+        assert!(
+            node.end_byte() >= self.body_offset,
+            "synthetic sentinel node cannot be mapped to a macro replacement"
+        );
+        let start_offset = node.start_byte() - self.body_offset;
+        let end_offset = node.end_byte() - self.body_offset;
+        assert!(start_offset <= end_offset);
+        let start_origin = *self
+            .original_offsets
+            .get(start_offset)
+            .expect("replacement node start must have a source mapping");
+        let end_origin = *self
+            .original_offsets
+            .get(end_offset)
+            .expect("replacement node end must have a source mapping");
+        assert!(start_origin <= end_origin);
+        let start = replacement_start + start_origin;
+        let end = replacement_start + end_origin;
+        start..end
     }
 
     /// Whether the replacement names the variadic argument pack.
@@ -1263,11 +1346,7 @@ impl ParsedReplacementBody {
             {
                 return true;
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
+            push_named_children_reversed(node, &mut stack);
         }
         false
     }
@@ -1331,6 +1410,36 @@ pub struct MacroLocalBinding<'tree> {
     pub proven_unit: Option<CodeUnit>,
 }
 
+/// The source-backed declaration introduced by a function-like macro. The
+/// declaration belongs to the macro definition, while the reference range
+/// returned by [`VisibilityIndex::macro_lexical_references`] belongs to the
+/// definition body, invocation argument, or caller scope where substitution
+/// makes the binding visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacroLexicalBindingKind {
+    Parameter,
+    Local,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroLexicalBinding {
+    pub definition: ProjectFile,
+    pub kind: MacroLexicalBindingKind,
+    pub name: String,
+    pub name_range: std::ops::Range<usize>,
+    pub declaration_range: std::ops::Range<usize>,
+}
+
+/// Lexical macro references are query-local facts. A cancelled or bounded
+/// walk is kept distinct from a complete empty enumeration so authoritative
+/// inverse callers can preserve their completeness status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MacroLexicalReferences {
+    pub references: Vec<(std::ops::Range<usize>, MacroLexicalBinding)>,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
 fn macro_replacement_type_parameters(
     body: &ParsedReplacementBody,
     parameters: &[String],
@@ -1371,11 +1480,7 @@ fn macro_replacement_type_parameters(
         {
             found.push(index);
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     (!found.is_empty()).then_some(found)
 }
@@ -1388,7 +1493,10 @@ fn macro_replacement_type_parameter(
     (parameters.len() == 1).then(|| parameters.pop().unwrap())
 }
 
-fn macro_type_argument_node<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+pub(crate) fn macro_type_argument_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
     match node.kind() {
         "type_descriptor" => {
             let type_child = node
@@ -1727,6 +1835,7 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             compile_proven_guard_cells: Mutex::new(HashMap::default()),
+            include_path_admission_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_index_build_count: AtomicUsize::new(0),
             conditional_include_projection_state_count: AtomicUsize::new(0),
@@ -1757,6 +1866,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
+            macro_lexical_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
             macro_type_parameters: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
@@ -1992,6 +2102,7 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             compile_proven_guard_cells: Mutex::new(HashMap::default()),
+            include_path_admission_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             conditional_include_projection_index_build_count: AtomicUsize::new(0),
@@ -2032,6 +2143,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_environment_checkpoints: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             macro_local_binding_templates: Mutex::new(HashMap::default()),
+            macro_lexical_templates: Mutex::new(HashMap::default()),
             macro_replacement_bodies: Mutex::new(HashMap::default()),
             macro_type_parameters: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
@@ -2484,6 +2596,120 @@ impl<'a> VisibilityIndex<'a> {
         })
     }
 
+    /// Recover the invocation-specific type of a replacement local visible
+    /// at the selected source token.
+    pub fn macro_local_binding_at<'tree>(
+        &self,
+        file: &ProjectFile,
+        root: Node<'tree>,
+        source: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Option<MacroLocalBinding<'tree>> {
+        crate::graph::macro_lexical::typed_binding(self, file, root, source, start_byte, end_byte)
+    }
+
+    /// Resolve the source-backed lexical macro declaration for one source
+    /// range. The range may be a point range (`start..start + 1`) inside an
+    /// identifier, which is the form used by goto-definition queries.
+    pub fn macro_lexical_binding(
+        &self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Option<MacroLexicalBinding> {
+        crate::graph::macro_lexical::binding(self, file, root, source, start_byte, end_byte)
+    }
+
+    /// Enumerate source ranges whose lexical meaning comes from a
+    /// function-like macro formal or replacement local. Definition spellings
+    /// themselves are omitted; callers needing goto-definition on a spelling
+    /// use [`Self::macro_lexical_binding`].
+    pub fn macro_lexical_references(
+        &self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        max_references: usize,
+        cancelled: impl FnMut() -> bool,
+    ) -> MacroLexicalReferences {
+        crate::graph::macro_lexical::all_references(
+            self,
+            file,
+            root,
+            source,
+            max_references,
+            cancelled,
+        )
+    }
+
+    /// Return the source identity of the exact active function-like macro
+    /// binding. The definition AST is hydrated by the lexical helper from
+    /// this `(ProjectFile, declaration byte)` pair, so no parser node escapes
+    /// the prepared source borrow.
+    pub(crate) fn function_macro_binding_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+    ) -> Option<(ProjectFile, usize)> {
+        let environment = self.macro_environment(file, before_byte);
+        let binding = environment.binding(name)?;
+        if binding.is_exact()
+            && matches!(
+                binding.definition,
+                MacroDefinition::Function { .. } | MacroDefinition::VariadicFunction { .. }
+            )
+        {
+            return Some((binding.source.clone(), binding.declaration_byte));
+        }
+        // A definition under an unknown condition is still certain at a use
+        // within that same branch. The checkpoint retains the event that made
+        // the binding uncertain. Require that exact defining event, so an
+        // intervening undef, include, or conditional redefinition cannot be
+        // bypassed by a lexical search for an older macro.
+        if binding.source != *file {
+            return None;
+        }
+        let prepared = self.cpp.prepared_syntax(self.token, file)?;
+        let root = prepared.tree().root_node();
+        let source = prepared.source();
+        let reference = root.descendant_for_byte_range(
+            before_byte,
+            before_byte.saturating_add(1).min(source.len()),
+        )?;
+        let reference_conditions = owning_preprocessor_conditionals(root, reference, source);
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let event = events
+            .iter()
+            .find(|event| event.byte() == binding.declaration_byte)?;
+        let MacroEvent::Define {
+            name: defined_name,
+            binding: definition,
+            conditionals,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if defined_name != name
+            || conditionals.is_empty()
+            || !conditionals
+                .iter()
+                .all(|condition| reference_conditions.contains(condition))
+            || !matches!(
+                definition.definition,
+                MacroDefinition::Function { .. } | MacroDefinition::VariadicFunction { .. }
+            )
+        {
+            return None;
+        }
+        Some((definition.source.clone(), definition.declaration_byte))
+    }
+
     /// Return the type argument at a C function-like macro invocation.
     ///
     /// Exact local macro definitions identify type formals from their parsed
@@ -2627,12 +2853,16 @@ impl<'a> VisibilityIndex<'a> {
         source: &str,
     ) -> Option<Arc<ParsedReplacementBody>> {
         debug_assert_eq!(definition.kind(), "preproc_function_def");
-        let MacroDefinition::Function {
-            parameters,
-            replacement,
-        } = Self::decode_macro_definition(definition, source)
-        else {
-            return None;
+        let (parameters, replacement) = match Self::decode_macro_definition(definition, source) {
+            MacroDefinition::Function {
+                parameters,
+                replacement,
+            }
+            | MacroDefinition::VariadicFunction {
+                parameters,
+                replacement,
+            } => (parameters, replacement),
+            MacroDefinition::Object { .. } | MacroDefinition::Unsupported => return None,
         };
         self.parsed_macro_replacement_body(
             &(file.clone(), definition.start_byte()),
@@ -2666,20 +2896,14 @@ impl<'a> VisibilityIndex<'a> {
             if replacement.trim().is_empty() {
                 return None;
             }
-            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(&source, None)?;
-            if tree.root_node().has_error() {
-                return None;
-            }
+            let (source, tree, original_offsets) =
+                Self::parse_macro_replacement_body(replacement, parameters)?;
             let body = ParsedReplacementBody {
                 source,
                 tree,
                 body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
                 parameters: parameters.to_vec(),
+                original_offsets,
             };
             body.statements()?;
             if body.expands_variadic_arguments() {
@@ -2692,6 +2916,136 @@ impl<'a> VisibilityIndex<'a> {
             .expect("C++ macro replacement body cache poisoned")
             .insert(key.clone(), body.clone());
         body
+    }
+
+    /// Parse a replacement while preserving a map from the parse buffer back
+    /// to the original logical-line bytes. A block formal can occur where C
+    /// requires a statement terminator (`if (condition) block`); the caller's
+    /// actual block supplies that terminator only after macro substitution.
+    /// Tree-sitter exposes the formal as an identifier inside recovery, so a
+    /// semicolon is inserted at that AST-derived boundary for the fallback
+    /// parse. No identifier text is scanned to find the insertion point.
+    fn parse_macro_replacement_body(
+        replacement: &str,
+        parameters: &[String],
+    ) -> Option<(String, Tree, Box<[usize]>)> {
+        let normalized = normalize_macro_continuations(replacement);
+        let parse = |replacement: &str| {
+            let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(&source, None)?;
+            Some((source, tree))
+        };
+        let (source, tree) = parse(&normalized)?;
+        if !tree.root_node().has_error() {
+            let mut original_offsets = (0..=normalized.len()).collect::<Vec<_>>();
+            Self::append_sentinel_offsets(&mut original_offsets, normalized.len());
+            return Some((source, tree, original_offsets.into_boxed_slice()));
+        }
+
+        let body_offset = MACRO_BODY_SENTINEL_PREFIX.len();
+        let mut insertion_points = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier"
+            ) && parameters
+                .iter()
+                .any(|parameter| parameter.as_str() == node_text(node, &source))
+                && Self::macro_formal_needs_statement_separator(node)
+            {
+                let point = node.end_byte().saturating_sub(body_offset);
+                if point <= normalized.len() && !insertion_points.contains(&point) {
+                    insertion_points.push(point);
+                }
+            }
+            push_named_children_reversed(node, &mut stack);
+        }
+        if insertion_points.is_empty() {
+            return None;
+        }
+        insertion_points.sort_unstable();
+        let mut recovered = Vec::with_capacity(normalized.len() + insertion_points.len());
+        let mut original_offsets =
+            Vec::with_capacity(normalized.len() + insertion_points.len() + 1);
+        let mut next_insertion = 0;
+        for (index, byte) in normalized.bytes().enumerate() {
+            recovered.push(byte);
+            original_offsets.push(index);
+            while insertion_points.get(next_insertion).copied() == Some(index + 1) {
+                recovered.push(b';');
+                original_offsets.push(index + 1);
+                next_insertion += 1;
+            }
+        }
+        original_offsets.push(normalized.len());
+        Self::append_sentinel_offsets(&mut original_offsets, normalized.len());
+        let recovered = String::from_utf8(recovered).expect("source text remains UTF-8");
+        let (source, tree) = parse(&recovered)?;
+        if tree.root_node().has_error() {
+            return None;
+        }
+        Some((source, tree, original_offsets.into_boxed_slice()))
+    }
+
+    /// Extend a replacement-origin map over the `; }` suffix appended by the
+    /// sentinel parser. Nodes such as a declaration whose source omits its
+    /// terminator include that synthetic semicolon; every suffix boundary
+    /// still maps to the replacement's real end.
+    fn append_sentinel_offsets(offsets: &mut Vec<usize>, replacement_end: usize) {
+        offsets.extend([replacement_end; 3]);
+    }
+
+    /// A formal is statement-shaped when the recovered tree places it directly
+    /// at a statement boundary. This is the grammar recovery produced for
+    /// replacement forms such as `if (condition) block`; an identifier inside
+    /// an expression or call argument must not receive an artificial `;`.
+    fn macro_formal_needs_statement_separator(node: Node<'_>) -> bool {
+        let mut current = node;
+        let mut crossed_recovery = false;
+        while let Some(parent) = current.parent() {
+            if parent.is_error() {
+                crossed_recovery = true;
+                current = parent;
+                continue;
+            }
+            if matches!(
+                parent.kind(),
+                "call_expression"
+                    | "argument_list"
+                    | "field_expression"
+                    | "binary_expression"
+                    | "unary_expression"
+                    | "assignment_expression"
+                    | "conditional_expression"
+                    | "parenthesized_expression"
+                    | "subscript_expression"
+            ) {
+                return false;
+            }
+            if parent.kind() == "expression_statement" {
+                return parent.named_child_count() == 1;
+            }
+            if parent.kind() == "compound_statement" && current == node {
+                return true;
+            }
+            if matches!(
+                parent.kind(),
+                "compound_statement" | "if_statement" | "while_statement" | "do_statement"
+            ) {
+                return crossed_recovery
+                    || parent.child_by_field_name("consequence") == Some(current);
+            }
+            if matches!(parent.kind(), "declaration" | "init_declarator") {
+                return false;
+            }
+            current = parent;
+        }
+        false
     }
 
     /// Identify fixed macro formals that retain an unambiguous type role even
@@ -2722,17 +3076,23 @@ impl<'a> VisibilityIndex<'a> {
             if replacement.trim().is_empty() {
                 return None;
             }
+            // Keep this parser permissive. Type-role extraction predates the
+            // replacement-body model and deliberately survives unrelated
+            // token-pasting or recovery elsewhere in a production macro.
             let source = format!("{MACRO_BODY_SENTINEL_PREFIX}{replacement}; }}");
             let mut parser = Parser::new();
             parser
                 .set_language(&tree_sitter_cpp::LANGUAGE.into())
                 .ok()?;
             let tree = parser.parse(&source, None)?;
+            let mut original_offsets = (0..=replacement.len()).collect::<Vec<_>>();
+            Self::append_sentinel_offsets(&mut original_offsets, replacement.len());
             let body = ParsedReplacementBody {
                 source,
                 tree,
                 body_offset: MACRO_BODY_SENTINEL_PREFIX.len(),
                 parameters: parameters.to_vec(),
+                original_offsets: original_offsets.into_boxed_slice(),
             };
             macro_replacement_type_parameters(&body, parameters).map(Arc::from)
         })();
@@ -2744,10 +3104,20 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
-        let replacement = node
-            .child_by_field_name("value")
-            .map(|value| node_text(value, source).to_string())
-            .unwrap_or_default();
+        let replacement = if node.kind() == "preproc_function_def" {
+            function_macro_replacement_span(node, source)
+                .and_then(|span| source.get(span))
+                .map(str::to_owned)
+                .or_else(|| {
+                    node.child_by_field_name("value")
+                        .map(|value| node_text(value, source).to_string())
+                })
+                .unwrap_or_default()
+        } else {
+            node.child_by_field_name("value")
+                .map(|value| node_text(value, source).to_string())
+                .unwrap_or_default()
+        };
         if node.kind() == "preproc_def" {
             return MacroDefinition::Object { replacement };
         }
@@ -3739,19 +4109,29 @@ impl<'a> VisibilityIndex<'a> {
                         });
                         continue;
                     };
-                    let targets =
-                        structured_include_path(path, source).map_or_else(Vec::new, |path| {
-                            resolve_include_targets_with_index(
-                                file,
-                                path,
-                                self.cpp.include_target_index(),
-                            )
-                        });
-                    // An unresolved angle-bracket include crosses into an external system
-                    // boundary that is absent from the source index. It must not poison all
-                    // later local macro evidence. Quoted/project-local and computed includes,
-                    // by contrast, may hide indexed macro state and therefore fail closed.
-                    if targets.is_empty() && path.kind() == "system_lib_string" {
+                    let include = structured_include_path(path, source);
+                    let targets = include.map_or_else(Vec::new, |include| {
+                        resolve_include_targets_with_index(
+                            file,
+                            include,
+                            self.cpp.include_target_index(),
+                        )
+                    });
+                    // An include no indexed file can answer -- its final path component names
+                    // no analyzable workspace file -- crosses into sources this index does not
+                    // hold, so it cannot hide indexed macro state and must not poison every
+                    // later local macro binding. The include's spelling does not decide that:
+                    // a quoted include falls back to the same search path an angle include
+                    // uses, and esphome's `core/log.h` reaches every component with
+                    // `#include "WString.h"`, an Arduino header absent from the tree (#3057).
+                    // A computed include, and a spelling some indexed file name does match
+                    // without resolving to one target, may still hide indexed macro state and
+                    // therefore fail closed.
+                    if targets.is_empty()
+                        && include.is_some_and(|include| {
+                            !self.cpp.include_target_index().names_indexed_file(include)
+                        })
+                    {
                         continue;
                     }
                     events.push(MacroEvent::Include {
@@ -3786,11 +4166,7 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 _ => {}
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
+            push_named_children_reversed(node, &mut stack);
         }
         events.sort_by_key(MacroEvent::byte);
         events
@@ -4491,21 +4867,22 @@ impl<'a> VisibilityIndex<'a> {
         let Some(donor_syntax) = self.cpp.prepared_syntax(self.token, declaration.source()) else {
             return false;
         };
-        if callable_declaration_activation_in_file(
-            analyzer,
-            donor_syntax.as_ref(),
-            declaration,
-            &reference,
-        )
-        .or_else(|| {
-            self.exhaustive_guard_family_activation(
+        if self
+            .foreign_callable_declaration_activation(
                 analyzer,
                 donor_syntax.as_ref(),
                 declaration,
                 &reference,
             )
-        })
-        .is_none()
+            .or_else(|| {
+                self.exhaustive_guard_family_activation(
+                    analyzer,
+                    donor_syntax.as_ref(),
+                    declaration,
+                    &reference,
+                )
+            })
+            .is_none()
         {
             return false;
         }
@@ -4521,6 +4898,60 @@ impl<'a> VisibilityIndex<'a> {
                     reference_byte,
                 )
             })
+    }
+
+    /// The byte at which `declaration` activates inside the foreign file that
+    /// `donor_syntax` describes.
+    ///
+    /// Which guard rule applies depends on what decides the reference's
+    /// configuration. When `compile_commands.json` covers the reference's
+    /// translation unit, the build is the proof source and the declaration's
+    /// guards must follow from the reference's active guards plus the proven
+    /// defines; a platform macro the build does not prove leaves the
+    /// declaration invisible (#2011). With no compile coverage nothing decides
+    /// a platform macro, so the cross-file rule stands: the donor resolves its
+    /// own conditionals and only has to stay free of contradiction with the
+    /// reference. Otherwise a libuv-shaped `#if defined(__linux__)` prototype
+    /// in a shared header is hidden from every unguarded caller in another
+    /// translation unit (#2988).
+    fn foreign_callable_declaration_activation(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        donor_syntax: &PreparedSyntaxTree,
+        declaration: &CodeUnit,
+        reference: &CallableReferenceContext<'_>,
+    ) -> Option<usize> {
+        let build_decides = !self.compile_context_is_absent(reference.file);
+        let proven = self.compile_proven_guards(reference.file);
+        let augmented;
+        let active = match reference.guards() {
+            Some(active) if !proven.is_empty() => {
+                augmented = active.union(&proven).cloned().collect();
+                Some(&augmented)
+            }
+            other => other,
+        };
+        nameable_callable_declaration_nodes(analyzer, donor_syntax, declaration)
+            .into_iter()
+            .filter(|node| {
+                let Some(required) = callable_declaration_guard_requirements(
+                    *node,
+                    donor_syntax.source(),
+                    reference,
+                ) else {
+                    return false;
+                };
+                if required.is_empty() {
+                    return true;
+                }
+                if build_decides {
+                    guard_requirements_hold_at_reference(&required, active)
+                } else {
+                    guards_compatible_at_reference(&required, reference.guards())
+                }
+            })
+            .map(callable_declaration_activation_byte)
+            .min()
     }
 
     pub fn external_type_candidate_visible_at(
@@ -4633,6 +5064,37 @@ impl<'a> VisibilityIndex<'a> {
         proven
     }
 
+    /// The rule a conditional `#include` path's guards face on the way to a
+    /// reference in `file`.
+    ///
+    /// This is the include-edge analogue of the choice
+    /// [`Self::foreign_callable_declaration_activation`] makes for a foreign
+    /// declaration's own guards (#2988), and it is decided by the same thing:
+    /// what settles the reference's configuration. Memoized per file because
+    /// the answer depends on nothing else, and the callers ask it once per
+    /// candidate.
+    fn include_path_admission(&self, file: &ProjectFile) -> IncludePathAdmission {
+        if let Some(cached) = self
+            .include_path_admission_cells
+            .lock()
+            .expect("C++ include-path admission cache poisoned")
+            .get(file)
+            .copied()
+        {
+            return cached;
+        }
+        let admission = if self.compile_context_is_absent(file) {
+            IncludePathAdmission::Compatible
+        } else {
+            IncludePathAdmission::Proven
+        };
+        self.include_path_admission_cells
+            .lock()
+            .expect("C++ include-path admission cache poisoned")
+            .insert(file.clone(), admission);
+        admission
+    }
+
     /// Whether no compile data covers the compilations of `file`: it has no
     /// database entry of its own, and either nothing reaches it or some
     /// translation unit that reaches it has no entry. This is the state a
@@ -4712,7 +5174,8 @@ impl<'a> VisibilityIndex<'a> {
     /// `.c` translation unit can never satisfy the `#ifdef __cplusplus` that
     /// wraps every declaration of a portable C header, and demanding it would
     /// hide the whole header. Guards that the reference file imposes on its
-    /// own `#include` still have to hold, and still have to be stable.
+    /// own `#include` still have to be stable, and must satisfy the rule
+    /// [`IncludePathAdmission`] names for this reference's translation unit.
     fn foreign_declaration_reachable_at_reference(
         &self,
         file: &ProjectFile,
@@ -4762,10 +5225,12 @@ impl<'a> VisibilityIndex<'a> {
                 projections.len(),
             );
         }
+        let admission = self.include_path_admission(file);
         projections.iter().any(|projection| {
             projection.activation_byte <= reference_byte
-                && guard_requirements_hold_at_reference(
+                && admission.admits(
                     &projection.required_guards,
+                    &projection.partial_guards,
                     reference_guards,
                 )
                 && self.preprocessor_guards_stable_between(
@@ -4810,6 +5275,7 @@ impl<'a> VisibilityIndex<'a> {
             file,
             prepared,
             declaration_source,
+            self.include_path_admission(file),
             reference_guards,
             reference_byte,
             &|| {
@@ -6053,7 +6519,7 @@ impl<'a> VisibilityIndex<'a> {
             let prefix_len = qualified.len().saturating_sub(components.len());
             if injected
                 .as_ref()
-                .is_some_and(|(owner_len, _)| prefix_len < *owner_len)
+                .is_some_and(|(owner_len, _)| prefix_len <= *owner_len)
             {
                 return injected
                     .take()
@@ -6144,16 +6610,12 @@ impl<'a> VisibilityIndex<'a> {
         if matches.is_empty() {
             return None;
         }
-        // A same-named class at the current lexical boundary is already
-        // represented by the ordinary namespace/class tier.  The injected
-        // recovery is only needed when lookup is occurring inside a nested
-        // class, where the enclosing class name is injected across that
-        // additional class boundary.  Keeping this boundary strict avoids
-        // treating qualified receiver/static-qualifier context as an
-        // injected-name reference.
-        if owner_len >= lexical_scope.len() {
-            return None;
-        }
+        // The exact current class boundary is the most important injected-name
+        // case. Ordinary lexical lookup appends the requested name and can
+        // otherwise select a synthetic constructor-shaped child such as
+        // `Portal::Impl::Impl` instead of the enclosing `Portal::Impl` class.
+        // The global and single-component gates above keep qualified receiver
+        // and static-qualifier contexts out of this recovery.
         let owner_components = lexical_scope[..owner_len].to_vec();
         let matches = self.candidates_for_type_resolution(analyzer, file, &matches, resolution);
         let resolution = match self.resolve_type_candidates(analyzer, file, &matches, resolution) {
@@ -6544,8 +7006,12 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let mut current =
-            self.resolve_unique_type_for_declaration(visible_from, declaration, raw_name)?;
+        let mut current = self.resolve_defining_type_for_declaration(
+            analyzer,
+            visible_from,
+            declaration,
+            raw_name,
+        )?;
         let mut seen_aliases = HashSet::default();
         loop {
             let Some(target) = self.structured_alias_target(analyzer, &current) else {
@@ -7562,6 +8028,43 @@ impl<'a> VisibilityIndex<'a> {
             declaration,
             raw_name,
         ))
+    }
+
+    /// The type `raw_name` names at `declaration`, answered with the
+    /// declaration that defines it.
+    ///
+    /// C spells one type twice. `typedef struct T T;` in the header that
+    /// publishes the handle indexes an incomplete `struct T` beside the
+    /// complete `struct T { ... }` in the header that declares the members, and
+    /// both carry the same kind and fully qualified name, so
+    /// [`logical_type_candidate`] is free to answer with either. mbedtls writes
+    /// exactly that: `include/mbedtls/ssl.h` forward-declares
+    /// `mbedtls_ssl_handshake_params` for the pointer member
+    /// `mbedtls_ssl_handshake_params *MBEDTLS_PRIVATE(handshake)` while
+    /// `library/ssl_misc.h` defines its fields. A receiver typed from a field
+    /// declaration is asked for its members on the next link of the chain, and
+    /// only the definition owns them (#2982).
+    ///
+    /// Competing definitions leave nothing to choose between, so keep the
+    /// logical answer rather than picking one of them.
+    fn resolve_defining_type_for_declaration(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let candidates = self.type_candidates_for_declaration(visible_from, declaration, raw_name);
+        let logical = unique_logical_type_candidate(candidates.clone())?;
+        let mut defining = candidates.into_iter().filter(|candidate| {
+            candidate.is_class()
+                && cpp_class_declaration_strength(analyzer, candidate)
+                    == CppClassDeclarationStrength::Full
+        });
+        match (defining.next(), defining.next()) {
+            (Some(unique_definition), None) => Some(unique_definition.clone()),
+            _ => Some(logical),
+        }
     }
 
     pub fn resolves_to_type(
@@ -8791,6 +9294,11 @@ fn build_bounded_visible_declarations(
             let mut visible = root_declarations.into_iter().collect::<HashSet<_>>();
             let mut pending_names = HashSet::default();
             if let Some(prepared) = cpp.prepared_syntax(token, root) {
+                // One cursor for the whole file walk: `named_child(index)`
+                // re-steps the sibling list from the first child on every
+                // access, which made this whole-file scan quadratic in the
+                // fan-out of each node (#3097).
+                let mut cursor = prepared.tree().walk();
                 let mut pending_nodes = vec![prepared.tree().root_node()];
                 while let Some(node) = pending_nodes.pop() {
                     if matches!(
@@ -8809,11 +9317,7 @@ fn build_bounded_visible_declarations(
                             pending_names.extend(reference.components);
                         }
                     }
-                    for index in 0..node.named_child_count() {
-                        if let Some(child) = node.named_child(index) {
-                            pending_nodes.push(child);
-                        }
-                    }
+                    pending_nodes.extend(node.named_children(&mut cursor));
                 }
             }
             stats.root_names += pending_names.len();
@@ -8899,6 +9403,7 @@ fn build_bounded_visible_declarations(
                         stats.selected_units += 1;
                         if let Some(prepared) = cpp.prepared_syntax(token, &source) {
                             let ast_started = Instant::now();
+                            let mut cursor = prepared.tree().walk();
                             for range in analyzer.ranges(&unit) {
                                 let Some(declaration) =
                                     node_for_exact_range(prepared.tree().root_node(), &range)
@@ -8919,11 +9424,7 @@ fn build_bounded_visible_declarations(
                                             stats.dependency_names += 1;
                                         }
                                     }
-                                    for index in 0..node.named_child_count() {
-                                        if let Some(child) = node.named_child(index) {
-                                            pending_nodes.push(child);
-                                        }
-                                    }
+                                    pending_nodes.extend(node.named_children(&mut cursor));
                                 }
                             }
                             stats.dependency_ast_elapsed += ast_started.elapsed();
@@ -10023,11 +10524,7 @@ fn find_include_activation(
             }
             continue;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                nodes.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut nodes);
     }
     direct_includes.sort_by_key(|(activation, _)| *activation);
     let mut known_missing = HashSet::default();
@@ -10054,6 +10551,7 @@ fn find_conditional_include_projection_index(
     prepared: &PreparedSyntaxTree,
     on_state: &dyn Fn(),
 ) -> ConditionalIncludeProjectionIndex {
+    let reference_is_c = reference_uses_c_semantics(cpp, file);
     let include_targets = cpp.include_target_index();
     let mut projections_by_source: HashMap<ProjectFile, Vec<ConditionalIncludeProjection>> =
         HashMap::default();
@@ -10061,7 +10559,8 @@ fn find_conditional_include_projection_index(
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            let Some(required_guards) = preprocessor_guard_environment(node, prepared.source())
+            let Some(required_guards) =
+                include_directive_guard_requirements(node, prepared.source(), reference_is_c)
             else {
                 continue;
             };
@@ -10078,11 +10577,7 @@ fn find_conditional_include_projection_index(
             }
             continue;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                nodes.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut nodes);
     }
 
     // One reached file can have several distinct compatible guard paths. Each
@@ -10098,21 +10593,24 @@ fn find_conditional_include_projection_index(
     // scans, and resident memory all grew without bound (#2365).
     let mut expanded: HashMap<(ProjectFile, usize), Vec<HashSet<PreprocessorGuard>>> =
         HashMap::default();
-    while let Some((current_file, activation_byte, required_guards)) = pending.pop() {
+    while let Some((current_file, activation_byte, path)) = pending.pop() {
         let guard_sets = expanded
             .entry((current_file.clone(), activation_byte))
             .or_default();
+        // Minimality is keyed on the full guard set alone: a path's undecided
+        // guards are the per-conditional subset of that set, so a subset path
+        // carries a subset of them too.
         if guard_sets
             .iter()
-            .any(|existing| existing.is_subset(&required_guards))
+            .any(|existing| existing.is_subset(&path.all))
         {
             continue;
         }
         let (evicted, kept): (Vec<_>, Vec<_>) = guard_sets
             .drain(..)
-            .partition(|existing| required_guards.is_subset(existing));
+            .partition(|existing| path.all.is_subset(existing));
         *guard_sets = kept;
-        guard_sets.push(required_guards.clone());
+        guard_sets.push(path.all.clone());
         if !evicted.is_empty()
             && let Some(projections) = projections_by_source.get_mut(&current_file)
         {
@@ -10130,7 +10628,8 @@ fn find_conditional_include_projection_index(
             .or_default()
             .push(ConditionalIncludeProjection {
                 activation_byte,
-                required_guards: required_guards.clone(),
+                required_guards: path.all.clone(),
+                partial_guards: path.partial.clone(),
             });
 
         let Some(current_prepared) = cpp.prepared_syntax(token, &current_file) else {
@@ -10139,14 +10638,14 @@ fn find_conditional_include_projection_index(
         let mut nodes = vec![current_prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                let Some(include_guards) =
-                    preprocessor_guard_environment(node, current_prepared.source())
-                else {
+                let Some(include_guards) = include_directive_guard_requirements(
+                    node,
+                    current_prepared.source(),
+                    reference_is_c,
+                ) else {
                     continue;
                 };
-                let Some(path_guards) =
-                    merge_preprocessor_guards(&required_guards, &include_guards)
-                else {
+                let Some(reached) = path.merged(&include_guards) else {
                     continue;
                 };
                 let raw = normalize_cpp_whitespace(node_text(node, current_prepared.source()));
@@ -10158,15 +10657,11 @@ fn find_conditional_include_projection_index(
                     )) else {
                         continue;
                     };
-                    pending.push((target, activation_byte, path_guards.clone()));
+                    pending.push((target, activation_byte, reached.clone()));
                 }
                 continue;
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    nodes.push(child);
-                }
-            }
+            push_named_children_reversed(node, &mut nodes);
         }
     }
 
@@ -10180,9 +10675,10 @@ fn find_conditional_include_projection_index(
 }
 
 /// Decide one conditional include target without materializing every source
-/// reached by every guard combination. Paths whose requirements do not hold
-/// at the reference cannot become feasible after adding nested include guards,
-/// so discard them before expanding the next header.
+/// reached by every guard combination. A path `admission` already rejects
+/// cannot become admissible after adding nested include guards -- both rules
+/// only ever add requirements -- so discard it before expanding the next
+/// header.
 #[allow(clippy::too_many_arguments)]
 fn find_conditional_include_projection_for_source(
     cpp: &dyn CppSource,
@@ -10190,6 +10686,7 @@ fn find_conditional_include_projection_for_source(
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
+    admission: IncludePathAdmission,
     reference_guards: Option<&HashSet<PreprocessorGuard>>,
     reference_byte: usize,
     on_state: &dyn Fn(),
@@ -10197,17 +10694,23 @@ fn find_conditional_include_projection_for_source(
     let Some(reference_guards) = reference_guards else {
         return false;
     };
+    let reference_is_c = reference_uses_c_semantics(cpp, file);
     let include_targets = cpp.include_target_index();
     let mut pending = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            let Some(required_guards) = preprocessor_guard_environment(node, prepared.source())
+            let Some(required_guards) =
+                include_directive_guard_requirements(node, prepared.source(), reference_is_c)
             else {
                 continue;
             };
             if node.end_byte() > reference_byte
-                || !guard_requirements_hold_at_reference(&required_guards, Some(reference_guards))
+                || !admission.admits(
+                    &required_guards.all,
+                    &required_guards.partial,
+                    Some(reference_guards),
+                )
             {
                 continue;
             }
@@ -10227,20 +10730,16 @@ fn find_conditional_include_projection_for_source(
             }
             continue;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                nodes.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut nodes);
     }
 
     let mut expanded: HashMap<ProjectFile, Vec<HashSet<PreprocessorGuard>>> = HashMap::default();
-    while let Some((current_file, required_guards)) = pending.pop() {
+    while let Some((current_file, path)) = pending.pop() {
         let guard_sets = expanded.entry(current_file.clone()).or_default();
-        if guard_sets.contains(&required_guards) {
+        if guard_sets.contains(&path.all) {
             continue;
         }
-        guard_sets.push(required_guards.clone());
+        guard_sets.push(path.all.clone());
         on_state();
 
         let Some(current_prepared) = cpp.prepared_syntax(token, &current_file) else {
@@ -10249,17 +10748,17 @@ fn find_conditional_include_projection_for_source(
         let mut nodes = vec![current_prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
-                let Some(include_guards) =
-                    preprocessor_guard_environment(node, current_prepared.source())
-                else {
+                let Some(include_guards) = include_directive_guard_requirements(
+                    node,
+                    current_prepared.source(),
+                    reference_is_c,
+                ) else {
                     continue;
                 };
-                let Some(path_guards) =
-                    merge_preprocessor_guards(&required_guards, &include_guards)
-                else {
+                let Some(reached) = path.merged(&include_guards) else {
                     continue;
                 };
-                if !guard_requirements_hold_at_reference(&path_guards, Some(reference_guards)) {
+                if !admission.admits(&reached.all, &reached.partial, Some(reference_guards)) {
                     continue;
                 }
                 let raw = normalize_cpp_whitespace(node_text(node, current_prepared.source()));
@@ -10274,15 +10773,11 @@ fn find_conditional_include_projection_for_source(
                     if &target == donor_source {
                         return true;
                     }
-                    pending.push((target, path_guards.clone()));
+                    pending.push((target, reached.clone()));
                 }
                 continue;
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    nodes.push(child);
-                }
-            }
+            push_named_children_reversed(node, &mut nodes);
         }
     }
     false
@@ -10361,6 +10856,8 @@ fn unconditional_include_reaches(
         let Some(prepared) = cpp.prepared_syntax(token, &file) else {
             continue;
         };
+        // One cursor for the whole-file walk; see `named_children_iter` (#3097).
+        let mut cursor = prepared.tree().walk();
         let mut nodes = vec![prepared.tree().root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() == "preproc_include" {
@@ -10380,11 +10877,9 @@ fn unconditional_include_reaches(
                 }
                 continue;
             }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    nodes.push(child);
-                }
-            }
+            let first_pushed = nodes.len();
+            nodes.extend(node.named_children(&mut cursor));
+            nodes[first_pushed..].reverse();
         }
     }
     known_missing.extend(visited);
@@ -10554,11 +11049,73 @@ fn preprocessor_conditional_family_has_terminal_else(mut conditional: Node<'_>) 
     }
 }
 
+/// The undecidable preprocessor guards an `#include` directive stands under,
+/// or `None` when its conditional context keeps the directive out of a
+/// translation unit of the reference's language: a false constant, a
+/// condition this analyzer cannot read, or a `__cplusplus` branch that
+/// language never takes.
+///
+/// This is [`callable_declaration_guard_requirements`]'s rule for the include
+/// edge, and the language test is what keeps
+/// [`IncludePathAdmission::Compatible`] honest: an empty active guard set
+/// never implies `defined(__cplusplus)`, but it never contradicts it either,
+/// so without this a `.c` file would reach the C++ arm of every
+/// `#ifdef __cplusplus` / `#else` include pair.
+fn include_directive_guard_requirements(
+    node: Node<'_>,
+    source: &str,
+    reference_is_c: bool,
+) -> Option<PreprocessorGuardEnvironment> {
+    let required = preprocessor_guard_environment_by_family(node, source)?;
+    let excluded_by_language = required.all.iter().any(|guard| match guard {
+        PreprocessorGuard::Defined(name) => reference_is_c && name == "__cplusplus",
+        PreprocessorGuard::Undefined(name) => !reference_is_c && name == "__cplusplus",
+        _ => false,
+    });
+    (!excluded_by_language).then_some(required)
+}
+
 pub fn preprocessor_guard_environment(
     node: Node<'_>,
     source: &str,
 ) -> Option<HashSet<PreprocessorGuard>> {
-    let mut guards = HashSet::default();
+    preprocessor_guard_environment_by_family(node, source).map(|environment| environment.all)
+}
+
+/// The preprocessor guards `node` stands under, split by whether the
+/// conditional that contributes each one belongs to a family that covers every
+/// configuration.
+///
+/// A complete `#if`/`#else` or `#if`/`#elif`/`#else` family is a case analysis
+/// every configuration takes exactly one branch of, which is why the resolver
+/// already reads a declaration through one (`exhaustive_guard_family_activation`,
+/// `complementary_same_fqn_type_declarations`). A lone `#if` is not: nothing in
+/// the source says any configuration defines that macro, so only the build can
+/// decide it, and it stays in `partial`.
+#[derive(Clone)]
+struct PreprocessorGuardEnvironment {
+    all: HashSet<PreprocessorGuard>,
+    partial: HashSet<PreprocessorGuard>,
+}
+
+impl PreprocessorGuardEnvironment {
+    /// The environment of a path standing under both `self` and `other`, or
+    /// `None` when the two contradict. A guard a lone `#if` contributes on
+    /// either side stays undecided for the whole path.
+    fn merged(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            all: merge_preprocessor_guards(&self.all, &other.all)?,
+            partial: self.partial.union(&other.partial).cloned().collect(),
+        })
+    }
+}
+
+fn preprocessor_guard_environment_by_family(
+    node: Node<'_>,
+    source: &str,
+) -> Option<PreprocessorGuardEnvironment> {
+    let mut all = HashSet::default();
+    let mut partial = HashSet::default();
     let mut ancestor = node.parent();
     while let Some(conditional) = ancestor {
         if matches!(
@@ -10577,10 +11134,15 @@ pub fn preprocessor_guard_environment(
                 PreprocessorGuard::Constant(false) => return None,
                 _ => {}
             }
-            if guards.contains(&guard.negated()) {
+            if all.contains(&guard.negated()) {
                 return None;
             }
-            guards.insert(guard);
+            if !preprocessor_conditional_family_has_terminal_else(
+                preprocessor_conditional_family_root(conditional),
+            ) {
+                partial.insert(guard.clone());
+            }
+            all.insert(guard);
         }
         ancestor = conditional.parent();
     }
@@ -10589,14 +11151,18 @@ pub fn preprocessor_guard_environment(
             PreprocessorGuard::Constant(true) => {}
             PreprocessorGuard::Constant(false) => return None,
             _ => {
-                if guards.contains(&guard.negated()) {
+                if all.contains(&guard.negated()) {
                     return None;
                 }
-                guards.insert(guard);
+                // The family of a conditional the parser split across a
+                // statement boundary is not readable from the tree, so it
+                // counts as undecided.
+                partial.insert(guard.clone());
+                all.insert(guard);
             }
         }
     }
-    Some(guards)
+    Some(PreprocessorGuardEnvironment { all, partial })
 }
 
 fn fragmented_statement_preprocessor_guard(
@@ -10645,11 +11211,7 @@ fn fragmented_statement_preprocessor_guard(
                     terminators.push(node);
                     continue;
                 }
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
+                push_named_children_reversed(node, &mut stack);
             }
             if terminators.len() == 1 {
                 return simple_preprocessor_guard(openers[0], source);
@@ -10940,6 +11502,15 @@ fn callable_declaration_nodes<'tree>(
             // A declaration an attribute-like macro invocation swallowed lives
             // inside the `ERROR` the parser left, not inside a `declaration`
             // node, so that envelope is where the climb stops (#2552).
+            //
+            // The climb can also run out of ancestors. A collapse that takes a
+            // whole file with it -- whisper.cpp's `include/whisper.h` from its
+            // first `WHISPER_DEPRECATED(` to the end (#3094) -- leaves no
+            // envelope around most of what a region reparse recovers there, and
+            // the recovered declaration's own `;` can fall outside the envelope
+            // it does leave, so the range spans the container rather than one
+            // node. Either way the declaration stands at the scope the climb
+            // ended in, which is what the callers ask these nodes about.
             while !matches!(
                 declaration.kind(),
                 "declaration" | "field_declaration" | "function_definition"
@@ -10947,7 +11518,10 @@ fn callable_declaration_nodes<'tree>(
                 declaration,
                 prepared.source(),
             ) {
-                declaration = declaration.parent()?;
+                let Some(parent) = declaration.parent() else {
+                    break;
+                };
+                declaration = parent;
             }
             Some(declaration)
         })
@@ -11048,12 +11622,24 @@ impl CallableReferenceContext<'_> {
     }
 }
 
-fn callable_preprocessor_context_is_visible_for_reference(
+/// The undecidable preprocessor guards `node` stands under, or `None` when its
+/// conditional context excludes it from `reference`'s translation unit outright:
+/// a false constant, a condition this analyzer cannot read, or a `__cplusplus`
+/// branch the reference's language never takes.
+///
+/// Collecting one guard per enclosing conditional makes the whole walk a
+/// conjunction of the declaration's requirements. Which comparison those
+/// requirements then face depends on where the declaration lives: a same-file
+/// declaration shares the reference's configuration, so the reference's active
+/// guards must imply them, while a foreign file resolves its own conditionals
+/// and only has to stay compatible with the reference.
+fn callable_declaration_guard_requirements(
     node: Node<'_>,
     source: &str,
     reference: &CallableReferenceContext<'_>,
-) -> bool {
+) -> Option<HashSet<PreprocessorGuard>> {
     let reference_is_c = reference.is_c();
+    let mut required = HashSet::default();
     let mut ancestor = node.parent();
     while let Some(conditional) = ancestor {
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
@@ -11061,40 +11647,42 @@ fn callable_preprocessor_context_is_visible_for_reference(
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
             && preprocessor_conditional_contains_descendant(conditional, node)
         {
-            let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
-                return false;
-            };
+            let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
                 PreprocessorGuard::Constant(true) => {}
-                PreprocessorGuard::Constant(false) => return false,
+                PreprocessorGuard::Constant(false) => return None,
                 PreprocessorGuard::Defined(name) if name == "__cplusplus" => {
                     if reference_is_c {
-                        return false;
+                        return None;
                     }
                 }
                 PreprocessorGuard::Undefined(name) if name == "__cplusplus" => {
                     if !reference_is_c {
-                        return false;
+                        return None;
                     }
                 }
-                // The declaration stands under a guard whose value this
-                // analyzer cannot decide. It is still co-active with a
-                // reference whose active guards imply it. Collecting one guard
-                // per ancestor makes the whole walk a conjunction of the
-                // declaration requirements.
                 guard => {
-                    if !reference
-                        .guards()
-                        .is_some_and(|active| preprocessor_guard_holds_at_reference(&guard, active))
-                    {
-                        return false;
-                    }
+                    required.insert(guard);
                 }
             }
         }
         ancestor = conditional.parent();
     }
-    true
+    Some(required)
+}
+
+/// Whether a declaration in the reference's own file is co-active with the
+/// reference: one translation unit resolves every conditional the same way, so
+/// the reference's active guards must imply the declaration's requirements.
+fn callable_preprocessor_context_is_visible_for_reference(
+    node: Node<'_>,
+    source: &str,
+    reference: &CallableReferenceContext<'_>,
+) -> bool {
+    let Some(required) = callable_declaration_guard_requirements(node, source, reference) else {
+        return false;
+    };
+    required.is_empty() || guard_requirements_hold_at_reference(&required, reference.guards())
 }
 
 fn flattened_macro_namespace_declaration_matches(
@@ -11257,6 +11845,9 @@ fn recovered_macro_namespace_name(function: Node<'_>, source: &str) -> Option<St
 /// the wrapper instead of treating the declaration as block local.
 fn is_recovered_declaration_scope_container(node: Node<'_>, source: &str) -> bool {
     crate::declarations::is_recovered_exported_class_container(node, source)
+        || crate::declarations::is_recovered_fragmented_partial_specialization_container(
+            node, source,
+        )
         || recovered_macro_namespace_name(node, source).is_some()
 }
 
@@ -11563,6 +12154,14 @@ pub fn recovered_c_new_expression_argument_at(
     end_byte: usize,
     uses_c_semantics: bool,
 ) -> Option<Node<'_>> {
+    // The recovery only exists for C sources, and the climb below reaches the
+    // root before it can answer no. `Node::parent` re-descends from the root on
+    // every step, so leaving the check inside the loop made every scanned node
+    // of a C++ file pay a full quadratic ancestor walk for an answer settled by
+    // the file's language (#3097).
+    if !uses_c_semantics {
+        return None;
+    }
     loop {
         if let Some(arguments) = recovered_c_new_expression_arguments(node, uses_c_semantics) {
             return arguments.into_iter().find(|argument| {
@@ -11716,6 +12315,36 @@ pub fn cast_expression_type_node(node: Node<'_>) -> Option<Node<'_>> {
     } else {
         Some(descriptor)
     }
+}
+
+/// The expression a field access reads its member from.
+///
+/// That is normally the node in the `argument` field. A preprocessor
+/// conditional inside a call's argument list defeats the grammar: tree-sitter
+/// ends the argument list at the `#if` line, then reads the text that follows
+/// `#endif` as a field access on the whole call expression and leaves the real
+/// receiver in an `ERROR` node between the `argument` child and the operator.
+/// mbedtls writes exactly that at `library/ssl_tls.c:4999`, where
+/// `ssl->session->encrypt_then_mac` is one conditionally compiled call argument
+/// (#2982).
+///
+/// `.` and `->` read whatever ends immediately before them in either tree, so
+/// answer from the operator's position instead of trusting the `argument`
+/// field, and unwrap the single expression a displaced `ERROR` holds.
+pub fn cpp_field_expression_receiver(field: Node<'_>) -> Option<Node<'_>> {
+    debug_assert_eq!(field.kind(), "field_expression");
+    let operator = field.child_by_field_name("operator")?;
+    let mut cursor = field.walk();
+    let receiver = field
+        .named_children(&mut cursor)
+        .filter(|child| child.end_byte() <= operator.start_byte())
+        .last()?;
+    if receiver.kind() != "ERROR" {
+        return Some(receiver);
+    }
+    (receiver.named_child_count() == 1)
+        .then(|| receiver.named_child(0))
+        .flatten()
 }
 
 pub fn field_initializer_constructs_target(
@@ -12475,7 +13104,7 @@ fn append_structured_type_components(
     }
 }
 
-fn declared_name_indirection(
+pub(crate) fn declared_name_indirection(
     declaration: Node<'_>,
     type_node: Node<'_>,
     field_name: &str,
@@ -12637,8 +13266,8 @@ pub fn declaration_constructor_initializer(
                 _ => DeclarationConstructorInitializer::Expression(value),
             };
         }
-        if is_declarator_node(child) {
-            return declarator_parameters(child)
+        if let Some(declarator) = declaration_declarator(node, child) {
+            return declarator_parameters(declarator)
                 .map_or(DeclarationConstructorInitializer::Empty, |parameters| {
                     DeclarationConstructorInitializer::Arguments(parameters)
                 });
@@ -12685,11 +13314,7 @@ fn first_descendant_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Option<Node
         if node.kind() == kind {
             return Some(node);
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     None
 }
@@ -12723,11 +13348,7 @@ fn argument_shape_may_change_arity(node: Node<'_>) -> bool {
             }
             continue;
         }
-        for index in (0..descendant.named_child_count()).rev() {
-            if let Some(child) = descendant.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(descendant, &mut stack);
     }
     false
 }
@@ -12797,11 +13418,7 @@ fn macro_expansion_shape_is_safe(
                 return false;
             }
         }
-        for index in (0..descendant.named_child_count()).rev() {
-            if let Some(child) = descendant.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(descendant, &mut stack);
     }
     true
 }
@@ -12909,10 +13526,7 @@ fn is_canonical_include_guard(node: Node<'_>, source: &str) -> bool {
 
 fn top_level_canonical_include_guard_name(root: Node<'_>, source: &str) -> Option<String> {
     let mut guard = None;
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
+    for child in named_children_iter(root) {
         if child.kind() == "comment" || is_pragma_once(child, source) {
             continue;
         }
@@ -13142,6 +13756,8 @@ pub fn is_declarator_node(node: Node<'_>) -> bool {
         node.kind(),
         "identifier"
             | "field_identifier"
+            | "qualified_identifier"
+            | "scoped_identifier"
             | "pointer_declarator"
             | "reference_declarator"
             | "array_declarator"
@@ -13150,17 +13766,62 @@ pub fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
-/// One run of a container's children that tree-sitter parsed outside the
-/// namespaces that really enclose it, with the namespaces that do.
+/// Returns the declarator represented by one direct child of a declaration.
+///
+/// Tree-sitter exposes the first declarator through the `declarator` field,
+/// but subsequent comma-separated declarators are unfielded direct children:
+/// `int first, second;` therefore has an `identifier` child for `first` and a
+/// second, otherwise identical, `identifier` child for `second`. Consumers
+/// must inspect both shapes or a later declarator can be mistaken for a use of
+/// an unrelated indexed symbol.
+pub fn declaration_declarator<'tree>(
+    declaration: Node<'tree>,
+    child: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if !matches!(
+        declaration.kind(),
+        "declaration"
+            | "field_declaration"
+            | "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "function_definition"
+            | "type_definition"
+            | "alias_declaration"
+            | "template_instantiation"
+    ) {
+        return None;
+    }
+    if declaration
+        .child_by_field_name("type")
+        .is_some_and(|type_node| same_node(type_node, child))
+    {
+        return None;
+    }
+    if child.kind() == "init_declarator" {
+        return child.child_by_field_name("declarator");
+    }
+    let field = field_name_in_parent(declaration, child);
+    if (is_declarator_node(child) && matches!(field, Some("declarator") | None))
+        || (declaration.kind() == "type_definition"
+            && child.kind() == "type_identifier"
+            && matches!(field, Some("declarator") | None))
+    {
+        Some(child)
+    } else {
+        None
+    }
+}
+
+/// One run of a container's children whose parsed namespaces differ from
+/// their lexical namespaces, with the complete lexical namespace path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveredNamespaceRegion {
     /// Start byte of the first child in the run.
     pub start: usize,
     /// End byte of the last child in the run.
     pub end: usize,
-    /// The complete enclosing namespace path of the run, outermost first: the
-    /// namespaces the parse tree still attributes to the container, then the
-    /// ones recovery dropped.
+    /// The complete enclosing namespace path of the run, outermost first.
+    /// This can be empty when a parsed namespace extends past its real close.
     pub components: Vec<String>,
 }
 
@@ -13175,20 +13836,19 @@ pub struct RecoveredNamespaceRegion {
 /// positions but lose their `namespace_definition` ancestors (Catch2's
 /// `catch_matchers_templated.hpp`, issue #1537).
 ///
-/// Braces balance in source that compiles, so the lost scopes are exactly what
-/// a brace stack over tree-sitter's own tokens leaves open. Within one node, in
-/// child order: a real `{` opens a scope (the node's namespace when the node is
-/// a named namespace body, otherwise an opaque scope); a real `}` closes the
-/// innermost open scope, or is owed to the parent when the node has none open;
-/// a MISSING brace is not a token and does nothing; a child without errors is
-/// balanced and contributes nothing; an error-marked child contributes the
-/// closes it owes and the scopes it leaves open. Whatever is open before a
-/// child starts, beyond the node's own scope, is what the parse lost for that
-/// child. Consecutive children with the same lost namespaces form one
-/// [`RecoveredNamespaceRegion`]. A file without parse errors has no regions.
+/// A file-global stack over real AST brace tokens restores both lost and
+/// overextended namespaces. Missing braces do nothing; error-free subtrees are
+/// balanced and can be skipped. For each child of a damaged container, compare
+/// the namespaces still open on that stack with the parsed ancestor path. A
+/// difference yields a region carrying the complete lexical path, including
+/// an empty path when recovery swallowed file-scope declarations. Consecutive
+/// children sharing that path form one [`RecoveredNamespaceRegion`]. The same
+/// pass retains matching brace positions for declaration partitioning (#3087).
+/// A file without parse errors needs neither correction nor a brace index.
 #[derive(Clone, Debug, Default)]
 pub struct OrphanedNamespaceScopeIndex {
     regions: Vec<RecoveredNamespaceRegion>,
+    brace_closes: HashMap<usize, Range>,
 }
 
 impl OrphanedNamespaceScopeIndex {
@@ -13199,111 +13859,114 @@ impl OrphanedNamespaceScopeIndex {
         struct Frame<'tree> {
             node: Node<'tree>,
             children: std::vec::IntoIter<Node<'tree>>,
-            /// The enclosing namespace path of this node's children before
-            /// this node's own scopes: the parent's path plus what was open in
-            /// the parent when this node started.
-            scope: Vec<String>,
-            /// The namespace this node's own real `{` opens; empty when the
-            /// node is not a named namespace body.
-            own_scope: Vec<String>,
-            /// Scopes opened inside this node and still open, innermost last.
-            /// A namespace carries its name components; an opaque scope (a
-            /// class body, a function body, a brace inside an ERROR) is empty.
-            open: Vec<Vec<String>>,
-            /// Whether `open[0]` is this node's own scope.
-            own_open: bool,
-            /// Real closes seen with nothing open here; the parent closes them.
-            owed: usize,
-            /// The run of children currently sharing the same lost namespaces.
+            parsed_scope: Vec<String>,
             run: Option<RecoveredNamespaceRegion>,
         }
         fn frame<'tree>(
             node: Node<'tree>,
-            scope: Vec<String>,
-            own_scope: Vec<String>,
+            mut parsed_scope: Vec<String>,
+            source: &str,
         ) -> Frame<'tree> {
+            if node.kind() == "namespace_definition"
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let mut components = Vec::new();
+                if append_cpp_name_components(name, source, &mut components).is_some() {
+                    parsed_scope.extend(components);
+                }
+            }
             let mut cursor = node.walk();
-            let children = node.children(&mut cursor).collect::<Vec<_>>().into_iter();
             Frame {
                 node,
-                children,
-                scope,
-                own_scope,
-                open: Vec::new(),
-                own_open: false,
-                owed: 0,
+                children: node.children(&mut cursor).collect::<Vec<_>>().into_iter(),
+                parsed_scope,
                 run: None,
             }
         }
         let mut regions = Vec::new();
-        let mut frames = vec![frame(root, Vec::new(), Vec::new())];
+        let mut brace_closes = HashMap::default();
+        // The brace stack belongs to the file, not to a parser frame. A real
+        // close inside a damaged child can close its parent's namespace. The
+        // following children must see that removal immediately (#3087).
+        let mut open = Vec::new();
+        let mut lexical_scope = Vec::new();
+        let mut frames = vec![frame(root, Vec::new(), source)];
         while let Some(current) = frames.last_mut() {
             let Some(child) = current.children.next() else {
-                let done = frames.pop().expect("the frame just borrowed");
-                regions.extend(done.run);
-                let Some(parent) = frames.last_mut() else {
-                    break;
-                };
-                for _ in 0..done.owed {
-                    if parent.open.pop().is_none() {
-                        parent.owed += 1;
-                    }
-                }
-                parent.own_open &= !parent.open.is_empty();
-                parent.open.extend(done.open);
+                regions.extend(frames.pop().expect("the frame just borrowed").run);
                 continue;
             };
             match child.kind() {
                 "{" if !child.is_missing() => {
-                    let own = current.open.is_empty();
-                    current.open.push(if own {
-                        current.own_scope.clone()
-                    } else {
-                        Vec::new()
-                    });
-                    current.own_open |= own;
+                    regions.extend(current.run.take());
+                    let mut components = current
+                        .node
+                        .parent()
+                        .map(|parent| namespace_body_name_components(parent, current.node, source))
+                        .unwrap_or_default();
+                    if components.is_empty() {
+                        components = recovered_namespace_open_components(child, source);
+                    }
+                    open.push((child.start_byte(), lexical_scope.len()));
+                    lexical_scope.extend(components);
                     continue;
                 }
                 "}" if !child.is_missing() => {
-                    if current.open.pop().is_none() {
-                        current.owed += 1;
+                    regions.extend(current.run.take());
+                    if let Some((start, namespace_len)) = open.pop() {
+                        lexical_scope.truncate(namespace_len);
+                        brace_closes.insert(
+                            start,
+                            Range {
+                                start_byte: child.start_byte(),
+                                end_byte: child.end_byte(),
+                                start_line: child.start_position().row + 1,
+                                end_line: child.end_position().row + 1,
+                            },
+                        );
                     }
-                    // The node's own close, or a close that reached it once
-                    // every lost scope was popped: nothing of this node's is
-                    // open for the children that follow.
-                    current.own_open &= !current.open.is_empty();
                     continue;
                 }
                 _ => {}
             }
-            let lost = &current.open[usize::from(current.own_open)..];
-            let child_scope = current
-                .scope
-                .iter()
-                .chain(current.open.iter().flatten())
-                .cloned()
-                .collect::<Vec<_>>();
-            if lost.iter().any(|scope| !scope.is_empty()) {
+            // The namespace head and body precede their opening brace; their
+            // own parsed namespace is not yet on the lexical stack. Compare
+            // the items inside the body, not this header bookkeeping.
+            if current.node.kind() != "namespace_definition"
+                && lexical_scope != current.parsed_scope
+            {
                 match &mut current.run {
-                    Some(run) if run.components == child_scope => run.end = child.end_byte(),
+                    Some(run) if run.components == lexical_scope => run.end = child.end_byte(),
                     run => {
                         regions.extend(run.take());
                         *run = Some(RecoveredNamespaceRegion {
                             start: child.start_byte(),
                             end: child.end_byte(),
-                            components: child_scope.clone(),
+                            components: lexical_scope.clone(),
                         });
                     }
                 }
             } else {
                 regions.extend(current.run.take());
             }
+            // Error-free subtrees are balanced. Keeping them intact also
+            // leaves their valid nested namespaces to the ordinary ancestry
+            // walk in restore_enclosing_namespaces.
             if child.has_error() {
-                let own_scope = namespace_body_name_components(current.node, child, source);
-                frames.push(frame(child, child_scope, own_scope));
+                let parsed_scope = current.parsed_scope.clone();
+                frames.push(frame(child, parsed_scope, source));
             }
         }
-        Self { regions }
+        Self {
+            regions,
+            brace_closes,
+        }
+    }
+
+    /// The real AST brace matching an opening brace in a damaged subtree.
+    /// Missing tokens and braces inside comments or literals do not participate.
+    pub fn matching_close_brace(&self, open: usize) -> Option<Range> {
+        self.brace_closes.get(&open).copied()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -13312,11 +13975,14 @@ impl OrphanedNamespaceScopeIndex {
 
     /// The bytes this index holds, for the analyzer cache's weight.
     pub fn approximate_size(&self) -> usize {
-        self.regions.iter().fold(0usize, |total, region| {
-            total
-                .saturating_add(std::mem::size_of::<RecoveredNamespaceRegion>())
-                .saturating_add(region.components.iter().map(String::len).sum::<usize>())
-        })
+        self.regions.iter().fold(
+            self.brace_closes.len() * std::mem::size_of::<(usize, Range)>(),
+            |total, region| {
+                total
+                    .saturating_add(std::mem::size_of::<RecoveredNamespaceRegion>())
+                    .saturating_add(region.components.iter().map(String::len).sum::<usize>())
+            },
+        )
     }
 
     /// The innermost recovered region containing `byte`.
@@ -13376,6 +14042,42 @@ impl OrphanedNamespaceScopeIndex {
             )
             .collect()
     }
+}
+
+/// The name components of the namespace a stray `{` opens, or empty when `open`
+/// does not follow a namespace head.
+///
+/// When a namespace body holds a construct tree-sitter cannot parse, recovery
+/// can collapse the whole `namespace Name { ... }` into one `ERROR` instead of
+/// a `namespace_definition`: the head survives as the node's own `namespace`
+/// keyword, name and `{` tokens, in that order, and everything the namespace
+/// declares becomes a flat sibling of them (Catch2's `catch_decomposer.hpp`,
+/// issue #3084). Read the head from those siblings so the brace stack names
+/// the scope the brace opens. An anonymous namespace has no representable
+/// name and keeps an opaque scope.
+fn recovered_namespace_open_components(open: Node<'_>, source: &str) -> Vec<String> {
+    let mut head = Vec::new();
+    let mut previous = open.prev_sibling();
+    while let Some(node) = previous {
+        if node.kind() != "comment" {
+            head.push(node);
+            if head.len() == 2 {
+                break;
+            }
+        }
+        previous = node.prev_sibling();
+    }
+    let [name, keyword] = head[..] else {
+        return Vec::new();
+    };
+    if keyword.kind() != "namespace" {
+        return Vec::new();
+    }
+    let mut components = Vec::new();
+    if append_cpp_name_components(name, source, &mut components).is_none() {
+        components.clear();
+    }
+    components
 }
 
 /// The name components of the namespace whose body `body` is, or empty when
@@ -13843,11 +14545,12 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     let mut current = Some(parent);
     while let Some(ancestor) = current {
         let type_definition = ancestor.kind() == "type_definition";
-        let mut declarator_cursor = ancestor.walk();
-        if ancestor
-            .children_by_field_name("declarator", &mut declarator_cursor)
-            .any(|declarator| declarator_name_path_contains(declarator, node, type_definition))
-        {
+        let mut child_cursor = ancestor.walk();
+        if ancestor.named_children(&mut child_cursor).any(|child| {
+            declaration_declarator(ancestor, child).is_some_and(|declarator| {
+                declarator_name_path_contains(declarator, node, type_definition)
+            })
+        }) {
             return true;
         }
         if matches!(
@@ -13859,6 +14562,7 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
                 | "function_definition"
                 | "type_definition"
                 | "alias_declaration"
+                | "template_instantiation"
                 | "class_specifier"
                 | "struct_specifier"
                 | "union_specifier"
@@ -13998,8 +14702,7 @@ fn recovered_c_reference_node(
     // its function_declarator as a declaration path, but the ERROR sibling
     // proves it is a call.
     let name = node_text(node, source);
-    let recovered_function_call =
-        recovered_c_function_declarator_call(visibility, file, node, name);
+    let recovered_function_call = recovered_c_function_call(visibility, file, node, name);
     let recovered_macro_call = recovered_c_function_declarator_invocation(node)
         && visibility.macro_name_may_be_bound_at(file, name, node.start_byte());
     let recovered_parenthesized_reference = recovered_c_parenthesized_declarator_reference(node);
@@ -14099,11 +14802,12 @@ fn recovered_c_error_expression_leaf(node: Node<'_>) -> bool {
 }
 
 /// C recovery may represent a call as `identifier > function_declarator >
-/// ERROR > compound_statement`. This shape is only a call when the malformed
-/// declarator is attached to a real function body and the name is an indexed
-/// visible callable. A declaration's `ERROR > function_declarator >
-/// declaration` shape deliberately fails this test.
-fn recovered_c_function_declarator_call(
+/// function_declarator > ERROR > compound_statement`. This shape is only a
+/// call when the malformed declarator is attached to a real function body and
+/// the name is an indexed visible callable. A declaration's
+/// `ERROR > function_declarator > declaration` shape deliberately fails this
+/// test.
+fn recovered_c_function_call(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     node: Node<'_>,
@@ -14115,7 +14819,25 @@ fn recovered_c_function_declarator_call(
     ) {
         return false;
     }
-    recovered_c_function_declarator_invocation(node)
+    // C++ keywords used as C arguments can leave only the call prefix under
+    // ERROR, with the remaining arguments in a following expression statement.
+    // Require a statement boundary in a real block, an opening parenthesis,
+    // and a recovered argument. A bare ERROR identifier supplies no call role.
+    let error_call_prefix = node.parent().is_some_and(|error| {
+        error.is_error()
+            && error
+                .parent()
+                .is_some_and(|parent| parent.kind() == "compound_statement")
+    }) && node
+        .prev_sibling()
+        .is_none_or(|previous| previous.kind() == ";")
+        && node.next_sibling().is_some_and(|open| {
+            open.kind() == "("
+                && open.next_named_sibling().is_some_and(|argument| {
+                    argument.kind() == "parameter_declaration" && !argument.has_error()
+                })
+        });
+    (error_call_prefix || recovered_c_function_declarator_invocation(node))
         && visibility
             .visible_identifier_candidates(file, name)
             .any(CodeUnit::is_function)
@@ -14131,7 +14853,7 @@ fn recovered_c_function_declarator_call(
 /// at a real expression-bearing boundary; declarations therefore cannot pass
 /// this predicate merely because they have a parameter list.
 fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
-    let function_declarator = if node.parent().is_some_and(|parent| {
+    let mut function_declarator = if node.parent().is_some_and(|parent| {
         parent.kind() == "function_declarator"
             && parent.child_by_field_name("declarator") == Some(node)
     }) {
@@ -14164,6 +14886,14 @@ fn recovered_c_function_declarator_invocation(node: Node<'_>) -> bool {
         function_declarator
     };
 
+    // Recovery may absorb the next statement's parenthesized cast into a
+    // second function declarator. Follow only the original declarator chain.
+    while let Some(parent) = function_declarator.parent().filter(|parent| {
+        parent.kind() == "function_declarator"
+            && parent.child_by_field_name("declarator") == Some(function_declarator)
+    }) {
+        function_declarator = parent;
+    }
     let Some(mut current) = function_declarator
         .parent()
         .filter(|parent| parent.is_error())
@@ -14536,10 +15266,7 @@ pub fn qualified_name_has_concrete_scope_separators(node: Node<'_>) -> bool {
             continue;
         }
         let mut current_has_separator = false;
-        for index in 0..current.child_count() {
-            let Some(child) = current.child(index) else {
-                continue;
-            };
+        for child in children_iter(current) {
             if child.kind() == "::" {
                 if child.is_missing() {
                     return false;
@@ -14806,11 +15533,7 @@ pub fn cpp_member_using_declaration_scopes(source: &str, member: &str) -> Vec<St
             }
             continue;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                pending.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut pending);
     }
     scopes
 }
@@ -16869,6 +17592,20 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_3089_statement_formal_at_end_of_replacement() {
+        let parameters = vec!["handle".to_owned(), "block".to_owned()];
+        for replacement in [
+            "do { header_event_t* event; if ((handle)->active) block } while (0)",
+            "do { header_event_t* event; block } while (0)",
+        ] {
+            assert!(
+                super::VisibilityIndex::parse_macro_replacement_body(replacement, &parameters)
+                    .is_some(),
+                "{replacement}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -16983,6 +17720,63 @@ struct AfterAll {};
         assert_eq!(
             index.enclosing_namespace_components(named_node_at(&tree, damaged, "class C"), damaged),
             ["a"]
+        );
+    }
+
+    /// A function-like `#define` in a class body, whose replacement returns a
+    /// SFINAE type, makes tree-sitter give up on the whole enclosing namespace:
+    /// `namespace app {` becomes an `ERROR` whose own `namespace`, name and `{`
+    /// tokens are the only trace of the head, and every declaration the
+    /// namespace holds becomes their flat sibling. This is Catch2's
+    /// `catch_decomposer.hpp`, reduced (issue #3084).
+    const COLLAPSED_NAMESPACE_HEAD: &str = r#"namespace app {
+
+    class Target {
+        int value_;
+    };
+
+    template <typename T>
+    class Holder {
+    public:
+        explicit constexpr Holder( T lhs ): m_lhs( lhs ) {}
+
+#define HOLDER_DEFINE_OP( id, op )                                             \
+    template <typename U>                                                      \
+    constexpr friend auto operator op( Holder&& lhs, U&& rhs )                 \
+        -> std::enable_if_t<is_##id##_comparable<T, U>::value, Target> {       \
+        return Target{};                                                       \
+    }
+
+        HOLDER_DEFINE_OP( equal, == )
+#undef HOLDER_DEFINE_OP
+        T m_lhs;
+    };
+
+    class Tail {};
+}
+"#;
+
+    #[test]
+    fn orphaned_namespace_scope_index_names_a_collapsed_namespace_head() {
+        let source = COLLAPSED_NAMESPACE_HEAD;
+        let tree = parse_cpp(source);
+        let target = named_node_at(&tree, source, "class Target");
+
+        assert!(
+            !has_ancestor_kind(target, "namespace_definition"),
+            "the fixture must reproduce the collapse: the class has no namespace ancestor"
+        );
+        let head = target.parent().expect("the collapsed namespace envelope");
+        assert_eq!(
+            head.kind(),
+            "ERROR",
+            "the fixture must keep the namespace head in an ERROR node"
+        );
+
+        let index = OrphanedNamespaceScopeIndex::build(tree.root_node(), source);
+        assert_eq!(
+            index.enclosing_namespace_components(target, source),
+            ["app"]
         );
     }
 

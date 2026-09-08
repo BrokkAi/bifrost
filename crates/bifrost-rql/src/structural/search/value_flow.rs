@@ -900,12 +900,25 @@ fn hash_public_carrier_key(digest: &mut LengthDelimitedDigest, root: &ValueFlowC
                 digest.push(b"scoped_root");
                 digest.push(match kind {
                     ValueFlowScopedRootKind::Static => b"static",
-                    ValueFlowScopedRootKind::LexicalCell => b"lexical_cell",
                     ValueFlowScopedRootKind::TypeSummary => b"type_summary",
                     ValueFlowScopedRootKind::ModuleObject => b"module_object",
                     ValueFlowScopedRootKind::External => b"external",
                 });
                 hash_public_locator(digest, locator);
+            }
+            Part::Carrier(ValueFlowCarrierKey::LexicalCell { locator, binding }) => {
+                digest.push(b"lexical_cell");
+                hash_public_locator(digest, locator);
+                digest.push(b"binding");
+                hash_public_locator(digest, &binding.locator);
+                digest.push(binding.role.as_bytes());
+                match binding.ordinal {
+                    Some(ordinal) => {
+                        digest.push(b"ordinal");
+                        digest.push(&ordinal.to_le_bytes());
+                    }
+                    None => digest.push(b"no_ordinal"),
+                }
             }
             Part::Carrier(ValueFlowCarrierKey::Location {
                 root,
@@ -1154,12 +1167,18 @@ pub(super) fn public_carrier_symbol(
                 id,
                 root_kind: match kind {
                     ValueFlowScopedRootKind::Static => "static",
-                    ValueFlowScopedRootKind::LexicalCell => "lexical_cell",
                     ValueFlowScopedRootKind::TypeSummary => "type_summary",
                     ValueFlowScopedRootKind::ModuleObject => "module_object",
                     ValueFlowScopedRootKind::External => "external",
                 },
                 site: public_symbol_site(workspace, locator),
+            }
+        }
+        ValueFlowCarrierKey::LexicalCell { binding, .. } => {
+            CodeQueryFlowCarrierSymbol::ScopedRoot {
+                id,
+                root_kind: "lexical_cell",
+                site: public_symbol_site(workspace, &binding.locator),
             }
         }
         ValueFlowCarrierKey::Location {
@@ -1340,4 +1359,63 @@ fn hash_public_point(digest: &mut LengthDelimitedDigest, point: &ProgramPointHan
 fn locator_span(locator: &SemanticLocator) -> std::ops::Range<usize> {
     let span = locator.anchor().span();
     span.start_byte() as usize..span.end_byte() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::analyzer::semantic::{
+        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DurableValueIdentity,
+        SemanticLanguage, SemanticRole, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
+        WorkspaceRelativePath,
+    };
+
+    fn test_locator(offset: u32, role: SemanticRole) -> SemanticLocator {
+        let anchor = SourceAnchor::new(
+            SourceSpan::new(
+                SourcePosition::new(offset, 0, offset),
+                SourcePosition::new(offset + 1, 0, offset + 1),
+            )
+            .expect("ordered test span"),
+            0,
+        );
+        let declaration = DeclarationLocator::new(vec![
+            DeclarationSegment::named(DeclarationSegmentKind::Function, "recoverBox", anchor, 0)
+                .expect("named declaration"),
+        ])
+        .expect("non-empty declaration");
+        SemanticLocator::new(
+            WorkspaceMountId::hash_bytes(b"test mount"),
+            WorkspaceRelativePath::new("src/Issue3099.go").expect("valid path"),
+            SemanticLanguage::Standard(Language::Go),
+            declaration,
+            role,
+            anchor,
+        )
+    }
+
+    #[test]
+    fn public_carrier_ids_distinguish_shared_cell_binding_identity() {
+        let cell_locator = test_locator(0, SemanticRole::MemoryLocation);
+        let binding_locator = test_locator(20, SemanticRole::Value);
+        let key = |role: &str, ordinal: Option<u32>| ValueFlowCarrierKey::LexicalCell {
+            locator: cell_locator.clone(),
+            binding: DurableValueIdentity {
+                locator: binding_locator.clone(),
+                role: role.into(),
+                ordinal,
+            },
+        };
+
+        let parameter = public_carrier_symbol_id(&key("parameter", Some(0)));
+        let local = public_carrier_symbol_id(&key("local", Some(0)));
+        let second = public_carrier_symbol_id(&key("parameter", Some(1)));
+        let unordinaled = public_carrier_symbol_id(&key("parameter", None));
+        let max_ordinal = public_carrier_symbol_id(&key("parameter", Some(u32::MAX)));
+
+        assert_ne!(parameter, local);
+        assert_ne!(parameter, second);
+        assert_ne!(unordinaled, max_ordinal);
+    }
 }

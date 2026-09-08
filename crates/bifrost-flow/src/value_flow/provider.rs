@@ -59,10 +59,10 @@
 //! and its cancellation token. Neither needs covering, because neither can
 //! reach a retained entry: exhausting the budget or cancelling produces
 //! `SemanticOutcome::ExceededBudget` or `SemanticOutcome::Cancelled`, and
-//! `memoizable_outcome` retains neither. Budget-caused incompleteness is
-//! therefore excluded from the memo by construction rather than by a key
-//! dimension, so a later touch with more budget still runs the oracle and can
-//! still reach a better answer.
+//! [`SemanticOutcome::completed_replay`] retains neither. Budget-caused
+//! incompleteness is therefore excluded from the memo by construction rather
+//! than by a key dimension, so a later touch with more budget still runs the
+//! oracle and can still reach a better answer.
 //!
 //! ### The dispatch key (#2943)
 //!
@@ -114,17 +114,17 @@
 
 use std::fmt;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchBoundary, DispatchCandidate,
-    DispatchOracle, DispatchReadAttribution, DispatchResult, EvidenceCompleteness, IcfgProvider,
-    IcfgProviderBehaviorIdentity, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId,
-    ProofStatus, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
-    StableDigest, ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot, WorkspaceIcfgProvider,
-    WorkspaceSemanticOracle, dispatch_read_attribution,
+    DispatchReadAttribution, DispatchResult, EvidenceCompleteness, IcfgProvider,
+    IcfgProviderBehaviorIdentity, OracleCallContext, OracleLimits, PreparedWorkspaceDispatchPool,
+    ProcedureHandle, ProcedureId, ProofStatus, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation,
+    ValueFlowSnapshot, WorkspaceIcfgProvider, WorkspaceSemanticOracle, dispatch_read_attribution,
 };
 use brokk_bifrost_core::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 
@@ -306,65 +306,6 @@ impl DispatchKey {
             provider_behavior,
             limits,
         }
-    }
-}
-
-/// Which published outcomes are safe to retain, and in what form.
-///
-/// `Complete`, `Ambiguous`, `Unknown`, `Unsupported`, and `Unproven` are
-/// finished verdicts: the oracle ran to the end of the procedure or the call
-/// and reported what it found, so a later touch with the same key reproduces
-/// exactly this answer.
-///
-/// `ExceededBudget` and `Cancelled` are not verdicts about the procedure or the
-/// call at all. They report that *this* request ran out of budget or was
-/// interrupted, which is a property of the request rather than of the artifact.
-/// Retaining one would freeze a transient shortfall into an authoritative
-/// answer and deny a later, better-funded touch the chance to succeed -- with
-/// the per-region budget reset in `TaintPolicyCompiler::compile_inner`, a later
-/// region really can afford work an earlier region could not. Returning `None`
-/// for them keeps them out of the cache and out of every follower's answer.
-///
-/// A value-less `Unknown` or `Unsupported` carries nothing worth replaying, so
-/// it is not retained either.
-///
-/// One function serves both sub-caches because the rule is a property of
-/// [`SemanticOutcome`] rather than of the value inside it.
-fn memoizable_outcome<T: Clone>(outcome: &SemanticOutcome<T>) -> Option<SemanticOutcome<T>> {
-    let work = SemanticWork::default();
-    match outcome {
-        SemanticOutcome::Complete { value, .. } => Some(SemanticOutcome::Complete {
-            value: value.clone(),
-            work,
-        }),
-        SemanticOutcome::Ambiguous { candidates, .. } => Some(SemanticOutcome::Ambiguous {
-            candidates: candidates.clone(),
-            work,
-        }),
-        SemanticOutcome::Unproven { partial, .. } => Some(SemanticOutcome::Unproven {
-            partial: partial.clone(),
-            work,
-        }),
-        SemanticOutcome::Unknown {
-            partial: Some(partial),
-            ..
-        } => Some(SemanticOutcome::Unknown {
-            partial: Some(partial.clone()),
-            work,
-        }),
-        SemanticOutcome::Unsupported {
-            capability,
-            partial: Some(partial),
-            ..
-        } => Some(SemanticOutcome::Unsupported {
-            capability: *capability,
-            partial: Some(partial.clone()),
-            work,
-        }),
-        SemanticOutcome::Unknown { partial: None, .. }
-        | SemanticOutcome::Unsupported { partial: None, .. }
-        | SemanticOutcome::ExceededBudget { .. }
-        | SemanticOutcome::Cancelled { .. } => None,
     }
 }
 
@@ -610,18 +551,24 @@ pub struct WorkspaceValueFlowProvider<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
     provider_behavior: IcfgProviderBehaviorIdentity,
     cache: ValueFlowCache,
+    dispatch_sessions: Arc<PreparedWorkspaceDispatchPool<'a>>,
     dispatch_reads: Option<DispatchReadCollector>,
+    retained_writes: Arc<AtomicBool>,
 }
 
 impl<'a> WorkspaceValueFlowProvider<'a> {
     /// Bind the provider to one analyzer generation and one shared cache.
     pub fn new(workspace: &'a WorkspaceAnalyzer, cache: ValueFlowCache) -> Self {
         let provider = WorkspaceIcfgProvider::new(workspace);
+        let oracle = provider.oracle().clone();
+        let dispatch_sessions = Arc::new(oracle.prepare_workspace_dispatch_pool());
         Self {
-            oracle: provider.oracle().clone(),
+            oracle,
             provider_behavior: provider.behavior_identity(),
             cache,
+            dispatch_sessions,
             dispatch_reads: None,
+            retained_writes: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -631,16 +578,19 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
     /// executor's snapshot-bound oracle today, a hinted oracle under #2945)
     /// hands it in here; building a second oracle from the current overlay
     /// would give one walk two oracle identities.
-    pub const fn with_oracle(
+    pub fn with_oracle(
         oracle: WorkspaceSemanticOracle<'a>,
         provider_behavior: IcfgProviderBehaviorIdentity,
         cache: ValueFlowCache,
     ) -> Self {
+        let dispatch_sessions = Arc::new(oracle.prepare_workspace_dispatch_pool());
         Self {
             oracle,
             provider_behavior,
             cache,
+            dispatch_sessions,
             dispatch_reads: None,
+            retained_writes: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -651,7 +601,9 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
             oracle: self.oracle.clone(),
             provider_behavior: self.provider_behavior,
             cache: self.cache.clone(),
+            dispatch_sessions: Arc::clone(&self.dispatch_sessions),
             dispatch_reads: Some(collector),
+            retained_writes: Arc::clone(&self.retained_writes),
         }
     }
 
@@ -663,6 +615,12 @@ impl<'a> WorkspaceValueFlowProvider<'a> {
     /// The workspace semantic oracle this provider delegates to.
     pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
         &self.oracle
+    }
+
+    /// Whether this provider or one of its observer clones published a
+    /// completed outcome into the externally shared value-flow cache.
+    pub(crate) fn take_retained_writes(&self) -> bool {
+        self.retained_writes.swap(false, Ordering::AcqRel)
     }
 
     fn record_dispatch_read(
@@ -719,8 +677,9 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 // (#2284). Dropping the permit on a budget-exhausted or
                 // cancelled outcome wakes followers to retry, so a shortfall of
                 // this request never enters the ready cache.
-                if let Some(memoized) = memoizable_outcome(&outcome) {
+                if let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
+                    self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
             }
@@ -754,9 +713,10 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .dispatch_misses
                     .fetch_add(1, Ordering::Relaxed);
-                let outcome = self.oracle.resolve_call(call, request)?;
-                if let Some(memoized) = memoizable_outcome(&outcome) {
+                let outcome = self.dispatch_sessions.resolve_call(call, request)?;
+                if let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
+                    self.retained_writes.store(true, Ordering::Release);
                 }
                 outcome
             }
@@ -804,8 +764,9 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .call_bindings(call, candidate, context, request)?;
                 // A finished binding verdict is retained whether or not it is
                 // complete, on the same terms as a snapshot (#2289).
-                if let Some(memoized) = memoizable_outcome(&outcome) {
+                if let Some(memoized) = outcome.completed_replay() {
                     permit.publish_complete(Arc::new(memoized));
+                    self.retained_writes.store(true, Ordering::Release);
                 }
                 Ok(outcome)
             }
@@ -823,9 +784,136 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::{CancellationToken, SemanticBudget};
+    use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticBudgetDimension};
     use crate::analyzer::{AnalyzerConfig, Language};
     use crate::inline_project::InlineTestProject;
+
+    const BATCH_CALL_SOURCE: &str = concat!(
+        "import { open } from \"third-party\";\n",
+        "export function caller() { open(\"a\"); open(\"b\"); }\n",
+    );
+
+    fn with_batch_calls(
+        body: impl FnOnce(&WorkspaceAnalyzer, Vec<CallSiteHandle>, ValueFlowCache),
+    ) {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("batch.ts", BATCH_CALL_SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("batch.ts"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("fixture semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("fixture artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture caller");
+        let calls = caller
+            .semantics()
+            .call_sites()
+            .iter()
+            .map(|call| {
+                caller
+                    .call_site_handle(call.id)
+                    .expect("fixture call remains live")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "fixture has two calls");
+        body(&workspace, calls, ValueFlowCache::default());
+    }
+
+    #[test]
+    fn observer_clones_share_one_prepared_source_charge_for_distinct_calls() {
+        with_batch_calls(|workspace, calls, cache| {
+            let provider = WorkspaceValueFlowProvider::new(workspace, cache.clone());
+            let left = provider.observing_dispatch_reads(DispatchReadCollector::default());
+            let right = provider.observing_dispatch_reads(DispatchReadCollector::default());
+            let cancellation = CancellationToken::default();
+            let mut limits = SemanticBudget::default().limits();
+            limits.source_bytes = BATCH_CALL_SOURCE.len();
+            let mut budget = SemanticBudget::new(limits).expect("positive source budget");
+
+            let first = left
+                .resolve_call(
+                    &calls[0],
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("first prepared dispatch");
+            let second = right
+                .resolve_call(
+                    &calls[1],
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("second prepared dispatch");
+
+            assert!(first.available_value().is_some(), "{first:?}");
+            assert!(second.available_value().is_some(), "{second:?}");
+            assert_eq!(first.work().source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(second.work().source_bytes, 0);
+            assert_eq!(budget.used().source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(cache.dispatch_misses(), 2);
+            assert_eq!(cache.dispatch_hits(), 0);
+        });
+    }
+
+    #[test]
+    fn unpaid_prepared_source_is_dropped_before_a_dispatch_retry() {
+        with_batch_calls(|workspace, calls, cache| {
+            let provider = WorkspaceValueFlowProvider::new(workspace, cache.clone());
+            let cancellation = CancellationToken::default();
+            let mut starved_budget = SemanticBudget::default();
+            let nested_limit = starved_budget.limits().nested_entries;
+            starved_budget
+                .charge(SemanticWork {
+                    nested_entries: nested_limit - 1,
+                    ..SemanticWork::default()
+                })
+                .expect("leave one nested entry of headroom");
+
+            let starved = provider
+                .resolve_call(
+                    &calls[0],
+                    &mut SemanticRequest::new(&mut starved_budget, &cancellation),
+                )
+                .expect("starved dispatch remains typed");
+            let SemanticOutcome::ExceededBudget { exceeded, work, .. } = starved else {
+                panic!("the resolver must exceed the nested-entry budget: {starved:?}");
+            };
+            assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+            assert_eq!(work.source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(starved_budget.used().source_bytes, 0);
+
+            let mut retry_budget = SemanticBudget::default();
+            let retry = provider
+                .resolve_call(
+                    &calls[0],
+                    &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+                )
+                .expect("funded retry reparses the unpaid source");
+            assert!(retry.available_value().is_some(), "{retry:?}");
+            assert_eq!(retry.work().source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(retry_budget.used().source_bytes, BATCH_CALL_SOURCE.len());
+            assert_eq!(cache.dispatch_misses(), 2);
+            assert_eq!(cache.dispatch_hits(), 0);
+        });
+    }
 
     #[test]
     fn cold_and_cached_dispatch_observe_the_same_read() {
@@ -872,6 +960,7 @@ mod tests {
             .expect("fixture call");
         let cache = ValueFlowCache::default();
         let provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+        assert!(!provider.take_retained_writes());
 
         let cold_reads = DispatchReadCollector::default();
         let cold_provider = provider.observing_dispatch_reads(cold_reads.clone());
@@ -883,6 +972,7 @@ mod tests {
             )
             .expect("cold dispatch");
         assert!(cold.available_value().is_some());
+        assert!(provider.take_retained_writes());
 
         let cached_reads = DispatchReadCollector::default();
         let cached_provider = provider.observing_dispatch_reads(cached_reads.clone());
@@ -894,9 +984,24 @@ mod tests {
             )
             .expect("cached dispatch");
 
+        let hit_only_provider = WorkspaceValueFlowProvider::new(&workspace, cache.clone());
+        assert!(!hit_only_provider.take_retained_writes());
+        let mut hit_only_budget = SemanticBudget::default();
+        let hit_only = hit_only_provider
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut hit_only_budget, &cancellation),
+            )
+            .expect("dispatch cached before this provider was created");
+
         assert_eq!(cold.available_value(), cached.available_value());
+        assert_eq!(cold.available_value(), hit_only.available_value());
+        assert!(
+            !hit_only_provider.take_retained_writes(),
+            "cache hits are not retained writes by the current provider"
+        );
         assert_eq!(cache.dispatch_misses(), 1);
-        assert_eq!(cache.dispatch_hits(), 1);
+        assert_eq!(cache.dispatch_hits(), 2);
         assert_eq!(cold_reads.observations(), cached_reads.observations());
         assert_eq!(cold_reads.observations().len(), 1);
     }

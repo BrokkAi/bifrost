@@ -786,6 +786,25 @@ impl FilesystemProject {
         Ok(matcher)
     }
 
+    /// The matcher this project has already built, if it has built one.
+    ///
+    /// A matcher is built from the whole-workspace listing, but only the first
+    /// time: once built it answers from its own rules and never consults the
+    /// listing again. Producing a listing to hand to an already-built matcher
+    /// is therefore pure waste, and on this project it is expensive waste -- a
+    /// directory walk plus a whole-repository `git status` subprocess. That
+    /// cost landed on `is_bifrostignored`, which answers one path per call and
+    /// is called once per path in loops over a whole revision, so a warm
+    /// `--diff-base` policy run spawned one repository-wide `git status` per
+    /// committed blob (#2769).
+    fn cached_bifrost_ignore_matcher(&self) -> Option<Arc<BifrostIgnoreMatcher>> {
+        self.bifrost_ignore
+            .lock()
+            .expect("Bifrost ignore matcher lock poisoned")
+            .as_ref()
+            .map(Arc::clone)
+    }
+
     fn take_initial_listing(&self) -> Option<Arc<BTreeSet<ProjectFile>>> {
         self.initial_listing
             .lock()
@@ -909,11 +928,18 @@ impl Project for FilesystemProject {
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        self.all_files_shared()
-            .and_then(|files| {
-                self.bifrost_ignore_matcher(&files)
-                    .map(|matcher| matcher.is_ignored(&file))
-            })
+        // The listing is taken only to build the matcher, so ask for it only
+        // when there is no matcher yet. `invalidate_cached_file_listing` clears
+        // the matcher and the listing together, so reading the matcher first
+        // can never answer from rules older than the listing would have been.
+        let matcher = match self.cached_bifrost_ignore_matcher() {
+            Some(matcher) => Ok(matcher),
+            None => self
+                .all_files_shared()
+                .and_then(|files| self.bifrost_ignore_matcher(&files)),
+        };
+        matcher
+            .map(|matcher| matcher.is_ignored(&file))
             .unwrap_or(false)
     }
 }
@@ -2313,6 +2339,36 @@ mod tests {
 
         assert!(project.all_files_shared().unwrap().contains(&added));
         assert_eq!(project.workspace_file_listing_count(), 1);
+    }
+
+    /// `is_bifrostignored` answers one path per call and callers ask it per
+    /// path across a whole revision, so its cost must not include a
+    /// whole-workspace listing once the ignore matcher exists. On a
+    /// `FilesystemProject` with no listing cache each listing is a fresh
+    /// directory walk plus a repository-wide `git status` subprocess, which
+    /// made a warm `--diff-base` policy run spawn one `git status` per
+    /// committed blob (#2769).
+    #[test]
+    fn repeated_ignore_questions_take_one_workspace_listing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, ".bifrostignore", "vendor/\n");
+        write_file(&root, "kept.rs", "fn kept() {}\n");
+        write_file(&root, "vendor/skipped.rs", "fn skipped() {}\n");
+        let project = FilesystemProject::new(&root).unwrap();
+
+        // The answers themselves, so a listing count of one cannot be bought
+        // by an is_bifrostignored that stopped consulting .bifrostignore.
+        for _ in 0..8 {
+            assert!(project.is_bifrostignored(Path::new("vendor/skipped.rs")));
+            assert!(!project.is_bifrostignored(Path::new("kept.rs")));
+        }
+
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            1,
+            "the ignore matcher is built from one listing and answers every later question itself"
+        );
     }
 
     #[test]

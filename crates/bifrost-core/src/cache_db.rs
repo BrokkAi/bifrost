@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 47;
+const CURRENT_MIGRATION_VERSION: i64 = 57;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -91,6 +91,26 @@ const PATH_SYMBOL_LOOKUPS_SQL: &str =
     include_str!("../migrations/cache/0046-path-symbol-lookups.sql");
 const CLASS_SET_SUMMARY_OWNER_LOCAL_LOOKUPS_SQL: &str =
     include_str!("../migrations/cache/0047-class-set-summary-owner-local-lookups.sql");
+const SIGNATURE_PARAMETER_TYPE_IDENTITIES_SQL: &str =
+    include_str!("../migrations/cache/0048-signature-parameter-type-identities.sql");
+const SIGNATURE_CALLABLE_OVERRIDE_MODIFIER_SQL: &str =
+    include_str!("../migrations/cache/0049-signature-callable-override-modifier.sql");
+const CLASS_SET_SUMMARY_ENTRY_EVIDENCE_SQL: &str =
+    include_str!("../migrations/cache/0050-class-set-summary-entry-evidence.sql");
+const CLASS_SET_PROCEDURE_SURFACES_SQL: &str =
+    include_str!("../migrations/cache/0051-class-set-procedure-surfaces.sql");
+const CLASS_SET_SURFACE_EXACT_BEHAVIOR_SQL: &str =
+    include_str!("../migrations/cache/0052-class-set-surface-exact-behavior.sql");
+const CLASS_SET_FIELD_SLOT_INDEXES_SQL: &str =
+    include_str!("../migrations/cache/0053-class-set-field-slot-indexes.sql");
+const CLASS_SET_ROOT_RESULTS_SQL: &str =
+    include_str!("../migrations/cache/0054-class-set-root-results.sql");
+const CLASS_SET_OPEN_TYPE_BOUND_SQL: &str =
+    include_str!("../migrations/cache/0055-class-set-open-type-bound.sql");
+const CLASS_SET_SCALAR_RECEIVER_SQL: &str =
+    include_str!("../migrations/cache/0056-class-set-scalar-receiver.sql");
+const STRUCTURAL_FACT_EXTERNAL_NAMES_SQL: &str =
+    include_str!("../migrations/cache/0057-structural-fact-external-names.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -111,7 +131,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 29] = [
+const CACHE_MIGRATIONS: [CacheMigration; 39] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -227,6 +247,46 @@ const CACHE_MIGRATIONS: [CacheMigration; 29] = [
     CacheMigration {
         version: 47,
         sql: CLASS_SET_SUMMARY_OWNER_LOCAL_LOOKUPS_SQL,
+    },
+    CacheMigration {
+        version: 48,
+        sql: SIGNATURE_PARAMETER_TYPE_IDENTITIES_SQL,
+    },
+    CacheMigration {
+        version: 49,
+        sql: SIGNATURE_CALLABLE_OVERRIDE_MODIFIER_SQL,
+    },
+    CacheMigration {
+        version: 50,
+        sql: CLASS_SET_SUMMARY_ENTRY_EVIDENCE_SQL,
+    },
+    CacheMigration {
+        version: 51,
+        sql: CLASS_SET_PROCEDURE_SURFACES_SQL,
+    },
+    CacheMigration {
+        version: 52,
+        sql: CLASS_SET_SURFACE_EXACT_BEHAVIOR_SQL,
+    },
+    CacheMigration {
+        version: 53,
+        sql: CLASS_SET_FIELD_SLOT_INDEXES_SQL,
+    },
+    CacheMigration {
+        version: 54,
+        sql: CLASS_SET_ROOT_RESULTS_SQL,
+    },
+    CacheMigration {
+        version: 55,
+        sql: CLASS_SET_OPEN_TYPE_BOUND_SQL,
+    },
+    CacheMigration {
+        version: 56,
+        sql: CLASS_SET_SCALAR_RECEIVER_SQL,
+    },
+    CacheMigration {
+        version: 57,
+        sql: STRUCTURAL_FACT_EXTERNAL_NAMES_SQL,
     },
 ];
 
@@ -846,21 +906,19 @@ fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", READER_PAGE_CACHE_KIB)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    // No memory-mapped I/O. `mmap_size` is per connection, so a pool of readers
-    // maps the same file once each, and the mapped bytes scale with the host's
-    // core count as well as the DB: measured 2026-08-08, 115-125 mappings of one
-    // 176 MB cache DB held 20.0 GB of mapped address space for a whole query.
-    // mmap's only unique benefit is avoiding a copy out of the OS page cache,
-    // which matters when the DB does not fit the connection's own cache --
-    // exactly the case where the mapping cost is largest.
+    // Keep interactive readers unmapped, with the page-cache budget above.
+    // Mapping can bypass pcache1's global LRU mutex when SQLite is built with
+    // SQLITE_ENABLE_MEMORY_MANAGEMENT (BrokkAi/bifrost#21). Workspace builds
+    // instead undefine that option through LIBSQLITE3_FLAGS in .cargo/config.toml
+    // so each page cache has a private reclamation group. This addresses the
+    // shared mutex without adding mappings or changing mapped-I/O error and
+    // file-truncation behavior. Downstream Rust builds do not inherit our Cargo
+    // configuration and must apply the build flag themselves.
     //
-    // This is a priced trade, not a free win. Isolated on the same cell,
-    // removing the mapping costs about 7% CPU, all of it `sys` (212.2 against
-    // 197.6 CPU-seconds; `sys` 79.6 against 70.1) from read syscalls replacing
-    // mapped loads, and wall clock does not move. It buys 20.0 GB of address
-    // space and 2.3 GB of RSS back, and it removes a ceiling that grows with
-    // both the DB size and the core count (5.55-12.3 GB on the 848 MB rustc
-    // cache, ~30 GB worst case on a 120-CPU host).
+    // Earlier mmap measurements predate the reader pool's concurrency cap and
+    // do not establish the tradeoff for this configuration. Any reevaluation
+    // should measure wall time and contention as well as memory: mappings of
+    // the same file share physical pages, and file-backed RSS is reclaimable.
     conn.pragma_update(None, "mmap_size", 0)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
@@ -1105,7 +1163,7 @@ struct RecognizedForeignStore {
     /// True for exactly this lineage's stores at [`Self::declared_version`].
     recognize: fn(&Connection) -> Result<bool>,
     /// Brings the store to [`Self::equivalent_version`] of this build's chain.
-    bridge_sql: &'static str,
+    bridge_sql: &'static [&'static str],
     /// The version of this build's chain the bridged store then holds.
     equivalent_version: i64,
     /// Named in the log line so an operator can tell which rule fired.
@@ -1125,27 +1183,37 @@ const OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL: &str =
 // definition views, so only the content-addressed reference facts are missing.
 const REVISIONED_WORKSPACE_AT_30_BRIDGE_SQL: &str = REFERENCE_IDENTIFIER_FACTS_SQL;
 
-const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 3] = [
+const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 4] = [
     RecognizedForeignStore {
         declared_version: 18,
         recognize: is_foreign_import_bindings_store,
-        bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
+        bridge_sql: &[OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL],
         equivalent_version: 19,
         lineage: "foreign import-bindings-at-18",
     },
     RecognizedForeignStore {
         declared_version: 30,
         recognize: is_revisioned_workspace_at_30_store,
-        bridge_sql: REVISIONED_WORKSPACE_AT_30_BRIDGE_SQL,
+        bridge_sql: &[REVISIONED_WORKSPACE_AT_30_BRIDGE_SQL],
         equivalent_version: 32,
         lineage: "revisioned-workspace-projections-at-30",
     },
     RecognizedForeignStore {
         declared_version: 30,
         recognize: is_definition_identifier_views_v30_store,
-        bridge_sql: REFERENCE_IDENTIFIER_FACTS_SQL,
+        bridge_sql: &[REFERENCE_IDENTIFIER_FACTS_SQL],
         equivalent_version: 31,
         lineage: "definition-identifier-views-at-30",
+    },
+    RecognizedForeignStore {
+        declared_version: 50,
+        recognize: is_class_set_follow_ons_v50_store,
+        bridge_sql: &[
+            SIGNATURE_PARAMETER_TYPE_IDENTITIES_SQL,
+            SIGNATURE_CALLABLE_OVERRIDE_MODIFIER_SQL,
+        ],
+        equivalent_version: 52,
+        lineage: "class-set-follow-ons-at-48-through-50",
     },
 ];
 
@@ -1179,6 +1247,58 @@ fn is_definition_identifier_views_v30_store(conn: &Connection) -> Result<bool> {
         && view_exists(conn, "live_anchored_definition_identifiers")?)
 }
 
+/// The class-set follow-on branch shipped its three migrations as versions
+/// 48 through 50 before the signature metadata branch merged. The merged
+/// chain assigns those same class-set schemas versions 50 through 52 and uses
+/// 48 and 49 for two additive columns on `unit_signature_metadata`.
+///
+/// Require every table and discriminating column introduced by the displaced
+/// class-set migrations, and require both merged signature columns to be
+/// absent. No schema in this build's own chain has that combination. The
+/// staged upgrade's whole-schema comparison remains the final guard against a
+/// damaged or merely similar store.
+fn is_class_set_follow_ons_v50_store(conn: &Connection) -> Result<bool> {
+    if column_exists(conn, "unit_signature_metadata", "parameter_type_identities")?
+        || column_exists(
+            conn,
+            "unit_signature_metadata",
+            "callable_override_modifier",
+        )?
+    {
+        return Ok(false);
+    }
+    for table in [
+        "unit_signature_metadata",
+        "class_set_summary_dependency_sources",
+        "class_set_procedure_surfaces",
+        "class_set_procedure_surface_calls",
+        "class_set_procedure_surface_bindings",
+        "class_set_procedure_surface_entered",
+        "class_set_procedure_surface_lexical_children",
+        "class_set_procedure_surface_reads",
+    ] {
+        if !table_exists(conn, table)? {
+            return Ok(false);
+        }
+    }
+    Ok(column_exists(
+        conn,
+        "class_set_summary_dependencies",
+        "entry_source_behavior_digest",
+    )? && column_exists(conn, "class_set_summaries", "root_surface_digest")?
+        && column_exists(conn, "class_set_summaries", "direct_calls_digest")?
+        && column_exists(
+            conn,
+            "class_set_procedure_surfaces",
+            "exact_behavior_digest",
+        )?
+        && column_exists(
+            conn,
+            "class_set_procedure_surfaces",
+            "exact_provenance_digest",
+        )?)
+}
+
 /// Give the staged copy a version number that means what this build's
 /// migrations expect it to mean.
 ///
@@ -1198,13 +1318,15 @@ fn adopt_store_schema_version(conn: &mut Connection, source: &Path) -> Result<()
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
-        tx.execute_batch(foreign.bridge_sql).map_err(|err| {
-            format!(
-                "cache DB upgrade error bridging {} from the {} lineage: {err}",
-                source.display(),
-                foreign.lineage
-            )
-        })?;
+        for sql in foreign.bridge_sql {
+            tx.execute_batch(sql).map_err(|err| {
+                format!(
+                    "cache DB upgrade error bridging {} from the {} lineage: {err}",
+                    source.display(),
+                    foreign.lineage
+                )
+            })?;
+        }
         tx.pragma_update(None, "user_version", foreign.equivalent_version)
             .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
         tx.commit()
@@ -4753,6 +4875,837 @@ mod tests {
         assert!(quick_check_is_ok(&conn).unwrap());
     }
 
+    #[test]
+    fn class_set_entry_evidence_migrates_v47_rows_and_enforces_exact_cascades() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(47)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'python', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id, lang,
+               artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count,
+               reached_count, dependency_count, read_count, charge_count, completion,
+               budget_mode, output_digest, content_digest, published_at
+             ) SELECT
+               zeroblob(32), zeroblob(32), 'src/app.py', id, lang,
+               zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32), zeroblob(32),
+               zeroblob(32), zeroblob(32), zeroblob(32), 0, 1, 1, 1, 1, 1, 1,
+               'complete', 'exhaustive', zeroblob(32), zeroblob(32), 0
+             FROM blobs",
+            [],
+        )
+        .unwrap();
+        let old_summary_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_summary_facts
+             VALUES(?1, 0, 'zero', 'none', NULL, NULL, NULL, 0)",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_exits VALUES(?1, 0, 'normal', 0, 1)",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_reached VALUES(?1, 0, 0, 0, 1)",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_dependencies
+             VALUES(?1, 0, zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32))",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_reads(
+               summary_id, read_ordinal, key_digest, kind, family, languages, rel_path,
+               name, index_key, blob_oid, subject, start_byte, end_byte, digest
+             ) VALUES(?1, 0, zeroblob(32), 'models', NULL, NULL, NULL, NULL, NULL,
+                      NULL, NULL, NULL, NULL, zeroblob(32))",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_charges VALUES(?1, 'solver.callback_rows', 1)",
+            [old_summary_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 47).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(50)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 50);
+        for table in [
+            "class_set_summaries",
+            "class_set_summary_facts",
+            "class_set_summary_exits",
+            "class_set_summary_reached",
+            "class_set_summary_dependencies",
+            "class_set_summary_dependency_sources",
+            "class_set_summary_reads",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "v47 dependency evidence must be removed from {table}"
+            );
+        }
+        for column in [
+            "entry_kind",
+            "entry_carrier_key",
+            "entry_uncertain",
+            "entry_source_behavior_digest",
+            "entry_source_count",
+        ] {
+            assert!(
+                column_exists(&conn, "class_set_summary_dependencies", column).unwrap(),
+                "class_set_summary_dependencies.{column}"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id, lang,
+               artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count,
+               reached_count, dependency_count, read_count, charge_count, completion,
+               budget_mode, output_digest, content_digest, published_at
+             ) SELECT
+               randomblob(32), randomblob(32), 'src/app.py', id, lang,
+               randomblob(32), randomblob(32), 1, randomblob(32), randomblob(32), randomblob(32),
+               randomblob(32), randomblob(32), randomblob(32), 0, 1, 1, 0, 1, 0, 1,
+               'complete', 'exhaustive', randomblob(32), randomblob(32), 0
+             FROM blobs",
+            [],
+        )
+        .unwrap();
+        let summary_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_summary_facts
+             VALUES(?1, 0, 'zero', 'none', NULL, NULL, NULL, 0)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_exits VALUES(?1, 0, 'normal', 0, 1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_dependencies
+             VALUES(?1, 0, randomblob(32), randomblob(32), randomblob(32), randomblob(32),
+                    'carrier', randomblob(32), 0, randomblob(32), 2)",
+            [summary_id],
+        )
+        .unwrap();
+        for source_ordinal in 0..2 {
+            conn.execute(
+                "INSERT INTO class_set_summary_dependency_sources
+                 VALUES(?1, 0, ?2, randomblob(32))",
+                rusqlite::params![summary_id, source_ordinal],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO class_set_summary_charges VALUES(?1, 'solver.callback_rows', 1)",
+            [summary_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_summary_dependency_sources
+                 VALUES(?1, 99, 0, randomblob(32))",
+                [summary_id],
+            )
+            .is_err(),
+            "a source witness cannot outlive or bypass its dependency"
+        );
+        validate_foreign_keys(&conn).unwrap();
+
+        conn.execute(
+            "DELETE FROM class_set_summaries WHERE summary_id = ?1",
+            [summary_id],
+        )
+        .unwrap();
+        for table in [
+            "class_set_summary_facts",
+            "class_set_summary_exits",
+            "class_set_summary_dependencies",
+            "class_set_summary_dependency_sources",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "deleting the v50 owner must cascade through {table}"
+            );
+        }
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    #[test]
+    fn class_set_surface_migration_discards_v50_rows_and_enforces_root_certificate() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(50)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation)
+             VALUES('1111111111111111111111111111111111111111','python',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+               carrier_digest,field_slots_digest,entry_fact_ordinal,fact_count,exit_count,
+               reached_count,dependency_count,read_count,charge_count,completion,budget_mode,
+               output_digest,content_digest,published_at)
+             SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,randomblob(32),
+                    randomblob(32),1,randomblob(32),randomblob(32),randomblob(32),
+                    randomblob(32),randomblob(32),randomblob(32),0,1,1,0,0,0,1,
+                    'complete','exhaustive',randomblob(32),randomblob(32),0
+             FROM blobs",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 50).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(51)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 51);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM class_set_summaries", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert!(column_exists(&conn, "class_set_summaries", "root_surface_digest").unwrap());
+        assert!(column_exists(&conn, "class_set_summaries", "direct_calls_digest").unwrap());
+        for table in [
+            "class_set_procedure_surfaces",
+            "class_set_procedure_surface_calls",
+            "class_set_procedure_surface_bindings",
+            "class_set_procedure_surface_entered",
+            "class_set_procedure_surface_lexical_children",
+            "class_set_procedure_surface_reads",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+
+        conn.execute(
+            "INSERT INTO class_set_procedure_surfaces(
+               surface_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               local_structure_digest,behavior_read_digest,carrier_semantics_digest,
+               direct_calls_digest,call_count,binding_count,entered_count,lexical_child_count,read_count,
+               completion,published_at
+             ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                      randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                      randomblob(32),randomblob(32),0,0,0,0,0,'complete',0
+               FROM blobs",
+            [],
+        )
+        .unwrap();
+        let surface_digest = conn
+            .query_row(
+                "SELECT surface_digest FROM class_set_procedure_surfaces",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        let missing_surface = conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+               carrier_digest,field_slots_digest,root_surface_digest,direct_calls_digest,entry_fact_ordinal,
+               fact_count,exit_count,reached_count,dependency_count,read_count,charge_count,
+               completion,budget_mode,output_digest,content_digest,published_at
+             ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                      randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                      randomblob(32),randomblob(32),randomblob(32),randomblob(32),NULL,randomblob(32),
+                      0,1,1,0,0,0,1,'complete','exhaustive',randomblob(32),randomblob(32),0
+               FROM blobs",
+            [],
+        );
+        assert!(
+            missing_surface.is_err(),
+            "a summary cannot omit its root surface"
+        );
+
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+               carrier_digest,field_slots_digest,root_surface_digest,direct_calls_digest,entry_fact_ordinal,
+               fact_count,exit_count,reached_count,dependency_count,read_count,charge_count,
+               completion,budget_mode,output_digest,content_digest,published_at
+             ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                      randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                      randomblob(32),randomblob(32),randomblob(32),randomblob(32),?1,
+                      (SELECT direct_calls_digest FROM class_set_procedure_surfaces LIMIT 1),
+                      0,1,1,0,0,0,1,'complete','exhaustive',randomblob(32),randomblob(32),0
+               FROM blobs",
+            [surface_digest],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap()
+                == 0
+        );
+        conn.execute("DELETE FROM class_set_procedure_surfaces", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM class_set_summaries", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "deleting a certified surface must invalidate its summaries"
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    #[test]
+    fn class_set_exact_behavior_migration_discards_derived_v51_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(51)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation)
+             VALUES('1111111111111111111111111111111111111111','python',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_procedure_surfaces(
+               surface_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               local_structure_digest,behavior_read_digest,carrier_semantics_digest,
+               direct_calls_digest,call_count,binding_count,entered_count,
+               lexical_child_count,read_count,completion,published_at
+             ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                      randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                      randomblob(32),randomblob(32),0,0,0,0,0,'complete',0
+               FROM blobs",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+               carrier_digest,field_slots_digest,root_surface_digest,direct_calls_digest,
+               entry_fact_ordinal,fact_count,exit_count,reached_count,dependency_count,
+               read_count,charge_count,completion,budget_mode,output_digest,content_digest,
+               published_at)
+             SELECT randomblob(32),procedure_lineage,owner_rel_path,owner_blob_id,lang,
+                    artifact_public_identity,artifact_content_identity,schema_version,
+                    randomblob(32),randomblob(32),behavior_read_digest,randomblob(32),
+                    carrier_semantics_digest,randomblob(32),surface_digest,direct_calls_digest,
+                    0,1,1,0,0,0,1,'complete','exhaustive',randomblob(32),randomblob(32),0
+             FROM class_set_procedure_surfaces",
+            [],
+        )
+        .unwrap();
+        let summary_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_summary_facts
+             VALUES(?1,0,'zero','none',NULL,NULL,NULL,0)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_exits VALUES(?1,0,'normal',0,1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_charges VALUES(?1,'solver.callback_rows',1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 51).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(52)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 52);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            1,
+            "the migration must preserve source cache data"
+        );
+        for table in [
+            "class_set_procedure_surfaces",
+            "class_set_summaries",
+            "class_set_summary_facts",
+            "class_set_summary_exits",
+            "class_set_summary_charges",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+                0,
+                "v51 derived rows must be discarded from {table}"
+            );
+        }
+        for column in ["exact_behavior_digest", "exact_provenance_digest"] {
+            assert!(
+                column_exists(&conn, "class_set_procedure_surfaces", column).unwrap(),
+                "missing {column}"
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT \"notnull\" FROM pragma_table_info('class_set_procedure_surfaces')
+                     WHERE name=?1",
+                    [column],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+                "{column} must be required"
+            );
+        }
+        let insert = |exact_behavior: &[u8], exact_provenance: &[u8]| {
+            conn.execute(
+                "INSERT INTO class_set_procedure_surfaces(
+                   surface_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+                   artifact_public_identity,artifact_content_identity,schema_version,
+                   local_structure_digest,behavior_read_digest,carrier_semantics_digest,
+                   direct_calls_digest,call_count,binding_count,entered_count,
+                   lexical_child_count,read_count,completion,published_at,exact_behavior_digest,
+                   exact_provenance_digest
+                 ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                          randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                          randomblob(32),randomblob(32),0,0,0,0,0,'complete',0,?1,?2
+                   FROM blobs",
+                rusqlite::params![exact_behavior, exact_provenance],
+            )
+        };
+        assert!(insert(&[7; 31], &[8; 32]).is_err());
+        assert!(insert(&[7; 32], &[8; 31]).is_err());
+        assert_eq!(insert(&[7; 32], &[8; 32]).unwrap(), 1);
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    #[test]
+    fn class_set_field_slot_migration_builds_strict_normalized_schema_and_cascades() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(52)).unwrap();
+        conn.execute(
+            "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES (?1, 4, X'01')",
+            [seeded_vector_hash("preserved by field-slot migration")],
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "class_set_field_slot_indexes").unwrap());
+
+        migrate_with_sql(&mut conn, &migrations_through(53)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 53);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_vectors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the additive field-slot schema must preserve existing cache rows"
+        );
+        for table in [
+            "class_set_field_slot_indexes",
+            "class_set_field_slot_artifacts",
+            "class_set_field_slots",
+            "class_set_field_slot_atoms",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} must reject SQLite's permissive storage classes"
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list(?1)",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                    >= 1,
+                "{table} must retain its primary or lookup index"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'class_set_field_slot_indexes_recent'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "retention must have a language-and-recency lookup"
+        );
+
+        conn.execute(
+            "INSERT INTO class_set_field_slot_indexes(
+               lang,workspace_content_digest,provider_behavior_digest,active_pack_digest,
+               adapter_semantics_digest,representation_version,content_digest,
+               slot_count,atom_count,artifact_count,payload_text_bytes,completion,published_at
+             ) VALUES('python',zeroblob(32),randomblob(32),randomblob(32),randomblob(32),
+                      1,randomblob(32),2,3,1,44,'complete',17)",
+            [],
+        )
+        .unwrap();
+        let index_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_field_slot_artifacts VALUES(
+               ?1,0,'src/app.py',randomblob(32),100,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)",
+            [index_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slots VALUES(
+               ?1,0,'workspace','decl-1','pkg.App','src/app.py',NULL,'value')",
+            [index_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slots VALUES(
+               ?1,1,'external',NULL,'library.Result',NULL,'symbol-1','item')",
+            [index_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slot_atoms VALUES(
+               ?1,0,0,'workspace','decl-2','pkg.Value','src/value.py',NULL,NULL,
+               'src/app.py',10,1,2,20,1,12,'constructor_call')",
+            [index_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slot_atoms VALUES(
+               ?1,0,1,'unknown',NULL,NULL,NULL,NULL,'ambiguous_field_write',
+               'src/app.py',30,2,0,31,2,1,'unknown')",
+            [index_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slot_atoms VALUES(
+               ?1,1,0,'external',NULL,'library.Item',NULL,'symbol-2',NULL,
+               'src/app.py',40,3,0,45,3,5,'declared_parameter')",
+            [index_id],
+        )
+        .unwrap();
+
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_field_slots VALUES(
+                   ?1,2,'external','decl-invalid','pkg.Invalid',NULL,NULL,'member')",
+                [index_id],
+            )
+            .is_err(),
+            "owner identity columns must match owner_kind"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_field_slot_atoms VALUES(
+                   ?1,0,2,'unknown',NULL,NULL,NULL,NULL,'gap','src/app.py',50,4,0,49,4,0,'unknown')",
+                [index_id],
+            )
+            .is_err(),
+            "source ranges must be ordered"
+        );
+
+        conn.execute(
+            "DELETE FROM class_set_field_slot_indexes WHERE index_id = ?1",
+            [index_id],
+        )
+        .unwrap();
+        for table in [
+            "class_set_field_slot_artifacts",
+            "class_set_field_slots",
+            "class_set_field_slot_atoms",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "deleting an index head must cascade through {table}"
+            );
+        }
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    #[test]
+    fn class_set_root_result_migration_builds_strict_normalized_schema_and_cascades() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(53)).unwrap();
+        conn.execute(
+            "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES (?1, 4, X'01')",
+            [seeded_vector_hash("preserved by root-result migration")],
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "class_set_root_result_generations").unwrap());
+
+        migrate_with_sql(&mut conn, &migrations_through(54)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 54);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_vectors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the additive root-result schema must preserve existing cache rows"
+        );
+        for table in [
+            "class_set_root_result_generations",
+            "class_set_finding_free_root_results",
+            "class_set_finding_free_root_rows",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} must reject SQLite's permissive storage classes"
+            );
+        }
+        for index in [
+            "class_set_root_result_generations_recent",
+            "class_set_finding_free_root_results_owner_blob",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "missing {index}"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation)
+             VALUES('1111111111111111111111111111111111111111','python',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_root_result_generations(
+               lang,workspace_content_digest,provider_behavior_digest,active_pack_digest,
+               field_slots_digest,root_result_semantics_digest,representation_version,published_at)
+             VALUES('python',zeroblob(32),randomblob(32),randomblob(32),randomblob(32),
+                    randomblob(32),1,17)",
+            [],
+        )
+        .unwrap();
+        let generation_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_results(
+               generation_id,root_public_digest,owner_rel_path,owner_blob_id,lang,
+               completion,finding_count,row_count,payload_text_bytes,content_digest,published_at)
+             SELECT ?1,randomblob(32),'src/app.py',id,'python','complete',0,2,74,
+                    randomblob(32),18 FROM blobs WHERE lang='python'",
+            [generation_id],
+        )
+        .unwrap();
+        let result_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,0,'src/app.py',10,1,2,20,1,12,'value','workspace','pkg.Value',NULL,'known')",
+            [result_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,1,'src/app.py',30,2,0,31,2,1,'other','unknown',NULL,
+               'unresolved_call','partial')",
+            [result_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,2,'src/app.py',32,2,2,33,2,3,'open','unknown',NULL,
+                   'open_type_bound','partial')",
+                [result_id],
+            )
+            .is_err(),
+            "schema 54 must reject the reason added by schema 55"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,2,'src/app.py',40,3,0,41,3,1,'bad','unknown','pkg.Bad',NULL,'known')",
+                [result_id],
+            )
+            .is_err(),
+            "atom kind must agree with class and unknown columns"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,2,'src/app.py',40,3,0,39,3,0,'bad','external','pkg.Bad',NULL,'known')",
+                [result_id],
+            )
+            .is_err(),
+            "source spans must be ordered"
+        );
+
+        migrate_with_sql(&mut conn, &migrations_through(55)).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 55);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_rows",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "schema 55 must preserve every schema-54 row"
+        );
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,2,'src/app.py',32,2,2,33,2,3,'open','unknown',NULL,
+               'open_type_bound','partial')",
+            [result_id],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,3,'src/app.py',34,2,4,35,2,5,'scalar','unknown',NULL,
+                   'scalar_receiver','partial')",
+                [result_id],
+            )
+            .is_err(),
+            "schema 55 must reject the reason added by schema 56"
+        );
+
+        migrate_with_sql(&mut conn, &migrations_through(56)).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 56);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_rows",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "schema 56 must preserve every schema-55 row"
+        );
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,3,'src/app.py',34,2,4,35,2,5,'scalar','unknown',NULL,
+               'scalar_receiver','partial')",
+            [result_id],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+
+        conn.execute("DELETE FROM blobs WHERE lang='python'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_results",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "deleting the owner blob must cascade through the result header"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_rows",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "deleting the owner blob must cascade through result rows"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_root_result_generations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "a generation is incrementally populated and does not belong to one root"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
     /// The other schema that briefly shipped as version 30 while the
     /// reference-fact migration was being developed in parallel.
     fn definition_identifier_views_v30_migrations() -> Vec<CacheMigration> {
@@ -4776,6 +5729,129 @@ mod tests {
                 sql: REVISIONED_WORKSPACE_PROJECTIONS_SQL,
             }))
             .collect()
+    }
+
+    /// The class-set follow-on branch applied the schemas now numbered 50
+    /// through 52 directly after version 47, and stamped them 48 through 50.
+    fn class_set_follow_ons_v50_migrations() -> Vec<CacheMigration> {
+        migrations_through(47)
+            .into_iter()
+            .chain([
+                CacheMigration {
+                    version: 48,
+                    sql: CLASS_SET_SUMMARY_ENTRY_EVIDENCE_SQL,
+                },
+                CacheMigration {
+                    version: 49,
+                    sql: CLASS_SET_PROCEDURE_SURFACES_SQL,
+                },
+                CacheMigration {
+                    version: 50,
+                    sql: CLASS_SET_SURFACE_EXACT_BEHAVIOR_SQL,
+                },
+            ])
+            .collect()
+    }
+
+    fn create_class_set_follow_ons_v50_store(path: &Path) {
+        create_store_at(path, &class_set_follow_ons_v50_migrations(), 50);
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid,lang,generation)
+             VALUES('1111111111111111111111111111111111111111','python',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_procedure_surfaces(
+               surface_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               local_structure_digest,behavior_read_digest,carrier_semantics_digest,
+               direct_calls_digest,call_count,binding_count,entered_count,
+               lexical_child_count,read_count,completion,published_at,
+               exact_behavior_digest,exact_provenance_digest
+             ) SELECT randomblob(32),randomblob(32),'src/app.py',id,lang,
+                      randomblob(32),randomblob(32),1,randomblob(32),randomblob(32),
+                      randomblob(32),randomblob(32),0,0,0,0,0,'complete',17,
+                      randomblob(32),randomblob(32)
+               FROM blobs WHERE blob_oid='1111111111111111111111111111111111111111'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summaries(
+               lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+               artifact_public_identity,artifact_content_identity,schema_version,
+               semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+               carrier_digest,field_slots_digest,root_surface_digest,direct_calls_digest,
+               entry_fact_ordinal,fact_count,exit_count,reached_count,dependency_count,
+               read_count,charge_count,completion,budget_mode,output_digest,content_digest,
+               published_at)
+             SELECT randomblob(32),procedure_lineage,owner_rel_path,owner_blob_id,lang,
+                    artifact_public_identity,artifact_content_identity,schema_version,
+                    randomblob(32),randomblob(32),behavior_read_digest,randomblob(32),
+                    carrier_semantics_digest,randomblob(32),surface_digest,direct_calls_digest,
+                    0,1,1,0,0,0,1,'complete','exhaustive',randomblob(32),randomblob(32),19
+             FROM class_set_procedure_surfaces",
+            [],
+        )
+        .unwrap();
+        let summary_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO class_set_summary_facts
+             VALUES(?1,0,'zero','none',NULL,NULL,NULL,0)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_exits VALUES(?1,0,'normal',0,1)",
+            [summary_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO class_set_summary_charges VALUES(?1,'solver.callback_rows',7)",
+            [summary_id],
+        )
+        .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+    }
+
+    type ClassSetFollowOnRows = (
+        Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64)>,
+        Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64)>,
+    );
+
+    fn class_set_follow_on_rows(conn: &Connection) -> ClassSetFollowOnRows {
+        let surfaces = conn
+            .prepare(
+                "SELECT surface_digest,exact_behavior_digest,exact_provenance_digest,published_at
+                 FROM class_set_procedure_surfaces ORDER BY surface_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let summaries = conn
+            .prepare(
+                "SELECT summaries.lookup_digest,summaries.root_surface_digest,
+                        summaries.content_digest,charges.amount
+                 FROM class_set_summaries AS summaries
+                 JOIN class_set_summary_charges AS charges
+                   ON charges.summary_id=summaries.summary_id
+                 ORDER BY summaries.summary_id,charges.charge_kind",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        (surfaces, summaries)
     }
 
     /// Undo what migration 16 did, so a fixture can stand where the
@@ -5100,6 +6176,177 @@ mod tests {
         assert!(quick_check_is_ok(&conn).unwrap());
     }
 
+    /// Migration 0057 keeps ordinary structural rows while allowing a
+    /// source-backed semantic name to belong to an enclosing fact. This is the
+    /// shape Kotlin constructors need: their constructor range starts at the
+    /// constructor syntax, while their normalized name is the class name.
+    #[test]
+    fn v56_structural_rows_upgrade_to_external_name_schema_and_cascade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(56)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'kotlin', 0)",
+            [],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO blob_meta(
+                 blob_id, lang, contains_tests, content_package,
+                 stored_unit_count, range_count, signature_count,
+                 signature_metadata_count, supertype_count, child_count,
+                 import_statement_count, type_identifier_count, is_complete
+             ) VALUES(?1, 'kotlin', 0, 'pkg', 0, 0, 0, 0, 0, 0, 0, 0, 1)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_fact_manifests(
+                 blob_id, facts_version, source_bytes, node_count,
+                 role_count, occurrence_role_count
+             ) VALUES(?1, 21, 20, 2, 1, 1)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_fact_nodes(
+                 blob_id, node_id, kind, start_byte, end_byte,
+                 name_start_byte, name_end_byte, subtree_end
+             ) VALUES(?1, 0, 'class', 0, 5, 0, 5, 2)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_fact_nodes(
+                 blob_id, node_id, kind, start_byte, end_byte,
+                 parent_node_id, name_start_byte, name_end_byte, subtree_end
+             ) VALUES(?1, 1, 'constructor', 6, 20, 0, 6, 10, 2)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_fact_roles(
+                 blob_id, source_node_id, ordinal, role, spread,
+                 target_start_byte, target_end_byte, name_start_byte, name_end_byte
+             ) VALUES(?1, 0, 0, 'callee', 0, 0, 5, 0, 5)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_fact_occurrence_roles(
+                 blob_id, node_id, ordinal, role
+             ) VALUES(?1, 1, 0, 'declaration_name')",
+            [blob],
+        )
+        .unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(57)).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 57);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM structural_fact_nodes WHERE blob_id = ?1",
+                [blob],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "migration 0057 preserves existing structural nodes"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE structural_fact_nodes
+                 SET name_start_byte = -1, name_end_byte = 0
+                 WHERE blob_id = ?1 AND node_id = 1",
+                [blob],
+            )
+            .is_err(),
+            "semantic names remain nonnegative source offsets"
+        );
+        conn.execute(
+            "UPDATE structural_fact_nodes
+             SET name_start_byte = 0, name_end_byte = 5
+             WHERE blob_id = ?1 AND node_id = 1",
+            [blob],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT name_start_byte, name_end_byte
+                 FROM structural_fact_nodes WHERE blob_id = ?1 AND node_id = 1",
+                [blob],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (0, 5),
+            "the node name may precede the constructor match range"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT roles.role, roles.source_node_id, roles.target_node_id,
+                        roles.target_start_byte, roles.target_end_byte,
+                        occurrences.role, occurrences.node_id
+                 FROM structural_fact_roles AS roles
+                 JOIN structural_fact_occurrence_roles AS occurrences
+                   ON occurrences.blob_id = roles.blob_id
+                 WHERE roles.blob_id = ?1",
+                [blob],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (
+                "callee".to_owned(),
+                0,
+                None,
+                0,
+                5,
+                "declaration_name".to_owned(),
+                1,
+            ),
+            "migration 0057 preserves role and occurrence-role identity"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "the migrated schema matches a fresh version-57 cache"
+        );
+        validate_foreign_keys(&conn).unwrap();
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM structural_fact_manifests WHERE blob_id = ?1),
+                    (SELECT COUNT(*) FROM structural_fact_nodes WHERE blob_id = ?1),
+                    (SELECT COUNT(*) FROM structural_fact_roles WHERE blob_id = ?1),
+                    (SELECT COUNT(*) FROM structural_fact_occurrence_roles WHERE blob_id = ?1)",
+                [blob],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (0, 0, 0, 0),
+            "deleting the blob cascades through every external-name structural table"
+        );
+    }
+
     /// Version 28 removes the opaque identity copy without forcing a warm
     /// version-27 analyzer cache to be reparsed. The ordered child rows are
     /// already authoritative in version 27; migration only records their
@@ -5327,6 +6574,120 @@ mod tests {
         assert!(is_foreign_import_bindings_store(&foreign).unwrap());
     }
 
+    /// The class-set follow-on branch's version 50 already has the complete
+    /// procedure-surface schema now numbered 52, including reusable derived
+    /// rows. Only the two additive signature columns are absent. Bridge those
+    /// columns on the staged copy without deleting the warm summary evidence.
+    #[test]
+    fn class_set_follow_ons_v50_store_is_bridged_without_losing_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let foreign = store_path(cache_dir, 50);
+        create_class_set_follow_ons_v50_store(&foreign);
+        let foreign_conn = Connection::open(&foreign).unwrap();
+        assert!(is_class_set_follow_ons_v50_store(&foreign_conn).unwrap());
+        let expected_semantic_rows = semantic_rows(&foreign_conn);
+        let expected_class_set_rows = class_set_follow_on_rows(&foreign_conn);
+        assert_eq!(expected_class_set_rows.0.len(), 1);
+        assert_eq!(expected_class_set_rows.1.len(), 1);
+        drop(foreign_conn);
+        let foreign_before = std::fs::read(&foreign).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(semantic_rows(&conn), expected_semantic_rows);
+        assert_eq!(
+            class_set_follow_on_rows(&conn),
+            expected_class_set_rows,
+            "the additive lineage bridge must preserve reusable class-set evidence byte for byte"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "the bridged store must reproduce the canonical merged schema"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            foreign_before,
+            "the foreign source remains available to its original build"
+        );
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    #[test]
+    fn class_set_follow_ons_v50_bridge_matches_canonical_v52_before_v53() {
+        let temp = tempfile::tempdir().unwrap();
+        let foreign_path = temp.path().join("foreign-class-set-v50.db");
+        create_class_set_follow_ons_v50_store(&foreign_path);
+        let mut foreign = Connection::open(&foreign_path).unwrap();
+        configure_connection(&mut foreign).unwrap();
+        let expected_rows = class_set_follow_on_rows(&foreign);
+
+        adopt_store_schema_version(&mut foreign, &foreign_path).unwrap();
+
+        assert_eq!(cache_migration_version(&foreign).unwrap(), 52);
+        assert!(!table_exists(&foreign, "class_set_field_slot_indexes").unwrap());
+        let mut canonical_v52 = Connection::open_in_memory().unwrap();
+        configure_connection(&mut canonical_v52).unwrap();
+        migrate_with_sql(&mut canonical_v52, &migrations_through(52)).unwrap();
+        assert_eq!(
+            schema_object_definitions(&foreign).unwrap(),
+            schema_object_definitions(&canonical_v52).unwrap(),
+            "the displaced branch must first become the canonical merged v52 schema"
+        );
+
+        migrate_with_sql(&mut foreign, &migrations_through(53)).unwrap();
+
+        assert_eq!(cache_migration_version(&foreign).unwrap(), 53);
+        assert!(table_exists(&foreign, "class_set_field_slot_indexes").unwrap());
+        assert_eq!(
+            class_set_follow_on_rows(&foreign),
+            expected_rows,
+            "the v53 additive migration must preserve bridged class-set evidence"
+        );
+        migrate(&mut foreign).unwrap();
+        assert_eq!(
+            cache_migration_version(&foreign).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(class_set_follow_on_rows(&foreign), expected_rows);
+        assert_eq!(
+            schema_object_definitions(&foreign).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        validate_foreign_keys(&foreign).unwrap();
+        assert!(quick_check_is_ok(&foreign).unwrap());
+    }
+
+    /// Both absent signature columns are part of the foreign-lineage
+    /// fingerprint. This build's own v50 and a hybrid schema with only one
+    /// column absent must continue through the ordinary fail-closed path.
+    #[test]
+    fn class_set_follow_ons_v50_recognizer_rejects_merged_and_hybrid_schemas() {
+        let current_v50 = {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate_with_sql(&mut conn, &migrations_through(50)).unwrap();
+            conn
+        };
+        assert!(!is_class_set_follow_ons_v50_store(&current_v50).unwrap());
+
+        let mut hybrid = Connection::open_in_memory().unwrap();
+        configure_connection(&mut hybrid).unwrap();
+        migrate_with_sql(&mut hybrid, &class_set_follow_ons_v50_migrations()).unwrap();
+        assert!(is_class_set_follow_ons_v50_store(&hybrid).unwrap());
+        hybrid
+            .execute_batch(SIGNATURE_PARAMETER_TYPE_IDENTITIES_SQL)
+            .unwrap();
+        assert!(!is_class_set_follow_ons_v50_store(&hybrid).unwrap());
+    }
+
     /// The revisioned-workspace branch and master both shipped a different
     /// migration 30 before they merged. Preserve a populated cache from the
     /// revisioned branch by recognizing its schema, adding the missing
@@ -5417,7 +6778,7 @@ mod tests {
             // statement must keep tracking whatever the newest migration
             // rewrites; a poison aimed at an older migration would let the
             // upgrade succeed and the test would prove nothing.
-            conn.execute_batch("DROP TABLE unit_signature_metadata;")
+            conn.execute_batch("DROP TABLE class_set_summary_dependencies;")
                 .unwrap();
         }
         let poisoned_before = std::fs::read(&poisoned).unwrap();

@@ -218,6 +218,7 @@ pub(super) fn measure_artifact_work(
                 }
                 SemanticValueKind::Local
                 | SemanticValueKind::Receiver { .. }
+                | SemanticValueKind::DefaultArgument { .. }
                 | SemanticValueKind::Return
                 | SemanticValueKind::Temporary
                 | SemanticValueKind::Address
@@ -721,17 +722,62 @@ fn validate_procedure(
         gap_index.insert(procedure, gap)?;
     }
 
-    let mut parameter_ordinals = HashSet::default();
+    let mut parameter_multiplicities = HashMap::default();
+    let mut default_argument_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
-        if let SemanticValueKind::Parameter { ordinal, .. } = &value.kind
-            && !parameter_ordinals.insert(*ordinal)
-        {
-            return Err(SemanticIrError::procedure(
-                id,
-                SemanticIrErrorKind::CallContract,
-                format!("parameter ordinal {ordinal} is published more than once"),
-            ));
+        match &value.kind {
+            SemanticValueKind::Parameter {
+                ordinal,
+                multiplicity,
+                ..
+            } => {
+                if parameter_multiplicities
+                    .insert(*ordinal, multiplicity.clone())
+                    .is_some()
+                {
+                    return Err(SemanticIrError::procedure(
+                        id,
+                        SemanticIrErrorKind::CallContract,
+                        format!("parameter ordinal {ordinal} is published more than once"),
+                    ));
+                }
+            }
+            SemanticValueKind::DefaultArgument { ordinal }
+                if !default_argument_ordinals.insert(*ordinal) =>
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "default argument value for parameter ordinal {ordinal} is published more than once"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    for ordinal in default_argument_ordinals {
+        match parameter_multiplicities.get(&ordinal) {
+            Some(FormalMultiplicity::One) => {}
+            Some(FormalMultiplicity::Rest(_)) => {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "default argument value for parameter ordinal {ordinal} names a rest formal"
+                    ),
+                ));
+            }
+            None => {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "default argument value for parameter ordinal {ordinal} has no parameter formal"
+                    ),
+                ));
+            }
         }
     }
     if !procedure.values.is_empty() {

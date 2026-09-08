@@ -2,18 +2,20 @@ use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnitType, ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
-    StructuredTypeIdentityBuilder, StructuredTypeName,
+    CodeUnitType, ImportInfo, ParameterMetadata, Range, SignatureMetadata, StructuredImportPath,
+    StructuredImportPathKind, StructuredTypeIdentity, StructuredTypeIdentityBuilder,
+    StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Point, Tree};
 
 use crate::aliases::{
-    PhpFileContext, PhpUseAliases, module_constant_fq, php_file_context_from_tree_at,
-    php_use_aliases_from_node, resolve_php_type_node,
+    PhpFileContext, PhpFileContextIndex, PhpUseAliases, module_constant_fq,
+    php_file_context_from_tree_at, php_use_aliases_from_node, resolve_php_type_node,
 };
 use crate::graph::syntax::{instanceof_type_node, object_creation_type, static_member_parts};
 
@@ -50,15 +52,67 @@ fn php_package_fq(package_name: &str) -> FqName {
 pub fn parse_php_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let package_name = determine_php_package_name(tree.root_node(), source);
     let mut parsed = ParsedFile::new(package_name);
-    let package_name = parsed.package_name.clone();
     let mut visitor = PhpVisitor {
         file,
         source,
         parsed: &mut parsed,
     };
-    visitor.visit_children(tree.root_node(), &PhpScope::new(package_name, None));
+    // The walk starts in the global namespace, which is what PHP has in force
+    // before the file's first `namespace` declaration; every declaration takes
+    // its package from the declaration that governs it rather than from the
+    // file-level qualifier above.
+    visitor.visit_children(tree.root_node(), &PhpScope::new(String::new(), None));
     collect_php_imported_type_names(tree.root_node(), source, &mut parsed.type_identifiers);
+    parsed.imports = collect_php_import_infos(tree.root_node(), source);
     parsed
+}
+
+/// The local names this file's `use` declarations introduce, one row per bound
+/// name.
+///
+/// One row per binding is the shape the store holds (migration 0019) and the
+/// shape the lexical-environment layer joins its import binders from: the
+/// binder span points at the exact token that spells the local name, so an
+/// aliased import and a same-named local stay distinguishable without reading
+/// the snippet. The clauses come from [`PhpFileContextIndex`], which already
+/// visits every `use` declaration with the namespace it is written in, so
+/// nothing here re-walks `namespace_use_declaration`.
+///
+/// PHP has no wildcard import. `use Foo\{A, B}` is a group, which the index
+/// expands into one binding per clause, and `use Foo\Bar` binds exactly the
+/// tail name, so `is_wildcard` is always false.
+fn collect_php_import_infos(root: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    let Some(index) = PhpFileContextIndex::from_tree(root, source, || true) else {
+        return Vec::new();
+    };
+    let mut imports = Vec::new();
+    for declaration in index.use_declarations() {
+        let raw_snippet = source[declaration.start_byte..declaration.end_byte].to_owned();
+        for binding in &declaration.bindings {
+            let imported = binding.segments.last().cloned();
+            let alias = (imported.as_deref() != Some(binding.local.as_str()))
+                .then(|| binding.local.clone());
+            imports.push(ImportInfo {
+                raw_snippet: raw_snippet.clone(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: imported,
+                alias,
+                path: Some(StructuredImportPath {
+                    segments: binding.segments.clone(),
+                    kind: Some(StructuredImportPathKind::Namespace),
+                    lexical_prefixes: Vec::new(),
+                    lexical_scopes: Vec::new(),
+                    declaration_start_byte: declaration.start_byte,
+                }),
+                binder_span: Some(Span {
+                    start_byte: binding.binder_start,
+                    end_byte: binding.binder_end,
+                }),
+            });
+        }
+    }
+    imports
 }
 
 /// The workspace-visible FQ names one PHP file imports.
@@ -100,24 +154,21 @@ fn collect_php_imported_type_names(root: Node<'_>, source: &str, out: &mut HashS
         };
         let mut cursor = scope.walk();
         for child in scope.named_children(&mut cursor) {
-            match child.kind() {
-                "namespace_definition" => {
-                    let name = child
-                        .child_by_field_name("name")
-                        .map(|name_node| php_namespace_package_name(name_node, source))
-                        .unwrap_or_default();
-                    match child.child_by_field_name("body") {
-                        // `namespace N { ... }` is its own scope, with its own
-                        // `use` declarations.
-                        Some(body) => scopes.push((body, name)),
-                        // `namespace N;` replaces the file scope's namespace
-                        // from this statement on, and starts a fresh alias set.
-                        None => {
-                            ctx.namespace = name;
-                            ctx.aliases = PhpUseAliases::default();
-                        }
+            if let Some(declaration) = php_namespace_declaration(child, source) {
+                match declaration.body {
+                    // `namespace N { ... }` is its own scope, with its own
+                    // `use` declarations.
+                    Some(body) => scopes.push((body, declaration.package_name)),
+                    // `namespace N;` replaces the file scope's namespace
+                    // from this statement on, and starts a fresh alias set.
+                    None => {
+                        ctx.namespace = declaration.package_name;
+                        ctx.aliases = PhpUseAliases::default();
                     }
                 }
+                continue;
+            }
+            match child.kind() {
                 "namespace_use_declaration" => {
                     let Some(aliases) = php_use_aliases_from_node(child, source, &mut || true)
                     else {
@@ -238,15 +289,50 @@ enum PhpWork<'tree> {
     Node(PhpNodeWork<'tree>),
 }
 
-fn push_php_child_work<'tree>(node: Node<'tree>, scope: PhpScope, stack: &mut Vec<PhpWork<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
+/// Push one work item per statement `node` holds, each carrying the package
+/// that PHP has in force where that statement is written.
+///
+/// This is the sibling half of [`php_namespace_declaration`]: an unbraced
+/// `namespace N;` has no body, so the statements it governs are its LATER
+/// SIBLINGS, and it keeps governing them until the next `namespace`
+/// declaration or the end of the container. Re-scoping only the
+/// `namespace_definition`'s own children left every statement after a second
+/// `namespace B;` holding the first namespace's package (#3104). A braced
+/// `namespace N { ... }` governs its body and nothing else, so its body is
+/// pushed as a container under the declared package while the running package
+/// for the siblings is untouched.
+///
+/// The running package advances in source order, so the statements are pushed
+/// in source order and the run this call appended is reversed in place: the
+/// LIFO stack then pops them back into source order without a second vector.
+fn push_php_child_work<'tree>(
+    node: Node<'tree>,
+    scope: PhpScope,
+    source: &str,
+    stack: &mut Vec<PhpWork<'tree>>,
+) {
+    let appended_from = stack.len();
+    let mut package_name = scope.package_name;
+    for index in 0..node.named_child_count() {
+        let Some(child) = node.named_child(index) else {
+            continue;
+        };
+        let Some(declaration) = php_namespace_declaration(child, source) else {
             stack.push(PhpWork::Node(PhpNodeWork {
                 node: child,
-                scope: scope.clone(),
+                scope: PhpScope::new(package_name.clone(), scope.class_unit.clone()),
             }));
+            continue;
+        };
+        match declaration.body {
+            Some(body) => stack.push(PhpWork::Container(PhpContainer {
+                node: body,
+                scope: PhpScope::new(declaration.package_name, scope.class_unit.clone()),
+            })),
+            None => package_name = declaration.package_name,
         }
     }
+    stack[appended_from..].reverse();
 }
 
 struct PhpVisitor<'a> {
@@ -264,7 +350,7 @@ impl<'a> PhpVisitor<'a> {
         while let Some(work) = stack.pop() {
             match work {
                 PhpWork::Container(container) => {
-                    push_php_child_work(container.node, container.scope, &mut stack);
+                    push_php_child_work(container.node, container.scope, self.source, &mut stack);
                 }
                 PhpWork::Node(work) => {
                     self.visit_node(work.node, &work.scope, &mut stack);
@@ -280,7 +366,12 @@ impl<'a> PhpVisitor<'a> {
         stack: &mut Vec<PhpWork<'tree>>,
     ) {
         match node.kind() {
-            "namespace_definition" => self.visit_namespace(node, scope, stack),
+            // `push_php_child_work` is the only producer of node work, and it
+            // resolves every `namespace_definition` into the package its
+            // statements carry, so one never reaches the dispatcher.
+            "namespace_definition" => unreachable!(
+                "push_php_child_work consumes every namespace_definition before it is dispatched"
+            ),
             "class_declaration"
             | "interface_declaration"
             | "trait_declaration"
@@ -304,30 +395,6 @@ impl<'a> PhpVisitor<'a> {
                 }))
             }
             _ => {}
-        }
-    }
-
-    fn visit_namespace<'tree>(
-        &mut self,
-        node: Node<'tree>,
-        scope: &PhpScope,
-        stack: &mut Vec<PhpWork<'tree>>,
-    ) {
-        let Some(name_node) = node.child_by_field_name("name") else {
-            return;
-        };
-        let package_name = php_namespace_package_name(name_node, self.source);
-        let scope = PhpScope::new(package_name, scope.class_unit.clone());
-        for index in (0..node.named_child_count()).rev() {
-            let Some(child) = node.named_child(index) else {
-                continue;
-            };
-            if !matches!(child.kind(), "namespace_name" | "name") {
-                stack.push(PhpWork::Node(PhpNodeWork {
-                    node: child,
-                    scope: scope.clone(),
-                }));
-            }
         }
     }
 
@@ -653,17 +720,63 @@ impl<'a> PhpVisitor<'a> {
     }
 }
 
+/// What one `namespace` declaration says, read off the grammar's two fields.
+struct PhpNamespaceDeclaration<'tree> {
+    /// The `.`-joined package the declaration names. `namespace { ... }` and
+    /// the recovery shapes that lose the name both declare the global
+    /// namespace, which is the empty package.
+    package_name: String,
+    /// The `compound_statement` of a braced `namespace N { ... }`. `None` is
+    /// the unbraced `namespace N;`, whose statements are its later siblings.
+    body: Option<Node<'tree>>,
+}
+
+/// Read `node` as a `namespace` declaration, or `None` when it is not one.
+///
+/// This is the single place that decides which of PHP's two namespace forms a
+/// node is and which package it names, so the file-level qualifier, the
+/// declaration walk's scoping and the imported-type walk cannot disagree about
+/// where a namespace starts and stops.
+fn php_namespace_declaration<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<PhpNamespaceDeclaration<'tree>> {
+    if node.kind() != "namespace_definition" {
+        return None;
+    }
+    Some(PhpNamespaceDeclaration {
+        package_name: node
+            .child_by_field_name("name")
+            .map(|name_node| php_namespace_package_name(name_node, source))
+            .unwrap_or_default(),
+        body: node.child_by_field_name("body"),
+    })
+}
+
+/// The one package a file writes for itself, or the empty package when it
+/// writes more than one.
+///
+/// `ParsedFile::package_name` is the file-level qualifier every
+/// namespace-per-file query prefers over the per-declaration answer, so it may
+/// only be non-empty when the whole file agrees on it. Returning the file's
+/// FIRST namespace gave a two-namespace file a qualifier that most of its
+/// declarations do not carry (#3104); an empty qualifier hands the question to
+/// `file_namespace_from_top_level_declarations`, which then answers with the
+/// namespace of the first top-level declaration in source order.
 fn determine_php_package_name(root: Node<'_>, source: &str) -> String {
+    let mut declared: Option<String> = None;
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        if child.kind() != "namespace_definition" {
+        let Some(declaration) = php_namespace_declaration(child, source) else {
             continue;
-        }
-        if let Some(name_node) = child.child_by_field_name("name") {
-            return php_namespace_package_name(name_node, source);
+        };
+        match &declared {
+            Some(existing) if *existing == declaration.package_name => {}
+            Some(_) => return String::new(),
+            None => declared = Some(declaration.package_name),
         }
     }
-    String::new()
+    declared.unwrap_or_default()
 }
 
 /// The `.`-joined package path a `namespace_definition` declares. A leading

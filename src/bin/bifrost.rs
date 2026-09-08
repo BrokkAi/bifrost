@@ -1850,7 +1850,13 @@ fn run_tool(
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let (arguments, overlays) =
         normalize_tool_arguments_for_cli(tool_name, tool_args, &canonical_root)?;
-    let service = create_cli_tool_service(canonical_root, tool_name, tool_sources, overlays)?;
+    let service = create_cli_tool_service(
+        canonical_root,
+        tool_name,
+        &arguments,
+        tool_sources,
+        overlays,
+    )?;
     let service = match diff_snapshot_object_dir {
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
         None => service,

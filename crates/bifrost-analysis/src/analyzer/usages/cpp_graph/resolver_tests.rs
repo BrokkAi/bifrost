@@ -228,10 +228,10 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_conditional_local_include_taints_an_earlier_macro() {
+    fn unresolved_conditional_computed_include_taints_an_earlier_macro() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
-        let source = "#define NUMPRI 5\n#if UNKNOWN_BACKEND\n#include \"missing-backend.c\"\n#endif\nint pending[NUMPRI];\n";
+        let source = "#define NUMPRI 5\n#if UNKNOWN_BACKEND\n#include UNKNOWN_BACKEND_HEADER\n#endif\nint pending[NUMPRI];\n";
         fs::write(root.join("missing-include.c"), source).expect("write include fixture");
         let file = ProjectFile::new(root.clone(), "missing-include.c");
         let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
@@ -257,6 +257,40 @@ mod tests {
             visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source()),
             OrdinaryMacroReferenceResolution::Ambiguous
         ));
+    }
+
+    #[test]
+    fn external_conditional_quoted_include_leaves_an_earlier_macro_exact() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define NUMPRI 5\n#if UNKNOWN_BACKEND\n#include \"missing-backend.c\"\n#endif\nint pending[NUMPRI];\n";
+        fs::write(root.join("external-include.c"), source).expect("write include fixture");
+        let file = ProjectFile::new(root.clone(), "external-include.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let prepared = cpp
+            .prepared_syntax(token, &file)
+            .expect("prepared include source");
+        let reference = source.rfind("NUMPRI").expect("macro reference");
+        let node = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(reference, reference + "NUMPRI".len())
+            .expect("macro reference node");
+
+        let OrdinaryMacroReferenceResolution::Resolved(target) =
+            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source())
+        else {
+            panic!("an external include must leave the earlier definition exact");
+        };
+        assert_eq!(target.signature(), Some("#define NUMPRI 5"));
     }
 
     fn template_parameter(

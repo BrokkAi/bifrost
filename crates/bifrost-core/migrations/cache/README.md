@@ -199,8 +199,8 @@ summary family added by migration 0044. Version 44 admitted only leaf rows and
 therefore stored placeholder dependency and read records that could not prove
 a non-leaf row reusable. The replacement records a caller-visible output
 digest, exact callee lineage/entry/output/lookup evidence, and the analyzer's
-lossless structured read-key vocabulary. Reverse indexes support later
-invalidation without enabling that operational policy yet. No version-44
+lossless structured read-key vocabulary. At version 45, reverse indexes
+supported later invalidation without enabling that operational policy yet. No version-44
 class-set row is carried forward: the family is derived cache data, and
 rebuilding prevents an old row from appearing complete under the stronger
 contract.
@@ -222,3 +222,63 @@ the schema. The one-time `UPDATE` names those three keys once, which a
 migration may do because it describes history, and every row written afterwards
 carries what the adapter said.
 
+Migration `0047-class-set-summary-owner-local-lookups.sql` replaces the v45
+class-set summary family before owner-local lookup identity becomes operational.
+The old lookup folded dependency-sensitive evidence into the address, which
+prevented a parent row from being found and compared after an equal-output child
+revision. Version 47 keys one current row by stable procedure lineage and entry
+selector while retaining exact dependency, read, and output attestations as
+validated mutable content. No v45 row is carried forward: the rows are derived,
+and deleting the complete table family through its existing cascades prevents
+lookup-v1 evidence from appearing current under the stronger replay contract.
+The flow-layer coordinator uses those owner-local heads and reverse indexes to
+recompute demanded parents and to stop propagation when caller-visible output
+is unchanged.
+
+Migration `0050-class-set-summary-entry-evidence.sql` replaces the derived
+class-set summary dependency rows with a complete, invertible entry
+descriptor. Each nonzero child dependency records its carrier, uncertainty,
+source-behavior partition, and the exact set of procedure-local source
+witnesses that consumed it. This lets maintenance reject a stale parent when
+only one of several formerly equivalent sources changes guard behavior, even
+when the consumed child row has already been collected. Version-47 class-set
+rows are discarded because they retained only the irreversible selector.
+
+Migration `0051-class-set-procedure-surfaces.sql` adds a normalized, local
+structural certificate for class-set procedure-summary cuts. Each content-
+addressed surface retains refreshable artifact/blob provenance alongside a
+procedure-local structure key, provider behavior, direct-call contract,
+per-call ordered binding statuses, directed entered targets and coverage,
+lexical children, and complete
+procedure-dispatch read keys. Artifact attachment fields are excluded from the
+semantic surface identity so an unrelated same-file edit can refresh them in
+place without invalidating a reusable procedure. Surface digests remain
+procedure-local so recursive call graphs do not create self-referential keys.
+Class-set summaries now reference their root surface and version-50 rows are
+discarded because they cannot prove that body elision preserves the structural
+plan. An exact-family index bounds pre-plan lookup without scanning historical
+rows.
+
+Migration `0052-class-set-surface-exact-behavior.sql` adds exact provider and
+artifact provenance to those procedure surfaces. Exact-workspace replay uses
+that provenance to reconstruct certified call coverage without re-running
+dispatch; a mismatch retains the live-read replay path. Version-51 derived
+surfaces and their dependent summaries are discarded because they cannot prove
+that the stored call topology came from the current provider behavior.
+
+Migration `0053-class-set-field-slot-indexes.sql` persists complete
+workspace-wide class-set field-slot indexes as normalized slot and atom rows.
+The exact key names the language content, provider behavior, active model set,
+adapter semantics, and representation version; stable declaration IDs and
+source coordinates cross the process boundary while artifact-local dense IDs
+do not. Recorded per-artifact semantic work is replayed before reuse, and
+corrupt or bounded rows fail closed.
+
+Migration `0057-structural-fact-external-names.sql` allows a persisted
+structural node's source-backed semantic name to lie outside the node's match
+range. Kotlin primary and secondary constructors use their enclosing class
+identifier as the constructor name, while their match ranges start at the
+constructor syntax. The name offsets remain nonnegative and ordered in SQL;
+hydration validates source bounds and UTF-8 boundaries. The structural tables
+are recreated to replace the old node-name containment checks while preserving
+all rows and foreign-key cascades.

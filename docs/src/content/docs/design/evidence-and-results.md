@@ -74,8 +74,16 @@ conditions hold:
 2. the intended workspace generation was analyzed;
 3. the capability was supported for every selected input;
 4. execution completed without cancellation or a budget boundary;
-5. result and provenance retention did not truncate the claim; and
-6. the absence statement repeats the actual analysis scope.
+5. every path selector the request named selected files that were searched;
+6. result and provenance retention did not truncate the claim; and
+7. the absence statement repeats the actual analysis scope.
+
+Condition 5 is the selector half of the same rule. A path selector names a
+file, a directory (with or without a trailing separator, selecting every file
+beneath it), or a glob. A selector that names none of those searched nothing,
+so the request covered less of the workspace than it asked for. Bifrost reports
+that selector as written, marks the result incomplete, and reports absence as
+unverified rather than proven.
 
 ## Provenance and source mapping
 

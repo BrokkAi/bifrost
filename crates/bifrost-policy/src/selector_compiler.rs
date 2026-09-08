@@ -2750,6 +2750,7 @@ pub(super) fn selected_site_quality(
         CodeQueryResultValue::ProgramPoint { value } => Some(&value.evidence),
         CodeQueryResultValue::ControlEdge { value } => Some(&value.evidence),
         CodeQueryResultValue::TypestateWitness { value } => Some(&value.quality),
+        CodeQueryResultValue::AbsentMemberWitness { value } => Some(&value.quality),
         CodeQueryResultValue::TaintFinding { value } => Some(&value.evidence),
         _ => None,
     };
@@ -3246,6 +3247,7 @@ pub(super) fn selected_site_quality(
             | CodeQueryResultValue::ProgramPoint { .. }
             | CodeQueryResultValue::ControlEdge { .. }
             | CodeQueryResultValue::TypestateWitness { .. }
+            | CodeQueryResultValue::AbsentMemberWitness { .. }
             | CodeQueryResultValue::TaintFinding { .. } => {
                 unreachable!("semantic result evidence was handled above")
             }

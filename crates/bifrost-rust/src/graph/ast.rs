@@ -196,3 +196,91 @@ pub fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
         }
     }
 }
+
+/// The trait bounds that give a generic type parameter its only type
+/// information, read from the enclosing scopes' `type_parameters` list and
+/// `where_clause`.
+///
+/// `Some(bounds)` when `name` is declared as a type parameter of a scope that
+/// encloses `reference`; the innermost declaration wins, because an inner type
+/// parameter shadows an outer one and any type of the same name. The vector is
+/// empty when that parameter carries no trait bound: nothing at all is known
+/// about a value of this type, which is not the same as knowing it is some
+/// other type. `None` when `name` is not a type parameter here, so it names an
+/// ordinary type and resolves like one.
+///
+/// A returned bound is the bound's own type node (`A`, `a::B`, `A<T>`), with
+/// lifetimes, `?Sized` removals, and the `for<'a>` binder stripped, so each
+/// resolves exactly like any other written type.
+pub fn type_parameter_trait_bounds<'tree>(
+    reference: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Vec<Node<'tree>>> {
+    let mut scope = Some(reference);
+    while let Some(node) = scope {
+        if let Some(parameters) = node.child_by_field_name("type_parameters") {
+            let mut cursor = parameters.walk();
+            let declaration = parameters.named_children(&mut cursor).find(|parameter| {
+                parameter
+                    .child_by_field_name("name")
+                    .and_then(|declared| simple_node_text(declared, source))
+                    .is_some_and(|declared| declared == name)
+            });
+            if let Some(declaration) = declaration {
+                let mut bounds = Vec::new();
+                if let Some(inline) = declaration.child_by_field_name("bounds") {
+                    push_trait_bounds(inline, &mut bounds);
+                }
+                push_where_clause_bounds(node, name, source, &mut bounds);
+                return Some(bounds);
+            }
+        }
+        scope = node.parent();
+    }
+    None
+}
+
+/// The `where S: A + B` bounds `scope` declares for the type parameter `name`.
+fn push_where_clause_bounds<'tree>(
+    scope: Node<'tree>,
+    name: &str,
+    source: &str,
+    bounds: &mut Vec<Node<'tree>>,
+) {
+    let mut scope_cursor = scope.walk();
+    let Some(where_clause) = scope
+        .named_children(&mut scope_cursor)
+        .find(|child| child.kind() == "where_clause")
+    else {
+        return;
+    };
+    let mut cursor = where_clause.walk();
+    for predicate in where_clause.named_children(&mut cursor) {
+        let names_parameter = predicate
+            .child_by_field_name("left")
+            .filter(|left| matches!(left.kind(), "type_identifier" | "identifier"))
+            .and_then(|left| simple_node_text(left, source))
+            .is_some_and(|left| left == name);
+        if names_parameter && let Some(predicate_bounds) = predicate.child_by_field_name("bounds") {
+            push_trait_bounds(predicate_bounds, bounds);
+        }
+    }
+}
+
+/// The type nodes of a `trait_bounds` list, minus everything that bounds a
+/// value without naming a type it has: lifetimes and `?Sized` removals.
+fn push_trait_bounds<'tree>(trait_bounds: Node<'tree>, bounds: &mut Vec<Node<'tree>>) {
+    let mut cursor = trait_bounds.walk();
+    for bound in trait_bounds.named_children(&mut cursor) {
+        match bound.kind() {
+            "lifetime" | "removed_trait_bound" => {}
+            "higher_ranked_trait_bound" => {
+                if let Some(inner) = bound.child_by_field_name("type") {
+                    bounds.push(inner);
+                }
+            }
+            _ => bounds.push(bound),
+        }
+    }
+}

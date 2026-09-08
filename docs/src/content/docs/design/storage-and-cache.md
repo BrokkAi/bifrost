@@ -28,7 +28,7 @@ while selection rules keep the old state out of current answers.
 | --- | --- | --- | --- |
 | Content facts | Content or Git blob identity, language storage key, and analysis generation | Across revisions, processes, and compatible worktrees | Queryable declarations, ranges, imports, hierarchy inputs, and other source-derived facts |
 | Workspace projection | Bound workspace, revision, relative path, and selected language generation | One immutable view of a workspace | Maps live paths to content and prevents facts from another revision or worktree leaking into a request |
-| Derived values | Full dependency key for the value being computed | Memory-resident while useful and within a byte budget | Semantic artifacts, graph projections, evidence indexes, and similar immutable products |
+| Derived values | Full semantic and dependency key for the value being computed | Memory-resident by default; selected exact-evidence summaries can survive across processes | Semantic artifacts, graph projections, evidence indexes, and reusable procedure summaries |
 
 ### Content-addressed relational facts
 
@@ -72,7 +72,11 @@ at the same path.
 
 Per-file semantic artifacts, usage-ranking graphs, structural indexes, resolver
 evidence, and bounded graph projections are expensive or request-specific.
-These immutable values live in byte- or weight-bounded in-memory caches.
+These immutable values normally live in byte- or weight-bounded in-memory
+caches. Complete acyclic class-set procedure summaries are a narrow durable
+exception: the store records their normalized transfer rows, exact child
+dependencies, structured dispatch reads, and replay charges under one current
+procedure-local head.
 
 Publication requires:
 
@@ -86,6 +90,10 @@ Publication requires:
 
 Eviction can require a later rebuild. The rebuilt value follows the same
 publication contract, so its published meaning remains bound to its key.
+For durable class-set summaries, a changed child or dispatch read triggers
+demand-scoped revalidation. Changed output recomputes demanded parents, while
+equal output only rebinds evidence; incomplete, corrupt, cancelled, or
+over-budget reuse falls back to a fresh witness-capable solve.
 
 ## Versions, generations, revisions, and epochs
 
@@ -188,10 +196,12 @@ of a full database sweep.
 
 Opportunistic garbage collection then reclaims unreachable analyzer rows, stale
 language generations, and superseded versioned stores. Reachability is seeded
-from repository references and active worktree state, including current working
-files that no committed revision represents. Collection is best effort and
-throttled. Failure to reclaim space must preserve every live fact set and leave
-incomplete candidates unpublished.
+from repository references, active worktree state, and retained workspace
+revisions, including immutable diff snapshots and current working files that
+no committed revision represents. Retained revision roots are read inside the
+deletion transaction so revisions published during the repository walk remain
+protected. Collection is best effort and throttled. Failure to reclaim space
+must preserve every live fact set and leave incomplete candidates unpublished.
 
 ## Current decisions and trade-offs
 

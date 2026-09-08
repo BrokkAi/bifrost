@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use super::PhpAnalyzer;
 use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, ImportAnalysisProvider, ProjectFile, QueryScope,
+    AnalyzerQueryScope, CodeUnit, CodeUnitIndex, ImportAnalysisProvider, ImportInfo, ProjectFile,
+    QueryScope,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 impl ImportAnalysisProvider for PhpAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
@@ -44,6 +46,15 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         self.imported_code_units
             .insert(file.clone(), Arc::clone(&imported));
         imported
+    }
+
+    /// The `use` declarations the parser recorded for this file, one row per
+    /// bound local name (#2962). This is what the lexical-environment layer
+    /// derives PHP's import binders from; `imported_code_units_of` above stays
+    /// on `type_identifiers`, which additionally covers the names PHP's
+    /// namespace rule binds with no `use` declaration at all (#1713).
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

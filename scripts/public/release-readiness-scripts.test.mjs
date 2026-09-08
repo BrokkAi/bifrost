@@ -677,7 +677,7 @@ test("the ELF verifier rejects binaries without glibc symbol versions", () => {
   });
 });
 
-function muslInstallerRun(dir, architecture) {
+function linuxInstallerRun(dir, architecture, overrides = {}) {
   const fakeBin = path.join(dir, "bin");
   fs.mkdirSync(fakeBin, { recursive: true });
   writeFile(
@@ -691,9 +691,34 @@ case "\${1:-}" in
 esac
 `,
   );
-  writeFile(fakeBin, "ldd", "#!/usr/bin/env bash\nprintf 'musl libc (test)\\n'\n");
-  writeFile(fakeBin, "curl", "#!/usr/bin/env bash\ntouch \"$CURL_MARKER\"\nexit 99\n");
-  for (const command of ["uname", "ldd", "curl"]) {
+  writeFile(fakeBin, "getconf", `#!/usr/bin/env bash
+printf '%s\\n' "$FAKE_GETCONF"
+exit "$FAKE_GETCONF_STATUS"
+`);
+  writeFile(fakeBin, "ldd", `#!/usr/bin/env bash
+printf '%s\\n' "$FAKE_LDD" >&2
+exit "$FAKE_LDD_STATUS"
+`);
+  writeFile(fakeBin, "curl", `#!/usr/bin/env bash
+touch "$CURL_MARKER"
+while [[ "$1" != -o ]]; do shift; done
+if [[ "$3" == *api.github.com* ]]; then
+  printf '{"tag_name":"v0.11.0","assets":[{"browser_download_url":"https://example.test/bifrost-v0.11.0-%s-unknown-linux-gnu.tar.gz"}]}' "$FAKE_ARCH" > "$2"
+else
+  exit 99
+fi
+`);
+  // Override only the loader glob, without relying on or modifying host /lib.
+  const bashEnv = path.join(dir, "bash-env");
+  fs.writeFileSync(bashEnv, `compgen() {
+  if [[ "$1" == -G && "$2" == '/lib/ld-musl-*' ]]; then
+    [[ "$FAKE_MUSL_LOADER" == 1 ]]
+  else
+    builtin compgen "$@"
+  fi
+}
+`);
+  for (const command of ["uname", "getconf", "ldd", "curl"]) {
     fs.chmodSync(path.join(fakeBin, command), 0o755);
   }
   const curlMarker = path.join(dir, "curl-called");
@@ -702,7 +727,16 @@ esac
       PATH: `${fakeBin}:${process.env.PATH}`,
       HOME: dir,
       FAKE_ARCH: architecture,
+      FAKE_GETCONF: "",
+      FAKE_GETCONF_STATUS: "1",
+      FAKE_LDD: "musl libc (test)",
+      FAKE_LDD_STATUS: "1",
+      FAKE_MUSL_LOADER: "0",
+      BASH_ENV: bashEnv,
+      BIFROST_INSTALL_DIR: path.join(dir, "install"),
+      BIFROST_VERSION: "v0.11.0",
       CURL_MARKER: curlMarker,
+      ...overrides,
     },
   });
   return { ...result, curlCalled: fs.existsSync(curlMarker) };
@@ -711,13 +745,45 @@ esac
 test("the installer rejects x86-64 and ARM64 musl before consulting a release", () => {
   for (const architecture of ["x86_64", "aarch64"]) {
     withTempDir((dir) => {
-      const result = muslInstallerRun(dir, architecture);
+      const result = linuxInstallerRun(dir, architecture);
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /no prebuilt musl release is published/u);
       assert.match(result.stderr, /Musl is unsupported/u);
       assert.equal(result.curlCalled, false, "musl rejection must happen before release download");
     });
   }
+});
+
+test("the installer selects GNU assets on glibc hosts with musl also installed", () => {
+  for (const architecture of ["x86_64", "aarch64"]) {
+    for (const probes of [
+      { FAKE_GETCONF: "glibc 2.36", FAKE_GETCONF_STATUS: "0" },
+      { FAKE_LDD: "ldd (Debian GLIBC 2.36-9) 2.36", FAKE_LDD_STATUS: "0" },
+      { FAKE_LDD: "ldd (GNU libc) 2.28", FAKE_LDD_STATUS: "0", FAKE_GETCONF_STATUS: "127" },
+    ]) {
+      withTempDir((dir) => {
+        const result = linuxInstallerRun(dir, architecture, { FAKE_MUSL_LOADER: "1", ...probes });
+        assert.equal(result.status, 99, "fixture stops at the selected archive download");
+        assert.equal(result.curlCalled, true);
+        assert.match(result.stdout, new RegExp(`downloading v0\\.11\\.0 \\(bifrost-v0\\.11\\.0-${architecture}-unknown-linux-gnu\\.tar\\.gz\\)`));
+        assert.doesNotMatch(result.stderr, /Musl is unsupported/u);
+      });
+    }
+  }
+});
+
+test("the installer rejects loader-only musl evidence when libc probes are unavailable", () => {
+  withTempDir((dir) => {
+    const result = linuxInstallerRun(dir, "x86_64", {
+      FAKE_GETCONF_STATUS: "127",
+      FAKE_LDD: "ldd: not found",
+      FAKE_LDD_STATUS: "127",
+      FAKE_MUSL_LOADER: "1",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Musl is unsupported/u);
+    assert.equal(result.curlCalled, false);
+  });
 });
 
 test("a bundle without third-party notices is refused", () => {

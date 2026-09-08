@@ -39,7 +39,9 @@ cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   "${output_dir}" \
   semantic-packs/python/typeshed-stdlib-2026.8.31.json \
-  "${input_dir}/typeshed-stdlib-1620e2254765"
+  "${input_dir}/typeshed-stdlib-1620e2254765" \
+  semantic-packs/python/unittest-assertions-2026.9.7.spec.json \
+  semantic-packs/python/unittest-assertions-2026.9.7.json
 cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
   "${output_dir}"
@@ -69,17 +71,33 @@ catalog_version = int(sys.argv[3])
 catalog_directory = sys.argv[4]
 index = json.loads((output_dir / "index.json").read_text())
 packs = index.get("packs", [])
-if len(packs) != 1:
-    raise SystemExit(f"expected one generated pack in {output_dir}, found {len(packs)}")
-pack = packs[0]
+if len(packs) != 2:
+    raise SystemExit(f"expected two generated packs in {output_dir}, found {len(packs)}")
+pack_by_id = {pack["pack_id"]: pack for pack in packs}
+expected_ids = {"bifrost.python-stdlib", "bifrost.python-stdlib-assertions"}
+if set(pack_by_id) != expected_ids:
+    raise SystemExit(f"generated pack identities differ: {sorted(pack_by_id)}")
+declaration = pack_by_id["bifrost.python-stdlib"]
 receipt = {
     "schema_version": 1,
     "catalog_schema_version": catalog_version,
     "catalog_directory": catalog_directory,
-    "pack_id": pack["pack_id"],
-    "pack_version": pack["pack_version"],
-    "manifest_digest": pack["manifest"]["sha256"],
+    # Keep the original declaration fields for consumers that only understand
+    # the first Python pack, while the complete activation identity lives in
+    # `packs` below.
+    "pack_id": declaration["pack_id"],
+    "pack_version": declaration["pack_version"],
+    "manifest_digest": declaration["manifest"]["sha256"],
     "bundle_path": str(output_dir),
+    "packs": [
+        {
+            "pack_id": pack["pack_id"],
+            "pack_version": pack["pack_version"],
+            "manifest_digest": pack["manifest"]["sha256"],
+            "bundle_path": str(output_dir),
+        }
+        for pack in sorted(packs, key=lambda item: (item["pack_id"], item["pack_version"]))
+    ],
 }
 receipt_path = cache_root / "type-flow-python-pack-activation.json"
 receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")

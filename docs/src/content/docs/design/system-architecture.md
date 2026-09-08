@@ -72,9 +72,11 @@ The adapter and resolver boundary is defined in the
 ### Storage layer
 
 The analyzer store is SQLite-backed. It persists content-addressed, queryable
-facts and projects them through workspace-generation views. A serialized writer
+facts and projects them through workspace-generation views. It also stores the
+complete acyclic class-set dimension of reusable procedure summaries as
+normalized rows with exact dependency and read evidence. A serialized writer
 and bounded reader pool allow writes and snapshot reads to proceed concurrently.
-In-memory caches hold complete immutable derived values within explicit byte
+Other complete immutable derived values remain in memory within explicit byte
 budgets. The storage chapter's
 [analysis storage layers](../storage-and-cache/#analysis-storage-layers) define
 the boundary between those durable, projected, and cached representations.

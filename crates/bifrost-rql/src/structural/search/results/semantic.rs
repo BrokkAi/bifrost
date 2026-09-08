@@ -449,6 +449,50 @@ pub struct CodeQueryAbsentMemberFinding {
     pub witness_steps: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryAbsentMemberWitnessStatus {
+    Available,
+    Truncated,
+    Unavailable,
+}
+
+impl CodeQueryAbsentMemberWitnessStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Truncated => "truncated",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One bounded retained path (or an explicit unavailable marker) for an
+/// absent-member finding. The finding itself remains independently Proven;
+/// `witness_status` describes only this evidence sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryAbsentMemberWitness {
+    pub id: String,
+    pub finding_id: String,
+    pub witness_index: usize,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub quality: CodeQuerySemanticEvidence,
+    pub steps: Vec<CodeQueryFlowWitnessStep>,
+    pub retained_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub omitted_steps_lower_bound: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub alternatives_truncated: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub retention_truncated: bool,
+    pub witness_status: CodeQueryAbsentMemberWitnessStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
 /// One bounded source occurrence contributing to an aggregated taint sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryTaintOrigin {

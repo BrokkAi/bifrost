@@ -141,6 +141,21 @@ impl SegmentKind {
         }
     }
 
+    /// Whether this segment denotes a namespace scope -- a module, package,
+    /// or file/directory step -- rather than a type, a nested scope, or a
+    /// member. `Unknown` is not a namespace claim: it records that the
+    /// spelling made no claim at all.
+    pub const fn denotes_namespace(self) -> bool {
+        match self {
+            SegmentKind::Path | SegmentKind::Package => true,
+            SegmentKind::Type
+            | SegmentKind::Companion
+            | SegmentKind::Nested
+            | SegmentKind::Member
+            | SegmentKind::Unknown => false,
+        }
+    }
+
     /// Stable, human-readable name for the kind. Declaration identities persist
     /// this spelling, while the debug/test `CodeUnit::fq_segments_debug`
     /// cross-check also exposes it without leaking `SegmentKind` into tests.
@@ -206,6 +221,26 @@ impl FqName {
         Some(FqName {
             segments: SmallVec::from_slice(&self.segments[..self.segments.len() - 1]),
         })
+    }
+
+    /// This name's owner prefix when that prefix is pure namespace scope:
+    /// every segment before the final one denotes a module, package, or
+    /// file/directory step, so the declaration is a direct member of that
+    /// namespace and of no type.
+    ///
+    /// `Some` of the empty name for a single-segment name -- a declaration at
+    /// the language's root scope, which the qualified name records by carrying
+    /// no scope segment at all. `None` as soon as an earlier segment denotes a
+    /// type, a nested scope, or a member, because then the declaration hangs
+    /// off that declaration rather than off a namespace.
+    pub fn namespace_prefix(&self) -> Option<FqName> {
+        let prefix = self.parent()?;
+        let interner = segment_interner();
+        prefix
+            .segments
+            .iter()
+            .all(|&id| interner.resolve(id).1.denotes_namespace())
+            .then_some(prefix)
     }
 
     #[allow(dead_code)]
@@ -784,6 +819,52 @@ mod tests {
             name.push(interner.intern(text, kind));
         }
         name
+    }
+
+    /// `namespace_prefix` answers over every segment kind, so a new kind
+    /// cannot silently join the namespace side of the split.
+    #[test]
+    fn namespace_prefix_accepts_only_namespace_scope_before_the_leaf() {
+        let interner = segment_interner();
+        // A root-scope declaration: one segment, so the prefix is empty and
+        // still an answer.
+        assert_eq!(
+            fq(interner, &[("drive", SegmentKind::Member)]).namespace_prefix(),
+            Some(FqName::new())
+        );
+        // A package-scoped free function, and a path-scoped one.
+        for scope in [SegmentKind::Package, SegmentKind::Path] {
+            assert_eq!(
+                fq(interner, &[("app", scope), ("drive", SegmentKind::Member)]).namespace_prefix(),
+                Some(fq(interner, &[("app", scope)])),
+                "{scope:?} places a declaration in a namespace"
+            );
+        }
+        // Everything else before the leaf means the declaration hangs off
+        // another declaration, so there is no namespace answer.
+        for owner in [
+            SegmentKind::Type,
+            SegmentKind::Companion,
+            SegmentKind::Nested,
+            SegmentKind::Member,
+            SegmentKind::Unknown,
+        ] {
+            assert_eq!(
+                fq(
+                    interner,
+                    &[
+                        ("app", SegmentKind::Package),
+                        ("Widget", owner),
+                        ("run", SegmentKind::Member),
+                    ],
+                )
+                .namespace_prefix(),
+                None,
+                "{owner:?} is not a namespace scope"
+            );
+        }
+        // An empty name names nothing at all, not a root scope.
+        assert_eq!(FqName::new().namespace_prefix(), None);
     }
 
     /// The whole point of the pair: whatever `normalize_joined` stores must

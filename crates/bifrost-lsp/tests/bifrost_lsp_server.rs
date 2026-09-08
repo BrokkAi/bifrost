@@ -11244,3 +11244,153 @@ fn bifrost_lsp_server_prepare_rename_returns_kotlin_identifier_range() {
         "prepare result: {response}"
     );
 }
+
+/// The unused-import hint's stable wire identity. A client filters on these.
+const UNUSED_IMPORT_CODE: &str = "unused-import";
+const UNUSED_IMPORT_SOURCE: &str = "bifrost-unused-imports";
+
+/// `DiagnosticTag.Unnecessary` in the LSP wire vocabulary. The enum is
+/// 1-based, and `Unnecessary` is its first member.
+const DIAGNOSTIC_TAG_UNNECESSARY: i64 = 1;
+
+fn unused_import_items(published: &Value) -> Vec<Value> {
+    published["params"]["diagnostics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item["code"] == UNUSED_IMPORT_CODE)
+        .collect()
+}
+
+/// Opening a document with an unused import publishes one `Unnecessary`-tagged
+/// hint on the binder token, and editing the document to use the import clears
+/// it. The tag is what an editor renders as a faded range, which is exactly
+/// what an unused import is (issue #40, Milestone 1).
+#[test]
+fn bifrost_lsp_server_publishes_and_clears_unused_import_hints() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        root.join("named.ts"),
+        "export const alpha = 1;\nexport const beta = 2;\n",
+    )
+    .expect("write named.ts");
+    let app_path = root.join("app.ts");
+    let unused_source = "import { alpha, beta } from './named';\n\nexport function go(): number {\n    return alpha;\n}\n";
+    fs::write(&app_path, unused_source).expect("write app.ts");
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": app_uri,
+                "languageId": "typescript",
+                "version": 1,
+                "text": unused_source,
+            }
+        }),
+    );
+    let published = server.read_publish_diagnostics_for_version(&app_uri, 1);
+    let items = unused_import_items(&published);
+    assert_eq!(
+        items.len(),
+        1,
+        "exactly the unreferenced specifier is reported: {published}"
+    );
+    let item = &items[0];
+    assert_eq!(item["message"], "unused import `beta`", "{item}");
+    assert_eq!(item["source"], UNUSED_IMPORT_SOURCE, "{item}");
+    assert_eq!(
+        item["severity"], 4,
+        "an unused import is a hint, not a warning: {item}"
+    );
+    assert_eq!(
+        item["tags"],
+        json!([DIAGNOSTIC_TAG_UNNECESSARY]),
+        "the LSP tag that greys out the range must be set: {item}"
+    );
+    assert_eq!(
+        item["range"]["start"],
+        json!({"line": 0, "character": 16}),
+        "the hint covers the binder token, not the whole statement: {item}"
+    );
+
+    let fixed_source = "import { alpha, beta } from './named';\n\nexport function go(): number {\n    return alpha + beta;\n}\n";
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": app_uri, "version": 2},
+            "contentChanges": [{"text": fixed_source}],
+        }),
+    );
+    let republished = server.read_publish_diagnostics_for_version(&app_uri, 2);
+    assert!(
+        unused_import_items(&republished).is_empty(),
+        "using the import must clear its hint: {republished}"
+    );
+
+    let documented_source = "import { alpha, beta } from './named';\n/** @type {beta} */\nexport const value = alpha;\n";
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": app_uri, "version": 3},
+            "contentChanges": [{"text": documented_source}],
+        }),
+    );
+    let documented = server.read_publish_diagnostics_for_version(&app_uri, 3);
+    assert!(
+        unused_import_items(&documented).is_empty(),
+        "a documentation-only reference must not publish an unused hint: {documented}"
+    );
+
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": app_uri, "version": 4},
+            "contentChanges": [{"text": unused_source}],
+        }),
+    );
+    let undocumented = server.read_publish_diagnostics_for_version(&app_uri, 4);
+    let items = unused_import_items(&undocumented);
+    assert_eq!(
+        items.len(),
+        1,
+        "removing the doc comment restores the hint: {undocumented}"
+    );
+    assert_eq!(items[0]["message"], "unused import `beta`");
+}
+
+/// A language outside the unused-import support table publishes nothing for
+/// the same shape. Go derives no import binders, so the absence of a use in
+/// its files proves nothing and no hint may be invented (issue #40).
+#[test]
+fn bifrost_lsp_server_publishes_no_unused_import_hint_outside_the_support_table() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").expect("write go.mod");
+    let app_path = root.join("main.go");
+    let source = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n";
+    fs::write(&app_path, source).expect("write main.go");
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": app_uri,
+                "languageId": "go",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let published = server.read_publish_diagnostics_for_version(&app_uri, 1);
+    assert!(
+        unused_import_items(&published).is_empty(),
+        "Go's unused `os` import must not be reported without import binders: {published}"
+    );
+}

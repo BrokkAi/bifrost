@@ -1,10 +1,12 @@
 use crate::graph::CSharpGraphSource;
 use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
 use crate::graph::resolver::{
-    CSharpBuiltinValueArguments, CSharpInitializerOwnerLookups, TargetKind, TargetSpec,
-    UnqualifiedMethodGroupResolution, applicable_member_candidates_for_owner, argument_count,
-    binding_scope_node, class_unit_for_fq_name, collection_target_element_type_node,
-    enclosing_declared_type, extension_visibility_site_key, first_type_child,
+    CSharpBuiltinValueArguments, CSharpCallArgumentOwners, CSharpInitializerOwnerLookups,
+    TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
+    applicable_member_candidates_for_owner, argument_count, binding_scope_node,
+    call_argument_parameter_index, callable_parameter_type_fq_name, class_unit_for_fq_name,
+    collection_target_element_type_node, csharp_invocation_member, enclosing_declared_type,
+    extension_visibility_site_key, filter_call_argument_method_candidates, first_type_child,
     is_type_reference_node, member_declared_collection_element_type_fq_name,
     member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
     normalize_type_text, object_initializer_for_label, object_initializer_owners,
@@ -1355,6 +1357,41 @@ impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
         .collect()
     }
 
+    fn call_argument_owners(&mut self, call: Node<'_>, index: usize) -> CSharpCallArgumentOwners {
+        let candidates = inverse_call_argument_method_candidates(call, self.token, self.ctx);
+        if candidates.len() != 1 {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: candidates,
+            };
+        }
+        let method = &candidates[0];
+        let metadata = self.ctx.csharp.signature_metadata(method);
+        let Some(metadata) = metadata.first() else {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: Vec::new(),
+            };
+        };
+        let Some(parameter_index) =
+            call_argument_parameter_index(call, index, metadata, self.ctx.source)
+        else {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: Vec::new(),
+            };
+        };
+        let owners =
+            callable_parameter_type_fq_name(self.ctx.csharp, self.token, method, parameter_index)
+                .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
+                .into_iter()
+                .collect();
+        CSharpCallArgumentOwners {
+            owners,
+            ambiguous_call_candidates: Vec::new(),
+        }
+    }
+
     fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
         if let Some(type_node) = collection_target_element_type_node(target, self.ctx.source) {
             let reference = reference_type_text(type_node, self.ctx.source);
@@ -1437,6 +1474,131 @@ impl CSharpInitializerOwnerLookups for InverseInitializerOwnerLookups<'_, '_> {
             .into_iter()
             .collect()
     }
+
+    fn member_element_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        member_declared_collection_element_type_fq_name(self.ctx.csharp, self.token, owner, member)
+            .and_then(|fqn| class_unit_for_fq_name(self.ctx.csharp, self.token, &fqn))
+            .into_iter()
+            .collect()
+    }
+}
+
+fn inverse_call_argument_method_candidates(
+    call: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> Vec<CodeUnit> {
+    let Some(function) = call.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let Some(invocation) = csharp_invocation_member(function, ctx.source) else {
+        return Vec::new();
+    };
+    let method_name = node_text(invocation.name.identifier, ctx.source);
+    if method_name.is_empty() {
+        return Vec::new();
+    }
+    let call_arity = argument_count(call, ctx.source);
+    let mut candidates = Vec::new();
+    if let Some(receiver) = invocation.receiver {
+        let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        seed_visible_bindings_at(
+            binding_scope_node(call),
+            call,
+            ctx.csharp,
+            token,
+            ctx.file,
+            ctx.source,
+            &mut bindings,
+        );
+        let types = match receiver_targets_owner(
+            receiver, ctx.graph, ctx.csharp, token, ctx.file, ctx.source, &bindings,
+        ) {
+            SymbolResolution::Precise(types) => types,
+            SymbolResolution::Ambiguous => return Vec::new(),
+            SymbolResolution::Unknown => {
+                // A receiver can name a static type, but a value binding that
+                // shadows its first identifier must suppress that reading.
+                let Some(leftmost) = csharp_type_leftmost_identifier(receiver) else {
+                    return Vec::new();
+                };
+                let name = node_text(leftmost, ctx.source);
+                if member_name_is_locally_bound(name, &bindings)
+                    || unqualified_member_has_structured_shadow(leftmost, ctx.source)
+                    || usage_unqualified_value_member_shadows_type(
+                        leftmost, name, ctx.graph, ctx.csharp, token, ctx.file, ctx.source,
+                    )
+                {
+                    return Vec::new();
+                }
+                resolve_type_fq_name_at(
+                    ctx.csharp,
+                    token,
+                    ctx.file,
+                    &ctx.class_ranges,
+                    &reference_type_text(receiver, ctx.source),
+                    receiver,
+                    ctx.source,
+                )
+                .into_iter()
+                .collect()
+            }
+        };
+        for fqn in types {
+            let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &fqn) else {
+                continue;
+            };
+            let raw = nearest_member_candidates_for_owner(
+                ctx.graph,
+                ctx.csharp,
+                token,
+                &owner,
+                method_name,
+                None,
+            );
+            candidates.extend(filter_call_argument_method_candidates(
+                ctx.csharp,
+                raw,
+                call_arity,
+                invocation.name.explicit_generic_arity,
+            ));
+        }
+    } else {
+        let Some(mut owner) =
+            enclosing_declared_type(call, ctx.csharp, token, ctx.file, ctx.source)
+        else {
+            return Vec::new();
+        };
+        loop {
+            let raw = nearest_member_candidates_for_owner(
+                ctx.graph,
+                ctx.csharp,
+                token,
+                &owner,
+                method_name,
+                None,
+            );
+            if !raw.is_empty() {
+                candidates = filter_call_argument_method_candidates(
+                    ctx.csharp,
+                    raw,
+                    call_arity,
+                    invocation.name.explicit_generic_arity,
+                );
+                break;
+            }
+            let Some(parent) = ctx.csharp.parent_of(&owner) else {
+                break;
+            };
+            if !parent.is_class() {
+                break;
+            }
+            owner = parent;
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 /// Whether `node` is the argument of a `nameof(...)` expression.

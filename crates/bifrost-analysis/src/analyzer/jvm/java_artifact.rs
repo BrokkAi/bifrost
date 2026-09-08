@@ -8,6 +8,7 @@ use crate::analyzer::semantic_model::{
     TypeRef, Visibility, WildcardVariance, carried_source_paths, member_declaration_id,
     read_exact_artifact_while, type_declaration_id,
 };
+use crate::analyzer::tree_walk::named_children_iter;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::declarations::{determine_package_name, node_text, parse_tree};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -842,10 +843,7 @@ fn source_members(
             )
         })
         .flatten();
-    for index in 0..body.named_child_count() {
-        let Some(node) = body.named_child(index) else {
-            continue;
-        };
+    for node in named_children_iter(body) {
         match node.kind() {
             "method_declaration"
             | "constructor_declaration"
@@ -981,10 +979,7 @@ fn source_members(
                     continue;
                 }
                 let modifiers = source_modifiers(node, source);
-                for child_index in 0..node.named_child_count() {
-                    let Some(declarator) = node.named_child(child_index) else {
-                        continue;
-                    };
+                for declarator in named_children_iter(node) {
                     if declarator.kind() != "variable_declarator" {
                         continue;
                     }
@@ -1260,10 +1255,7 @@ fn source_parameters(
         return Some(Vec::new());
     };
     let mut result = Vec::new();
-    for index in 0..parameters.named_child_count() {
-        let Some(parameter) = parameters.named_child(index) else {
-            continue;
-        };
+    for parameter in named_children_iter(parameters) {
         if !matches!(parameter.kind(), "formal_parameter" | "spread_parameter") {
             continue;
         }
@@ -1661,10 +1653,7 @@ impl<'a> SourceTypeResolution<'a> {
     ) -> Self {
         let mut explicit_imports = HashMap::default();
         let mut wildcard_imports = Vec::new();
-        for index in 0..root.named_child_count() {
-            let Some(import) = root.named_child(index) else {
-                continue;
-            };
+        for import in named_children_iter(root) {
             if import.kind() != "import_declaration"
                 || (0..import.child_count())
                     .filter_map(|index| import.child(index))

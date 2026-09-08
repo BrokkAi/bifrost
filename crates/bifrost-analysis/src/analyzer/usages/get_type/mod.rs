@@ -103,6 +103,27 @@ pub struct TypeLookupType {
     pub semantic_model_id: Option<String>,
 }
 
+/// Project one exact semantic-model type record into the compatibility type
+/// lookup domain. The synthetic declaration is only a DTO carrier; callers
+/// must retain `semantic_model_id` and use it for identity-sensitive work.
+pub(crate) fn semantic_model_lookup_type(
+    file: &ProjectFile,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> TypeLookupType {
+    TypeLookupType {
+        fqn: symbol.qualified_name.clone(),
+        definitions: vec![CodeUnit::with_signature(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            "",
+            symbol.qualified_name.clone(),
+            symbol.signature.clone(),
+            true,
+        )],
+        semantic_model_id: Some(symbol.id.clone()),
+    }
+}
+
 pub fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
@@ -120,6 +141,36 @@ fn resolve_type_batch_with_budget(
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request, budget))
         .collect()
+}
+
+/// Resolve a caller-selected structured reference site without applying the
+/// editor selection/token expansion contract. Callers must supply the exact
+/// source and its corresponding parsed tree; this entry point validates those
+/// inputs before entering the same bounded language dispatch as batch lookup.
+pub(crate) fn resolve_type_at_reference_site_with_budget(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+) -> TypeLookupOutcome {
+    if let Err(message) = validate_caller_reference_site(file, source, tree, &site) {
+        return diagnostic_outcome(
+            TypeLookupStatus::InvalidLocation,
+            "invalid_location",
+            message,
+        );
+    }
+    let language = language_for_file(file);
+    let support = AnalyzerDefinitionLookup::new(analyzer, language);
+    finish_bounded_resolution(
+        bounded_type_resolution(
+            analyzer, &support, file, language, source, tree, &site, budget,
+        ),
+        language,
+        site,
+    )
 }
 
 struct TypeBatchContext<'a> {
@@ -193,16 +244,28 @@ fn resolve_one<'a>(
         }
     };
 
-    let Some(resolution) = bounded_type_resolution(
-        analyzer,
-        &context.support,
-        &file,
+    finish_bounded_resolution(
+        bounded_type_resolution(
+            analyzer,
+            &context.support,
+            &file,
+            language,
+            &source,
+            tree.as_ref(),
+            &site,
+            budget,
+        ),
         language,
-        &source,
-        tree.as_ref(),
-        &site,
-        budget,
-    ) else {
+        site,
+    )
+}
+
+fn finish_bounded_resolution(
+    resolution: Option<BoundedResolution<TypeLookupOutcome>>,
+    language: Language,
+    site: ResolvedReferenceSite,
+) -> TypeLookupOutcome {
+    let Some(resolution) = resolution else {
         return finish_lookup_outcome(
             diagnostic_outcome(
                 TypeLookupStatus::UnsupportedLanguage,
@@ -228,6 +291,60 @@ fn resolve_one<'a>(
         }
     };
     finish_lookup_outcome(outcome, site)
+}
+
+fn validate_caller_reference_site(
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> Result<(), String> {
+    if site.path != rel_path_string(file) {
+        return Err("reference path does not match the requested file".to_string());
+    }
+    let range = &site.range;
+    if range.start_byte >= range.end_byte || range.end_byte > source.len() {
+        return Err(format!(
+            "invalid byte range [{}, {}) for {} byte file",
+            range.start_byte,
+            range.end_byte,
+            source.len()
+        ));
+    }
+    if !source.is_char_boundary(range.start_byte) || !source.is_char_boundary(range.end_byte) {
+        return Err(format!(
+            "byte range [{}, {}) does not align to UTF-8 character boundaries",
+            range.start_byte, range.end_byte
+        ));
+    }
+    if site.focus_start_byte >= site.focus_end_byte
+        || site.focus_start_byte < range.start_byte
+        || site.focus_end_byte > range.end_byte
+        || !source.is_char_boundary(site.focus_start_byte)
+        || !source.is_char_boundary(site.focus_end_byte)
+    {
+        return Err("reference focus is empty, invalid, or outside its range".to_string());
+    }
+    if source.get(range.start_byte..range.end_byte) != Some(site.text.as_str()) {
+        return Err("reference text does not match the supplied source range".to_string());
+    }
+    if let Some(tree) = tree {
+        let root = tree.root_node();
+        if root.start_byte() != 0 || root.end_byte() != source.len() {
+            return Err("parsed tree does not cover the supplied source".to_string());
+        }
+        let node = root
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+            .ok_or_else(|| "reference range is not covered by parsed syntax".to_string())?;
+        if node.start_byte() > range.start_byte
+            || node.end_byte() < range.end_byte
+            || node.start_byte() > site.focus_start_byte
+            || node.end_byte() < site.focus_end_byte
+        {
+            return Err("reference range and focus are not covered by one named node".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// One location's type, resolved through the bounded receiver contract, or
@@ -403,6 +520,39 @@ mod tests {
     use super::*;
     use crate::test_support::AnalyzerFixture;
 
+    fn direct_site(
+        fixture: &AnalyzerFixture,
+        language: Language,
+        path: &str,
+        source: &str,
+        expression: &str,
+        focus: &str,
+    ) -> TypeLookupOutcome {
+        let file = ProjectFile::new(fixture.project_root(), path);
+        let tree = parse_tree_for_type_lookup(&file, language, source).expect("fixture parses");
+        let start = source.rfind(expression).expect("expression source");
+        let focus_start = start + expression.find(focus).expect("focus in expression");
+        resolve_type_at_reference_site_with_budget(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            ResolvedReferenceSite {
+                path: path.to_string(),
+                text: expression.to_string(),
+                range: crate::analyzer::Range {
+                    start_byte: start,
+                    end_byte: start + expression.len(),
+                    start_line: 0,
+                    end_line: 0,
+                },
+                focus_start_byte: focus_start,
+                focus_end_byte: focus_start + focus.len(),
+            },
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        )
+    }
+
     const SOURCE: &str = r#"
 namespace Demo;
 public class Product {}
@@ -464,5 +614,115 @@ public class Consumer
         assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
         assert_eq!(outcome.types.len(), 1, "{outcome:#?}");
         assert_eq!(outcome.types[0].fqn, "Demo.Product", "{outcome:#?}");
+    }
+
+    #[test]
+    fn caller_built_whole_expression_site_reaches_php_type_resolution() {
+        let source = concat!(
+            "<?php\nnamespace App;\n",
+            "class Service {}\n",
+            "function make() { return new Service(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("app.php", source)]);
+        let outcome = direct_site(
+            &fixture,
+            Language::Php,
+            "app.php",
+            source,
+            "new Service()",
+            "Service",
+        );
+        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
+        assert_eq!(outcome.types[0].fqn, "App.Service", "{outcome:#?}");
+    }
+
+    #[test]
+    fn caller_built_python_sites_resolve_nested_and_namespace_classes() {
+        let nested = concat!(
+            "class Outer:\n",
+            "    class Inner:\n",
+            "        pass\n",
+            "def make():\n",
+            "    return Outer.Inner()\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(Language::Python, &[("app.py", nested)]);
+        let outcome = direct_site(
+            &fixture,
+            Language::Python,
+            "app.py",
+            nested,
+            "Outer.Inner",
+            "Inner",
+        );
+        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
+        assert_eq!(outcome.types[0].fqn, "app.Outer$Inner", "{outcome:#?}");
+
+        let models = "class Widget:\n    pass\n";
+        let consumer = "import models\ndef make():\n    return models.Widget()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[("models.py", models), ("consumer.py", consumer)],
+        );
+        let outcome = direct_site(
+            &fixture,
+            Language::Python,
+            "consumer.py",
+            consumer,
+            "models.Widget",
+            "Widget",
+        );
+        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
+        assert_eq!(outcome.types[0].fqn, "models.Widget", "{outcome:#?}");
+    }
+
+    #[test]
+    fn namespace_constructor_rebinding_and_invalid_direct_sites_fail_closed() {
+        let models = "class Widget:\n    pass\n";
+        let consumer = concat!(
+            "import models\n",
+            "models = object()\n",
+            "def make():\n",
+            "    return models.Widget()\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[("models.py", models), ("consumer.py", consumer)],
+        );
+        let outcome = direct_site(
+            &fixture,
+            Language::Python,
+            "consumer.py",
+            consumer,
+            "models.Widget",
+            "Widget",
+        );
+        assert_ne!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
+
+        let file = ProjectFile::new(fixture.project_root(), "consumer.py");
+        let start = consumer.rfind("models.Widget").unwrap();
+        let invalid = resolve_type_at_reference_site_with_budget(
+            fixture.analyzer.analyzer(),
+            &file,
+            consumer,
+            None,
+            ResolvedReferenceSite {
+                path: "wrong.py".to_string(),
+                text: "models.Widget".to_string(),
+                range: crate::analyzer::Range {
+                    start_byte: start,
+                    end_byte: start + "models.Widget".len(),
+                    start_line: 0,
+                    end_line: 0,
+                },
+                focus_start_byte: start,
+                focus_end_byte: start + "models".len(),
+            },
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        );
+        assert_eq!(
+            invalid.status,
+            TypeLookupStatus::InvalidLocation,
+            "{invalid:#?}"
+        );
     }
 }

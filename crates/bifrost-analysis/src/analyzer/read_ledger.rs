@@ -16,12 +16,13 @@
 //! Three rules govern the vocabulary:
 //!
 //! * **Mount-free.** Every identity is comparable across two checkouts of the
-//!   same content. Paths are workspace-relative, semantic items are named by
-//!   [`crate::analyzer::semantic::ids::SemanticArtifactKey::public_fingerprint`],
-//!   and no key carries a [`crate::analyzer::ProjectFile`] (which knows its
-//!   root), a `WorkspaceMountId`, or a process-local generation counter. The
-//!   base half of a `--diff-base` run is analyzed at a temporary root, so a
-//!   mount-bearing key could never equal its head counterpart.
+//!   same content. Paths are workspace-relative; whole artifacts use
+//!   [`crate::analyzer::semantic::ids::SemanticArtifactKey::public_fingerprint`]
+//!   and procedure-local questions use stable declaration lineage. No key
+//!   carries a [`crate::analyzer::ProjectFile`] (which knows its root), a
+//!   `WorkspaceMountId`, or a process-local generation counter. The base half
+//!   of a `--diff-base` run is analyzed at a temporary root, so a mount-bearing
+//!   key could never equal its head counterpart.
 //! * **Exactly keyed, or coarse and honest.** A funnel whose answer is keyed by
 //!   an exact name records [`ReadKey::Index`] with that name. A funnel that
 //!   searches the whole name index by prefix, suffix, or pattern cannot be
@@ -140,6 +141,14 @@ pub enum LookupKind {
     Descendants,
     /// The dispatch targets of one call site.
     Dispatch,
+    /// The dispatch targets of one call site addressed relative to its owning
+    /// procedure declaration.
+    ///
+    /// This is distinct from [`Self::Dispatch`], whose source-facing question
+    /// is pinned to one exact semantic artifact and absolute source range.
+    /// Procedure-local products use this funnel so an edit to a different
+    /// declaration in the same file does not change the question.
+    ProcedureDispatch,
     /// One procedure summary, by its mount-free identity.
     ProcedureSummary,
 }
@@ -155,6 +164,7 @@ impl LookupKind {
             Self::ReferenceCandidates => "reference_candidates",
             Self::Descendants => "descendants",
             Self::Dispatch => "dispatch",
+            Self::ProcedureDispatch => "procedure_dispatch",
             Self::ProcedureSummary => "procedure_summary",
         }
     }
@@ -436,6 +446,17 @@ pub enum LookupQuestion {
         artifact: StableDigest,
         site: CallSiteLocator,
     },
+    /// One exact procedure-local call site.
+    ///
+    /// `procedure` is stable declaration lineage. The byte interval is
+    /// relative to the owning procedure's start and is admitted only when it
+    /// selects exactly one structured call row. A preceding sibling may
+    /// therefore move the declaration without changing this question.
+    ProcedureCallSite {
+        rel_path: Box<str>,
+        procedure: StableDigest,
+        site: ProcedureCallSiteLocator,
+    },
     /// One procedure summary, by its mount-free identity.
     Summary { identity: StableDigest },
 }
@@ -443,6 +464,13 @@ pub enum LookupQuestion {
 /// Where in its file one call site sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CallSiteLocator {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// Where one call site sits relative to its owning procedure's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProcedureCallSiteLocator {
     pub start_byte: usize,
     pub end_byte: usize,
 }
@@ -479,6 +507,19 @@ impl LookupQuestion {
         }
     }
 
+    /// The question "what does this procedure-local call site dispatch to?".
+    pub fn procedure_call_site(
+        rel_path: &str,
+        procedure: StableDigest,
+        site: ProcedureCallSiteLocator,
+    ) -> Self {
+        Self::ProcedureCallSite {
+            rel_path: Box::from(rel_path),
+            procedure,
+            site,
+        }
+    }
+
     /// The question "what does the workspace answer about this procedure
     /// summary?".
     ///
@@ -495,6 +536,7 @@ impl LookupQuestion {
             Self::Declaration { .. } => "declaration",
             Self::File { .. } => "file",
             Self::CallSite { .. } => "call_site",
+            Self::ProcedureCallSite { .. } => "procedure_call_site",
             Self::Summary { .. } => "summary",
         }
     }
@@ -504,7 +546,8 @@ impl LookupQuestion {
         match self {
             Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
-            | Self::CallSite { rel_path, .. } => Some(rel_path),
+            | Self::CallSite { rel_path, .. }
+            | Self::ProcedureCallSite { rel_path, .. } => Some(rel_path),
             Self::Summary { .. } => None,
         }
     }
@@ -525,6 +568,16 @@ impl LookupQuestion {
             } => {
                 hasher.field("rel_path", rel_path.as_bytes());
                 hasher.field("artifact", artifact.as_bytes());
+                hasher.field("start_byte", &(site.start_byte as u64).to_be_bytes());
+                hasher.field("end_byte", &(site.end_byte as u64).to_be_bytes());
+            }
+            Self::ProcedureCallSite {
+                rel_path,
+                procedure,
+                site,
+            } => {
+                hasher.field("rel_path", rel_path.as_bytes());
+                hasher.field("procedure", procedure.as_bytes());
                 hasher.field("start_byte", &(site.start_byte as u64).to_be_bytes());
                 hasher.field("end_byte", &(site.end_byte as u64).to_be_bytes());
             }
@@ -838,6 +891,22 @@ mod tests {
                     end_byte: 20,
                 },
             },
+            LookupQuestion::ProcedureCallSite {
+                rel_path: Box::from("src/a.rs"),
+                procedure: StableDigest::sha256("procedure"),
+                site: ProcedureCallSiteLocator {
+                    start_byte: 3,
+                    end_byte: 13,
+                },
+            },
+            LookupQuestion::ProcedureCallSite {
+                rel_path: Box::from("src/a.rs"),
+                procedure: StableDigest::sha256("artifact"),
+                site: ProcedureCallSiteLocator {
+                    start_byte: 0,
+                    end_byte: 0,
+                },
+            },
             LookupQuestion::Summary {
                 identity: StableDigest::sha256("summary"),
             },
@@ -920,6 +989,35 @@ mod tests {
         assert_ne!(
             ReadKey::lookup(LookupKind::Callees, question.clone(), answer).canonical_digest(),
             ReadKey::lookup(LookupKind::Usages, question, answer).canonical_digest(),
+        );
+        let subject = StableDigest::sha256("subject");
+        assert_ne!(
+            ReadKey::lookup(
+                LookupKind::Dispatch,
+                LookupQuestion::CallSite {
+                    rel_path: Box::from("src/a.rs"),
+                    artifact: subject,
+                    site: CallSiteLocator {
+                        start_byte: 10,
+                        end_byte: 20,
+                    },
+                },
+                answer,
+            )
+            .canonical_digest(),
+            ReadKey::lookup(
+                LookupKind::ProcedureDispatch,
+                LookupQuestion::ProcedureCallSite {
+                    rel_path: Box::from("src/a.rs"),
+                    procedure: subject,
+                    site: ProcedureCallSiteLocator {
+                        start_byte: 10,
+                        end_byte: 20,
+                    },
+                },
+                answer,
+            )
+            .canonical_digest(),
         );
     }
 

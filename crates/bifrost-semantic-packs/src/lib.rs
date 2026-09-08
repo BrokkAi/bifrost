@@ -149,6 +149,12 @@ const NODE_CHILD_PROCESS_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_byt
 const NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json"
 )];
+const NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate"
+)];
+const NODE_BUFFER_TYPESCRIPT_DECLARATION_SHARDS: &[&[u8]] = &[include_bytes!(
+    "../embedded/node-buffer-typescript-declarations/shards/declarations.buffer.deflate"
+)];
 const GO_STDLIB_OS_SHARDS: &[&[u8]] = &[include_bytes!(
     "../embedded/go-stdlib-os/shards/go.stdlib.os.result-contracts.deflate"
 )];
@@ -265,6 +271,16 @@ const BIFROST_EMBEDDED_PACK_ENTRIES: &[EmbeddedSemanticPack<'static>] = &[
         "bifrost.node-child-process-typescript-declarations@0.2.0",
         include_bytes!("../embedded/node-child-process-typescript-declarations/manifest.json"),
         NODE_CHILD_PROCESS_TYPESCRIPT_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-buffer-javascript-declarations@0.1.0",
+        include_bytes!("../embedded/node-buffer-javascript-declarations/manifest.json"),
+        NODE_BUFFER_JAVASCRIPT_DECLARATION_SHARDS,
+    ),
+    EmbeddedSemanticPack::new(
+        "bifrost.node-buffer-typescript-declarations@0.1.0",
+        include_bytes!("../embedded/node-buffer-typescript-declarations/manifest.json"),
+        NODE_BUFFER_TYPESCRIPT_DECLARATION_SHARDS,
     ),
     EmbeddedSemanticPack::new(
         "bifrost.go.stdlib.os@1.0.0",

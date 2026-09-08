@@ -504,6 +504,17 @@ impl CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> HeaderLanguageAttribution {
+        self.header_language_attribution_by_file
+            .get_with_by_ref(file, || self.build_header_language_attribution(token, file))
+    }
+
+    /// The evidence walk behind [`Self::header_language_attribution`], run
+    /// once per file for the life of this analyzer.
+    fn build_header_language_attribution(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> HeaderLanguageAttribution {
         let direct_contexts = self.compile_contexts_for(file);
         if !direct_contexts.is_empty() {
             return attribution_from_languages(

@@ -46,6 +46,7 @@ use crate::analyzer::{
 use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
+use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
@@ -55,11 +56,14 @@ use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 pub(crate) use brokk_bifrost_cpp::declarations::CppRecoveredExportClassIndex;
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
-use brokk_bifrost_cpp::graph::extractor::build_source_using_index;
+use brokk_bifrost_cpp::graph::extractor::{
+    build_source_using_index, cpp_member_is_spelled_at_references, cpp_syntax_may_spell_member,
+};
 use brokk_bifrost_cpp::graph::resolver::{
     CppClassDeclarationStrength, OrphanedNamespaceScopeIndex, SourceUsingIndex,
+    is_declaration_name as cpp_is_declaration_name,
 };
-use brokk_bifrost_cpp::graph::syntax::MacroReplacementField;
+use brokk_bifrost_cpp::graph::syntax::ObjectMacroReplacement;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
@@ -144,6 +148,24 @@ pub struct CppAnalyzer {
     /// the two readings of that blob agree, so every question about the C view
     /// is answered from the file's own row-set.
     c_readings_by_file: Cache<ProjectFile, Option<Arc<projection::CppCReading>>>,
+    /// The per-file answer behind [`Self::header_language_attribution`].
+    ///
+    /// The attribution reads only the compile database and the transitive
+    /// reverse translation-unit index, both of which live for this analyzer,
+    /// so the answer is a per-file constant here. It is memoized because the
+    /// C++ inverse scan asks it through `reference_uses_c_semantics` once per
+    /// visited AST node, and each ask normalized the path of the file and of
+    /// every translation unit reaching it: 9.6 percent of the BehaviorTree
+    /// `integer_sequence` query was this one per-file question (#1496).
+    header_language_attribution_by_file: Cache<ProjectFile, HeaderLanguageAttribution>,
+    /// The object-like field-list macro events of one file, in source order.
+    ///
+    /// [`Self::build_macro_composed_fields`] collects these for every file in
+    /// an owner's include closure, so before this memo the same header's AST
+    /// was walked, and each of its macro replacements re-parsed, once per
+    /// owner whose closure reached it: 11.6 percent of the BehaviorTree
+    /// `integer_sequence` query, for 161 distinct files (#1496).
+    object_macro_field_events_by_file: Cache<ProjectFile, Arc<Vec<ObjectMacroFieldEvent>>>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
     /// that produce it are what #1908 stopped repeating per queried fq name.
@@ -298,6 +320,96 @@ impl CppAnalyzer {
         Some(fields)
     }
 
+    fn macro_composed_fields_for_owner_name(
+        &self,
+        owner_name: brokk_bifrost_core::analyzer::RelationalName,
+        owner_query: crate::analyzer::RelationalDefinitionQuery,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Vec<MacroComposedField>, crate::analyzer::RelationalBatchOutcome> {
+        let owner_request = crate::analyzer::RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: crate::analyzer::DefinitionLanguageScope::Language(Language::Cpp),
+            name: owner_name,
+            query: owner_query,
+        };
+        let mut results = match crate::analyzer::RelationalDefinitionLookup::batch(
+            &self.inner,
+            &[owner_request],
+            cancellation,
+        ) {
+            crate::analyzer::RelationalBatchOutcome::Complete(results) => results,
+            outcome => return Err(outcome),
+        };
+        let result = results
+            .pop()
+            .expect("one owner definition request returns one result");
+        let crate::analyzer::RelationalDefinitionValue::Definitions(owners) = result.value else {
+            panic!("an owner definition request returned the wrong relational value shape");
+        };
+        let mut owner_files = owners
+            .into_iter()
+            .filter(|owner| owner.is_class())
+            .map(|owner| owner.source().clone())
+            .collect::<Vec<_>>();
+        owner_files.sort();
+        owner_files.dedup();
+
+        let mut fields = Vec::new();
+        for file in owner_files {
+            if cancellation.is_cancelled() {
+                return Err(crate::analyzer::RelationalBatchOutcome::Cancelled);
+            }
+            fields.extend(self.macro_composed_fields(&file).iter().cloned());
+        }
+        Ok(fields)
+    }
+
+    /// The object-like field-list macro events `file` declares, in source
+    /// order.
+    ///
+    /// Macro events need only the exact source and AST. Indexed syntax also
+    /// hydrates every declaration in this include closure, undoing the
+    /// visibility resolver's target-directed declaration reads, so the read
+    /// stays on `prepared_syntax_limited`. A file whose source cannot be
+    /// prepared declares no events, which is what a caller walking an include
+    /// closure needs from it either way.
+    fn object_macro_field_events(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<Vec<ObjectMacroFieldEvent>> {
+        self.object_macro_field_events_by_file
+            .get_with_by_ref(file, || {
+                let Some((_, prepared)) = self
+                    .inner
+                    .prepared_syntax_limited(token, file, usize::MAX)
+                    .expect("an unbounded syntax read cannot exceed its source limit")
+                else {
+                    return Arc::new(Vec::new());
+                };
+                Arc::new(collect_cpp_object_macro_field_events(
+                    prepared.tree().root_node(),
+                    prepared.source(),
+                ))
+            })
+    }
+
+    fn macro_composed_field_owner_name(
+        request: &crate::analyzer::RelationalDefinitionRequest,
+    ) -> Option<brokk_bifrost_core::analyzer::RelationalName> {
+        let owner_name = match &request.query {
+            crate::analyzer::RelationalDefinitionQuery::ExactName
+            | crate::analyzer::RelationalDefinitionQuery::NormalizedName => request.name.parent(),
+            crate::analyzer::RelationalDefinitionQuery::StructuralChildren
+            | crate::analyzer::RelationalDefinitionQuery::StructuralMembers { .. }
+            | crate::analyzer::RelationalDefinitionQuery::VisibleMembers { .. } => {
+                Some(request.name.clone())
+            }
+            _ => None,
+        }?;
+        (!owner_name.full_name().is_empty()).then_some(owner_name)
+    }
+
     fn build_macro_composed_fields(&self, owner_file: &ProjectFile) -> Vec<MacroComposedField> {
         #[cfg(any(test, feature = "test-support"))]
         self.macro_composed_fields_build_count
@@ -307,7 +419,7 @@ impl CppAnalyzer {
         let include_target_index = self.include_target_index();
         let mut visited = HashSet::default();
         let mut queue = VecDeque::from([owner_file.clone()]);
-        let mut macro_fields = HashMap::<String, Vec<MacroReplacementField>>::default();
+        let mut macro_fields = HashMap::<String, ObjectMacroReplacement>::default();
         let mut blocked = HashSet::default();
         while let Some(file) = queue.pop_front() {
             if self
@@ -333,13 +445,7 @@ impl CppAnalyzer {
             if file == *owner_file {
                 continue;
             }
-            let Some(prepared) = self.prepared_syntax(token, &file) else {
-                continue;
-            };
-            for event in collect_cpp_object_macro_field_events(
-                prepared.tree().root_node(),
-                prepared.source(),
-            ) {
+            for event in self.object_macro_field_events(token, &file).iter() {
                 if self
                     .inner
                     .active_query_cancellation()
@@ -348,22 +454,33 @@ impl CppAnalyzer {
                     return Vec::new();
                 }
                 match event {
-                    ObjectMacroFieldEvent::Define { name, fields, .. } => {
-                        if fields.is_empty() {
-                            macro_fields.remove(&name);
-                            blocked.insert(name);
+                    ObjectMacroFieldEvent::Define {
+                        name, replacement, ..
+                    } => {
+                        if replacement.is_empty() {
+                            macro_fields.remove(name);
+                            blocked.insert(name.clone());
                             continue;
                         }
-                        if blocked.contains(&name) {
+                        if blocked.contains(name) {
                             continue;
                         }
-                        if let Some(previous) = macro_fields.get(&name) {
-                            if previous != &fields {
-                                macro_fields.remove(&name);
-                                blocked.insert(name);
+                        // Mutually exclusive headers in one closure (libuv's
+                        // `uv/unix.h` and `uv/win.h` both define
+                        // `UV_HANDLE_PRIVATE_FIELDS`) leave the members every
+                        // spelling declares identically proven, and the rest
+                        // unproven, instead of losing the name entirely.
+                        let admitted = match macro_fields.get(name) {
+                            Some(previous) if previous != replacement => {
+                                previous.intersect(replacement)
                             }
+                            _ => replacement.clone(),
+                        };
+                        if admitted.is_empty() {
+                            macro_fields.remove(name);
+                            blocked.insert(name.clone());
                         } else {
-                            macro_fields.insert(name, fields);
+                            macro_fields.insert(name.clone(), admitted);
                         }
                     }
                     ObjectMacroFieldEvent::Undef { name, .. } => {
@@ -371,8 +488,8 @@ impl CppAnalyzer {
                         // execution order. Permanently blocking an undefined
                         // name is conservative and prevents a stale donor
                         // definition from crossing an undef.
-                        macro_fields.remove(&name);
-                        blocked.insert(name);
+                        macro_fields.remove(name);
+                        blocked.insert(name.clone());
                     }
                 }
             }
@@ -507,6 +624,14 @@ impl CppAnalyzer {
                 cache::weight_orphaned_namespace_scopes,
             ),
             c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
+            header_language_attribution_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_header_language_attribution,
+            ),
+            object_macro_field_events_by_file: build_weighted_cache(
+                memo_budget / 8,
+                cache::weight_object_macro_field_events,
+            ),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 memo_budget / 8,
                 weight_reconcile_candidates,
@@ -711,6 +836,14 @@ impl CppAnalyzer {
                 cache::weight_orphaned_namespace_scopes,
             ),
             c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
+            header_language_attribution_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_header_language_attribution,
+            ),
+            object_macro_field_events_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                cache::weight_object_macro_field_events,
+            ),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_reconcile_candidates,
@@ -792,8 +925,31 @@ impl CppAnalyzer {
     }
 
     fn relational_definitions_for_rendered_name(&self, fq_name: &str) -> Vec<CodeUnit> {
-        let units =
-            crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Cpp).fqn(fq_name);
+        let name = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+            Language::Cpp,
+            fq_name,
+            crate::analyzer::fq_name::segment_interner(),
+        );
+        if name.is_empty() {
+            return Vec::new();
+        }
+        // Ask the semantic C++ projection first. Exact generated fields are
+        // owner-qualified, so this query scopes their overlay to the owner's
+        // source files. If the rendered identity needs source-spelling or
+        // mounted-name compatibility, only physical declarations can satisfy
+        // it: generated fields have no separate persisted identity to hydrate.
+        // Route that compatibility fallback through the inner analyzer so a
+        // missing rendered name cannot materialize every macro field overlay
+        // in the workspace (#3059).
+        let mut units = self.relational_definition_values(
+            brokk_bifrost_core::analyzer::RelationalName::stable(name),
+            crate::analyzer::RelationalDefinitionQuery::ExactName,
+        );
+        units.retain(|unit| unit.fq_name() == fq_name);
+        if units.is_empty() {
+            units = crate::analyzer::AnalyzerDefinitionLookup::new(&self.inner, Language::Cpp)
+                .fqn(fq_name);
+        }
         let reconciled = self.reconciled_definitions(fq_name);
         let mut candidates = units
             .into_iter()
@@ -827,6 +983,18 @@ impl CppAnalyzer {
             brokk_bifrost_core::analyzer::RelationalName::stable(name),
             crate::analyzer::RelationalDefinitionQuery::Identifier { file: None },
         )
+    }
+
+    /// Whether the persisted declaration index contains a class-like unit with
+    /// this source identifier. Macro-composed overlays only add fields, so a
+    /// caller asking specifically about a possible type must not materialize
+    /// those overlays through the general identifier lookup.
+    #[doc(hidden)]
+    pub fn has_indexed_class_identifier(&self, identifier: &str) -> bool {
+        self.inner
+            .lookup_candidates_by_identifier(identifier)
+            .iter()
+            .any(CodeUnit::is_class)
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -872,6 +1040,51 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(token, file)
+    }
+
+    /// Drop the files whose C++ syntax cannot spell a reference to the member
+    /// named `member`.
+    ///
+    /// Admission evidence only: a file this keeps still has to prove each of
+    /// its sites through the ordinary scan. What it removes is exact -- the
+    /// member scans compare the terminal name of a syntax node against the
+    /// member name before anything else, so a file that never spells it
+    /// produces neither a proven nor an unproven hit
+    /// ([`cpp_syntax_may_spell_member`]).
+    ///
+    /// A file whose syntax cannot be prepared, and every file at all once the
+    /// deadline expires, stays in: the narrowing must never turn a read
+    /// failure or a timeout into a missing candidate.
+    pub(crate) fn files_spelling_member(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        files: HashSet<ProjectFile>,
+        member: &str,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> HashSet<ProjectFile> {
+        // The walks below reach prepared syntax, so this narrowing owns a
+        // request scope; nested inside the caller's it shares that scope's
+        // memoization rather than reparsing (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        files
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter(|file| {
+                if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+                    return true;
+                }
+                match self.prepared_syntax(token, file) {
+                    Some(prepared) => cpp_syntax_may_spell_member(
+                        prepared.tree().root_node(),
+                        prepared.source(),
+                        member,
+                    ),
+                    None => true,
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
@@ -1585,16 +1798,10 @@ impl CodeUnitIndex for CppAnalyzer {
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
-        let mut definitions = self.relational_definitions_for_rendered_name(fq_name);
-        definitions.extend(
-            self.all_macro_composed_fields()
-                .iter()
-                .filter(|field| field.unit.fq_name() == fq_name)
-                .map(|field| field.unit.clone()),
-        );
-        definitions.sort();
-        definitions.dedup();
-        Box::new(definitions.into_iter())
+        Box::new(
+            self.relational_definitions_for_rendered_name(fq_name)
+                .into_iter(),
+        )
     }
 
     fn definitions_by_structured_name(
@@ -1603,19 +1810,10 @@ impl CodeUnitIndex for CppAnalyzer {
         language: Language,
     ) -> Vec<CodeUnit> {
         debug_assert_eq!(language, Language::Cpp);
-        let mut definitions = self.relational_definition_values(
+        self.relational_definition_values(
             brokk_bifrost_core::analyzer::RelationalName::stable(fq_name.clone()),
             crate::analyzer::RelationalDefinitionQuery::ExactName,
-        );
-        definitions.extend(
-            self.all_macro_composed_fields()
-                .iter()
-                .filter(|field| field.unit.fq() == fq_name)
-                .map(|field| field.unit.clone()),
-        );
-        definitions.sort();
-        definitions.dedup();
-        definitions
+        )
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -1867,6 +2065,81 @@ impl IAnalyzer for CppAnalyzer {
         };
         assert_eq!(results.len(), requests.len());
 
+        let mut macro_owner_names = requests
+            .iter()
+            .filter(|request| {
+                !matches!(
+                    request.query,
+                    crate::analyzer::RelationalDefinitionQuery::NormalizedName
+                )
+            })
+            .filter(|request| {
+                matches!(
+                    request.language_scope,
+                    crate::analyzer::DefinitionLanguageScope::Workspace
+                        | crate::analyzer::DefinitionLanguageScope::Language(Language::Cpp)
+                )
+            })
+            .filter_map(Self::macro_composed_field_owner_name)
+            .collect::<Vec<_>>();
+        let mut seen_macro_owner_names = HashSet::default();
+        macro_owner_names.retain(|name| seen_macro_owner_names.insert(name.clone()));
+        let mut macro_owner_files: HashMap<
+            brokk_bifrost_core::analyzer::RelationalName,
+            Vec<ProjectFile>,
+        > = HashMap::default();
+        if !macro_owner_names.is_empty() {
+            let owner_requests = macro_owner_names
+                .iter()
+                .enumerate()
+                .map(
+                    |(ordinal, owner_name)| crate::analyzer::RelationalDefinitionRequest {
+                        ordinal,
+                        language_scope: crate::analyzer::DefinitionLanguageScope::Language(
+                            Language::Cpp,
+                        ),
+                        name: owner_name.clone(),
+                        query: crate::analyzer::RelationalDefinitionQuery::ExactName,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let owner_results = match crate::analyzer::RelationalDefinitionLookup::batch(
+                &self.inner,
+                &owner_requests,
+                cancellation,
+            ) {
+                crate::analyzer::RelationalBatchOutcome::Complete(results) => results,
+                crate::analyzer::RelationalBatchOutcome::Cancelled => {
+                    return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                }
+                crate::analyzer::RelationalBatchOutcome::Failed(error) => {
+                    return crate::analyzer::RelationalBatchOutcome::Failed(error);
+                }
+            };
+            assert_eq!(owner_results.len(), owner_requests.len());
+            for result in owner_results {
+                let owner_name = macro_owner_names
+                    .get(result.ordinal)
+                    .expect("a macro-field owner query returned an unknown ordinal")
+                    .clone();
+                let crate::analyzer::RelationalDefinitionValue::Definitions(owners) = result.value
+                else {
+                    panic!("a macro-field owner query returned the wrong value shape");
+                };
+                let mut owner_files = owners
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .map(|owner| owner.source().clone())
+                    .collect::<Vec<_>>();
+                owner_files.sort();
+                owner_files.dedup();
+                assert!(
+                    macro_owner_files.insert(owner_name, owner_files).is_none(),
+                    "a macro-field owner query returned one ordinal twice"
+                );
+            }
+        }
+
         for (request, result) in requests.iter().zip(&mut results) {
             if cancellation.is_cancelled() {
                 return crate::analyzer::RelationalBatchOutcome::Cancelled;
@@ -1894,31 +2167,17 @@ impl IAnalyzer for CppAnalyzer {
                         .filter(|unit| self.inner.unit_matches_relational_request(unit, request))
                         .collect::<Vec<_>>();
                     units.extend(additions);
-                    let requested_name = request
-                        .name
-                        .full_name()
-                        .display(crate::analyzer::fq_name::segment_interner());
-                    let requested_identifier = request
-                        .name
-                        .full_name()
-                        .last()
-                        .map(|segment| {
-                            crate::analyzer::fq_name::segment_interner()
-                                .resolve(segment)
-                                .0
-                        })
-                        .unwrap_or_default();
                     let macro_fields_can_match = match &request.query {
                         crate::analyzer::RelationalDefinitionQuery::ExactName
-                        | crate::analyzer::RelationalDefinitionQuery::NormalizedName => {
-                            request.name.full_name().segments().len() > 1
-                        }
-                        crate::analyzer::RelationalDefinitionQuery::StructuralChildren
+                        | crate::analyzer::RelationalDefinitionQuery::NormalizedName
+                        | crate::analyzer::RelationalDefinitionQuery::StructuralChildren
                         | crate::analyzer::RelationalDefinitionQuery::StructuralMembers {
                             ..
                         }
-                        | crate::analyzer::RelationalDefinitionQuery::VisibleMembers { .. }
-                        | crate::analyzer::RelationalDefinitionQuery::Identifier { .. }
+                        | crate::analyzer::RelationalDefinitionQuery::VisibleMembers { .. } => {
+                            Self::macro_composed_field_owner_name(request).is_some()
+                        }
+                        crate::analyzer::RelationalDefinitionQuery::Identifier { .. }
                         | crate::analyzer::RelationalDefinitionQuery::IdentifierPrefix { .. } => {
                             true
                         }
@@ -1930,6 +2189,20 @@ impl IAnalyzer for CppAnalyzer {
                         continue;
                     }
                     let macro_composed_fields = match &request.query {
+                        crate::analyzer::RelationalDefinitionQuery::NormalizedName => {
+                            let owner_name = request
+                                .name
+                                .parent()
+                                .expect("a multi-segment normalized name has an owner");
+                            match self.macro_composed_fields_for_owner_name(
+                                owner_name,
+                                crate::analyzer::RelationalDefinitionQuery::NormalizedName,
+                                cancellation,
+                            ) {
+                                Ok(fields) => fields,
+                                Err(outcome) => return outcome,
+                            }
+                        }
                         crate::analyzer::RelationalDefinitionQuery::Identifier {
                             file: Some(file),
                         }
@@ -1940,6 +2213,26 @@ impl IAnalyzer for CppAnalyzer {
                                 return crate::analyzer::RelationalBatchOutcome::Cancelled;
                             }
                             self.macro_composed_fields(file).as_ref().clone()
+                        }
+                        crate::analyzer::RelationalDefinitionQuery::ExactName
+                        | crate::analyzer::RelationalDefinitionQuery::StructuralChildren
+                        | crate::analyzer::RelationalDefinitionQuery::StructuralMembers {
+                            ..
+                        }
+                        | crate::analyzer::RelationalDefinitionQuery::VisibleMembers { .. } => {
+                            let owner_name = Self::macro_composed_field_owner_name(request)
+                                .expect("a macro-field-capable structured query has an owner name");
+                            let owner_files = macro_owner_files
+                                .get(&owner_name)
+                                .expect("every macro-field owner has one batched query result");
+                            let mut fields = Vec::new();
+                            for file in owner_files {
+                                if cancellation.is_cancelled() {
+                                    return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                                }
+                                fields.extend(self.macro_composed_fields(file).iter().cloned());
+                            }
+                            fields
                         }
                         _ => {
                             let Some(fields) = self.all_macro_composed_fields_while(cancellation)
@@ -1952,33 +2245,9 @@ impl IAnalyzer for CppAnalyzer {
                     units.extend(
                         macro_composed_fields
                             .iter()
-                            .filter(|field| match &request.query {
-                                crate::analyzer::RelationalDefinitionQuery::ExactName
-                                | crate::analyzer::RelationalDefinitionQuery::NormalizedName => {
-                                    field.unit.fq_name() == requested_name
-                                }
-                                crate::analyzer::RelationalDefinitionQuery::StructuralChildren => {
-                                    field.owner.fq_name() == requested_name
-                                }
-                                crate::analyzer::RelationalDefinitionQuery::StructuralMembers {
-                                    identifier,
-                                }
-                                | crate::analyzer::RelationalDefinitionQuery::VisibleMembers {
-                                    identifier,
-                                } => {
-                                    field.owner.fq_name() == requested_name
-                                        && field.unit.identifier() == identifier
-                                }
-                                crate::analyzer::RelationalDefinitionQuery::Identifier { file }
-                                | crate::analyzer::RelationalDefinitionQuery::IdentifierPrefix {
-                                    file,
-                                } => {
-                                    field.unit.identifier() == requested_identifier
-                                        && file
-                                            .as_ref()
-                                            .is_none_or(|file| field.unit.source() == file)
-                                }
-                                _ => false,
+                            .filter(|field| {
+                                self.inner
+                                    .unit_matches_relational_request(&field.unit, request)
                             })
                             .map(|field| field.unit.clone()),
                     );
@@ -2083,6 +2352,18 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.claimed_files()
     }
 
+    fn workspace_declarations_with_primary_ranges(
+        &self,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Vec<(CodeUnit, Option<crate::analyzer::Range>)>> {
+        // The usage catalog accepts only classes and callables. Macro-composed
+        // C++ fields are intentionally absent from the old per-file summary
+        // path and would be filtered after paying to rebuild every file's
+        // overlay, so keep this inventory on the persisted inner declarations.
+        self.inner
+            .workspace_declarations_with_primary_ranges(cancellation)
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }
@@ -2183,6 +2464,17 @@ impl IAnalyzer for CppAnalyzer {
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
+    }
+
+    /// C++ spells one callable as a prototype and a separate body, so it
+    /// answers the declaration/definition peer relation (#1650). The pairing
+    /// and the head/body label both live in `identity`, beside the include
+    /// evidence they read.
+    fn declaration_definition_peers(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::structural::DeclarationDefinitionPeers> {
+        Some(identity::cpp_declaration_definition_peers(self, file))
     }
 
     fn structural_fact_providers(
@@ -2363,6 +2655,36 @@ impl TypeAliasProvider for CppAnalyzer {
 
 static CPP_USAGE_STRATEGY: CppUsageGraphStrategy = CppUsageGraphStrategy::new();
 
+/// The member identifier every reference to `target` must spell, when the
+/// C++ scans give that guarantee.
+///
+/// A member call or member-field reference is matched on the terminal name of
+/// a syntax node, so its identifier is written at every site. Nothing else
+/// here is: a type can be reached through an alias declared in a third file,
+/// a constructor site spells whatever name the type is reached by, and an
+/// `operator`, destructor, or conversion function is recorded under a name its
+/// call sites do not write. `None` means no spelling test applies and the
+/// whole include closure stays admitted.
+fn cpp_spelled_member_identifier<'a>(
+    analyzer: &dyn IAnalyzer,
+    target: &'a CodeUnit,
+) -> Option<&'a str> {
+    if !target.is_function() && !target.is_field() {
+        return None;
+    }
+    let owner = analyzer.parent_of(target)?;
+    if !owner.is_class() {
+        return None;
+    }
+    let identifier = crate::analyzer::common::source_identifier_for_target(target);
+    // A constructor carries the owner's own identifier, and its sites spell
+    // the name the type is reached by, which an alias can change.
+    if identifier == owner.identifier() || !cpp_member_is_spelled_at_references(identifier) {
+        return None;
+    }
+    Some(identifier)
+}
+
 pub(crate) struct CppSupport;
 
 impl LanguageSupport for CppSupport {
@@ -2370,9 +2692,14 @@ impl LanguageSupport for CppSupport {
         Language::Cpp
     }
 
-    fn transitive_referencing_files(
+    fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
+        !cpp_focus_is_non_lexical(focus)
+    }
+
+    fn referencing_candidate_files(
         &self,
         analyzer: &dyn IAnalyzer,
+        target: &CodeUnit,
         seed_files: &BTreeSet<ProjectFile>,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<HashSet<ProjectFile>> {
@@ -2391,14 +2718,20 @@ impl LanguageSupport for CppSupport {
                 }
             }
         }
-        Some(reached)
+        let Some(member) = cpp_spelled_member_identifier(analyzer, target) else {
+            return Some(reached);
+        };
+        Some(cpp.files_spelling_member(analyzer, reached, member, cancellation))
     }
 
     fn skips_local_declaration(&self, node: tree_sitter::Node<'_>, source: &str) -> bool {
-        node.kind() == "init_declarator"
-            && node.parent().is_some_and(|declaration| {
+        match node.kind() {
+            "declaration" => is_direct_recovered_exported_class_field_declaration(node, source),
+            "init_declarator" => node.parent().is_some_and(|declaration| {
                 is_direct_recovered_exported_class_field_declaration(declaration, source)
-            })
+            }),
+            _ => false,
+        }
     }
 
     fn package_separator(&self) -> &'static str {
@@ -2474,6 +2807,122 @@ impl LanguageSupport for CppSupport {
     fn highlight_query(&self) -> Option<&'static str> {
         Some(tree_sitter_cpp::HIGHLIGHT_QUERY)
     }
+}
+
+/// Generic lexical lookup is useful for C/C++ parameters and local value
+/// references, but it cannot decide names owned by the C++ declaration/member
+/// namespaces. Leave those structured sites to `get_definition::cpp`, where
+/// receiver identity and declarator roles are available.
+fn cpp_focus_is_non_lexical(focus: tree_sitter::Node<'_>) -> bool {
+    let declaration_name = cpp_is_declaration_name(focus);
+    let mut current = focus;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "field_expression"
+            && parent.child_by_field_name("field") == Some(current)
+        {
+            return true;
+        }
+        if declaration_name {
+            // Parameter names are lexical destinations, including names nested
+            // under pointer, reference, and function declarators. Other
+            // declaration names belong to the structured C++ resolver.
+            match parent.kind() {
+                "parameter_declaration" | "optional_parameter_declaration" => {
+                    return !cpp_parameter_is_callable_binder(parent);
+                }
+                "declaration"
+                | "field_declaration"
+                | "function_definition"
+                | "type_definition"
+                | "alias_declaration"
+                | "template_instantiation"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+                | "namespace_definition"
+                | "namespace_alias_definition"
+                | "enumerator" => return true,
+                _ => {}
+            }
+        }
+        current = parent;
+    }
+    declaration_name
+}
+
+/// A C++ parameter name is lexical only when its parameter list belongs to a
+/// callable declaration, not to a function type nested in a type descriptor or
+/// another declarator. Tree-sitter aliases `function_type_declarator` to
+/// `function_declarator`, so the ownership edge must be checked rather than the
+/// visible node kind alone.
+fn cpp_parameter_is_callable_binder(parameter: tree_sitter::Node<'_>) -> bool {
+    let Some(parameter_list) = parameter.parent() else {
+        return false;
+    };
+    if parameter_list.kind() != "parameter_list" {
+        return false;
+    }
+    let Some(declarator) = parameter_list.parent() else {
+        return false;
+    };
+
+    if declarator.kind() == "abstract_function_declarator" {
+        return declarator.parent().is_some_and(|lambda| {
+            lambda.kind() == "lambda_expression"
+                && lambda.child_by_field_name("declarator") == Some(declarator)
+        });
+    }
+    if declarator.kind() != "function_declarator" {
+        return false;
+    }
+    if cpp_function_declarator_names_function_value(declarator) {
+        return false;
+    }
+    let mut current = declarator;
+    while let Some(owner) = current.parent() {
+        if matches!(
+            owner.kind(),
+            "function_definition" | "declaration" | "field_declaration"
+        ) {
+            return owner.child_by_field_name("declarator") == Some(current);
+        }
+        let owns_current = match owner.kind() {
+            "pointer_declarator" => owner.child_by_field_name("declarator") == Some(current),
+            "reference_declarator" => owner.named_child(0) == Some(current),
+            _ => false,
+        };
+        if !owns_current {
+            return false;
+        }
+        current = owner;
+    }
+    false
+}
+
+/// Parentheses around a pointer-like name make the declaration a function
+/// value (for example, `void (*callback)(int nested)`) rather than a callable
+/// declaration whose parameters introduce lexical bindings.
+fn cpp_function_declarator_names_function_value(declarator: tree_sitter::Node<'_>) -> bool {
+    let Some(name_declarator) = declarator.child_by_field_name("declarator") else {
+        return false;
+    };
+    if name_declarator.kind() != "parenthesized_declarator" {
+        return false;
+    }
+
+    let mut pending = vec![name_declarator];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "pointer_declarator" | "reference_declarator" => return true,
+            "parenthesized_declarator" => {
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 struct CppEdgePass;

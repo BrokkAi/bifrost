@@ -21,11 +21,15 @@ mod solve;
 mod summary;
 
 pub use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
-pub use field_slots::{FieldSlot, FieldSlotIndex};
+pub use field_slots::{
+    FieldSlot, FieldSlotIndex, FieldSlotIndexAcquisitionKind, FieldSlotIndexCache,
+    FieldSlotIndexMissReason, active_semantic_model_pack_digest,
+};
 pub use plan::{MemberAccessSite, ProcedureDispatchReadContract, TypeFlowPlan, TypeFlowPlanError};
 pub use report::{TypeFlowReport, solve_type_flow_workspace};
 pub use solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
-    TypeFlowRootResult, solve_type_flow_for_root,
+    TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
+    solve_type_flow_for_root,
 };
-pub use summary::TypeFlowSummaryState;
+pub use summary::{TypeFlowSummaryProfile, TypeFlowSummaryState};

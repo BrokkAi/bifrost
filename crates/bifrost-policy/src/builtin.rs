@@ -28,6 +28,10 @@ const CODE_SMELLS_POLICY_SOURCES: &[(&str, &str)] = &[
         include_str!("../policy-packs/bifrost.code-smells/policies/unsafe-deserialization.rqlp"),
     ),
     (
+        "policies/python-absent-member.rqlp",
+        include_str!("../policy-packs/bifrost.code-smells/policies/python-absent-member.rqlp"),
+    ),
+    (
         "policies/go-nil-dereference.rqlp",
         include_str!("../policy-packs/bifrost.code-smells/policies/go-nil-dereference.rqlp"),
     ),
@@ -586,7 +590,7 @@ mod tests {
                 .expect("code-smells pack")
                 .policies
                 .len(),
-            16
+            17
         );
         assert_eq!(
             catalog
@@ -604,7 +608,7 @@ mod tests {
                 })
                 .expect("select pack")
                 .len(),
-            16
+            17
         );
         let security = catalog
             .select(&BuiltInPolicySelection {
@@ -659,7 +663,7 @@ mod tests {
                 .all(|id| id.starts_with("bifrost.correctness.")),
             "{selected:?}"
         );
-        assert_eq!(selected.len(), 6, "{selected:?}");
+        assert_eq!(selected.len(), 7, "{selected:?}");
         // The security pack's only policy is in category `security`, so the
         // category dimension alone never reaches it from this request.
         assert!(

@@ -6,7 +6,7 @@
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
 use brokk_bifrost_cpp::graph::resolver::{
-    guard_requirements_hold_at_reference, preprocessor_guard_environment,
+    declaration_declarator, guard_requirements_hold_at_reference, preprocessor_guard_environment,
 };
 use tree_sitter::Node;
 
@@ -16,6 +16,9 @@ use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexicalDefinition {
+    /// The defining file for a macro binding whose expansion can occur elsewhere.
+    /// Ordinary lexical definitions use the reference file.
+    pub source_file: Option<super::ProjectFile>,
     pub identifier: String,
     pub kind: DeclarationKind,
     pub name_range: Range,
@@ -370,7 +373,138 @@ pub(crate) fn resolve_lexical_binding(
     }
 
     let focus = smallest_named_node(root, focus_start, focus_end)?;
+    if language == Language::Cpp
+        && let Some(definition) = c_label_binding(focus, source, identifier)
+    {
+        return Some(LexicalBindingResolution::OtherLocal(definition));
+    }
     resolve_lexical_binding_from_focus(language, focus, source, focus_start, identifier)
+}
+
+/// Resolve a C statement label from the label/goto grammar nodes that own it.
+///
+/// C labels have function scope, unlike ordinary block-local declarations. The
+/// enclosing `function_definition` is therefore the ownership boundary used
+/// for both the goto and its declaration. The declaration remains out of the
+/// persisted `CodeUnit` graph; it is a query-local lexical destination, like a
+/// parameter or local variable.
+fn c_label_binding(focus: Node<'_>, source: &str, identifier: &str) -> Option<LexicalDefinition> {
+    let parent = focus.parent()?;
+    let is_goto =
+        parent.kind() == "goto_statement" && parent.child_by_field_name("label") == Some(focus);
+    let is_declaration =
+        parent.kind() == "labeled_statement" && parent.child_by_field_name("label") == Some(focus);
+    if (!is_goto && !is_declaration)
+        || focus.kind() != "statement_identifier"
+        || source.get(focus.byte_range())? != identifier
+    {
+        return None;
+    }
+
+    let mut owner = Some(parent);
+    while let Some(node) = owner {
+        if matches!(node.kind(), "function_definition" | "lambda_expression") {
+            let mut stack = vec![node];
+            while let Some(candidate) = stack.pop() {
+                if candidate.kind() == "labeled_statement"
+                    && let Some(label) = candidate.child_by_field_name("label")
+                    && label.kind() == "statement_identifier"
+                    && source.get(label.byte_range())? == identifier
+                {
+                    return Some(LexicalDefinition {
+                        source_file: None,
+                        identifier: identifier.to_owned(),
+                        kind: DeclarationKind::StatementLabel,
+                        name_range: node_range(label),
+                        declaration_range: node_range(candidate),
+                    });
+                }
+                if candidate != node
+                    && matches!(
+                        candidate.kind(),
+                        "function_definition" | "lambda_expression"
+                    )
+                {
+                    continue;
+                }
+                let mut cursor = candidate.walk();
+                stack.extend(candidate.named_children(&mut cursor));
+            }
+            return None;
+        }
+        owner = node.parent();
+    }
+    // A parser root that is not attached to a function cannot prove label
+    // ownership. Do not fall back to a same-file spelling search.
+    None
+}
+
+/// Resolve a C label at an AST identifier range. This is public because the
+/// reference differential and query surfaces share the same query-local label
+/// identity without publishing labels as workspace code units.
+pub fn resolve_c_label_definition(
+    root: Node<'_>,
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    identifier: &str,
+) -> Option<LexicalDefinition> {
+    let focus = smallest_named_node(root, start_byte, end_byte)?;
+    c_label_binding(focus, source, identifier)
+}
+
+/// Return exact goto operand ranges that bind to `target_definition`.
+///
+/// C labels are function-local, so this walk is deliberately bounded by the
+/// caller's one source tree. It never searches source text for a matching
+/// spelling.
+pub struct CLabelUsageRanges {
+    pub ranges: Vec<Range>,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+pub fn c_label_usage_ranges(
+    root: Node<'_>,
+    source: &str,
+    target_definition: &LexicalDefinition,
+    max_ranges: usize,
+    mut cancelled: impl FnMut() -> bool,
+) -> CLabelUsageRanges {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if cancelled() {
+            return CLabelUsageRanges {
+                ranges,
+                truncated: false,
+                cancelled: true,
+            };
+        }
+        if node.kind() == "goto_statement"
+            && let Some(label) = node.child_by_field_name("label")
+            && let Some(identifier) = source.get(label.byte_range())
+            && let Some(definition) = c_label_binding(label, source, identifier)
+            && definition.name_range == target_definition.name_range
+        {
+            if ranges.len() == max_ranges {
+                return CLabelUsageRanges {
+                    ranges,
+                    truncated: true,
+                    cancelled: false,
+                };
+            }
+            ranges.push(node_range(label));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    ranges.sort();
+    CLabelUsageRanges {
+        ranges,
+        truncated: false,
+        cancelled: false,
+    }
 }
 
 /// Resolve a lexical binding when a language adapter has structurally proven
@@ -396,18 +530,41 @@ pub(crate) fn resolve_lexical_binding_from_focus(
 
     // Walk lexical scopes from the focus outwards.  A local in an inner block
     // must win before an enclosing callable's parameters are considered.
-    for node in ancestors {
+    for node in &ancestors {
         if is_lexical_scope(language, node.kind())
             && let Some(definition) =
-                scope_matching_local(language, node, source, focus_start, identifier)
+                scope_matching_local(language, *node, source, focus, focus_start, identifier)
         {
             return Some(LexicalBindingResolution::OtherLocal(definition));
         }
 
         if is_parameter_owner(language, node.kind())
-            && let Some(binding) = matching_parameter(language, node, source, identifier)
+            && let Some(binding) = matching_parameter(language, *node, source, identifier)
         {
             return Some(LexicalBindingResolution::Parameter(LexicalDefinition {
+                source_file: None,
+                identifier: identifier.to_owned(),
+                kind: binding.kind,
+                name_range: node_range(binding.name),
+                declaration_range: node_range(binding.declaration),
+            }));
+        }
+    }
+
+    // The focus can still sit in a function body the parser cut loose from its
+    // own function node, in which case none of its ancestors is that function.
+    if language == Language::Cpp
+        && let Some(fragment) = cpp_recovered_function_body(focus, focus_start)
+    {
+        if let Some(body) = fragment.child_by_field_name("body")
+            && let Some(definition) =
+                scope_matching_local(language, body, source, focus, focus_start, identifier)
+        {
+            return Some(LexicalBindingResolution::OtherLocal(definition));
+        }
+        if let Some(binding) = matching_parameter(language, fragment, source, identifier) {
+            return Some(LexicalBindingResolution::Parameter(LexicalDefinition {
+                source_file: None,
                 identifier: identifier.to_owned(),
                 kind: binding.kind,
                 name_range: node_range(binding.name),
@@ -418,6 +575,126 @@ pub(crate) fn resolve_lexical_binding_from_focus(
 
     None
 }
+
+/// The function a C statement belongs to when the parser closed that function
+/// early.
+///
+/// tree-sitter ends a C `function_definition` at the wrong brace when a
+/// preprocessor conditional cuts an `if`/`else` chain -- the option-parsing
+/// loop in mbedtls's `programs/ssl/ssl_client2.c` wraps whole `else if` clauses
+/// in `#if ... #endif` (#2984), and `library/ssl_tls13_server.c` writes
+/// `} else` immediately before `#endif` (#3091) -- and parses the rest of that
+/// body as file-scope items beside the function node. The statements it cut
+/// loose still see the fragment's declarations and parameters, so answer with
+/// the fragment.
+///
+/// `focus` is the reference. C admits declarations and preprocessor
+/// conditionals at file scope but never a statement, so a statement outside
+/// every callable is the parser's recovery of a body it could not close. The
+/// proof is that no ancestor of the reference is a callable, that one of them
+/// is a statement, and that some ancestor holds a `function_definition` ending
+/// before the reference with an orphaned statement after it.
+pub(crate) fn cpp_recovered_function_body<'tree>(
+    focus: Node<'tree>,
+    focus_start: usize,
+) -> Option<Node<'tree>> {
+    let mut ancestors = Vec::new();
+    let mut cursor = Some(focus);
+    while let Some(node) = cursor {
+        ancestors.push(node);
+        cursor = node.parent();
+    }
+    if ancestors
+        .iter()
+        .any(|node| is_parameter_owner(Language::Cpp, node.kind()))
+        || !ancestors
+            .iter()
+            .any(|node| CPP_RECOVERED_BODY_STATEMENTS.contains(&node.kind()))
+    {
+        return None;
+    }
+    for container in ancestors {
+        let mut fragment = None;
+        let mut orphaned = false;
+        for item in cpp_file_scope_items(container, focus_start) {
+            if item.kind() == "function_definition" {
+                // A definition the parser did close ends the orphaned run.
+                if item.end_byte() > focus_start {
+                    break;
+                }
+                fragment = Some(item);
+                orphaned = false;
+                continue;
+            }
+            if fragment.is_some() && CPP_RECOVERED_BODY_STATEMENTS.contains(&item.kind()) {
+                orphaned = true;
+            }
+        }
+        if orphaned {
+            return fragment;
+        }
+    }
+    None
+}
+
+/// The file-scope items `container` holds up to `focus_start`, in source order,
+/// with preprocessor conditionals flattened away.
+///
+/// A conditional's arms hold file-scope items themselves, so a `#if` is
+/// transparent while reading that sequence. mbedtls's
+/// `library/ssl_tls13_server.c` needs the transparency: the statements the
+/// parser cut loose from `ssl_tls13_parse_client_hello` sit two `#if` levels
+/// below the conditional that holds the truncated function node, so their
+/// relation to it is indirect (#3091).
+fn cpp_file_scope_items<'tree>(container: Node<'tree>, focus_start: usize) -> Vec<Node<'tree>> {
+    let mut cursor = container.walk();
+    let mut pending: Vec<Node<'tree>> = container.named_children(&mut cursor).collect();
+    pending.reverse();
+    let mut items = Vec::new();
+    // `pending` holds the remaining items in reverse source order, so the first
+    // one past the reference ends the sequence.
+    while let Some(item) = pending.pop() {
+        if item.start_byte() > focus_start {
+            break;
+        }
+        if CPP_TRANSPARENT_PREPROCESSOR_BRANCHES.contains(&item.kind()) {
+            let resume = pending.len();
+            let mut branch = item.walk();
+            pending.extend(item.named_children(&mut branch));
+            pending[resume..].reverse();
+            continue;
+        }
+        items.push(item);
+    }
+    items
+}
+
+/// The C preprocessor conditionals whose arms hold file-scope items.
+const CPP_TRANSPARENT_PREPROCESSOR_BRANCHES: &[&str] = &[
+    "preproc_elif",
+    "preproc_elifdef",
+    "preproc_else",
+    "preproc_if",
+    "preproc_ifdef",
+];
+
+/// C statement kinds that no file scope admits, so the parser only emits one
+/// there while recovering a function body it closed early.
+const CPP_RECOVERED_BODY_STATEMENTS: &[&str] = &[
+    "break_statement",
+    "case_statement",
+    "compound_statement",
+    "continue_statement",
+    "do_statement",
+    "expression_statement",
+    "for_statement",
+    "goto_statement",
+    "if_statement",
+    "labeled_statement",
+    "return_statement",
+    "switch_statement",
+    "while_statement",
+];
 
 fn smallest_named_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
     let end = end.max(start.saturating_add(1)).min(root.end_byte());
@@ -770,15 +1047,16 @@ fn scope_matching_local(
     language: Language,
     scope: Node<'_>,
     source: &str,
+    focus: Node<'_>,
     focus_start: usize,
     identifier: &str,
 ) -> Option<LexicalDefinition> {
+    // Read the guards from the reference itself. A recovered function body is
+    // not an ancestor of the statements the parser cut loose from it, so
+    // locating the reference inside `scope` would answer `None` there and drop
+    // the guard test that keeps a contradicting branch's declaration out.
     let reference_guards = (language == Language::Cpp)
-        .then(|| {
-            scope
-                .descendant_for_byte_range(focus_start, focus_start.saturating_add(1))
-                .and_then(|focus| preprocessor_guard_environment(focus, source))
-        })
+        .then(|| preprocessor_guard_environment(focus, source))
         .flatten();
     let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
@@ -869,6 +1147,7 @@ fn scope_matching_local(
         .or(hoisted)
         .or_else(|| js_ts_hoisted_var_binder(language, scope, source, focus_start, identifier))?;
     Some(LexicalDefinition {
+        source_file: None,
         identifier: identifier.to_owned(),
         kind: local_declaration_kind(declaration.kind()),
         name_range: node_range(name),
@@ -1027,9 +1306,25 @@ fn binding_name_nodes_with_step<'tree>(
             roots.push(pattern);
         }
     }
-    for field in ["name", "pattern", "declarator", "left"] {
-        if !push_field_children_with_step(declaration, field, &mut roots, scope_step) {
-            return None;
+    if language == Language::Cpp {
+        // C++ tree-sitter exposes only the first comma-separated declarator
+        // through the `declarator` field. Later declarators are unfielded
+        // direct children, so use the shared declaration-shape helper rather
+        // than silently omitting their lexical bindings.
+        let mut cursor = declaration.walk();
+        for child in declaration.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
+            if let Some(declarator) = declaration_declarator(declaration, child) {
+                roots.push(declarator);
+            }
+        }
+    } else {
+        for field in ["name", "pattern", "declarator", "left"] {
+            if !push_field_children_with_step(declaration, field, &mut roots, scope_step) {
+                return None;
+            }
         }
     }
 
@@ -1561,6 +1856,87 @@ mod tests {
             .expect("load Kotlin grammar");
         let tree = parser.parse(source, None).expect("parse Kotlin source");
         (parser, tree)
+    }
+
+    #[test]
+    fn c_goto_labels_resolve_within_their_function() {
+        let source = "void first(void) { goto end; end: return; }\nvoid second(void) { goto end; end: return; }\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("load C grammar");
+        let tree = parser.parse(source, None).expect("parse C source");
+
+        let first_goto = source.find("goto end").expect("first goto") + "goto ".len();
+        let second_goto = source.rfind("goto end").expect("second goto") + "goto ".len();
+        let first = resolve_lexical_binding(
+            Language::Cpp,
+            tree.root_node(),
+            source,
+            first_goto,
+            first_goto + "end".len(),
+            "end",
+        )
+        .expect("first goto label should resolve");
+        let second = resolve_lexical_binding(
+            Language::Cpp,
+            tree.root_node(),
+            source,
+            second_goto,
+            second_goto + "end".len(),
+            "end",
+        )
+        .expect("second goto label should resolve");
+
+        let LexicalBindingResolution::OtherLocal(first) = first else {
+            panic!("expected lexical label definition");
+        };
+        let LexicalBindingResolution::OtherLocal(second) = second else {
+            panic!("expected lexical label definition");
+        };
+        assert_eq!(first.kind, DeclarationKind::StatementLabel);
+        assert_eq!(second.kind, DeclarationKind::StatementLabel);
+        assert_ne!(first.name_range, second.name_range);
+        assert_eq!(
+            &source[first.name_range.start_byte..first.name_range.end_byte],
+            "end"
+        );
+        assert_eq!(
+            &source[second.name_range.start_byte..second.name_range.end_byte],
+            "end"
+        );
+    }
+
+    #[test]
+    fn cpp_goto_labels_do_not_cross_lambda_boundaries() {
+        let source = "void f() { [] { goto done; done: return; }(); goto done; done: return; }\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("load C++ grammar");
+        let tree = parser.parse(source, None).expect("parse C++ source");
+        let lambda_goto = source.find("goto done").expect("lambda goto") + "goto ".len();
+        let function_goto = source.rfind("goto done").expect("function goto") + "goto ".len();
+
+        let resolve = |offset| {
+            let Some(LexicalBindingResolution::OtherLocal(definition)) = resolve_lexical_binding(
+                Language::Cpp,
+                tree.root_node(),
+                source,
+                offset,
+                offset + "done".len(),
+                "done",
+            ) else {
+                panic!("goto label should resolve");
+            };
+            definition
+        };
+        let lambda = resolve(lambda_goto);
+        let function = resolve(function_goto);
+
+        assert_ne!(lambda.name_range, function.name_range);
+        assert!(lambda.name_range.start_byte < function_goto);
+        assert!(function.name_range.start_byte > function_goto);
     }
 
     /// Kotlin's registry entries (parameter owners, containers, and bindings)

@@ -83,8 +83,35 @@ pub struct PhpFileContext {
 
 #[derive(Debug, Clone)]
 struct PhpAliasEvent {
+    start: usize,
     end: usize,
     aliases: PhpUseAliases,
+    bindings: Vec<PhpUseBinding>,
+}
+
+/// Read one `use` declaration into the event the index stores: the byte span
+/// the declaration occupies, the alias maps it contributes, and the binder
+/// token of every local name it introduces.
+fn php_alias_event(
+    declaration: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpAliasEvent> {
+    let bindings = php_use_bindings_from_node(declaration, source, step)?;
+    let mut aliases = PhpUseAliases::default();
+    for binding in &bindings {
+        aliases.insert(
+            binding.kind,
+            binding.local.clone(),
+            binding.segments.join("."),
+        );
+    }
+    Some(PhpAliasEvent {
+        start: declaration.start_byte(),
+        end: declaration.end_byte(),
+        aliases,
+        bindings,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +141,7 @@ pub struct PhpFileContextIndex {
     source_len: usize,
     segments: Vec<PhpContextSegment>,
     merged_aliases: PhpUseAliases,
+    use_declarations: Vec<PhpUseDeclaration>,
 }
 
 impl PhpFileContextIndex {
@@ -132,11 +160,9 @@ impl PhpFileContextIndex {
             if let Some(scope) = &mut unbraced {
                 if child.kind() != "namespace_definition" {
                     if child.kind() == "namespace_use_declaration" {
-                        let aliases = php_use_aliases_from_node(child, source, &mut step)?;
-                        scope.events.push(PhpAliasEvent {
-                            end: child.end_byte(),
-                            aliases,
-                        });
+                        scope
+                            .events
+                            .push(php_alias_event(child, source, &mut step)?);
                     }
                     continue;
                 }
@@ -148,11 +174,7 @@ impl PhpFileContextIndex {
             }
             if child.kind() != "namespace_definition" {
                 if child.kind() == "namespace_use_declaration" {
-                    let aliases = php_use_aliases_from_node(child, source, &mut step)?;
-                    global_events.push(PhpAliasEvent {
-                        end: child.end_byte(),
-                        aliases,
-                    });
+                    global_events.push(php_alias_event(child, source, &mut step)?);
                 }
                 continue;
             }
@@ -223,6 +245,7 @@ impl PhpFileContextIndex {
         }
 
         let mut segments = Vec::new();
+        let mut use_declarations = Vec::new();
         for scope in scopes {
             let mut aliases = PhpUseAliases::default();
             let mut cursor = scope.start;
@@ -236,6 +259,12 @@ impl PhpFileContextIndex {
                     end: event.end,
                     context,
                 });
+                use_declarations.push(PhpUseDeclaration {
+                    namespace: scope.namespace.clone(),
+                    start_byte: event.start,
+                    end_byte: event.end,
+                    bindings: event.bindings,
+                });
                 aliases.extend(event.aliases);
                 cursor = event.end;
             }
@@ -248,11 +277,23 @@ impl PhpFileContextIndex {
                 },
             });
         }
+        // Namespace scopes are assembled in the order they close, not the
+        // order they open, so declarations are put back into source order
+        // here: `import_statements` and every source-order visibility rule
+        // downstream read them that way.
+        use_declarations.sort_by_key(|declaration| declaration.start_byte);
         Some(Self {
             source_len: source.len(),
             segments,
             merged_aliases,
+            use_declarations,
         })
+    }
+
+    /// Every `use` declaration of the file in source order, with the namespace
+    /// each is written in and the binder token of every name it introduces.
+    pub fn use_declarations(&self) -> &[PhpUseDeclaration] {
+        &self.use_declarations
     }
 
     /// Return the exact namespace/import context visible at `byte`.
@@ -413,11 +454,42 @@ impl PhpCallableCandidates {
     }
 }
 
+/// Which declaration space a `use` clause binds in. PHP keeps types,
+/// functions and constants apart, and `use function` / `use const` say which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PhpUseKind {
+pub enum PhpUseKind {
     Type,
     Function,
     Const,
+}
+
+/// One local name a `use` clause binds, with the exact token that spells it.
+///
+/// The alias maps above answer "what does this local name mean"; this answers
+/// "which token introduced it, and where". The lexical-environment layer joins
+/// an import binding to its occurrence row by that token's byte span, so the
+/// span is read from the tree here rather than recovered from the snippet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpUseBinding {
+    pub kind: PhpUseKind,
+    /// The name introduced into the enclosing namespace scope.
+    pub local: String,
+    /// The absolute target path, group prefix already applied.
+    pub segments: Vec<String>,
+    /// Byte span of the token that spells `local`: the `as` alias when the
+    /// clause renames, the tail segment of the imported path otherwise.
+    pub binder_start: usize,
+    pub binder_end: usize,
+}
+
+/// One `use` declaration of a file, with the namespace it is written in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpUseDeclaration {
+    /// The namespace in force at the declaration; empty for the global one.
+    pub namespace: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub bindings: Vec<PhpUseBinding>,
 }
 
 fn php_alias_events_from_children(
@@ -439,11 +511,7 @@ fn php_alias_events_from_children(
         if child.kind() != "namespace_use_declaration" {
             continue;
         }
-        let aliases = php_use_aliases_from_node(child, source, step)?;
-        events.push(PhpAliasEvent {
-            end: child.end_byte(),
-            aliases,
-        });
+        events.push(php_alias_event(child, source, step)?);
     }
     Some(events)
 }
@@ -536,16 +604,17 @@ fn php_aliases_in_body_at(
     Some(aliases)
 }
 
-/// Interpret one tree-sitter `namespace_use_declaration` node.
+/// Interpret one tree-sitter `namespace_use_declaration` node, one clause at a
+/// time.
 ///
 /// This is the canonical PHP import interpreter. Callers must provide the
 /// declaration node from a complete PHP parse tree; raw snippets are routed
 /// through [`parse_php_use_aliases_by_kind`] instead.
-pub fn php_use_aliases_from_node(
+pub fn php_use_bindings_from_node(
     declaration: Node<'_>,
     source: &str,
     step: &mut impl FnMut() -> bool,
-) -> Option<PhpUseAliases> {
+) -> Option<Vec<PhpUseBinding>> {
     if !step() {
         return None;
     }
@@ -572,7 +641,7 @@ pub fn php_use_aliases_from_node(
     };
 
     let clause_parent = body.unwrap_or(declaration);
-    let mut aliases = PhpUseAliases::default();
+    let mut bindings = Vec::new();
     let mut cursor = clause_parent.walk();
     for clause in clause_parent.named_children(&mut cursor) {
         if !step() {
@@ -581,21 +650,57 @@ pub fn php_use_aliases_from_node(
         if clause.kind() != "namespace_use_clause" {
             continue;
         }
-        php_add_use_clause(clause, source, &prefix, default_kind, &mut aliases, step)?;
+        if let Some(binding) = php_use_clause_binding(clause, source, &prefix, default_kind, step)?
+        {
+            bindings.push(binding);
+        }
+    }
+    Some(bindings)
+}
+
+/// The alias maps one `namespace_use_declaration` contributes.
+///
+/// This is [`php_use_bindings_from_node`] collapsed onto the three
+/// local-name-to-target maps; both readers interpret the same clauses through
+/// [`php_use_clause_binding`], so an alias and its binder token can never
+/// disagree about what a clause binds.
+pub fn php_use_aliases_from_node(
+    declaration: Node<'_>,
+    source: &str,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpUseAliases> {
+    let mut aliases = PhpUseAliases::default();
+    for binding in php_use_bindings_from_node(declaration, source, step)? {
+        aliases.insert(binding.kind, binding.local, binding.segments.join("."));
     }
     Some(aliases)
 }
 
-fn php_add_use_clause(
+/// The token that spells the last segment of a written path.
+fn php_path_tail_node<'tree>(path: Node<'tree>) -> Option<Node<'tree>> {
+    match path.kind() {
+        "name" => Some(path),
+        _ => (0..path.named_child_count())
+            .rev()
+            .filter_map(|index| path.named_child(index))
+            .find_map(php_path_tail_node),
+    }
+}
+
+/// Interpret one `namespace_use_clause`.
+///
+/// The outer `None` aborts the whole declaration, which is what cancellation
+/// and an unreadable path did before; the inner `None` is a clause that binds
+/// nothing and leaves its siblings alone.
+fn php_use_clause_binding(
     clause: Node<'_>,
     source: &str,
     prefix: &[String],
     default_kind: PhpUseKind,
-    aliases: &mut PhpUseAliases,
     step: &mut impl FnMut() -> bool,
-) -> Option<()> {
+) -> Option<Option<PhpUseBinding>> {
     let alias_node = clause.child_by_field_name("alias");
-    let mut imported = None;
+    let mut imported_node = None;
     let mut cursor = clause.walk();
     for child in clause.named_children(&mut cursor) {
         if !step() {
@@ -605,13 +710,14 @@ fn php_add_use_clause(
             continue;
         }
         if matches!(child.kind(), "name" | "qualified_name" | "namespace_name") {
-            imported = php_path_segments(child, source, step);
+            imported_node = Some(child);
             break;
         }
     }
-    let mut imported = imported?;
+    let imported_node = imported_node?;
+    let mut imported = php_path_segments(imported_node, source, step)?;
     if imported.is_empty() {
-        return Some(());
+        return Some(None);
     }
     if !prefix.is_empty() {
         let mut full = Vec::with_capacity(prefix.len() + imported.len());
@@ -627,7 +733,10 @@ fn php_add_use_clause(
     } else {
         imported.last()?.clone()
     };
-    let imported = imported.join(".");
+    let binder = match alias_node {
+        Some(alias) => alias,
+        None => php_path_tail_node(imported_node)?,
+    };
     if clause.child_by_field_name("type").is_some() && !step() {
         return None;
     }
@@ -635,8 +744,13 @@ fn php_add_use_clause(
         PhpUseKind::Type if default_kind != PhpUseKind::Type => default_kind,
         kind => kind,
     };
-    aliases.insert(kind, local, imported);
-    Some(())
+    Some(Some(PhpUseBinding {
+        kind,
+        local,
+        segments: imported,
+        binder_start: binder.start_byte(),
+        binder_end: binder.end_byte(),
+    }))
 }
 
 fn php_use_kind(node: Option<Node<'_>>, source: &str) -> PhpUseKind {

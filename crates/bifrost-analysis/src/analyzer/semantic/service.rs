@@ -78,9 +78,9 @@ pub(crate) struct CompleteSemanticArtifactCache {
 /// A lowering reads the source and builds the artifact again, and charges that
 /// whole materialization. A complete-artifact cache hit performs none of that:
 /// the first hit in a budget scope charges the artifact's retained-row census,
-/// and every later hit in the same scope charges exactly one
-/// [`repeat_materialization_work`] unit. Which of the three a touch becomes is
-/// what the complete cache's ready state decides.
+/// and every later hit in the same scope charges exactly one nested-entry
+/// lookup unit. Which of the three a touch becomes is what the complete
+/// cache's ready state decides.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SemanticMaterializationCensus {
@@ -803,19 +803,12 @@ fn observe_complete_artifact(
 /// taint solve path and the summary foundry pass a request without one. The
 /// `nested_entries` lane is the existing home for a bounded traversal step that
 /// no retained row represents (see `ProcedureCfgBuilder::descend_nested_entry`).
-const fn repeat_materialization_work() -> SemanticWork {
-    SemanticWork {
-        nested_entries: 1,
-        ..SemanticWork::uniform(0)
-    }
-}
-
 /// Charge one complete-artifact cache hit.
 ///
 /// The first hit in this budget scope pays the artifact's whole retained-row
 /// census, because that scope has not yet paid for the material it is about to
 /// hold and walk. Every later hit on the same artifact pays
-/// [`repeat_materialization_work`], because the lowering it would otherwise be
+/// one nested-entry lookup unit, because the lowering it would otherwise be
 /// charged for has already been paid for in this scope and is not performed
 /// again (#2295).
 fn publish_cached(
@@ -827,23 +820,18 @@ fn publish_cached(
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
     let fingerprint = artifact.key().fingerprint();
-    let repeat = staged_budget.has_charged_artifact(fingerprint);
     #[cfg(any(test, feature = "test-support"))]
-    cache.record_hit(artifact.key().path(), repeat);
-    let charge = if repeat {
-        repeat_materialization_work()
-    } else {
-        artifact.work()
-    };
-    if let Err(exceeded) = staged_budget.charge(charge) {
+    cache.record_hit(
+        artifact.key().path(),
+        staged_budget.has_charged_artifact(fingerprint),
+    );
+    if let Err(exceeded) = staged_budget.charge_complete_artifact_hit(fingerprint, artifact.work())
+    {
         return Ok(SemanticOutcome::ExceededBudget {
             partial: None,
             exceeded,
             work: source_work.component_max(artifact.work()),
         });
-    }
-    if !repeat {
-        staged_budget.record_charged_artifact(fingerprint);
     }
     let work = source_work.component_max(artifact.work());
     if request.cancellation.is_cancelled() {
@@ -1906,7 +1894,7 @@ mod tests {
     /// site even though the file was lowered once. A budget sized for the
     /// material the request actually holds then aborted a request that had
     /// performed no new work. Each repeat now pays
-    /// `repeat_materialization_work`, which is what a repeat performs: derive
+    /// one nested-entry lookup unit, which is what a repeat performs: derive
     /// the key, look it up, clone an `Arc`.
     #[test]
     fn one_budget_charges_one_artifact_census_once_however_many_cache_hits() {

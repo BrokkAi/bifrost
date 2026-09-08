@@ -14,6 +14,7 @@ mod semantic;
 mod source_artifact;
 pub(crate) mod structural;
 mod tests;
+mod type_flow;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -733,6 +734,10 @@ pub(crate) struct RubySupport;
 impl LanguageSupport for RubySupport {
     fn language(&self) -> Language {
         Language::Ruby
+    }
+
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        Some(&type_flow::RubyTypeFlowAdapter)
     }
 
     fn declaration_name_range(&self, node: Node<'_>, source: &str) -> Range {

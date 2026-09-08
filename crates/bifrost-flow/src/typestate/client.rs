@@ -11,7 +11,7 @@ use crate::dataflow::{
     DataflowDirectionCapabilities, DataflowDirectionPlan, DataflowDirectionPlanningError,
     DataflowDirectionRequirements, DataflowEdge, DataflowOutput, DataflowRequest,
     DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput, ReusableProcedureSummary,
-    ReusableSummaryProvider, SolverTermination, SummaryBoundaryKind, SummaryDataflowError,
+    ReusableSummaryError, ReusableSummaryProvider, SummaryBoundaryKind, SummaryDataflowError,
     SummaryDataflowResult, SummaryPointSeed, SummarySolveInput, SummaryWitnessError,
     WitnessRetentionLimits, plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
     solve_backward_demands_on_snapshot, solve_with_reusable_end_summaries,
@@ -1868,7 +1868,7 @@ impl ReusableSummaryProvider<TypestateFact> for NoReusableTypestateSummaries {
         _root: &ProcedureHandle,
         _entry_fact: TypestateFact,
         _request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, SolverTermination> {
+    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, ReusableSummaryError> {
         Ok(None)
     }
 }

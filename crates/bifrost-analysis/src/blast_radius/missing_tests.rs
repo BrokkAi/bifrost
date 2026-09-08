@@ -552,6 +552,14 @@ fn map_scan_incomplete_reason(reason: ScanUsagesIncompleteReason) -> MissingTest
         ScanUsagesIncompleteReason::ResolutionCandidates => {
             MissingTestsIncompleteReason::UsageResolutionCandidates
         }
+        // Reachable only if a changed-file path stops naming a workspace file
+        // between the graph walk and the usage scan; the generic reason says
+        // the usage evidence is short without inventing a schema variant for a
+        // selector this caller derives from the workspace itself.
+        ScanUsagesIncompleteReason::UnmatchedPaths
+        | ScanUsagesIncompleteReason::SourceUnavailable => {
+            MissingTestsIncompleteReason::UsageAnalysisIncomplete
+        }
     }
 }
 

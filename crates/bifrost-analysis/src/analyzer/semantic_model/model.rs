@@ -24,6 +24,13 @@ pub const MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_RESULT_CONTRACTS: usize = 64;
 pub const MAX_RESULT_CONTRACT_MEMBER_CONTRACTS: usize = 64;
 pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS: usize = 64;
+pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_TYPE_REFINEMENTS: usize = 64;
+/// Upper bound on named boolean arguments accepted by one reviewed decorator
+/// factory claim.  The claim is a compact declaration, not an argument log.
+pub const MAX_CLASS_DECORATOR_FACTORY_KEYWORDS: usize = 64;
+/// Upper bound on exact receiver-member dependencies attached to one reviewed
+/// normal-return type refinement.
+pub const MAX_NORMAL_RETURN_TYPE_REFINEMENT_RECEIVER_MEMBERS: usize = 64;
 /// Upper bound on reviewed boolean-result outcomes that refine a procedure's
 /// parameters. These rows are API contracts rather than observed executions,
 /// so one summary should need only a small set.
@@ -572,6 +579,16 @@ pub struct AuthoredProcedureSummary {
     /// claims about the argument at call entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normal_return_refinements: Vec<AuthoredNormalReturnRefinement>,
+    /// Reviewed class assertions established for a subject parameter whenever
+    /// this procedure returns normally. The class parameter is the argument
+    /// whose runtime class the subject is asserted to have.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_return_type_refinements: Vec<AuthoredNormalReturnTypeRefinement>,
+    /// Reviewed identity of a class decorator or decorator factory.  This is
+    /// intentionally optional: omission does not assert anything about the
+    /// decorator's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_decorator_identity: Option<AuthoredClassDecoratorIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -620,6 +637,38 @@ pub struct AuthoredNormalReturnRefinement {
     #[schemars(range(max = 65535))]
     pub parameter_ordinal: u32,
     pub predicate: AuthoredResultPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredNormalReturnTypeRefinement {
+    #[schemars(range(max = 65535))]
+    pub parameter_ordinal: u32,
+    #[schemars(range(max = 65535))]
+    pub class_parameter_ordinal: u32,
+    /// Exact receiver members that must remain bound to the modeled owner for
+    /// this refinement's normal-return claim to hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_receiver_members: Vec<String>,
+}
+
+/// A reviewed claim that one exact decorator preserves the class identity
+/// needed by class-set analysis. `direct` describes a decorator applied to
+/// the implicit class argument. A present `factory_keywords` list describes
+/// a factory call with only the named literal-boolean keyword arguments.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredClassDecoratorIdentity {
+    pub direct: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_keywords: Option<Vec<AuthoredClassDecoratorKeyword>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredClassDecoratorKeyword {
+    pub name: String,
+    pub allowed_values: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]

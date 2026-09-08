@@ -9,6 +9,7 @@
 
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, DispatchExtensibility};
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 use tree_sitter::Node;
@@ -76,6 +77,23 @@ fn csharp_enclosing_accessor_owner<'tree>(
         .flatten()
         .and_then(|parent| ancestry.parent(parent))
         .filter(|owner| matches!(owner.kind(), "property_declaration" | "indexer_declaration"))
+}
+
+/// The default accessibility of a member of `node`'s enclosing type.
+///
+/// C# makes this a property of the *container*, not of the member: a member
+/// with no access modifier is `private` in a class, struct or record and
+/// `public` in an interface. Passing one default for both made every
+/// unmodified interface member read as private, which is what excluded it from
+/// method families as a non-inherited member (#1721).
+pub fn csharp_default_member_visibility<'tree>(
+    node: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+) -> DeclaredVisibility {
+    match csharp_enclosing_callable_type(node, ancestry) {
+        Some(owner) if owner.kind() == "interface_declaration" => DeclaredVisibility::Public,
+        _ => DeclaredVisibility::Private,
+    }
 }
 
 fn csharp_enclosing_callable_type<'tree>(

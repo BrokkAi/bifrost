@@ -19,6 +19,7 @@ mod receiver_analysis_tests;
 pub(crate) mod receiver_facts;
 pub(crate) mod semantic;
 mod structural;
+mod type_flow;
 use crate::analyzer::store::LimitedQueryRows;
 
 pub(crate) use brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier;
@@ -60,6 +61,17 @@ use brokk_bifrost_js_ts::syntax::{
 };
 use std::path::{Component, Path};
 use std::sync::LazyLock;
+
+pub(crate) fn is_typescript_declaration_path(path: &Path) -> bool {
+    let declaration_extension = path
+        .file_stem()
+        .and_then(|stem| Path::new(stem).extension())
+        .is_some_and(|extension| extension == "d");
+    declaration_extension
+        && path
+            .extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("ts" | "mts" | "cts")))
+}
 
 fn js_ts_local_declaration_binding_scope<'tree>(
     node: tree_sitter::Node<'tree>,
@@ -574,6 +586,10 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        Some(&JavascriptSupport)
+    }
+
     fn declaration_ranges_limited(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -674,6 +690,10 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        Some(&TypescriptSupport)
     }
 
     /// `$static` is an internal marker keeping static and instance members distinct in

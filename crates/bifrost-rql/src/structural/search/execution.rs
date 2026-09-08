@@ -1079,7 +1079,8 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
             | CodeQueryDiagnosticCode::TypestateWitnessTruncated
             | CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted
-            | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated => {
+            | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated
+            | CodeQueryDiagnosticCode::TypeFlowWitnessTruncated => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::TaintFindingTruncated => {
@@ -1121,6 +1122,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ValueFlowRootMismatch
             | CodeQueryDiagnosticCode::ValueFlowAnalysisPartial
             | CodeQueryDiagnosticCode::ValueFlowProviderFailed
+            | CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable
             | CodeQueryDiagnosticCode::UnresolvedTaintResultReference
             | CodeQueryDiagnosticCode::TaintRegistrationStale
             | CodeQueryDiagnosticCode::TaintHandleStale
@@ -1150,6 +1152,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::PathDerivationIncomplete
             | CodeQueryDiagnosticCode::EffectDerivationIncomplete
             | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
+            | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
             | CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }

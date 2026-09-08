@@ -206,6 +206,25 @@ pub struct CompiledProcedureSummary {
     pub conditional_indirect_writes: Vec<CompiledConditionalIndirectWrite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normal_return_refinements: Vec<CompiledNormalReturnRefinement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_return_type_refinements: Vec<CompiledNormalReturnTypeRefinement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_decorator_identity: Option<CompiledClassDecoratorIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledClassDecoratorIdentity {
+    pub direct: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_keywords: Option<Vec<CompiledClassDecoratorKeyword>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledClassDecoratorKeyword {
+    pub name: String,
+    pub allowed_values: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -245,6 +264,15 @@ pub enum CompiledPredicateProofEffect {
 pub struct CompiledNormalReturnRefinement {
     pub parameter_ordinal: u32,
     pub predicate: CompiledResultPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledNormalReturnTypeRefinement {
+    pub parameter_ordinal: u32,
+    pub class_parameter_ordinal: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_receiver_members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1654,6 +1682,29 @@ fn authored_procedure_summary_from_compiled(
                 predicate: authored_result_predicate_from_compiled(refinement.predicate),
             })
             .collect(),
+        normal_return_type_refinements: summary
+            .normal_return_type_refinements
+            .iter()
+            .map(|refinement| AuthoredNormalReturnTypeRefinement {
+                parameter_ordinal: refinement.parameter_ordinal,
+                class_parameter_ordinal: refinement.class_parameter_ordinal,
+                required_receiver_members: refinement.required_receiver_members.clone(),
+            })
+            .collect(),
+        class_decorator_identity: summary.class_decorator_identity.as_ref().map(|identity| {
+            AuthoredClassDecoratorIdentity {
+                direct: identity.direct,
+                factory_keywords: identity.factory_keywords.as_ref().map(|keywords| {
+                    keywords
+                        .iter()
+                        .map(|keyword| AuthoredClassDecoratorKeyword {
+                            name: keyword.name.clone(),
+                            allowed_values: keyword.allowed_values.clone(),
+                        })
+                        .collect()
+                }),
+            }
+        }),
     }
 }
 
@@ -2021,6 +2072,555 @@ mod tests {
             String::from_utf8(canonical_json(summary).unwrap())
                 .unwrap()
                 .contains("\"normal_continuation_absent\":true")
+        );
+    }
+
+    #[test]
+    fn normal_return_type_refinements_compile_decode_and_validate() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let authored_summary = &mut summaries[1];
+        authored_summary.target.parameter_count = 3;
+        authored_summary.target.has_receiver = true;
+        authored_summary.transfers.clear();
+        authored_summary.effects.clear();
+        authored_summary.locations.clear();
+        authored_summary.completeness = Completeness::Partial;
+        authored_summary.normal_return_type_refinements = vec![
+            AuthoredNormalReturnTypeRefinement {
+                parameter_ordinal: 1,
+                class_parameter_ordinal: 2,
+                required_receiver_members: vec!["helper".to_owned(), "fail".to_owned()],
+            },
+            AuthoredNormalReturnTypeRefinement {
+                parameter_ordinal: 0,
+                class_parameter_ordinal: 1,
+                required_receiver_members: Vec::new(),
+            },
+        ];
+        let mut expected = authored_summary.clone();
+        expected.normal_return_type_refinements[0]
+            .required_receiver_members
+            .sort();
+        expected.normal_return_type_refinements.sort();
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = decoded
+            .payload()
+            .procedure_summaries()
+            .unwrap()
+            .iter()
+            .find(|summary| summary.id == expected.id)
+            .unwrap();
+        assert_eq!(
+            summary.normal_return_type_refinements,
+            vec![
+                CompiledNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: Vec::new(),
+                },
+                CompiledNormalReturnTypeRefinement {
+                    parameter_ordinal: 1,
+                    class_parameter_ordinal: 2,
+                    required_receiver_members: vec!["fail".to_owned(), "helper".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(authored_procedure_summary_from_compiled(summary), expected);
+        assert!(
+            String::from_utf8(canonical_json(summary).unwrap())
+                .unwrap()
+                .contains("\"normal_return_type_refinements\"")
+        );
+
+        let empty: AuthoredSemanticModelPack = serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let empty_summary = match &empty.shards[0].payload {
+            AuthoredPayload::ProcedureSummaries { summaries } => &summaries[1],
+            _ => unreachable!(),
+        };
+        assert!(
+            !String::from_utf8(canonical_json(empty_summary).unwrap())
+                .unwrap()
+                .contains("normal_return_type_refinements")
+        );
+
+        fn diagnostics_for(
+            refinements: Vec<AuthoredNormalReturnTypeRefinement>,
+            parameter_count: u32,
+            variadic: bool,
+            has_receiver: bool,
+        ) -> Vec<Diagnostic> {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            let summary = &mut summaries[1];
+            summary.target.parameter_count = parameter_count;
+            summary.target.variadic = variadic;
+            summary.target.has_receiver = has_receiver;
+            summary.normal_return_type_refinements = refinements;
+            compile_pack(&authored, &CompilerOptions::default()).unwrap_err()
+        }
+
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 1,
+                    class_parameter_ordinal: 0,
+                    required_receiver_members: Vec::new(),
+                }],
+                1,
+                false,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.parameter_ordinal_out_of_range")
+        );
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 0,
+                    required_receiver_members: Vec::new(),
+                }],
+                1,
+                false,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "summary.same_normal_return_type_refinement_parameter"
+            })
+        );
+        assert!(
+            diagnostics_for(
+                vec![
+                    AuthoredNormalReturnTypeRefinement {
+                        parameter_ordinal: 0,
+                        class_parameter_ordinal: 1,
+                        required_receiver_members: Vec::new(),
+                    },
+                    AuthoredNormalReturnTypeRefinement {
+                        parameter_ordinal: 0,
+                        class_parameter_ordinal: 1,
+                        required_receiver_members: Vec::new(),
+                    },
+                ],
+                2,
+                false,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "summary.duplicate_normal_return_type_refinement"
+            })
+        );
+        assert!(
+            diagnostics_for(
+                vec![
+                    AuthoredNormalReturnTypeRefinement {
+                        parameter_ordinal: 0,
+                        class_parameter_ordinal: 1,
+                        required_receiver_members: Vec::new(),
+                    },
+                    AuthoredNormalReturnTypeRefinement {
+                        parameter_ordinal: 0,
+                        class_parameter_ordinal: 2,
+                        required_receiver_members: Vec::new(),
+                    },
+                ],
+                3,
+                false,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "summary.conflicting_normal_return_type_refinement"
+            })
+        );
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: Vec::new(),
+                }],
+                2,
+                true,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.unsupported_variadic_tail_reference")
+        );
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: vec!["fail".to_owned()],
+                }],
+                2,
+                false,
+                false,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "summary.required_receiver_members_without_receiver"
+            })
+        );
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: vec!["fail".to_owned(), "fail".to_owned()],
+                }],
+                2,
+                false,
+                true,
+            )
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "summary.duplicate_required_receiver_member" })
+        );
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: vec![String::new()],
+                }],
+                2,
+                false,
+                true,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "text.empty")
+        );
+        let bounded_members = (0..=MAX_NORMAL_RETURN_TYPE_REFINEMENT_RECEIVER_MEMBERS)
+            .map(|index| format!("member{index}"))
+            .collect();
+        assert!(
+            diagnostics_for(
+                vec![AuthoredNormalReturnTypeRefinement {
+                    parameter_ordinal: 0,
+                    class_parameter_ordinal: 1,
+                    required_receiver_members: bounded_members,
+                }],
+                2,
+                false,
+                true,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "limit.normal_return_type_refinement_receiver_members"
+            })
+        );
+    }
+
+    #[test]
+    fn class_decorator_identity_compile_decode_and_canonicalize() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let summary = &mut summaries[1];
+        summary.class_decorator_identity = Some(AuthoredClassDecoratorIdentity {
+            direct: false,
+            factory_keywords: Some(vec![
+                AuthoredClassDecoratorKeyword {
+                    name: "slots".to_owned(),
+                    allowed_values: vec![true, false],
+                },
+                AuthoredClassDecoratorKeyword {
+                    name: "frozen".to_owned(),
+                    allowed_values: vec![false],
+                },
+            ]),
+        });
+        let mut expected = summary.clone();
+        let identity = expected.class_decorator_identity.as_mut().unwrap();
+        let keywords = identity.factory_keywords.as_mut().unwrap();
+        for keyword in keywords.iter_mut() {
+            keyword.allowed_values.sort_unstable();
+        }
+        keywords.sort();
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let compiled_summary = decoded
+            .payload()
+            .procedure_summaries()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate.id == expected.id)
+            .unwrap();
+        assert_eq!(
+            compiled_summary.class_decorator_identity,
+            Some(CompiledClassDecoratorIdentity {
+                direct: false,
+                factory_keywords: Some(vec![
+                    CompiledClassDecoratorKeyword {
+                        name: "frozen".to_owned(),
+                        allowed_values: vec![false],
+                    },
+                    CompiledClassDecoratorKeyword {
+                        name: "slots".to_owned(),
+                        allowed_values: vec![false, true],
+                    },
+                ]),
+            })
+        );
+        let round_tripped = authored_procedure_summary_from_compiled(compiled_summary);
+        assert_eq!(
+            round_tripped.class_decorator_identity, expected.class_decorator_identity,
+            "the decorator identity claim survives authored/compiled round-trip"
+        );
+        assert!(
+            String::from_utf8(canonical_json(compiled_summary).unwrap())
+                .unwrap()
+                .contains("\"class_decorator_identity\"")
+        );
+
+        let omitted: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let omitted_summary = match &omitted.shards[0].payload {
+            AuthoredPayload::ProcedureSummaries { summaries } => &summaries[1],
+            _ => unreachable!(),
+        };
+        assert!(
+            !String::from_utf8(canonical_json(omitted_summary).unwrap())
+                .unwrap()
+                .contains("class_decorator_identity")
+        );
+    }
+
+    #[test]
+    fn class_decorator_identity_validation_rejects_unsafe_claims() {
+        fn diagnostics_for(
+            target: AuthoredProcedureTarget,
+            completeness: Completeness,
+            identity: AuthoredClassDecoratorIdentity,
+            normal_continuation_absent: bool,
+        ) -> Vec<Diagnostic> {
+            diagnostics_for_with_covers(
+                target,
+                completeness,
+                identity,
+                normal_continuation_absent,
+                false,
+            )
+        }
+
+        fn diagnostics_for_with_covers(
+            target: AuthoredProcedureTarget,
+            completeness: Completeness,
+            identity: AuthoredClassDecoratorIdentity,
+            normal_continuation_absent: bool,
+            covers_overrides: bool,
+        ) -> Vec<Diagnostic> {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            summaries[1].target = target;
+            summaries[1].completeness = completeness;
+            summaries[1].covers_overrides = covers_overrides;
+            summaries[1].normal_continuation_absent = normal_continuation_absent;
+            summaries[1].class_decorator_identity = Some(identity);
+            compile_pack(&authored, &CompilerOptions::default()).unwrap_err()
+        }
+
+        fn compiles_variadic_direct(parameter_count: u32) -> bool {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            let summary = &mut summaries[1];
+            summary.target.parameter_count = parameter_count;
+            summary.target.variadic = true;
+            summary.transfers.clear();
+            summary.effects.clear();
+            summary.locations.clear();
+            summary.class_decorator_identity = Some(AuthoredClassDecoratorIdentity {
+                direct: true,
+                factory_keywords: None,
+            });
+            compile_pack(&authored, &CompilerOptions::default()).is_ok()
+        }
+
+        let target = AuthoredProcedureTarget {
+            path: "com/acme/Flows.class".to_owned(),
+            symbol: "wrapper(java.lang.String)".to_owned(),
+            has_receiver: false,
+            variadic: false,
+            parameter_count: 1,
+        };
+        assert!(
+            diagnostics_for(
+                target.clone(),
+                Completeness::Partial,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == "summary.class_decorator_identity_requires_complete")
+        );
+        assert!(
+            diagnostics_for(
+                AuthoredProcedureTarget {
+                    parameter_count: 0,
+                    ..target.clone()
+                },
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.class_decorator_identity_arity")
+        );
+        assert!(
+            diagnostics_for(
+                AuthoredProcedureTarget {
+                    parameter_count: 2,
+                    ..target.clone()
+                },
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.class_decorator_identity_arity")
+        );
+        assert!(
+            diagnostics_for(
+                AuthoredProcedureTarget {
+                    parameter_count: 3,
+                    variadic: true,
+                    ..target.clone()
+                },
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.class_decorator_identity_arity")
+        );
+        assert!(compiles_variadic_direct(1));
+        assert!(compiles_variadic_direct(2));
+        assert!(diagnostics_for(
+            AuthoredProcedureTarget {
+                has_receiver: true,
+                ..target.clone()
+            },
+            Completeness::Complete,
+            AuthoredClassDecoratorIdentity {
+                direct: true,
+                factory_keywords: None,
+            },
+            false,
+        )
+        .iter()
+        .any(|diagnostic| diagnostic.code == "summary.class_decorator_identity_receiver_target"));
+        assert!(
+            diagnostics_for(
+                target.clone(),
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: false,
+                    factory_keywords: None,
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.empty_class_decorator_identity")
+        );
+        assert!(
+            diagnostics_for(
+                target.clone(),
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: false,
+                    factory_keywords: Some(vec![AuthoredClassDecoratorKeyword {
+                        name: "frozen".to_owned(),
+                        allowed_values: vec![],
+                    }]),
+                },
+                false,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == "summary.empty_class_decorator_factory_allowed_values")
+        );
+        assert!(
+            diagnostics_for(
+                target.clone(),
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                true,
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.code == "summary.normal_continuation_conflict")
+        );
+        assert!(
+            diagnostics_for_with_covers(
+                AuthoredProcedureTarget {
+                    parameter_count: 1,
+                    ..target
+                },
+                Completeness::Complete,
+                AuthoredClassDecoratorIdentity {
+                    direct: true,
+                    factory_keywords: None,
+                },
+                false,
+                true,
+            )
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.code == "summary.class_decorator_identity_covers_overrides"
+            })
         );
     }
 

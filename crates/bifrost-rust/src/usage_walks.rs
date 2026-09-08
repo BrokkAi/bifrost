@@ -44,7 +44,7 @@ use crate::graph_support::{
 };
 use crate::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_target_kind_root_alternative,
+    rust_external_module_segments, rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
@@ -52,7 +52,7 @@ use crate::usage::{
     RustMacroScopeKey, RustMacroScopeRanges, RustModuleAliasRoute, RustOriginRoute,
     RustResolvedModuleRoute, RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace,
     direct_import_scope_for_module_with_identity, edge_target_matches_exact_module,
-    imported_identity_domain, rust_mod_item_has_macro_use,
+    imported_identity_domain, module_route_for_identity, rust_mod_item_has_macro_use,
 };
 use crate::usage_queries::{RustImportBinding, RustUsageQueries};
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
@@ -1016,10 +1016,91 @@ impl<'a> RustUsageWalks<'a> {
             }
         }
 
+        // A dependency crate can expose a module only through facade
+        // re-exports, for example `pub use backend::*;` followed by
+        // `pub use modules::*;`. The ordinary module resolver intentionally
+        // works on physical module packages, so it cannot turn
+        // `dependency::ops::conv` into the physical
+        // `backend::ops::modules::conv` package. Follow the structured export
+        // index when the Cargo route is known and the physical route above
+        // found nothing. This keeps registry dependencies an honest boundary:
+        // an untracked crate has no root file and therefore cannot be
+        // fabricated by this fallback.
+        let facade_routes = self.resolve_external_facade_segments(importing_file, segments);
+        if !facade_routes.is_empty() {
+            return facade_routes;
+        }
+
         self.resolve_segments_plain(importing_file, importing_module, segments)
             .into_iter()
             .filter(|route| self.is_analyzed(&route.target_file))
             .collect()
+    }
+
+    /// Resolve a dependency-rooted module path through the dependency's
+    /// structured `pub use` export chain. `export_targets_from_files` returns
+    /// the physical declaration backing each exported segment; walking those
+    /// declarations one segment at a time preserves the module identity needed
+    /// by import edges instead of collapsing the path to a short name.
+    fn resolve_external_facade_segments(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Vec<RustResolvedModuleRoute> {
+        let Some((root, _nested)) = rust_external_module_segments(segments) else {
+            return Vec::new();
+        };
+        let Some(root_file) = self
+            .cargo_routes
+            .resolve_crate_root_file(importing_file, root)
+        else {
+            return Vec::new();
+        };
+        if !self.is_analyzed(&root_file) {
+            return Vec::new();
+        }
+
+        let mut module_files = vec![root_file];
+        let mut module_routes = Vec::new();
+        for segment in segments[1..].iter().filter(|segment| !segment.is_empty()) {
+            let exports = self.export_targets_from_files(self.analyzer, &module_files, segment);
+            let mut next_files = Vec::new();
+            let mut next_routes = Vec::new();
+            for (target_file, target_name) in exports {
+                let path_identity = self.queries.path_identity_of(&target_file);
+                let package = &path_identity.package;
+                let target_module = self
+                    .queries
+                    .module_key_of(&target_file, package)
+                    .with_suffix(std::slice::from_ref(&target_name));
+                let files = self.files_for_module(&target_module);
+                if files.is_empty() {
+                    continue;
+                }
+                next_files.extend(files.iter().cloned());
+                next_routes.extend(files.iter().cloned().map(|file| RustResolvedModuleRoute {
+                    target_file: file,
+                    target_module: target_module.clone(),
+                    provenance: RustRouteProvenance::Dependency,
+                }));
+            }
+            next_files.sort();
+            next_files.dedup();
+            next_routes.sort_by(|left, right| {
+                left.target_file.cmp(&right.target_file).then_with(|| {
+                    left.target_module
+                        .package()
+                        .cmp(&right.target_module.package())
+                })
+            });
+            next_routes.dedup();
+            if next_files.is_empty() {
+                return Vec::new();
+            }
+            module_files = next_files;
+            module_routes = next_routes;
+        }
+        module_routes
     }
 
     // ---------------------------------------------------------------- layer 0
@@ -1696,6 +1777,17 @@ impl<'a> RustUsageWalks<'a> {
     ) -> Vec<RustModuleBinding> {
         self.computations.set(self.computations.get() + 1);
         let mut bindings = self.declared_bindings_at(file, module);
+        let unconditional_declarations = bindings
+            .iter()
+            // `macro_rules!` has its own lexical and export precedence; the
+            // macro-scope graph adjudicates it separately.
+            .filter(|binding| binding.namespace != RustSymbolNamespace::Macro)
+            .filter(|binding| {
+                self.declared_cfg_conditions_of(&binding.origin)
+                    .is_some_and(|conditions| conditions.contains(&RustCfgCondition::Always))
+            })
+            .map(|binding| (binding.name.clone(), binding.namespace))
+            .collect::<HashSet<_>>();
         for edge in self
             .forward_import_edges_of(file)
             .iter()
@@ -1710,6 +1802,10 @@ impl<'a> RustUsageWalks<'a> {
                 RustImportEdgeKind::Namespace | RustImportEdgeKind::Qualified(_) => continue,
             };
             for (target, incoming) in self.edge_targets(edge) {
+                let bound_name = name.clone().unwrap_or_else(|| target.name.clone());
+                if unconditional_declarations.contains(&(bound_name.clone(), target.namespace)) {
+                    continue;
+                }
                 let Some(effective) = self.effective_import_domain(&target, &incoming.domain, edge)
                 else {
                     continue;
@@ -1717,7 +1813,7 @@ impl<'a> RustUsageWalks<'a> {
                 push_unique_binding(
                     &mut bindings,
                     RustModuleBinding {
-                        name: name.clone().unwrap_or_else(|| target.name.clone()),
+                        name: bound_name,
                         namespace: target.namespace,
                         origin: incoming.origin,
                         domain: effective,
@@ -1921,6 +2017,83 @@ impl<'a> RustUsageWalks<'a> {
                 }
             }
         }
+        // A passthrough item macro can introduce an external `mod` item that
+        // is not present in the declaring file's syntax tree. Cargo route
+        // composition has already recovered those edges structurally; merge
+        // them here so macro visibility follows the same module path as
+        // ordinary declarations. The byte offsets and macro-use bit are
+        // carried by the route edge, preserving declaration order and the
+        // upward `#[macro_use]` rule.
+        for declaration in self.cargo_routes.external_module_declarations() {
+            if declaration.declaring_file != *file
+                || !self.owners_intersect(file, &declaration.target_file)
+            {
+                continue;
+            }
+            let parent_module = self
+                .queries
+                .module_key_of(file, &declaration.declaring_module);
+            let child_module = self.queries.module_key_of(
+                &declaration.target_file,
+                &self
+                    .queries
+                    .path_identity_of(&declaration.target_file)
+                    .package,
+            );
+            edges.push(RustMacroScopeEdge {
+                parent: RustMacroScopeKey {
+                    file: file.clone(),
+                    module: parent_module,
+                },
+                child: RustMacroScopeKey {
+                    file: declaration.target_file.clone(),
+                    module: child_module,
+                },
+                declaration_start: declaration.declaration_start_byte,
+                visibility_start: declaration.visibility_start_byte,
+                imports_macros: declaration.imports_macros,
+            });
+        }
+        edges.sort_by(|left, right| {
+            left.parent
+                .file
+                .cmp(&right.parent.file)
+                .then_with(|| {
+                    left.parent
+                        .module
+                        .crate_root
+                        .cmp(&right.parent.module.crate_root)
+                        .then_with(|| {
+                            left.parent
+                                .module
+                                .components
+                                .cmp(&right.parent.module.components)
+                        })
+                })
+                .then_with(|| left.child.file.cmp(&right.child.file))
+                .then_with(|| {
+                    left.child
+                        .module
+                        .crate_root
+                        .cmp(&right.child.module.crate_root)
+                        .then_with(|| {
+                            left.child
+                                .module
+                                .components
+                                .cmp(&right.child.module.components)
+                        })
+                })
+                .then_with(|| left.declaration_start.cmp(&right.declaration_start))
+                .then_with(|| left.visibility_start.cmp(&right.visibility_start))
+                .then_with(|| left.imports_macros.cmp(&right.imports_macros))
+        });
+        edges.dedup_by(|left, right| {
+            left.parent == right.parent
+                && left.child == right.child
+                && left.declaration_start == right.declaration_start
+                && left.visibility_start == right.visibility_start
+                && left.imports_macros == right.imports_macros
+        });
         let edges = Arc::new(edges);
         if !self.cancelled() {
             self.caches
@@ -2165,7 +2338,10 @@ fn binding_names_module_component(binding: &RustImportBinding, component: &str) 
 /// and only the identity of that name is bound; a glob or namespace edge binds
 /// whatever the module exports, so the reaching test is the whole test.
 fn edge_binds_identity(edge: &RustImportEdge, identity: &RustSymbolIdentity) -> bool {
-    if edge.target_file != identity.file || edge.target_module != identity.module {
+    if edge.target_file != identity.file
+        || (edge.target_module != identity.module
+            && edge.target_module != module_route_for_identity(identity))
+    {
         return false;
     }
     match &edge.kind {

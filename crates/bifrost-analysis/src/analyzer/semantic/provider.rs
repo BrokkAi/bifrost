@@ -346,6 +346,30 @@ impl SemanticBudget {
         Arc::make_mut(&mut self.charged_artifacts).insert(artifact);
     }
 
+    /// Charge the canonical complete-artifact cache-hit cost atomically.
+    #[doc(hidden)]
+    pub fn charge_complete_artifact_hit(
+        &mut self,
+        artifact: StableDigest,
+        full_work: SemanticWork,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        let mut staged = self.clone();
+        let repeat = staged.has_charged_artifact(artifact);
+        staged.charge(if repeat {
+            SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::uniform(0)
+            }
+        } else {
+            full_work
+        })?;
+        if !repeat {
+            staged.record_charged_artifact(artifact);
+        }
+        *self = staged;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn charged_artifact_count(&self) -> usize {
         self.charged_artifacts.len()
@@ -785,6 +809,52 @@ impl<T> SemanticOutcome<T> {
         }
     }
 
+    /// Clone a finished provider verdict for zero-work replay.
+    ///
+    /// Budget exhaustion and cancellation describe the request, not the
+    /// semantic input, so they cannot become cache entries. A value-less
+    /// `Unknown` or `Unsupported` has no retained result worth replaying.
+    pub fn completed_replay(&self) -> Option<Self>
+    where
+        T: Clone,
+    {
+        let work = SemanticWork::default();
+        match self {
+            Self::Complete { value, .. } => Some(Self::Complete {
+                value: value.clone(),
+                work,
+            }),
+            Self::Ambiguous { candidates, .. } => Some(Self::Ambiguous {
+                candidates: candidates.clone(),
+                work,
+            }),
+            Self::Unproven { partial, .. } => Some(Self::Unproven {
+                partial: partial.clone(),
+                work,
+            }),
+            Self::Unknown {
+                partial: Some(partial),
+                ..
+            } => Some(Self::Unknown {
+                partial: Some(partial.clone()),
+                work,
+            }),
+            Self::Unsupported {
+                capability,
+                partial: Some(partial),
+                ..
+            } => Some(Self::Unsupported {
+                capability: *capability,
+                partial: Some(partial.clone()),
+                work,
+            }),
+            Self::Unknown { partial: None, .. }
+            | Self::Unsupported { partial: None, .. }
+            | Self::ExceededBudget { .. }
+            | Self::Cancelled { .. } => None,
+        }
+    }
+
     pub fn map<U>(self, mapper: impl FnOnce(T) -> U) -> SemanticOutcome<U> {
         match self {
             Self::Complete { value, work } => SemanticOutcome::Complete {
@@ -1154,6 +1224,72 @@ mod tests {
     }
 
     #[test]
+    fn complete_artifact_hit_replays_full_and_repeat_work_across_imported_paid_sets() {
+        let already_paid = StableDigest::sha256(b"already paid");
+        let sibling_paid = StableDigest::sha256(b"sibling paid");
+        let newly_paid = StableDigest::sha256(b"newly paid");
+        let full_work = SemanticWork {
+            procedures: 2,
+            blocks: 3,
+            events: 5,
+            ..SemanticWork::default()
+        };
+
+        let mut parent = SemanticBudget::uniform(32).expect("parent budget");
+        parent.record_charged_artifact(already_paid);
+        parent.record_charged_artifact(sibling_paid);
+        let parent_scope = parent.scope_snapshot();
+        let mut child = SemanticBudget::new_child(SemanticWork::uniform(32), &parent_scope);
+
+        child
+            .charge_complete_artifact_hit(newly_paid, full_work)
+            .expect("an uncharged artifact pays its full census");
+        child
+            .charge_complete_artifact_hit(already_paid, full_work)
+            .expect("an imported paid artifact pays one lookup");
+        child
+            .charge_complete_artifact_hit(sibling_paid, full_work)
+            .expect("every imported paid identity uses the repeat price");
+
+        assert_eq!(
+            child.used(),
+            SemanticWork {
+                procedures: 2,
+                blocks: 3,
+                events: 5,
+                nested_entries: 2,
+                ..SemanticWork::default()
+            }
+        );
+        assert!(child.has_charged_artifact(newly_paid));
+
+        parent
+            .apply_child_charge(SemanticWork::default(), child.into_child_charge())
+            .expect("the child charge fits and imports its new paid identity");
+        assert!(parent.has_charged_artifact(already_paid));
+        assert!(parent.has_charged_artifact(sibling_paid));
+        assert!(parent.has_charged_artifact(newly_paid));
+        assert_eq!(parent.used().nested_entries, 2);
+
+        let before = parent.clone();
+        let oversized = SemanticWork {
+            procedures: 33,
+            ..SemanticWork::default()
+        };
+        assert!(
+            parent
+                .charge_complete_artifact_hit(StableDigest::sha256(b"over limit"), oversized)
+                .is_err()
+        );
+        assert_eq!(parent.used(), before.used());
+        assert_eq!(
+            parent.charged_artifact_count(),
+            before.charged_artifact_count(),
+            "a refused full charge must not import the artifact identity"
+        );
+    }
+
+    #[test]
     fn child_charge_import_is_scope_bound_conservative_and_atomic() {
         let mut parent = SemanticBudget::uniform(4).expect("parent budget");
         let parent_scope = parent.scope_snapshot();
@@ -1511,6 +1647,57 @@ mod tests {
         }
         assert!(mapped[0].is_complete());
         assert!(!mapped[1].is_complete());
+    }
+
+    #[test]
+    fn completed_replay_keeps_finished_payloads_and_rejects_request_interruptions() {
+        let work = SemanticWork {
+            program_points: 3,
+            ..SemanticWork::default()
+        };
+        let complete = SemanticOutcome::Complete { value: 1_u32, work }
+            .completed_replay()
+            .expect("a completed payload is replayable");
+        let partial = SemanticOutcome::Unknown {
+            partial: Some(2_u32),
+            work,
+        }
+        .completed_replay()
+        .expect("a finished partial payload is replayable");
+        assert_eq!(complete.available_value(), Some(&1));
+        assert_eq!(partial.available_value(), Some(&2));
+        assert_eq!(complete.work(), SemanticWork::default());
+        assert_eq!(partial.work(), SemanticWork::default());
+
+        assert!(
+            SemanticOutcome::<u32>::Unknown {
+                partial: None,
+                work,
+            }
+            .completed_replay()
+            .is_none()
+        );
+        assert!(
+            SemanticOutcome::ExceededBudget {
+                partial: Some(3_u32),
+                exceeded: SemanticBudgetExceeded {
+                    dimension: SemanticBudgetDimension::ProgramPoints,
+                    limit: 2,
+                    attempted: 3,
+                },
+                work,
+            }
+            .completed_replay()
+            .is_none()
+        );
+        assert!(
+            SemanticOutcome::Cancelled {
+                partial: Some(4_u32),
+                work,
+            }
+            .completed_replay()
+            .is_none()
+        );
     }
 
     #[test]

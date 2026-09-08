@@ -187,6 +187,12 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
+impl TypescriptAnalyzer {
+    pub fn inner(&self) -> &TreeSitterAnalyzer<TypescriptAdapter> {
+        &self.inner
+    }
+}
+
 impl JsTsSource for TypescriptAnalyzer {
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver

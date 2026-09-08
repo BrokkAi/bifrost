@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use crate::analyzer::semantic::{
-    CancellationToken, SemanticBudget, SemanticRequest, SourceSpan, TypeFlowAdapter, UnknownReason,
-    type_flow_adapter,
+    CancellationToken, IcfgProvider, SemanticBudget, SemanticRequest, SourceSpan, TypeFlowAdapter,
+    UnknownReason, WorkspaceIcfgProvider, type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
@@ -22,7 +22,7 @@ use crate::value_flow::{ClosureLimits, ValueFlowCache};
 
 use super::solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
-    TypeFlowRootResult, solve_type_flow_for_root,
+    TypeFlowRootResult, prefer_retained_finding, solve_type_flow_for_root,
 };
 use super::{FieldSlotIndex, TypeFlowSummaryState};
 
@@ -78,7 +78,8 @@ impl TypeFlowReport {
 
     /// Merge one root's result. Class sets union per site; a reason is
     /// counted once per site that reports it; findings deduplicate by (site,
-    /// class, member) with the first root keeping its witness.
+    /// class, member), preferring retained witness evidence over an unavailable
+    /// witness from an earlier root.
     pub fn merge_root(&mut self, result: TypeFlowRootResult) {
         self.roots_analyzed += 1;
         if !result.complete {
@@ -114,13 +115,15 @@ impl TypeFlowReport {
             }
         }
         for finding in result.findings {
-            let duplicate = self.findings.iter().any(|existing| {
+            let duplicate = self.findings.iter_mut().find(|existing| {
                 existing.site.file == finding.site.file
                     && existing.site.span == finding.site.span
                     && existing.site.member == finding.site.member
                     && existing.class == finding.class
             });
-            if !duplicate {
+            if let Some(existing) = duplicate {
+                prefer_retained_finding(existing, finding);
+            } else {
                 self.findings.push(finding);
             }
         }
@@ -143,23 +146,61 @@ fn merge_class_set(existing: &mut ReceiverClassSet, incoming: ReceiverClassSet) 
             existing.classes.push((identity, origin));
         }
     }
-    for (identity, declaration) in incoming.member_declarations {
-        if !existing
-            .member_declarations
-            .iter()
-            .any(|(existing_identity, existing_declaration)| {
-                existing_identity == &identity && existing_declaration == &declaration
-            })
-        {
-            existing.member_declarations.push((identity, declaration));
-        }
-    }
+    merge_member_declarations(
+        &mut existing.member_declarations,
+        incoming.member_declarations,
+    );
     for reason in incoming.unknown {
         if !existing.unknown.contains(&reason) {
             existing.unknown.push(reason);
         }
     }
     existing.status = merge_status(existing.status, incoming.status);
+}
+
+fn merge_member_declarations(
+    existing: &mut Vec<(
+        crate::analyzer::semantic::ClassIdentity,
+        crate::analyzer::semantic::MemberLookupHit,
+    )>,
+    incoming: impl IntoIterator<
+        Item = (
+            crate::analyzer::semantic::ClassIdentity,
+            crate::analyzer::semantic::MemberLookupHit,
+        ),
+    >,
+) {
+    for (identity, hit) in incoming {
+        if let Some((_, existing_hit)) =
+            existing
+                .iter_mut()
+                .find(|(existing_identity, existing_hit)| {
+                    existing_identity == &identity && existing_hit.declaration == hit.declaration
+                })
+        {
+            existing_hit.dispatch_coverage =
+                weakest_candidate_coverage(existing_hit.dispatch_coverage, hit.dispatch_coverage);
+        } else {
+            existing.push((identity, hit));
+        }
+    }
+}
+
+fn weakest_candidate_coverage(
+    left: crate::analyzer::semantic::CandidateCoverage,
+    right: crate::analyzer::semantic::CandidateCoverage,
+) -> crate::analyzer::semantic::CandidateCoverage {
+    use crate::analyzer::semantic::CandidateCoverage;
+
+    match (left, right) {
+        (CandidateCoverage::Truncated, _) | (_, CandidateCoverage::Truncated) => {
+            CandidateCoverage::Truncated
+        }
+        (CandidateCoverage::Open, _) | (_, CandidateCoverage::Open) => CandidateCoverage::Open,
+        (CandidateCoverage::Exhaustive, CandidateCoverage::Exhaustive) => {
+            CandidateCoverage::Exhaustive
+        }
+    }
 }
 
 /// The weakest status wins: an inconclusive root means the site was not fully
@@ -219,8 +260,20 @@ fn solve_language(
     report: &mut TypeFlowReport,
 ) -> Result<(), TypeFlowError> {
     let mut field_slot_budget = SemanticBudget::default();
-    let field_slots =
-        FieldSlotIndex::build(workspace, adapter, &mut field_slot_budget, cancellation)?;
+    let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+        workspace,
+        active_semantic_model_snapshot.clone(),
+    );
+    let field_slots = FieldSlotIndex::acquire(
+        workspace,
+        adapter,
+        provider.behavior_identity(),
+        active_semantic_model_snapshot.clone(),
+        &summary_state.field_slot_indexes(),
+        &mut field_slot_budget,
+        cancellation,
+    )?
+    .index;
     let files = workspace
         .analyzer()
         .project()
@@ -272,4 +325,45 @@ fn solve_language(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_member_declarations;
+    use crate::analyzer::semantic::{
+        CandidateCoverage, ClassIdentity, ExternalMemberDeclaration, MemberDeclaration,
+        MemberLookupHit,
+    };
+
+    #[test]
+    fn merged_member_hit_keeps_one_declaration_and_weakens_coverage() {
+        let class = ClassIdentity::External {
+            qualified_name: "pkg.Widget".into(),
+            symbol_id: "class-widget".into(),
+        };
+        let declaration =
+            MemberDeclaration::External(ExternalMemberDeclaration::new([Box::from("method-run")]));
+        let mut hits = vec![(
+            class.clone(),
+            MemberLookupHit::new(declaration.clone(), CandidateCoverage::Exhaustive),
+        )];
+
+        merge_member_declarations(
+            &mut hits,
+            [(
+                class.clone(),
+                MemberLookupHit::new(declaration.clone(), CandidateCoverage::Open),
+            )],
+        );
+        merge_member_declarations(
+            &mut hits,
+            [(
+                class,
+                MemberLookupHit::new(declaration, CandidateCoverage::Truncated),
+            )],
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.dispatch_coverage, CandidateCoverage::Truncated);
+    }
 }

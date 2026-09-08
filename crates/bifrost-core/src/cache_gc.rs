@@ -153,6 +153,16 @@ pub fn planner_statistics_enabled() -> bool {
     statistics_enabled(std::env::var_os(STORE_STATISTICS_ENV).as_deref())
 }
 
+/// Serialize tests that change or observe the process-wide planner-statistics
+/// switch. The production code intentionally reads the environment directly;
+/// tests that temporarily set it must keep other tests from observing the
+/// temporary value.
+#[cfg(any(test, feature = "test-support"))]
+pub fn planner_statistics_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn statistics_enabled(value: Option<&OsStr>) -> bool {
     !matches!(
         value.and_then(OsStr::to_str),
@@ -228,6 +238,55 @@ pub fn planner_statistics_describe_database(conn: &Connection) -> Result<bool, S
         )
         .map_err(|err| format!("planner statistics SQLite error: {err}"))?;
     Ok(recorded == total_blob_count_conn(conn)?)
+}
+
+/// How many times this process has repaired a store's planner statistics while
+/// opening it. Tests observe the repair by this counter rather than by timing.
+static PLANNER_STATISTICS_REPAIRS: AtomicI64 = AtomicI64::new(0);
+
+/// Repairs run by [`repair_planner_statistics_on_open`] since the process
+/// started.
+pub fn planner_statistics_repairs() -> i64 {
+    PLANNER_STATISTICS_REPAIRS.load(Ordering::Relaxed)
+}
+
+/// Give a built store the statistics it should already have, at open time.
+///
+/// A store that holds blobs but no statistics is not a slow path, it is a
+/// latency cliff: on `laravel/framework` one `most_relevant_files` call took
+/// 405 s with `sqlite_stat1` emptied and 3.3 s after one `ANALYZE` of the same
+/// file, a factor of 125 (issue #3016's corpus report, finding F3). The build
+/// and collection hooks keep a store this build produced current, so the
+/// remaining ways into that state are a store built by a binary older than
+/// those hooks and a store built while `BIFROST_STORE_STATISTICS=off` was set.
+/// Both are repaired here, once, when the database is opened.
+///
+/// Runs nothing on an empty database -- `ANALYZE` writes no row for an empty
+/// table, so an empty store would read as stale forever -- and nothing when
+/// [`planner_statistics_describe_database`] says the stored statistics still
+/// describe this store.
+///
+/// `ANALYZE` takes a write transaction, and opening a store deliberately takes
+/// no build lock, so this can meet another process mid-build. The connection's
+/// 120-second busy timeout is what handles that: the repair waits for the
+/// builder's current write transaction, and if the whole timeout expires it
+/// reports the SQLite error, the caller leaves the store without statistics,
+/// and the next open (or that builder's own post-build hook) does the work.
+pub fn repair_planner_statistics_on_open(
+    conn: &Connection,
+) -> Result<Option<PlannerStatisticsRefresh>, String> {
+    if !planner_statistics_enabled() {
+        return Ok(None);
+    }
+    if total_blob_count_conn(conn)? == 0 {
+        return Ok(None);
+    }
+    if planner_statistics_describe_database(conn)? {
+        return Ok(None);
+    }
+    let evidence = refresh_planner_statistics(conn)?;
+    PLANNER_STATISTICS_REPAIRS.fetch_add(1, Ordering::Relaxed);
+    Ok(Some(evidence))
 }
 
 /// Planner statistics captured from real corpus stores, one workspace build
@@ -367,11 +426,27 @@ fn sweep_with_claim(
     )
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
-    let live = live_bloom(repo, workspace_root)?;
+    let mut live = live_bloom(repo, workspace_root)?;
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    // Retained workspace revisions also own their blobs, including immutable
+    // diff images whose objects need not be reachable from any Git ref. Read
+    // these roots under the deletion transaction so a projection published
+    // during the Git walk is protected too. Stream them once rather than
+    // scanning workspace history separately for every candidate blob.
+    {
+        let mut stmt = tx
+            .prepare("SELECT blob_oid FROM workspace_file_versions")
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        let roots = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        for root in roots {
+            live.insert(root.map_err(|err| format!("cache GC SQLite error: {err}"))?);
+        }
+    }
     let dead_analyzer = {
         let mut stmt = tx
             .prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")

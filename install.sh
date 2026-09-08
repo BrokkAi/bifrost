@@ -82,11 +82,28 @@ download_file() {
   curl "${args[@]}" -o "$dest" "$url"
 }
 
-# GNU/Linux release binaries require glibc. Detect musl before consulting the
-# release so the error cannot be mistaken for a missing asset.
+# GNU/Linux release binaries require glibc. Prefer positive glibc evidence so
+# a glibc host with a musl loader installed is not mistaken for musl.
 detect_linux_libc() {
-  if ldd --version 2>&1 | grep -qi musl; then
+  local gnu_libc_version
+  local ldd_version
+
+  gnu_libc_version="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  if [[ "$gnu_libc_version" == glibc[[:space:]]* ]]; then
+    printf 'gnu\n'
+    return 0
+  fi
+
+  # musl's ldd reports its version and exits with status 1. Capture its output
+  # before matching it so set -euo pipefail cannot discard the evidence or
+  # turn a short-circuiting grep into a SIGPIPE failure.
+  ldd_version="$(ldd --version 2>&1 || true)"
+  if [[ "$ldd_version" == *musl* ]]; then
     printf 'musl\n'
+    return 0
+  fi
+  if [[ "$ldd_version" == *'GNU libc'* || "$ldd_version" == *GLIBC* || "$ldd_version" == *glibc* ]]; then
+    printf 'gnu\n'
     return 0
   fi
   if compgen -G '/lib/ld-musl-*' >/dev/null 2>&1; then

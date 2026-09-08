@@ -34,10 +34,11 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, which contains fifteen
-structured policies: ten match policies and five assertion policies. It covers
+The installed binary embeds `bifrost.code-smells`, which contains seventeen
+structured policies. It covers
 dynamic evaluation, unsafe Python object deserialization, success-gated Go API
 results, wrong zero-valued errors returned from exact Go API failure paths,
+Go data races and Proven Python absent-member accesses,
 rayon parallelism inside blocking Rust lazy initializers,
 loop-invariant sorting, and review prompts for regular-expression compilation,
 file reads, serialization, parsing, database calls, network calls,
@@ -45,6 +46,15 @@ subprocesses, sleep, and expensive operations beneath nested loops. Every rule
 is an ordinary checked-in `.rqlp` source with a stable ID and semantic hash;
 its pack manifest also records the category, claimed languages, required
 capabilities, severity rationale, and remediation.
+
+Version 2.11 adds `bifrost.correctness.python-absent-member`. It follows caller
+values to a member access and reports only a fully classified receiver whose
+complete class surface proves the member absent. Unknown receivers, unresolved
+bases, dynamic attributes, and incomplete member models suppress a finding.
+Missing Python declaration-model coverage makes the run inconclusive. A clean
+run means no Proven absence was found, not that every runtime receiver was
+classified. Inspect `(witness (absent-member ...))` for the retained origin-to-
+access evidence; missing or truncated evidence is explicitly labeled.
 
 ### Built-in security pack
 
@@ -989,26 +999,43 @@ is never asserted.
 
 #### Completeness in a relational plan
 
-A relational assertion counts rows, so the one completeness signal it can act
-on is a bound row that says its own producer suppressed the row *set* it heads.
-Today exactly one row says that: a `call_shape` row whose `coverage` is not
-`exact`. A macro-derived or otherwise unreadable argument list emits no
+A relational assertion counts rows, so it is sensitive to a set that is empty
+because nobody could read it rather than because it is genuinely empty. Today
+exactly one producer suppresses a set that way: a call shape whose `coverage`
+is not `exact`. A macro-derived or otherwise unreadable argument list emits no
 argument-group and no argument row at all, precisely so it cannot look
-byte-identical to a real zero-argument call, and binding such a row makes the
-whole run inconclusive rather than clean.
+byte-identical to a real zero-argument call.
 
-That signal lives on the mandatory `call_shape` row, so a plan that asserts
-anything about a call's arguments must bind that row. A plan that binds only
-the projected argument rows sees a legitimately empty set for a macro-derived
-site and reports it clean:
+A suppressed shape reports that gap on **every row family derived from it**,
+not only on the `call_shape` row itself. Deriving the shape emits a
+`call_shape_coverage_incomplete` diagnostic of `incomplete` impact naming the
+site and the coverage that suppressed it, so the query that projects
+`call_argument_groups`, `call_arguments` or `call_bindings` from that shape is
+`incomplete` too, and the run that binds any of them is inconclusive rather
+than clean. Both of these plans therefore reach the same verdict, for the same
+reason, on the same macro-derived site:
 
 ```lisp
+; Binds the mandatory shape row beside the arguments it heads.
 (bind :name shape :query (rql (call-shape (occurrences :role [member_position]))))
 (bind :name arg :query
   (rql (call-arguments (call-argument-groups
     (call-shape (occurrences :role [member_position]))))))
 (join :left shape :right arg :on ((site_id site_id)))
 ```
+
+```lisp
+; Binds only the projected argument rows. The suppressed shape they were
+; derived from still makes the run inconclusive (issue #1949).
+(bind :name arg :query
+  (rql (call-arguments (call-argument-groups
+    (call-shape (occurrences :role [member_position]))))))
+```
+
+Binding the shape row remains worth writing when your invariant reads the
+shape's own fields -- its `coverage`, `call_kind` or `callee_name` -- or when
+you need the site to appear in the join even where it has no arguments. It is
+no longer the only way to keep a suppressed shape from reading as clean.
 
 Nothing weaker poisons the run. An `unknown_shape` overload summary, an
 undecided candidate verdict, and a signature whose arity the language never
@@ -2303,6 +2330,26 @@ identity, so an edit that adds a tracked object in one file leaves every other
 finding's identity where it was. Editing the policy document's automaton does
 re-key the findings that policy reports, because a different protocol is a
 different rule.
+
+A tracked object's semantic identity names each declaration it was acquired
+through -- the file, the type, the enclosing function -- by that declaration's
+kind, name and ordinal among its same-kind siblings, never by a byte span of
+the file or the type that contains it. An edit somewhere else in a file that
+declares an acquisition callee therefore leaves the identity where it was.
+
+The one byte span such an identity does carry is the span of the procedure or
+call site the locator itself names, and it is measured from the start of the
+declaration that contains it rather than from the start of the file. An edit
+that makes a declaration longer moves every byte below it in that file, so a
+file-relative span would re-key every locator under the edit; a span measured
+from its own declaration does not move at all unless that declaration's own
+text changes. A locator that names a class-level member from inside a method
+is the exception, because the member is a sibling of the method rather than a
+part of it; such a span is marked as such and stays file-relative.
+
+What still re-keys a finding is an edit to the violating site's own source
+slice, to the text of the declaration a locator sits in above that locator, or
+to the declaration path any of these locators names.
 
 ### What a second run reuses
 

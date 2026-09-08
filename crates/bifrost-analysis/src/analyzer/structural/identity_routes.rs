@@ -12,9 +12,10 @@
 //! one consumer. Here they become per-file rows derived from producers that
 //! already compute them — occurrence-row resolution for import/export/alias
 //! sites, the type-alias capability for alias declarations, `FqName` parents
-//! for nested owners, and two analyzer capabilities (partial parts, abstract
-//! member implementations) — plus one cycle-safe bounded traversal over the
-//! rows, forward and inverse, so a round trip is checkable.
+//! for nested owners, and three analyzer capabilities (partial parts, abstract
+//! member implementations, declaration/definition peers) — plus one cycle-safe
+//! bounded traversal over the rows, forward and inverse, so a round trip is
+//! checkable.
 //!
 //! The load-bearing properties are the sibling layers': grammar and language
 //! knowledge stays behind adapter hooks and analyzer capabilities; endpoints
@@ -119,6 +120,38 @@ pub fn physical_occurrences(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Ph
     occurrences
 }
 
+/// One declaration head paired with the definition body that completes it: a
+/// C++ prototype and the out-of-line function body it declares (issue #1650).
+///
+/// `body_range` is the body occurrence's own range, never the body
+/// declaration's merged range list, so a row built from this pair points at
+/// the occurrence that makes the relation real. `head` and `body` are always
+/// distinct declarations: two occurrences of one declaration are one identity
+/// with two physical ranges, which is the physical-grouping answer rather than
+/// an indirection hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationDefinitionPeer {
+    /// The declaration whose occurrence in the queried file is a head.
+    pub head: CodeUnit,
+    /// The declaration that carries the definition body, here or in another
+    /// file.
+    pub body: CodeUnit,
+    /// The body occurrence's own range, inside `body.source()`.
+    pub body_range: Range,
+}
+
+/// One file's declaration/definition peers, and whether the adapter could read
+/// every occurrence it needed to pair them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclarationDefinitionPeers {
+    pub peers: Vec<DeclarationDefinitionPeer>,
+    /// At least one occurrence of a declaration this file anchors could not be
+    /// read as a head or a body, so `peers` can be short of the whole truth.
+    /// The file's completeness says so, rather than letting a missing row read
+    /// as an absence the adapter never established.
+    pub unclassified_occurrences: bool,
+}
+
 /// One end of a route relation: a declaration, or a binder/export site that
 /// is not itself a declaration (an import's local name, an export specifier).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +228,10 @@ pub enum RouteRelationIncompleteReason {
     /// computes is the case this exists for: membership decides whether an
     /// import re-exports, and an unreadable `__all__` settles it neither way.
     IndirectionUnclassified,
+    /// An occurrence the declaration/definition peer producer had to read as a
+    /// head or a body could not be read as either, so a peer of this file can
+    /// be missing from the rows (issue #1650).
+    PeerOccurrenceUnclassified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +269,11 @@ impl RouteRelationCompleteness {
                             relation,
                             RouteHopKind::Import | RouteHopKind::Export | RouteHopKind::ReExport
                         ),
+                        // An occurrence the peer producer could not read leaves
+                        // only the peer relation short.
+                        RouteRelationIncompleteReason::PeerOccurrenceUnclassified => {
+                            relation == RouteHopKind::DeclarationDefinitionPeer
+                        }
                         RouteRelationIncompleteReason::NoStructuralAdapter
                         | RouteRelationIncompleteReason::FactsUnavailable
                         | RouteRelationIncompleteReason::OccurrenceRowsIncomplete => true,
@@ -337,7 +379,7 @@ pub fn route_relations_for_file(
         }
     }
 
-    declaration_relation_rows(analyzer, file, support, &mut rows);
+    declaration_relation_rows(analyzer, file, support, &mut rows, &mut reasons);
 
     Ok(RouteRelationsFileResult {
         rows,
@@ -561,13 +603,48 @@ fn type_alias_rows(
 }
 
 /// Declaration-anchored relations: nested owners from `FqName` parents,
-/// partial parts, and abstract-member implementations.
+/// partial parts, abstract-member implementations, and declaration/definition
+/// peers. Notes in `reasons` whichever occurrence the peer producer could not
+/// read.
 fn declaration_relation_rows(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     support: &super::routes::IdentityRouteSupport,
     rows: &mut Vec<RouteRelationRow>,
+    reasons: &mut Vec<RouteRelationIncompleteReason>,
 ) {
+    // The peer relation is asked once for the whole file, not once per
+    // declaration: an adapter labels a head and a body by classifying the
+    // file's occurrences in one pass, and a head's body routinely lives in
+    // another file (issue #1650). Several bodies for one head are several
+    // rows, each with its own provenance: two definitions of one external
+    // callable are an ODR violation the rows state rather than hide.
+    if support.supports_relation(RouteHopKind::DeclarationDefinitionPeer)
+        && let Some(peers) = analyzer.declaration_definition_peers(file)
+    {
+        if peers.unclassified_occurrences {
+            note(
+                reasons,
+                RouteRelationIncompleteReason::PeerOccurrenceUnclassified,
+            );
+        }
+        for peer in peers.peers {
+            debug_assert_ne!(
+                peer.head, peer.body,
+                "a peer relates two declarations; one declaration's own occurrences are its physical grouping"
+            );
+            let provenance = RouteProvenance {
+                file: peer.body.source().clone(),
+                range: Some(peer.body_range),
+            };
+            rows.push(RouteRelationRow {
+                kind: RouteHopKind::DeclarationDefinitionPeer,
+                from: RouteEndpoint::Declaration(peer.head),
+                to: RouteEndpoint::Declaration(peer.body),
+                provenance,
+            });
+        }
+    }
     let declarations: Vec<CodeUnit> = analyzer.declarations(file).into_iter().collect();
     for unit in &declarations {
         if support.supports_relation(RouteHopKind::NestedOwner)

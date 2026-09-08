@@ -33,15 +33,16 @@ use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::extractor::{QualifiedReceiverBase, qualified_receiver_base};
 use brokk_bifrost_cpp::graph::resolver::lexical_component_tiers;
 use brokk_bifrost_cpp::graph::resolver::{
-    CppClassDeclarationStrength, OrdinaryMacroReferenceResolution, anonymous_aggregate_owner,
-    c_offsetof_member_parts, cpp_alias_declaration_names_function_type,
+    CppClassDeclarationStrength, MacroLocalBinding, OrdinaryMacroReferenceResolution,
+    anonymous_aggregate_owner, c_offsetof_member_parts, cpp_alias_declaration_names_function_type,
     cpp_alias_declaration_target_text, cpp_class_declaration_strength,
-    cpp_field_declaration_names_function_type, cpp_member_using_declaration_scopes,
-    cpp_qualified_name_has_scope_suffix, guard_requirements_hold_at_reference,
-    is_c_offsetof_member_node, is_c_sizeof_expression_type_candidate, is_c_source_file,
-    is_type_shaped_template_argument_name, preprocessor_guard_environment,
-    recovered_c_new_expression_argument_at, recovered_macro_decorated_declarator_type,
-    same_logical_symbol, same_visible_symbol,
+    cpp_field_declaration_names_function_type, cpp_field_expression_receiver,
+    cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix,
+    guard_requirements_hold_at_reference, is_c_offsetof_member_node,
+    is_c_sizeof_expression_type_candidate, is_c_source_file, is_type_shaped_template_argument_name,
+    preprocessor_guard_environment, recovered_c_new_expression_argument_at,
+    recovered_macro_decorated_declarator_type, same_logical_symbol, same_visible_symbol,
+    type_owner_of,
 };
 use std::time::Instant;
 
@@ -1461,10 +1462,7 @@ fn resolve_cpp_bounded_member(
             "C++ field expression has no supported member name",
         );
     };
-    let Some(receiver) = field
-        .child_by_field_name("argument")
-        .or_else(|| field.named_child(0))
-    else {
+    let Some(receiver) = cpp_field_expression_receiver(field) else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
     let member = cpp_node_text(member_node, source);
@@ -5538,7 +5536,7 @@ fn resolve_cpp_call(
                     }
                 }
             }
-            if let Some(owner) = cpp_enclosing_class(
+            let enclosing_classes = cpp_enclosing_class(
                 ctx.analyzer,
                 ctx.support,
                 ctx.visibility,
@@ -5546,7 +5544,14 @@ fn resolve_cpp_call(
                 ctx.source,
                 ctx.root,
                 name_node.start_byte(),
-            ) {
+            )
+            .map(|innermost| cpp_enclosing_class_chain(ctx.analyzer, innermost))
+            .unwrap_or_default();
+            // Unqualified lookup inside a nested class searches the nested class,
+            // then each lexically enclosing class outward, and stops at the first
+            // one that declares the name: a same-named member of the nested class
+            // hides the enclosing one (#3095).
+            for owner in enclosing_classes {
                 let (member_candidates, had_member_callable) = if call_arity.is_none() {
                     cpp_member_candidates_lazy_with_presence(
                         ctx,
@@ -5672,56 +5677,55 @@ fn resolve_cpp_call(
                 if !later.is_empty() {
                     return cpp_callable_candidates_outcome(later);
                 }
-
-                // A file-scope function-pointer variable is an indexed global
-                // field, not a function CodeUnit. Preserve that declaration
-                // identity, but prove callability from its structured
-                // declarator or from the structured typedef it names. A scalar
-                // field must not become callable merely because it appears in
-                // call-expression position (#2404).
-                let lexical_namespace = cpp_lexical_namespace(function, ctx.source);
-                let expected_name = lexical_namespace
-                    .as_deref()
-                    .filter(|namespace| !namespace.is_empty())
-                    .map_or_else(
-                        || name.to_string(),
-                        |namespace| format!("{namespace}::{name}"),
-                    );
-                let callable_variables = cpp_visible_name_candidates(
-                    ctx.analyzer,
-                    token,
-                    ctx.visibility,
+            }
+            // A file-scope function-pointer variable is an indexed global
+            // field, not a function CodeUnit. Preserve that declaration
+            // identity, but prove callability from its structured
+            // declarator or from the structured typedef it names. A scalar
+            // field must not become callable merely because it appears in
+            // call-expression position (#2404). A function-pointer variable
+            // called through its own name is the same construct in C and in
+            // C++ -- ggml's `rpcmem_alloc_pfn` and its `.cpp` callers are the
+            // C++ half -- so this route is not part of the C-only recovery
+            // above (#2551).
+            let lexical_namespace = cpp_lexical_namespace(function, ctx.source);
+            let expected_name = lexical_namespace
+                .as_deref()
+                .filter(|namespace| !namespace.is_empty())
+                .map_or_else(
+                    || name.to_string(),
+                    |namespace| format!("{namespace}::{name}"),
+                );
+            let callable_variables = cpp_visible_name_candidates(
+                ctx.analyzer,
+                token,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                name,
+                Some(CppTargetKind::GlobalField),
+                lexical_namespace.as_deref(),
+            )
+            .into_iter()
+            .filter(|candidate| cpp_name_for(candidate) == expected_name)
+            .filter(|candidate| {
+                ctx.visibility.external_type_candidate_visible_in_context(
+                    &ctx_dispatch.source(),
                     ctx.file,
-                    ctx.support,
-                    name,
-                    Some(CppTargetKind::GlobalField),
-                    lexical_namespace.as_deref(),
+                    candidate,
+                    call,
                 )
-                .into_iter()
-                .filter(|candidate| cpp_name_for(candidate) == expected_name)
-                .filter(|candidate| {
-                    ctx.visibility.external_type_candidate_visible_in_context(
-                        &ctx_dispatch.source(),
-                        ctx.file,
-                        candidate,
-                        call,
-                    )
-                })
-                .filter(|candidate| {
-                    ctx.analyzer
-                        .get_source(candidate, false)
-                        .is_some_and(|declaration| {
-                            cpp_field_declaration_names_function_type(
-                                &declaration,
-                                candidate.identifier(),
-                            )
-                        })
-                        || cpp_field_declared_type(
-                            ctx.analyzer,
-                            ctx.visibility,
-                            ctx.file,
-                            candidate,
+            })
+            .filter(|candidate| {
+                ctx.analyzer
+                    .get_source(candidate, false)
+                    .is_some_and(|declaration| {
+                        cpp_field_declaration_names_function_type(
+                            &declaration,
+                            candidate.identifier(),
                         )
+                    })
+                    || cpp_field_declared_type(ctx.analyzer, ctx.visibility, ctx.file, candidate)
                         .into_iter()
                         .flat_map(|field_type| {
                             let mut aliases = cpp_visible_name_candidates(
@@ -5747,11 +5751,10 @@ fn resolve_cpp_call(
                                     )
                                 })
                         })
-                })
-                .collect::<Vec<_>>();
-                if !callable_variables.is_empty() {
-                    return candidates_outcome(callable_variables);
-                }
+            })
+            .collect::<Vec<_>>();
+            if !callable_variables.is_empty() {
+                return candidates_outcome(callable_variables);
             }
             let macros = cpp_macro_candidates(
                 ctx.analyzer,
@@ -6239,10 +6242,7 @@ fn resolve_cpp_field(
         );
     };
     let member = cpp_node_text(name_node, ctx.source);
-    let Some(receiver) = field
-        .child_by_field_name("argument")
-        .or_else(|| field.named_child(0))
-    else {
+    let Some(receiver) = cpp_field_expression_receiver(field) else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
     let external_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
@@ -6264,6 +6264,20 @@ fn resolve_cpp_field(
         field,
         receiver,
     );
+    // A complete C++ class scope sees all of its members, including members
+    // declared later in the class body. Preserve that language rule only when
+    // the structured receiver and physical enclosing class identify the same
+    // owner; an arbitrary object expression outside the class must still obey
+    // declaration-before-reference visibility.
+    let enclosing_receiver_owner = ctx
+        .class_ranges
+        .and_then(|ranges| ranges.enclosing_unit(name_node.start_byte()))
+        .filter(|enclosing| {
+            owners
+                .iter()
+                .any(|owner| same_visible_symbol(owner, enclosing))
+        })
+        .cloned();
     // Two unrelated failures used to share one message. Claiming the receiver
     // is unresolved when it typed perfectly well sent the whole class-template
     // inherited-lookup family's triage at receiver analysis instead of at the
@@ -6273,15 +6287,23 @@ fn resolve_cpp_field(
     let mut candidates = cpp_member_candidates(ctx, token, owners, member, arity, arg_types);
     candidates.retain(|candidate| candidate.is_field() || candidate.is_callable());
     let dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
+    let graph = dispatch.source();
     let visible_declarations = candidates
         .iter()
         .filter(|candidate| {
-            ctx.visibility.declaration_visible_at_reference(
-                &dispatch.source(),
-                ctx.file,
-                candidate,
-                name_node,
-            )
+            ctx.visibility
+                .declaration_visible_at_reference(&graph, ctx.file, candidate, name_node)
+                || (candidate.is_callable()
+                    && enclosing_receiver_owner.as_ref().is_some_and(|enclosing| {
+                        type_owner_of(&graph, candidate).is_some_and(|candidate_owner| {
+                            same_visible_symbol(&candidate_owner, enclosing)
+                        })
+                    })
+                    && ctx
+                        .visibility
+                        .same_file_callable_guard_compatible_ignoring_order(
+                            &graph, ctx.file, candidate, name_node,
+                        ))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -6293,7 +6315,7 @@ fn resolve_cpp_field(
                     && cpp_callable_definitions_share_identity_evidence_with_visibility(
                         ctx.analyzer,
                         token,
-                        &dispatch.source(),
+                        &graph,
                         ctx.visibility,
                         declaration,
                         candidate,
@@ -6680,7 +6702,10 @@ fn cpp_is_terminal_declarator_name(node: Node<'_>) -> bool {
 fn cpp_declares_terminal_name(container: Node<'_>, target: Node<'_>) -> bool {
     let target = cpp_terminal_declarator_name_target(target);
     let mut cursor = container.walk();
-    for declarator in container.children_by_field_name("declarator", &mut cursor) {
+    for child in container.named_children(&mut cursor) {
+        let Some(declarator) = cpp_declaration_declarator(container, child) else {
+            continue;
+        };
         if cpp_declarator_name_node(declarator).is_some_and(|name| cpp_same_node(name, target)) {
             return true;
         }
@@ -8170,9 +8195,7 @@ fn cpp_field_expression_type(
     let member = field
         .child_by_field_name("field")
         .map(|field| cpp_node_text(field, source))?;
-    let receiver = field
-        .child_by_field_name("argument")
-        .or_else(|| field.named_child(0))?;
+    let receiver = cpp_field_expression_receiver(field)?;
     let owners = cpp_field_receiver_type_units(
         analyzer, token, support, visibility, file, source, root, field, receiver,
     );
@@ -8418,6 +8441,20 @@ fn cpp_identifier_value_type(
     name: &str,
     bindings: &LocalInferenceEngine<CppType>,
 ) -> Option<CppType> {
+    // A function-like macro can introduce a local declaration whose spelling
+    // is visible at this receiver after substitution. Resolve that binding at
+    // the receiver range first: the macro-local declaration shadows a caller
+    // local with the same name, even when its type cannot be proven.
+    if let Some(binding) = ctx.visibility.macro_local_binding_at(
+        ctx.file,
+        ctx.root,
+        ctx.source,
+        node.start_byte(),
+        node.end_byte(),
+    ) && binding.name == name
+    {
+        return cpp_macro_local_binding_type(ctx, token, node, binding);
+    }
     if let Some(cpp_type) = first_precise(bindings, name) {
         return Some(cpp_type);
     }
@@ -8445,6 +8482,48 @@ fn cpp_identifier_value_type(
             .iter()
             .filter(|unit| unit.is_field()),
     )
+}
+
+/// Convert the structured declaration recovered from a function-like macro to
+/// the same value type used by ordinary local binding inference. Seeding a
+/// temporary engine keeps all of the existing C++ type-node handling in one
+/// place; a proven unit bypasses that path when the macro resolver already
+/// established the declaration's identity.
+fn cpp_macro_local_binding_type(
+    ctx: CppLookupCtx<'_, '_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+    binding: MacroLocalBinding<'_>,
+) -> Option<CppType> {
+    if let Some(unit) = binding.proven_unit {
+        return Some(CppType {
+            name: normalize_cpp_type_name(&binding.type_name),
+            unit: Some(unit),
+            indirection: binding.pointer_depth,
+            pointee_const: false,
+            alias_unit: None,
+        });
+    }
+
+    let mut macro_bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let namespace_node = binding.type_node.unwrap_or(node);
+    cpp_seed_binding(
+        ctx.analyzer,
+        token,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        cpp_lexical_namespace(namespace_node, ctx.source).as_deref(),
+        &binding.name,
+        Some(&binding.type_name),
+        binding.type_node,
+        binding.pointer_depth,
+        None,
+        None,
+        &mut macro_bindings,
+    );
+    first_precise(&macro_bindings, &binding.name)
 }
 
 fn cpp_identifier_receiver_type_units(
@@ -8653,15 +8732,32 @@ fn cpp_enclosing_class_member_candidates(
     let Some(ranges) = class_ranges else {
         return Vec::new();
     };
-    let mut owner = ranges.enclosing_unit(node.start_byte()).cloned();
-    while let Some(current) = owner {
-        let candidates = candidates_for_owner(&current);
-        if !candidates.is_empty() {
-            return candidates;
-        }
-        owner = analyzer.parent_of(&current).filter(CodeUnit::is_class);
-    }
-    Vec::new()
+    let Some(innermost) = ranges.enclosing_unit(node.start_byte()).cloned() else {
+        return Vec::new();
+    };
+    let chain = cpp_enclosing_class_chain(analyzer, innermost);
+    chain
+        .iter()
+        .map(candidates_for_owner)
+        .find(|candidates| !candidates.is_empty())
+        .unwrap_or_default()
+}
+
+/// The lexically enclosing classes at a site, innermost first. C++ unqualified
+/// lookup walks this chain outward before it reaches the enclosing namespaces,
+/// and stops at the first class that declares the name.
+fn cpp_enclosing_class_chain(analyzer: &dyn IAnalyzer, innermost: CodeUnit) -> Vec<CodeUnit> {
+    // The innermost owner is whatever enclosing-owner resolution produced, so
+    // it is kept as given; only the walk outward is filtered to classes.
+    let mut chain = vec![innermost.clone()];
+    chain.extend(
+        crate::analyzer::usages::common::enclosing_owner_chain(innermost, |unit| {
+            analyzer.parent_of(unit)
+        })
+        .skip(1)
+        .take_while(CodeUnit::is_class),
+    );
+    chain
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9041,19 +9137,43 @@ fn cpp_bindings_before_with_reference_guards(
     #[cfg(test)]
     CPP_BINDINGS_BUILD_COUNT.with(|count| count.set(count.get() + 1));
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    if let Some(function) = cpp_macro_fractured_function_before(root, cutoff_start) {
+    let fractured = cpp_macro_fractured_function_before(root, cutoff_start).or_else(|| {
+        reference_node.and_then(|reference| {
+            crate::analyzer::lexical_definitions::cpp_recovered_function_body(
+                reference,
+                cutoff_start,
+            )
+        })
+    });
+    if let Some(function) = fractured {
         // A multiline block-like macro defined inside a C function can make
         // tree-sitter close the function at the macro's `do` body and parse
-        // the remaining statements as translation-unit siblings. Seed the
-        // declaration prefix from that still-structured function fragment;
-        // the ordinary active-path walk below handles the sibling statement
+        // the remaining statements as translation-unit siblings. A `#if` that
+        // cuts an `if`/`else` chain closes the function early the same way, and
+        // then the orphaned statements can sit below further conditionals
+        // (#3091); the lexical binder's structural proof recognises both. Seed
+        // the declaration prefix from the still-structured function fragment;
+        // the ordinary active-path walk below handles the orphaned statement
         // containing the reference.
+        //
+        // The fragment is not an ancestor of the reference, so the walk's own
+        // containment test says nothing about which of its declarations the
+        // reference can see. Read the reference's guards and let the guard
+        // test decide, which keeps a contradicting `#else` branch's
+        // declaration out.
+        let derived_guards = reference_guards
+            .is_none()
+            .then(|| {
+                reference_node
+                    .and_then(|reference| preprocessor_guard_environment(reference, ctx.source))
+            })
+            .flatten();
         cpp_seed_active_path(
             ctx,
             token,
             function,
             function.end_byte().saturating_sub(1),
-            reference_guards,
+            reference_guards.or(derived_guards.as_ref()),
             reference_node,
             &mut bindings,
         );

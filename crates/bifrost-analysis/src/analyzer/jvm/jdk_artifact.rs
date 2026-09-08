@@ -9,6 +9,7 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Visibility, carried_source_paths, read_exact_artifact_while,
 };
+use crate::analyzer::tree_walk::push_named_children_reversed;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::declarations::{node_text, parse_tree};
 use std::io::{Cursor, Read};
@@ -586,11 +587,7 @@ fn exported_module_packages(source: &str) -> Option<HashSet<String>> {
             }
             continue;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     Some(exports)
 }

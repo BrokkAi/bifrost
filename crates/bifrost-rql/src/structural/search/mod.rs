@@ -330,7 +330,7 @@ use semantic::{
     SemanticProgramPointValue, SemanticQueryContext,
 };
 use taint::SemanticTaintFindingValue;
-use type_flow::{AbsentMemberFindingValue, ClassSetRowValue};
+use type_flow::{AbsentMemberFindingValue, AbsentMemberWitnessValue, ClassSetRowValue};
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 use units::unit_row_key;
 pub use units::{
@@ -374,6 +374,8 @@ use brokk_bifrost_rql::{
 };
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryAbsentMemberFinding;
+pub use results::CodeQueryAbsentMemberWitness;
+pub use results::CodeQueryAbsentMemberWitnessStatus;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryBudgetedWork;
 pub use results::CodeQueryCallArgument;
@@ -1038,6 +1040,7 @@ enum SemanticPipelineValue {
     TypestateWitness(SemanticTypestateWitnessValue),
     FlowEndpoint(Box<SemanticFlowEndpointValue>),
     FlowWitness(SemanticFlowWitnessValue),
+    AbsentMemberWitness(AbsentMemberWitnessValue),
     TaintFinding(Box<SemanticTaintFindingValue>),
 }
 
@@ -1122,10 +1125,20 @@ enum SemanticPipelineKey {
     TypestateWitness(String),
     FlowEndpoint(String),
     FlowWitness(String),
+    AbsentMemberWitness(String),
     TaintFinding(String),
 }
 
 impl PipelineValue {
+    /// Set identity does not include the evidence used to establish a value.
+    /// Preserve independent caller contexts when equal finding rows combine.
+    fn merge_evidence(&mut self, other: Self) {
+        if let (Self::AbsentMemberFinding(value), Self::AbsentMemberFinding(other)) = (self, other)
+        {
+            value.merge_evidence(*other);
+        }
+    }
+
     fn key(&self) -> PipelineKey {
         match self {
             Self::StructuralMatch(seed) => {
@@ -1240,6 +1253,9 @@ impl SemanticPipelineValue {
             Self::FlowWitness(witness) => {
                 SemanticPipelineKey::FlowWitness(witness.key().to_string())
             }
+            Self::AbsentMemberWitness(witness) => {
+                SemanticPipelineKey::AbsentMemberWitness(witness.key().to_string())
+            }
             Self::TaintFinding(finding) => {
                 SemanticPipelineKey::TaintFinding(finding.key().to_string())
             }
@@ -1256,6 +1272,7 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(value) => value.file(),
             Self::FlowEndpoint(value) => value.file(),
             Self::FlowWitness(value) => value.file(),
+            Self::AbsentMemberWitness(value) => value.file(),
             Self::TaintFinding(value) => value.file(),
         }
     }
@@ -1286,6 +1303,9 @@ impl SemanticPipelineValue {
             Self::FlowWitness(value) => CodeQueryResultValue::FlowWitness {
                 value: Box::new(value.public),
             },
+            Self::AbsentMemberWitness(value) => CodeQueryResultValue::AbsentMemberWitness {
+                value: Box::new(value.public),
+            },
             Self::TaintFinding(value) => CodeQueryResultValue::TaintFinding {
                 value: Box::new(value.public),
             },
@@ -1302,6 +1322,7 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(value) => value.public_ref(),
             Self::FlowEndpoint(value) => value.public_ref(),
             Self::FlowWitness(value) => value.public_ref(),
+            Self::AbsentMemberWitness(value) => value.public_ref(),
             Self::TaintFinding(value) => value.public_ref(),
         }
     }
@@ -1406,6 +1427,18 @@ impl SemanticPipelineValue {
                 key: DetailedCodeQueryKey::FlowWitness {
                     id: value.public.id.clone(),
                     endpoint_id: value.public.endpoint_id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
+            Self::AbsentMemberWitness(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::AbsentMemberWitness,
+                key: DetailedCodeQueryKey::AbsentMemberWitness {
+                    id: value.public.id.clone(),
+                    finding_id: value.public.finding_id.clone(),
                 },
                 file: value.file(),
                 byte_span: value.byte_span(),
@@ -1527,6 +1560,10 @@ struct CallTraversalCache {
     reported_outgoing: HashSet<CodeUnit>,
     bindings: CallBindingCache,
     effects: EffectTraversalCache,
+    /// Call sites whose suppressed-shape incompleteness has already been
+    /// reported, keyed by `site_ast_id`. One site reached by many pipeline
+    /// rows states its gap once (#1949).
+    reported_suppressed_shapes: HashSet<String>,
 }
 
 impl CallTraversalCache {
@@ -3504,6 +3541,16 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         parallel_seed_budget: None,
         scheduler_workers,
     };
+    let python_gate_file = {
+        let files = state
+            .scope
+            .seed_files()
+            .map_or_else(|| analyzer.analyzed_files(), |files| files.to_vec());
+        python_absent_member_file(&query.plan, &files)
+    };
+    if let (Some(file), Some(semantic)) = (python_gate_file.as_ref(), state.semantic.as_mut()) {
+        semantic.require_python_absent_member_declaration_surface(file);
+    }
     let mut profile_branch = state.profile.as_ref().map(|_| Vec::new());
     let execution_started = capture_profile.then(Instant::now);
     let mut execution = execute_plan(
@@ -5204,7 +5251,7 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         }
         PipelineValue::AbsentMemberFinding(value) => {
             files.insert(value.file().clone());
-            files.insert(value.origin_file.clone());
+            files.extend(value.roots.iter().map(|root| root.origin_file.clone()));
         }
         PipelineValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());
@@ -5369,7 +5416,7 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::AbsentMemberFinding(value) => {
             files.insert(value.file().clone());
-            files.insert(value.origin_file.clone());
+            files.extend(value.roots.iter().map(|root| root.origin_file.clone()));
         }
         PipelineTraceValue::DetachedTaskTransfer(value) => {
             files.insert(value.file().clone());

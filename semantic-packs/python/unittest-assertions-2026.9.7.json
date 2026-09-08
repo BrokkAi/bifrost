@@ -1,0 +1,120 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.python-stdlib-assertions",
+  "version": "2026.9.7",
+  "producer": {
+    "name": "bifrost-python-reviewed",
+    "version": "1.0.0"
+  },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.8.24, <1.0.0",
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.10.0, <3.15.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "https://github.com/python/cpython/blob/v3.13.5/Lib/unittest/case.py",
+    "revision": "v3.13.5"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "python.unittest.assertions",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "cpython",
+            "version": ">=3.10.0, <3.15.0"
+          },
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "unittest.case.testcase.assertisinstance-2",
+            "target": {
+              "path": "unittest/case.pyi",
+              "symbol": "unittest.case.TestCase.assertIsInstance(obj, cls)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "transfers": [],
+            "normal_return_type_refinements": [
+              {
+                "parameter_ordinal": 0,
+                "class_parameter_ordinal": 1,
+                "required_receiver_members": [
+                  "fail"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "unittest.case.testcase.assertisinstance-3",
+            "target": {
+              "path": "unittest/case.pyi",
+              "symbol": "unittest.case.TestCase.assertIsInstance(obj, cls, msg)",
+              "has_receiver": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "transfers": [],
+            "normal_return_type_refinements": [
+              {
+                "parameter_ordinal": 0,
+                "class_parameter_ordinal": 1,
+                "required_receiver_members": [
+                  "fail"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "dataclasses.dataclass-identity",
+            "target": {
+              "path": "dataclasses.pyi",
+              "symbol": "dataclasses.dataclass(args)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": false,
+            "transfers": [],
+            "class_decorator_identity": {
+              "direct": true,
+              "factory_keywords": [
+                {"name": "init", "allowed_values": [false, true]},
+                {"name": "repr", "allowed_values": [false, true]},
+                {"name": "eq", "allowed_values": [false, true]},
+                {"name": "order", "allowed_values": [false, true]},
+                {"name": "unsafe_hash", "allowed_values": [false, true]},
+                {"name": "frozen", "allowed_values": [false, true]},
+                {"name": "match_args", "allowed_values": [false, true]},
+                {"name": "kw_only", "allowed_values": [false, true]},
+                {"name": "slots", "allowed_values": [false]},
+                {"name": "weakref_slot", "allowed_values": [false]}
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

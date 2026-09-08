@@ -4,6 +4,7 @@
 //! declaration source comes from the analyzer, so `analyzer/cpp/clones.rs` keeps
 //! the ~12-LOC entry point; everything that knows C++ is here.
 
+use brokk_bifrost_core::analyzer::tree_walk::push_children_reversed;
 use tree_sitter::{Node, Parser};
 
 const CPP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &[
@@ -70,11 +71,7 @@ pub fn cpp_clone_profile(parser: &mut Parser, source: &str) -> (Vec<String>, Str
                 normalized_tokens.push(token);
             }
         }
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                stack.push(child);
-            }
-        }
+        push_children_reversed(node, &mut stack);
     }
     (normalized_tokens, ast_labels.join("|"))
 }

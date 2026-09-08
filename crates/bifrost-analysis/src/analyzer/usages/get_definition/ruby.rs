@@ -4,9 +4,11 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::RubyMethodDispatchMode;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
 use crate::analyzer::ruby::{RubyFieldScope, RubyNamePath, ruby_field_short_name};
+use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::tree_walk::push_named_children_reversed_as;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use brokk_bifrost_ruby::graph::resolver::{ReceiverType, RubyMethodFind};
+use brokk_bifrost_ruby::graph::resolver::RubyMethodFind;
 
 pub(crate) struct RubyDefinitionProvider<'a> {
     ruby: &'a RubyAnalyzer,
@@ -72,6 +74,21 @@ impl<'a> RubyDefinitionProvider<'a> {
 
     fn scope_step(&self) -> bool {
         self.session.scope_step()
+    }
+
+    fn visible_files_from(
+        &self,
+        semantic: &RubySemanticIndex<'_>,
+        file: &ProjectFile,
+    ) -> Option<HashSet<ProjectFile>> {
+        let files = self.session.query_limited_rows(|limit| {
+            let Some(files) = semantic.visible_files_from_bounded(file, limit) else {
+                return LimitedQueryRows::incomplete(Vec::new(), limit);
+            };
+            let inspected = files.len();
+            LimitedQueryRows::complete(files.into_iter().collect(), inspected)
+        });
+        (!files.is_empty()).then(|| files.into_iter().collect())
     }
 }
 
@@ -422,18 +439,56 @@ fn ruby_bounded_method_outcome(
             format!("receiver for Ruby method `{member}` is not structurally resolved"),
         );
     };
-    let mut candidates = provider
-        .members_for_owner_name(&receiver.owner_fq_name, member)
-        .into_iter()
-        .filter(|unit| {
-            unit.is_function()
-                && provider
-                    .method_dispatch_mode(unit)
-                    .is_some_and(|mode| ruby_dispatch_mode_matches(mode, receiver.mode))
-        })
-        .collect::<Vec<_>>();
-    sort_units(&mut candidates);
-    candidates.dedup();
+    let bounded_definitions = AnalyzerDefinitionLookup::new(provider.ruby, Language::Ruby);
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&bounded_definitions);
+    };
+    let scope = AnalyzerQueryScope::new(provider.ruby);
+    let semantic = RubySemanticIndex::build_for_lookup(
+        RubyGraphSource {
+            token: scope.token(),
+            index: provider.ruby,
+            definitions: &definitions,
+        },
+        provider.ruby,
+    );
+    let Some(mut visible_files) = provider.visible_files_from(&semantic, context.file) else {
+        return no_definition(
+            "ruby_resolution_budget_exhausted",
+            "Ruby visible-file resolution exceeded its bounded scope",
+        );
+    };
+    // Exact indexed owner declarations remain candidates without an explicit
+    // require edge. Admit only their bounded source set alongside the require
+    // closure; the semantic index still selects dispatch mode and precedence.
+    // Otherwise the visibility filter would erase direct-owner evidence that
+    // the bounded declaration lookup has already established.
+    visible_files.extend(
+        provider
+            .members_for_owner_name(&receiver.owner_fq_name, member)
+            .into_iter()
+            .map(|unit| unit.source().clone()),
+    );
+    if receiver.mode == RubyReceiverMode::Class && member == "new" {
+        visible_files.extend(
+            provider
+                .fqn(&receiver.owner_fq_name)
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .map(|unit| unit.source().clone()),
+        );
+    }
+    let mut candidates =
+        semantic.resolve_method_candidates(provider, &visible_files, &receiver, member);
+    if candidates.is_empty() {
+        candidates = ruby_default_constructor_candidates(
+            provider,
+            &semantic,
+            &visible_files,
+            &receiver,
+            member,
+        );
+    }
     if candidates.is_empty() {
         return no_definition(
             "ruby_inherited_or_dynamic_dispatch_unproven",
@@ -458,6 +513,48 @@ fn ruby_dispatch_mode_matches(
         ) | (RubyMethodDispatchMode::Singleton, RubyReceiverMode::Class)
             | (RubyMethodDispatchMode::ModuleFunction, _)
     )
+}
+
+fn ruby_default_constructor_candidates(
+    support: &dyn BoundedDefinitionLookup,
+    semantic: &RubySemanticIndex<'_>,
+    visible_files: &HashSet<ProjectFile>,
+    receiver: &RubyReceiverType,
+    member: &str,
+) -> Vec<CodeUnit> {
+    if member != "new" || receiver.mode != RubyReceiverMode::Class {
+        return Vec::new();
+    }
+    let mut candidates = support
+        .fqn(&receiver.owner_fq_name)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class()
+                && unit.fq_name() == receiver.owner_fq_name
+                && visible_files.contains(unit.source())
+        })
+        .collect::<Vec<_>>();
+    let initializer_receiver = RubyReceiverType {
+        owner_fq_name: receiver.owner_fq_name.clone(),
+        mode: RubyReceiverMode::Instance,
+    };
+    let inherited_initializers = semantic
+        .resolve_method_candidates(support, visible_files, &initializer_receiver, "initialize")
+        .into_iter()
+        .filter(|initializer| {
+            initializer
+                .fq_name()
+                .strip_suffix(initializer.identifier())
+                .and_then(|owner| owner.strip_suffix('.'))
+                .is_some_and(|owner| owner != receiver.owner_fq_name)
+        })
+        .collect::<Vec<_>>();
+    if !inherited_initializers.is_empty() {
+        return inherited_initializers;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 struct BoundedRubyLookupContext<'a, 'tree> {
@@ -1378,7 +1475,7 @@ fn ruby_method_outcome(
     // The traced entry points report where the winning group was found
     // (#1477). An untraced lookup takes the plain ones and records nothing.
     let mut find = None;
-    let candidates = match (bare, trace::recording()) {
+    let mut candidates = match (bare, trace::recording()) {
         (true, true) => semantic.resolve_bare_method_candidates_traced(
             support,
             visible_files,
@@ -1400,6 +1497,15 @@ fn ruby_method_outcome(
             semantic.resolve_method_candidates(support, visible_files, &receiver, member)
         }
     };
+    if candidates.is_empty() {
+        candidates = ruby_default_constructor_candidates(
+            support,
+            semantic,
+            visible_files,
+            &receiver,
+            member,
+        );
+    }
 
     if candidates.is_empty() {
         return no_definition(
@@ -1485,7 +1591,7 @@ fn ruby_stage_member_attribution(
     semantic: &RubySemanticIndex<'_>,
     support: &dyn BoundedDefinitionLookup,
     visible_files: &HashSet<ProjectFile>,
-    receiver: &ReceiverType,
+    receiver: &RubyReceiverType,
     find: &RubyMethodFind,
     winners: &[CodeUnit],
 ) {
@@ -1619,19 +1725,15 @@ impl<'a> RubyLookupContext<'a> {
             match frame {
                 RubyFrame::Enter(node) => match self.enter(node) {
                     RubyWalkAction::Descend => {
-                        for index in (0..node.named_child_count()).rev() {
-                            if let Some(child) = node.named_child(index) {
-                                stack.push(RubyFrame::Enter(child));
-                            }
-                        }
+                        push_named_children_reversed_as(node, &mut stack, |child| {
+                            RubyFrame::Enter(child)
+                        });
                     }
                     RubyWalkAction::DescendWithExit => {
                         stack.push(RubyFrame::Exit);
-                        for index in (0..node.named_child_count()).rev() {
-                            if let Some(child) = node.named_child(index) {
-                                stack.push(RubyFrame::Enter(child));
-                            }
-                        }
+                        push_named_children_reversed_as(node, &mut stack, |child| {
+                            RubyFrame::Enter(child)
+                        });
                     }
                     RubyWalkAction::Skip => {
                         reached_focus = node.start_byte() >= self.focus_start;

@@ -614,6 +614,64 @@ impl DispatchExtensibility {
     }
 }
 
+/// Which member of the override-modifier family one callable declaration
+/// states about itself.
+///
+/// The variants are mutually exclusive because the languages that have them
+/// make them so: C# rejects `virtual override`, `new override`, and
+/// `abstract virtual` alike, and Kotlin and Scala spell at most one of `open`,
+/// `abstract`, and `override`. Recording one value rather than a bag of flags
+/// is therefore a statement about the language, not a compression of it.
+///
+/// `NotDeclared` is a positive record: the adapter read the declaration's
+/// modifier nodes and none of them belongs to this family. That is a different
+/// fact from the field being absent, which means nobody looked. Method
+/// families depend on the difference: a C# member that declares no `override`
+/// *hides* the base member (compiler warning CS0108), while a member whose
+/// modifiers were never read proves nothing either way (#1721).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CallableOverrideModifier {
+    /// The adapter read the modifier nodes and found none of this family.
+    NotDeclared,
+    /// C# `virtual`, Kotlin/Scala `open`: this member may be overridden.
+    Virtual,
+    /// The member has no body and must be supplied by a subtype.
+    Abstract,
+    /// This member redefines an inherited one.
+    Override,
+    /// C# `new`: this member hides an inherited one instead of overriding it.
+    Hiding,
+}
+
+impl CallableOverrideModifier {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotDeclared => "not_declared",
+            Self::Virtual => "virtual",
+            Self::Abstract => "abstract",
+            Self::Override => "override",
+            Self::Hiding => "hiding",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "not_declared" => Some(Self::NotDeclared),
+            "virtual" => Some(Self::Virtual),
+            "abstract" => Some(Self::Abstract),
+            "override" => Some(Self::Override),
+            "hiding" => Some(Self::Hiding),
+            _ => None,
+        }
+    }
+
+    /// Whether a member carrying this modifier can be the *base* of an
+    /// override edge in a language that requires the base to opt in.
+    pub const fn is_overridable(self) -> bool {
+        matches!(self, Self::Virtual | Self::Abstract | Self::Override)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SignatureMetadata {
     label: String,
@@ -633,6 +691,17 @@ pub struct SignatureMetadata {
     /// answers the same for both shapes.
     #[serde(default)]
     result_type_identities: Vec<StructuredTypeIdentity>,
+    /// One structured identity per declared parameter, in declaration order.
+    ///
+    /// A consumer deciding whether binding a parameter preserves the caller's
+    /// object identity cannot answer from `parameters`, which records a label
+    /// and a byte range: a language that copies arguments distinguishes `*T`
+    /// from `T`, and only the structured shape carries that. An entry is
+    /// `None` where the adapter read a parameter but could not type it, and
+    /// the whole list is empty where no adapter recorded types at all, which
+    /// is distinct from recording that none are pointers.
+    #[serde(default)]
+    parameter_type_identities: Vec<Option<StructuredTypeIdentity>>,
     /// The declared type's structured right-hand side, such as the
     /// `[256]*operation` in `type JumpTable [256]*operation`.
     ///
@@ -733,6 +802,14 @@ pub struct SignatureMetadata {
     /// Whether this class-like declaration is an interface.
     #[serde(default)]
     class_like_is_interface: bool,
+    /// Which override-family modifier this callable declaration states.
+    ///
+    /// `None` means the adapter never read the declaration's modifier nodes
+    /// for this family; `Some(CallableOverrideModifier::NotDeclared)` means it
+    /// read them and the declaration states none. Method families read this to
+    /// tell overriding from hiding (#1721).
+    #[serde(default)]
+    callable_override_modifier: Option<CallableOverrideModifier>,
     /// Whether this class-like declaration has the Java `static` modifier.
     ///
     /// Java uses this fact to determine whether an unqualified reference in a
@@ -2044,6 +2121,7 @@ impl SignatureMetadata {
             return_type_text: None,
             return_type_identity: None,
             result_type_identities: Vec::new(),
+            parameter_type_identities: Vec::new(),
             underlying_type_identity: None,
             declaration_only: false,
             callable_arity: None,
@@ -2066,6 +2144,7 @@ impl SignatureMetadata {
             callable_modifiers_recorded: false,
             callable_parameter_types: None,
             callable_is_native: false,
+            callable_override_modifier: None,
             class_like_is_interface: false,
             class_like_is_static: false,
         }
@@ -2165,6 +2244,31 @@ impl SignatureMetadata {
         self
     }
 
+    /// Record which override-family modifier the declaration states.
+    ///
+    /// Pass `CallableOverrideModifier::NotDeclared` when the modifier nodes
+    /// were read and state none of the family; that is what lets a consumer
+    /// separate "declares no override" from "nobody looked".
+    pub fn with_callable_override_modifier(mut self, modifier: CallableOverrideModifier) -> Self {
+        self.callable_override_modifier = Some(modifier);
+        self
+    }
+
+    /// Restore the field independently, as a store rehydrating a persisted row
+    /// must: the column is nullable and its NULL means unread, which the
+    /// parser-side builder above cannot express.
+    pub fn with_persisted_callable_override_modifier(
+        mut self,
+        modifier: Option<CallableOverrideModifier>,
+    ) -> Self {
+        self.callable_override_modifier = modifier;
+        self
+    }
+
+    pub fn callable_override_modifier(&self) -> Option<CallableOverrideModifier> {
+        self.callable_override_modifier
+    }
+
     pub fn with_class_like_interface(mut self, is_interface: bool) -> Self {
         self.class_like_is_interface = is_interface;
         self
@@ -2244,6 +2348,14 @@ impl SignatureMetadata {
         result_type_identities: Vec<StructuredTypeIdentity>,
     ) -> Self {
         self.result_type_identities = result_type_identities;
+        self
+    }
+
+    pub fn with_parameter_type_identities(
+        mut self,
+        parameter_type_identities: Vec<Option<StructuredTypeIdentity>>,
+    ) -> Self {
+        self.parameter_type_identities = parameter_type_identities;
         self
     }
 
@@ -2390,6 +2502,15 @@ impl SignatureMetadata {
     /// only ever asks for ordinal zero sees no difference between the two.
     pub fn result_type_identities(&self) -> &[StructuredTypeIdentity] {
         &self.result_type_identities
+    }
+
+    pub fn parameter_type_identities(&self) -> &[Option<StructuredTypeIdentity>] {
+        &self.parameter_type_identities
+    }
+
+    /// The declared type of one parameter, by declaration ordinal.
+    pub fn parameter_type_identity(&self, ordinal: usize) -> Option<&StructuredTypeIdentity> {
+        self.parameter_type_identities.get(ordinal)?.as_ref()
     }
 
     pub fn result_type_identity(&self, ordinal: usize) -> Option<&StructuredTypeIdentity> {
@@ -4285,6 +4406,7 @@ pub enum DeclarationKind {
     Parameter,
     ReceiverParameter,
     ImportAlias,
+    StatementLabel,
     LocalVariable,
     CatchParameter,
     EnhancedForVariable,
@@ -4300,6 +4422,7 @@ impl DeclarationKind {
             Self::Parameter => "parameter",
             Self::ReceiverParameter => "receiver_parameter",
             Self::ImportAlias => "import_alias",
+            Self::StatementLabel => "statement_label",
             Self::LocalVariable => "local_variable",
             Self::CatchParameter => "catch_parameter",
             Self::EnhancedForVariable => "enhanced_for_variable",

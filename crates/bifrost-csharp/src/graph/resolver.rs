@@ -1688,6 +1688,163 @@ fn resolve_member_type_fq_name(
     })
 }
 
+fn resolve_member_type_fq_name_in_session(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    type_text: &str,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let nested_fq_name = if owner.package_name().is_empty() {
+        format!("{}${type_text}", owner.short_name())
+    } else {
+        format!(
+            "{}.{}${type_text}",
+            owner.package_name(),
+            owner.short_name()
+        )
+    };
+    forward_class_unit_for_fq_name_in_session(csharp, &nested_fq_name, session)
+        .map(|unit| unit.fq_name())
+        .or_else(|| resolve_type_fq_name_in_session(csharp, token, file, type_text, session))
+}
+
+/// The member invoked by a C# invocation and its structured receiver.
+#[derive(Clone, Copy)]
+pub struct CSharpInvocationMember<'tree> {
+    pub name: CSharpMemberName<'tree>,
+    pub receiver: Option<Node<'tree>>,
+}
+
+/// Read the invoked member and its structured receiver from an invocation's
+/// function node. Both forward and inverse call-argument owner probes use this
+/// so conditional access, generic names, and ordinary member access have one
+/// syntax interpretation.
+pub fn csharp_invocation_member<'tree>(
+    function: Node<'tree>,
+    source: &str,
+) -> Option<CSharpInvocationMember<'tree>> {
+    let (name_node, receiver) = match function.kind() {
+        "member_access_expression" => (
+            member_access_name(function)?,
+            member_access_receiver(function),
+        ),
+        "conditional_access_expression" => {
+            let access = csharp_conditional_member_access(function)?;
+            (access.name, Some(access.receiver))
+        }
+        "identifier" | "generic_name" => (function, None),
+        _ => return None,
+    };
+    let name = csharp_member_name(name_node)?;
+    if receiver.is_none() && unqualified_member_has_structured_shadow(name.identifier, source) {
+        return None;
+    }
+    Some(CSharpInvocationMember { name, receiver })
+}
+
+pub fn call_argument_node(call: Node<'_>, index: usize) -> Option<Node<'_>> {
+    let arguments = call
+        .child_by_field_name("arguments")
+        .or_else(|| first_named_child_of_kind(call, "argument_list"))?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter(|argument| argument.kind() == "argument")
+        .nth(index)
+}
+
+/// Map a call argument to the declared parameter it names. Positional
+/// arguments preserve their argument-list index; a named argument uses the
+/// declaration metadata's parameter label. This keeps target typing correct
+/// for `Call(options: new())` and for omitted/reordered named arguments.
+pub fn call_argument_parameter_index(
+    call: Node<'_>,
+    index: usize,
+    metadata: &SignatureMetadata,
+    source: &str,
+) -> Option<usize> {
+    let argument = call_argument_node(call, index)?;
+    let Some(name) = argument.child_by_field_name("name") else {
+        return Some(index);
+    };
+    let name = node_text(name, source);
+    metadata
+        .parameters()
+        .iter()
+        .position(|parameter| parameter.label() == name)
+}
+
+/// Resolve a callable parameter's declared type in the callable's declaring
+/// type scope. The caller has already chosen the method candidate; this helper
+/// only reads its recorded parameter spelling and resolves that spelling where
+/// the declaration lives.
+pub fn callable_parameter_type_fq_name(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    method: &CodeUnit,
+    parameter_index: usize,
+) -> Option<String> {
+    let metadata = csharp.signature_metadata(method);
+    let type_text = metadata
+        .iter()
+        .find_map(|metadata| metadata.callable_parameter_types())
+        .and_then(|types| types.get(parameter_index))?;
+    let owner = csharp.parent_of(method)?;
+    resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, true)
+}
+
+/// Forward-definition counterpart to [`callable_parameter_type_fq_name`].
+pub fn callable_parameter_type_fq_name_for_forward(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    method: &CodeUnit,
+    parameter_index: usize,
+) -> Option<String> {
+    let metadata = csharp.signature_metadata(method);
+    let type_text = metadata
+        .iter()
+        .find_map(|metadata| metadata.callable_parameter_types())
+        .and_then(|types| types.get(parameter_index))?;
+    let owner = csharp.parent_of(method)?;
+    resolve_member_type_fq_name(csharp, token, method.source(), &owner, type_text, false)
+}
+
+/// Budgeted forward counterpart to [`callable_parameter_type_fq_name`].
+pub fn callable_parameter_type_fq_name_in_session(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    method: &CodeUnit,
+    parameter_index: usize,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let metadata =
+        session.query_limited_rows(|limit| csharp.signature_metadata_limited(method, limit));
+    if !session.observe_cancellation() {
+        return None;
+    }
+    let type_text = metadata
+        .iter()
+        .find_map(|metadata| metadata.callable_parameter_types())
+        .and_then(|types| types.get(parameter_index))?;
+    let owner = session.query(|| csharp.parent_of(method)).flatten()?;
+    if !session.observe_cancellation() {
+        return None;
+    }
+    resolve_member_type_fq_name_in_session(
+        csharp,
+        token,
+        method.source(),
+        &owner,
+        type_text,
+        session,
+    )
+}
+
 fn resolve_structured_method_return_type_fq_name_in_session(
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
@@ -2392,7 +2549,8 @@ fn resolve_in_enclosing_type_scopes(
 
     let mut scope = class_ranges.enclosing_unit(byte)?.clone();
     loop {
-        let mut candidates = nested_class_children_named(csharp, token, &scope, prefix);
+        let mut candidates =
+            nested_class_children_named_or_inherited(csharp, token, &scope, prefix);
         if !candidates.is_empty() {
             graph_support::sort_dedup_type_candidates(&mut candidates);
             let resolved = (graph_support::logical_type_count(&candidates) == 1)
@@ -2431,6 +2589,49 @@ fn nested_class_children_named(
         .flat_map(|part| csharp.direct_children(&part))
         .filter(|child| child.is_class() && child.identifier() == name)
         .collect()
+}
+
+/// Every class spelled `name` that `scope` declares itself or inherits.
+///
+/// C# looks a simple type name up among the members of the enclosing type, and
+/// a type nested in a base class is one of those members, so `new Options { .. }`
+/// written inside `class Derived : Base` names `Base`'s nested `Options`. The
+/// enclosing-scope walk climbed lexical nesting only, so that spelling proved
+/// no declaration at all and the object initializer's label had no owner
+/// (#2173). A type the scope declares itself hides the inherited one, so the
+/// base walk runs only after the scope's own declarations miss, and it is
+/// breadth first so the nearest base answers. Ancestors are read as the
+/// hierarchy states them, interfaces included, the same way every other member
+/// walk here reads them.
+fn nested_class_children_named_or_inherited(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    scope: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let declared = nested_class_children_named(csharp, token, scope, name);
+    if !declared.is_empty() {
+        return declared;
+    }
+    let mut seen = HashSet::default();
+    seen.insert(scope.clone());
+    let mut pending: std::collections::VecDeque<CodeUnit> =
+        hierarchy::usage_direct_ancestors(csharp, token, scope)
+            .into_iter()
+            .filter(|ancestor| seen.insert(ancestor.clone()))
+            .collect();
+    while let Some(ancestor) = pending.pop_front() {
+        let inherited = nested_class_children_named(csharp, token, &ancestor, name);
+        if !inherited.is_empty() {
+            return inherited;
+        }
+        pending.extend(
+            hierarchy::usage_direct_ancestors(csharp, token, &ancestor)
+                .into_iter()
+                .filter(|next| seen.insert(next.clone())),
+        );
+    }
+    Vec::new()
 }
 
 /// The nested type `suffix` names below `owner`, one segment at a time, or
@@ -2506,6 +2707,68 @@ fn declaration_type_parameters_shadow(
         .child_by_field_name("type_parameters")
         .or_else(|| first_named_child_of_kind(declaration, "type_parameter_list"))
         .is_some_and(|parameters| type_parameter_list_contains(parameters, source, reference))
+}
+
+/// The type constraints on the type parameter spelled `reference`, when an
+/// enclosing declaration declares one.
+///
+/// `Some` says the spelling names a type parameter rather than a type, which is
+/// what decides how the rest of the resolution reads it: C# resolves everything
+/// written on a type parameter against its constraints, so `new T { Member = 1 }`
+/// under `where T : Base, new()` writes a member of `Base` (#2173). An empty
+/// vector is the honest answer for a parameter constrained to nothing but
+/// `object`, and it is a different fact from `None`, which says the spelling
+/// names an ordinary type the index can look up.
+pub fn type_parameter_constraint_types<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    reference: &str,
+) -> Option<Vec<Node<'tree>>> {
+    if reference.contains('.') {
+        return None;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if declaration_type_parameters_shadow(parent, source, reference) {
+            return Some(declaration_type_parameter_constraints(
+                parent, source, reference,
+            ));
+        }
+        current = parent;
+    }
+    None
+}
+
+/// The constraint clause `declaration` writes for the type parameter
+/// `reference`, reduced to the types it names. `class`, `struct`, `notnull` and
+/// `new()` name no type and so contribute nothing to a member lookup.
+fn declaration_type_parameter_constraints<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+    reference: &str,
+) -> Vec<Node<'tree>> {
+    let mut constraints = Vec::new();
+    let mut cursor = declaration.walk();
+    let clauses: Vec<Node<'tree>> = declaration
+        .named_children(&mut cursor)
+        .filter(|clause| clause.kind() == "type_parameter_constraints_clause")
+        .collect();
+    for clause in clauses {
+        let target = clause
+            .named_child(0)
+            .filter(|target| target.kind() == "identifier");
+        if target.map(|target| node_text(target, source)) != Some(reference) {
+            continue;
+        }
+        let mut clause_cursor = clause.walk();
+        constraints.extend(
+            clause
+                .named_children(&mut clause_cursor)
+                .filter(|constraint| constraint.kind() == "type_parameter_constraint")
+                .filter_map(|constraint| constraint.child_by_field_name("type")),
+        );
+    }
+    constraints
 }
 
 fn type_parameter_list_contains(parameters: Node<'_>, source: &str, reference: &str) -> bool {
@@ -4104,6 +4367,44 @@ pub(super) fn applicable_member_candidates_for_owner(
     )
 }
 
+/// Keep call-argument target typing at the method-name/arity stage only. This
+/// deliberately does not inspect argument types: overload resolution is outside
+/// the owner ladder's contract, and callers must refuse when more than one
+/// method remains.
+pub fn filter_call_argument_method_candidates(
+    csharp: &dyn CSharpSource,
+    candidates: impl IntoIterator<Item = CodeUnit>,
+    call_arity: usize,
+    explicit_generic_arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    filter_call_argument_method_candidates_with_arities(
+        candidates,
+        call_arity,
+        explicit_generic_arity,
+        |candidate| csharp_callable_arity(csharp, candidate),
+    )
+}
+
+pub fn filter_call_argument_method_candidates_with_arities(
+    candidates: impl IntoIterator<Item = CodeUnit>,
+    call_arity: usize,
+    explicit_generic_arity: Option<usize>,
+    callable_arity: impl Fn(&CodeUnit) -> CallableArity,
+) -> Vec<CodeUnit> {
+    let mut methods = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_function()
+                && explicit_generic_arity
+                    .is_none_or(|arity| csharp_method_generic_arity(candidate.signature()) == arity)
+                && callable_arity(candidate).accepts(call_arity)
+        })
+        .collect::<Vec<_>>();
+    methods.sort();
+    methods.dedup();
+    methods
+}
+
 /// Resolve the callable selected by invocation syntax. The invocation may call
 /// either a method or the delegate value read from a field/property, so only
 /// method candidates are constrained by the outer argument list.
@@ -4599,6 +4900,41 @@ pub fn object_creation_assignment_target(initializer: Node<'_>) -> Option<Node<'
     assignment.child_by_field_name("left")
 }
 
+/// The invocation and argument position that target-types an implicit object
+/// creation. The walk follows the grammar's argument wrappers instead of
+/// reading source text, so named arguments and parenthesized values retain the
+/// call node and their actual argument-list position.
+pub fn object_creation_call_argument(initializer: Node<'_>) -> Option<(Node<'_>, usize)> {
+    let object_creation = initializer.parent()?;
+    if object_creation.kind() != "implicit_object_creation_expression" {
+        return None;
+    }
+
+    let mut current = object_creation;
+    loop {
+        let parent = current.parent()?;
+        match parent.kind() {
+            "parenthesized_expression" | "checked_expression" => {
+                current = parent;
+            }
+            "argument" => {
+                let argument_list = parent.parent()?;
+                if argument_list.kind() != "argument_list" {
+                    return None;
+                }
+                let mut cursor = argument_list.walk();
+                let index = argument_list
+                    .named_children(&mut cursor)
+                    .filter(|argument| argument.kind() == "argument")
+                    .position(|argument| argument == parent)?;
+                let call = argument_list.parent()?;
+                return (call.kind() == "invocation_expression").then_some((call, index));
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The collection expression whose element target-types this initializer's
 /// implicit `new()`.
 ///
@@ -4653,6 +4989,9 @@ pub enum CSharpInitializerOwnerSource<'tree> {
     /// The tree writes the constructed type, either directly (`new Foo { .. }`)
     /// or on the target a `new()` takes its type from.
     WrittenType(Node<'tree>),
+    /// A `new()` whose argument position supplies its target type from the
+    /// invoked method's declared parameter.
+    CallArgument { call: Node<'tree>, index: usize },
     /// A `new()` whose target is an element of the collection value this node
     /// names.
     CollectionTarget(Node<'tree>),
@@ -4666,6 +5005,15 @@ pub enum CSharpInitializerOwnerSource<'tree> {
         label: Node<'tree>,
         enclosing: Node<'tree>,
     },
+    /// A `new()` written into an ELEMENT of an enclosing initializer's member,
+    /// as the inner creation of `new A { B = [new() { .. }] }`. Its type is the
+    /// element type of the collection the member `label` names, so it descends
+    /// the same chain as [`Self::EnclosingInitializerMember`] and reads the
+    /// member's element type at the last hop.
+    EnclosingInitializerElement {
+        label: Node<'tree>,
+        enclosing: Node<'tree>,
+    },
 }
 
 pub fn object_initializer_owner_source(
@@ -4674,7 +5022,22 @@ pub fn object_initializer_owner_source(
     if let Some(type_node) = object_initializer_owner_type_node(initializer) {
         return Some(CSharpInitializerOwnerSource::WrittenType(type_node));
     }
+    if let Some((call, index)) = object_creation_call_argument(initializer) {
+        return Some(CSharpInitializerOwnerSource::CallArgument { call, index });
+    }
     if let Some(target) = object_creation_collection_target(initializer) {
+        // A collection whose assignment target is an initializer label writes a
+        // member of the enclosing constructed type, not a variable, the same
+        // way a plain label does. Reading it as a variable is what left
+        // `new A { B = [new() { .. }] }` without an owner.
+        if target.kind() == "identifier"
+            && let Some(enclosing) = object_initializer_for_label(target)
+        {
+            return Some(CSharpInitializerOwnerSource::EnclosingInitializerElement {
+                label: target,
+                enclosing,
+            });
+        }
         return Some(CSharpInitializerOwnerSource::CollectionTarget(target));
     }
     let target = object_creation_assignment_target(initializer)?;
@@ -4696,19 +5059,25 @@ pub fn object_initializer_owner_source(
 
 /// The index lookups [`object_initializer_owners`] needs.
 ///
-/// The ladder is one function; only these four probes differ between the
+/// The ladder is one function; only these probes differ between the
 /// forward definition provider and the inverse usage scan, because the two
 /// reach different index facades.
 pub trait CSharpInitializerOwnerLookups {
     /// Every declaration the written type spelling `reference` at `type_node`
     /// can name, in C# lookup order.
     fn written_type_owners(&mut self, reference: &str, type_node: Node<'_>) -> Vec<CodeUnit>;
+    /// The type of a target-typed `new()` passed at `index` to `call`, plus any
+    /// method candidates that make the target ambiguous without overload
+    /// resolution.
+    fn call_argument_owners(&mut self, call: Node<'_>, index: usize) -> CSharpCallArgumentOwners;
     /// The element type of the collection value `target` names.
     fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit>;
     /// Every type the expression `target` can have.
     fn expression_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit>;
     /// The declared type of `member` on `owner`, including inherited members.
     fn member_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit>;
+    /// The element type of the collection `member` declares on `owner`.
+    fn member_element_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit>;
 }
 
 /// The owner declarations an object initializer's target proved.
@@ -4718,6 +5087,19 @@ pub struct CSharpInitializerOwners {
     pub owners: Vec<CodeUnit>,
     /// What the owners were derived from, for the caller's refusal message.
     pub target: CSharpInitializerOwnerTarget,
+    /// Method candidates that prevented the call-argument target from being
+    /// selected. These stay separate from `owners` because two overloads can
+    /// declare the same parameter type.
+    pub ambiguous_call_candidates: Vec<CodeUnit>,
+}
+
+/// Result of the call-argument owner probe. `owners` contains parameter types
+/// only for a unique method candidate; `ambiguous_call_candidates` preserves
+/// all same-name, same-arity methods when overload resolution is deliberately
+/// out of scope.
+pub struct CSharpCallArgumentOwners {
+    pub owners: Vec<CodeUnit>,
+    pub ambiguous_call_candidates: Vec<CodeUnit>,
 }
 
 /// The target text a refusal must name, tagged with the kind of target it was.
@@ -4725,6 +5107,7 @@ pub struct CSharpInitializerOwners {
 /// whose type could not be inferred at all.
 pub enum CSharpInitializerOwnerTarget {
     WrittenType(String),
+    CallArgument(String),
     CollectionTarget(String),
     AssignmentTarget(String),
     InitializerMember(String),
@@ -4734,11 +5117,20 @@ impl CSharpInitializerOwnerTarget {
     pub fn text(&self) -> &str {
         match self {
             Self::WrittenType(text)
+            | Self::CallArgument(text)
             | Self::CollectionTarget(text)
             | Self::AssignmentTarget(text)
             | Self::InitializerMember(text) => text,
         }
     }
+}
+
+/// One hop of the label chain [`object_initializer_owners`] descends: which
+/// member of the owner resolved so far the initializer sits in, and whether it
+/// sits in that member's value or in one of its elements.
+enum CSharpInitializerLabelHop<'tree> {
+    MemberValue(Node<'tree>),
+    MemberElement(Node<'tree>),
 }
 
 /// The owner ladder for an object initializer, shared by forward definition
@@ -4759,42 +5151,98 @@ pub fn object_initializer_owners(
     let base = loop {
         match object_initializer_owner_source(current)? {
             CSharpInitializerOwnerSource::EnclosingInitializerMember { label, enclosing } => {
-                labels.push(label);
+                labels.push(CSharpInitializerLabelHop::MemberValue(label));
+                current = enclosing;
+            }
+            CSharpInitializerOwnerSource::EnclosingInitializerElement { label, enclosing } => {
+                labels.push(CSharpInitializerLabelHop::MemberElement(label));
                 current = enclosing;
             }
             base => break base,
         }
     };
-    let (mut owners, mut target) = match base {
+    let (mut owners, mut target, ambiguous_call_candidates) = match base {
         CSharpInitializerOwnerSource::WrittenType(type_node) => {
             let reference = reference_type_text(type_node, source);
-            let owners = lookups.written_type_owners(&reference, type_node);
-            (owners, CSharpInitializerOwnerTarget::WrittenType(reference))
+            // `new T { .. }`, and a `new()` whose target is declared `T`,
+            // construct the type argument. C# resolves the initializer's
+            // members against the type parameter's constraints, so the
+            // constraint types are the owners and the spelling itself names no
+            // declaration to look up (#2173).
+            let owners = match type_parameter_constraint_types(type_node, source, &reference) {
+                Some(constraints) => constraints
+                    .into_iter()
+                    .flat_map(|constraint| {
+                        lookups.written_type_owners(
+                            &reference_type_text(constraint, source),
+                            constraint,
+                        )
+                    })
+                    .collect(),
+                None => lookups.written_type_owners(&reference, type_node),
+            };
+            (
+                owners,
+                CSharpInitializerOwnerTarget::WrittenType(reference),
+                Vec::new(),
+            )
+        }
+        CSharpInitializerOwnerSource::CallArgument { call, index } => {
+            let resolved = lookups.call_argument_owners(call, index);
+            (
+                resolved.owners,
+                CSharpInitializerOwnerTarget::CallArgument(format!(
+                    "{} argument {}",
+                    node_text(call, source),
+                    index + 1
+                )),
+                resolved.ambiguous_call_candidates,
+            )
         }
         CSharpInitializerOwnerSource::CollectionTarget(node) => (
             lookups.collection_target_owners(node),
             CSharpInitializerOwnerTarget::CollectionTarget(node_text(node, source).to_string()),
+            Vec::new(),
         ),
         CSharpInitializerOwnerSource::AssignmentTarget(node) => (
             lookups.expression_owners(node),
             CSharpInitializerOwnerTarget::AssignmentTarget(node_text(node, source).to_string()),
+            Vec::new(),
         ),
-        CSharpInitializerOwnerSource::EnclosingInitializerMember { .. } => {
+        CSharpInitializerOwnerSource::EnclosingInitializerMember { .. }
+        | CSharpInitializerOwnerSource::EnclosingInitializerElement { .. } => {
             unreachable!("the walk above breaks only on a source that needs no enclosing owner")
         }
     };
     // Outermost label first: the chain was collected inside out.
-    for label in labels.into_iter().rev() {
+    for hop in labels.into_iter().rev() {
         let [owner] = owners.as_slice() else {
             // Nothing to descend from, or an ambiguity the caller reports with
             // the candidates it already has.
-            return Some(CSharpInitializerOwners { owners, target });
+            return Some(CSharpInitializerOwners {
+                owners,
+                target,
+                ambiguous_call_candidates,
+            });
         };
-        let member = node_text(label, source);
-        owners = lookups.member_type_owners(owner, member);
+        let (member, descended) = match hop {
+            CSharpInitializerLabelHop::MemberValue(label) => {
+                let member = node_text(label, source);
+                (member, lookups.member_type_owners(owner, member))
+            }
+            CSharpInitializerLabelHop::MemberElement(label) => {
+                let member = node_text(label, source);
+                (member, lookups.member_element_type_owners(owner, member))
+            }
+        };
         target = CSharpInitializerOwnerTarget::InitializerMember(member.to_string());
+        owners = descended;
     }
-    Some(CSharpInitializerOwners { owners, target })
+    Some(CSharpInitializerOwners {
+        owners,
+        target,
+        ambiguous_call_candidates,
+    })
 }
 
 /// The written type a target-typed `new()` takes its type from.
@@ -4832,25 +5280,26 @@ fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Nod
                 let collection_type = expression_target_type(parent)?;
                 return collection_element_type_node(collection_type);
             }
-            // `new List<T> { new() { ... } }`: the containing object creation
-            // writes the collection type directly. The initializer expression
-            // is the structured bridge between both creations.
+            // `new List<T> { new() { ... } }` and `new T[] { new() { ... } }`:
+            // the containing creation states the collection type. The
+            // initializer expression is the structured bridge between both
+            // creations, and an array creation reaches it the same way an
+            // object creation does -- reading only the object creations left
+            // every element of an array initializer without an owner (#2173).
             "initializer_expression" => {
                 let collection_creation = parent.parent()?;
-                if !matches!(
-                    collection_creation.kind(),
-                    "object_creation_expression" | "implicit_object_creation_expression"
-                ) {
-                    return None;
-                }
                 let collection_type = match collection_creation.kind() {
-                    "object_creation_expression" => collection_creation
-                        .child_by_field_name("type")
-                        .or_else(|| first_type_child(collection_creation)),
+                    "object_creation_expression" | "array_creation_expression" => {
+                        collection_creation
+                            .child_by_field_name("type")
+                            .or_else(|| first_type_child(collection_creation))
+                    }
+                    // `new() { new() { ... } }` states no type of its own, so
+                    // the collection type is whatever target-types it.
                     "implicit_object_creation_expression" => {
                         expression_target_type(collection_creation)
                     }
-                    _ => None,
+                    _ => return None,
                 }?;
                 return collection_element_type_node(collection_type);
             }

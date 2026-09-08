@@ -25,7 +25,7 @@
 //!   per-file route relation rows and the bounded route traversal (#1475).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
-//!   source-hash-validated facts cache behind it.
+//!   content-keyed facts cache behind it.
 //! - [`search`]: parallel workspace execution and the tool-facing output.
 //!
 //! See `.agents/plans/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the original plan
@@ -63,8 +63,9 @@ pub use edges::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use identity_routes::{
-    IDENTITY_PRESERVING_HOPS, IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH,
-    MAX_ROUTE_FAN_OUT, PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
+    DeclarationDefinitionPeer, DeclarationDefinitionPeers, IDENTITY_PRESERVING_HOPS,
+    IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH, MAX_ROUTE_FAN_OUT,
+    PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
     RouteRelationCompleteness, RouteRelationIncompleteReason, RouteRelationRow,
     RouteRelationsFileResult, RoutesCancelled, canonical_identity_of,
     file_supplies_route_relations, identity_routes_from, physical_occurrences,
@@ -114,7 +115,7 @@ pub use resolution::{
     DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
     EnvironmentSupport, HierarchyRelation, HoistingClass, ImportActivation,
     LexicalEnvironmentSupport, MemberDispatchTier, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier,
-    RejectionReason,
+    RejectionReason, ScopeFormation, default_scope_formation,
 };
 pub use routes::{
     ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,

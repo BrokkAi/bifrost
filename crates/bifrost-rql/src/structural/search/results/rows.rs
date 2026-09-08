@@ -542,6 +542,8 @@ mod value_domain {
     pub(super) const CONCURRENT_PROOF: &[&str] = &["proven", "open"];
     pub(super) const CONCURRENT_COVERAGE: &[&str] = &["exhaustive", "open"];
     pub(super) const CLASS_SET_STATUS: &[&str] = ClassSetStatus::LABELS;
+    pub(super) const ABSENT_MEMBER_WITNESS_STATUS: &[&str] =
+        &["available", "truncated", "unavailable"];
     pub(super) const SWITCH_PROOF: &[&str] = &["exact", "unknown"];
     pub(super) const SWITCH_REASON: &[&str] = &[
         "type_switch",
@@ -1044,6 +1046,25 @@ detailed_row_domains! {
                     CodeQueryRowField::required("class", Scalar::String),
                     CodeQueryRowField::required("caller", Scalar::String),
                     CodeQueryRowField::required("witness_steps", Scalar::Integer),
+        ],
+    },
+    AbsentMemberWitness => "absent_member_witness" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("finding_id", Scalar::StableId),
+                    CodeQueryRowField::required("witness_index", Scalar::Integer),
+                    CodeQueryRowField::required("retained_bytes", Scalar::Integer),
+                    CodeQueryRowField::required("truncated", Scalar::Boolean),
+                    CodeQueryRowField::required("omitted_steps_lower_bound", Scalar::Integer),
+                    CodeQueryRowField::required("alternatives_truncated", Scalar::Boolean),
+                    CodeQueryRowField::required("retention_truncated", Scalar::Boolean),
+                    CodeQueryRowField::required_enum(
+                        "witness_status",
+                        value_domain::ABSENT_MEMBER_WITNESS_STATUS
+                    ),
+                    CodeQueryRowField::optional("unavailable_reason", Scalar::String),
         ],
     },
     TaintFinding => "taint_finding" {
@@ -2588,6 +2609,36 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::AbsentMemberFinding { value }, "witness_steps") => {
             Some(Scalar::Integer(value.witness_steps as u64))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "finding_id") => {
+            Some(Scalar::StableId(&value.finding_id))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "witness_index") => {
+            Some(Scalar::Integer(value.witness_index as u64))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "retained_bytes") => {
+            Some(Scalar::Integer(value.retained_bytes as u64))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "truncated") => {
+            Some(Scalar::Boolean(value.truncated))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "omitted_steps_lower_bound") => {
+            Some(Scalar::Integer(value.omitted_steps_lower_bound as u64))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "alternatives_truncated") => {
+            Some(Scalar::Boolean(value.alternatives_truncated))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "retention_truncated") => {
+            Some(Scalar::Boolean(value.retention_truncated))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "witness_status") => {
+            Some(Scalar::ConstrainedEnum(value.witness_status.as_str()))
+        }
+        (CodeQueryResultValue::AbsentMemberWitness { value }, "unavailable_reason") => {
+            value.unavailable_reason.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::TaintFinding { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::TaintFinding { value }, "sink_event_id") => {
@@ -4489,6 +4540,10 @@ pub enum DetailedCodeQueryKey {
     AbsentMemberFinding {
         id: String,
     },
+    AbsentMemberWitness {
+        id: String,
+        finding_id: String,
+    },
     TaintFinding {
         id: String,
     },
@@ -4997,6 +5052,13 @@ fn detailed_semantic_identity(
                 id: value.id.clone(),
             },
         )),
+        CodeQueryResultValue::AbsentMemberWitness { value } => Some((
+            DetailedCodeQueryDomain::AbsentMemberWitness,
+            DetailedCodeQueryKey::AbsentMemberWitness {
+                id: value.id.clone(),
+                finding_id: value.finding_id.clone(),
+            },
+        )),
         CodeQueryResultValue::TaintFinding { value } => Some((
             DetailedCodeQueryDomain::TaintFinding,
             DetailedCodeQueryKey::TaintFinding {
@@ -5095,6 +5157,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::TypestateWitness { id, .. }
         | DetailedCodeQueryKey::FlowEndpoint { id }
         | DetailedCodeQueryKey::FlowWitness { id, .. }
+        | DetailedCodeQueryKey::AbsentMemberWitness { id, .. }
         | DetailedCodeQueryKey::TaintFinding { id } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }

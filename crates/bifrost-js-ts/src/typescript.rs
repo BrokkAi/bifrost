@@ -60,10 +60,14 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                     .extend(parse_es_import_infos_from_node(child, source));
             }
             "expression_statement" => {
-                let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                if !imports.is_empty() {
-                    module_has_imports = true;
-                    parsed.imports.extend(imports);
+                if let Some(namespace) = ts_internal_module_statement(child) {
+                    visit_ts_class_like(file, source, namespace, None, &mut parsed, false);
+                } else {
+                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                    if !imports.is_empty() {
+                        module_has_imports = true;
+                        parsed.imports.extend(imports);
+                    }
                 }
             }
             "export_statement" => {
@@ -219,6 +223,17 @@ pub fn ts_is_global_internal_module(node: Node<'_>, source: &str) -> bool {
         && node
             .child_by_field_name("name")
             .is_some_and(|name| trim_statement(node_text(name, source)) == "global")
+}
+
+fn ts_internal_module_statement(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "internal_module" {
+        return Some(node);
+    }
+    if node.kind() != "expression_statement" || node.named_child_count() != 1 {
+        return None;
+    }
+    node.named_child(0)
+        .filter(|child| child.kind() == "internal_module")
 }
 
 fn visit_ts_export(
@@ -549,6 +564,21 @@ fn visit_ts_class_like_body<'tree>(
             | "enum_declaration"
             | "internal_module" => {
                 nested_class_like.push(child);
+            }
+            "expression_statement" => {
+                if let Some(namespace) = ts_internal_module_statement(child) {
+                    nested_class_like.push(namespace);
+                }
+            }
+            "export_statement" => {
+                visit_ts_export(
+                    file,
+                    source,
+                    child,
+                    Some(parent),
+                    parsed,
+                    &HashSet::default(),
+                );
             }
             _ => {}
         }
@@ -1965,6 +1995,33 @@ mod callable_modifier_tests {
         assert_eq!(modifiers("render"), (false, false));
         assert_eq!(modifiers("measure"), (false, false));
         assert_eq!(modifiers("constructor"), (false, true));
+    }
+
+    #[test]
+    fn namespace_exported_class_is_indexed_with_qualified_identity() {
+        let source = "namespace Domain { export class Declared {} }";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "domain.ts",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse TypeScript fixture");
+        let parsed = parse_typescript_file(&file, source, &tree);
+        let mut classes = parsed
+            .ranges
+            .keys()
+            .filter(|unit| unit.is_class())
+            .map(|unit| unit.fq_name().to_owned())
+            .collect::<Vec<_>>();
+        classes.sort();
+
+        assert_eq!(classes, ["Domain", "Domain.Declared"]);
     }
 }
 

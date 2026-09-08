@@ -2,19 +2,12 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::git_file::{parse_rev_path, read_git_file, resolve_git_file_path};
 use crate::model_context;
 use crate::path_utils::{
-    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
-    normalize_pattern, rel_path_string,
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, WorkspacePathSelector,
+    has_drive_letter_prefix, normalize_pattern, rel_path_string,
 };
-use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-
-const STRICT_SEPARATOR: MatchOptions = MatchOptions {
-    case_sensitive: true,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
 
 const DEFAULT_FIND_FILES_CONTAINING_LIMIT: usize = 50;
 const DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT: usize = 2;
@@ -89,6 +82,12 @@ pub struct SearchFileContentsResult {
     pub invalid_patterns: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    /// `file_path` as the caller wrote it, when it names no workspace file and
+    /// no workspace directory. Without it an empty result reads as "this
+    /// pattern is nowhere in those files" rather than "those files do not
+    /// exist" (#3092).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unmatched_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,33 +312,39 @@ pub fn search_file_contents(
             truncated: false,
             invalid_patterns,
             ambiguous_paths: Vec::new(),
+            unmatched_paths: Vec::new(),
         };
     }
 
-    enum PathFilter {
-        Glob(Pattern),
-        Exact(String),
-    }
-
     let mut ambiguous_paths = Vec::new();
+    let mut unmatched_paths = Vec::new();
     let filter_requested = params
         .file_path
         .as_deref()
         .is_some_and(|raw| !raw.trim().is_empty());
+    // The same selector reading every path-scoped tool uses: a directory names
+    // the files under it, and a selector that names nothing is reported rather
+    // than silently searching an empty file set (#3092).
     let path_filter = params.file_path.as_deref().and_then(|raw| {
-        let normalized = normalize_pattern(raw.trim());
-        if normalized.is_empty() {
-            None
-        } else if is_glob_pattern(&normalized) {
-            Pattern::new(&normalized).ok().map(PathFilter::Glob)
-        } else {
-            match resolver.resolve_literal(&normalized) {
-                ResolvedFileInput::File(file) => Some(PathFilter::Exact(rel_path_string(&file))),
-                ResolvedFileInput::Ambiguous(item) => {
-                    ambiguous_paths.push(item);
-                    None
+        match resolver.classify_selector(raw) {
+            WorkspacePathSelector::Invalid => None,
+            WorkspacePathSelector::Unmatched => {
+                unmatched_paths.push(raw.trim().to_string());
+                Some(WorkspacePathSelector::Unmatched)
+            }
+            matcher => {
+                // An ambiguous basename is reported as such rather than
+                // searched: which file the caller meant decides the answer.
+                if let WorkspacePathSelector::Files(paths) = &matcher
+                    && paths.len() > 1
+                {
+                    ambiguous_paths.push(AmbiguousPathInput {
+                        input: raw.trim().to_string(),
+                        matches: paths.clone(),
+                    });
+                    return None;
                 }
-                ResolvedFileInput::NotFound(_) => Some(PathFilter::Exact(normalized)),
+                Some(matcher)
             }
         }
     });
@@ -352,6 +357,7 @@ pub fn search_file_contents(
                 truncated: false,
                 invalid_patterns,
                 ambiguous_paths,
+                unmatched_paths,
             };
         }
     };
@@ -363,14 +369,9 @@ pub fn search_file_contents(
         all_files
             .into_iter()
             .filter(|file| {
-                let rel = rel_path_string(file);
                 path_filter
                     .as_ref()
-                    .map(|filter| match filter {
-                        PathFilter::Glob(glob) => glob.matches_with(&rel, STRICT_SEPARATOR),
-                        PathFilter::Exact(path) => rel == *path,
-                    })
-                    .unwrap_or(true)
+                    .is_none_or(|filter| filter.matches(&rel_path_string(file)))
             })
             .collect()
     };
@@ -448,6 +449,7 @@ pub fn search_file_contents(
         truncated,
         invalid_patterns,
         ambiguous_paths,
+        unmatched_paths,
     }
 }
 
@@ -530,10 +532,6 @@ fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, 
         })
         .collect();
     (regexes, invalid_patterns)
-}
-
-fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '['])
 }
 
 // Reject binary files and files large enough to risk OOM if read into memory.

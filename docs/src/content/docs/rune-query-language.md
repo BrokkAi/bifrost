@@ -279,7 +279,7 @@ Schema v10 adds the rows that keep a qualified path's identity visible segment b
     (paths)))
 ```
 
-A segment row states its namespace only when the adapter's classification or the segment's own resolution decides it; a Java or Rust scope segment without resolution has none, which is "not stated", never a guess. A language whose adapter does not answer the path axes makes the run incomplete rather than returning an empty complete answer.
+A segment row states the adapter's namespace classification. Java and Rust qualifiers use `path_prefix`, meaning a module or a type; the segment's own resolution can refine that classification. An absent namespace means "not stated", never a guess. A language whose adapter does not answer the path axes makes the run incomplete rather than returning an empty complete answer.
 
 <!-- code-query-test:rql:binding-of-shadowed -->
 ```lisp
@@ -441,6 +441,29 @@ An analyzer that chases a chain of rewrites -- import-alias substitution, specif
 Every row carries the ordered `steps`, each naming its `state_key`, its `input`, its `output` and the `rule` that fired, so the derivation is on the row rather than implied by it. The rows come from the production chase itself, instrumented in place -- there is no second walk of the binder, so a row that says `cycle` says the production resolver met that cycle.
 
 A file no declared domain applies to answers empty and complete: there is nothing the derivation failed to compute. A derivation that genuinely could not run reports `rewrite_domain_unsupported` or `rewrite_path_derivation_incomplete` with `incomplete` impact instead, and never a clean empty answer.
+
+## Caller-Driven Absent-Member Evidence
+
+Given `normalize(value)` accessing `value.strip()` and `read_config()` calling
+`normalize(123)`, a Python declaration model can prove that the integer receiver
+does not declare `strip`. Inspect its retained caller-to-access evidence with:
+
+<!-- code-query-test:rql:absent-member-witness -->
+```lisp
+(language python
+  (witness :max-steps 32 :max-bytes 16384
+    (absent-member
+      (procedure-of (function :name "read_config")))))
+```
+
+Use `:max-steps 1` to request a one-step prefix. A longer path is explicitly
+truncated; unavailable evidence carries its reason, not an invented path.
+`file-of` accepts the resulting witness rows. Finding identity is site-based,
+while witnesses retain distinct caller contexts. Unknown receivers, open
+hierarchies, and incomplete member models do not authorize absence findings.
+Missing Python declaration coverage makes the absence query incomplete even
+when no procedure is selected. See [the JSON contract](../code-query-json/)
+for availability fields and aggregate limits.
 
 ## Registered Typestate Findings and Witnesses
 

@@ -69,7 +69,9 @@ pub fn scan_files_for_seeds(
         .then(|| browser_global_property_shape(target))
         .flatten();
     let target_owner = analyzer.parent_of(target);
+    let target_is_type_alias = host.is_type_alias(target);
     let target_member = (!target.is_file_scope()
+        && !(target_is_type_alias && target_owner.is_none())
         && target_owner
             .as_ref()
             .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope()))
@@ -245,6 +247,7 @@ pub fn scan_files_for_seeds(
                 host,
                 definitions,
                 target,
+                target_is_type_alias,
                 target_short: &target_short,
                 target_member: target_member.as_deref(),
                 browser_global_object,
@@ -405,6 +408,11 @@ pub struct ScanCtx<'a> {
     host: &'a dyn JsTsSource,
     definitions: &'a dyn BoundedDefinitionLookup,
     target: &'a CodeUnit,
+    /// Whether the queried TypeScript declaration is a type alias. A top-level
+    /// alias carries a synthetic file-name path segment in its rendered short
+    /// name, but that segment is not a member owner and the alias has no value
+    /// binding in the term namespace.
+    target_is_type_alias: bool,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,
     /// For members, the member name (e.g. `foo` in `BaseClass.foo`); otherwise None.
@@ -2327,6 +2335,8 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     let binds_target = if node.kind() == "type_identifier" {
         ctx.binds_target_type(text)
+    } else if ctx.target_is_type_alias {
+        false
     } else {
         ctx.binds_target(text) || ctx.is_bare_browser_global_read(text, node.start_byte())
     };

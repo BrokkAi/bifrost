@@ -8,7 +8,6 @@ use crate::analyzer::languages::{
 use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 
@@ -150,9 +149,9 @@ impl WorkspaceUsageCatalog {
     }
 
     /// Enumerate one file's graph declarations through its persisted summary
-    /// projection. Each lookup is bounded to one live analyzed file and is
-    /// independent of every other file, so the unrooted builder can distribute
-    /// them across Rayon without materializing an analyzer generation.
+    /// projection. Each lookup is bounded to one live analyzed file; the rooted
+    /// builder uses it so a small supplied root set never materializes an
+    /// analyzer generation.
     ///
     /// The inventory comes from `projection.declarations`, never from
     /// `top_level_declarations` plus `children`: that pair is the rendering
@@ -168,8 +167,7 @@ impl WorkspaceUsageCatalog {
             return None;
         }
         #[cfg(test)]
-        let catalog_file_sequence =
-            CATALOG_FILES_ENUMERATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        CATALOG_FILES_ENUMERATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut declarations = Vec::new();
         if let Some(projection) = analyzer.summary_file_projection(file) {
@@ -213,12 +211,6 @@ impl WorkspaceUsageCatalog {
                 .min_by_key(range_key);
             declarations.push((file_scope, range));
         }
-        #[cfg(test)]
-        if catalog_file_sequence
-            == CATALOG_CANCEL_AFTER_FILE.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            cancellation.cancel();
-        }
         (!cancellation.is_cancelled()).then_some(declarations)
     }
 
@@ -226,18 +218,35 @@ impl WorkspaceUsageCatalog {
         analyzer: &dyn IAnalyzer,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
-        if cancellation.is_cancelled() {
-            return None;
-        }
-        let files = analyzer.analyzed_files();
-        let declaration_batches: Option<Vec<Vec<CatalogDeclaration>>> = {
-            let _scope = crate::profiling::scope("workspace_graph::parallel_catalog_enumeration");
-            files
-                .par_iter()
-                .map(|file| Self::declarations_for_file(analyzer, file, cancellation))
+        let declarations = {
+            let _scope = crate::profiling::scope("workspace_graph::batched_catalog_enumeration");
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let mut declarations =
+                analyzer.workspace_declarations_with_primary_ranges(cancellation)?;
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let files = analyzer.analyzed_files();
+            for (index, file) in files.into_iter().enumerate() {
+                if index.is_multiple_of(512) && cancellation.is_cancelled() {
+                    return None;
+                }
+                if is_java_module_descriptor_file(&file) {
+                    let file_scope = CodeUnit::file_scope(file.clone());
+                    let range = analyzer
+                        .ranges(&file_scope)
+                        .into_iter()
+                        .min_by_key(range_key);
+                    declarations.push((file_scope, range));
+                }
+            }
+            declarations
+                .into_iter()
+                .filter(|(unit, _)| is_graph_declaration(unit))
                 .collect()
         };
-        let declarations = declaration_batches?.into_iter().flatten().collect();
         if cancellation.is_cancelled() {
             return None;
         }
@@ -465,9 +474,6 @@ impl WorkspaceUsageCatalog {
 #[cfg(test)]
 static CATALOG_FILES_ENUMERATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static CATALOG_CANCEL_AFTER_FILE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
 /// Declaration identities computed while building a catalog.
 ///
 /// `CodeUnit::declaration_id` is a SHA-256 over every identity field, and the
@@ -947,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_catalog_enumeration_matches_authoritative_inventory_in_file_sized_work_units() {
+    fn batched_catalog_enumeration_matches_authoritative_inventory_without_file_projections() {
         let _guard = CATALOG_TEST_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -974,7 +980,7 @@ mod tests {
         let actual_nodes = catalog_node_fields(&actual);
         assert_eq!(
             actual_nodes, expected_nodes,
-            "per-file enumeration must preserve exact catalog identity, ranges, duplicates, and order"
+            "batched enumeration must preserve exact catalog identity, ranges, duplicates, and order"
         );
         assert!(
             actual.nodes.iter().any(|node| {
@@ -993,8 +999,22 @@ mod tests {
 
         assert_eq!(
             CATALOG_FILES_ENUMERATED.load(std::sync::atomic::Ordering::Relaxed),
-            analyzer.analyzed_files().len(),
-            "catalog work must be exactly one bounded projection per analyzed file"
+            0,
+            "unrooted catalog construction must not open any per-file summary projection"
+        );
+
+        let rooted_files = analyzer
+            .analyzed_files()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        CATALOG_FILES_ENUMERATED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let rooted = WorkspaceUsageCatalog::build_for_files(&analyzer, &rooted_files);
+        assert!(!rooted.nodes.is_empty());
+        assert_eq!(
+            CATALOG_FILES_ENUMERATED.load(std::sync::atomic::Ordering::Relaxed),
+            rooted_files.len(),
+            "rooted catalog construction must remain bounded to its supplied files"
         );
 
         assert!(
@@ -1002,7 +1022,7 @@ mod tests {
                 node.primary.is_file_scope()
                     && node.primary.source().rel_path() == std::path::Path::new("module-info.java")
             }),
-            "parallel declaration enumeration must retain the graph-only Java module descriptor"
+            "batched declaration enumeration must retain the graph-only Java module descriptor"
         );
 
         let cancelled = CancellationToken::default();
@@ -1012,18 +1032,17 @@ mod tests {
             "a cancelled inventory must not publish a partial catalog"
         );
 
-        CATALOG_FILES_ENUMERATED.store(0, std::sync::atomic::Ordering::Relaxed);
-        CATALOG_CANCEL_AFTER_FILE.store(1, std::sync::atomic::Ordering::Relaxed);
-        let cancelled_during_enumeration = CancellationToken::default();
+        // Five checks let the first delegate enter its store query and read its
+        // mounted rows, then cancel before hydration can publish that batch.
+        let cancelled_during_enumeration = CancellationToken::cancel_after_checks_for_test(5);
         assert!(
             WorkspaceUsageCatalog::build_with_cancellation(
                 &analyzer,
                 &cancelled_during_enumeration
             )
             .is_none(),
-            "cancellation after one completed file must discard every parallel batch"
+            "cancellation after reading a mounted batch must discard the whole inventory"
         );
-        CATALOG_CANCEL_AFTER_FILE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The grouping this file replaced, written out as an independent oracle.

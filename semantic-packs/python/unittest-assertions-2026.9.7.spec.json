@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.python-stdlib-assertions",
+  "pack_version": "2026.9.7",
+  "ecosystem": "python",
+  "kind": {
+    "artifact_kind": "authored_semantic_model"
+  },
+  "artifact": {
+    "file_name": "unittest-assertions-2026.9.7.json",
+    "sha256": "50697e170cecbe791773b0ddd33d6e4fc9f4d5494b2dd9b061bf6022fdc19e48",
+    "url": "https://github.com/BrokkAi/bifrost/blob/master/semantic-packs/python/unittest-assertions-2026.9.7.json",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.8.24, <1.0.0",
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.10.0, <3.15.0"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "toolchain": {
+        "name": "cpython",
+        "version": ">=3.10.0, <3.15.0"
+      },
+      "targets": [],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/python/cpython/blob/v3.13.5/Lib/unittest/case.py",
+    "revision": "v3.13.5"
+  },
+  "license": "Apache-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/cpython-unittest-3.13.5.txt"
+  ],
+  "measurement_activation": {
+    "toolchain": {
+      "name": "cpython",
+      "version": "=3.13.5"
+    },
+    "targets": [],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "procedure",
+      "language": "python",
+      "owner": "unittest.case.TestCase",
+      "name": "assertIsInstance",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    {
+      "kind": "procedure",
+      "language": "python",
+      "owner": "unittest.case.TestCase",
+      "name": "assertIsInstance",
+      "has_receiver": true,
+      "parameter_count": 3
+    }
+  ]
+}

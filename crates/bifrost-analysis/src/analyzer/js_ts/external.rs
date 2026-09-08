@@ -23,6 +23,9 @@ use crate::analyzer::semantic_model::{
     read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
+use crate::analyzer::tree_walk::{
+    named_children_iter, push_named_children_reversed, push_named_children_reversed_as,
+};
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_js_ts::model::node_text;
@@ -1134,11 +1137,7 @@ fn triple_slash_library_references(
                 references.push(reference);
             }
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     references
 }
@@ -1454,17 +1453,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             return;
         };
         let mut stack = Vec::new();
-        for index in (0..root.named_child_count()).rev() {
-            if let Some(child) = root.named_child(index) {
-                stack.push(PendingDeclaration {
-                    node: child,
-                    owner_name: root_name.clone(),
-                    owner_id: root_id.clone(),
-                    exported: !self.external_module,
-                    ambient: false,
-                });
-            }
-        }
+        push_named_children_reversed_as(root, &mut stack, |child| PendingDeclaration {
+            node: child,
+            owner_name: root_name.clone(),
+            owner_id: root_id.clone(),
+            exported: !self.external_module,
+            ambient: false,
+        });
         while let Some(pending) = stack.pop() {
             if cancelled(self.cancellation) {
                 self.cancelled = true;
@@ -1534,17 +1529,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             }
             "ambient_declaration" | "statement_block" => {
                 let exported = exported || is_global_ambient_declaration(node);
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(declaration) = node.named_child(index) {
-                        stack.push(PendingDeclaration {
-                            node: declaration,
-                            owner_name: owner_name.clone(),
-                            owner_id: owner_id.clone(),
-                            exported,
-                            ambient: true,
-                        });
-                    }
-                }
+                push_named_children_reversed_as(node, stack, |declaration| PendingDeclaration {
+                    node: declaration,
+                    owner_name: owner_name.clone(),
+                    owner_id: owner_id.clone(),
+                    exported,
+                    ambient: true,
+                });
             }
             "class_declaration"
             | "abstract_class_declaration"
@@ -1655,17 +1646,13 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             return;
         };
         let container = body.child_by_field_name("body").unwrap_or(body);
-        for index in (0..container.named_child_count()).rev() {
-            if let Some(child) = container.named_child(index) {
-                stack.push(PendingDeclaration {
-                    node: child,
-                    owner_name: name.clone(),
-                    owner_id: module_id.clone(),
-                    exported: true,
-                    ambient: true,
-                });
-            }
-        }
+        push_named_children_reversed_as(container, stack, |child| PendingDeclaration {
+            node: child,
+            owner_name: name.clone(),
+            owner_id: module_id.clone(),
+            exported: true,
+            ambient: true,
+        });
     }
 
     fn qualified_name(&self, owner_name: &str, short_name: &str) -> String {
@@ -1753,11 +1740,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 );
                 continue;
             }
-            for index in (0..candidate.named_child_count()).rev() {
-                if let Some(child) = candidate.named_child(index) {
-                    stack.push(child);
-                }
-            }
+            push_named_children_reversed(candidate, &mut stack);
         }
     }
 
@@ -1961,10 +1944,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
 
 fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<String>> {
     let mut aliases = HashMap::default();
-    for index in 0..root.named_child_count() {
-        let Some(statement) = root.named_child(index) else {
-            continue;
-        };
+    for statement in named_children_iter(root) {
         if statement.kind() != "export_statement"
             || statement.child_by_field_name("declaration").is_some()
             || statement.child_by_field_name("source").is_some()
@@ -1992,11 +1972,7 @@ fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<
                 }
                 continue;
             }
-            for child_index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(child_index) {
-                    stack.push(child);
-                }
-            }
+            push_named_children_reversed(node, &mut stack);
         }
     }
     aliases
@@ -2115,11 +2091,7 @@ fn typescript_hierarchy(node: Node<'_>, source: &str, max_depth: usize) -> Vec<H
             }
             continue;
         }
-        for index in (0..candidate.named_child_count()).rev() {
-            if let Some(child) = candidate.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(candidate, &mut stack);
     }
     hierarchy
 }
@@ -2830,7 +2802,7 @@ fn declaration_path(value: &str) -> Result<PathBuf, String> {
 }
 
 fn is_declaration_path(value: &str) -> bool {
-    value.ends_with(".d.ts") || value.ends_with(".d.mts") || value.ends_with(".d.cts")
+    super::is_typescript_declaration_path(Path::new(value))
 }
 
 fn declaration_import_name(package_name: &str) -> String {
@@ -2966,11 +2938,7 @@ fn has_unrecoverable_typescript_errors(root: Node<'_>) -> bool {
         {
             return true;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     false
 }

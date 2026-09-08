@@ -958,6 +958,10 @@ pub enum DurableObjectIdentity {
     },
     LexicalCell {
         locator: SemanticLocator,
+        /// The binding value is part of the cell identity. A lowerer may
+        /// create several lexical cells at one synthetic entry mapping, so
+        /// the cell's source locator alone is not injective.
+        binding: DurableValueIdentity,
     },
     CaptureSlot {
         procedure: SemanticLocator,
@@ -1010,8 +1014,16 @@ impl AccessPathRoot {
                     .semantics()
                     .memory_location(location.id())
                     .ok_or(DurableIdentityError::StaleRow)?;
+                let binding = match &row.kind {
+                    MemoryLocationKind::LexicalCell { binding } => location
+                        .procedure()
+                        .value_handle(*binding)
+                        .expect("validated lexical-cell rows name an existing binding value"),
+                    _ => unreachable!("validated lexical-cell roots name lexical-cell rows"),
+                };
                 DurableObjectIdentity::LexicalCell {
                     locator: durable_source_locator(location.procedure(), row.source)?,
+                    binding: DurableValueIdentity::of(&binding)?,
                 }
             }
             Self::Static(locator) => DurableObjectIdentity::Static {

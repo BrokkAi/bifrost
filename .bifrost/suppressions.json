@@ -183,7 +183,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "0e1006668070a67855533fc3e8fe5e2eaf220228d040699e8ed8df3661cbc67c",
+      "finding_id": "710a29758026d00fb638e38901d4a38c6b142c91b367bf7392e363adb17daffc",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -195,7 +195,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "e1b3283fcb632197731ec71f609cd1cde12f5af51211d4dfea9af35e3a947df3",
+      "finding_id": "7f9c9c3438521ef434e4d768aab7413e0c2bafd7d463f0fc78204104939f2313",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -375,7 +375,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "19e857a7c4afdd4b84f3f7e84d6b82d780f2076aea9edc2248d97f87d3e173e8",
+      "finding_id": "9590be0a96c0c09b251f4898f167b1a5951ddb1b209145f897504cebbc04e8a2",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -387,7 +387,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "dd2a20f2d6dbe56b5b18a730575509c611c238b8cfbe7ee1b5c51e36e9ef22b8",
+      "finding_id": "34ea22520ba26ae2bbcbaf8f62c7b059084a1d2772408050dc8ae07ff4d7abb0",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "4523957eccce22ad65d5aa51c8ac0b8fecee4aa1d30ab6750391f87b99cbc187",
+      "finding_id": "3f31bf60d9edaed4af6f855a953fa1ae27bc908fab6bccd2e5fa7c85fe38c83a",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

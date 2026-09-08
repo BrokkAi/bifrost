@@ -44,7 +44,7 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `cfg-edge-source` | `cfg_edge_source` | control edge → program point | Project an edge to its source. |
 | `cfg-edge-target` | `cfg_edge_target` | control edge → program point | Project an edge to its target. |
 | `typestate` | `typestate` | procedure → typestate finding | Resolve `protocol_ref` against the host snapshot and run the bounded existing typestate client once. |
-| `witness` | `witness` | typestate finding → typestate witness | Project retained source-backed steps, optionally reducing them with `max_steps` and `max_bytes`. |
+| `witness` | `witness` | typestate finding, flow endpoint, or absent-member finding -> matching witness domain | Project retained source-backed steps, optionally reducing them with `max_steps` and `max_bytes`. |
 | `references-of` | `references_of` | declaration → reference site | Return exact structured sites targeting a declaration. |
 | `used-by` | `used_by` | declaration → declaration | Return each smallest exact semantic user, with its proving site under `via`. |
 | `uses` | `uses` | declaration → declaration | Return exact indexed targets used by one semantic declaration, with `via`. |

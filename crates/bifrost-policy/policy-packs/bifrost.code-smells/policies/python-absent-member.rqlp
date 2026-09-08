@@ -1,0 +1,23 @@
+; Evaluate the complete relation of Proven absent-member findings, not a claim
+; that every runtime receiver is known. Per-site Unknown suppresses a finding;
+; unavailable Python declaration coverage makes the query inconclusive.
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.python-absent-member"
+  :name "Python absent member"
+  :message "this Python receiver may hold a proven class that does not declare the accessed member"
+  :severity error
+  :description "Caller-driven class-set propagation proves that a reachable receiver can hold a class whose complete modeled surface lacks the accessed member. Partial receiver sets, unresolved hierarchies, dynamic attribute hooks, and incomplete member models do not produce findings. A clean run means no Proven absence was found, not that all runtime receivers were classified. Missing Python declaration-model coverage makes the run inconclusive."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "python" "type-flow"]
+  :analysis (analysis
+    :type assertion
+    (bind :name finding
+      :query (rql :schema-version 1
+        (language python
+          (absent-member
+            (procedure-of
+              (callable))))))
+    (group :name by-access-class :by (finding.id)
+      (aggregate :name violations :op count))
+    (assert :group by-access-class :value violations :cardinality (exactly 0))))

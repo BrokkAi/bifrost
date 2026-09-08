@@ -13,9 +13,100 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     IAnalyzer, Project, ProjectFile, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
+use glob::{MatchOptions, Pattern};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+/// How every path selector in this workspace matches: `*` and `?` stop at a
+/// directory boundary, so `src/*.rs` never reaches into `src/a/b.rs`, and the
+/// comparison is case sensitive.
+pub(crate) const STRICT_SEPARATOR: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+/// Whether `pattern` is a glob rather than a literal path.
+pub(crate) fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+/// The workspace-relative directory `target` names, if any: the empty path for
+/// the workspace root, `None` for spellings that cannot name a workspace
+/// directory at all (absolute, root-anchored, or `..`-escaping).
+///
+/// A trailing separator is optional: `src` and `src/` name the same directory.
+pub(crate) fn workspace_directory_path(target: &str) -> Option<PathBuf> {
+    let normalized = normalize_pattern(target.trim());
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() || normalized == "." {
+        Some(PathBuf::new())
+    } else {
+        workspace_rel_path(normalized)
+    }
+}
+
+/// The prefix every workspace-relative path under `directory` starts with,
+/// spelled with `/` like [`rel_path_string`].
+///
+/// The workspace root contributes no components, so its prefix is empty and
+/// selects every file without needing a case of its own.
+fn directory_prefix(directory: &Path) -> String {
+    directory
+        .components()
+        .map(|component| format!("{}/", component.as_os_str().to_string_lossy()))
+        .collect()
+}
+
+/// One caller-supplied path selector, interpreted against a workspace.
+///
+/// Every tool that narrows its work with a `paths`-style selector asks the same
+/// question -- glob, file, or directory? -- and, when the answer is none of
+/// those, has to say so rather than silently searching an empty file set
+/// (#3092).
+#[derive(Debug, Clone)]
+pub enum WorkspacePathSelector {
+    /// A glob, matched against workspace-relative paths with
+    /// [`STRICT_SEPARATOR`].
+    Glob(Pattern),
+    /// The workspace files the selector names exactly. A bare basename that
+    /// could mean several files names every file it could mean.
+    Files(Vec<String>),
+    /// Every file under a workspace directory, named by the workspace-relative
+    /// prefix those files share. The workspace root's prefix is empty.
+    Directory(String),
+    /// Not a usable selector: blank, or a glob the pattern compiler rejected.
+    Invalid,
+    /// A well-formed selector that names no workspace file and no workspace
+    /// directory. It selects nothing, so a caller that draws a conclusion from
+    /// what it scanned must report it.
+    Unmatched,
+}
+
+impl WorkspacePathSelector {
+    /// Whether this selector selects `rel`, a workspace-relative path spelled
+    /// with `/` as [`rel_path_string`] produces it.
+    pub fn matches(&self, rel: &str) -> bool {
+        match self {
+            Self::Glob(glob) => glob.matches_with(rel, STRICT_SEPARATOR),
+            Self::Files(paths) => paths.iter().any(|path| path == rel),
+            Self::Directory(prefix) => rel.starts_with(prefix.as_str()),
+            Self::Invalid | Self::Unmatched => false,
+        }
+    }
+
+    /// The workspace paths this selector stands for in a reported scope: the
+    /// glob or directory as written, or each file it resolved to.
+    pub fn scope_paths(&self) -> Vec<&str> {
+        match self {
+            Self::Glob(glob) => vec![glob.as_str()],
+            Self::Files(paths) => paths.iter().map(String::as_str).collect(),
+            Self::Directory(prefix) => vec![prefix.as_str()],
+            Self::Invalid | Self::Unmatched => Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AmbiguousPathInput {
@@ -94,6 +185,41 @@ impl<'a> WorkspaceFileResolver<'a> {
                 input: trimmed.to_string(),
                 matches: matches.iter().map(rel_path_string).collect(),
             }),
+        }
+    }
+
+    /// Interpret one caller-supplied path selector against this workspace.
+    ///
+    /// A selector names a glob, one or more workspace files, or a workspace
+    /// directory whose files it selects -- with or without a trailing
+    /// separator. A selector that names none of those answers
+    /// [`WorkspacePathSelector::Unmatched`], so a caller never reads a scan of
+    /// zero files as a confident answer about the workspace (#3092).
+    pub fn classify_selector(&self, raw: &str) -> WorkspacePathSelector {
+        let normalized = normalize_pattern(raw.trim());
+        if normalized.is_empty() {
+            return WorkspacePathSelector::Invalid;
+        }
+        if is_glob_pattern(&normalized) {
+            return match Pattern::new(&normalized) {
+                Ok(glob) => WorkspacePathSelector::Glob(glob),
+                Err(_) => WorkspacePathSelector::Invalid,
+            };
+        }
+        match self.resolve_literal(&normalized) {
+            ResolvedFileInput::File(file) => {
+                return WorkspacePathSelector::Files(vec![rel_path_string(&file)]);
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                return WorkspacePathSelector::Files(item.matches);
+            }
+            ResolvedFileInput::NotFound(_) => {}
+        }
+        match workspace_directory_path(&normalized) {
+            Some(directory) if self.project.has_directory(&directory) => {
+                WorkspacePathSelector::Directory(directory_prefix(&directory))
+            }
+            _ => WorkspacePathSelector::Unmatched,
         }
     }
 

@@ -5,7 +5,8 @@ use super::value_flow::{
     call_symbol_site, point_symbol_site, public_carrier_symbol, public_symbol_site,
 };
 use super::{
-    CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryRange, CodeQuerySemanticCompleteness,
+    CodeQueryAbsentMemberWitness, CodeQueryAbsentMemberWitnessStatus, CodeQueryFlowEvent,
+    CodeQueryFlowFactSymbol, CodeQueryRange, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding,
     CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,
     public_witness_step,
@@ -40,6 +41,101 @@ pub(super) fn retain_prefix_by_bytes<T>(
         retained.push(item);
     }
     (retained, retained_bytes, 0)
+}
+
+/// Project the evidence already retained by the class-set solve. Zero payload
+/// budgets still retain a bounded metadata row; they cannot manufacture a
+/// complete empty path or turn a reconstruction error into retention exhaustion.
+pub(super) fn public_absent_member_witness(
+    workspace: &WorkspaceAnalyzer,
+    finding: &super::type_flow::AbsentMemberFindingValue,
+    root: &super::type_flow::AbsentMemberRootEvidence,
+    witness_index: usize,
+    max_steps: usize,
+    max_bytes: usize,
+    cache: &mut super::PipelineRenderCache,
+) -> CodeQueryAbsentMemberWitness {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.absent_member_witness.v1");
+    digest.push(finding.id.as_bytes());
+    digest.push(root.root_procedure_id.as_bytes());
+    // The engine retains one representative witness for this root/site/class.
+    // Its identity is independent of how much of that evidence is projected.
+    let mut row = CodeQueryAbsentMemberWitness {
+        id: digest.finish().to_string(),
+        finding_id: finding.id.clone(),
+        witness_index,
+        path: crate::path_utils::rel_path_string(&finding.file),
+        language: crate::analyzer::common::language_for_file(&finding.file).config_label(),
+        range: super::render::render_source_range(
+            workspace.analyzer(),
+            &finding.file,
+            &finding.range,
+            cache,
+        ),
+        quality: CodeQuerySemanticEvidence {
+            proof: CodeQuerySemanticProof::Unproven,
+            proof_reason: None,
+            completeness: CodeQuerySemanticCompleteness::Partial,
+            completeness_reason: None,
+        },
+        steps: Vec::new(),
+        retained_bytes: 0,
+        truncated: false,
+        omitted_steps_lower_bound: 0,
+        alternatives_truncated: false,
+        retention_truncated: false,
+        witness_status: CodeQueryAbsentMemberWitnessStatus::Unavailable,
+        unavailable_reason: None,
+    };
+    match &root.witness {
+        Err(error) => {
+            let reason = bounded_reason(&error.to_string());
+            row.quality.proof_reason = Some(reason.clone());
+            row.quality.completeness_reason =
+                Some("retained witness evidence is unavailable".to_owned());
+            row.unavailable_reason = Some(reason);
+        }
+        Ok(witness) => {
+            let (steps, retained_bytes, omitted) = retain_prefix_by_bytes(
+                witness
+                    .steps()
+                    .iter()
+                    .map(|step| public_witness_step(workspace, step)),
+                max_steps,
+                max_bytes,
+                serialized_json_bytes,
+            );
+            row.steps = steps;
+            row.retained_bytes = retained_bytes;
+            row.truncated = witness.truncated() || omitted > 0;
+            row.omitted_steps_lower_bound =
+                witness.omitted_steps_lower_bound().saturating_add(omitted);
+            row.alternatives_truncated = witness.alternatives_truncated();
+            row.retention_truncated = witness.retention_truncated();
+            row.quality.proof = if witness.quality().is_proven() {
+                CodeQuerySemanticProof::Proven
+            } else {
+                CodeQuerySemanticProof::Unproven
+            };
+            row.quality.completeness = if witness.quality().is_complete() && !row.truncated {
+                CodeQuerySemanticCompleteness::Complete
+            } else {
+                CodeQuerySemanticCompleteness::Partial
+            };
+            if row.truncated {
+                row.quality.completeness_reason = Some(format!(
+                    "retained witness is truncated; at least {} step(s) omitted",
+                    row.omitted_steps_lower_bound,
+                ));
+            }
+            row.witness_status = if row.truncated {
+                CodeQueryAbsentMemberWitnessStatus::Truncated
+            } else {
+                CodeQueryAbsentMemberWitnessStatus::Available
+            };
+        }
+    }
+    row
 }
 
 fn serialized_json_bytes(value: &impl serde::Serialize) -> usize {

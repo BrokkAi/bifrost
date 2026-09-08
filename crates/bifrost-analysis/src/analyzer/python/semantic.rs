@@ -22,7 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v12";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v14";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -1783,6 +1783,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.receiver = Some(value);
                 value
             } else {
+                if !spec
+                    .callable
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "decorated_definition")
+                    && let Some(range) = slot.default_range
+                {
+                    let default = spec
+                        .callable
+                        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                        .expect("a formal default range names a retained syntax node");
+                    let metadata = self.value_mapping(builder, default)?;
+                    // This is the value saved when the callable was defined,
+                    // not an expression evaluated in this procedure's CFG.
+                    self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::DefaultArgument { ordinal },
+                    )?;
+                }
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
@@ -5305,18 +5324,18 @@ fn may_invoke_user_code(node: Node<'_>) -> bool {
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .filter(|child| !is_comment_kind(child.kind()))
+        .filter(|child| !is_ignored_extra_kind(child.kind()))
         .collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
+        .find(|child| !is_ignored_extra_kind(child.kind()))
 }
 
-fn is_comment_kind(kind: &str) -> bool {
-    kind == "comment"
+fn is_ignored_extra_kind(kind: &str) -> bool {
+    matches!(kind, "comment" | "line_continuation")
 }
 
 fn required_field<'tree>(
@@ -5458,6 +5477,23 @@ mod tests {
                 value.len()
             )
         })
+    }
+
+    #[test]
+    fn continued_comparison_preserves_both_control_outcomes() {
+        let parts = lower_fixture_named(
+            "def compare(left, right):\n    return left == \\\n        right\n",
+            Some("compare"),
+        );
+        for kind in [
+            ControlEdgeKind::ConditionalTrue,
+            ControlEdgeKind::ConditionalFalse,
+        ] {
+            assert!(
+                parts.control_edges.iter().any(|edge| edge.kind == kind),
+                "a continued comparison must preserve {kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -5806,6 +5842,29 @@ mod tests {
                 || (gap.capability == SemanticCapability::ExceptionalControlFlow
                     && gap.detail.contains("assignment"))
         }));
+    }
+
+    #[test]
+    fn defaults_are_saved_values_not_callee_calls_or_allocations() {
+        let source = "class Token:\n    pass\ndef target(x=Token(), *, items=[]):\n    return x\n";
+        let parts = lower_fixture_named(source, Some("target"));
+        let defaults = parts
+            .values
+            .iter()
+            .filter_map(|value| match value.kind {
+                SemanticValueKind::DefaultArgument { ordinal } => Some(ordinal),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, [0, 1]);
+        assert!(
+            parts.call_sites.is_empty(),
+            "defaults are not evaluated by calling target"
+        );
+        assert!(
+            parts.allocations.is_empty(),
+            "a mutable default is not fresh on each call"
+        );
     }
 
     #[test]

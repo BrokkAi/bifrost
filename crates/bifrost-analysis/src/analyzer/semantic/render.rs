@@ -518,6 +518,9 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
                 }
             }
         }
+        SemanticValueKind::DefaultArgument { ordinal } => {
+            write!(writer, " :ordinal {ordinal}")?;
+        }
         SemanticValueKind::LanguageDefined(kind) => {
             write!(writer, " :language-kind {}", quoted(kind))?;
         }

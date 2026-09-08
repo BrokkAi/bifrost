@@ -1157,6 +1157,72 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
 }
 
 #[test]
+fn issue_3041_c_label_usage_respects_source_and_callsite_budgets() {
+    use crate::test_support::AnalyzerFixture;
+
+    let source = "void f(void) { goto end; goto end; end: return; }\n";
+    let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("labels.c", source)]);
+    let label_column = source.rfind("end:").expect("label") + 1;
+    let params = || ScanUsagesByLocationParams {
+        targets: vec![ScanUsagesTarget {
+            path: "labels.c".to_string(),
+            line: 1,
+            column: Some(label_column),
+            symbol: None,
+        }],
+        include_tests: true,
+        paths: None,
+        include_same_owner: true,
+    };
+
+    let source_budget = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default(),
+        1_000,
+        10_000,
+        0,
+        1_000,
+    );
+    let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+    let result = scan_usages_by_location_with_context(
+        fixture.analyzer.analyzer(),
+        scope.token(),
+        params(),
+        &source_budget,
+    );
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(result.results[0].status, ScanUsagesStatus::Failure);
+    assert_eq!(
+        result.results[0].incomplete_reason,
+        Some(ScanUsagesIncompleteReason::SourceBytes),
+        "{result:#?}"
+    );
+    drop(scope);
+
+    let callsite_budget = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default(),
+        1_000,
+        10_000,
+        usize::MAX,
+        1,
+    );
+    let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+    let result = scan_usages_by_location_with_context(
+        fixture.analyzer.analyzer(),
+        scope.token(),
+        params(),
+        &callsite_budget,
+    );
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(
+        result.results[0].status,
+        ScanUsagesStatus::TooManyCallsites,
+        "{result:#?}"
+    );
+    assert_eq!(result.results[0].total_callsites, Some(2));
+    assert_eq!(result.results[0].limit, Some(1));
+}
+
+#[test]
 fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     use crate::analyzer::{RustAnalyzer, TestProject};
 

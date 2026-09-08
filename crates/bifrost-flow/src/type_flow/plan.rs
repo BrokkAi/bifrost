@@ -17,11 +17,11 @@ use brokk_bifrost_core::profiling;
 use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::{
     CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
-    DispatchReadUnattributedReason, EvidenceCompleteness, GuardArmSide, GuardPredicate,
-    MemberAccessKind, MemberAccessQuery, MemoryLocationKind, NarrowingVerdict, ProcedureHandle,
-    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
-    SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind,
-    SourceSite, SourceSiteKind, SourceSpan, TypeFlowAdapter, UnknownReason,
+    DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, MemberAccessKind,
+    MemberAccessQuery, MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget, SemanticCallSite,
+    SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind, SourceSite,
+    SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -29,18 +29,29 @@ use crate::dataflow::{
     ExternalSummaryCompatibilityKey, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
     SummarySemanticsVersion, UnmodeledCallBehavior,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
-    BindingCoverage, CallSiteCoverage, ClosureLimits, DiscoveredClosure, DispatchReadCollector,
-    DispatchStatus, DurableProcedureKey, ProcedureDispatchRead, ValueFlowCarrier,
-    ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowObservationPhase,
-    ValueFlowPlan, ValueFlowPlanError, ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId,
-    ValueFlowSourceSpec, WorkspaceValueFlowProvider, discover_closure_with,
+    BindingCoverage, CallSiteCoverage, ClosureCutDecider, ClosureLimits, DiscoveredClosure,
+    DispatchReadCollector, DispatchStatus, DurableProcedureKey, ProcedureDispatchRead, SkipReason,
+    ValueFlowCarrier, ValueFlowEdgeKillSpec, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
+    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPlanError, ValueFlowSinkId,
+    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, WorkspaceValueFlowProvider,
+    discover_closure_with_cuts,
 };
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
 use super::field_slots::{FieldSlotIndex, receiver_values};
+use super::summary::class_set_local_structure_digest;
 use crate::scalar_state::BindingOriginIndex;
+
+/// Restrict the dependency relation to transfers that preserve runtime class.
+/// Computation result seeds are added separately by `seed_procedure`.
+pub(super) fn class_set_snapshot(
+    input: ValueFlowInput<ValueFlowSnapshot>,
+) -> ValueFlowInput<ValueFlowSnapshot> {
+    let (snapshot, status) = input.into_parts();
+    ValueFlowInput::new(snapshot.into_class_identity_projection(), status)
+}
 
 /// One member access whose receiver's class set the solve computes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +95,33 @@ pub struct TypeFlowPlan {
     sinks: Vec<MemberAccessSite>,
     coverage: HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
     dispatch_reads: HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
+    local_structure_digests: HashMap<DurableProcedureKey, StableDigest>,
+    summary_cuts: HashSet<DurableProcedureKey>,
     field_slot_semantic_budget_exhausted: bool,
+    provider_failure_observed: bool,
+}
+
+fn closure_has_provider_failure(closure: &DiscoveredClosure) -> bool {
+    provider_failure_observed(
+        closure.skipped.iter().map(|(_, reason)| reason),
+        closure.coverage.values(),
+    )
+}
+
+fn provider_failure_observed<'a>(
+    skipped: impl IntoIterator<Item = &'a SkipReason>,
+    coverage: impl IntoIterator<Item = &'a CallSiteCoverage>,
+) -> bool {
+    skipped
+        .into_iter()
+        .any(|reason| matches!(reason, SkipReason::ProviderError { .. }))
+        || coverage.into_iter().any(|coverage| {
+            matches!(coverage.dispatch, DispatchStatus::ProviderError { .. })
+                || coverage
+                    .bindings
+                    .iter()
+                    .any(|binding| matches!(binding, BindingCoverage::ProviderError { .. }))
+        })
 }
 
 fn canonical_dispatch_read_contract(
@@ -112,6 +149,7 @@ fn canonical_dispatch_read_contract(
 fn canonical_dispatch_read_contracts(
     procedures: &[ProcedureHandle],
     observations: Vec<ProcedureDispatchRead>,
+    certified: HashMap<DurableProcedureKey, Box<[ReadKey]>>,
 ) -> HashMap<DurableProcedureKey, ProcedureDispatchReadContract> {
     let mut pending = HashMap::default();
     for procedure in procedures {
@@ -131,12 +169,23 @@ fn canonical_dispatch_read_contracts(
             .expect("every dispatch observation belongs to a discovered procedure");
         contract.push(attribution);
     }
-    pending
+    let mut contracts = pending
         .into_iter()
         .map(|(procedure, attributions)| {
             (procedure, canonical_dispatch_read_contract(attributions))
         })
-        .collect()
+        .collect::<HashMap<_, _>>();
+    for (procedure, reads) in certified {
+        let contract = contracts
+            .get_mut(&procedure)
+            .expect("a certified dispatch contract belongs to a mounted surface");
+        assert!(
+            matches!(contract, ProcedureDispatchReadContract::Complete(reads) if reads.is_empty()),
+            "identity-only surfaces have no live dispatch observations"
+        );
+        *contract = ProcedureDispatchReadContract::Complete(reads);
+    }
+    contracts
 }
 
 /// Why one root's class-set plan could not be built.
@@ -319,6 +368,11 @@ fn guard_edge_kills(
             .push(source.key().clone());
     }
     let mut kills = Vec::new();
+    let class_sources = sources_by_class.iter().collect::<Vec<_>>();
+    let classes = class_sources
+        .iter()
+        .map(|(class, _)| *class)
+        .collect::<Vec<_>>();
     for procedure in procedures {
         let origins = BindingOriginIndex::new(procedure);
         for guard in procedure.semantics().guard_facts() {
@@ -334,40 +388,27 @@ fn guard_edge_kills(
             else {
                 continue;
             };
-            let carrier = match &procedure
-                .semantics()
-                .value(binding)
-                .expect("a binding origin is live in its procedure")
-                .kind
-            {
-                SemanticValueKind::Parameter { ordinal, .. } => ValueFlowCarrier::Port(
-                    ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
-                        .expect("the ordinal comes from a retained parameter value"),
-                ),
-                SemanticValueKind::Receiver { .. } => ValueFlowCarrier::Port(
-                    ProcedurePortHandle::receiver(procedure.clone())
-                        .expect("the procedure retains its receiver value"),
-                ),
-                SemanticValueKind::Local => ValueFlowCarrier::Value(
-                    procedure
-                        .value_handle(binding)
-                        .expect("a local binding origin is live in its procedure"),
-                ),
-                kind => unreachable!("binding origin has unsupported kind: {kind:?}"),
-            };
-            for (side, edge_id) in [
-                (GuardArmSide::True, guard.true_edge),
-                (GuardArmSide::False, guard.false_edge),
+            let carrier = binding_carrier(procedure, binding);
+            if classes.is_empty() || (guard.true_edge.is_none() && guard.false_edge.is_none()) {
+                continue;
+            }
+            let verdicts = adapter.narrowing_verdicts(workspace, procedure, guard, &classes);
+            assert_eq!(
+                verdicts.len(),
+                classes.len(),
+                "one guard verdict per candidate class"
+            );
+            for (dropped_verdict, edge_id) in [
+                (NarrowingVerdict::Drop, guard.true_edge),
+                (NarrowingVerdict::Keep, guard.false_edge),
             ] {
                 let Some(edge) = edge_id.and_then(|id| procedure.semantics().control_edge(id))
                 else {
                     continue;
                 };
                 let mut dropped = Vec::new();
-                for (atom, atom_sources) in &sources_by_class {
-                    if adapter.narrowing_verdict(workspace, procedure, guard, atom, side)
-                        == NarrowingVerdict::Drop
-                    {
+                for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
+                    if *verdict == dropped_verdict {
                         dropped.extend(atom_sources.iter().cloned());
                     }
                 }
@@ -384,8 +425,93 @@ fn guard_edge_kills(
                 }
             }
         }
+        for call in procedure.semantics().call_sites() {
+            let Some(normal) = call.normal_continuation.target() else {
+                continue;
+            };
+            let point = procedure
+                .semantics()
+                .point(normal)
+                .expect("a normal continuation is retained");
+            // Apply a reviewed return condition before the next operation.
+            // Python publishes a dedicated continuation marker. Other shapes
+            // remain open rather than killing facts after a use or overwrite.
+            if !point.events.iter().all(|event| {
+                matches!(event.effect, SemanticEffect::CallContinuation {
+                    call_site,
+                    kind: crate::analyzer::semantic::CallContinuationKind::Normal,
+                } if call_site == call.id)
+            }) {
+                continue;
+            }
+            for constraint in adapter.normal_return_type_constraints(workspace, procedure, call) {
+                if constraint.provenance.ambiguous
+                    || constraint.provenance.completeness
+                        != crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+                    || constraint.classes.is_empty()
+                {
+                    continue;
+                }
+                let Some(binding) = origins.unique_binding_origin(constraint.subject) else {
+                    continue;
+                };
+                let mut dropped = Vec::new();
+                for (atom, atom_sources) in &sources_by_class {
+                    if adapter.instance_of_verdict(workspace, atom, &constraint.classes)
+                        == NarrowingVerdict::Drop
+                    {
+                        dropped.extend(atom_sources.iter().cloned());
+                    }
+                }
+                if dropped.is_empty() {
+                    continue;
+                }
+                let carrier = binding_carrier(procedure, binding);
+                for (_, edge) in procedure.semantics().successor_edges(normal) {
+                    if edge.kind != crate::analyzer::semantic::ControlEdgeKind::Normal {
+                        continue;
+                    }
+                    kills.push(ValueFlowEdgeKillSpec {
+                        point: procedure
+                            .point_handle(normal)
+                            .expect("the continuation is live"),
+                        target: edge.target_point,
+                        kind: edge.kind,
+                        carrier: carrier.clone(),
+                        sources: dropped.clone(),
+                    });
+                }
+            }
+        }
     }
     kills
+}
+
+fn binding_carrier(
+    procedure: &ProcedureHandle,
+    binding: crate::analyzer::semantic::ValueId,
+) -> ValueFlowCarrier {
+    match &procedure
+        .semantics()
+        .value(binding)
+        .expect("a binding origin is live in its procedure")
+        .kind
+    {
+        SemanticValueKind::Parameter { ordinal, .. } => ValueFlowCarrier::Port(
+            ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
+                .expect("the ordinal comes from a retained parameter value"),
+        ),
+        SemanticValueKind::Receiver { .. } => ValueFlowCarrier::Port(
+            ProcedurePortHandle::receiver(procedure.clone())
+                .expect("the procedure retains its receiver value"),
+        ),
+        SemanticValueKind::Local => ValueFlowCarrier::Value(
+            procedure
+                .value_handle(binding)
+                .expect("a local binding origin is live"),
+        ),
+        kind => unreachable!("binding origin has unsupported kind: {kind:?}"),
+    }
 }
 
 impl TypeFlowPlan {
@@ -400,16 +526,56 @@ impl TypeFlowPlan {
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        struct NoSummaryCuts;
+        impl ClosureCutDecider for NoSummaryCuts {
+            fn should_cut(
+                &mut self,
+                _procedure: &ProcedureHandle,
+                _snapshot: &crate::value_flow::ValueFlowInput<
+                    crate::analyzer::semantic::ValueFlowSnapshot,
+                >,
+                _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
+                _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> bool {
+                false
+            }
+        }
+        Self::build_with_summary_cuts(
+            workspace,
+            adapter,
+            field_slots,
+            root,
+            provider,
+            limits,
+            semantic_budget,
+            cancellation,
+            &mut NoSummaryCuts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_summary_cuts<C: ClosureCutDecider>(
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        field_slots: &FieldSlotIndex,
+        root: &ProcedureHandle,
+        provider: &WorkspaceValueFlowProvider<'_>,
+        limits: ClosureLimits,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        cuts: &mut C,
+    ) -> Result<Self, TypeFlowPlanError> {
         let dispatch_reads = DispatchReadCollector::default();
-        let closure = {
+        let mut closure = {
             let _scope = profiling::scope("type_flow.discovery");
             let observed_provider = provider.observing_dispatch_reads(dispatch_reads.clone());
-            discover_closure_with(
+            discover_closure_with_cuts(
                 &observed_provider,
                 root,
                 limits,
                 semantic_budget,
                 cancellation,
+                cuts,
             )
             .map_err(TypeFlowPlanError::Discovery)?
         };
@@ -417,9 +583,28 @@ impl TypeFlowPlan {
         if closure.root_snapshot.is_none() {
             return Err(TypeFlowPlanError::RootRelationsUnavailable);
         }
-        let dispatch_reads =
-            canonical_dispatch_read_contracts(&closure.procedures, dispatch_reads.observations());
+        let provider_failure_observed = closure_has_provider_failure(&closure);
+        let dispatch_reads = canonical_dispatch_read_contracts(
+            &closure.procedures,
+            dispatch_reads.observations(),
+            std::mem::take(&mut closure.certified_dispatch_reads),
+        );
+        let local_structure_digests = closure
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                Ok((
+                    snapshot.value().procedure().durable_key(),
+                    class_set_local_structure_digest(snapshot)?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, ValueFlowPlanError>>()?;
         let root_key = root.durable_key();
+        let summary_cuts = closure
+            .summary_cuts
+            .iter()
+            .map(ProcedureHandle::durable_key)
+            .collect();
         let mut unmaterialized_external_targets = closure
             .boundaries
             .iter()
@@ -465,7 +650,11 @@ impl TypeFlowPlan {
         let call_behavior = UnmodeledCallBehavior::Optimistic;
         let mut value_flow = ValueFlowPlan::with_call_behavior_and_edge_kills(
             root.clone(),
-            closure.snapshots,
+            closure
+                .snapshots
+                .into_iter()
+                .map(class_set_snapshot)
+                .collect(),
             closure.bindings,
             source_specs,
             sink_specs,
@@ -535,7 +724,10 @@ impl TypeFlowPlan {
             sinks: member_sites,
             coverage: closure.coverage,
             dispatch_reads,
+            local_structure_digests,
+            summary_cuts,
             field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted(),
+            provider_failure_observed,
         })
     }
 
@@ -564,6 +756,29 @@ impl TypeFlowPlan {
         self.dispatch_reads.get(procedure)
     }
 
+    pub(crate) fn local_structure_digest(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> Option<StableDigest> {
+        self.local_structure_digests
+            .get(&procedure.durable_key())
+            .copied()
+    }
+
+    /// Every structurally entered callee certified for summary dependency
+    /// construction. This includes persisted surface edges whose executable
+    /// `CallBindings` are intentionally absent from a cut plan.
+    pub(crate) fn summary_callees_of<'a>(
+        &'a self,
+        procedure: &'a ProcedureHandle,
+    ) -> impl Iterator<Item = &'a ProcedureHandle> + 'a {
+        let caller = procedure.durable_key();
+        self.coverage
+            .iter()
+            .filter(move |((candidate, _), _)| candidate == &caller)
+            .flat_map(|(_, coverage)| coverage.entered.iter())
+    }
+
     /// The call site in `procedure` whose result is `value`, when one exists.
     /// This is how `interpret` finds the call that produced a sink's
     /// receiver.
@@ -590,8 +805,20 @@ impl TypeFlowPlan {
         self.coverage.get(&(procedure.durable_key(), call))
     }
 
+    pub(crate) fn is_summary_cut(&self, procedure: &ProcedureHandle) -> bool {
+        self.summary_cuts.contains(&procedure.durable_key())
+    }
+
+    pub(crate) fn has_summary_cuts(&self) -> bool {
+        !self.summary_cuts.is_empty()
+    }
+
     pub(crate) const fn field_slot_semantic_budget_exhausted(&self) -> bool {
         self.field_slot_semantic_budget_exhausted
+    }
+
+    pub(crate) const fn provider_failure_observed(&self) -> bool {
+        self.provider_failure_observed
     }
 }
 
@@ -663,6 +890,11 @@ fn seed_procedure(
     let entry = procedure
         .point_handle(semantics.entry_point())
         .expect("a procedure's entry point is live");
+    let callee_values = semantics
+        .call_sites()
+        .iter()
+        .map(|call| call.callee)
+        .collect::<HashSet<_>>();
 
     for call in semantics.call_sites() {
         seed_call(workspace, adapter, closure, procedure, call, tables);
@@ -671,46 +903,26 @@ fn seed_procedure(
         match &value.kind {
             SemanticValueKind::Constant => {
                 let span = mapping_span(procedure, value.source);
-                match adapter.constant_class(workspace, procedure, value) {
-                    ClassSeed::Class(identity) => {
-                        let Some(site) =
-                            source_site(workspace, procedure, span, SourceSiteKind::Literal)
-                        else {
-                            continue;
-                        };
-                        let carrier = ValueFlowCarrier::Value(
-                            procedure
-                                .value_handle(value.id)
-                                .expect("a retained value is live"),
-                        );
-                        tables.push_source(
-                            &entry,
-                            ValueFlowObservationPhase::AfterEffects,
-                            carrier,
-                            ClassAtom::Class(identity),
-                            site,
-                        );
-                    }
-                    ClassSeed::Unknown(reason) => {
-                        let Some(site) =
-                            source_site(workspace, procedure, span, SourceSiteKind::Unknown)
-                        else {
-                            continue;
-                        };
-                        let carrier = ValueFlowCarrier::Value(
-                            procedure
-                                .value_handle(value.id)
-                                .expect("a retained value is live"),
-                        );
-                        tables.push_source(
-                            &entry,
-                            ValueFlowObservationPhase::AfterEffects,
-                            carrier,
-                            ClassAtom::Unknown(reason),
-                            site,
-                        );
-                    }
-                    ClassSeed::NotApplicable => {}
+                for atom in adapter
+                    .constant_class(workspace, procedure, value)
+                    .into_atoms()
+                {
+                    let kind = source_kind_for_atom(&atom, SourceSiteKind::Literal);
+                    let Some(site) = source_site(workspace, procedure, span, kind) else {
+                        continue;
+                    };
+                    let carrier = ValueFlowCarrier::Value(
+                        procedure
+                            .value_handle(value.id)
+                            .expect("a retained value is live"),
+                    );
+                    tables.push_source(
+                        &entry,
+                        ValueFlowObservationPhase::AfterEffects,
+                        carrier,
+                        atom,
+                        site,
+                    );
                 }
             }
             SemanticValueKind::Parameter {
@@ -735,44 +947,26 @@ fn seed_procedure(
                     );
                     continue;
                 }
-                match adapter.declared_parameter_class(workspace, procedure, *ordinal) {
-                    ClassSeed::Class(identity) => {
+                let seed = adapter.declared_parameter_class(workspace, procedure, *ordinal);
+                if matches!(seed, ClassSeed::NotApplicable) {
+                    if is_root {
                         seed_port(
                             workspace,
                             procedure,
                             *ordinal,
                             &entry,
-                            ClassAtom::Class(identity),
-                            span,
-                            SourceSiteKind::DeclaredParameter,
-                            tables,
-                        );
-                    }
-                    ClassSeed::Unknown(reason) => {
-                        seed_port(
-                            workspace,
-                            procedure,
-                            *ordinal,
-                            &entry,
-                            ClassAtom::Unknown(reason),
+                            ClassAtom::Unknown(UnknownReason::RootParameter),
                             span,
                             SourceSiteKind::Unknown,
                             tables,
                         );
                     }
-                    ClassSeed::NotApplicable => {
-                        if is_root {
-                            seed_port(
-                                workspace,
-                                procedure,
-                                *ordinal,
-                                &entry,
-                                ClassAtom::Unknown(UnknownReason::RootParameter),
-                                span,
-                                SourceSiteKind::Unknown,
-                                tables,
-                            );
-                        }
+                } else {
+                    for atom in seed.into_atoms() {
+                        let kind = source_kind_for_atom(&atom, SourceSiteKind::DeclaredParameter);
+                        seed_port(
+                            workspace, procedure, *ordinal, &entry, atom, span, kind, tables,
+                        );
                     }
                 }
             }
@@ -829,6 +1023,32 @@ fn seed_procedure(
                     site,
                 );
             }
+            SemanticValueKind::DefaultArgument { .. } => {
+                let span = mapping_span(procedure, value.source);
+                let seed = adapter.retained_value_class(workspace, procedure, value);
+                let seed = if matches!(seed, ClassSeed::NotApplicable) {
+                    ClassSeed::Unknown(UnknownReason::UncertainFlow)
+                } else {
+                    seed
+                };
+                for atom in seed.into_atoms() {
+                    let kind = source_kind_for_atom(&atom, SourceSiteKind::Unknown);
+                    let Some(site) = source_site(workspace, procedure, span, kind) else {
+                        continue;
+                    };
+                    tables.push_source(
+                        &entry,
+                        ValueFlowObservationPhase::AfterEffects,
+                        ValueFlowCarrier::Value(
+                            procedure
+                                .value_handle(value.id)
+                                .expect("a saved default is live"),
+                        ),
+                        atom,
+                        site,
+                    );
+                }
+            }
             SemanticValueKind::LanguageDefined(_) => {
                 let span = mapping_span(procedure, value.source);
                 let Some(site) = source_site(workspace, procedure, span, SourceSiteKind::Unknown)
@@ -848,43 +1068,108 @@ fn seed_procedure(
                     site,
                 );
             }
-            _ => {}
+            SemanticValueKind::Local
+            | SemanticValueKind::Return
+            | SemanticValueKind::Temporary
+            | SemanticValueKind::Address
+            | SemanticValueKind::Null
+            | SemanticValueKind::Boolean(_)
+            | SemanticValueKind::UnsignedInteger(_)
+            | SemanticValueKind::Exception
+            | SemanticValueKind::Callable => {
+                if callee_values.contains(&value.id) {
+                    continue;
+                }
+                let span = mapping_span(procedure, value.source);
+                for atom in adapter
+                    .retained_value_class(workspace, procedure, value)
+                    .into_atoms()
+                {
+                    let kind = source_kind_for_atom(&atom, SourceSiteKind::Unknown);
+                    let Some(site) = source_site(workspace, procedure, span, kind) else {
+                        continue;
+                    };
+                    let carrier = ValueFlowCarrier::Value(
+                        procedure
+                            .value_handle(value.id)
+                            .expect("a retained value is live"),
+                    );
+                    tables.push_source(
+                        &entry,
+                        ValueFlowObservationPhase::AfterEffects,
+                        carrier,
+                        atom,
+                        site,
+                    );
+                }
+            }
         }
     }
     for allocation in semantics.allocations() {
         let span = mapping_span(procedure, allocation.source);
-        let atom = match adapter.allocation_class(workspace, procedure, allocation) {
-            ClassSeed::Class(identity) => ClassAtom::Class(identity),
-            ClassSeed::Unknown(reason) => ClassAtom::Unknown(reason),
-            ClassSeed::NotApplicable => continue,
-        };
-        let kind = if matches!(atom, ClassAtom::Class(_)) {
-            SourceSiteKind::ContainerLiteral
-        } else {
-            SourceSiteKind::Unknown
-        };
-        let Some(site) = source_site(workspace, procedure, span, kind) else {
-            continue;
-        };
         let point = procedure
             .point_handle(allocation.point)
             .expect("an allocation's point is live");
-        let carrier = ValueFlowCarrier::Value(
-            procedure
-                .value_handle(allocation.result)
-                .expect("an allocation's result value is live"),
-        );
-        tables.push_source(
-            &point,
-            ValueFlowObservationPhase::AfterEffects,
-            carrier,
-            atom,
-            site,
-        );
+        for atom in adapter
+            .allocation_class(workspace, procedure, allocation)
+            .into_atoms()
+        {
+            let kind = source_kind_for_atom(&atom, SourceSiteKind::ContainerLiteral);
+            let Some(site) = source_site(workspace, procedure, span, kind) else {
+                continue;
+            };
+            let carrier = ValueFlowCarrier::Value(
+                procedure
+                    .value_handle(allocation.result)
+                    .expect("an allocation's result value is live"),
+            );
+            tables.push_source(
+                &point,
+                ValueFlowObservationPhase::AfterEffects,
+                carrier,
+                atom,
+                site,
+            );
+        }
     }
     for point in semantics.points() {
+        let mut computed_results = HashSet::default();
         for event in &point.events {
             match &event.effect {
+                SemanticEffect::ValueFlow { kind, target, .. }
+                    if !kind.preserves_runtime_class() && computed_results.insert(*target) =>
+                {
+                    let result = semantics
+                        .value(*target)
+                        .expect("a computed value is retained");
+                    let span = mapping_span(procedure, result.source);
+                    let point_handle = procedure
+                        .point_handle(point.id)
+                        .expect("a retained computation point is live");
+                    let seed = adapter.computed_class(workspace, procedure, result);
+                    let seed = if matches!(seed, ClassSeed::NotApplicable) {
+                        ClassSeed::Unknown(UnknownReason::UncertainFlow)
+                    } else {
+                        seed
+                    };
+                    for atom in seed.into_atoms() {
+                        let kind = source_kind_for_atom(&atom, SourceSiteKind::Unknown);
+                        let Some(site) = source_site(workspace, procedure, span, kind) else {
+                            continue;
+                        };
+                        tables.push_source(
+                            &point_handle,
+                            ValueFlowObservationPhase::AfterEffects,
+                            ValueFlowCarrier::Value(
+                                procedure
+                                    .value_handle(*target)
+                                    .expect("a computed result is live"),
+                            ),
+                            atom,
+                            site,
+                        );
+                    }
+                }
                 SemanticEffect::MemoryLoad {
                     location, result, ..
                 } => {
@@ -1053,6 +1338,13 @@ fn seed_call_result(
     );
 }
 
+fn source_kind_for_atom(atom: &ClassAtom, class_kind: SourceSiteKind) -> SourceSiteKind {
+    match atom {
+        ClassAtom::Class(_) => class_kind,
+        ClassAtom::Unknown(_) => SourceSiteKind::Unknown,
+    }
+}
+
 fn seed_call(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
@@ -1061,35 +1353,23 @@ fn seed_call(
     call: &SemanticCallSite,
     tables: &mut SeedTables,
 ) {
-    match adapter.constructed_class(workspace, procedure, call) {
-        ClassSeed::Class(identity) => seed_call_result(
-            workspace,
-            procedure,
-            call,
-            ClassAtom::Class(identity),
-            SourceSiteKind::ConstructorCall,
-            tables,
-        ),
-        ClassSeed::Unknown(reason) => seed_call_result(
-            workspace,
-            procedure,
-            call,
-            ClassAtom::Unknown(reason),
-            SourceSiteKind::Unknown,
-            tables,
-        ),
-        ClassSeed::NotApplicable => {
-            let key = (procedure.durable_key(), call.id);
-            if let Some(reason) = uncovered_reason(closure.coverage.get(&key)) {
-                seed_call_result(
-                    workspace,
-                    procedure,
-                    call,
-                    ClassAtom::Unknown(reason),
-                    SourceSiteKind::Unknown,
-                    tables,
-                );
-            }
+    let seed = adapter.constructed_class(workspace, procedure, call);
+    if matches!(seed, ClassSeed::NotApplicable) {
+        let key = (procedure.durable_key(), call.id);
+        if let Some(reason) = uncovered_reason(closure.coverage.get(&key)) {
+            seed_call_result(
+                workspace,
+                procedure,
+                call,
+                ClassAtom::Unknown(reason),
+                SourceSiteKind::Unknown,
+                tables,
+            );
+        }
+    } else {
+        for atom in seed.into_atoms() {
+            let kind = source_kind_for_atom(&atom, SourceSiteKind::ConstructorCall);
+            seed_call_result(workspace, procedure, call, atom, kind, tables);
         }
     }
     if let Some(receiver) = call.receiver
@@ -1266,6 +1546,7 @@ mod tests {
             entered: Vec::new(),
             has_uncovered_boundary: false,
             truncated: false,
+            complete_receiver_hint_refinable: false,
             dispatch,
             bindings,
         }
@@ -1317,5 +1598,45 @@ mod tests {
         );
 
         assert_eq!(uncovered_reason(Some(&absent_member)), None);
+    }
+
+    #[test]
+    fn persistence_observes_every_typed_provider_failure_channel() {
+        let stable_open = coverage(
+            DispatchStatus::Unavailable {
+                status: SemanticInputStatus::Unknown,
+            },
+            vec![BindingCoverage::Answered {
+                status: SemanticInputStatus::Unknown,
+            }],
+        );
+        assert!(
+            !provider_failure_observed(std::iter::empty(), [&stable_open]),
+            "stable open semantic outcomes are not transient provider failures"
+        );
+
+        let skipped = SkipReason::ProviderError {
+            detail: "snapshot failed".to_owned(),
+        };
+        assert!(provider_failure_observed([&skipped], [&stable_open]));
+
+        let dispatch = coverage(
+            DispatchStatus::ProviderError {
+                detail: "dispatch failed".to_owned(),
+            },
+            Vec::new(),
+        );
+        assert!(provider_failure_observed(std::iter::empty(), [&dispatch]));
+
+        let binding = coverage(
+            DispatchStatus::Resolved {
+                status: SemanticInputStatus::Complete,
+                coverage: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
+            },
+            vec![BindingCoverage::ProviderError {
+                detail: "binding failed".to_owned(),
+            }],
+        );
+        assert!(provider_failure_observed(std::iter::empty(), [&binding]));
     }
 }

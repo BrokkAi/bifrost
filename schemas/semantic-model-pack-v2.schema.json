@@ -155,6 +155,47 @@
         "read_modify_write"
       ]
     },
+    "AuthoredClassDecoratorIdentity": {
+      "description": "A reviewed claim that one exact decorator preserves the class identity\nneeded by class-set analysis. `direct` describes a decorator applied to\nthe implicit class argument. A present `factory_keywords` list describes\na factory call with only the named literal-boolean keyword arguments.",
+      "type": "object",
+      "properties": {
+        "direct": {
+          "type": "boolean"
+        },
+        "factory_keywords": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AuthoredClassDecoratorKeyword"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "direct"
+      ]
+    },
+    "AuthoredClassDecoratorKeyword": {
+      "type": "object",
+      "properties": {
+        "allowed_values": {
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          }
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "allowed_values"
+      ]
+    },
     "AuthoredConcurrencyEffect": {
       "oneOf": [
         {
@@ -455,6 +496,35 @@
         "predicate"
       ]
     },
+    "AuthoredNormalReturnTypeRefinement": {
+      "type": "object",
+      "properties": {
+        "class_parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "required_receiver_members": {
+          "description": "Exact receiver members that must remain bound to the modeled owner for\nthis refinement's normal-return claim to hold.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter_ordinal",
+        "class_parameter_ordinal"
+      ]
+    },
     "AuthoredOperationPrecondition": {
       "type": "object",
       "properties": {
@@ -559,6 +629,17 @@
     "AuthoredProcedureSummary": {
       "type": "object",
       "properties": {
+        "class_decorator_identity": {
+          "description": "Reviewed identity of a class decorator or decorator factory.  This is\nintentionally optional: omission does not assert anything about the\ndecorator's behavior.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthoredClassDecoratorIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "completeness": {
           "$ref": "#/$defs/Completeness"
         },
@@ -629,6 +710,13 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/AuthoredNormalReturnRefinement"
+          }
+        },
+        "normal_return_type_refinements": {
+          "description": "Reviewed class assertions established for a subject parameter whenever\nthis procedure returns normally. The class parameter is the argument\nwhose runtime class the subject is asserted to have.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredNormalReturnTypeRefinement"
           }
         },
         "preconditions": {

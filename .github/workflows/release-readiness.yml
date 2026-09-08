@@ -859,9 +859,14 @@ jobs:
 
   policy-scan-smoke:
     name: smoke policy scan with staged binary
-    needs: [preflight, build]
+    # Metadata-only requalification reuses the prior qualification bundle and
+    # skips all source-dependent jobs, including the semantic-pack producers.
+    # Keep this explicit so the new artifact dependency does not change that
+    # release path into a rebuild.
+    if: ${{ inputs.requalify_from_run == '' }}
+    needs: [preflight, build, semantic-pack-python]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -873,6 +878,43 @@ jobs:
         with:
           name: bifrost-x86_64-unknown-linux-gnu
           path: ${{ runner.temp }}/bifrost-linux-release
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache semantic-pack installer
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-policy-semantic-pack
+      - name: Download exact Python semantic-pack bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bifrost-semantic-packs-python
+          path: ${{ runner.temp }}/bifrost-semantic-packs-python
+      - name: Verify and install Python semantic-pack bundle
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/bifrost-semantic-packs-python
+          CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --features release-tooling \
+            -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify "$BUNDLE_DIR"
+          catalog_version=$(sed -nE \
+            's/^pub\(super\) const CURRENT_CATALOG_VERSION: i64 = ([0-9]+);$/\1/p' \
+            crates/bifrost-analysis/src/analyzer/semantic_model/catalog/db.rs)
+          if [[ ! "$catalog_version" =~ ^[0-9]+$ ]]; then
+            echo "could not derive exactly one numeric semantic-pack catalog version" >&2
+            exit 2
+          fi
+          catalog_root="$CACHE_ROOT/semantic-pack-catalog.v${catalog_version}"
+          mkdir -p "$CACHE_ROOT"
+          cargo run --locked --release --features release-tooling \
+            -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- install \
+            "$BUNDLE_DIR" "$catalog_root"
+      # Keep this after the Cargo cache restore and installer build: restoring
+      # target/release before this point could replace the exact qualified
+      # binary with a cached build.
       - name: Stage exact binary
         shell: bash
         env:
@@ -889,6 +931,8 @@ jobs:
           chmod +x target/release/$BIN_NAME
       - name: Scan repository with staged binary
         uses: ./.github/actions/policy-scan
+        env:
+          BIFROST_SEMANTIC_PACK_CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
         with:
           version: local
           upload: 'false'

@@ -76,7 +76,15 @@ use std::fmt;
 /// the parameters written in either are scoped by the definition instead of
 /// sitting in the enclosing template's scope, where the shared class-scope
 /// rule excluded them as members (#2925).
-pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 20;
+/// Version 21 gives Ruby a lexical environment: `singleton_class` is a
+/// class-kind fact, and every `identifier`, `constant`, `instance_variable`,
+/// `class_variable` and `global_variable` token now carries an occurrence role
+/// where only receiver-call member positions did before (#2962).
+/// The same version gives PHP one: every `name` and `variable_name` token now
+/// carries an occurrence role -- binder, import alias, import target, type
+/// operand, path segment, receiver, declaration name or value reference --
+/// where only member positions did before (#2962).
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 21;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralFactsPersistenceError(String);
@@ -199,8 +207,11 @@ pub struct NormalizedNode {
     /// Nearest enclosing normalized node, forming the containment chain used
     /// by `inside` / `not_inside` / `has`.
     pub parent: Option<u32>,
-    /// The fact's own name span (declared identifier for declarations, the
-    /// callee name for calls, field name for field accesses, ...).
+    /// The fact's source-backed semantic name span (declared identifier for
+    /// declarations, the callee name for calls, field name for field accesses,
+    /// ...). A semantic name may be outside the fact's match range when the
+    /// language supplies an owner name for syntax without its own spelling,
+    /// such as a Kotlin constructor.
     pub name: Option<Span>,
     /// One-past-the-end fact id for this fact's normalized subtree. Facts are
     /// stored in pre-order, so descendants are exactly
@@ -397,13 +408,6 @@ impl FileFacts {
                 .name
                 .map(|name| hydrate_span(name, &source))
                 .transpose()?;
-            if name.is_some_and(|name| {
-                name.start_byte < span.start_byte || name.end_byte > span.end_byte
-            }) {
-                return Err(StructuralFactsPersistenceError::invalid(format!(
-                    "structural node {id} name is outside its node span"
-                )));
-            }
             let call_site = node
                 .call_site
                 .map(|facts| {
@@ -668,7 +672,9 @@ impl FileFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileFacts, NormalizedNode, RoleTarget, STRUCTURAL_FACTS_VERSION, Span};
+    use super::{
+        FileFacts, NormalizedNode, PersistedSpan, RoleTarget, STRUCTURAL_FACTS_VERSION, Span,
+    };
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
@@ -875,7 +881,7 @@ mod tests {
 
     #[test]
     fn relational_round_trip_reconstructs_identical_hot_facts() {
-        assert_eq!(STRUCTURAL_FACTS_VERSION, 20);
+        assert_eq!(STRUCTURAL_FACTS_VERSION, 21);
         let original = relational_fixture();
         let rows = original.persisted_rows().unwrap();
         assert_eq!(rows.source_bytes, original.source().len() as u32);
@@ -919,6 +925,47 @@ mod tests {
     #[test]
     fn relational_hydration_rejects_inconsistent_rows() {
         let fixture = relational_fixture();
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[1].name = Some(PersistedSpan { start: 0, end: 1 });
+        let decoded = FileFacts::from_persisted_rows(fixture.source().to_owned(), rows).unwrap();
+        assert_eq!(
+            decoded.nodes()[1].name,
+            Some(Span {
+                start_byte: 0,
+                end_byte: 1
+            })
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[1].name = Some(PersistedSpan {
+            start: 0,
+            end: fixture.source().len() as u32 + 1,
+        });
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("outside source length")
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[1].name = Some(PersistedSpan { start: 4, end: 2 });
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("outside source length")
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[1].name = Some(PersistedSpan { start: 2, end: 3 });
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8 boundaries")
+        );
 
         let mut rows = fixture.persisted_rows().unwrap();
         rows.source_bytes -= 1;

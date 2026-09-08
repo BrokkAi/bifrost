@@ -683,6 +683,18 @@ impl CallBindings {
                     if source.procedure() != caller && source.procedure() != &callee {
                         return Err(OracleContractError::CrossProcedure);
                     }
+                    if let SemanticValueKind::DefaultArgument { ordinal } = source
+                        .procedure()
+                        .semantics()
+                        .value(source.id())
+                        .expect("a value handle names a live value")
+                        .kind
+                        && (source.procedure() != &callee || ordinal != *formal_ordinal)
+                    {
+                        return Err(OracleContractError::InvalidCallBinding(
+                            "saved default does not name its callee parameter",
+                        ));
+                    }
                     if formal.kind()
                         != (ProcedurePortKind::Parameter {
                             ordinal: *formal_ordinal,

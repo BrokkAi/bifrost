@@ -43,6 +43,14 @@ macro_rules! forward_relational_definition_batch {
             crate::analyzer::RelationalDefinitionLookup::batch(&self.inner, requests, cancellation)
         }
 
+        fn workspace_declarations_with_primary_ranges(
+            &self,
+            cancellation: &crate::CancellationToken,
+        ) -> Option<Vec<(crate::analyzer::CodeUnit, Option<crate::analyzer::Range>)>> {
+            self.inner
+                .workspace_declarations_with_primary_ranges(cancellation)
+        }
+
         fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
             self.inner.active_query_cancellation()
         }
@@ -1009,6 +1017,21 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         Vec::new()
     }
 
+    /// Return the complete declaration inventory for this workspace snapshot,
+    /// retaining each declaration's optional primary source range. `None`
+    /// distinguishes an incomplete answer (for example cancellation or a
+    /// store failure) from a successful inventory, including an empty one.
+    fn workspace_declarations_with_primary_ranges(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<Vec<(CodeUnit, Option<crate::analyzer::Range>)>> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let declarations = self.all_declarations_with_primary_ranges();
+        (!cancellation.is_cancelled()).then_some(declarations)
+    }
+
     /// Starts a top-level query boundary. Persisted analyzers use this to
     /// memoize filesystem liveness checks for the duration of one request.
     fn begin_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
@@ -1394,6 +1417,23 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// implementation relation, or `code_unit` is not an abstract member it
     /// can enumerate implementations for (issue #1475).
     fn abstract_member_implementations(&self, _code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        None
+    }
+
+    /// The declaration heads `file` spells paired with the definition bodies
+    /// that complete them: a C++ prototype here and the out-of-line body that
+    /// defines it, in this file or in a translation unit the include evidence
+    /// relates to it. `None` means this analyzer does not model the
+    /// declaration/definition peer relation at all -- which is different from
+    /// an empty `Some`, a modeled file that holds no peer (issue #1650).
+    ///
+    /// Asked per file rather than per declaration because the head/body label
+    /// comes from classifying the file's occurrences against its parse tree,
+    /// which is one pass over the file however many declarations it holds.
+    fn declaration_definition_peers(
+        &self,
+        _file: &ProjectFile,
+    ) -> Option<crate::analyzer::structural::DeclarationDefinitionPeers> {
         None
     }
 
@@ -1917,6 +1957,24 @@ pub trait AnalyzerTestHooks {
 
     #[doc(hidden)]
     fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        0
+    }
+
+    /// Records one call to `resolve_definition_batch_with_source`, so a
+    /// batching caller can assert it collapsed many per-edge calls into one
+    /// call per file rather than re-deriving that from timing (bifrost#15).
+    /// Recorded through this hook, rather than a process-wide static,
+    /// because the call site holds only `&dyn IAnalyzer` and per-instance
+    /// counting keeps concurrently running tests from inflating each
+    /// other's counts (#3010).
+    #[doc(hidden)]
+    fn record_resolve_definition_batch_with_source_call_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
         0
     }
 

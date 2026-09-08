@@ -2510,26 +2510,9 @@ fn resolve_go_local_selector_chain(
     let mut external_concrete_receiver_candidate = false;
     let mut owner_fqn = match owner_inferred.as_ref() {
         Some(owner) => {
-            if let Some(modeled) = owner.modeled_nominal() {
-                external_concrete_receiver_candidate = true;
-                modeled.qualified_name.clone()
-            } else {
-                match go_resolve_inferred_type_fqn(support, token, go, owner) {
-                    Some(owner_fqn) => owner_fqn,
-                    None => {
-                        let identity = owner.indexed_identity()?;
-                        let owner_fqn = go_imported_nominal_receiver_candidate_fqn(
-                            support,
-                            token,
-                            go,
-                            &owner.file,
-                            identity,
-                        )?;
-                        external_concrete_receiver_candidate = true;
-                        owner_fqn
-                    }
-                }
-            }
+            let (owner_fqn, owner_is_external) = go_selector_owner_fqn(support, token, go, owner)?;
+            external_concrete_receiver_candidate = owner_is_external;
+            owner_fqn
         }
         None => selector.base_identifier(source).and_then(|base| {
             go_binding_type_fqn(
@@ -2632,7 +2615,9 @@ fn resolve_go_local_selector_chain(
             let next_owner = go_field_inferred_type_for_receiver(
                 analyzer, token, support, &owner, &owner_fqn, member,
             )?;
-            let next_owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &next_owner)?;
+            let (next_owner_fqn, next_owner_is_external) =
+                go_selector_owner_fqn(support, token, go, &next_owner)?;
+            external_concrete_receiver_candidate = next_owner_is_external;
             owner_fqn = next_owner_fqn;
             owner_inferred = Some(next_owner);
         } else {
@@ -2855,6 +2840,102 @@ fn go_range_binding<'tree>(
     let left = node.child_by_field_name("left")?;
     let index = go_expression_list_index(support, left, source, name)?;
     (index == 1).then_some(GoLocalBinding::RangeElement(node))
+}
+
+/// The struct field whose declaration one offset falls inside.
+///
+/// A producer resolves a field only where it can type the receiver, so a
+/// capture inside a spawned closure falls back to an identity interned per
+/// procedure while the parent uses the field's declaration. The two then
+/// describe one field differently and their accesses are declared disjoint. A
+/// definition lookup cannot close that from the parent's side, because at a
+/// declaration there is no reference to follow.
+///
+/// Returns nothing unless the offset is a field name inside a struct type and
+/// exactly one declared field of that struct carries the name. Merging
+/// distinct fields would turn a missed race into a reported one.
+/// Whether the Go expression at `offset` yields a reference to the object it
+/// creates rather than the object itself.
+///
+/// `&T{}` and `new(T)` produce a pointer, so a local bound to one names the
+/// same object wherever it is copied. `T{}` produces a value, and copying it
+/// copies the object, which is the difference a consumer must know before it
+/// may equate two locals. The semantic IR records both as one allocation
+/// kind, so the distinction is read from the declaration syntax.
+pub fn allocation_yields_reference_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> bool {
+    let Some(tree) = parse_tree_for_language(file, Language::Go, source) else {
+        return false;
+    };
+    let Some(node) = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)
+    else {
+        return false;
+    };
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current.kind() == "unary_expression"
+            && current
+                .child_by_field_name("operator")
+                .is_none_or(|operator| go_node_text(operator, source) == "&")
+            && go_node_text(current, source).starts_with('&')
+        {
+            return true;
+        }
+        if current.kind() == "call_expression"
+            && current
+                .child_by_field_name("function")
+                .is_some_and(|function| go_node_text(function, source) == "new")
+        {
+            return true;
+        }
+        if current.start_byte() < offset {
+            break;
+        }
+        cursor = current.parent();
+    }
+    false
+}
+
+pub(super) fn field_declaration_at_offset(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<CodeUnit> {
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let name = tree
+        .root_node()
+        .named_descendant_for_byte_range(offset, offset)
+        .filter(|node| node.kind() == "field_identifier")?;
+    let field_name = go_node_text(name, source);
+    let owner_name = name
+        .parent()
+        .filter(|declaration| declaration.kind() == "field_declaration")?
+        .parent()
+        .filter(|list| list.kind() == "field_declaration_list")?
+        .parent()
+        .filter(|structure| structure.kind() == "struct_type")?
+        .parent()
+        .filter(|spec| spec.kind() == "type_spec")?
+        .child_by_field_name("name")
+        .map(|node| go_node_text(node, source))?;
+    let declarations = analyzer.get_declarations(file);
+    let mut matches = declarations.iter().filter(|unit| {
+        unit.kind() == crate::analyzer::CodeUnitType::Field
+            && unit.terminal_name() == field_name
+            && unit.fq().parent().is_some_and(|owner_fq| {
+                declarations
+                    .iter()
+                    .any(|owner| owner.fq() == &owner_fq && owner.terminal_name() == owner_name)
+            })
+    });
+    let unit = matches.next()?.clone();
+    matches.next().is_none().then_some(unit)
 }
 
 fn go_short_var_binding<'tree>(
@@ -3872,6 +3953,34 @@ fn go_field_inferred_type_for_receiver(
         package: candidate.package_name().to_string(),
         addressable: !candidate.is_function() && owner.admits_pointer_receivers(),
     })
+}
+
+/// Name the owner an inferred type denotes for selector resolution, and report
+/// whether that name came from outside the workspace.
+///
+/// A selector chain needs this at its base and at every later step, and the
+/// three routes are the same everywhere: a reviewed modeled nominal, a
+/// workspace declaration, or an imported nominal whose package the workspace
+/// does not contain. Only the first and third name a type the workspace cannot
+/// index, and both report `true`, because a reviewed external slice proves a
+/// direct method on the concrete receiver and carries no field surface for a
+/// longer chain.
+fn go_selector_owner_fqn(
+    support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
+    go: &GoAnalyzer,
+    owner: &GoInferredType,
+) -> Option<(String, bool)> {
+    if let Some(modeled) = owner.modeled_nominal() {
+        return Some((modeled.qualified_name.clone(), true));
+    }
+    if let Some(owner_fqn) = go_resolve_inferred_type_fqn(support, token, go, owner) {
+        return Some((owner_fqn, false));
+    }
+    let identity = owner.indexed_identity()?;
+    let owner_fqn =
+        go_imported_nominal_receiver_candidate_fqn(support, token, go, &owner.file, identity)?;
+    Some((owner_fqn, true))
 }
 
 fn go_resolve_inferred_type_fqn(

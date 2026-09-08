@@ -5,7 +5,7 @@
 //! [`CppVisitor`] out of `LanguageAdapter::parse_file`.
 
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
-use crate::graph::syntax::MacroReplacementField;
+use crate::graph::syntax::{MacroReplacementField, ObjectMacroReplacement};
 use brokk_bifrost_core::analyzer::common::{
     node_source_text, parse_source_ranges_with_cancellation, parse_source_region,
 };
@@ -23,7 +23,10 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    NodeKindIds, ParentIndex, WalkControl, children_iter, named_children_iter,
+    push_children_reversed, push_named_children_reversed, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use regex::Regex;
@@ -382,11 +385,7 @@ fn class_like_name_from_children(node: Node<'_>, source: &str) -> Option<String>
             continue;
         }
 
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(current, &mut stack);
     }
     best.or(grammar_name)
 }
@@ -861,16 +860,31 @@ fn cpp_fragment_sibling_is_class_member(node: Node<'_>, class_end: usize, source
             .is_some_and(|close| close.start_byte() == class_end)
 }
 
-/// Recover a plain class whose opening prefix is retained in one ERROR node
-/// while one or more nested class closes and the outer close are displaced to
-/// sibling `}`/`;` nodes. This is the non-export counterpart to the fragmented
-/// export-class recovery above. All boundaries come from tree-sitter nodes: the
-/// direct class tokens establish nesting depth and the displaced close nodes
-/// terminate it.
-fn fragmented_plain_class_body<'tree>(
+/// A class whose head tree-sitter kept in one malformed container while the
+/// members after the first and the closing `};` scattered across that
+/// container's following siblings.
+struct FragmentedClassRecovery<'tree> {
+    declaration_node: Node<'tree>,
+    name: String,
+    raw_supertypes: Vec<String>,
+    body: FragmentedExportBody,
+}
+
+/// Recover a class whose opening prefix is retained in one ERROR node while one
+/// or more nested class closes and the outer close are displaced to sibling
+/// `}`/`;` nodes. All boundaries come from tree-sitter nodes: the direct class
+/// tokens establish nesting depth and the displaced close nodes terminate it.
+///
+/// Two head spellings reach the ERROR arm. A plain `class Name ... {` keeps the
+/// `class` keyword as the container's first token. A function-like export macro
+/// (`class BOTAN_PUBLIC_API(2, 0) Name : public virtual Base {`) is reduced to a
+/// body-less `class_specifier` named after the macro followed by the
+/// invocation's `(`, arguments and `)`, with the real class name and the base
+/// clause left as bare tokens after it (#2924).
+fn fragmented_class_body<'tree>(
     node: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, String, FragmentedExportBody)> {
+) -> Option<FragmentedClassRecovery<'tree>> {
     if let Some(recovered) = fragmented_plain_class_declaration_body(node, source) {
         return Some(recovered);
     }
@@ -881,6 +895,9 @@ fn fragmented_plain_class_body<'tree>(
     }
     let mut cursor = node.walk();
     let children = node.children(&mut cursor).collect::<Vec<_>>();
+    if let Some(recovered) = fragmented_export_macro_class_body(node, &children, source) {
+        return Some(recovered);
+    }
     let keyword = children.first()?;
     if !matches!(keyword.kind(), "class" | "struct" | "union") {
         return None;
@@ -898,6 +915,77 @@ fn fragmented_plain_class_body<'tree>(
         return None;
     }
     let open_index = children.iter().position(|child| child.kind() == "{")?;
+    Some(FragmentedClassRecovery {
+        declaration_node: node,
+        name,
+        raw_supertypes: extract_cpp_supertypes(node, source),
+        body: fragmented_displaced_class_body(node, &children, open_index, source)?,
+    })
+}
+
+/// The fragmented body of a function-like export-macro class head that
+/// tree-sitter kept in one declaration-scope `ERROR` together with the body's
+/// opening `{` (Botan's `class BOTAN_PUBLIC_API(2, 0) GOST_3410_PublicKey :
+/// public virtual EC_PublicKey {`, #2924).
+///
+/// The class name is read positionally by [`recovered_export_head_name`] -- the
+/// last identifier before the head ends at `final`, at the base clause `:`, or
+/// at the body `{` -- so no macro spelling is interpreted, and a base clause
+/// spelled with `virtual`, with `final`, or with qualified base names needs no
+/// arm of its own.
+fn fragmented_export_macro_class_body<'tree>(
+    node: Node<'tree>,
+    children: &[Node<'tree>],
+    source: &str,
+) -> Option<FragmentedClassRecovery<'tree>> {
+    let class_node = *children.first()?;
+    if class_node.kind() != "class_specifier" || cpp_body_node(class_node).is_some() {
+        return None;
+    }
+    // The identifier tree-sitter took for the class name is the export macro, a
+    // function-like invocation when the `(` of its argument list follows it
+    // directly. Spelling plays no part (#2557).
+    class_node
+        .child_by_field_name("name")
+        .and_then(|name| direct_identifier_name(name, source))?;
+    let invocation = *children.get(1)?;
+    if invocation.is_named() || invocation.kind() != "(" {
+        return None;
+    }
+    let open_index = children
+        .iter()
+        .position(|child| !child.is_named() && child.kind() == "{")?;
+    let open = children[open_index];
+    let name_node = recovered_export_head_name(node, open, source)?;
+    let name = normalize_cpp_whitespace(node_text(name_node, source));
+    if name.is_empty() || cpp_export_macro_token(&name) {
+        return None;
+    }
+    Some(FragmentedClassRecovery {
+        declaration_node: node,
+        name,
+        raw_supertypes: recovered_export_head_bases(
+            node,
+            name_node.end_byte(),
+            open.start_byte(),
+            source,
+        ),
+        body: fragmented_displaced_class_body(node, children, open_index, source)
+            .or_else(|| fragmented_container_close_class_body(node, open, source))?,
+    })
+}
+
+/// The class body a fragmented head opened at `children[open_index]` but could
+/// not close: tree-sitter scattered the remaining members and the closing `};`
+/// across the container's following siblings. The direct class tokens after the
+/// opening brace say how many closes the nested classes consume before this
+/// class's own, and the displaced `}`/`;` sibling pair terminates it.
+fn fragmented_displaced_class_body(
+    node: Node<'_>,
+    children: &[Node<'_>],
+    open_index: usize,
+    source: &str,
+) -> Option<FragmentedExportBody> {
     let open = children[open_index];
     let nested_class_opens = children[open_index + 1..]
         .iter()
@@ -914,20 +1002,16 @@ fn fragmented_plain_class_body<'tree>(
                 if open.end_byte() >= candidate.start_byte() {
                     return None;
                 }
-                return Some((
-                    node,
-                    name,
-                    FragmentedExportBody {
-                        reparse_start: open.end_byte(),
-                        reparse_end: candidate.start_byte(),
-                        class_range: Range {
-                            start_byte: node.start_byte(),
-                            end_byte: semicolon.end_byte(),
-                            start_line: node.start_position().row + 1,
-                            end_line: semicolon.end_position().row + 1,
-                        },
+                return Some(FragmentedExportBody {
+                    reparse_start: open.end_byte(),
+                    reparse_end: candidate.start_byte(),
+                    class_range: Range {
+                        start_byte: node.start_byte(),
+                        end_byte: semicolon.end_byte(),
+                        start_line: node.start_position().row + 1,
+                        end_line: semicolon.end_position().row + 1,
                     },
-                ));
+                });
             }
         }
         sibling = next;
@@ -935,16 +1019,57 @@ fn fragmented_plain_class_body<'tree>(
     None
 }
 
-pub(crate) fn recovered_fragmented_plain_class_has_body(
+/// The body of a fragmented export-macro class head whose close tree-sitter
+/// spent on the enclosing container instead: Botan's
+/// `class BOTAN_PUBLIC_API(2, 0) GOST_3410_PublicKey : public virtual
+/// EC_PublicKey {` leaves every member as a `declaration_list` sibling and ends
+/// `namespace Botan` on the class's own brace, so nothing is displaced to a
+/// sibling `}` and [`fragmented_displaced_class_body`] finds no terminator
+/// (#2924).
+fn fragmented_container_close_class_body(
+    node: Node<'_>,
+    open: Node<'_>,
+    source: &str,
+) -> Option<FragmentedExportBody> {
+    let parent = node.parent()?;
+    if !matches!(
+        parent.kind(),
+        "declaration_list" | "field_declaration_list" | "compound_statement"
+    ) {
+        return None;
+    }
+    let close = direct_close_brace(parent).filter(|close| !close.is_missing())?;
+    // The container's close is this class's close only when the body's own
+    // brace balance says so. Without that cross-check -- the one issue #1524
+    // already uses on a mis-closed wrapper body -- a class that really does end
+    // earlier would claim every later container-level declaration as a member.
+    if cpp_matching_close_brace(source, open.start_byte()) != Some(close.start_byte())
+        || open.end_byte() >= close.start_byte()
+    {
+        return None;
+    }
+    Some(FragmentedExportBody {
+        reparse_start: open.end_byte(),
+        reparse_end: close.start_byte(),
+        class_range: Range {
+            start_byte: node.start_byte(),
+            end_byte: close.end_byte(),
+            start_line: node.start_position().row + 1,
+            end_line: close.end_position().row + 1,
+        },
+    })
+}
+
+pub(crate) fn recovered_fragmented_class_has_body(
     node: Node<'_>,
     source: &str,
     expected_name: &str,
     expected_range: &Range,
 ) -> bool {
-    fragmented_plain_class_body(node, source).is_some_and(|(_, name, fragmented)| {
-        name == expected_name
-            && fragmented.class_range.start_byte == expected_range.start_byte
-            && fragmented.class_range.end_byte == expected_range.end_byte
+    fragmented_class_body(node, source).is_some_and(|recovered| {
+        recovered.name == expected_name
+            && recovered.body.class_range.start_byte == expected_range.start_byte
+            && recovered.body.class_range.end_byte == expected_range.end_byte
     })
 }
 
@@ -957,7 +1082,7 @@ pub(crate) fn recovered_fragmented_plain_class_has_body(
 fn fragmented_plain_class_declaration_body<'tree>(
     node: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, String, FragmentedExportBody)> {
+) -> Option<FragmentedClassRecovery<'tree>> {
     if !matches!(node.kind(), "declaration" | "function_definition") || !node.has_error() {
         return None;
     }
@@ -1054,10 +1179,11 @@ fn fragmented_plain_class_declaration_body<'tree>(
     if open.end_byte() >= close.start_byte() {
         return None;
     }
-    Some((
-        class_node,
+    Some(FragmentedClassRecovery {
+        declaration_node: class_node,
         name,
-        FragmentedExportBody {
+        raw_supertypes: extract_cpp_supertypes(class_node, source),
+        body: FragmentedExportBody {
             reparse_start: open.end_byte(),
             reparse_end: close.start_byte(),
             class_range: Range {
@@ -1067,7 +1193,7 @@ fn fragmented_plain_class_declaration_body<'tree>(
                 end_line: semicolon.end_position().row + 1,
             },
         },
-    ))
+    })
 }
 
 fn displaced_export_function_namespace_shape<'tree>(
@@ -1145,9 +1271,9 @@ fn displaced_export_function_namespace_shape<'tree>(
             });
         }
         if current.start_byte() >= nested_fragment_end
-            && let Some((_, _, fragmented)) = fragmented_plain_class_body(current, source)
+            && let Some(recovered) = fragmented_class_body(current, source)
         {
-            nested_fragment_end = fragmented.class_range.end_byte;
+            nested_fragment_end = recovered.body.class_range.end_byte;
         } else if current.start_byte() >= nested_fragment_end
             && recover_exported_class_function_definition(current, source).is_some()
             && let Some(body) = cpp_body_node(current)
@@ -1218,9 +1344,9 @@ fn displaced_fragment_namespace_geometry<'tree>(
             break;
         }
         if current.start_byte() >= nested_fragment_end
-            && let Some((_, _, fragmented)) = fragmented_plain_class_body(current, source)
+            && let Some(recovered) = fragmented_class_body(current, source)
         {
-            nested_fragment_end = fragmented.class_range.end_byte;
+            nested_fragment_end = recovered.body.class_range.end_byte;
         }
         namespace_items.push(current);
         sibling = current.next_named_sibling();
@@ -1409,13 +1535,26 @@ fn malformed_qualified_prefix(node: Node<'_>, source: &str) -> Option<String> {
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "ERROR")
     {
-        if error.named_child_count() != 1 || prefix.is_some() {
+        if prefix.is_some() {
             return None;
         }
-        prefix = error
-            .named_child(0)
-            .and_then(|child| recovered_base_atom(child, source));
-        prefix.as_ref()?;
+        // `public virtual Botan::EC_PublicKey` reduces the access specifier to
+        // the qualified name's scope and leaves `virtual` beside the real
+        // qualifier inside the `ERROR`. `virtual` is a base specifier, never a
+        // component of the base's name (#2924).
+        let mut error_cursor = error.walk();
+        let atoms = error
+            .named_children(&mut error_cursor)
+            .map(|child| recovered_base_atom(child, source))
+            .collect::<Option<Vec<_>>>()?;
+        let [atom] = atoms
+            .iter()
+            .filter(|atom| atom.as_str() != "virtual")
+            .collect::<Vec<_>>()[..]
+        else {
+            return None;
+        };
+        prefix = Some(atom.clone());
     }
     prefix
 }
@@ -1444,20 +1583,50 @@ struct MacroWrappedDeclaration<'tree> {
 }
 
 /// Whether `node` stands where declarations live: directly in the translation
-/// unit, or in a `namespace` or `extern "C"` body.
+/// unit, in a `namespace` or `extern "C"` body, or in an `ERROR` that itself
+/// stands in one of those.
+///
+/// An `ERROR` is a grouping failure, never a scope, so what it holds stands
+/// where it stands. The case that matters is a whole translation unit the
+/// parser could not close: whisper.cpp's `include/whisper.h` opens
+/// `extern "C" {` inside `#ifdef __cplusplus` and closes it inside another one,
+/// so the braces never balance in the token stream tree-sitter sees, the file's
+/// own root node is an `ERROR`, and every top-level declaration in the file is
+/// a child of it (#3094). Without this the macro recoveries below read nothing
+/// in such a file, because none of their envelopes is in a declaration scope
+/// the parser managed to build.
 fn is_declaration_scope_position(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    match parent.kind() {
-        "translation_unit" => true,
-        "declaration_list" => parent.parent().is_some_and(|grandparent| {
-            matches!(
-                grandparent.kind(),
-                "namespace_definition" | "linkage_specification"
-            )
-        }),
-        _ => false,
+    declaration_scope_container(node).is_some()
+}
+
+/// The container `node` declares in, for [`is_declaration_scope_position`]. Its
+/// end is where a parse failure that starts at `node` can still be doing
+/// damage: a declaration scope has no synchronization point of its own, so the
+/// parser carries such a failure to the scope's close.
+fn declaration_scope_container(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent()?;
+    loop {
+        match parent.kind() {
+            "translation_unit" => return Some(parent),
+            "declaration_list" => {
+                return parent
+                    .parent()
+                    .is_some_and(|grandparent| {
+                        matches!(
+                            grandparent.kind(),
+                            "namespace_definition" | "linkage_specification"
+                        )
+                    })
+                    .then_some(parent);
+            }
+            "ERROR" => match parent.parent() {
+                Some(grandparent) => parent = grandparent,
+                // A root `ERROR` is the translation unit the parser could not
+                // build, so its children stand at file scope.
+                None => return Some(parent),
+            },
+            _ => return None,
+        }
     }
 }
 
@@ -1654,15 +1823,69 @@ fn macro_wrapped_declarations<'tree>(
 }
 
 /// What one macro invocation swallowed when it collapsed a whole run of
-/// declarations into a single node.
+/// declarations.
 struct CollapsedMacroDeclarationRun {
     /// The byte just past the `;` that closes the invocation, which is where
     /// the declarations it swallowed begin.
     invocation_end: usize,
+    /// The byte this recovery owns to: the close of the enclosing declaration
+    /// scope when the invocation swallowed the declarations written after it,
+    /// and the invocation's own end when the parser instead spread the
+    /// invocation itself across the container's children and swallowed nothing.
+    region_end: usize,
 }
 
-/// The macro invocation at the head of `node` when it swallowed the
-/// declarations written after it, or `None` when `node` is not that shape.
+/// The tokens one collapsed macro invocation spans, in source order: the leaves
+/// of `node`, then the leaves of the siblings written after it. Comments and
+/// the parser's own MISSING tokens are skipped; neither is in the source the
+/// invocation is written in.
+///
+/// The parser puts the parts of a failed invocation wherever it has room. It
+/// keeps them in one `ERROR`; it splits them across an `ERROR` and the
+/// `expression_statement` it recovered with; it spreads them flat over the
+/// container's children; it packs the tail of the file into one of the
+/// arguments. The grouping therefore says nothing, but the token order still
+/// spells the invocation, which is what this reads.
+struct MacroInvocationTokens<'tree> {
+    stack: Vec<Node<'tree>>,
+    next_sibling: Option<Node<'tree>>,
+}
+
+impl<'tree> MacroInvocationTokens<'tree> {
+    fn new(node: Node<'tree>) -> Self {
+        Self {
+            stack: vec![node],
+            next_sibling: node.next_sibling(),
+        }
+    }
+}
+
+impl<'tree> Iterator for MacroInvocationTokens<'tree> {
+    type Item = Node<'tree>;
+
+    fn next(&mut self) -> Option<Node<'tree>> {
+        loop {
+            let Some(node) = self.stack.pop() else {
+                let sibling = self.next_sibling?;
+                self.next_sibling = sibling.next_sibling();
+                self.stack.push(sibling);
+                continue;
+            };
+            if node.child_count() == 0 {
+                if node.kind() == "comment" || node.is_missing() {
+                    continue;
+                }
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            let children = node.children(&mut cursor).collect::<Vec<_>>();
+            self.stack.extend(children.into_iter().rev());
+        }
+    }
+}
+
+/// The macro invocation that begins at `node` when the parser could not group
+/// it, or `None` when `node` does not begin one.
 ///
 /// whisper.cpp's bundled `llama.h` writes
 ///
@@ -1673,95 +1896,99 @@ struct CollapsedMacroDeclarationRun {
 ///         "use llama_model_load_from_file instead");
 /// ```
 ///
-/// The wrapped declaration's own parameter list spans lines, and that alone is
-/// enough -- no stack of such items, no `extern "C"` block -- for the parser to
-/// read `DEPRECATED(` as a function declarator whose close it never finds. It
-/// then consumes every declaration written after it: in the real header, 57 KB
-/// from line 481 to line 1535, `llama_tokenize` included, which is the
-/// `LLAMA_API` half of #2551. A `MACRO(decl, "hint");` whose wrapped
-/// declaration fits on its line collapses nothing; the parser leaves the
-/// declaration-scope `ERROR` that [`macro_wrapped_declarations`] reads.
+/// and its own `include/whisper.h` writes
 ///
-/// The envelope is a `function_definition` when a brace block falls in the
-/// swallowed tail -- the parser borrows it for the body the bogus definition
-/// needs -- and an `ERROR` when none does. That says nothing about the
-/// construct, so both are accepted. Neither is the shape
-/// [`macro_wrapped_declarations`] reads, whose first named child is the bare
-/// macro-name `identifier` with no declarator around it.
+/// ```text
+/// WHISPER_DEPRECATED(
+///     WHISPER_API struct whisper_context * whisper_init_from_file(const char * path_model),
+///     "use whisper_init_from_file_with_params instead"
+/// );
+/// ```
 ///
-/// Fails closed. The first argument must be a declaration and the argument
-/// after it must be the one the parser handed the invocation's own `)` and `;`,
-/// so a macro call whose end this cannot name is left to the ordinary readers.
+/// tree-sitter cannot know either name is a macro, so it reads the name and its
+/// `(` as a function declarator whose close it never finds, and carries that
+/// failure forward over the declarations written after it. In `llama.h` that
+/// puts 57 KB, from line 481 to line 1535, into one `function_definition`
+/// (#2551). In `whisper.h` it instead flattens the invocations over the
+/// container's children -- a bare `identifier`, `(`, `parameter_declaration`,
+/// `,` and an `ERROR` holding the hint, over and over -- and then packs lines
+/// 232 to 456 into one `parameter_declaration` (#3094). The envelope is a
+/// `function_definition` when a brace block falls in a swallowed tail, because
+/// the parser borrows it for the body the bogus definition needs, and an
+/// `ERROR` or a bare token when none does. None of that says anything about the
+/// construct, so the node's kind is not the criterion; the token order is.
+///
+/// The invocation ends at the `)` that closes its own `(`, immediately followed
+/// by `;`. That is unambiguous: a `)` the lexer left inside the hint text is
+/// balanced by the `(` beside it, and a macro argument list carries no `;` of
+/// its own, so a `;` reached before the close means this is some other
+/// construct -- a macro-defined function body, say -- and the ordinary readers
+/// keep the node.
+///
+/// Fails closed everywhere else too. The head must be an export-macro-shaped
+/// token followed by `(`, the node must stand where declarations live, and an
+/// invocation the ordinary [`macro_wrapped_declarations`] reader already has --
+/// one the parser left whole in a declaration-scope `ERROR` and that swallowed
+/// nothing past it -- is left to that reader.
 fn collapsed_macro_declaration_run(
     node: Node<'_>,
     source: &str,
 ) -> Option<CollapsedMacroDeclarationRun> {
-    if !matches!(node.kind(), "function_definition" | "ERROR")
-        || !is_declaration_scope_position(node)
+    let container_end = declaration_scope_container(node)?.end_byte();
+    let mut tokens = MacroInvocationTokens::new(node);
+    let name = tokens.next()?;
+    if !matches!(name.kind(), "identifier" | "type_identifier")
+        || !cpp_export_macro_token(node_text(name, source))
     {
         return None;
     }
-    let head = if node.kind() == "function_definition" {
-        // A real definition names its return type here. The envelope has none:
-        // the macro name took the declarator slot and nothing precedes it.
-        if node.child_by_field_name("type").is_some() {
-            return None;
+    if tokens.next()?.kind() != "(" {
+        return None;
+    }
+    let mut depth = 1usize;
+    let invocation_end = loop {
+        let token = tokens.next()?;
+        match token.kind() {
+            "(" => depth += 1,
+            ";" => return None,
+            ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    let semicolon = tokens.next()?;
+                    if semicolon.kind() != ";" {
+                        return None;
+                    }
+                    break semicolon.end_byte();
+                }
+            }
+            _ => {}
         }
-        node.child_by_field_name("declarator")?
-    } else {
-        node.named_child(0)?
     };
-    let mut invocation = extract_function_declarator(head)?;
-    if invocation.start_byte() != node.start_byte() {
+    // An invocation that reaches the end of its own declaration scope swallowed
+    // nothing: there is nothing after it left to recover, and the ordinary
+    // readers have the invocation itself. This is also what stops the scan
+    // below from re-entering itself, since the region it reparses for one
+    // invocation ends exactly at that invocation's `;`.
+    if invocation_end >= container_end {
         return None;
     }
-    // Each declaration the invocation swallowed wraps another
-    // `function_declarator` around the one before it, so the macro's own
-    // invocation is the innermost.
-    while let Some(inner) = invocation
-        .child_by_field_name("declarator")
-        .filter(|inner| inner.kind() == "function_declarator")
-    {
-        invocation = inner;
-    }
-    let name = invocation.child_by_field_name("declarator")?;
-    if name.kind() != "identifier"
-        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(name, source)))
-    {
-        return None;
-    }
-    let arguments = invocation.child_by_field_name("parameters")?;
-    let mut cursor = arguments.walk();
-    let mut children = arguments
-        .children(&mut cursor)
-        .filter(|child| child.kind() != "comment");
-    if children.next()?.kind() != "(" || children.next()?.kind() != "parameter_declaration" {
-        return None;
-    }
-    // The argument after the wrapped declaration is where the parser put the
-    // invocation's own `)` and `;`. Their adjacency inside that argument is
-    // where the invocation ends; whatever follows them there, or after the
-    // argument, is what the invocation swallowed. A `)` the lexer left inside
-    // the hint text is not followed by a `;`, so the pair names the end and
-    // nothing else does.
-    let hint = children.find(|child| child.kind() != ",")?;
-    if hint.kind() != "ERROR" {
-        return None;
-    }
-    let mut hint_cursor = hint.walk();
-    let parts = hint.children(&mut hint_cursor).collect::<Vec<_>>();
-    let invocation_end = parts.windows(2).find_map(|pair| {
-        let [close, semicolon] = pair else {
-            return None;
-        };
-        (close.kind() == ")"
-            && !close.is_missing()
-            && semicolon.kind() == ";"
-            && !semicolon.is_missing())
-        .then(|| semicolon.end_byte())
-    })?;
-    // An invocation that ends where the node does swallowed nothing after it.
-    (invocation_end < node.end_byte()).then_some(CollapsedMacroDeclarationRun { invocation_end })
+    // Where the damage ends. A node that reaches past its own invocation packed
+    // real declarations into the invocation's argument list, so the parser was
+    // still failing when it got there and everything to the close of the scope
+    // is suspect -- in `whisper.h` the collapse takes the `{` of the enum on
+    // line 455 with it, and every declaration from there to the end of the file
+    // is shredded. A node that stops at or before the invocation's `;` holds
+    // nothing but the invocation, whose own parts the parser spread over the
+    // siblings after it.
+    let region_end = if node.end_byte() > invocation_end {
+        container_end
+    } else {
+        invocation_end
+    };
+    Some(CollapsedMacroDeclarationRun {
+        invocation_end,
+        region_end,
+    })
 }
 
 /// `MACRO("text") <member-declaration>` as tree-sitter parses it inside an
@@ -2168,7 +2395,12 @@ fn recovered_export_head_bases(
             bases.push(base);
         }
     }
-    bases.retain(|base| !matches!(base.as_str(), "final" | "public" | "protected" | "private"));
+    bases.retain(|base| {
+        !matches!(
+            base.as_str(),
+            "final" | "public" | "protected" | "private" | "virtual"
+        )
+    });
     bases
 }
 
@@ -2201,10 +2433,34 @@ fn recovered_export_head_name<'tree>(
     tail: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
+    export_head_name_from_tokens(&export_head_tokens(node, Some(tail)), source)
+}
+
+/// The class name of a head whose tokens straddle the recovered pair: the
+/// grammar can keep `class MACRO(3, 6) Name final :` in the prefix fragment and
+/// only the base list and the body in the sibling (Botan's TPM2 keys, #2924).
+/// The positional rule is the same, read over the two token runs in source
+/// order, so a name in either node wins by position rather than by which node
+/// holds it.
+fn recovered_export_pair_head_name<'tree>(
+    prefix: Node<'tree>,
+    sibling: Node<'tree>,
+    tail: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut tokens = export_head_tokens(prefix, None);
+    tokens.extend(export_head_tokens(sibling, Some(tail)));
+    export_head_name_from_tokens(&tokens, source)
+}
+
+/// One node's head tokens in source order, with `ERROR` fragments spliced in
+/// place (an `ERROR` here is a grouping failure, not a construct) and stopping
+/// before `tail` when the caller names one.
+fn export_head_tokens<'tree>(node: Node<'tree>, tail: Option<Node<'tree>>) -> Vec<Node<'tree>> {
     let mut tokens = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.start_byte() >= tail.start_byte() {
+        if tail.is_some_and(|tail| child.start_byte() >= tail.start_byte()) {
             break;
         }
         if child.kind() == "ERROR" {
@@ -2214,8 +2470,16 @@ fn recovered_export_head_name<'tree>(
             tokens.push(child);
         }
     }
+    tokens
+}
+
+/// The last identifier before the head ends, per the positional rule.
+fn export_head_name_from_tokens<'tree>(
+    tokens: &[Node<'tree>],
+    source: &str,
+) -> Option<Node<'tree>> {
     let mut name = None;
-    for token in tokens {
+    for token in tokens.iter().copied() {
         if recovered_export_head_final(token, source) || (!token.is_named() && token.kind() == ":")
         {
             break;
@@ -2269,25 +2533,84 @@ fn recovered_export_declaration_tail<'tree>(
     Some((bases, body))
 }
 
+/// Whether `node` is the head fragment tree-sitter leaves where
+/// `class MACRO(args)` was written: the class keyword and the export macro's
+/// function-like invocation in that order, with nothing else between them.
+/// Spelling plays no part -- the invocation's `(` following the macro
+/// identifier directly is what makes it function-like (#2557).
+///
+/// Two reductions produce the head. On its own the grammar keeps a body-less
+/// `class_specifier` named after the macro inside a declaration-scope `ERROR`,
+/// with the invocation's `(`, arguments and `)` beside it. After object-like
+/// macro lines -- Botan's `BOTAN_DIAGNOSTIC_PUSH` /
+/// `BOTAN_DIAGNOSTIC_IGNORE_INHERITED_VIA_DOMINANCE` -- it instead keeps a
+/// `declaration` whose class keyword is demoted to a bare `identifier` and
+/// whose macro invocation becomes the trailing `init_declarator` (#2924).
+fn is_function_like_export_class_head(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "ERROR" => {
+            let Some(class_node) = first_class_like_child(node) else {
+                return false;
+            };
+            if class_node.kind() != "class_specifier" || cpp_body_node(class_node).is_some() {
+                return false;
+            }
+            if class_node
+                .child_by_field_name("name")
+                .and_then(|name| direct_identifier_name(name, source))
+                .is_none()
+            {
+                return false;
+            }
+            class_node
+                .next_sibling()
+                .is_some_and(|invocation| !invocation.is_named() && invocation.kind() == "(")
+        }
+        "declaration" => {
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            // The class keyword lost its own node: it survives as a bare
+            // identifier spelled `class`, `struct` or `union`, which is never a
+            // declarator or a type in well-formed code. It can sit inside an
+            // `ERROR` beside the object-like macro names, and an `ERROR` here is
+            // a grouping failure rather than a construct, so read through it.
+            let Some(keyword) = children
+                .iter()
+                .copied()
+                .flat_map(|child| {
+                    let mut cursor = child.walk();
+                    if child.kind() == "ERROR" {
+                        child.named_children(&mut cursor).collect::<Vec<_>>()
+                    } else {
+                        vec![child]
+                    }
+                })
+                .find(|child| {
+                    child.kind() == "identifier"
+                        && matches!(node_text(*child, source), "class" | "struct" | "union")
+                })
+            else {
+                return false;
+            };
+            children.last().is_some_and(|init| {
+                init.kind() == "init_declarator" && init.start_byte() >= keyword.end_byte() && {
+                    let mut cursor = init.walk();
+                    let parts = init.named_children(&mut cursor).collect::<Vec<_>>();
+                    matches!(parts.as_slice(), [macro_name, arguments]
+                        if matches!(macro_name.kind(), "identifier" | "type_identifier")
+                            && arguments.kind() == "argument_list")
+                }
+            })
+        }
+        _ => false,
+    }
+}
+
 fn recover_function_like_export_class_pair(
     node: Node<'_>,
     source: &str,
 ) -> Option<RecoveredFunctionLikeExportClassPair> {
-    if node.kind() != "ERROR" {
-        return None;
-    }
-    let class_node = first_class_like_child(node)?;
-    if class_node.kind() != "class_specifier" || cpp_body_node(class_node).is_some() {
-        return None;
-    }
-    // The identifier tree-sitter took for the class name is the export macro,
-    // a function-like invocation when the `(` of its argument list follows it
-    // directly inside the error. Spelling plays no part (#2557).
-    class_node
-        .child_by_field_name("name")
-        .and_then(|name| direct_identifier_name(name, source))?;
-    let invocation = class_node.next_sibling()?;
-    if invocation.is_named() || invocation.kind() != "(" {
+    if !is_function_like_export_class_head(node, source) {
         return None;
     }
     let sibling = node.next_named_sibling()?;
@@ -2298,7 +2621,7 @@ fn recover_function_like_export_class_pair(
         // class name, and optional `final` token in source order, so recover
         // the name by the same positional rule as the other shapes.
         "compound_statement" => (
-            recovered_export_head_name(node, sibling, source)
+            recovered_export_pair_head_name(node, sibling, sibling, source)
                 .map(|name| normalize_cpp_whitespace(node_text(name, source)))?,
             None,
             sibling,
@@ -2350,7 +2673,7 @@ fn recover_function_like_export_class_pair(
             if body.kind() != "compound_statement" {
                 return None;
             }
-            let name_node = recovered_export_head_name(sibling, body, source)?;
+            let name_node = recovered_export_pair_head_name(node, sibling, body, source)?;
             let bases = recovered_export_head_bases(
                 sibling,
                 name_node.end_byte(),
@@ -2368,7 +2691,7 @@ fn recover_function_like_export_class_pair(
         // declaration whose trailing `init_declarator` carries the body.
         "declaration" => {
             let init = recovered_export_init_declarator(sibling)?;
-            let name_node = recovered_export_head_name(sibling, init, source)?;
+            let name_node = recovered_export_pair_head_name(node, sibling, init, source)?;
             let (bases, body) =
                 recovered_export_declaration_tail(sibling, name_node.end_byte(), source)?;
             (
@@ -2407,7 +2730,7 @@ fn recover_embedded_function_like_export_classes(
     node: Node<'_>,
     source: &str,
 ) -> Vec<RecoveredEmbeddedFunctionLikeExportClass> {
-    if node.kind() != "ERROR" {
+    if !node.is_error() {
         return Vec::new();
     }
 
@@ -2415,21 +2738,28 @@ fn recover_embedded_function_like_export_classes(
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         nodes.push(current);
-        for index in (0..current.child_count()).rev() {
-            stack.push(
-                current
-                    .child(index)
-                    .expect("index below the node's own child count"),
-            );
-        }
+        push_children_reversed(current, &mut stack);
     }
     nodes.sort_unstable_by_key(|child| (child.start_byte(), child.end_byte()));
+
+    // The scans below ask the same handful of kind questions once per node of
+    // the error subtree, so the kinds are resolved to symbol ids first (#3097).
+    let language = node.language();
+    let class_kind = NodeKindIds::new(&language, "class");
+    let identifier_kinds = [
+        NodeKindIds::new(&language, "identifier"),
+        NodeKindIds::new(&language, "type_identifier"),
+        NodeKindIds::new(&language, "field_identifier"),
+    ];
+    let argument_list_kind = NodeKindIds::new(&language, "argument_list");
+    let colon_kind = NodeKindIds::new(&language, ":");
+    let field_initializer_kind = NodeKindIds::new(&language, "field_initializer");
 
     let mut recovered = Vec::new();
     for class_token in nodes
         .iter()
         .copied()
-        .filter(|child| !child.is_named() && child.kind() == "class")
+        .filter(|child| !child.is_named() && class_kind.matches(*child))
     {
         let row = class_token.start_position().row;
         // The head after the `class` token reads `MACRO(args) macros... name
@@ -2438,11 +2768,7 @@ fn recover_embedded_function_like_export_classes(
         // name is the last identifier before the head ends at `final` or at the
         // base clause `:`. Spelling plays no part (#2557).
         let is_identifier = |candidate: &Node<'_>| {
-            !candidate.is_missing()
-                && matches!(
-                    candidate.kind(),
-                    "identifier" | "type_identifier" | "field_identifier"
-                )
+            !candidate.is_missing() && identifier_kinds.iter().any(|kind| kind.matches(*candidate))
         };
         let Some(macro_name) = nodes.iter().copied().find(|candidate| {
             candidate.start_byte() >= class_token.end_byte()
@@ -2452,7 +2778,7 @@ fn recover_embedded_function_like_export_classes(
             continue;
         };
         let Some(arguments) = nodes.iter().copied().find(|candidate| {
-            candidate.kind() == "argument_list"
+            argument_list_kind.matches(*candidate)
                 && candidate.start_byte() >= macro_name.end_byte()
                 && candidate.start_position().row == row
         }) else {
@@ -2468,7 +2794,7 @@ fn recover_embedded_function_like_export_classes(
         let Some(head_end) = nodes.iter().copied().find(|candidate| {
             candidate.start_byte() >= arguments.end_byte()
                 && (recovered_export_head_final(*candidate, source)
-                    || (!candidate.is_named() && candidate.kind() == ":"))
+                    || (!candidate.is_named() && colon_kind.matches(*candidate)))
         }) else {
             continue;
         };
@@ -2482,7 +2808,7 @@ fn recover_embedded_function_like_export_classes(
         };
         let name = normalize_cpp_whitespace(node_text(name_node, source));
         let Some(base_initializer) = nodes.iter().copied().find(|candidate| {
-            candidate.kind() == "field_initializer"
+            field_initializer_kind.matches(*candidate)
                 && candidate.start_byte() >= name_node.end_byte()
                 && candidate
                     .child_by_field_name("field")
@@ -2642,15 +2968,17 @@ impl CppRecoveredExportClassIndex {
             (usize, usize),
             Vec<RecoveredEmbeddedFunctionLikeExportClass>,
         > = HashMap::default();
+        // One cursor for the whole-file walk, and the error question asked by
+        // symbol rather than by `kind()` string (#3097).
+        let mut cursor = root.walk();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.kind() == "ERROR" {
+            if node.is_error() {
                 let recovered = recover_embedded_function_like_export_classes(node, source);
                 if !recovered.is_empty() {
                     by_error_node.insert((node.start_byte(), node.end_byte()), recovered);
                 }
             }
-            let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
         }
         Self { by_error_node }
@@ -2767,8 +3095,11 @@ pub(crate) fn recovered_class_body_at(
             && recovered_function_like_export_class_pair_has_body(node, source, identifier, range))
             || recovered_export_classes.claims(node, identifier, range)
             || (node.start_byte() == range.start_byte
-                && recovered_fragmented_plain_class_has_body(node, source, identifier, range))
+                && recovered_fragmented_class_has_body(node, source, identifier, range))
         {
+            return Some(true);
+        }
+        if recovered_collapsed_aggregate_has_body(node, source, identifier, range) {
             return Some(true);
         }
         // Macro-decorated exported classes are recovered from a malformed
@@ -2791,6 +3122,47 @@ pub(crate) fn recovered_class_body_at(
         stack.extend(node.named_children(&mut cursor).filter(covers_range_start));
     }
     saw_forward.then_some(false)
+}
+
+/// Whether the collapsed-aggregate recovery reads `node`'s children as the
+/// head of `identifier`'s member list at `range`.
+///
+/// An aggregate whose member list opens with a field-list macro invocation
+/// never forms a specifier, so the ordinary strength read finds no specifier
+/// node at the indexed range and answers `Unknown`. A complete definition
+/// recovered this way then loses the defining-type choice to a forward
+/// declaration of the same tag in another header, and every member the
+/// definition declares becomes unreachable through it: libuv's
+/// `struct uv_loop_s` in `include/uv.h` lost to `struct uv_loop_s;` in
+/// `include/uv/unix.h`, hiding `uv_loop_s.wq` (#3098). The recovery already
+/// proves the body, so it answers for its own ranges.
+fn recovered_collapsed_aggregate_has_body(
+    node: Node<'_>,
+    source: &str,
+    identifier: &str,
+    range: &Range,
+) -> bool {
+    let claims = |head: &CppCollapsedAggregateHead<'_>| {
+        head.key.start_byte() == range.start_byte
+            && normalize_cpp_whitespace(node_text(head.name, source)) == identifier
+    };
+    if cpp_folded_aggregate_head(node, source).is_some_and(|head| claims(&head)) {
+        return true;
+    }
+    if !node.is_error() {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let children = node.children(&mut cursor).collect::<Vec<_>>();
+    children
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| {
+            child.start_byte() <= range.start_byte && range.start_byte < child.end_byte()
+        })
+        .any(|(index, _)| {
+            cpp_collapsed_aggregate_head(&children, index, source).is_some_and(|head| claims(&head))
+        })
 }
 
 /// Whether `node` is the base type displaced into the declarator field of an
@@ -3334,12 +3706,14 @@ pub struct CppVisitor<'a> {
     /// `Widget$Inner`). Regions are rare (one per fragmented recovery), so a
     /// linear scan at visit time is fine.
     pub consumed_fragment_regions: Vec<(usize, usize)>,
-    /// The namespaces tree-sitter's error recovery closed early, by the byte
-    /// regions of the declarations it left outside them (issue #1537). The
-    /// container walk reads a declaration's package from its parsed ancestors,
-    /// which for those declarations stop short; see
+    /// Lexical namespace corrections and brace boundaries for declarations
+    /// displaced by parse recovery (issues #1537 and #3087). The parsed
+    /// ancestors can stop short or extend past their true closes; see
     /// [`CppVisitor::recovered_namespace_scope`].
     pub orphaned_namespaces: OrphanedNamespaceScopeIndex,
+    /// Owned reparses waiting for the outer work loop. Partitioning another
+    /// swallowed class in a tail must not grow the Rust call stack.
+    pub partitioned_regions: Vec<(Tree, std::ops::Range<usize>, ScopeInfo)>,
     /// The namespace forward declarations already folded out of each tree this
     /// walk has asked [`CppVisitor::unique_earlier_namespace_forward`] about.
     /// Empty until the first question, which the overwhelming majority of files
@@ -3356,7 +3730,7 @@ pub struct CppVisitor<'a> {
     /// Object-like field-list macros defined earlier in this source. Their
     /// replacements are parsed structurally and materialized under each
     /// invoking aggregate; no source-text expansion is used.
-    pub object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+    pub object_macro_fields: HashMap<String, ObjectMacroReplacement>,
     /// Names whose active replacement is not a unique structured field list.
     /// A later `#undef` resets the ambiguity; another `#define` does not.
     pub ambiguous_object_macro_fields: HashSet<String>,
@@ -3372,7 +3746,7 @@ pub struct CppVisitor<'a> {
 pub enum ObjectMacroFieldEvent {
     Define {
         name: String,
-        fields: Vec<MacroReplacementField>,
+        replacement: ObjectMacroReplacement,
         conditional: bool,
     },
     Undef {
@@ -3387,14 +3761,14 @@ pub enum ObjectMacroFieldEvent {
 pub fn collect_cpp_object_macro_fields<'tree>(
     root: Node<'tree>,
     source: &str,
-) -> HashMap<String, Vec<MacroReplacementField>> {
+) -> HashMap<String, ObjectMacroReplacement> {
     let mut fields = HashMap::default();
     let mut ambiguous = HashSet::default();
     for event in collect_cpp_object_macro_field_events(root, source) {
         match event {
             ObjectMacroFieldEvent::Define {
                 name,
-                fields: value,
+                replacement: value,
                 conditional,
             } => {
                 if value.is_empty() {
@@ -3442,15 +3816,10 @@ pub fn collect_cpp_object_macro_field_events<'tree>(
         if node.kind() == "preproc_def"
             && let Some(name) = extract_macro_name(node, source)
         {
-            let fields = node
-                .child_by_field_name("value")
-                .map(|value| {
-                    crate::graph::syntax::object_macro_replacement_fields(node_text(value, source))
-                })
-                .unwrap_or_default();
+            let replacement = object_macro_replacement_of(node, source);
             events.push(ObjectMacroFieldEvent::Define {
                 name,
-                fields,
+                replacement,
                 conditional: inside_preprocessor_conditional(node),
             });
         } else if is_cpp_undef_directive(node, source)
@@ -3779,7 +4148,24 @@ impl<'a> CppVisitor<'a> {
             recovered_specialization_member_scope: false,
             visible_using_namespaces,
         };
+        // The work loop dispatches a container's children, never the container
+        // itself, so an `ERROR` container that is the seed does not reach the
+        // ERROR arm of `visit_node`. A header whose first collapsed aggregate
+        // breaks the parse leaves the whole translation unit as that seed
+        // (libuv's `include/uv.h`, issue #2985), which is exactly the shape the
+        // macro-error-class recovery reads.
+        if node.is_error() {
+            self.visit_object_macro_error_classes(node, &scope);
+        }
         self.run_container_work(node, scope, ancestry);
+        while let Some((tree, range, scope)) = self.partitioned_regions.pop() {
+            let root = tree.root_node();
+            let container = root
+                .descendant_for_byte_range(range.start, range.end)
+                .expect("the queued container belongs to this tree");
+            assert_eq!(container.byte_range(), range);
+            self.run_container_work(container, scope, &ParentIndex::new(root));
+        }
     }
 
     /// Whether a work node lies entirely inside a byte region consumed by a
@@ -4096,7 +4482,12 @@ impl<'a> CppVisitor<'a> {
         if node.kind() == "function_definition" && node.has_error() {
             self.visit_embedded_function_like_export_classes(node, scope, stack, ancestry);
         }
-        if let Some((class_node, name, fragmented)) = fragmented_plain_class_body(node, self.source)
+        if let Some(FragmentedClassRecovery {
+            declaration_node: class_node,
+            name,
+            raw_supertypes,
+            body: fragmented,
+        }) = fragmented_class_body(node, self.source)
         {
             let displaced_namespace_items =
                 displaced_fragment_namespace_geometry(node, self.source)
@@ -4116,7 +4507,7 @@ impl<'a> CppVisitor<'a> {
                 parser_visible_body,
                 true,
                 Some(fragmented.class_range),
-                Some(extract_cpp_supertypes(class_node, self.source)),
+                Some(raw_supertypes),
                 scope,
                 &mut class_stack,
                 ancestry,
@@ -4144,7 +4535,7 @@ impl<'a> CppVisitor<'a> {
                 // structurally proven class/base declaration and re-own those
                 // sibling nodes under it. They retain their original parser
                 // nodes and exact ranges; the close boundary comes solely from
-                // `fragmented_plain_class_body`.
+                // `fragmented_class_body`.
                 // Template wrappers put the escaped members beside the
                 // template rather than beside its malformed declaration.
                 for candidate in cpp_following_named_siblings(node, self.source) {
@@ -4166,6 +4557,9 @@ impl<'a> CppVisitor<'a> {
                     .insert(item.id(), scope.clone());
             }
             stack.extend(class_stack);
+            return;
+        }
+        if self.visit_folded_aggregate(node, scope) {
             return;
         }
         match node.kind() {
@@ -4342,6 +4736,15 @@ impl<'a> CppVisitor<'a> {
             }
             "declaration" => {
                 if node.has_error() {
+                    // Object-like macro lines before a function-like
+                    // export-macro class head keep the head in a `declaration`
+                    // rather than in an `ERROR` (#2924). It is the same head
+                    // and the same following-sibling body, so it takes the same
+                    // recovery; without it the head's macro invocation indexes
+                    // as a field named after the macro.
+                    if self.visit_function_like_export_class_pair(node, scope, stack, ancestry) {
+                        return;
+                    }
                     self.visit_prototype_macro_declarations(node, scope);
                     if self.node_is_inside_consumed_fragment(node) {
                         // The whole declaration was a recovered K&R
@@ -4466,7 +4869,14 @@ impl<'a> CppVisitor<'a> {
                     scope: scope.clone(),
                 }))
             }
-            _ => {}
+            // A macro invocation the parser could not group leaves its head in
+            // whatever slot was free. The `function_definition` and `ERROR`
+            // arms above try the same recovery on the envelopes they get; a
+            // flattened run leaves a bare `identifier`/`type_identifier`, and a
+            // swallowed tail can land in a `parameter_declaration` (#3094).
+            _ => {
+                self.visit_collapsed_macro_declaration_run(node, scope);
+            }
         }
     }
 
@@ -4490,10 +4900,8 @@ impl<'a> CppVisitor<'a> {
             if node.kind() == "function_declarator" {
                 self.visit_error_swallowed_function_declaration(node, scope);
             }
-            for index in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
+            for child in named_children_iter(node) {
+                stack.push(child);
             }
         }
     }
@@ -4519,35 +4927,42 @@ impl<'a> CppVisitor<'a> {
         });
     }
 
-    /// Index the declarations a macro invocation collapsed into one envelope.
-    /// See [`collapsed_macro_declaration_run`] for the shape and why the parser
-    /// produces it. Returns whether it claimed `envelope`.
+    /// Index the declarations a macro invocation collapsed. See
+    /// [`collapsed_macro_declaration_run`] for the shape and why the parser
+    /// produces it. Returns whether it claimed the region beginning at
+    /// `envelope`.
     ///
-    /// The envelope's own nodes cannot be read the way the swallowed tail of
-    /// the one-line shape can. Of the 214 declarations whisper's `llama.h`
-    /// hides in it, 57 are shredded to bare identifier and punctuation tokens
+    /// The parser's own nodes cannot be read the way the swallowed tail of the
+    /// one-line shape can. Of the 214 declarations whisper's `llama.h` hides in
+    /// its envelope, 57 are shredded to bare identifier and punctuation tokens
     /// with no declarator left at all, and the declarators that do survive on
     /// the envelope's declarator spine pair one declaration's name with the
     /// *next* declaration's parameter list. Reading those would be a guess.
     ///
     /// The bytes are still ordinary declarations, though, and the collapse is
     /// the parser carrying the failure forward from one macro invocation. So
-    /// reparse the envelope's region, walk the items the parser makes of it,
-    /// and when one item is itself a collapsed run, recover that invocation
-    /// from its own bytes and resume the scan just past it. Each pass starts
-    /// later than the last, so the scan is a loop over the invocations that
-    /// collapse, not over the declarations: the real header needs three passes
-    /// for 214 declarations.
+    /// reparse the region, walk the items the parser makes of it, and when one
+    /// item is itself a collapsed run, recover that invocation from its own
+    /// bytes and resume the scan just past it. Each pass starts later than the
+    /// last, so the scan is a loop over the invocations that collapse, not over
+    /// the declarations: `llama.h` needs three passes for 214 declarations.
+    ///
+    /// The region can reach past `envelope` into the siblings the parser handed
+    /// the rest of one invocation, so it is recorded as consumed: those
+    /// siblings are this recovery's, and the ordinary walk must not read them
+    /// again. Recording it after the scan, not before, keeps the scan's own
+    /// reparsed nodes -- which carry their original byte offsets -- visible to
+    /// the walk it drives.
     fn visit_collapsed_macro_declaration_run(
         &mut self,
         envelope: Node<'_>,
         scope: &ScopeInfo,
     ) -> bool {
-        if collapsed_macro_declaration_run(envelope, self.source).is_none() {
+        let Some(run) = collapsed_macro_declaration_run(envelope, self.source) else {
             return false;
-        }
+        };
         let start = envelope.start_byte();
-        let end = envelope.end_byte();
+        let end = run.region_end;
         let recovery = cpp_recovery_window(self.source, start, end);
         self.record_recovered_declarations(recovery, |visitor| {
             let mut position = start;
@@ -4605,6 +5020,7 @@ impl<'a> CppVisitor<'a> {
                 position = run.invocation_end;
             }
         });
+        self.consumed_fragment_regions.push((start, end));
         true
     }
 
@@ -4898,30 +5314,21 @@ impl<'a> CppVisitor<'a> {
         (package_name, module)
     }
 
-    /// The scope for a node that C++ parse recovery displaced out of the
-    /// namespaces enclosing it (issue #1537). When tree-sitter closes a
-    /// damaged namespace early, the rest of its body and possibly the rest of
-    /// the file lose the `namespace_definition` ancestors this walk reads a
-    /// package from; the recovered region names the complete enclosing path.
-    /// `None` when the walk's scope already names every enclosing namespace,
-    /// or names a path another recovery established that this one does not
-    /// extend.
+    /// Restore the complete lexical namespace path when recovery dropped an
+    /// ancestor or retained it past its real close. Parsed namespaces beginning
+    /// inside the recovered region still contribute their normal nesting.
+    /// Crossing that boundary also clears any malformed class owner.
     fn recovered_namespace_scope(
         &mut self,
         node: Node<'_>,
         scope: &ScopeInfo,
     ) -> Option<ScopeInfo> {
+        self.orphaned_namespaces.region_at(node.start_byte())?;
         let components = self
             .orphaned_namespaces
-            .region_at(node.start_byte())?
-            .components
-            .clone();
+            .enclosing_namespace_components(node, self.source);
         let package_name = components.join(CPP_PACKAGE_SEPARATOR);
-        let extends = package_name.len() > scope.package_name.len()
-            && package_name.starts_with(scope.package_name.as_str())
-            && (scope.package_name.is_empty()
-                || package_name[scope.package_name.len()..].starts_with(CPP_PACKAGE_SEPARATOR));
-        if !extends {
+        if package_name == scope.package_name {
             return None;
         }
         let (package_name, module) = self.declare_namespace_levels(String::new(), components, node);
@@ -5445,6 +5852,95 @@ impl<'a> CppVisitor<'a> {
         if let Some((class_node, name, raw_supertypes)) =
             recover_exported_class_function_definition(node, self.source)
         {
+            if let Some(body) = cpp_body_node(node)
+                && let Some(close) = self
+                    .orphaned_namespaces
+                    .matching_close_brace(body.start_byte())
+                && close.end_byte < body.end_byte()
+            {
+                let class_range = Range {
+                    start_byte: node.start_byte(),
+                    end_byte: close.end_byte,
+                    start_line: node.start_position().row + 1,
+                    end_line: close.end_line,
+                };
+                // Parse the body in class context, preserving the original
+                // keyword, recovered name and body as included ranges. Parsing
+                // the interior at file scope turns constructors and access
+                // labels into another oversized ERROR instead of members.
+                let mut head = vec![node];
+                let mut keyword = None;
+                let mut name_node = None;
+                while let Some(part) = head.pop() {
+                    if part.start_byte() >= body.start_byte() || part.is_missing() {
+                        continue;
+                    }
+                    if matches!(part.kind(), "class" | "struct" | "union") {
+                        keyword = Some(part);
+                    }
+                    if matches!(part.kind(), "identifier" | "type_identifier")
+                        && node_text(part, self.source) == name
+                    {
+                        name_node = Some(part);
+                    }
+                    let mut cursor = part.walk();
+                    head.extend(part.children(&mut cursor));
+                }
+                if let (Some(keyword), Some(name_node)) = (keyword, name_node)
+                    && let Some(type_name) = keyword
+                        .parent()
+                        .and_then(|parent| parent.child_by_field_name("name"))
+                    && let Some(tree) = parse_source_ranges_with_cancellation(
+                        &tree_sitter_cpp::LANGUAGE.into(),
+                        self.source,
+                        &[
+                            (keyword.start_byte(), type_name.start_byte()),
+                            (name_node.start_byte(), name_node.end_byte()),
+                            (body.start_byte(), close.end_byte),
+                        ],
+                        None,
+                    )
+                    && let Some(reparsed_class) = tree.root_node().named_child(0)
+                    && let Some(class_body) = cpp_body_node(reparsed_class)
+                    && class_body.start_byte() == body.start_byte()
+                    && class_body.end_byte() == close.end_byte
+                    && let Some(tail) =
+                        cpp_reparse_region_items(self.source, close.end_byte, node.end_byte())
+                {
+                    let class_unit = self.visit_named_class_like_shape(
+                        class_node,
+                        name,
+                        None,
+                        true,
+                        Some(class_range),
+                        raw_supertypes,
+                        scope,
+                        stack,
+                        ancestry,
+                    );
+                    self.parsed.record_materialization(
+                        MaterializationRecord::RecoveredDeclaration {
+                            recovery: class_range,
+                            unit: class_unit.clone(),
+                        },
+                    );
+                    let member_scope = ScopeInfo {
+                        package_name: class_unit.package_name().to_string(),
+                        class_unit: Some(class_unit),
+                        declarations_are_fields: true,
+                        template_metadata: None,
+                        recovered_specialization_member_scope: false,
+                        ..scope.clone()
+                    };
+                    let class_body_range = class_body.byte_range();
+                    let tail_range = tail.root_node().byte_range();
+                    self.partitioned_regions
+                        .push((tail, tail_range, scope.clone()));
+                    self.partitioned_regions
+                        .push((tree, class_body_range, member_scope));
+                    return;
+                }
+            }
             let body = cpp_body_node(class_node);
             let displaced_namespace = cpp_body_node(node)
                 .and_then(|_| displaced_export_function_namespace_shape(node, self.source));
@@ -5611,13 +6107,15 @@ impl<'a> CppVisitor<'a> {
             // When the body's text-balanced close lands before the body's own
             // end, re-own the swallowed tail with the outer scope instead.
             if let Some(body) = body
-                && let Some(class_close) = cpp_matching_close_brace(self.source, body.start_byte())
-                && class_close < body.end_byte()
+                && let Some(class_close) = self
+                    .orphaned_namespaces
+                    .matching_close_brace(body.start_byte())
+                && class_close.start_byte < body.end_byte()
             {
                 let split = {
                     let mut cursor = body.walk();
                     body.named_children(&mut cursor)
-                        .position(|child| child.start_byte() > class_close)
+                        .position(|child| child.start_byte() > class_close.start_byte)
                 };
                 if let Some(split) = split {
                     // The seeded work is a single Container over the whole
@@ -6112,7 +6610,17 @@ impl<'a> CppVisitor<'a> {
         let recovered_scope = ScopeInfo {
             package_name,
             module,
-            class_unit: scope.class_unit.clone(),
+            // This scope's package comes from the namespace levels the sentinel
+            // shape proves, so its owner must come from the same place. C++
+            // never nests a namespace inside a class, so a surviving
+            // `class_unit` here is recovery bleed from an earlier malformed
+            // region, and keeping it would publish declarations whose package
+            // names one lexical position and whose owner names another -- the
+            // hybrid identity that trips the package/short boundary assert in
+            // `CodeUnit::with_signature_and_fq` (#2306, #2979). Dropping it is
+            // identity-neutral for valid code, where `class_unit` is always
+            // empty at a namespace.
+            class_unit: None,
             template_signature: scope.template_signature.clone(),
             template_metadata: scope.template_metadata.clone(),
             declarations_are_fields: false,
@@ -6978,6 +7486,15 @@ impl<'a> CppVisitor<'a> {
     }
 
     fn visit_macro(&mut self, node: Node<'_>) {
+        // A comment can terminate tree-sitter's preproc_arg before the logical
+        // directive ends. Its remaining declarations are replacement locals,
+        // not file-scope fields, even when recovery exposes them as siblings.
+        if let Some(replacement) =
+            crate::graph::syntax::function_macro_replacement_span(node, self.source)
+        {
+            self.consumed_fragment_regions
+                .push((replacement.start, replacement.end));
+        }
         let Some(name) = extract_macro_name(node, self.source) else {
             return;
         };
@@ -7035,7 +7552,8 @@ impl<'a> CppVisitor<'a> {
         };
         let name = node_text(directive, self.source).trim();
         let range = cpp_declaration_range(node);
-        self.materialize_object_macro_fields(name, range, scope);
+        let fields = object_macro_field_closure(&self.object_macro_fields, name);
+        self.materialize_object_macro_fields(fields, range, scope);
     }
 
     /// Bare object-like field-list macros inside an otherwise well-formed
@@ -7046,19 +7564,47 @@ impl<'a> CppVisitor<'a> {
         if !matches!(node.kind(), "declaration" | "field_declaration") {
             return false;
         }
+        // Claiming the declaration means its members are accounted for, which
+        // is only true when there is an owner to materialize them into. A file
+        // scope reaches this with a declaration that merely *contains* an
+        // aggregate spelling an invocation (tree-sitter wraps libuv's
+        // `struct uv_fs_poll_s { UV_HANDLE_FIELDS ... }` in a top-level
+        // `field_declaration` under a malformed header), and consuming it there
+        // would discard the aggregate itself (#2985).
+        if scope.class_unit.is_none() {
+            return false;
+        }
         let macro_nodes =
             object_macro_identifier_nodes(node, self.source, &self.object_macro_fields);
         for macro_node in &macro_nodes {
             let name = node_text(*macro_node, self.source).trim();
-            self.materialize_object_macro_fields(name, cpp_declaration_range(*macro_node), scope);
+            let fields = object_macro_field_closure(&self.object_macro_fields, name);
+            self.materialize_object_macro_fields(fields, cpp_declaration_range(*macro_node), scope);
         }
-        !macro_nodes.is_empty()
+        let Some(last) = macro_nodes.last() else {
+            return false;
+        };
+        // Claiming the declaration accounts for every member it spells, not
+        // only the donated ones: an invocation folded together with the
+        // members after it (libuv's `UV_HANDLE_FIELDS ... void* poll_ctx;`)
+        // leaves those members shapeless, and the grammar recovers them from
+        // the byte range that follows the invocation.
+        self.record_collapsed_aggregate_fields(
+            last.end_byte()..node.end_byte(),
+            node.start_position().row
+                + 1
+                + cpp_line_breaks_between(self.source, node.start_byte(), last.end_byte()),
+            scope,
+        );
+        true
     }
 
-    fn materialize_object_macro_fields(&mut self, name: &str, range: Range, scope: &ScopeInfo) {
-        let Some(fields) = self.object_macro_fields.get(name).cloned() else {
-            return;
-        };
+    fn materialize_object_macro_fields(
+        &mut self,
+        fields: Vec<MacroReplacementField>,
+        range: Range,
+        scope: &ScopeInfo,
+    ) {
         let Some(owner) = scope.class_unit.as_ref() else {
             return;
         };
@@ -7097,7 +7643,7 @@ impl<'a> CppVisitor<'a> {
     fn visit_object_macro_error_classes(&mut self, node: Node<'_>, scope: &ScopeInfo) {
         let mut cursor = node.walk();
         let children = node.children(&mut cursor).collect::<Vec<_>>();
-        let mut recovered = Vec::<(CodeUnit, usize, usize, Vec<Node<'_>>)>::new();
+        let mut recovered = Vec::<(CodeUnit, usize, usize, Vec<CppCollapsedMember>)>::new();
         let mut object_macro_fields = self.object_macro_fields.clone();
         let mut ambiguous_object_macro_fields = self.ambiguous_object_macro_fields.clone();
         let mut open = Vec::<usize>::new();
@@ -7113,14 +7659,8 @@ impl<'a> CppVisitor<'a> {
                 index += 1;
                 continue;
             }
-            if index + 2 < children.len()
-                && matches!(keyword.kind(), "struct" | "class" | "union")
-                && matches!(children[index + 1].kind(), "type_identifier" | "identifier")
-                && children[index + 2].kind() == "{"
-            {
-                let name_node = children[index + 1];
-                let opening = children[index + 2];
-                let name = normalize_cpp_whitespace(node_text(name_node, self.source));
+            if let Some(head) = cpp_collapsed_aggregate_head(&children, index, self.source) {
+                let name = normalize_cpp_whitespace(node_text(head.name, self.source));
                 if !name.is_empty() {
                     let parent = open
                         .last()
@@ -7147,9 +7687,67 @@ impl<'a> CppVisitor<'a> {
                         false,
                         fq,
                     );
-                    recovered.push((owner, keyword.start_byte(), opening.end_byte(), Vec::new()));
-                    open.push(recovered.len() - 1);
-                    index += 3;
+                    recovered.push((
+                        owner,
+                        head.key.start_byte(),
+                        head.opening.end_byte(),
+                        Vec::new(),
+                    ));
+                    let class_index = recovered.len() - 1;
+                    match head.folded_members {
+                        // The ordinary shape leaves the aggregate open: every
+                        // child that follows belongs to it until a close brace
+                        // ends it.
+                        None => open.push(class_index),
+                        // A folded head carries its own member list and its own
+                        // closing brace, so it closes here. The invocations that
+                        // precede the class key are the dangling tail of the
+                        // replacement that folded it, and belong to whatever
+                        // aggregate is open around it, not to this one.
+                        Some(members) => {
+                            let macro_nodes = object_macro_identifier_nodes_with_environment(
+                                children[index],
+                                self.source,
+                                &mut object_macro_fields,
+                                &mut ambiguous_object_macro_fields,
+                            );
+                            let (preceding, inner): (Vec<_>, Vec<_>) = macro_nodes
+                                .iter()
+                                .partition(|node| node.start_byte() < head.key.start_byte());
+                            if let Some(&enclosing) = open.last() {
+                                for macro_node in preceding {
+                                    recovered[enclosing]
+                                        .3
+                                        .push(CppCollapsedMember::MacroFields {
+                                            range: cpp_declaration_range(macro_node),
+                                            fields: object_macro_field_closure(
+                                                &object_macro_fields,
+                                                &normalize_cpp_whitespace(node_text(
+                                                    macro_node,
+                                                    self.source,
+                                                )),
+                                            ),
+                                        });
+                                }
+                            }
+                            let closing = cpp_collapsed_aggregate_closing_brace(members);
+                            recovered[class_index]
+                                .3
+                                .extend(cpp_collapsed_aggregate_members(
+                                    &inner,
+                                    head.opening.end_byte()..closing,
+                                    head.opening.end_position().row + 1,
+                                    self.source,
+                                    &object_macro_fields,
+                                ));
+                            recovered[class_index].2 = members.end_byte();
+                            for &open_class in &open {
+                                recovered[open_class].2 =
+                                    recovered[open_class].2.max(members.end_byte());
+                            }
+                        }
+                    }
+                    index += head.width;
                     continue;
                 }
             }
@@ -7157,13 +7755,20 @@ impl<'a> CppVisitor<'a> {
                 && children[index].kind() == "field_declaration"
             {
                 let field = children[index];
+                let macro_nodes = object_macro_identifier_nodes_with_environment(
+                    field,
+                    self.source,
+                    &mut object_macro_fields,
+                    &mut ambiguous_object_macro_fields,
+                );
                 recovered[class_index]
                     .3
-                    .extend(object_macro_identifier_nodes_with_environment(
-                        field,
+                    .extend(cpp_collapsed_aggregate_members(
+                        &macro_nodes,
+                        field.start_byte()..field.end_byte(),
+                        field.start_position().row + 1,
                         self.source,
-                        &mut object_macro_fields,
-                        &mut ambiguous_object_macro_fields,
+                        &object_macro_fields,
                     ));
                 let end = field.end_byte();
                 for &open_class in &open {
@@ -7180,39 +7785,180 @@ impl<'a> CppVisitor<'a> {
         }
 
         let mut owners = Vec::with_capacity(recovered.len());
-        for (owner, start, end, macro_nodes) in recovered {
-            let range = Range {
-                start_byte: start,
-                end_byte: end,
-                start_line: self.source.get(..start).map_or(1, |source| {
-                    source.bytes().filter(|byte| *byte == b'\n').count() + 1
-                }),
-                end_line: self.source.get(..end).map_or(1, |source| {
-                    source.bytes().filter(|byte| *byte == b'\n').count() + 1
-                }),
-            };
-            if !self.parsed.contains_declaration(&owner) {
-                let parent = owners
-                    .iter()
-                    .find(|parent: &&CodeUnit| owner.fq().parent().as_ref() == Some(parent.fq()))
-                    .cloned()
-                    .or_else(|| scope.class_unit.clone());
-                self.add_declaration_with_range(owner.clone(), range, parent, None);
-            }
-            let owner_scope = ScopeInfo {
-                class_unit: Some(owner.clone()),
-                declarations_are_fields: true,
-                ..scope.clone()
-            };
-            for macro_node in macro_nodes {
-                let name = normalize_cpp_whitespace(node_text(macro_node, self.source));
-                self.materialize_object_macro_fields(
-                    &name,
-                    cpp_declaration_range(macro_node),
-                    &owner_scope,
-                );
-            }
+        for (owner, start, end, members) in recovered {
+            let parent = owners
+                .iter()
+                .find(|parent: &&CodeUnit| owner.fq().parent().as_ref() == Some(parent.fq()))
+                .cloned()
+                .or_else(|| scope.class_unit.clone());
+            self.declare_collapsed_aggregate(owner.clone(), start..end, parent, members, scope);
             owners.push(owner);
+        }
+    }
+
+    /// Record one recovered aggregate and the members it declares.
+    fn declare_collapsed_aggregate(
+        &mut self,
+        owner: CodeUnit,
+        span: std::ops::Range<usize>,
+        parent: Option<CodeUnit>,
+        members: Vec<CppCollapsedMember>,
+        scope: &ScopeInfo,
+    ) {
+        let range = Range {
+            start_byte: span.start,
+            end_byte: span.end,
+            start_line: self.source.get(..span.start).map_or(1, |source| {
+                source.bytes().filter(|byte| *byte == b'\n').count() + 1
+            }),
+            end_line: self.source.get(..span.end).map_or(1, |source| {
+                source.bytes().filter(|byte| *byte == b'\n').count() + 1
+            }),
+        };
+        // The tag can already be declared by a typedef or a forward
+        // declaration, and this range is the definition's. Record it either
+        // way: a declaration carries every range it is written at, and
+        // dropping this one leaves nothing able to prove that the aggregate
+        // has a body (#3098). Recording a range that is already held, or a
+        // unit that is already declared, changes nothing.
+        self.add_declaration_with_range(owner.clone(), range, parent, None);
+        let owner_scope = ScopeInfo {
+            class_unit: Some(owner),
+            declarations_are_fields: true,
+            ..scope.clone()
+        };
+        for member in members {
+            match member {
+                CppCollapsedMember::MacroFields { range, fields } => {
+                    self.materialize_object_macro_fields(fields, range, &owner_scope);
+                }
+                CppCollapsedMember::Declarations { span, start_line } => {
+                    self.record_collapsed_aggregate_fields(span, start_line, &owner_scope);
+                }
+            }
+        }
+    }
+
+    /// Recover an aggregate whose head tree-sitter folded into the declaration
+    /// that precedes it, outside any collapsed `ERROR` container.
+    ///
+    /// A comment inside a field-list macro's replacement ends the replacement
+    /// token, so the rest of the replacement is read at file scope. When the
+    /// aggregate that follows declares its member list with one invocation,
+    /// the parser reads the dangling tail as that declaration's type, the
+    /// class key as an `ERROR`, and the member list as an initializer (#3098).
+    /// The invocations before the class key belong to the replacement, not to
+    /// this aggregate, so they go to whatever aggregate encloses it.
+    fn visit_folded_aggregate(&mut self, node: Node<'_>, scope: &ScopeInfo) -> bool {
+        if node.parent().is_some_and(|parent| parent.is_error()) {
+            // The container's own recovery reads this child in source order,
+            // with the preprocessor environment its earlier children build.
+            return false;
+        }
+        let Some(head) = cpp_folded_aggregate_head(node, self.source) else {
+            return false;
+        };
+        let members = head
+            .folded_members
+            .expect("a folded aggregate head carries its member list");
+        let name = normalize_cpp_whitespace(node_text(head.name, self.source));
+        if name.is_empty() {
+            return false;
+        }
+        let macro_nodes =
+            object_macro_identifier_nodes(node, self.source, &self.object_macro_fields);
+        let (preceding, inner): (Vec<_>, Vec<_>) = macro_nodes
+            .iter()
+            .partition(|macro_node| macro_node.start_byte() < head.key.start_byte());
+        for macro_node in preceding {
+            let fields = object_macro_field_closure(
+                &self.object_macro_fields,
+                &normalize_cpp_whitespace(node_text(macro_node, self.source)),
+            );
+            self.materialize_object_macro_fields(fields, cpp_declaration_range(macro_node), scope);
+        }
+        let parent = scope.class_unit.clone();
+        let short_name = parent.as_ref().map_or_else(
+            || name.clone(),
+            |parent| cpp_join_nested_short(parent.short_name(), &name),
+        );
+        let fq = cpp_leaf_fq(
+            &scope.package_name,
+            parent.as_ref(),
+            &name,
+            SegmentKind::Nested,
+            SegmentKind::Type,
+        );
+        let owner = CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Class,
+            scope.package_name.clone(),
+            short_name,
+            None,
+            false,
+            fq,
+        );
+        let recovered = cpp_collapsed_aggregate_members(
+            &inner,
+            head.opening.end_byte()..cpp_collapsed_aggregate_closing_brace(members),
+            head.opening.end_position().row + 1,
+            self.source,
+            &self.object_macro_fields,
+        );
+        self.declare_collapsed_aggregate(
+            owner,
+            head.key.start_byte()..members.end_byte(),
+            parent,
+            recovered,
+            scope,
+        );
+        true
+    }
+
+    /// Record the members of a collapsed aggregate region as fields of its
+    /// recovered owner. The names, declaration text, and byte ranges all come
+    /// from the grammar's reading of the region, so a region that is not a
+    /// member list contributes nothing.
+    fn record_collapsed_aggregate_fields(
+        &mut self,
+        span: std::ops::Range<usize>,
+        start_line: usize,
+        scope: &ScopeInfo,
+    ) {
+        let Some(owner) = scope.class_unit.as_ref() else {
+            return;
+        };
+        for field in crate::graph::syntax::recovered_aggregate_fields(self.source, span.clone()) {
+            let range = Range {
+                start_byte: field.range.start,
+                end_byte: field.range.end,
+                start_line: start_line
+                    + cpp_line_breaks_between(self.source, span.start, field.range.start),
+                end_line: start_line
+                    + cpp_line_breaks_between(self.source, span.start, field.range.end),
+            };
+            let mut fq = owner.fq().clone();
+            fq.push(segment_interner().intern(&field.name, SegmentKind::Member));
+            let short_name = if owner.short_name().is_empty() {
+                field.name.clone()
+            } else {
+                format!("{}.{}", owner.short_name(), field.name)
+            };
+            let signature = normalize_cpp_whitespace(&field.declaration);
+            let code_unit = CodeUnit::with_signature_and_fq(
+                self.file.clone(),
+                CodeUnitType::Field,
+                owner.package_name().to_string(),
+                short_name,
+                Some(signature.clone()),
+                false,
+                fq,
+            );
+            if self.parsed.contains_declaration(&code_unit) {
+                continue;
+            }
+            self.add_declaration_with_range(code_unit.clone(), range, Some(owner.clone()), None);
+            self.parsed.add_signature(code_unit, signature);
         }
     }
 
@@ -7238,6 +7984,45 @@ impl<'a> CppVisitor<'a> {
     }
 }
 
+/// Every member a field-list macro contributes under `environment`, including
+/// the members of the field-list macros it composes.
+///
+/// Composition is resolved at the invocation, not at the definition, because a
+/// nested name's active replacement is a property of the environment the
+/// invocation sees. The traversal is iterative and visits each name once, so a
+/// self-composing or mutually composing pair terminates.
+fn object_macro_field_closure(
+    environment: &HashMap<String, ObjectMacroReplacement>,
+    name: &str,
+) -> Vec<MacroReplacementField> {
+    let mut fields = Vec::new();
+    let mut visited = HashSet::default();
+    let mut stack = vec![name.to_string()];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let Some(replacement) = environment.get(&current) else {
+            continue;
+        };
+        fields.extend(replacement.fields.iter().cloned());
+        stack.extend(replacement.nested.iter().rev().cloned());
+    }
+    fields
+}
+
+/// The structured replacement an object-like `#define` contributes.
+///
+/// The directive's whole logical line is the replacement list, which
+/// [`object_macro_replacement_span`] recovers, because a comment inside the
+/// replacement ends tree-sitter's `preproc_arg` token early.
+fn object_macro_replacement_of(node: Node<'_>, source: &str) -> ObjectMacroReplacement {
+    crate::graph::syntax::object_macro_replacement_span(node, source)
+        .and_then(|span| source.get(span))
+        .map(crate::graph::syntax::object_macro_replacement)
+        .unwrap_or_default()
+}
+
 /// Apply one preprocessor directive to an object-like field-list environment.
 /// The environment is intentionally separate from the declaration visitor so
 /// malformed parser regions can replay directives in source order without
@@ -7245,7 +8030,7 @@ impl<'a> CppVisitor<'a> {
 fn update_object_macro_field_environment(
     node: Node<'_>,
     source: &str,
-    fields: &mut HashMap<String, Vec<MacroReplacementField>>,
+    fields: &mut HashMap<String, ObjectMacroReplacement>,
     ambiguous: &mut HashSet<String>,
 ) -> bool {
     match node.kind() {
@@ -7253,12 +8038,7 @@ fn update_object_macro_field_environment(
             let Some(name) = extract_macro_name(node, source) else {
                 return false;
             };
-            let replacement = node
-                .child_by_field_name("value")
-                .map(|value| {
-                    crate::graph::syntax::object_macro_replacement_fields(node_text(value, source))
-                })
-                .unwrap_or_default();
+            let replacement = object_macro_replacement_of(node, source);
             if replacement.is_empty() || ambiguous.contains(&name) {
                 fields.remove(&name);
                 ambiguous.insert(name);
@@ -7291,7 +8071,7 @@ fn update_object_macro_field_environment(
 fn object_macro_identifier_nodes<'tree>(
     node: Node<'tree>,
     source: &str,
-    fields: &HashMap<String, Vec<MacroReplacementField>>,
+    fields: &HashMap<String, ObjectMacroReplacement>,
 ) -> Vec<Node<'tree>> {
     let mut result = Vec::new();
     let mut stack = vec![node];
@@ -7318,7 +8098,7 @@ fn object_macro_identifier_nodes<'tree>(
 fn object_macro_identifier_nodes_with_environment<'tree>(
     node: Node<'tree>,
     source: &str,
-    fields: &mut HashMap<String, Vec<MacroReplacementField>>,
+    fields: &mut HashMap<String, ObjectMacroReplacement>,
     ambiguous: &mut HashSet<String>,
 ) -> Vec<Node<'tree>> {
     let mut result = Vec::new();
@@ -7342,17 +8122,196 @@ fn object_macro_identifier_nodes_with_environment<'tree>(
     result
 }
 
+/// One member region of an aggregate whose head and body tree-sitter collapsed
+/// into an `ERROR` container, in source order.
+enum CppCollapsedMember {
+    /// The members a field-list macro invocation donates, all sharing the
+    /// invocation's range.
+    MacroFields {
+        range: Range,
+        fields: Vec<MacroReplacementField>,
+    },
+    /// A byte span whose ordinary member declarations lost their shape with
+    /// the aggregate body, with the 1-based line the span starts on.
+    Declarations {
+        span: std::ops::Range<usize>,
+        start_line: usize,
+    },
+}
+
+/// One aggregate head recovered from the children of a collapsed `ERROR`
+/// container.
+///
+/// A member list that opens with an object-like field-list macro invocation
+/// has no grammar rule, so the aggregate never forms a specifier and its head
+/// reaches the tree as loose children. Two shapes carry it. Ordinarily the
+/// class key, the name, and the opening brace are three consecutive children.
+/// When the aggregate follows the dangling tail of a comment-truncated
+/// replacement, the parser reads that tail as the declaration's type and folds
+/// the whole aggregate into it: libuv's `UV_HANDLE_PRIVATE_FIELDS` line ends
+/// the `UV_HANDLE_FIELDS` replacement token, and the `struct uv_handle_s { ...
+/// }` that follows becomes one `field_declaration` whose class key is an
+/// `ERROR`, whose name is a `field_identifier`, and whose member list is an
+/// `initializer_list` (#3098).
+struct CppCollapsedAggregateHead<'tree> {
+    key: Node<'tree>,
+    name: Node<'tree>,
+    opening: Node<'tree>,
+    /// The member list when the head folded it into its own node, which also
+    /// carries the aggregate's closing brace. `None` leaves the aggregate open
+    /// for the children that follow it.
+    folded_members: Option<Node<'tree>>,
+    /// How many children the head consumes.
+    width: usize,
+}
+
+/// The aggregate head that starts at `children[index]`, if one does.
+fn cpp_collapsed_aggregate_head<'tree>(
+    children: &[Node<'tree>],
+    index: usize,
+    source: &str,
+) -> Option<CppCollapsedAggregateHead<'tree>> {
+    let key = *children.get(index)?;
+    if matches!(key.kind(), "struct" | "class" | "union") {
+        let name = *children.get(index + 1)?;
+        let opening = *children.get(index + 2)?;
+        if !matches!(name.kind(), "type_identifier" | "identifier") || opening.kind() != "{" {
+            return None;
+        }
+        return Some(CppCollapsedAggregateHead {
+            key,
+            name,
+            opening,
+            folded_members: None,
+            width: 3,
+        });
+    }
+    cpp_folded_aggregate_head(key, source)
+}
+
+/// The aggregate head tree-sitter folded into one declaration node, reading
+/// the class key as an `ERROR` and the member list as an initializer.
+fn cpp_folded_aggregate_head<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<CppCollapsedAggregateHead<'tree>> {
+    if !matches!(node.kind(), "declaration" | "field_declaration") {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let children = node.children(&mut cursor).collect::<Vec<_>>();
+    let key_index = children.iter().position(|child| {
+        child.is_error()
+            && matches!(
+                node_text(*child, source).trim(),
+                "struct" | "class" | "union"
+            )
+    })?;
+    let declarator = *children.get(key_index + 1)?;
+    // At file scope the grammar has an `init_declarator` for the name and its
+    // initializer; inside an `ERROR` container the two are loose siblings.
+    let (name, members) = if declarator.kind() == "init_declarator" {
+        (
+            declarator.child_by_field_name("declarator")?,
+            declarator.child_by_field_name("value")?,
+        )
+    } else {
+        (declarator, *children.get(key_index + 2)?)
+    };
+    if !matches!(
+        name.kind(),
+        "field_identifier" | "type_identifier" | "identifier"
+    ) {
+        return None;
+    }
+    if members.kind() != "initializer_list" {
+        return None;
+    }
+    let opening = members.child(0).filter(|brace| brace.kind() == "{")?;
+    Some(CppCollapsedAggregateHead {
+        key: children[key_index],
+        name,
+        opening,
+        folded_members: Some(members),
+        width: 1,
+    })
+}
+
+/// Where a folded member list ends: at its own closing brace when it has one,
+/// so the reparse of the declarations it holds sees a member list and not a
+/// stray brace.
+fn cpp_collapsed_aggregate_closing_brace(members: Node<'_>) -> usize {
+    let mut cursor = members.walk();
+    members
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "}" && !child.is_missing())
+        .last()
+        .map_or_else(|| members.end_byte(), |brace| brace.start_byte())
+}
+
+/// The members one collapsed aggregate region declares, in source order: what
+/// its field-list macro invocations donate, then the ordinary declarations
+/// that follow the last invocation and lost their shape with the body.
+fn cpp_collapsed_aggregate_members(
+    macro_nodes: &[Node<'_>],
+    region: std::ops::Range<usize>,
+    region_start_line: usize,
+    source: &str,
+    environment: &HashMap<String, ObjectMacroReplacement>,
+) -> Vec<CppCollapsedMember> {
+    let mut members = macro_nodes
+        .iter()
+        .map(|macro_node| CppCollapsedMember::MacroFields {
+            range: cpp_declaration_range(*macro_node),
+            fields: object_macro_field_closure(
+                environment,
+                &normalize_cpp_whitespace(node_text(*macro_node, source)),
+            ),
+        })
+        .collect::<Vec<_>>();
+    // Whatever follows the last invocation is an ordinary member list that
+    // lost its declaration shape with the aggregate's body; the grammar
+    // recovers it from its own byte range.
+    let declarations_start = macro_nodes
+        .last()
+        .map_or(region.start, |macro_node| macro_node.end_byte());
+    members.push(CppCollapsedMember::Declarations {
+        span: declarations_start..region.end,
+        start_line: region_start_line
+            + cpp_line_breaks_between(source, region.start, declarations_start),
+    });
+    members
+}
+
+/// Line breaks in `source[from..to]`, for mapping a recovered byte offset to a
+/// line without rescanning the file from its start.
+fn cpp_line_breaks_between(source: &str, from: usize, to: usize) -> usize {
+    source.get(from..to).map_or(0, |slice| {
+        slice.bytes().filter(|byte| *byte == b'\n').count()
+    })
+}
+
+/// How many enclosing aggregates a collapsed member declaration closes: the
+/// close braces it carries that its own braces do not balance. A member that
+/// declares a nested aggregate of its own (`union { ... } active_reqs;` in
+/// libuv's `uv_loop_s`) closes nothing, so counting every `}` node ended the
+/// owner early and lost every member after it (#2985).
 fn count_close_brace_nodes(node: Node<'_>) -> usize {
-    let mut count = 0;
+    let mut opened = 0usize;
+    let mut closed = 0usize;
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if current.kind() == "}" && !current.is_missing() {
-            count += 1;
+        if !current.is_missing() {
+            match current.kind() {
+                "{" => opened += 1,
+                "}" => closed += 1,
+                _ => {}
+            }
         }
         let mut cursor = current.walk();
         stack.extend(current.children(&mut cursor));
     }
-    count
+    closed.saturating_sub(opened)
 }
 
 /// Classify a C++ field while its declaration syntax is already available.
@@ -9619,10 +10578,8 @@ pub fn cpp_displaced_preprocessor_terminator<'tree>(
             continue;
         }
         let inside_error = inside_error || node.kind() == "ERROR";
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                stack.push((child, inside_error));
-            }
+        for child in children_iter(node) {
+            stack.push((child, inside_error));
         }
     }
     displaced
@@ -9691,10 +10648,7 @@ fn displaced_nested_conditional_terminator<'tree>(conditional: Node<'tree>) -> O
         return None;
     }
     let mut recovered = None;
-    for index in 0..conditional.named_child_count() {
-        let Some(nested) = conditional.named_child(index) else {
-            continue;
-        };
+    for nested in named_children_iter(conditional) {
         if !matches!(
             nested.kind(),
             "preproc_if" | "preproc_ifdef" | "preproc_ifndef"
@@ -9801,11 +10755,7 @@ fn displaced_split_declaration<'tree>(conditional: Node<'tree>) -> Option<Node<'
         if matches!(node.kind(), "identifier" | "type_identifier") {
             names.push(node.start_byte());
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     let error_end = error_end?;
     names
@@ -10035,6 +10985,30 @@ fn recover_fragmented_partial_specialization<'tree>(
         member_siblings,
         following_declarations,
     })
+}
+
+/// Whether `node` is the function-shaped parser wrapper whose body was
+/// recovered as a fragmented partial-specialization class body.
+///
+/// Consumers that walk lexical function scopes must use the same complete
+/// structural proof as declaration extraction. Otherwise member callables in
+/// the recovered body are mistaken for function-local declarations.
+pub fn is_recovered_fragmented_partial_specialization_container(
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    let Some(template) = node
+        .parent()
+        .filter(|parent| parent.kind() == "template_declaration")
+    else {
+        return false;
+    };
+    let mut root = template;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    recover_fragmented_partial_specialization(template, node, source, &ParentIndex::new(root))
+        .is_some()
 }
 
 fn recovered_declaration_has_class_terminator(declaration: Node<'_>) -> bool {
@@ -14184,10 +15158,7 @@ pub fn recovered_macro_return_type_node<'tree>(
     }
     let mut has_missing_semicolon = false;
     let mut has_real_semicolon = false;
-    for index in 0..node.child_count() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
+    for child in children_iter(node) {
         if child.kind() != ";" {
             continue;
         }
@@ -15637,11 +16608,11 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             index += 3;
             continue;
         }
-        if let Some((_, _, fragmented)) = fragmented_plain_class_body(child, source) {
+        if let Some(recovered) = fragmented_class_body(child, source) {
             let Some(tree) = cpp_reparse_fragmented_class_body(
                 source,
-                fragmented.reparse_start,
-                fragmented.reparse_end,
+                recovered.body.reparse_start,
+                recovered.body.reparse_end,
             ) else {
                 return false;
             };
@@ -15651,7 +16622,7 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
             saw_member = true;
             index += 1;
             while index < children.len()
-                && children[index].end_byte() <= fragmented.class_range.end_byte
+                && children[index].end_byte() <= recovered.body.class_range.end_byte
             {
                 index += 1;
             }
@@ -16098,6 +17069,7 @@ namespace internal {
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
             orphaned_namespaces: index,
+            partitioned_regions: Vec::new(),
             namespace_forward_scans: HashMap::default(),
             field_owners: None,
             recovery_captures: Vec::new(),
@@ -16543,6 +17515,164 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
                 "{name}: {text:?}"
             );
         }
+    }
+
+    /// whisper.cpp's own `include/whisper.h` writes the same construct with the
+    /// invocation's `(` at the end of its line, and the parser then keeps no
+    /// invocation whole. It hands the first one's hint and its own `)` and `;`
+    /// to the `expression_statement` beside it, and flattens the ones after
+    /// that into bare `identifier`/`type_identifier`, `(`,
+    /// `parameter_declaration`, `,` and `ERROR` parts of whatever node it is
+    /// already inside. No part of that is a head the grouping can be read from,
+    /// which is why the invocation is read from the token order instead
+    /// (#3094).
+    ///
+    /// The identifiers are `library_*` at whisper's own lengths on purpose:
+    /// tree-sitter prices error recovery partly by how much input a repair
+    /// skips, and the same construct written with shorter names parses cleanly.
+    #[test]
+    fn a_flattened_macro_invocation_run_is_read_from_its_token_order() {
+        let source = r#"    LIBRARY_DEPRECATED(
+        LIBRARY_API struct library_context * library_init_from_file(const char * path_model),
+        "use library_init_from_file_with_params instead"
+    );
+    LIBRARY_DEPRECATED(
+        LIBRARY_API struct library_context * library_init_from_buffer(void * buffer, size_t buffer_size),
+        "use library_init_from_buffer_with_params instead"
+    );
+    LIBRARY_DEPRECATED(
+        LIBRARY_API struct library_context * library_init(struct library_model_loader * loader),
+        "use library_init_with_params instead"
+    );
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ tree");
+        let root = tree.root_node();
+
+        // The shape this recovery exists for: the second invocation is not a
+        // node of its own, and the third is a run of bare siblings inside the
+        // second one's `ERROR`.
+        let mut cursor = root.walk();
+        let items = root.children(&mut cursor).collect::<Vec<_>>();
+        let [first, hint_statement, rest @ ..] = items.as_slice() else {
+            panic!("{}", root.to_sexp());
+        };
+        assert_eq!(first.kind(), "ERROR");
+        assert_eq!(hint_statement.kind(), "expression_statement");
+        assert!(
+            node_text(*first, source).ends_with(','),
+            "the first invocation's own `)` and `;` are the statement's, not its own: {}",
+            root.to_sexp()
+        );
+        let swallowing = rest
+            .iter()
+            .find(|item| item.kind() == "ERROR")
+            .unwrap_or_else(|| panic!("{}", root.to_sexp()));
+        let mut swallowing_cursor = swallowing.walk();
+        let flattened = swallowing
+            .children(&mut swallowing_cursor)
+            .map(|child| child.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flattened,
+            vec![
+                "identifier",
+                "(",
+                "parameter_declaration",
+                ",",
+                "ERROR",
+                "type_identifier",
+                "(",
+                "parameter_declaration",
+                ",",
+                "\"",
+                "identifier",
+                "identifier",
+                "identifier",
+                "\"",
+                ")",
+            ],
+            "the third invocation must be flattened into the second one's node: {}",
+            root.to_sexp()
+        );
+
+        // Both are admitted, and each names the byte just past its own `;`.
+        let first_run =
+            collapsed_macro_declaration_run(*first, source).expect("the first invocation");
+        assert_eq!(
+            &source[..first_run.invocation_end],
+            &source[..source.find("instead\"\n    );").expect("first hint")
+                + "instead\"\n    );".len()]
+        );
+        assert_eq!(
+            first_run.region_end, first_run.invocation_end,
+            "the first invocation swallowed nothing, so the recovery owns only its own bytes"
+        );
+        let swallowing_run =
+            collapsed_macro_declaration_run(*swallowing, source).expect("the second invocation");
+        assert!(
+            swallowing_run.invocation_end < swallowing.end_byte(),
+            "the second invocation swallowed the third"
+        );
+        assert_eq!(
+            swallowing_run.region_end,
+            root.end_byte(),
+            "a swallowing invocation owns the region to the close of its declaration scope"
+        );
+
+        let parsed = parse_cpp_declarations(source, "library.h");
+        assert_eq!(
+            function_identities(&parsed),
+            vec![
+                (
+                    "library_init".to_string(),
+                    "(struct library_model_loader *)".to_string()
+                ),
+                (
+                    "library_init_from_buffer".to_string(),
+                    "(void *, size_t)".to_string()
+                ),
+                (
+                    "library_init_from_file".to_string(),
+                    "(const char *)".to_string()
+                ),
+            ],
+            "{:#?}",
+            parsed.declarations()
+        );
+    }
+
+    /// The hand-off that keeps the scan finite. An invocation that reaches the
+    /// end of its own declaration scope swallowed nothing, and the ordinary
+    /// `macro_wrapped_declarations` reader has it. The scan reparses exactly
+    /// that region for every invocation it finds, so admitting it here would
+    /// hand the scan its own input back.
+    #[test]
+    fn an_invocation_that_fills_its_scope_is_left_to_the_ordinary_reader() {
+        let source = r#"LIBRARY_DEPRECATED(
+        LIBRARY_API struct library_context * library_init_from_file(const char * path_model),
+        "use library_init_from_file_with_params instead"
+    );"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ tree");
+        let root = tree.root_node();
+        let head = root.named_child(0).expect("the invocation");
+        assert!(
+            collapsed_macro_declaration_run(head, source).is_none(),
+            "{}",
+            root.to_sexp()
+        );
+        assert!(
+            !macro_wrapped_declarations(head, source).is_empty(),
+            "the ordinary reader must be the one that has it: {}",
+            root.to_sexp()
+        );
     }
 
     /// Negative controls for the same recovery: a macro invocation whose
@@ -18090,6 +19220,122 @@ class PROJECT_PUBLIC_API(2, 0) FIRST_MACRO SECOND_MACRO Layered final : public B
     }
 
     #[test]
+    fn export_class_head_with_a_virtual_base_recovers_its_fragmented_body() {
+        // #2924: `class MACRO(2, 0) Name : public virtual Base {` leaves the
+        // head, the body's `{` and its first member in one declaration-scope
+        // ERROR, scatters the remaining members across the container's
+        // siblings, and ends the container on the class's own `}`. The class
+        // was lost and the macro minted a class of its own.
+        let source = r#"
+namespace api {
+
+/**
+* Doc comment
+*/
+class PROJECT_PUBLIC_API(2, 0) VirtualBased : public virtual BaseKey {
+   public:
+      /**
+      * Construct from a point.
+      */
+      VirtualBased(const Group& group, const Point& point) : BaseKey(group, point) {}
+
+#if defined(PROJECT_HAS_LEGACY_POINT)
+      /**
+      * Construct from a legacy point.
+      */
+      VirtualBased(const Group& group, const LegacyPoint& point) : BaseKey(group, point) {}
+#endif
+
+      std::string algo_name() const override;
+
+      AlgorithmIdentifier algorithm_identifier() const override;
+};
+
+}
+"#;
+        let parsed = parse_cpp_declarations(source, "virtual-base.hpp");
+        let declarations = parsed.declarations();
+        let class = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "api.VirtualBased")
+            .unwrap_or_else(|| panic!("missing recovered class: {declarations:#?}"));
+        assert_eq!(
+            parsed.raw_supertypes.get(class),
+            Some(&vec!["BaseKey".to_string()]),
+            "the virtual base is the class's base: {declarations:#?}"
+        );
+        for member in [
+            "api.VirtualBased.algo_name",
+            "api.VirtualBased.algorithm_identifier",
+        ] {
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_function() && unit.fq_name() == member),
+                "{member} must be owned by the recovered class: {declarations:#?}"
+            );
+        }
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.identifier() != "PROJECT_PUBLIC_API"),
+            "an unrecovered head must not mint a macro-named class: {declarations:#?}"
+        );
+    }
+
+    #[test]
+    fn export_class_head_after_object_macro_lines_recovers_its_name_and_bases() {
+        // #2924: object-like macro lines before the head demote the `class`
+        // keyword to a bare identifier and make the macro invocation an
+        // `init_declarator`, so the head arrives as a `declaration` rather than
+        // as an ERROR carrying a `class_specifier`. The name is still the last
+        // identifier before `final`, and `virtual` is a base specifier rather
+        // than a base.
+        let source = r#"
+namespace api {
+
+DIAGNOSTIC_PUSH
+DIAGNOSTIC_IGNORE_INHERITED_VIA_DOMINANCE
+
+class PROJECT_PUBLIC_API(3, 6) Wrapped final : public virtual api::Outer::Key,
+                                               public virtual api::Inner::Key {
+   public:
+      std::string algo_name() const override;
+};
+
+DIAGNOSTIC_POP
+
+}
+"#;
+        let parsed = parse_cpp_declarations(source, "object-macro-head.hpp");
+        let declarations = parsed.declarations();
+        let class = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "api.Wrapped")
+            .unwrap_or_else(|| panic!("missing recovered class: {declarations:#?}"));
+        assert_eq!(
+            parsed.raw_supertypes.get(class),
+            Some(&vec![
+                "api::Outer::Key".to_string(),
+                "api::Inner::Key".to_string()
+            ]),
+            "both qualified virtual bases are bases, and `virtual` is not: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_function() && unit.fq_name() == "api.Wrapped.algo_name"),
+            "the member is owned by the recovered class: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.identifier() != "PROJECT_PUBLIC_API"),
+            "the macro invocation must not mint a declaration: {declarations:#?}"
+        );
+    }
+
+    #[test]
     fn embedded_function_like_export_class_is_named_by_position_not_spelling() {
         // The class embedded in a preceding malformed body follows the same
         // rule (#2557): `X509_CA` is the class, `OTHER_MACRO` is decoration.
@@ -18187,15 +19433,15 @@ class PROJECT_PUBLIC_API(2, 0) {head} : public Exception {{
 
     #[test]
     fn function_like_export_class_head_with_virtual_qualified_bases_does_not_invent_a_name() {
-        // Botan's TPM2 keys (`tpm2_ecc.h`, `tpm2_rsa.h`). The grammar swallows
-        // the whole head into the `class MACRO(3, 6)` error, keeps the first
-        // base as the `type` of the following declaration, and closes that
-        // declaration with a zero-width `MISSING identifier`. Reading the head
-        // by position must not take that missing node for the class name: an
-        // empty name panics at `FqName` construction, which took the Botan
-        // corpus replay down (#2557). The class itself stays unrecovered here,
-        // and the bodyless `class PROJECT_PUBLIC_API` specifier still surfaces
-        // the way it did before this change.
+        // Botan's TPM2 keys (`tpm2_ecc.h`, `tpm2_rsa.h`). The grammar keeps
+        // `class MACRO(3, 6) Name final :` in the error, the first base as the
+        // `type` of the following declaration, and closes that declaration with
+        // a zero-width `MISSING identifier`. Reading the head by position must
+        // not take that missing node for the class name: an empty name panics
+        // at `FqName` construction, which took the Botan corpus replay down
+        // (#2557). The head's tokens straddle the two nodes, so the positional
+        // read spans both and recovers the class rather than leaving the
+        // bodyless `class PROJECT_PUBLIC_API` specifier behind (#2924).
         let source = r#"
 namespace api {
 class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::PublicKey,
@@ -18218,6 +19464,24 @@ class PROJECT_PUBLIC_API(3, 6) EC_PublicKey final : public virtual Botan::TPM2::
                 .iter()
                 .all(|unit| !matches!(unit.identifier(), "final" | "public" | "virtual")),
             "macros and head specifiers must not become declarations: {declarations:#?}"
+        );
+        let class = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "api.EC_PublicKey")
+            .unwrap_or_else(|| panic!("missing recovered class: {declarations:#?}"));
+        assert_eq!(
+            parsed.raw_supertypes.get(class),
+            Some(&vec![
+                "Botan::TPM2::PublicKey".to_string(),
+                "Botan::EC_PublicKey".to_string()
+            ]),
+            "both qualified virtual bases are bases: {declarations:#?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.identifier() != "PROJECT_PUBLIC_API"),
+            "the head must not mint a macro-named class: {declarations:#?}"
         );
     }
 
@@ -18469,13 +19733,13 @@ struct Analyzer {
             .named_children(&mut root.walk())
             .find(|child| child.kind() == "ERROR")
             .expect("fragmented Analyzer prefix");
-        let (_, outer_name, outer_fragment) = fragmented_plain_class_body(outer, source)
-            .expect("structured Analyzer fragment boundary");
-        assert_eq!(outer_name, "Analyzer");
+        let outer_recovered =
+            fragmented_class_body(outer, source).expect("structured Analyzer fragment boundary");
+        assert_eq!(outer_recovered.name, "Analyzer");
         let outer_tree = cpp_reparse_fragmented_class_body(
             source,
-            outer_fragment.reparse_start,
-            outer_fragment.reparse_end,
+            outer_recovered.body.reparse_start,
+            outer_recovered.body.reparse_end,
         )
         .expect("reparse Analyzer body");
         let outer_root = outer_tree.root_node();
@@ -18483,13 +19747,13 @@ struct Analyzer {
             .named_children(&mut outer_root.walk())
             .find(|child| child.kind() == "ERROR")
             .expect("fragmented Action prefix");
-        let (_, action_name, action_fragment) = fragmented_plain_class_body(action_prefix, source)
+        let action_recovered = fragmented_class_body(action_prefix, source)
             .expect("structured Action fragment boundary");
-        assert_eq!(action_name, "Action");
+        assert_eq!(action_recovered.name, "Action");
         let action_tree = cpp_reparse_fragmented_class_body(
             source,
-            action_fragment.reparse_start,
-            action_fragment.reparse_end,
+            action_recovered.body.reparse_start,
+            action_recovered.body.reparse_end,
         )
         .expect("reparse Action body");
         let action_root = action_tree.root_node();

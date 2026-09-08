@@ -41,12 +41,13 @@ use std::time::Instant;
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, ArtifactProduction,
-    ArtifactProductionRequest, CatalogCoordinate, CatalogOptions, Compatibility,
-    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DependencyArtifactRole,
-    DependencyPackLimits, DurablePackSource, DurablePackSourceKind, ExactArtifact,
-    ExactDependencyArtifact, ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION,
-    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, PackExtractionSourceEntry,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
+    ArtifactProductionRequest, AuthoredSemanticModelPack, CatalogCoordinate, CatalogOptions,
+    Compatibility, CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits,
+    DependencyArtifactRole, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
+    ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
+    GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey, PackExtractionAccounting,
+    PackExtractionGap, PackExtractionSourceEntry, ProcedureSummaryMemberKey, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
     SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SemanticModelActivationControl,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
     SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
@@ -106,8 +107,20 @@ pub struct PinnedPackSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PinnedLookupQuery {
-    Type { name: String },
-    Member { owner: String, name: String },
+    Type {
+        name: String,
+    },
+    Member {
+        owner: String,
+        name: String,
+    },
+    Procedure {
+        language: String,
+        owner: String,
+        name: String,
+        has_receiver: bool,
+        parameter_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +150,10 @@ pub enum PinnedPackKind {
     PythonStub {
         stubs: Vec<String>,
     },
+    /// One exact, reviewed semantic-model source. Unlike the artifact-backed
+    /// producer families, this input is already an authored pack and must be
+    /// compiled directly without being classified as generated declarations.
+    AuthoredSemanticModel,
     /// One pinned npm package: its manifest plus the pinned TypeScript
     /// declaration files that make up its public surface. `manifest` names
     /// the pinned `package.json` path; each entry in `declarations` names its
@@ -256,8 +273,8 @@ impl PinnedComposerAutoloadRule {
 }
 
 impl PinnedPackKind {
-    fn artifact_kind(&self) -> ExternalArtifactKind {
-        match self {
+    fn artifact_kind(&self) -> Option<ExternalArtifactKind> {
+        Some(match self {
             Self::JdkSourceZip { .. } => ExternalArtifactKind::JdkSourceZip,
             Self::KotlinSourceJar => ExternalArtifactKind::KotlinSourceJar,
             Self::ScalaSourceJar => ExternalArtifactKind::ScalaSourceJar,
@@ -274,7 +291,8 @@ impl PinnedPackKind {
             Self::RubyGemArchive => ExternalArtifactKind::RubyGemArchive,
             Self::ComposerPackage { .. } => ExternalArtifactKind::ComposerPackageSourceSet,
             Self::PhpDeclarationStub { .. } => ExternalArtifactKind::PhpDeclarationStub,
-        }
+            Self::AuthoredSemanticModel => return None,
+        })
     }
 }
 
@@ -671,39 +689,60 @@ fn generate_one(
         )));
     }
 
-    let request = ArtifactProductionRequest {
-        path: input.artifact_path.clone(),
-        artifact_kind: spec.kind.artifact_kind(),
-        pack_id: spec.pack_id.clone(),
-        pack_version: spec.pack_version.clone(),
-        ecosystem: spec.ecosystem.clone(),
-        compatibility: spec.compatibility.clone(),
-        activation: spec.activation.clone(),
-        provenance: spec.provenance.clone(),
-        license: spec.license.clone(),
-        safety: spec.safety.clone(),
-    };
     let started = Instant::now();
     let cancellation = CancellationToken::default();
-    let production = produce_pinned_pack(
-        &spec.kind,
-        &request,
-        &producer_limits,
-        &cancellation,
-        &artifact,
-    );
-    let authored = production.pack.as_ref().ok_or_else(|| {
-        BundleError::new(format!(
-            "pack production failed: {}",
-            render_diagnostics(&production.diagnostics)
-        ))
-    })?;
-    if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
-        return Err(BundleError::new(
-            "producer did not retain the pinned artifact identity",
-        ));
-    }
-    let compiled = compile_pack(authored, &CompilerOptions::default()).map_err(|diagnostics| {
+    let (authored, diagnostics, suppressed_rejects) = match &spec.kind {
+        PinnedPackKind::AuthoredSemanticModel => (
+            read_authored_semantic_model(spec, &artifact)?,
+            Vec::new(),
+            0_u64,
+        ),
+        _ => {
+            let request = ArtifactProductionRequest {
+                path: input.artifact_path.clone(),
+                artifact_kind: spec
+                    .kind
+                    .artifact_kind()
+                    .expect("generated release pack kind has an artifact kind"),
+                pack_id: spec.pack_id.clone(),
+                pack_version: spec.pack_version.clone(),
+                ecosystem: spec.ecosystem.clone(),
+                compatibility: spec.compatibility.clone(),
+                activation: spec.activation.clone(),
+                provenance: spec.provenance.clone(),
+                license: spec.license.clone(),
+                safety: spec.safety.clone(),
+            };
+            let production = produce_pinned_pack(
+                &spec.kind,
+                &request,
+                &producer_limits,
+                &cancellation,
+                &artifact,
+            );
+            let authored = production.pack.ok_or_else(|| {
+                BundleError::new(format!(
+                    "pack production failed: {}",
+                    render_diagnostics(&production.diagnostics)
+                ))
+            })?;
+            if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
+                return Err(BundleError::new(
+                    "producer did not retain the pinned artifact identity",
+                ));
+            }
+            (
+                authored,
+                production.diagnostics,
+                production
+                    .suppressed_diagnostics
+                    .total()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            )
+        }
+    };
+    let compiled = compile_pack(&authored, &CompilerOptions::default()).map_err(|diagnostics| {
         BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
     })?;
     let elapsed = started.elapsed();
@@ -723,8 +762,7 @@ fn generate_one(
         pack_id: spec.pack_id.clone(),
         pack_version: spec.pack_version.clone(),
         completeness: compiled.manifest.completeness,
-        rejects: production
-            .diagnostics
+        rejects: diagnostics
             .iter()
             .map(|diagnostic| ReleaseReject {
                 severity: match diagnostic.severity {
@@ -738,11 +776,7 @@ fn generate_one(
                 message: diagnostic.message.clone(),
             })
             .collect(),
-        suppressed_rejects: production
-            .suppressed_diagnostics
-            .total()
-            .try_into()
-            .unwrap_or(u64::MAX),
+        suppressed_rejects,
     };
     Ok((
         ReleasePack {
@@ -767,6 +801,41 @@ fn generate_one(
     ))
 }
 
+fn read_authored_semantic_model(
+    spec: &PinnedPackSpec,
+    artifact: &ExactArtifact,
+) -> Result<AuthoredSemanticModelPack, BundleError> {
+    let authored: AuthoredSemanticModelPack = serde_json::from_slice(artifact.bytes())
+        .map_err(|error| BundleError::new(format!("parse authored semantic model: {error}")))?;
+    if authored.pack_id != spec.pack_id || authored.version != spec.pack_version {
+        return Err(BundleError::new(format!(
+            "authored semantic model identity {}@{} does not match spec {}@{}",
+            authored.pack_id, authored.version, spec.pack_id, spec.pack_version
+        )));
+    }
+    if authored.ecosystem != spec.ecosystem
+        || authored.compatibility != spec.compatibility
+        || authored.provenance != spec.provenance
+        || authored.license != spec.license
+        || authored.safety != spec.safety
+    {
+        return Err(BundleError::new(
+            "authored semantic model metadata does not match its pinned spec",
+        ));
+    }
+    if authored.shards.is_empty()
+        || authored
+            .shards
+            .iter()
+            .any(|shard| shard.activation != spec.activation)
+    {
+        return Err(BundleError::new(
+            "authored semantic model shards must repeat the pinned activation exactly",
+        ));
+    }
+    Ok(authored)
+}
+
 fn generate_generated_productions(
     output_root: &Path,
     inputs: &[BundleInput],
@@ -780,6 +849,12 @@ fn generate_generated_productions(
     );
     let mut generated = Vec::new();
     for (input, spec) in inputs.iter().zip(specs) {
+        // Authored semantic-model inputs are curated packs, never derived
+        // productions. Keep them out of this separate generated index even
+        // when a future generated producer family is added beside them.
+        if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel) {
+            continue;
+        }
         if !matches!(&spec.kind, PinnedPackKind::JdkSourceZip { .. }) {
             continue;
         }
@@ -1214,6 +1289,18 @@ fn produce_pinned_pack(
         }
         PinnedPackKind::PhpDeclarationStub { stubs } => PhpDeclarationStubPackProducer
             .produce_loaded_source_set(request, limits, cancellation, artifact, stubs),
+        PinnedPackKind::AuthoredSemanticModel => ArtifactProduction::failed(
+            ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                source_entry: None,
+                code: "artifact.authored_semantic_model".to_owned(),
+                location: None,
+                declaration: None,
+                message: "authored semantic models must bypass generated artifact production"
+                    .to_owned(),
+            },
+            limits,
+        ),
     }
 }
 
@@ -1270,6 +1357,17 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
                 )));
             }
         }
+    }
+    if matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel)
+        && Path::new(&spec.artifact.file_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+    {
+        return Err(BundleError::new(format!(
+            "spec {} authored semantic model artifact must be a .json file",
+            spec_path.display()
+        )));
     }
     if let PinnedPackKind::NpmPackage {
         manifest,
@@ -1837,6 +1935,22 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
             .iter()
             .map(|owner| active.members_named(&owner.record.id, name).records.len())
             .sum(),
+        PinnedLookupQuery::Procedure {
+            language,
+            owner,
+            name,
+            has_receiver,
+            parameter_count,
+        } => active
+            .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                language,
+                owner,
+                name,
+                *has_receiver,
+                *parameter_count,
+            ))
+            .records
+            .len(),
     };
     count.try_into().unwrap_or(u64::MAX)
 }
@@ -3005,6 +3119,7 @@ fn render_diagnostics(diagnostics: &[ProducerDiagnostic]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload;
     use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionConstraint};
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
@@ -3106,6 +3221,104 @@ mod tests {
             }
         }
         assert_eq!(&verify_release_bundle(first).unwrap(), first_bundle);
+    }
+
+    #[test]
+    fn authored_python_assertion_pack_is_pinned_and_override_closed() {
+        let spec: PinnedPackSpec = serde_json::from_str(include_str!(
+            "../../../semantic-packs/python/unittest-assertions-2026.9.7.spec.json"
+        ))
+        .unwrap();
+        let source =
+            include_bytes!("../../../semantic-packs/python/unittest-assertions-2026.9.7.json");
+        assert_eq!(sha256_bytes(source), spec.artifact.sha256);
+        let fixture = tempdir().unwrap();
+        let artifact_path = fixture.path().join(&spec.artifact.file_name);
+        fs::write(&artifact_path, source).unwrap();
+        let artifact =
+            read_exact_artifact(&artifact_path, &ArtifactProducerLimits::default()).unwrap();
+        let authored = read_authored_semantic_model(&spec, &artifact).unwrap();
+        let summaries = match &authored.shards[0].payload {
+            AuthoredPayload::ProcedureSummaries { summaries } => summaries,
+            _ => panic!("assertion pack must carry procedure summaries"),
+        };
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.target.parameter_count)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(
+            spec.activation[0]
+                .toolchain
+                .as_ref()
+                .unwrap()
+                .version
+                .as_deref(),
+            Some(">=3.10.0, <3.15.0")
+        );
+        assert_eq!(
+            spec.measurement_activation
+                .toolchain
+                .as_ref()
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("=3.13.5")
+        );
+        assert!(summaries.iter().all(|summary| !summary.covers_overrides));
+        let decorator = summaries
+            .iter()
+            .find(|summary| summary.id == "dataclasses.dataclass-identity")
+            .expect("assertion pack must carry dataclass identity contract");
+        assert_eq!(decorator.target.path, "dataclasses.pyi");
+        assert_eq!(decorator.target.symbol, "dataclasses.dataclass(args)");
+        assert!(!decorator.target.has_receiver);
+        assert!(decorator.target.variadic);
+        assert_eq!(decorator.target.parameter_count, 1);
+        let identity = decorator
+            .class_decorator_identity
+            .as_ref()
+            .expect("dataclass summary must carry decorator identity");
+        assert!(identity.direct);
+        let keywords = identity
+            .factory_keywords
+            .as_ref()
+            .expect("dataclass summary must carry factory keywords");
+        assert!(keywords.iter().any(|keyword| {
+            keyword.name == "frozen" && keyword.allowed_values == vec![false, true]
+        }));
+        assert!(
+            keywords.iter().any(|keyword| {
+                keyword.name == "slots" && keyword.allowed_values == vec![false]
+            })
+        );
+        assert!(keywords.iter().any(|keyword| {
+            keyword.name == "weakref_slot" && keyword.allowed_values == vec![false]
+        }));
+        let assertion_summaries = summaries
+            .iter()
+            .filter(|summary| summary.target.path == "unittest/case.pyi")
+            .collect::<Vec<_>>();
+        assert_eq!(assertion_summaries.len(), 2);
+        assert!(assertion_summaries.iter().all(|summary| {
+            summary
+                .normal_return_type_refinements
+                .iter()
+                .any(|refinement| {
+                    refinement.parameter_ordinal == 0
+                        && refinement.class_parameter_ordinal == 1
+                        && refinement.required_receiver_members == vec!["fail".to_owned()]
+                })
+        }));
+        compile_pack(&authored, &CompilerOptions::default()).unwrap();
+
+        let mut tampered: PinnedPackSpec = spec.clone();
+        tampered.provenance.revision = Some("v3.13.4".to_owned());
+        let error = read_authored_semantic_model(&tampered, &artifact).unwrap_err();
+        assert!(error.to_string().contains("metadata"));
     }
 
     #[test]
@@ -3630,7 +3843,10 @@ mod tests {
         );
         let request = ArtifactProductionRequest {
             path: root,
-            artifact_kind: pinned.kind.artifact_kind(),
+            artifact_kind: pinned
+                .kind
+                .artifact_kind()
+                .expect("fixture pack kind has an artifact producer"),
             pack_id: pinned.pack_id,
             pack_version: pinned.pack_version,
             ecosystem: pinned.ecosystem,

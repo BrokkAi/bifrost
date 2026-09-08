@@ -1,7 +1,7 @@
 //! The analyzer-owned shim over [`brokk_bifrost_python`].
 //!
 //! What lives here is everything the language crate cannot name: the
-//! [`PythonAnalyzer`] newtype and its seven moka caches and three
+//! [`PythonAnalyzer`] newtype and its seven moka caches and four
 //! `PoolSafeMemo`s; the accessors that implement
 //! [`brokk_bifrost_python::graph_support::PythonSource`] and
 //! [`brokk_bifrost_python::graph_support::PythonUsageSource`] out of them; the
@@ -11,6 +11,7 @@
 mod adapter;
 mod cache;
 mod clones;
+mod default_arguments;
 pub(crate) mod diagnostics;
 pub mod external;
 mod hierarchy;
@@ -137,6 +138,11 @@ pub struct PythonAnalyzer {
     // protocol, which stops a cold whole-workspace build from parking every worker that arrives
     // behind the one thread running the initializer.
     usage_index: Arc<PoolSafeMemo<PythonUsageIndex>>,
+    // PoolSafeMemo, not OnceLock: this whole-workspace scan is reached from
+    // rayon workers and must not park a worker behind a build that can enter
+    // the same query machinery. The bool is the closed (true) or explicitly
+    // mutable/open (false) metadata fact; an incomplete scan is not cached.
+    saved_default_arguments: Arc<PoolSafeMemo<bool>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
@@ -235,6 +241,7 @@ impl PythonAnalyzer {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
+        clone.saved_default_arguments = Arc::new(PoolSafeMemo::new());
         clone
     }
 
@@ -279,7 +286,16 @@ impl PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
+    }
+
+    /// Whether this analyzer generation has a complete, closed view of saved
+    /// Python defaults. `None` means the bounded workspace scan could not
+    /// inspect every analyzed file and therefore must not authorize default
+    /// bindings.
+    pub(crate) fn saved_default_arguments_available(&self) -> Option<bool> {
+        default_arguments::saved_default_arguments_available(self)
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -740,6 +756,7 @@ impl IAnalyzer for PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
     }
 
@@ -761,6 +778,7 @@ impl IAnalyzer for PythonAnalyzer {
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            saved_default_arguments: Arc::new(PoolSafeMemo::new()),
         }
     }
 

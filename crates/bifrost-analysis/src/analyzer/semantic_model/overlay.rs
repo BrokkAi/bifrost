@@ -5102,6 +5102,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn type_flow_external_class_identity_filters_before_uniqueness_and_keeps_canonical_identity() {
+        use crate::analyzer::semantic::type_flow::{ExternalClassCache, external_class_identity};
+
+        let mut good = class("builtins.str", "python");
+        good.aliases.push("StringAlias".to_string());
+        let good_id = good.id.clone();
+        let mut cache = ExternalClassCache::default();
+        let good_overlay = overlay(vec![good], Vec::new());
+        let identity = external_class_identity(
+            Some(&good_overlay),
+            Language::Python,
+            "StringAlias",
+            Some(&good_id),
+            &mut cache,
+        )
+        .expect("an exact eligible class resolves");
+        assert_eq!(identity.qualified_name(), "builtins.str");
+
+        let mut owned = class("builtins.str", "python");
+        owned.owner_id = Some("owner".to_string());
+        let mut ambiguous = class("builtins.str", "python");
+        ambiguous.provenance.ambiguous = true;
+        let foreign = class("builtins.str", "ruby");
+        for rejected in [owned, ambiguous, foreign] {
+            let overlay = overlay(vec![rejected], Vec::new());
+            assert!(
+                external_class_identity(
+                    Some(&overlay),
+                    Language::Python,
+                    "builtins.str",
+                    None,
+                    &mut ExternalClassCache::default(),
+                )
+                .is_none()
+            );
+        }
+    }
+
     fn extends(from: &SemanticModelSymbol, to: &str) -> SemanticModelRelation {
         SemanticModelRelation {
             id: format!("hierarchy:{}:extends:{to}", from.id),

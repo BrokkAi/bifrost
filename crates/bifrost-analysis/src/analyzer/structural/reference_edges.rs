@@ -37,7 +37,7 @@ use crate::analyzer::usages::{
     FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
     UsageHitSurface, UsageProof, UsageQueryCompletion,
 };
-use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, DeclarationId, FqName, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -739,14 +739,70 @@ fn supports_edge_axis(
         .map(|provider| provider.structural_supports_edge_axis(axis))
 }
 
+/// What owns a declaration for the purpose of relating one edge's two ends.
+///
+/// The two scope shapes are kept apart because they are compared by different
+/// evidence: two types are related by the type hierarchy, two namespaces by
+/// their qualified names, and a type is never a namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// A class-like declaration: the unit itself when it is class-like, else
+    /// the class-like declaration the unit hangs off.
+    Type(CodeUnit),
+    /// A module, package, namespace, or root scope, named by the qualified
+    /// name that places declarations directly in it. The name is empty for a
+    /// root scope -- Rust's crate root, a JS/TS file module, Ruby top level --
+    /// which no qualified name spells, so two root scopes cannot be told apart
+    /// or told to be the same.
+    Namespace(FqName),
+}
+
+/// The scope that owns `unit`, or `None` when the recorded structure does not
+/// establish one.
+///
+/// A class-like declaration owns itself, and so does a module-like one: both
+/// are scopes that other declarations hang off. Otherwise the qualified name
+/// answers first, because it records the owner directly: a name whose every
+/// segment before the leaf denotes a namespace places the declaration in that
+/// namespace and in no type, which is exactly the shape of a free function, a
+/// Go package-level func, a PHP namespaced function, or a Kotlin top-level
+/// function. Only a name that puts the declaration inside another declaration
+/// needs the declaration lookup, which is also the only case where that
+/// lookup can succeed.
+fn owner_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Owner> {
+    if unit.is_class() {
+        return Some(Owner::Type(unit.clone()));
+    }
+    if unit.is_module() || unit.is_file_scope() {
+        return Some(Owner::Namespace(unit.fq().clone()));
+    }
+    if let Some(namespace) = unit.fq().namespace_prefix() {
+        return Some(Owner::Namespace(namespace));
+    }
+    match analyzer.parent_of(unit)? {
+        parent if parent.is_class() => Some(Owner::Type(parent)),
+        parent => Some(Owner::Namespace(parent.fq().clone())),
+    }
+}
+
 /// How the declaration enclosing a use site relates to the edge's target.
 /// One computation for both producers, so the classification can never drift
 /// between the forward and inverse surfaces.
 ///
-/// The owner of a unit is the unit itself when it is class-like, else its
-/// parent declaration. `Unknown` is the honest answer whenever an owner is
-/// missing, or the owners are distinct classes and no type-hierarchy provider
-/// can rule inheritance in or out; it is never collapsed into `External`.
+/// The owner of a unit is [`owner_of`]'s answer. Two owners are the same owner
+/// only when they are the same scope; containment is not sameness, so a
+/// namespace that contains the target's type is `External`, exactly as Java
+/// already states for a class calling a method of its own nested class. A
+/// namespace owner and a type owner are always distinct and no type hierarchy
+/// spans them, which is why a free function calling a method states `External`
+/// rather than declining to answer.
+///
+/// `Unknown` is the honest answer whenever an owner is missing, whenever two
+/// distinct class owners meet no type-hierarchy provider that can rule
+/// inheritance in or out, and whenever a root scope is one of the two
+/// namespaces being compared -- a root scope has no name, so two of them may
+/// be one scope or two and the qualified names do not say. `Unknown` is never
+/// collapsed into `External`.
 pub fn classify_owner_relation(
     analyzer: &dyn IAnalyzer,
     site_enclosing: Option<&CodeUnit>,
@@ -758,34 +814,35 @@ pub fn classify_owner_relation(
     if enclosing == target {
         return OwnerRelation::SelfReference;
     }
-    let owner_of = |unit: &CodeUnit| {
-        if unit.is_class() {
-            Some(unit.clone())
-        } else {
-            analyzer.parent_of(unit)
-        }
-    };
-    let (Some(site_owner), Some(target_owner)) = (owner_of(enclosing), owner_of(target)) else {
+    let (Some(site_owner), Some(target_owner)) =
+        (owner_of(analyzer, enclosing), owner_of(analyzer, target))
+    else {
         return OwnerRelation::Unknown;
     };
-    if site_owner == target_owner {
-        return OwnerRelation::SameOwner;
-    }
-    if !target_owner.is_class() {
-        return OwnerRelation::External;
-    }
-    if !site_owner.is_class() {
-        return OwnerRelation::External;
-    }
-    match analyzer.type_hierarchy_provider() {
-        Some(hierarchy) => {
-            if hierarchy.get_ancestors(&site_owner).contains(&target_owner) {
-                OwnerRelation::InheritedOwner
+    match (site_owner, target_owner) {
+        (Owner::Type(site), Owner::Type(target)) if site == target => OwnerRelation::SameOwner,
+        (Owner::Type(site), Owner::Type(target)) => match analyzer.type_hierarchy_provider() {
+            Some(hierarchy) => {
+                if hierarchy.get_ancestors(&site).contains(&target) {
+                    OwnerRelation::InheritedOwner
+                } else {
+                    OwnerRelation::External
+                }
+            }
+            None => OwnerRelation::Unknown,
+        },
+        (Owner::Namespace(site), Owner::Namespace(target)) => {
+            if site.is_empty() || target.is_empty() {
+                OwnerRelation::Unknown
+            } else if site == target {
+                OwnerRelation::SameOwner
             } else {
                 OwnerRelation::External
             }
         }
-        None => OwnerRelation::Unknown,
+        (Owner::Type(_), Owner::Namespace(_)) | (Owner::Namespace(_), Owner::Type(_)) => {
+            OwnerRelation::External
+        }
     }
 }
 
@@ -1532,6 +1589,199 @@ mod tests {
         );
         assert_eq!(
             classify_owner_relation(analyzer, None, &base_ping),
+            OwnerRelation::Unknown
+        );
+    }
+
+    /// A declaration whose qualified name places it in a namespace and in no
+    /// type has that namespace as its owner, so a free function calling a
+    /// method states `External` instead of declining to answer (#1645).
+    ///
+    /// The rule reads only the recorded segment kinds, so every language whose
+    /// free functions carry a module, package, or namespace prefix -- or carry
+    /// no type prefix at all -- answers the same way without a per-language
+    /// branch. Each language is listed with the shape it contributes.
+    #[test]
+    fn a_namespace_owner_and_a_type_owner_are_external() {
+        /// One language's contribution: the sources, the free callable, and
+        /// the type-owned target it calls.
+        struct Case {
+            language: Language,
+            sources: &'static [(&'static str, &'static str)],
+            caller: &'static str,
+            target: &'static str,
+        }
+
+        let cases: &[Case] = &[
+            // Rust: the caller sits at the crate root, which the qualified
+            // name spells by carrying no scope segment.
+            Case {
+                language: Language::Rust,
+                sources: &[(
+                    "src/lib.rs",
+                    "pub struct Widget;\n\nimpl Widget {\n    pub fn new() -> Widget {\n        Widget\n    }\n\n    pub fn run(&self) -> usize {\n        1\n    }\n}\n\npub fn drive() -> usize {\n    let s = Widget::new();\n    s.run()\n}\n",
+                )],
+                caller: "drive",
+                target: "Widget.run",
+            },
+            // Rust again, with a named module owner: containing the target's
+            // type is not owning the target.
+            Case {
+                language: Language::Rust,
+                sources: &[(
+                    "src/lib.rs",
+                    "pub mod thing {\n    pub struct Widget;\n    impl Widget {\n        pub fn run(&self) -> usize { 1 }\n    }\n    pub fn drive(w: &Widget) -> usize {\n        w.run()\n    }\n}\n",
+                )],
+                caller: "thing.drive",
+                target: "thing.Widget.run",
+            },
+            // Go: the package prefix is a `Path` segment.
+            Case {
+                language: Language::Go,
+                sources: &[(
+                    "main.go",
+                    "package main\n\ntype Widget struct{}\n\nfunc (w Widget) Run() int { return 1 }\n\nfunc Drive() int {\n\tw := Widget{}\n\treturn w.Run()\n}\n",
+                )],
+                caller: "main.Drive",
+                target: "main.Widget.Run",
+            },
+            // PHP: a namespaced function.
+            Case {
+                language: Language::Php,
+                sources: &[(
+                    "app.php",
+                    "<?php\nnamespace App;\n\nclass Widget {\n    public function run() { return 1; }\n}\n\nfunction drive() {\n    $w = new Widget();\n    return $w->run();\n}\n",
+                )],
+                caller: "App.drive",
+                target: "App.Widget.run",
+            },
+            // Kotlin: a top-level function in a package.
+            Case {
+                language: Language::Kotlin,
+                sources: &[(
+                    "src/app.kt",
+                    "package fixture\n\nclass Widget {\n    fun run(): Int = 1\n}\n\nfun drive(): Int {\n    val w = Widget()\n    return w.run()\n}\n",
+                )],
+                caller: "fixture.drive",
+                target: "fixture.Widget.run",
+            },
+            // Ruby: a top-level method, whose type-owned counterpart carries a
+            // `Nested` prefix rather than a namespace one.
+            Case {
+                language: Language::Ruby,
+                sources: &[(
+                    "app.rb",
+                    "class Widget\n  def run\n    1\n  end\nend\n\ndef drive\n  w = Widget.new\n  w.run\nend\n",
+                )],
+                caller: "drive",
+                target: "Widget.run",
+            },
+            // JavaScript: the same js/ts model, listed separately because it
+            // is a separately claimed language.
+            Case {
+                language: Language::JavaScript,
+                sources: &[
+                    (
+                        "widget.js",
+                        "export class Widget {\n  run() { return 1; }\n}\n",
+                    ),
+                    (
+                        "app.js",
+                        "import { Widget } from './widget.js';\nexport function drive() {\n  const w = new Widget();\n  return w.run();\n}\n",
+                    ),
+                ],
+                caller: "drive",
+                target: "Widget.run",
+            },
+            // TypeScript: the module scope is the file and is unnamed, but the
+            // caller still provably belongs to no type.
+            Case {
+                language: Language::TypeScript,
+                sources: &[
+                    (
+                        "widget.ts",
+                        "export class Widget {\n  run(): number { return 1; }\n}\n",
+                    ),
+                    (
+                        "app.ts",
+                        "import { Widget } from './widget';\nexport function drive(): number {\n  const w = new Widget();\n  return w.run();\n}\n",
+                    ),
+                ],
+                caller: "drive",
+                target: "Widget.run",
+            },
+        ];
+        for case in cases {
+            let language = case.language;
+            let fixture = Fixture::new(language, case.sources);
+            let analyzer = fixture.analyzer();
+            let caller = fixture.declaration(case.caller);
+            let target = fixture.declaration(case.target);
+            assert_eq!(
+                classify_owner_relation(analyzer, Some(&caller), &target),
+                OwnerRelation::External,
+                "{language:?}: {caller:?} owns no type, {target:?} does"
+            );
+            assert_eq!(
+                classify_owner_relation(analyzer, Some(&target), &caller),
+                OwnerRelation::External,
+                "{language:?}: the relation is symmetric across the two scopes"
+            );
+        }
+    }
+
+    /// Two declarations directly in one named namespace share that owner, and
+    /// two in different named namespaces are external -- the namespace half of
+    /// the same rule.
+    #[test]
+    fn namespace_owners_are_compared_by_name() {
+        let fixture = Fixture::new(
+            Language::Go,
+            &[
+                (
+                    "main.go",
+                    "package main\n\nfunc Drive() int { return Helper() }\n\nfunc Helper() int { return 1 }\n",
+                ),
+                (
+                    "util/util.go",
+                    "package util\n\nfunc Assist() int { return 1 }\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer();
+        let drive = fixture.declaration("main.Drive");
+        let helper = fixture.declaration("main.Helper");
+        let assist = fixture.declaration("util.Assist");
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&drive), &helper),
+            OwnerRelation::SameOwner,
+            "both funcs hang off package `main`"
+        );
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&drive), &assist),
+            OwnerRelation::External,
+            "`main` and `util` are different packages"
+        );
+    }
+
+    /// A root scope carries no name, so two declarations in one are not
+    /// claimed to share an owner. `Unknown` here is the honesty rule, not a
+    /// missing case: the qualified names cannot tell one root scope from
+    /// another.
+    #[test]
+    fn two_root_scope_owners_stay_unknown() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[(
+                "src/lib.rs",
+                "pub fn drive() -> usize {\n    helper()\n}\n\npub fn helper() -> usize {\n    1\n}\n",
+            )],
+        );
+        let analyzer = fixture.analyzer();
+        let drive = fixture.declaration("drive");
+        let helper = fixture.declaration("helper");
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&drive), &helper),
             OwnerRelation::Unknown
         );
     }

@@ -612,8 +612,9 @@ fn get_symbol_sources_with_budget(
             None => {}
         }
 
-        if analyzer.languages().contains(&Language::Go) && looks_like_go_receiver_selector(&symbol)
-        {
+        let is_go_receiver_selector = analyzer.languages().contains(&Language::Go)
+            && looks_like_go_receiver_selector(&symbol);
+        if is_go_receiver_selector {
             match resolve_selectable_definitions(
                 analyzer,
                 token,
@@ -782,7 +783,7 @@ fn get_symbol_sources_with_budget(
                 if !keep_going() {
                     return cancelled_source_outcome(&symbol);
                 }
-                if looks_like_file_target(&symbol) {
+                if looks_like_file_target(&symbol) && !is_go_receiver_selector {
                     return SourceLookupOutcome::NotFound(file_not_found_input(symbol));
                 }
                 if !keep_going() {

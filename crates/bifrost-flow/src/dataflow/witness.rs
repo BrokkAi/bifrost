@@ -420,6 +420,25 @@ impl SummaryWitness {
         }
     }
 
+    pub(crate) fn reconstruction_expansion_marker(quality: PathQuality, expansions: usize) -> Self {
+        Self::from_parts(
+            Vec::new(),
+            quality,
+            Some(WitnessTruncationCause::ReconstructionExpansionLimit),
+            1,
+            false,
+            size_of::<Self>(),
+            WitnessReconstructionWork::new(expansions, 0),
+        )
+    }
+
+    /// Include bounded caller-context search and discarded intermediate work.
+    pub(crate) fn with_expansion_work(mut self, expansions: usize) -> Self {
+        debug_assert!(expansions >= self.work.evidence_expansions());
+        self.work = WitnessReconstructionWork::new(expansions, self.steps.len());
+        self
+    }
+
     pub fn steps(&self) -> &[SummaryWitnessStep] {
         &self.steps
     }

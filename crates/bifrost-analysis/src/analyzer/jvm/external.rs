@@ -46,6 +46,7 @@ use zip::ZipArchive;
 
 use crate::CancellationToken;
 use crate::analyzer::topology::DependencyScope;
+use crate::analyzer::tree_walk::named_children_iter;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_INDEX_ARTIFACTS: usize = 128;
@@ -3622,10 +3623,7 @@ fn source_visibility(
     source: &str,
     default_visibility: JvmVisibility,
 ) -> JvmVisibility {
-    for index in 0..node.named_child_count() {
-        let Some(child) = node.named_child(index) else {
-            continue;
-        };
+    for child in named_children_iter(node) {
         if child.kind() != "modifiers" {
             continue;
         }

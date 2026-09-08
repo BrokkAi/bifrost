@@ -171,7 +171,7 @@ impl OccurrenceTraversalCache {
     /// Turn a file result's completeness into typed diagnostics, scoped to the
     /// roles the query actually depends on.
     ///
-    /// A file whose adapter cannot name path-segment namespaces is still
+    /// A file whose adapter classifies no generated-source token is still
     /// authoritative about its binders, so a `(role binder)` query over it must
     /// not be reported incomplete.
     pub(super) fn report_completeness(

@@ -994,6 +994,58 @@ fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
 }
 
 #[test]
+fn absent_member_witness_help_validation_and_status_domain_are_typed() {
+    let rql =
+        "(file-of (witness :max-steps 1 :max-bytes 256 (absent-member (procedure-of (function)))))";
+    for token in [
+        "file-of",
+        "witness",
+        "absent-member",
+        ":max-steps",
+        ":max-bytes",
+    ] {
+        let offset = rql.find(token).expect("RQL witness token");
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no RQL witness help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let json = r#"{"schema_version":1,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"absent_member"},{"op":"witness","max_steps":1,"max_bytes":256},{"op":"file_of"}]}"#;
+    assert!(validate_query_source(json).is_empty(), "{json}");
+    for token in ["absent_member", "witness", "file_of"] {
+        let offset = json.find(token).expect("JSON witness token");
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON witness help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+
+    let incompatible = "(witness (class-set (procedure-of (function))))";
+    let diagnostic = validate_query_source(incompatible)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "invalid-query")
+        .expect("witness must reject class-set input");
+    assert_eq!(&incompatible[diagnostic.range.clone()], "witness");
+    assert!(diagnostic.message.contains("absent_member_finding"));
+
+    let fields =
+        crate::structural::search::DetailedCodeQueryDomain::AbsentMemberWitness.row_fields();
+    let status = fields
+        .iter()
+        .find(|field| field.name == "witness_status")
+        .expect("absent-member witness status field");
+    assert_eq!(
+        status.scalar_type,
+        crate::structural::search::CodeQueryRowScalarType::ConstrainedEnum
+    );
+    assert_eq!(
+        status.value_domain.and_then(|domain| domain.labels()),
+        Some(["available", "truncated", "unavailable"].as_slice())
+    );
+}
+
+#[test]
 fn value_flow_help_and_diagnostics_are_range_precise() {
     let rql = "(witness :max-steps 8 (value-flow :plan-ref test:flow (procedure-of (function))))";
     for token in ["witness", "value-flow", ":plan-ref"] {

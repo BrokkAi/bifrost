@@ -8,9 +8,10 @@ use serde::Serialize;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DeclarationSegmentKind,
-    DurableCallContext, DurableObjectIdentity, DurablePortIdentity, EvidenceCompleteness,
-    ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus,
-    SemanticArtifact, SemanticArtifactKey, SemanticLocator, SourceAnchor,
+    DurableCallContext, DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity,
+    EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle,
+    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticLocator,
+    SourceAnchor,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -22,7 +23,7 @@ use super::{
     TypestateProtocolHash,
 };
 
-pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 3;
+pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 6;
 pub const MAX_TYPESTATE_SUBJECTS: usize = 4_096;
 pub const MAX_TYPESTATE_INITIAL_SEEDS: usize = 4_096;
 pub const MAX_TYPESTATE_EVENT_BINDINGS: usize = 16_384;
@@ -115,7 +116,10 @@ pub enum TypestateObjectKey {
     },
     Allocation(SemanticLocator),
     Static(SemanticLocator),
-    LexicalCell(SemanticLocator),
+    LexicalCell {
+        locator: SemanticLocator,
+        binding: DurableValueIdentity,
+    },
     CaptureSlot {
         procedure: SemanticLocator,
         port: TypestateProcedurePortKey,
@@ -130,14 +134,11 @@ impl TypestateObjectKey {
         typestate_object_key(object)
     }
 
-    /// Render the source-facing stable object identity without the absolute
-    /// workspace mount. This is the object-only counterpart of
-    /// `TypestateSubjectKey::public_canonical_rendering`.
+    /// Render the source-facing stable object identity. This is the object-only
+    /// counterpart of `TypestateSubjectKey::public_canonical_rendering`.
     pub fn public_canonical_rendering(&self) -> String {
-        let mut value = serde_json::to_value(canonical_object_key(self))
-            .expect("canonical typestate object identities are serializable");
-        remove_canonical_mounts(&mut value);
-        serde_json::to_string(&value).expect("public typestate object identities are serializable")
+        serde_json::to_string(&canonical_object_key(self))
+            .expect("canonical typestate object identities are serializable")
     }
 }
 
@@ -171,39 +172,12 @@ impl TypestateSubjectKey {
     /// Render the stable semantic subject identity used by public query rows.
     ///
     /// This is the same canonical representation that contributes to the
-    /// binding-plan hash; it never contains a run-local dense subject ID.
-    pub fn canonical_rendering(&self) -> String {
+    /// binding-plan hash; it never contains a run-local dense subject ID, and
+    /// it carries no absolute workspace mount (see [`CanonicalLocator`]), so
+    /// the same indexed content has the same identity in every checkout.
+    pub fn public_canonical_rendering(&self) -> String {
         serde_json::to_string(&canonical_subject_key(self))
             .expect("canonical typestate subject identities are serializable")
-    }
-
-    /// Render the source-facing identity without the absolute workspace mount.
-    ///
-    /// Registration and cache identities continue to use
-    /// [`Self::canonical_rendering`]. Public query rows use this form so the
-    /// same indexed content has the same identity in different checkouts.
-    pub fn public_canonical_rendering(&self) -> String {
-        let mut value = serde_json::to_value(canonical_subject_key(self))
-            .expect("canonical typestate subject identities are serializable");
-        remove_canonical_mounts(&mut value);
-        serde_json::to_string(&value).expect("public typestate subject identities are serializable")
-    }
-}
-
-fn remove_canonical_mounts(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(fields) => {
-            fields.remove("mount");
-            for value in fields.values_mut() {
-                remove_canonical_mounts(value);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                remove_canonical_mounts(value);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1651,7 +1625,9 @@ fn check_count(
 ///
 /// This view is lossy on purpose: a typestate subject names an object, not a
 /// value slot, so the role and identity ordinal a durable value identity
-/// carries are dropped and a capture port keeps only its source locator.
+/// carries are dropped for ordinary values and a capture port keeps only its
+/// source locator. A lexical cell retains its bound value identity because
+/// one lowering can create several cells at one source locator.
 fn typestate_object_key(object: &AbstractObject) -> TypestateObjectKey {
     let identity = object
         .identity()
@@ -1684,7 +1660,9 @@ fn typestate_object_key(object: &AbstractObject) -> TypestateObjectKey {
         },
         DurableObjectIdentity::Allocation { locator } => TypestateObjectKey::Allocation(locator),
         DurableObjectIdentity::Static { locator } => TypestateObjectKey::Static(locator),
-        DurableObjectIdentity::LexicalCell { locator } => TypestateObjectKey::LexicalCell(locator),
+        DurableObjectIdentity::LexicalCell { locator, binding } => {
+            TypestateObjectKey::LexicalCell { locator, binding }
+        }
         DurableObjectIdentity::TypeSummary { locator } => TypestateObjectKey::TypeSummary(locator),
         DurableObjectIdentity::ModuleObject { locator } => {
             TypestateObjectKey::ModuleObject(locator)
@@ -2401,6 +2379,14 @@ struct CanonicalSubjectKey<'a> {
 }
 
 #[derive(Serialize)]
+struct CanonicalValueIdentity<'a> {
+    identity: CanonicalLocator<'a>,
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordinal: Option<u32>,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CanonicalObjectKey<'a> {
     Value {
@@ -2425,6 +2411,7 @@ enum CanonicalObjectKey<'a> {
     },
     LexicalCell {
         identity: CanonicalLocator<'a>,
+        binding: CanonicalValueIdentity<'a>,
     },
     CaptureSlot {
         procedure: CanonicalLocator<'a>,
@@ -2537,6 +2524,24 @@ struct CanonicalContext<'a> {
 /// language, declaration segments, role and anchor below already name the
 /// procedure exactly, within a plan whose every locator comes from the one
 /// workspace being analyzed.
+///
+/// The declaration segments carry no byte anchor either (#3022). A segment
+/// names one enclosing declaration, and a declaration's identity is its kind,
+/// its name and its ordinal among the same-kind, same-name siblings of its
+/// parent -- which `ProcedureInventoryBuilder` mints so that no two segments
+/// under one parent share the triple (an unmaterialized external declaration
+/// overloads the same ordinal with its arity, which separates its members the
+/// same way), and which is exactly what the policy crate's own
+/// `append_declaration_identity` already hashes. A segment's
+/// anchor is the span of the *container*, not of the thing the locator names:
+/// the outermost `file` segment's anchor is the whole file, so any edit
+/// anywhere in a file re-keyed every locator declared in it, and with it the
+/// subject identity of every typestate finding whose tracked object was
+/// acquired through a callee that file declares. Only `anchor` below stays,
+/// and it belongs to what this locator names.
+///
+/// That anchor is rendered relative to the innermost declaration segment's
+/// start (#3054), never as an absolute file offset. See [`CanonicalAnchor`].
 #[derive(Serialize)]
 struct CanonicalLocator<'a> {
     path: &'a str,
@@ -2551,19 +2556,55 @@ struct CanonicalDeclarationSegment<'a> {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
-    anchor: CanonicalAnchor,
     sibling_ordinal: u32,
 }
 
+/// The span a canonical locator names, addressed relative to the declaration
+/// the same locator names (#3054).
+///
+/// An absolute byte offset is not an identity: every declaration below an edit
+/// in the same file moves by the edit's length delta, so lengthening anything
+/// above an acquisition callee re-keyed every subject acquired through it and
+/// re-keyed the binding-plan hash that folds them, exactly the way the byte
+/// anchors that #3022 removed from the declaration segments did. Subtracting
+/// the innermost declaration's start is a translation, so it is injective on
+/// one declaration's spans and cannot merge two of them; and the declaration
+/// path, path and role that accompany it in [`CanonicalLocator`] separate the
+/// declarations from each other.
+///
+/// Line and byte-column coordinates are dropped with the absolute offset. They
+/// are absolute in the same way -- a line inserted anywhere above shifts every
+/// line below it -- and they add nothing: within one file revision the byte
+/// range determines them.
+///
+/// Not every locator sits inside the declaration it carries.
+/// `memory_member_locator` and `declared_member_locator` (Scala, Java, Kotlin,
+/// Go, Rust, PHP, Python, JS/TS) name a class-level member from inside a
+/// method, and attach it to the *enclosing procedure's* declaration path: the
+/// member is a sibling of that procedure, not a part of it, so the subtraction
+/// would underflow whenever the member is declared above the method.
+/// `SemanticLocator::push_procedure_local_identity` meets the same shape and
+/// answers it the same way, with an `external-locator` tag. Such an anchor is
+/// tagged `out_of_declaration` and keeps its file-relative start, which is
+/// still unique -- the tag keeps it from colliding with a declaration-relative
+/// offset of the same number -- and is no less stable than what it replaces.
 #[derive(Debug, Clone, Copy, Serialize)]
-struct CanonicalAnchor {
-    start_byte: u32,
-    start_line: u32,
-    start_byte_column: u32,
-    end_byte: u32,
-    end_line: u32,
-    end_byte_column: u32,
-    occurrence: u32,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CanonicalAnchor {
+    /// The locator's span lies inside the innermost declaration of its own
+    /// path, and is addressed from that declaration's first byte.
+    InDeclaration {
+        start_offset: u32,
+        length: u32,
+        occurrence: u32,
+    },
+    /// The locator's span lies outside the innermost declaration of its own
+    /// path, and is addressed from the first byte of the file.
+    OutOfDeclaration {
+        start_byte: u32,
+        length: u32,
+        occurrence: u32,
+    },
 }
 
 fn canonical_subject(subject: &BoundTypestateSubjectSpec) -> CanonicalSubject<'_> {
@@ -2611,8 +2652,9 @@ fn canonical_object_key(key: &TypestateObjectKey) -> CanonicalObjectKey<'_> {
         TypestateObjectKey::Static(identity) => CanonicalObjectKey::Static {
             identity: canonical_locator(identity),
         },
-        TypestateObjectKey::LexicalCell(identity) => CanonicalObjectKey::LexicalCell {
-            identity: canonical_locator(identity),
+        TypestateObjectKey::LexicalCell { locator, binding } => CanonicalObjectKey::LexicalCell {
+            identity: canonical_locator(locator),
+            binding: canonical_value_identity(binding),
         },
         TypestateObjectKey::CaptureSlot { procedure, port } => CanonicalObjectKey::CaptureSlot {
             procedure: canonical_locator(procedure),
@@ -2696,6 +2738,14 @@ fn canonical_context_key(context: &TypestateContextKey) -> CanonicalContext<'_> 
     }
 }
 
+fn canonical_value_identity(value: &DurableValueIdentity) -> CanonicalValueIdentity<'_> {
+    CanonicalValueIdentity {
+        identity: canonical_locator(&value.locator),
+        role: value.role.as_ref(),
+        ordinal: value.ordinal,
+    }
+}
+
 fn canonical_locator(locator: &SemanticLocator) -> CanonicalLocator<'_> {
     CanonicalLocator {
         path: locator.path().as_str(),
@@ -2707,27 +2757,52 @@ fn canonical_locator(locator: &SemanticLocator) -> CanonicalLocator<'_> {
             .map(|segment| CanonicalDeclarationSegment {
                 kind: declaration_kind_label(segment.kind()),
                 name: segment.name(),
-                anchor: canonical_anchor(segment.anchor()),
                 sibling_ordinal: segment.sibling_ordinal(),
             })
             .collect(),
         role: locator.role().stable_label(),
-        anchor: canonical_anchor(locator.anchor()),
+        anchor: canonical_anchor(locator.anchor(), locator.declaration()),
     }
 }
 
-fn canonical_anchor(anchor: SourceAnchor) -> CanonicalAnchor {
+/// Address `anchor` from the start of the innermost segment of `declaration`.
+///
+/// The innermost segment is the declaration the locator was minted inside: for
+/// a procedure locator it is the procedure itself, so the offset is zero; for a
+/// call site or a program point it is the enclosing procedure. See
+/// [`CanonicalAnchor`] for why the absolute offset is not an identity and what
+/// the out-of-declaration case is.
+fn canonical_anchor(anchor: SourceAnchor, declaration: &DeclarationLocator) -> CanonicalAnchor {
     let span = anchor.span();
-    let start = span.start();
-    let end = span.end();
-    CanonicalAnchor {
-        start_byte: start.byte_offset(),
-        start_line: start.line(),
-        start_byte_column: start.byte_column(),
-        end_byte: end.byte_offset(),
-        end_line: end.line(),
-        end_byte_column: end.byte_column(),
-        occurrence: anchor.occurrence(),
+    // `SourceSpan::new` rejects a reversed span, so this cannot wrap.
+    let length = span.end_byte() - span.start_byte();
+    let occurrence = anchor.occurrence();
+    let container = declaration
+        .segments()
+        .last()
+        .expect("a declaration locator has at least one segment")
+        .anchor()
+        .span();
+    if span.start_byte() >= container.start_byte() && span.end_byte() <= container.end_byte() {
+        return CanonicalAnchor::InDeclaration {
+            start_offset: span.start_byte() - container.start_byte(),
+            length,
+            occurrence,
+        };
+    }
+    // A locator either sits inside the declaration it carries or names a
+    // sibling of it. A span that straddles the boundary is neither, and means
+    // the producer paired an anchor with a declaration path that does not
+    // describe it -- which no clamped offset could make into an identity.
+    debug_assert!(
+        span.end_byte() <= container.start_byte() || span.start_byte() >= container.end_byte(),
+        "an out-of-declaration locator anchor is a sibling of its declaration, \
+         not a partial overlap of it: anchor {span:?}, declaration {container:?}"
+    );
+    CanonicalAnchor::OutOfDeclaration {
+        start_byte: span.start_byte(),
+        length,
+        occurrence,
     }
 }
 
@@ -2760,5 +2835,303 @@ const fn declaration_kind_label(kind: DeclarationSegmentKind) -> &'static str {
         DeclarationSegmentKind::Lambda => "lambda",
         DeclarationSegmentKind::Closure => "closure",
         DeclarationSegmentKind::AnonymousCallable => "anonymous_callable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::analyzer::Language;
+    use crate::analyzer::semantic::{
+        DeclarationSegment, SemanticLanguage, SemanticRole, SourcePosition, SourceSpan,
+        WorkspaceMountId, WorkspaceRelativePath,
+    };
+
+    use super::*;
+
+    fn anchor(start: u32, end: u32) -> SourceAnchor {
+        SourceAnchor::new(
+            SourceSpan::new(
+                SourcePosition::new(start, 0, start),
+                SourcePosition::new(end, 0, end),
+            )
+            .expect("span"),
+            0,
+        )
+    }
+
+    /// One `res.go` declaration, named by its declaration path and its own
+    /// span, with the whole file's span on the enclosing `file` segment.
+    fn declaration_key(file_span: SourceAnchor, name: &str, own_span: SourceAnchor) -> String {
+        let declaration = DeclarationLocator::new(vec![
+            DeclarationSegment::named(DeclarationSegmentKind::File, "res.go", file_span, 0)
+                .expect("file segment"),
+            DeclarationSegment::named(DeclarationSegmentKind::Function, name, own_span, 0)
+                .expect("function segment"),
+        ])
+        .expect("declaration");
+        TypestateSubjectKey {
+            class: "res".parse().expect("subject class"),
+            object: TypestateObjectKey::Value(SemanticLocator::new(
+                WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
+                WorkspaceRelativePath::new("res.go").expect("path"),
+                SemanticLanguage::Standard(Language::Go),
+                declaration,
+                SemanticRole::Procedure,
+                own_span,
+            )),
+        }
+        .public_canonical_rendering()
+    }
+
+    /// An edit elsewhere in the declaring file must not re-key a declaration
+    /// (#3022). `OpenRes` keeps its own span; only the file it is declared in
+    /// gets shorter, which is what an edit inside a later declaration does.
+    #[test]
+    fn a_declaration_identity_survives_an_edit_elsewhere_in_its_file() {
+        let before = declaration_key(anchor(0, 214), "OpenRes", anchor(33, 69));
+        let after = declaration_key(anchor(0, 208), "OpenRes", anchor(33, 69));
+        assert_eq!(
+            before, after,
+            "the file's length is not part of a declaration"
+        );
+    }
+
+    /// Two declarations of one file still differ, and the name is what
+    /// separates them: both sides here are given the same spans, so only the
+    /// declaration path can tell them apart.
+    #[test]
+    fn two_named_declarations_of_one_file_render_differently() {
+        let file = anchor(0, 214);
+        let span = anchor(33, 69);
+        let open = declaration_key(file, "OpenRes", span);
+        let close = declaration_key(file, "CloseRes", span);
+        assert_ne!(open, close, "two named declarations are two identities");
+    }
+
+    /// Two anonymous declarations of one kind under one parent are separated
+    /// by the sibling ordinal the inventory mints for them, which is the
+    /// identity the removed byte anchor used to supply. Both sides here carry
+    /// the same spans, so the ordinal is the only thing that can differ.
+    #[test]
+    fn two_anonymous_siblings_render_differently() {
+        fn closure_key(ordinal: u32) -> String {
+            let span = anchor(60, 90);
+            let declaration = DeclarationLocator::new(vec![
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::File,
+                    "res.go",
+                    anchor(0, 214),
+                    0,
+                )
+                .expect("file segment"),
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::Function,
+                    "Run",
+                    anchor(33, 200),
+                    0,
+                )
+                .expect("function segment"),
+                DeclarationSegment::anonymous(DeclarationSegmentKind::Closure, span, ordinal),
+            ])
+            .expect("declaration");
+            TypestateSubjectKey {
+                class: "res".parse().expect("subject class"),
+                object: TypestateObjectKey::Value(SemanticLocator::new(
+                    WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
+                    WorkspaceRelativePath::new("res.go").expect("path"),
+                    SemanticLanguage::Standard(Language::Go),
+                    declaration,
+                    SemanticRole::Procedure,
+                    span,
+                )),
+            }
+            .public_canonical_rendering()
+        }
+
+        assert_ne!(
+            closure_key(0),
+            closure_key(1),
+            "two anonymous siblings are two identities"
+        );
+    }
+
+    /// One site inside `OpenRes`, named by the declaration path, the enclosing
+    /// declaration's span, and the site's own span.
+    fn site_key(file_span: SourceAnchor, own_span: SourceAnchor, site: SourceAnchor) -> String {
+        let declaration = DeclarationLocator::new(vec![
+            DeclarationSegment::named(DeclarationSegmentKind::File, "res.go", file_span, 0)
+                .expect("file segment"),
+            DeclarationSegment::named(DeclarationSegmentKind::Function, "OpenRes", own_span, 0)
+                .expect("function segment"),
+        ])
+        .expect("declaration");
+        TypestateSubjectKey {
+            class: "res".parse().expect("subject class"),
+            object: TypestateObjectKey::Value(SemanticLocator::new(
+                WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
+                WorkspaceRelativePath::new("res.go").expect("path"),
+                SemanticLanguage::Standard(Language::Go),
+                declaration,
+                SemanticRole::Value,
+                site,
+            )),
+        }
+        .public_canonical_rendering()
+    }
+
+    /// A length change in a declaration above the locator must not re-key it
+    /// (#3054). Everything below an insertion moves by the insertion's length,
+    /// so `OpenRes` and the site inside it both shift by 12 bytes here while
+    /// nothing about either changes.
+    #[test]
+    fn a_site_identity_survives_a_length_change_in_a_declaration_above_it() {
+        let before = site_key(anchor(0, 214), anchor(33, 69), anchor(45, 61));
+        let after = site_key(anchor(0, 226), anchor(45, 81), anchor(57, 73));
+        assert_eq!(
+            before, after,
+            "a site is addressed from the declaration that contains it"
+        );
+    }
+
+    /// Two sites inside one declaration are still two identities: the offsets
+    /// from the declaration's start differ exactly as the absolute offsets did,
+    /// because subtracting one declaration start from both is a translation.
+    #[test]
+    fn two_sites_inside_one_declaration_render_differently() {
+        let file = anchor(0, 214);
+        let own = anchor(33, 69);
+        assert_ne!(
+            site_key(file, own, anchor(45, 61)),
+            site_key(file, own, anchor(50, 66)),
+            "two sites of one declaration are two identities"
+        );
+    }
+
+    /// A class-level member named from inside a method is a sibling of that
+    /// method, not a part of it, and Scala's `declared_member_locator` attaches
+    /// it to the method's declaration path. Subtracting the method's start
+    /// would underflow when the member is declared above the method, so the
+    /// rendering tags it and keeps the file-relative start.
+    #[test]
+    fn a_member_declared_above_its_enclosing_method_renders_out_of_declaration() {
+        fn member_key(member: SourceAnchor) -> String {
+            let declaration = DeclarationLocator::new(vec![
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::File,
+                    "Res.scala",
+                    anchor(0, 260),
+                    0,
+                )
+                .expect("file segment"),
+                DeclarationSegment::named(DeclarationSegmentKind::Type, "Res", anchor(20, 250), 0)
+                    .expect("type segment"),
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::Method,
+                    "compute",
+                    anchor(120, 240),
+                    0,
+                )
+                .expect("method segment"),
+            ])
+            .expect("declaration");
+            TypestateSubjectKey {
+                class: "res".parse().expect("subject class"),
+                object: TypestateObjectKey::Static(SemanticLocator::new(
+                    WorkspaceMountId::hash_bytes(b"/tmp/workspace"),
+                    WorkspaceRelativePath::new("Res.scala").expect("path"),
+                    SemanticLanguage::Standard(Language::Scala),
+                    declaration,
+                    SemanticRole::MemoryLocation,
+                    member,
+                )),
+            }
+            .public_canonical_rendering()
+        }
+
+        let rendering = member_key(anchor(40, 58));
+        assert!(
+            rendering.contains("out_of_declaration"),
+            "a member above its enclosing method is tagged, not clamped: {rendering}"
+        );
+        assert_ne!(
+            rendering,
+            member_key(anchor(70, 88)),
+            "two members of one class are two identities"
+        );
+    }
+
+    fn lexical_cell_key(
+        mount: &str,
+        binding_role: &str,
+        binding_ordinal: Option<u32>,
+    ) -> TypestateObjectKey {
+        TypestateObjectKey::LexicalCell {
+            locator: SemanticLocator::new(
+                WorkspaceMountId::hash_bytes(mount),
+                WorkspaceRelativePath::new("res.go").expect("path"),
+                SemanticLanguage::Standard(Language::Go),
+                DeclarationLocator::new(vec![
+                    DeclarationSegment::named(
+                        DeclarationSegmentKind::Function,
+                        "Run",
+                        anchor(0, 80),
+                        0,
+                    )
+                    .expect("function segment"),
+                ])
+                .expect("declaration"),
+                SemanticRole::MemoryLocation,
+                anchor(12, 16),
+            ),
+            binding: DurableValueIdentity {
+                locator: SemanticLocator::new(
+                    WorkspaceMountId::hash_bytes(mount),
+                    WorkspaceRelativePath::new("res.go").expect("path"),
+                    SemanticLanguage::Standard(Language::Go),
+                    DeclarationLocator::new(vec![
+                        DeclarationSegment::named(
+                            DeclarationSegmentKind::Function,
+                            "Run",
+                            anchor(0, 80),
+                            0,
+                        )
+                        .expect("function segment"),
+                    ])
+                    .expect("declaration"),
+                    SemanticRole::Value,
+                    anchor(20, 24),
+                ),
+                role: binding_role.into(),
+                ordinal: binding_ordinal,
+            },
+        }
+    }
+
+    #[test]
+    fn lexical_cell_rendering_retains_binding_role_and_ordinal() {
+        let base = lexical_cell_key("mount", "parameter", Some(0));
+        let changed_role = lexical_cell_key("mount", "local", Some(0));
+        let changed_ordinal = lexical_cell_key("mount", "parameter", Some(1));
+
+        assert_ne!(
+            base.public_canonical_rendering(),
+            changed_role.public_canonical_rendering()
+        );
+        assert_ne!(
+            base.public_canonical_rendering(),
+            changed_ordinal.public_canonical_rendering()
+        );
+    }
+
+    #[test]
+    fn lexical_cell_rendering_is_checkout_independent() {
+        let first = lexical_cell_key("first checkout", "parameter", Some(0));
+        let second = lexical_cell_key("second checkout", "parameter", Some(0));
+
+        assert_ne!(first, second, "mounted locators retain exact equality");
+        assert_eq!(
+            first.public_canonical_rendering(),
+            second.public_canonical_rendering()
+        );
     }
 }

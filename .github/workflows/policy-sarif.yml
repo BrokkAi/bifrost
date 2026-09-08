@@ -17,7 +17,10 @@ jobs:
   scan:
     name: bifrost code-smells scan
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold release-mode repository scan is primarily serial. Keep enough
+    # wall-clock budget for the complete report and fail closed on any
+    # incomplete analysis or finding-gate failure.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -34,11 +37,22 @@ jobs:
         with:
           shared-key: policy-sarif
 
-      - name: Build the policy runner
-        run: cargo build --locked --bin bifrost
+      - name: Build the release policy runner
+        run: cargo build --locked --release --bin bifrost
+
+      - name: Generate and install pinned Python semantic pack
+        env:
+          CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
+        run: |
+          bash scripts/public/build-pinned-python-semantic-packs.sh \
+            "${RUNNER_TEMP}/bifrost-semantic-packs-python" \
+            "${RUNNER_TEMP}" \
+            "$CACHE_ROOT"
 
       - name: Scan with the built-in pack
         uses: ./.github/actions/policy-scan
+        env:
+          BIFROST_SEMANTIC_PACK_CACHE_ROOT: ${{ runner.temp }}/bifrost-python-semantic-pack-cache
         with:
           version: local
           category: bifrost-code-smells

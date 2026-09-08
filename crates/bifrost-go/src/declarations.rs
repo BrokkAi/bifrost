@@ -343,7 +343,10 @@ pub fn go_signature_metadata(
         return enrich(SignatureMetadata::new(signature, Vec::new()));
     }
     let mut search_start = parameters_start;
-    let parameters = go_parameter_label_nodes(node)
+    // The label and its declared type are collected together because this pass
+    // drops parameters it cannot place in the rendered signature. Collecting
+    // the types separately would misalign them with the labels that survived.
+    let (parameters, parameter_type_identities): (Vec<_>, Vec<_>) = go_parameter_label_nodes(node)
         .into_iter()
         .filter_map(|label_node| {
             let label = go_node_text(label_node, source).trim();
@@ -355,10 +358,18 @@ pub fn go_signature_metadata(
             let start_byte = search_start + relative_start;
             let end_byte = start_byte + label.len();
             search_start = end_byte;
-            Some(ParameterMetadata::new(label, start_byte, end_byte))
+            let identity = go_parameter_declared_type(label_node)
+                .and_then(|declared| go_structured_type_identity(declared, source));
+            Some((
+                ParameterMetadata::new(label, start_byte, end_byte),
+                identity,
+            ))
         })
-        .collect();
-    enrich(SignatureMetadata::new(signature, parameters))
+        .unzip();
+    enrich(
+        SignatureMetadata::new(signature, parameters)
+            .with_parameter_type_identities(parameter_type_identities),
+    )
 }
 
 /// One structured identity per declared result of a multi-result callable.
@@ -676,6 +687,25 @@ pub fn named_children_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<
 pub fn children_by_field<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();
     node.children_by_field_name(field, &mut cursor).collect()
+}
+
+/// The declared type of the parameter a label node names.
+///
+/// A label is either the parameter's identifier or, for an unnamed
+/// parameter, the type node itself. Walking up to the enclosing declaration
+/// reads the `type` field in both cases, so one shared step answers both.
+fn go_parameter_declared_type<'a>(label: Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = Some(label);
+    while let Some(node) = cursor {
+        if matches!(
+            node.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            return node.child_by_field_name("type");
+        }
+        cursor = node.parent();
+    }
+    None
 }
 
 pub fn go_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {

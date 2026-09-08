@@ -123,6 +123,57 @@ fn flush_run<'a>(text: &'a str, run: &mut Option<(usize, usize)>, segments: &mut
     }
 }
 
+/// The terminal segment of an already-*rendered* qualified name.
+///
+/// This is the counterpart of [`symbol_path_segments`] for a name that has
+/// already been rendered by `FqName::render_native`, not typed by a client.
+/// The two differ, and a rendered name must not be routed through the selector
+/// splitter:
+///
+/// - A rendered name is joined by the renderer's own separators. Between two
+///   ordinary segments that separator is `.` -- `::` appears only between two
+///   C++ package segments, `/` only between two path segments, `$` only around
+///   a nested or companion segment, and none of those three can be the *last*
+///   join of a name whose terminal is a member or a type.
+/// - A member's own spelling may be any of the selector splitter's other
+///   delimiters. Scala names methods `+`, `/` and `::`, so
+///   `symbol_path_segments` would read `scala.Int.+` as `scala` / `Int` and
+///   `List.::` as `List`, losing the member the caller asked for.
+///
+/// So the split is on `.` alone, with the same backtick rule
+/// ([`backtick_quotes_identifiers`]) that makes `` scalaz.`zio.ZIO` `` two
+/// segments rather than four (#2219). Prefer the recorded structure --
+/// `CodeUnit::terminal_name`, or the last `FqName` segment -- wherever the
+/// declaration is still in hand; this exists for the consumers that hold only
+/// the rendered string.
+pub fn rendered_terminal_segment(language: Language, rendered: &str) -> &str {
+    let quotes = backtick_quotes_identifiers(language);
+    let mut terminal_start = 0;
+    let mut inside_backticks = false;
+    for (index, ch) in rendered.char_indices() {
+        if quotes {
+            if inside_backticks {
+                // Inside the quoted run every `.` belongs to the name. An
+                // unterminated run therefore swallows the rest of the string,
+                // which is what the selector splitter does with it too.
+                inside_backticks = ch != '`';
+                continue;
+            }
+            // A backtick quotes a whole identifier, so it only opens a run at a
+            // segment boundary; anywhere else it is an ordinary character (C#
+            // generic arity, `Dictionary`2`, is spelled that way).
+            if ch == '`' && index == terminal_start {
+                inside_backticks = true;
+                continue;
+            }
+        }
+        if ch == '.' {
+            terminal_start = index + ch.len_utf8();
+        }
+    }
+    &rendered[terminal_start..]
+}
+
 /// Whether a backtick quotes an identifier in this language's grammar.
 ///
 /// Scala and Kotlin both let any identifier be written `` `like this` ``, and
@@ -335,6 +386,53 @@ mod tests {
         assert_eq!(
             parse_symbol_path(Language::Scala, "zio.ZIO"),
             vec!["zio".to_string(), "ZIO".to_string()]
+        );
+    }
+
+    /// Issue #3033. A *rendered* qualified name is joined by the renderer's
+    /// separators, so its terminal is the tail after the last `.` outside a
+    /// backtick-quoted run -- never the tail of the selector splitter, which
+    /// treats `::`, `/` and `+` as delimiters and so would eat a symbolic
+    /// Scala member's own name.
+    #[test]
+    fn a_rendered_terminal_is_the_last_dot_joined_segment() {
+        assert_eq!(
+            rendered_terminal_segment(Language::Scala, "scalaz.`zio.ZIO`"),
+            "`zio.ZIO`"
+        );
+        assert_eq!(
+            rendered_terminal_segment(Language::Scala, "scalaz.`zio.ZIO`.run"),
+            "run"
+        );
+        assert_eq!(
+            rendered_terminal_segment(Language::Scala, "scalaz.Plain"),
+            "Plain"
+        );
+
+        // A member whose own name is one of the selector grammar's delimiters.
+        assert_eq!(
+            rendered_terminal_segment(Language::Scala, "scala.Int.+"),
+            "+"
+        );
+        assert_eq!(
+            rendered_terminal_segment(Language::Scala, "scalaz.List.::"),
+            "::"
+        );
+        assert_eq!(
+            symbol_path_segments(Language::Scala, "scalaz.List.::").last(),
+            Some(&"List")
+        );
+
+        // Languages that do not quote with backticks read one verbatim.
+        assert_eq!(
+            rendered_terminal_segment(Language::CSharp, "System.Collections.Dictionary`2"),
+            "Dictionary`2"
+        );
+        // A rendered name with no join at all is its own terminal.
+        assert_eq!(rendered_terminal_segment(Language::Go, "single"), "single");
+        assert_eq!(
+            rendered_terminal_segment(Language::Cpp, "ns::Type.method"),
+            "method"
         );
     }
 

@@ -24,6 +24,8 @@ use crate::profiling;
 pub struct IndexWarmer {
     state: Mutex<IndexWarmerState>,
     idle: Condvar,
+    #[cfg(test)]
+    panic_before_next_warm: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -41,6 +43,8 @@ impl IndexWarmer {
         Arc::new(Self {
             state: Mutex::new(IndexWarmerState::default()),
             idle: Condvar::new(),
+            #[cfg(test)]
+            panic_before_next_warm: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -71,6 +75,13 @@ impl IndexWarmer {
             let mut next = Some(snapshot);
             while let Some(current) = next.take() {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if warmer
+                        .panic_before_next_warm
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        panic!("injected index warm failure");
+                    }
                     let _scope = profiling::scope("mcp_cold.query_index_construction");
                     // The two halves run together because neither may wait on
                     // the other, and because the structural half must claim
@@ -100,13 +111,24 @@ impl IndexWarmer {
                 if let Err(panic) = outcome {
                     // A panicking index build installs nothing, so the same
                     // panic resurfaces in whichever request first demands the
-                    // index; reset the warmer instead of wedging it, then let
-                    // the panic reach the hook.
+                    // index. Reset the warmer instead of wedging it. The panic
+                    // hook has already reported the original panic, and this
+                    // contextual diagnostic explains why the server remains
+                    // alive rather than unwinding through Rayon's unowned
+                    // spawn, which would abort the process.
                     state.pending = None;
                     state.running = false;
                     warmer.idle.notify_all();
                     drop(state);
-                    std::panic::resume_unwind(panic);
+                    let payload = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    eprintln!(
+                        "background index warm failed: {payload}; failed index builds remain unpublished and can retry on demand"
+                    );
+                    return;
                 }
                 next = state.pending.take();
                 if next.is_none() {
@@ -135,9 +157,12 @@ impl IndexWarmer {
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_index_warm;
+    use super::{IndexWarmer, spawn_index_warm};
+    use crate::analyzer::AnalyzerConfig;
+    use crate::inline_project::InlineTestProject;
     use rayon::prelude::*;
-    use std::sync::mpsc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     #[test]
@@ -165,6 +190,34 @@ mod tests {
                 .iter()
                 .all(|name| name.starts_with("bifrost-index-build-")),
             "nested warm parallelism escaped to non-build workers: {worker_names:?}"
+        );
+    }
+
+    #[test]
+    fn background_warm_panic_resets_for_the_next_schedule() {
+        let project = InlineTestProject::new()
+            .file(
+                "src/lib.rs",
+                "pub trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
+            )
+            .build();
+        let snapshot = Arc::new(project.workspace_analyzer(AnalyzerConfig::default()));
+        assert!(!snapshot.query_indexes_warm());
+
+        let warmer = IndexWarmer::new();
+        warmer.panic_before_next_warm.store(true, Ordering::Release);
+        warmer.schedule(Arc::clone(&snapshot));
+        warmer.wait_until_idle();
+        assert!(
+            !snapshot.query_indexes_warm(),
+            "a failed warm must not publish a completed lazy index"
+        );
+
+        warmer.schedule(Arc::clone(&snapshot));
+        warmer.wait_until_idle();
+        assert!(
+            snapshot.query_indexes_warm(),
+            "the next schedule must retry and publish the lazy index"
         );
     }
 }

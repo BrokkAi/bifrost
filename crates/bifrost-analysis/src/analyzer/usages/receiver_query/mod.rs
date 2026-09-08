@@ -12,8 +12,9 @@ use crate::analyzer::semantic::{
     WorkspaceSemanticOracle,
 };
 use crate::analyzer::semantic_model::{
-    SemanticModelMemberTargetDisposition, SemanticModelProvenance, SemanticModelSymbol,
-    SemanticModelSymbolKind,
+    SemanticModelCallableKey, SemanticModelMemberTargetDisposition,
+    SemanticModelOverlayDisposition, SemanticModelProvenance, SemanticModelSymbol,
+    SemanticModelSymbolKind, TypeRef,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::structural::FileFacts;
@@ -28,7 +29,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
-    resolve_js_ts_type_bounded,
+    resolve_js_ts_type_bounded, semantic_model_lookup_type,
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
@@ -843,6 +844,33 @@ impl<'a> ReceiverQueryService<'a> {
                 let mut report =
                     values_report(operation, file, language, receiver, source, analysis);
                 if !legacy_external_module_identity_is_precise(&report.analysis) {
+                    let dispatch_range = receiver
+                        .child_by_field_name("function")
+                        .map_or_else(|| node_range(receiver), node_range);
+                    let modeled_call_result = self.modeled_call_result_type(
+                        file,
+                        language,
+                        dispatch_range,
+                        &mut ledger,
+                        cancellation,
+                    )?;
+                    let modeled_call_result = match modeled_call_result {
+                        CompatibilityOutcome::Complete(outcome) => outcome,
+                        CompatibilityOutcome::Exceeded(limit) => {
+                            return Ok(budget_report(operation, report.site, ledger.work(), limit));
+                        }
+                    };
+                    if let Some(type_outcome) = modeled_call_result {
+                        let model_values = projected_type_definitions(&type_outcome)
+                            .cloned()
+                            .map(ReceiverValue::InstanceType)
+                            .collect::<Vec<_>>();
+                        report.analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
+                            type_outcome.status,
+                            model_values,
+                        ));
+                        return Ok(finalize_exact_modeled_report(report, &mut ledger));
+                    }
                     let reference_site =
                         structural_reference_site(file, source, node_range(receiver));
                     let resolution = resolve_js_ts_type_bounded(
@@ -1146,6 +1174,143 @@ impl<'a> ReceiverQueryService<'a> {
                 Some(_) | None => Ok(SemanticReceiverGate::Unavailable { work, unsupported }),
             },
         }
+    }
+
+    fn modeled_call_result_type(
+        &self,
+        file: &ProjectFile,
+        language: Language,
+        range: Range,
+        ledger: &mut ReceiverWorkLedger,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<CompatibilityOutcome<Option<TypeLookupOutcome>>, ReceiverQueryError> {
+        if !matches!(language, Language::JavaScript | Language::TypeScript) {
+            return Ok(CompatibilityOutcome::Complete(None));
+        }
+        let Some(workspace) = self.workspace else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        let Some(overlay) = self.analyzer.semantic_model_overlay() else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        let cancellation = cancellation.cloned().unwrap_or_default();
+        let mut semantic = match ReceiverSemanticBridge::new(ledger.remaining_budget()) {
+            Ok(semantic) => semantic,
+            Err(limit) => return Ok(CompatibilityOutcome::Exceeded(limit)),
+        };
+        let outcome = semantic
+            .oracle(workspace)
+            .dispatch_at_source(
+                file,
+                range,
+                &mut SemanticRequest::new(&mut semantic.budget, &cancellation),
+            )
+            .map_err(ReceiverQueryError::SemanticProvider)?;
+        let aggregate_limit = ledger.charge_analysis(semantic.work()).err();
+        match &outcome {
+            SemanticOutcome::Cancelled { .. } => return Err(ReceiverQueryError::Cancelled),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                return Ok(CompatibilityOutcome::Exceeded(
+                    aggregate_limit
+                        .unwrap_or_else(|| ReceiverSemanticBridge::receiver_limit(*exceeded)),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(limit) = aggregate_limit {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+        let Some(dispatches) = outcome.available_value() else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        if dispatches.coverage().is_truncated() {
+            return Ok(CompatibilityOutcome::Complete(None));
+        }
+        if dispatches.observations().is_empty() {
+            return Ok(CompatibilityOutcome::Complete(None));
+        }
+        let mut exact_target = None::<(String, String, bool, u32)>;
+        for observation in dispatches.observations() {
+            let dispatch = observation.dispatch();
+            if dispatch.coverage().is_truncated() || !dispatch.candidates().is_empty() {
+                return Ok(CompatibilityOutcome::Complete(None));
+            }
+            let mut observation_has_target = false;
+            for boundary in dispatch.boundaries() {
+                let Some(target) = boundary.unmaterialized_external_target() else {
+                    continue;
+                };
+                observation_has_target = true;
+                if boundary.proven_external_receiver_shape() != Some(target.has_receiver()) {
+                    return Ok(CompatibilityOutcome::Complete(None));
+                }
+                let target = (
+                    target.owner_fqn().to_owned(),
+                    target.member().to_owned(),
+                    target.has_receiver(),
+                    target.arity(),
+                );
+                match &exact_target {
+                    Some(expected) if expected != &target => {
+                        return Ok(CompatibilityOutcome::Complete(None));
+                    }
+                    None => exact_target = Some(target),
+                    Some(_) => {}
+                }
+            }
+            if !observation_has_target {
+                return Ok(CompatibilityOutcome::Complete(None));
+            }
+        }
+        let Some((owner, member, has_receiver, arity)) = exact_target else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        if let Err(limit) = charge_summary_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+        let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+            language.config_label(),
+            &owner,
+            &member,
+            has_receiver,
+            arity,
+        ));
+        let Some(callable) = matched.unique() else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        let Some(TypeRef::Declared {
+            id,
+            nullable: false,
+            ..
+        }) = callable
+            .structured_signature()
+            .and_then(|signature| signature.returns.as_ref())
+        else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+        let returned = overlay.symbols_with_id(id);
+        if returned.disposition != SemanticModelOverlayDisposition::Unique {
+            return Ok(CompatibilityOutcome::Complete(None));
+        }
+        let [returned] = returned.records.as_slice() else {
+            return Ok(CompatibilityOutcome::Complete(None));
+        };
+        if returned.owner_id.is_some()
+            || returned.language != language.config_label()
+            || returned.provenance.ambiguous
+        {
+            return Ok(CompatibilityOutcome::Complete(None));
+        }
+        Ok(CompatibilityOutcome::Complete(Some(TypeLookupOutcome {
+            status: TypeLookupStatus::Resolved,
+            reference: None,
+            types: vec![semantic_model_lookup_type(file, returned)],
+            diagnostics: Vec::new(),
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        })))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2371,6 +2536,22 @@ fn finalize_legacy_report(
     let compatibility_limit = ledger.charge_analysis(report.work).err();
     let mut report = apply_semantic_gate(analyzer, report, gate);
     if let Some(limit) = compatibility_limit {
+        neutral_exceeded(&mut report.analysis, limit);
+    }
+    report.work = ledger.work();
+    report
+}
+
+/// Finish a JS/TS call-result projection whose exact dispatch boundary and
+/// declared model return already supplied the receiver proof. The neutral
+/// points-to gate cannot improve that external type identity because the
+/// callee body is unmaterialized, so applying it would turn the independent
+/// exact proof back into the pre-#2862 unknown result.
+fn finalize_exact_modeled_report(
+    mut report: ReceiverQueryReport,
+    ledger: &mut ReceiverWorkLedger,
+) -> ReceiverQueryReport {
+    if let Err(limit) = ledger.charge_analysis(report.work) {
         neutral_exceeded(&mut report.analysis, limit);
     }
     report.work = ledger.work();

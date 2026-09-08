@@ -1279,7 +1279,7 @@ fn ts_resolve_named_type_node(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ts_named_type_candidates(
+pub fn ts_named_type_candidates(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -1303,6 +1303,7 @@ fn ts_named_type_candidates(
     };
     let root_name = slice(*root, source).trim();
     let mut remaining = segments.into_iter().skip(1);
+    let has_qualified_tail = remaining.len() != 0;
     let mut candidates = if let Some(binding) = imports.binding(root_name).filter(|binding| {
         matches!(
             binding.kind,
@@ -1323,6 +1324,12 @@ fn ts_named_type_candidates(
             Some(aliases),
             value_position,
         )
+    } else if has_qualified_tail {
+        // A namespace/module qualifier is neither purely a type nor purely a
+        // value. Preserve its raw declaration candidates until the terminal
+        // segment is selected, then let `jsts_member_candidates` apply the
+        // requested namespace filtering to the declared type itself.
+        support.file_identifier(file, root_name)
     } else {
         ts_identifier_candidates(
             host,

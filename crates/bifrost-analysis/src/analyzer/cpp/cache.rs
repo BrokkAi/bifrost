@@ -263,3 +263,54 @@ pub(super) fn weight_orphaned_namespace_scopes(
 ) -> u32 {
     value.approximate_size().clamp(1, u32::MAX as usize) as u32
 }
+
+/// #1496: the attribution itself is four bits; the key's path is the entry.
+pub(super) fn weight_header_language_attribution(
+    key: &ProjectFile,
+    _value: &super::HeaderLanguageAttribution,
+) -> u32 {
+    let size = size_of::<ProjectFile>()
+        .saturating_add(key.root().as_os_str().len())
+        .saturating_add(key.rel_path().as_os_str().len())
+        .saturating_add(size_of::<super::HeaderLanguageAttribution>());
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+/// #1496: one entry is a whole file's object-like field-list macro event
+/// stream, so weigh it by the replacements it carries.
+pub(super) fn weight_object_macro_field_events(
+    _key: &ProjectFile,
+    value: &Arc<Vec<brokk_bifrost_cpp::declarations::ObjectMacroFieldEvent>>,
+) -> u32 {
+    use brokk_bifrost_cpp::declarations::ObjectMacroFieldEvent;
+    let size = value
+        .iter()
+        .fold(size_of::<Vec<ObjectMacroFieldEvent>>(), |acc, event| {
+            let event_size = size_of::<ObjectMacroFieldEvent>();
+            let content = match event {
+                ObjectMacroFieldEvent::Define {
+                    name, replacement, ..
+                } => name
+                    .len()
+                    .saturating_add(weight_object_macro_replacement(replacement)),
+                ObjectMacroFieldEvent::Undef { name, .. } => name.len(),
+            };
+            acc.saturating_add(event_size).saturating_add(content)
+        });
+    size.clamp(1, u32::MAX as usize) as u32
+}
+
+fn weight_object_macro_replacement(
+    replacement: &brokk_bifrost_cpp::graph::syntax::ObjectMacroReplacement,
+) -> usize {
+    let fields = replacement.fields.iter().fold(0usize, |acc, field| {
+        acc.saturating_add(size_of_val(field))
+            .saturating_add(field.name.len())
+            .saturating_add(field.declaration.len())
+    });
+    let nested = replacement
+        .nested
+        .iter()
+        .fold(0usize, |acc, name| acc.saturating_add(name.len()));
+    fields.saturating_add(nested)
+}

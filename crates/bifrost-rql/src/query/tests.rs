@@ -718,6 +718,17 @@ fn flow_state_projections_reject_incompatible_inputs() {
         error.message.contains("procedure or declaration"),
         "{error:?}"
     );
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" },
+            { "op": "witness" }
+        ]
+    }));
+    assert!(error.message.contains("absent_member_finding"), "{error:?}");
 }
 
 /// A bad constrained value is rejected by the decoder, on the offending field's
@@ -986,6 +997,39 @@ fn class_set_and_absent_member_steps_parse_and_lower_from_both_frontends() {
     assert_eq!(
         finding.validate_steps().unwrap(),
         QueryValueKind::AbsentMemberFinding
+    );
+
+    let witness = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" },
+            { "op": "witness", "max_steps": 12, "max_bytes": 4096 }
+        ]
+    }));
+    assert_eq!(
+        witness.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::AbsentMember,
+            QueryStep::Witness(WitnessTraversal {
+                max_steps: Some(12),
+                max_bytes: Some(4096),
+            })
+        ]
+    );
+    assert_eq!(
+        witness.validate_steps().unwrap(),
+        QueryValueKind::AbsentMemberWitness
+    );
+    assert_eq!(
+        CodeQuery::from_sexp(
+            "(witness :max-steps 12 :max-bytes 4096 (absent-member (procedure-of (function :name \"read_config\"))))"
+        )
+        .expect("absent-member witness RQL should lower")
+        .to_canonical_json(),
+        witness.to_canonical_json()
     );
 
     for spelling in ["absent-member", "absent_member"] {

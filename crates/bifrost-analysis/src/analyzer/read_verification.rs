@@ -32,7 +32,10 @@ use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind, InvalidationReason};
 use crate::analyzer::read_ledger::{IndexFamily, LookupKind, LookupQuestion, ReadKey};
 use crate::analyzer::semantic::ids::StableDigest;
-use crate::analyzer::semantic::{SemanticBudget, SemanticRequest, SemanticWork};
+use crate::analyzer::semantic::{
+    CallSiteHandle, DispatchOracle, ProcedureHandle, SemanticBudget, SemanticBudgetExceeded,
+    SemanticRequest, SemanticWork, WorkspaceSemanticOracle,
+};
 use crate::analyzer::usages::call_relations::{CallRelationLimits, CallRelationService};
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder};
 use crate::analyzer::workspace::WorkspaceAnalyzer;
@@ -596,7 +599,9 @@ pub fn replay_lookup(
                 .collect::<std::collections::BTreeSet<_>>();
             Some(crate::analyzer::read_ledger::file_set_digest(&referencing))
         }
-        LookupKind::Dispatch => replay_dispatch(head, question, limits),
+        LookupKind::Dispatch | LookupKind::ProcedureDispatch => {
+            replay_dispatch(head, kind, question, limits)
+        }
         // The repository is not this crate's, so the answer comes from the
         // caller that holds the head's, through the same lookup the recording
         // was announced from.
@@ -664,14 +669,39 @@ fn analyzed_file(analyzer: &dyn IAnalyzer, rel_path: &str) -> Option<ProjectFile
     analyzer.is_analyzed(&file).then_some(file)
 }
 
-/// Replay one dispatch question: materialize the head's artifact for the
-/// call site's file and resolve dispatch at the same source range.
+/// Replay one dispatch question through the address domain its kind names.
+fn replay_dispatch(
+    head: &WorkspaceAnalyzer,
+    kind: LookupKind,
+    question: &LookupQuestion,
+    limits: LookupReplayLimits,
+) -> Option<StableDigest> {
+    match (kind, question) {
+        (LookupKind::Dispatch, LookupQuestion::CallSite { .. }) => {
+            replay_source_dispatch(head, question, limits)
+        }
+        (LookupKind::ProcedureDispatch, LookupQuestion::ProcedureCallSite { .. }) => {
+            replay_procedure_dispatch(head, question, limits)
+        }
+        _ => {
+            debug_assert!(
+                false,
+                "a {} lookup recorded a {} question: {question:?}",
+                kind.stable_label(),
+                question.stable_label()
+            );
+            None
+        }
+    }
+}
+
+/// Replay artifact-pinned dispatch at the recorded absolute source range.
 ///
 /// The recorded artifact fingerprint is part of the question, so a head whose
 /// artifact for that file moved has no answer to it. That is exactly right:
 /// "dispatch at this range of this artifact" and "dispatch at this range of
 /// whatever artifact the file has now" are different questions.
-fn replay_dispatch(
+fn replay_source_dispatch(
     head: &WorkspaceAnalyzer,
     question: &LookupQuestion,
     limits: LookupReplayLimits,
@@ -682,12 +712,7 @@ fn replay_dispatch(
         site,
     } = question
     else {
-        debug_assert!(
-            false,
-            "a dispatch lookup recorded a {} question: {question:?}",
-            question.stable_label()
-        );
-        return None;
+        unreachable!("replay_source_dispatch is called only for a source call-site question")
     };
     let file = analyzed_file(head.analyzer(), rel_path)?;
     let mut budget = SemanticBudget::new(limits.semantic).ok()?;
@@ -716,6 +741,213 @@ fn replay_dispatch(
             outcome.available_value(),
         ),
     )
+}
+
+fn replay_procedure_dispatch(
+    head: &WorkspaceAnalyzer,
+    question: &LookupQuestion,
+    limits: LookupReplayLimits,
+) -> Option<StableDigest> {
+    let mut budget = SemanticBudget::new(limits.semantic).ok()?;
+    let cancellation = CancellationToken::default();
+    replay_procedure_dispatch_with_request(
+        head,
+        question,
+        &head.semantic_oracle_provider(),
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+}
+
+/// Replay one exact procedure-local dispatch read against `head` while
+/// charging the caller's semantic request.
+///
+/// Class-set summary acquisition uses this before pruning a procedure's
+/// descendants. Only the replayable procedure-dispatch shape is accepted;
+/// an unnameable question, changed answer, cancellation, or exhausted budget
+/// all return `false`, so the caller keeps the ordinary discovery path.
+pub fn verify_procedure_dispatch_read(
+    head: &WorkspaceAnalyzer,
+    oracle: &WorkspaceSemanticOracle<'_>,
+    key: &ReadKey,
+    request: &mut SemanticRequest<'_>,
+) -> bool {
+    let ReadKey::Lookup {
+        kind: LookupKind::ProcedureDispatch,
+        question,
+        digest,
+    } = key
+    else {
+        return false;
+    };
+    replay_procedure_dispatch_with_request(head, question, oracle, request)
+        .is_some_and(|replayed| replayed == *digest)
+}
+
+/// A resource interruption while resolving the structured address of a
+/// procedure-dispatch read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcedureDispatchReadCallError {
+    Cancelled,
+    ExceededBudget(SemanticBudgetExceeded),
+}
+
+/// Resolve a procedure-dispatch read to the one live call it names.
+///
+/// This is the structured addressing half of dispatch replay. It deliberately
+/// accepts an already materialized procedure, so a caller that also needs the
+/// live dispatch result can invoke its cached provider exactly once and retain
+/// that outcome for coverage and boundary reconstruction. Whole-artifact
+/// content is not an equality input: the procedure lineage and procedure-local
+/// source range admit an unchanged procedure after an unrelated sibling edit.
+pub fn procedure_dispatch_read_call(
+    procedure: &ProcedureHandle,
+    key: &ReadKey,
+    request: &mut SemanticRequest<'_>,
+) -> Result<Option<(CallSiteHandle, StableDigest)>, ProcedureDispatchReadCallError> {
+    let ReadKey::Lookup {
+        kind: LookupKind::ProcedureDispatch,
+        question:
+            LookupQuestion::ProcedureCallSite {
+                rel_path,
+                procedure: expected_procedure,
+                site: expected_site,
+            },
+        digest,
+    } = key
+    else {
+        return Ok(None);
+    };
+    if procedure.artifact().key().path().as_str() != rel_path.as_ref()
+        || procedure
+            .artifact()
+            .key()
+            .procedure_lineage_fingerprint(procedure.semantics().locator().declaration())
+            != *expected_procedure
+    {
+        return Ok(None);
+    }
+    procedure_dispatch_call_at_relative_site(procedure, expected_site, request)
+        .map(|call| call.map(|call| (call, *digest)))
+}
+
+fn replay_procedure_dispatch_with_request(
+    head: &WorkspaceAnalyzer,
+    question: &LookupQuestion,
+    oracle: &WorkspaceSemanticOracle<'_>,
+    request: &mut SemanticRequest<'_>,
+) -> Option<StableDigest> {
+    let LookupQuestion::ProcedureCallSite {
+        rel_path,
+        procedure: expected_procedure,
+        site: expected_site,
+    } = question
+    else {
+        unreachable!("replay_procedure_dispatch is called only for a procedure call-site question")
+    };
+    let file = analyzed_file(head.analyzer(), rel_path)?;
+    let materialized = head
+        .materialize_program_semantics(&file, request)
+        .ok()?
+        .available_value()?
+        .clone();
+    let mut matched_procedure = None;
+    for procedure in materialized.procedures() {
+        if request.cancellation.is_cancelled() {
+            return None;
+        }
+        request
+            .budget
+            .charge(SemanticWork {
+                procedures: 1,
+                ..SemanticWork::default()
+            })
+            .ok()?;
+        let lineage = materialized
+            .key()
+            .procedure_lineage_fingerprint(procedure.locator().declaration());
+        if lineage != *expected_procedure {
+            continue;
+        }
+        let candidate = materialized.procedure_handle(procedure.id())?;
+        if matched_procedure.replace(candidate).is_some() {
+            return None;
+        }
+    }
+    let procedure = matched_procedure?;
+    let call = match procedure_dispatch_call_at_relative_site(&procedure, expected_site, request) {
+        Ok(Some(call)) => call,
+        Ok(None) | Err(_) => return None,
+    };
+    let outcome = oracle.resolve_call(&call, request).ok()?;
+    Some(
+        crate::analyzer::semantic::workspace_oracle::one_call_dispatch_answer_digest(
+            &call, &outcome,
+        ),
+    )
+}
+
+fn procedure_dispatch_call_at_relative_site(
+    procedure: &ProcedureHandle,
+    expected_site: &crate::analyzer::read_ledger::ProcedureCallSiteLocator,
+    request: &mut SemanticRequest<'_>,
+) -> Result<Option<CallSiteHandle>, ProcedureDispatchReadCallError> {
+    if request.cancellation.is_cancelled() {
+        return Err(ProcedureDispatchReadCallError::Cancelled);
+    }
+    let procedure_start = procedure.semantics().locator().anchor().span().start_byte() as usize;
+    let Some(expected_start) = procedure_start.checked_add(expected_site.start_byte) else {
+        return Ok(None);
+    };
+    let Some(expected_end) = procedure_start.checked_add(expected_site.end_byte) else {
+        return Ok(None);
+    };
+    let mut matched_call = None;
+    for semantic_call in procedure.semantics().call_sites() {
+        if request.cancellation.is_cancelled() {
+            return Err(ProcedureDispatchReadCallError::Cancelled);
+        }
+        request
+            .budget
+            .charge(SemanticWork {
+                call_sites: 1,
+                source_mappings: 1,
+                ..SemanticWork::default()
+            })
+            .map_err(ProcedureDispatchReadCallError::ExceededBudget)?;
+        let Some(mapping) = procedure.semantics().source_mapping(semantic_call.source) else {
+            return Ok(None);
+        };
+        let span = mapping.locator.anchor().span();
+        if span.start_byte() as usize != expected_start || span.end_byte() as usize != expected_end
+        {
+            continue;
+        }
+        request
+            .budget
+            .charge(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            })
+            .map_err(ProcedureDispatchReadCallError::ExceededBudget)?;
+        let Some(candidate) = procedure.call_site_handle(semantic_call.id) else {
+            return Ok(None);
+        };
+        if matched_call.replace(candidate).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some(call) = matched_call else {
+        return Ok(None);
+    };
+    let Ok(range) = crate::analyzer::semantic::workspace_oracle::exact_call_range(&call) else {
+        return Ok(None);
+    };
+    if range.start_byte.checked_sub(procedure_start) != Some(expected_site.start_byte)
+        || range.end_byte.checked_sub(procedure_start) != Some(expected_site.end_byte)
+    {
+        return Ok(None);
+    }
+    Ok(Some(call))
 }
 
 /// The engine's analysis epoch: every grammar and query epoch it could derive
@@ -1079,6 +1311,11 @@ fn blob_identity(blob: Option<Oid>) -> StableDigest {
 mod tests {
     use super::*;
     use crate::analyzer::AnalyzerConfig;
+    use crate::analyzer::semantic::{
+        ClassIdentity, DeclarationSegment, DispatchHint, DispatchHintCallSiteKey, DispatchHintSet,
+        DispatchHints, DispatchOracle, MemberDeclaration, SourceSite, SourceSiteKind,
+        WorkspaceIcfgProvider,
+    };
     use crate::inline_project::InlineTestProject;
 
     fn workspace(alpha: &str) -> crate::inline_project::BuiltInlineTestProject {
@@ -1089,6 +1326,443 @@ mod tests {
     }
 
     const ORIGINAL: &str = "export function alpha() {\n  return 1;\n}\n";
+
+    fn wrapper_procedure(
+        project: &crate::inline_project::BuiltInlineTestProject,
+        analyzer: &WorkspaceAnalyzer,
+    ) -> ProcedureHandle {
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = analyzer
+            .materialize_program_semantics(
+                &project.file("src/main.ts"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("wrapper")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("wrapper procedure")
+    }
+
+    fn dispatch_read(
+        project: &crate::inline_project::BuiltInlineTestProject,
+        analyzer: &WorkspaceAnalyzer,
+    ) -> (ReadKey, Range) {
+        let cancellation = CancellationToken::default();
+        let procedure = wrapper_procedure(project, analyzer);
+        let call = procedure
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| procedure.call_site_handle(call.id))
+            .expect("wrapper call");
+        let range = crate::analyzer::semantic::workspace_oracle::exact_call_range(&call)
+            .expect("exact wrapper call range");
+        let mut dispatch_budget = SemanticBudget::default();
+        let outcome = analyzer
+            .semantic_oracle_provider()
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("wrapper dispatch");
+        let crate::analyzer::semantic::DispatchReadAttribution::Attributed(read) =
+            crate::analyzer::semantic::dispatch_read_attribution(&call, &outcome)
+        else {
+            panic!("one exact authored call must have a replayable read")
+        };
+        (read, range)
+    }
+
+    fn head_inputs() -> HeadInputs {
+        HeadInputs {
+            models: StableDigest::sha256(b"models"),
+            policy_semantic_hash: StableDigest::sha256(b"policy-semantic"),
+            policy_source: StableDigest::sha256(b"policy-source"),
+            configuration: StableDigest::sha256(b"configuration"),
+            epoch: StableDigest::sha256(b"epoch"),
+        }
+    }
+
+    #[test]
+    fn procedure_dispatch_read_survives_a_preceding_sibling_edit() {
+        let base = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function sibling() { return 1; }\n",
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let head = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function sibling() { return 1000000; }\n",
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let head_analyzer = head.workspace_analyzer(AnalyzerConfig::default());
+        let (read, base_range) = dispatch_read(&base, &base_analyzer);
+        let (head_read, head_range) = dispatch_read(&head, &head_analyzer);
+
+        assert_ne!(base.root(), head.root(), "the mount must not enter the key");
+        assert_ne!(
+            base_range, head_range,
+            "the absolute call moved with its sibling"
+        );
+        assert_eq!(read, head_read, "question and answer are procedure-local");
+        assert!(matches!(
+            &read,
+            ReadKey::Lookup {
+                kind: LookupKind::ProcedureDispatch,
+                question: LookupQuestion::ProcedureCallSite { .. },
+                ..
+            }
+        ));
+
+        let changed = ChangedFacts::between(&base_analyzer, &head_analyzer);
+        assert_eq!(
+            verify_read_set(
+                &head_analyzer,
+                &changed,
+                &head_inputs(),
+                std::slice::from_ref(&read),
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            ),
+            ReadVerdict::Unchanged
+        );
+    }
+
+    #[test]
+    fn structured_procedure_dispatch_read_address_preserves_interruptions() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let (read, _) = dispatch_read(&project, &analyzer);
+        let procedure = wrapper_procedure(&project, &analyzer);
+
+        let cancellation = CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let (call, expected) = procedure_dispatch_read_call(
+            &procedure,
+            &read,
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        )
+        .expect("address resolution stays within budget")
+        .expect("the read names the live wrapper call");
+        assert_eq!(call.procedure(), &procedure);
+        let ReadKey::Lookup { digest, .. } = &read else {
+            panic!("dispatch attribution is a lookup read")
+        };
+        assert_eq!(expected, *digest);
+
+        let mut limits = SemanticWork::default_limits();
+        limits.call_sites = 1;
+        let mut exhausted = SemanticBudget::new(limits).expect("valid tight budget");
+        exhausted
+            .charge(SemanticWork {
+                call_sites: 1,
+                ..SemanticWork::default()
+            })
+            .expect("the test primes the tight call-site budget");
+        assert!(matches!(
+            procedure_dispatch_read_call(
+                &procedure,
+                &read,
+                &mut SemanticRequest::new(&mut exhausted, &cancellation),
+            ),
+            Err(ProcedureDispatchReadCallError::ExceededBudget(_))
+        ));
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let mut cancelled_budget = SemanticBudget::default();
+        assert_eq!(
+            procedure_dispatch_read_call(
+                &procedure,
+                &read,
+                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+            ),
+            Err(ProcedureDispatchReadCallError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn exact_procedure_dispatch_replay_uses_the_active_receiver_hints() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "hinted.py",
+                concat!(
+                    "class A:\n",
+                    "    def foo(self):\n",
+                    "        return 1\n",
+                    "\n",
+                    "def caller(x):\n",
+                    "    return x.foo()\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("hinted.py");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Python semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("caller")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let call = procedure
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| procedure.call_site_handle(call.id))
+            .expect("dynamic member call");
+        let declarations = workspace.analyzer().get_declarations(&file);
+        let class = declarations
+            .iter()
+            .find(|declaration| declaration.is_class())
+            .cloned()
+            .expect("class A declaration");
+        let member = declarations
+            .into_iter()
+            .find(|declaration| declaration.terminal_name() == "foo")
+            .expect("A.foo declaration");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(
+                call.procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("live call")
+                    .source,
+            )
+            .expect("call source mapping");
+        let hints = DispatchHints::new(vec![DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(call.procedure(), call.id()),
+            vec![DispatchHint::new(
+                MemberDeclaration::Workspace(member),
+                ClassIdentity::Workspace(class),
+                SourceSite {
+                    file,
+                    span: mapping.locator.anchor().span(),
+                    kind: SourceSiteKind::DeclaredParameter,
+                },
+            )],
+            true,
+            true,
+        )]);
+        let hinted = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &workspace, None, hints,
+        );
+        let mut attribution_budget = SemanticBudget::default();
+        let hinted_outcome = hinted
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut attribution_budget, &cancellation),
+            )
+            .expect("hinted dispatch");
+        let crate::analyzer::semantic::DispatchReadAttribution::Attributed(hinted_read) =
+            crate::analyzer::semantic::dispatch_read_attribution(&call, &hinted_outcome)
+        else {
+            panic!("the hinted call must have an exact dispatch read")
+        };
+
+        let mut hinted_replay_budget = SemanticBudget::default();
+        assert!(verify_procedure_dispatch_read(
+            &workspace,
+            hinted.oracle(),
+            &hinted_read,
+            &mut SemanticRequest::new(&mut hinted_replay_budget, &cancellation),
+        ));
+
+        let unhinted = workspace.semantic_oracle_provider();
+        let mut unhinted_replay_budget = SemanticBudget::default();
+        assert!(
+            !verify_procedure_dispatch_read(
+                &workspace,
+                &unhinted,
+                &hinted_read,
+                &mut SemanticRequest::new(&mut unhinted_replay_budget, &cancellation),
+            ),
+            "a default-provider replay must not certify a hint-dependent read"
+        );
+    }
+
+    #[test]
+    fn procedure_dispatch_read_rotates_for_a_different_logical_target() {
+        let base = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let head = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function twig(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return twig(value); }\n",
+                ),
+            )
+            .build();
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let head_analyzer = head.workspace_analyzer(AnalyzerConfig::default());
+        let (read, _) = dispatch_read(&base, &base_analyzer);
+        let (head_read, _) = dispatch_read(&head, &head_analyzer);
+
+        let (
+            ReadKey::Lookup {
+                question,
+                digest: base_answer,
+                ..
+            },
+            ReadKey::Lookup {
+                question: head_question,
+                digest: head_answer,
+                ..
+            },
+        ) = (&read, &head_read)
+        else {
+            panic!("dispatch attribution must be a lookup")
+        };
+        assert_eq!(
+            question, head_question,
+            "the call address itself did not move"
+        );
+        assert_ne!(base_answer, head_answer, "the target lineage must move");
+
+        let changed = ChangedFacts::between(&base_analyzer, &head_analyzer);
+        let verdict = verify_read_set(
+            &head_analyzer,
+            &changed,
+            &head_inputs(),
+            std::slice::from_ref(&read),
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        );
+        assert!(matches!(
+            verdict.changed().map(|changed| &changed.reason),
+            Some(InvalidationReason::DependencyFingerprintChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn procedure_dispatch_replay_fails_closed_when_its_exact_call_disappears_or_exceeds_budget() {
+        let base = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let removed = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return value; }\n",
+                ),
+            )
+            .build();
+        let base_analyzer = base.workspace_analyzer(AnalyzerConfig::default());
+        let removed_analyzer = removed.workspace_analyzer(AnalyzerConfig::default());
+        let (read, _) = dispatch_read(&base, &base_analyzer);
+        let removed_facts = ChangedFacts::between(&base_analyzer, &removed_analyzer);
+        let removed_verdict = verify_read_set(
+            &removed_analyzer,
+            &removed_facts,
+            &head_inputs(),
+            std::slice::from_ref(&read),
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        );
+        assert!(matches!(
+            removed_verdict.changed().map(|changed| &changed.reason),
+            Some(InvalidationReason::ReverseDependencyEvidenceMissing { .. })
+        ));
+
+        let unchanged = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "src/main.ts",
+                concat!(
+                    "function leaf(value: number) { return value; }\n",
+                    "export function wrapper(value: number) { return leaf(value); }\n",
+                ),
+            )
+            .build();
+        let unchanged_analyzer = unchanged.workspace_analyzer(AnalyzerConfig::default());
+        let unchanged_facts = ChangedFacts::between(&base_analyzer, &unchanged_analyzer);
+        let mut limits = LookupReplayLimits::default();
+        limits.semantic.procedures = 1;
+        let budgeted_verdict = verify_read_set(
+            &unchanged_analyzer,
+            &unchanged_facts,
+            &head_inputs(),
+            &[read],
+            limits,
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        );
+        assert!(matches!(
+            budgeted_verdict.changed().map(|changed| &changed.reason),
+            Some(InvalidationReason::ReverseDependencyEvidenceMissing { .. })
+        ));
+    }
 
     #[test]
     fn an_identical_workspace_changes_nothing() {

@@ -338,6 +338,7 @@ mod maintainability_size;
 mod secret_like_code;
 mod structural_clone_smells;
 mod test_assertion_smells;
+mod unused_imports;
 
 pub use cognitive::{
     ComputeCognitiveComplexityParams, ComputeCognitiveComplexityResult,
@@ -374,4 +375,9 @@ pub use structural_clone_smells::{
 };
 pub use test_assertion_smells::{
     ReportTestAssertionSmellsParams, ReportTestAssertionSmellsResult, report_test_assertion_smells,
+};
+pub use unused_imports::{
+    AmbientImportUse, UnusedImport, UnusedImportCertainty, UnusedImportSupport,
+    UnusedImportsCompleteness, UnusedImportsFileResult, UnusedImportsIncompleteReason,
+    unused_import_support, unused_imports_for_file,
 };

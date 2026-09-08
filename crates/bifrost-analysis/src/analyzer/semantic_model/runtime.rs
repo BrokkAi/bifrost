@@ -9,12 +9,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
+    CompiledClassDecoratorIdentity, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
     CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledNormalReturnRefinement,
-    CompiledOperationPrecondition, CompiledPackManifest, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledResultContract, CompiledShard, DeclarationGuard,
-    GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay,
-    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
+    CompiledProcedureSummary, CompiledProcedureTarget, CompiledResultContract, CompiledShard,
+    DeclarationGuard, GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger,
+    SemanticModelOverlay, SemanticModelOverlayBuildError, SemanticPackCatalog,
+    SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{is_lower_sha256, parse_lower_sha256};
@@ -398,6 +399,34 @@ impl ResolvedActiveSemanticModels {
             target.has_receiver,
             target.parameter_count,
         )
+    }
+
+    /// Cheap candidate filter before resolving a receiver's exact owner. This
+    /// does not prove a binding: callers must still select the exact member.
+    pub(crate) fn has_normal_return_type_refinement_candidate(
+        &self,
+        language: &str,
+        member: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> bool {
+        self.indexes
+            .procedure_summaries_by_member
+            .get(language)
+            .into_iter()
+            .flat_map(|owners| owners.values())
+            .filter_map(|members| members.get(member))
+            .any(|shapes| {
+                resolve_applicable_procedure_postings(
+                    &self.shards,
+                    Some(shapes),
+                    has_receiver,
+                    parameter_count,
+                )
+                .records
+                .iter()
+                .any(|selected| !selected.normal_return_type_refinements().is_empty())
+            })
     }
 
     /// Select an activated summary from an exact external declaration locator
@@ -801,6 +830,18 @@ impl<'a> ActivatedProcedureSummary<'a> {
     /// the call's normal continuation.
     pub fn normal_return_refinements(&self) -> &'a [CompiledNormalReturnRefinement] {
         &self.record.normal_return_refinements
+    }
+
+    /// Reviewed class assertions this summary establishes for actual
+    /// arguments on the call's normal continuation.
+    pub fn normal_return_type_refinements(&self) -> &'a [CompiledNormalReturnTypeRefinement] {
+        &self.record.normal_return_type_refinements
+    }
+
+    /// Reviewed identity claims for a class decorator or decorator factory.
+    /// Omission means that the activated summary makes no such claim.
+    pub fn class_decorator_identity(&self) -> Option<&'a CompiledClassDecoratorIdentity> {
+        self.record.class_decorator_identity.as_ref()
     }
 
     /// Whether the activated pack declares the named effect for this procedure.
@@ -1677,6 +1718,8 @@ fn procedure_claims_agree(
         && left.conditional_result_refinements == right.conditional_result_refinements
         && left.conditional_indirect_writes == right.conditional_indirect_writes
         && left.normal_return_refinements == right.normal_return_refinements
+        && left.normal_return_type_refinements == right.normal_return_type_refinements
+        && left.class_decorator_identity == right.class_decorator_identity
 }
 
 fn resolve_exact_procedure_postings<'a>(
@@ -3785,6 +3828,8 @@ mod procedure_claim_agreement_tests {
             conditional_result_refinements: Vec::new(),
             conditional_indirect_writes: Vec::new(),
             normal_return_refinements: Vec::new(),
+            normal_return_type_refinements: Vec::new(),
+            class_decorator_identity: None,
         }
     }
 
@@ -3850,6 +3895,67 @@ mod procedure_claim_agreement_tests {
             procedure_claims_agree(&left, &right),
             "two explicit absence claims make one runtime claim"
         );
+    }
+
+    #[test]
+    fn a_different_normal_return_type_refinement_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right
+            .normal_return_type_refinements
+            .push(CompiledNormalReturnTypeRefinement {
+                parameter_ordinal: 0,
+                class_parameter_ordinal: 1,
+                required_receiver_members: Vec::new(),
+            });
+        assert!(!procedure_claims_agree(&left, &right));
+    }
+
+    #[test]
+    fn a_different_class_decorator_identity_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.class_decorator_identity = Some(CompiledClassDecoratorIdentity {
+            direct: true,
+            factory_keywords: None,
+        });
+        assert!(!procedure_claims_agree(&left, &right));
+
+        let mut matching = left.clone();
+        matching.class_decorator_identity = right.class_decorator_identity.clone();
+        assert!(procedure_claims_agree(&matching, &right));
+    }
+
+    #[test]
+    fn a_different_normal_return_receiver_dependency_is_a_disagreement() {
+        let mut left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        left.normal_return_type_refinements
+            .push(CompiledNormalReturnTypeRefinement {
+                parameter_ordinal: 0,
+                class_parameter_ordinal: 1,
+                required_receiver_members: vec!["fail".to_owned()],
+            });
+        right
+            .normal_return_type_refinements
+            .push(CompiledNormalReturnTypeRefinement {
+                parameter_ordinal: 0,
+                class_parameter_ordinal: 1,
+                required_receiver_members: vec!["helper".to_owned()],
+            });
+        assert!(!procedure_claims_agree(&left, &right));
+
+        right.normal_return_type_refinements[0].required_receiver_members = vec!["fail".to_owned()];
+        assert!(procedure_claims_agree(&left, &right));
     }
 
     #[test]

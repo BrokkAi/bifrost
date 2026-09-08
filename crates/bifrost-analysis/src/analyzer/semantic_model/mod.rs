@@ -18,20 +18,21 @@ mod source;
 mod validate;
 
 pub use artifact::{
-    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledConcurrencyEffect,
-    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
-    CompiledLockMode, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
-    CompiledPackManifest, CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
-    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
-    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
-    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, DecodeLimits, PayloadKind, decode_manifest,
-    decode_shard, decode_shard_for_manifest,
+    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
+    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
+    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
+    CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget, CompiledLockMode,
+    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
+    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
+    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
+    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
+    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
+    CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation, CompiledSummaryOutput,
+    CompiledSummaryTransfer, CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
+    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
+    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
+    DecodeLimits, PayloadKind, decode_manifest, decode_shard, decode_shard_for_manifest,
 };
 pub use authoring::*;
 pub use catalog::*;

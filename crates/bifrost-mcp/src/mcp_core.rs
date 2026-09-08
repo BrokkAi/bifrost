@@ -108,7 +108,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional project-relative file paths or glob patterns whose declarations are graph roots. Omit to make every workspace declaration a root."
+                    "description": "Optional project-relative files, directories, or glob patterns whose declarations are graph roots. A directory contributes every file under it. A selector that names no workspace file or directory is reported in incomplete_reasons. Omit to make every workspace declaration a root."
                 },
                 "depth": {
                     "type": "integer",
@@ -253,7 +253,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional project-relative paths or globs used to narrow where usages are searched."
+                    "description": "Optional project-relative files, directories, or globs used to narrow where usages are searched. A directory selects every file under it. A selector that names no workspace file or directory is listed in scope.unmatched_paths and makes the result incomplete, so absence is reported as unverified_absent."
                 }
             },
             "required": ["symbols"]
@@ -311,7 +311,7 @@ fn scan_usages_by_location_descriptor() -> Value {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional project-relative paths or globs used to narrow where usages are searched."
+                    "description": "Optional project-relative files, directories, or globs used to narrow where usages are searched. A directory selects every file under it. A selector that names no workspace file or directory is listed in scope.unmatched_paths and makes the result incomplete, so absence is reported as unverified_absent."
                 }
             },
             "required": ["targets"]

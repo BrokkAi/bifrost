@@ -340,6 +340,71 @@ fn minimal_valid_artifact_exposes_scoped_handles() {
     assert!(handle.value_handle(ValueId::new(0)).is_none());
 }
 
+fn artifact_with_values(values: Vec<SemanticValue>) -> Result<SemanticArtifact, SemanticIrError> {
+    let key = key();
+    let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+    procedure.values = values;
+    SemanticArtifact::try_new(
+        key,
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure],
+    )
+}
+
+fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
+    SemanticValue {
+        id: ValueId::new(id),
+        kind: SemanticValueKind::Parameter {
+            ordinal,
+            multiplicity,
+            name: None,
+            passing_mode: FormalParameterPassingMode::PositionalOrNamed,
+        },
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    }
+}
+
+fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
+    SemanticValue {
+        id: ValueId::new(id),
+        kind: SemanticValueKind::DefaultArgument { ordinal },
+        source: SourceMappingId::new(0),
+        evidence: EvidenceId::new(0),
+    }
+}
+
+#[test]
+fn default_argument_values_require_one_existing_nonrest_formal() {
+    let duplicate = artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::One),
+        default_argument_value(1, 0),
+        default_argument_value(2, 0),
+    ])
+    .expect_err("one formal cannot publish duplicate saved defaults");
+    assert_eq!(duplicate.kind(), SemanticIrErrorKind::CallContract);
+    assert!(duplicate.detail().contains("published more than once"));
+
+    let absent = artifact_with_values(vec![default_argument_value(0, 4)])
+        .expect_err("a saved default must name an existing formal");
+    assert_eq!(absent.kind(), SemanticIrErrorKind::CallContract);
+    assert!(absent.detail().contains("has no parameter formal"));
+
+    let rest = artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::Rest(ArgumentDomain::Positional)),
+        default_argument_value(1, 0),
+    ])
+    .expect_err("a rest formal cannot own a saved default");
+    assert_eq!(rest.kind(), SemanticIrErrorKind::CallContract);
+    assert!(rest.detail().contains("names a rest formal"));
+
+    artifact_with_values(vec![
+        parameter_value(0, 0, FormalMultiplicity::One),
+        default_argument_value(1, 0),
+    ])
+    .expect("one saved default for an existing nonrest formal is valid");
+}
+
 #[test]
 fn durable_control_edge_locator_releases_and_rematerializes_its_artifact() {
     let key = key();

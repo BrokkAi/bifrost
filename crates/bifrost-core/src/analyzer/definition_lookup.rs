@@ -65,6 +65,15 @@ impl RelationalName {
         full
     }
 
+    /// The relational name with its final segment removed, preserving the
+    /// persisted prefix/tail boundary when the parent remains anchored.
+    pub fn parent(&self) -> Option<Self> {
+        if let Some(parent) = self.tail.parent() {
+            return Some(Self::new(self.prefix.clone(), parent));
+        }
+        Some(Self::new(self.prefix.parent()?, FqName::new()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.prefix.is_empty() && self.tail.is_empty()
     }
@@ -530,6 +539,30 @@ mod relational_tests {
             })
         );
         assert_eq!(lookup.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn relational_parent_preserves_the_anchor_boundary() {
+        let interner = segment_interner();
+        let mut prefix = FqName::new();
+        prefix.push(interner.intern("mounted", SegmentKind::Package));
+        let mut tail = FqName::new();
+        tail.push(interner.intern("Owner", SegmentKind::Type));
+        tail.push(interner.intern("field", SegmentKind::Member));
+
+        let field = RelationalName::new(prefix.clone(), tail);
+        let owner = field.parent().expect("field has an owner");
+        assert_eq!(owner.prefix(), &prefix);
+        assert_eq!(owner.tail().len(), 1);
+
+        let package = owner.parent().expect("owner has a package");
+        assert_eq!(package.prefix(), &prefix);
+        assert!(package.tail().is_empty());
+
+        let root = package.parent().expect("anchored package has a root");
+        assert!(root.prefix().is_empty());
+        assert!(root.tail().is_empty());
+        assert!(root.parent().is_none());
     }
 
     #[test]

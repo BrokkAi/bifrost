@@ -513,11 +513,12 @@ fn export_semantic_document<'a>(
             || !summary.conditional_result_refinements.is_empty()
             || !summary.conditional_indirect_writes.is_empty()
             || !summary.normal_return_refinements.is_empty()
+            || !summary.normal_return_type_refinements.is_empty()
+            || summary.class_decorator_identity.is_some()
         {
             return Err(CsmiExportError::Unsupported {
                 path: format!("procedureSummaries.{}", summary.id),
-                semantic: "effects and result contracts are not representable in CSMI core"
-                    .to_owned(),
+                semantic: "effects, result contracts, normal-return type refinements, and class decorator identity are not representable in CSMI core".to_owned(),
             });
         }
         let transfers = summary

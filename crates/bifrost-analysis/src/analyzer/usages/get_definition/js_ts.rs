@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
+use crate::analyzer::tree_walk::children_iter;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
@@ -37,6 +38,11 @@ use brokk_bifrost_js_ts::type_text::{
     ts_type_annotation_text,
 };
 use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module;
+
+use crate::analyzer::semantic_model::{
+    SemanticModelCallableKey, SemanticModelOverlay, SemanticModelOverlayDisposition,
+    SemanticModelSymbol, TypeRef,
+};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsTsAliasCandidateKey {
@@ -381,6 +387,174 @@ pub(super) fn exact_direct_named_import_call(
     ))
 }
 
+#[derive(Debug)]
+struct ModeledExternalCall<'a> {
+    owner: &'a SemanticModelSymbol,
+    callable: &'a SemanticModelSymbol,
+    parameter_count: u32,
+}
+
+impl ModeledExternalCall<'_> {
+    fn proof(&self) -> ExactExternalCallProof {
+        ExactExternalCallProof::js_ts_bound_external_member(
+            &self.owner.qualified_name,
+            &self.callable.name,
+            self.parameter_count,
+        )
+    }
+}
+
+/// Resolve a JS/TS external call solely from structured source and activated
+/// declaration facts. Each chained rung uses the previous callable's declared
+/// return type; no rendered call or type name is re-parsed (#2862).
+pub(super) fn exact_modeled_external_call(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<ExactExternalCallProof> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let lexical = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+    modeled_external_call_at_site(
+        overlay.as_ref(),
+        language,
+        source,
+        tree.root_node(),
+        site,
+        &lexical,
+    )
+    .map(|call| call.proof())
+}
+
+fn modeled_external_call_at_site<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+    lexical: &JsTsLexicalBindingIndex,
+) -> Option<ModeledExternalCall<'a>> {
+    let focused = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let call = enclosing_callee_call(focused)?;
+    modeled_external_call_expression(overlay, language, source, call, lexical, 8)
+}
+
+fn enclosing_callee_call(mut node: Node<'_>) -> Option<Node<'_>> {
+    for _ in 0..3 {
+        let parent = node.parent()?;
+        if parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == node.id())
+        {
+            return Some(parent);
+        }
+        if !matches!(parent.kind(), "member_expression" | "subscript_expression") {
+            return None;
+        }
+        node = parent;
+    }
+    None
+}
+
+fn modeled_external_call_expression<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    source: &str,
+    call: Node<'_>,
+    lexical: &JsTsLexicalBindingIndex,
+    remaining: usize,
+) -> Option<ModeledExternalCall<'a>> {
+    let remaining = remaining.checked_sub(1)?;
+    let function = call.child_by_field_name("function")?;
+    let (receiver, member_node) = jsts_dotted_access_parts(function)?;
+    let member = simple_reference_name(member_node, source, language)?;
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+
+    let owner = if receiver.kind() == "identifier" {
+        let receiver_name = simple_reference_name(receiver, source, language)?;
+        if !is_known_js_ts_global(receiver_name)
+            || !lexical
+                .binding_identifier_ranges_at(receiver_name, receiver.start_byte())
+                .is_empty()
+        {
+            return None;
+        }
+        exact_modeled_type_named(overlay, language, receiver_name)?
+    } else if receiver.kind() == "call_expression" {
+        let inner = modeled_external_call_expression(
+            overlay, language, source, receiver, lexical, remaining,
+        )?;
+        callable_declared_return_owner(overlay, language, inner.callable)?
+    } else {
+        return None;
+    };
+
+    let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+        language.config_label(),
+        &owner.qualified_name,
+        member,
+        true,
+        parameter_count,
+    ));
+    let callable = matched.unique()?;
+    Some(ModeledExternalCall {
+        owner,
+        callable,
+        parameter_count,
+    })
+}
+
+fn exact_modeled_type_named<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    name: &str,
+) -> Option<&'a SemanticModelSymbol> {
+    let matched = overlay.symbols_named(name);
+    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+        return None;
+    }
+    let [symbol] = matched.records.as_slice() else {
+        return None;
+    };
+    (symbol.owner_id.is_none()
+        && symbol.qualified_name == name
+        && symbol.language == language.config_label()
+        && !symbol.provenance.ambiguous)
+        .then_some(*symbol)
+}
+
+fn callable_declared_return_owner<'a>(
+    overlay: &'a SemanticModelOverlay,
+    language: Language,
+    callable: &SemanticModelSymbol,
+) -> Option<&'a SemanticModelSymbol> {
+    let TypeRef::Declared {
+        id,
+        nullable: false,
+        ..
+    } = callable.structured_signature()?.returns.as_ref()?
+    else {
+        return None;
+    };
+    let matched = overlay.symbols_with_id(id);
+    if matched.disposition != SemanticModelOverlayDisposition::Unique {
+        return None;
+    }
+    let [owner] = matched.records.as_slice() else {
+        return None;
+    };
+    (owner.owner_id.is_none()
+        && owner.language == language.config_label()
+        && !owner.provenance.ambiguous)
+        .then_some(*owner)
+}
+
 fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
     let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
     else {
@@ -581,6 +755,23 @@ pub(super) fn resolve_js_ts(
         analyzer, host, support, file, language, source, tree, site, imports, aliases,
     ) {
         return js_ts_candidates_outcome(analyzer, members);
+    }
+
+    if let Some(overlay) = analyzer.semantic_model_overlay()
+        && let Some(modeled) = modeled_external_call_at_site(
+            overlay.as_ref(),
+            language,
+            source,
+            tree.root_node(),
+            site,
+            &lexical_bindings,
+        )
+    {
+        let reference = format!("{}.{}", modeled.owner.qualified_name, modeled.callable.name);
+        trace::record_named_boundary_with_target(reference.clone(), modeled.callable.id.clone());
+        return boundary_unchecked(format!(
+            "`{reference}` resolves through an active JS/TS declaration-model return type"
+        ));
     }
 
     if let Some((qualifier, name)) = reference.split_once('.') {
@@ -2262,10 +2453,7 @@ fn ts_global_namespace_exports(root: Node<'_>, source: &str) -> HashSet<String> 
     {
         let mut has_as = false;
         let mut has_namespace = false;
-        for index in 0..statement.child_count() {
-            let Some(child) = statement.child(index) else {
-                continue;
-            };
+        for child in children_iter(statement) {
             match child.kind() {
                 "as" => has_as = true,
                 "namespace" => has_namespace = true,

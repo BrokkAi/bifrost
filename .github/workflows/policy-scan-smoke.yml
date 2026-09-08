@@ -71,34 +71,36 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p smoke-fixture/clean smoke-fixture/finding
-          cat > smoke-fixture/clean/main.py <<'EOF'
-          """Clean fixture. No policy in bifrost.code-smells matches this file."""
+          cat > smoke-fixture/clean/main.ts <<'EOF'
+          // Clean fixture. No policy in bifrost.code-smells matches this file.
 
 
-          def total(values):
-              result = 0
-              for value in values:
-                  result = result + value
-              return result
+          function total(values: number[]): number {
+            let result = 0;
+            for (const value of values) {
+              result = result + value;
+            }
+            return result;
+          }
 
 
-          def main():
-              print(total([1, 2, 3]))
+          function main(): void {
+            console.log(total([1, 2, 3]));
+          }
 
-
-          if __name__ == "__main__":
-              main()
+          main();
           EOF
           # The planted policy must sit at or above the action's default
           # fail-on threshold of warning, or leg B stops testing the gate.
           # bifrost.correctness.dynamic-evaluation is a warning; the
           # *-in-loop family is note-severity and would exit 0 here.
-          cat > smoke-fixture/finding/main.py <<'EOF'
-          """Planted fixture. The dispatcher evaluates source text as code."""
+          cat > smoke-fixture/finding/main.ts <<'EOF'
+          // Planted fixture. The dispatcher evaluates source text as code.
 
 
-          def apply_rule(expression, values):
-              return eval(expression, {"values": values})
+          function applyRule(expression: string, values: unknown[]): unknown {
+            return eval(expression);
+          }
           EOF
 
       # Leg A: a clean workspace must select the local binary, exit 0, and
@@ -162,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p smoke-fixture/orphan/.bifrost
-          cp smoke-fixture/clean/main.py smoke-fixture/orphan/main.py
+          cp smoke-fixture/clean/main.ts smoke-fixture/orphan/main.ts
           jq '
             .runs[0].results[0] as $finding
             | {

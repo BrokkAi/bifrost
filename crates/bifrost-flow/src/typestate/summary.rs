@@ -5,12 +5,12 @@ use std::fmt;
 use std::mem::size_of;
 
 use crate::analyzer::semantic::{
-    DeclarationLocator, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticArtifactKey,
-    SemanticBudget, SemanticLocator,
+    DeclarationLocator, DurableValueIdentity, IcfgProvider, ProcedureHandle, ReturnTransferKind,
+    SemanticArtifactKey, SemanticBudget, SemanticLocator,
 };
 use crate::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
-    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
+    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider,
     SemanticProcedureSummary, SemanticSummarySetValidationError, SolverTermination,
     SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey, SummaryExitKind,
     SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
@@ -1353,9 +1353,9 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         root: &ProcedureHandle,
         entry_fact: TypestateFact,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, SolverTermination> {
+    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, ReusableSummaryError> {
         if request.cancellation.is_cancelled() {
-            return Err(SolverTermination::Cancelled);
+            return Err(SolverTermination::Cancelled.into());
         }
         let Some(semantic) = self.semantic_summaries.unique_summary_for(procedure) else {
             return Ok(None);
@@ -1402,10 +1402,10 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
                 callback_rows: remap_rows,
                 ..crate::dataflow::SolverWork::default()
             }) {
-                return Err(termination);
+                return Err(termination.into());
             }
             if request.cancellation.is_cancelled() {
-                return Err(SolverTermination::Cancelled);
+                return Err(SolverTermination::Cancelled.into());
             }
             let Ok(remap) = ProtocolLiveRemap::try_new(self.protocol, self.bindings) else {
                 return Ok(None);
@@ -1418,12 +1418,12 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
                 callback_rows: point_count,
                 ..crate::dataflow::SolverWork::default()
             }) {
-                return Err(termination);
+                return Err(termination.into());
             }
             let mut points = HashMap::with_capacity(point_count);
             for point in procedure.semantics().points() {
                 if request.cancellation.is_cancelled() {
-                    return Err(SolverTermination::Cancelled);
+                    return Err(SolverTermination::Cancelled.into());
                 }
                 let Some(handle) = procedure.point_handle(point.id) else {
                     return Ok(None);
@@ -1437,7 +1437,7 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         for row in &summary.rows[row_range.clone()] {
             if request.cancellation.is_cancelled() || remap.fact(&row.output).is_err() {
                 return if request.cancellation.is_cancelled() {
-                    Err(SolverTermination::Cancelled)
+                    Err(SolverTermination::Cancelled.into())
                 } else {
                     Ok(None)
                 };
@@ -1445,7 +1445,7 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         }
         for effect in &summary.effects[effect_range.clone()] {
             if request.cancellation.is_cancelled() {
-                return Err(SolverTermination::Cancelled);
+                return Err(SolverTermination::Cancelled.into());
             }
             if remap.fact(&effect.observation).is_err()
                 || points.is_none_or(|points| !points.contains_key(&effect.site))
@@ -1459,12 +1459,12 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
             propagated_outputs: relation_rows,
             ..crate::dataflow::SolverWork::default()
         }) {
-            return Err(termination);
+            return Err(termination.into());
         }
         let mut exits = Vec::with_capacity(exit_count);
         for row in &summary.rows[row_range] {
             if request.cancellation.is_cancelled() {
-                return Err(SolverTermination::Cancelled);
+                return Err(SolverTermination::Cancelled.into());
             }
             exits.push(ReusableEndSummary {
                 exit_kind: match row.exit_kind {
@@ -1480,7 +1480,7 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         let mut reached = Vec::with_capacity(effect_count);
         for effect in &summary.effects[effect_range] {
             if request.cancellation.is_cancelled() {
-                return Err(SolverTermination::Cancelled);
+                return Err(SolverTermination::Cancelled.into());
             }
             reached.push(ReusableReachedFact {
                 point: points
@@ -2344,10 +2344,13 @@ fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
         TypestateObjectKey::Value(locator)
         | TypestateObjectKey::Allocation(locator)
         | TypestateObjectKey::Static(locator)
-        | TypestateObjectKey::LexicalCell(locator)
         | TypestateObjectKey::TypeSummary(locator)
         | TypestateObjectKey::ModuleObject(locator)
         | TypestateObjectKey::External(locator) => semantic_locator_heap_bytes(locator),
+        TypestateObjectKey::LexicalCell { locator, binding } => {
+            semantic_locator_heap_bytes(locator)
+                .saturating_add(durable_value_identity_heap_bytes(binding))
+        }
         TypestateObjectKey::CallResult {
             call,
             result,
@@ -2364,6 +2367,10 @@ fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
             semantic_locator_heap_bytes(procedure)
         }
     }
+}
+
+fn durable_value_identity_heap_bytes(value: &DurableValueIdentity) -> usize {
+    semantic_locator_heap_bytes(&value.locator).saturating_add(value.role.len())
 }
 
 fn context_key_heap_bytes(key: &TypestateContextKey) -> usize {

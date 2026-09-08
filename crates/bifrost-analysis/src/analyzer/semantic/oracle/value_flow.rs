@@ -8,8 +8,8 @@ use super::super::ir::{
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
 use super::model::{
-    AbstractLocation, AbstractObjectIdentity, ExecutionTimingClaim, OracleCallContext,
-    ProcedurePortHandle, ProcedurePortKind,
+    AbstractLocation, AbstractObjectIdentity, AccessSelector, ExecutionTimingClaim,
+    OracleCallContext, ProcedurePortHandle, ProcedurePortKind,
 };
 use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
@@ -543,6 +543,73 @@ pub struct ValueFlowRelation {
 }
 
 impl ValueFlowRelation {
+    /// Whether this dependency also establishes unchanged runtime class.
+    /// Element-to-container dependence and language computations are not
+    /// class identity. Retain them for value-flow, but not for class copying.
+    fn preserves_runtime_class(&self, chains: &mut Option<MemoryAccessChains>) -> bool {
+        let point = self
+            .point
+            .procedure()
+            .semantics()
+            .point(self.point.id())
+            .expect("a validated relation belongs to a retained point");
+        let index = self.event_index as usize;
+        let event = &point.events[index];
+        match self.kind {
+            ValueFlowRelationKind::Assignment => match event.effect {
+                SemanticEffect::Assignment { .. } => {
+                    // The immediately following marker overrides the plain
+                    // assignment for identity consumers. Only its own row
+                    // can establish whether the transfer preserves class.
+                    !point.assignment_has_transfer_marker(index)
+                }
+                SemanticEffect::ValueFlow { kind, .. } => kind.preserves_runtime_class(),
+                _ => unreachable!("validated assignment relation has an assignment event"),
+            },
+            ValueFlowRelationKind::MemoryLoad | ValueFlowRelationKind::MemoryStore => {
+                let (location, endpoint) = match event.effect {
+                    SemanticEffect::MemoryLoad { location, .. } => (location, &self.source),
+                    SemanticEffect::MemoryStore { location, .. } => (location, &self.target),
+                    _ => unreachable!("validated memory relation has a memory event"),
+                };
+                let procedure = self.point.procedure();
+                if matches!(
+                    procedure
+                        .semantics()
+                        .memory_location(location)
+                        .expect("validated memory location")
+                        .kind,
+                    MemoryLocationKind::Index {
+                        identity: super::super::ir::IndexedLocationIdentity::Aggregate,
+                        ..
+                    }
+                ) {
+                    return false;
+                }
+                // Indexed accesses also publish dependencies on the whole
+                // container. Only an element location transports its stored
+                // value's class; the container/base endpoint does not.
+                !chains
+                    .get_or_insert_with(|| MemoryAccessChains::derive(procedure))
+                    .is_indexed(procedure, location)
+                    || matches!(endpoint, ValueFlowEndpoint::Location(location)
+                        if location.path().selectors().iter().any(|selector|
+                            matches!(selector, AccessSelector::Index(_))))
+            }
+            ValueFlowRelationKind::Parameter
+            | ValueFlowRelationKind::Receiver
+            | ValueFlowRelationKind::NormalReturn
+            | ValueFlowRelationKind::ExceptionalReturn
+            | ValueFlowRelationKind::Capture
+            | ValueFlowRelationKind::HandlerBinding => true,
+            // Allocation classes are independently seeded at the allocation
+            // result, never inherited from the abstract object's contents.
+            ValueFlowRelationKind::Allocation
+            | ValueFlowRelationKind::ContainerCollapse
+            | ValueFlowRelationKind::LanguageDefined => false,
+        }
+    }
+
     pub fn point(&self) -> &ProgramPointHandle {
         &self.point
     }
@@ -700,6 +767,19 @@ impl ValueFlowSnapshot {
 
     pub fn relations(&self) -> &[ValueFlowRelation] {
         &self.relations
+    }
+
+    /// Restrict an already validated snapshot to runtime-class identity flow.
+    /// Retained rows keep their original evidence, owner, and arena identity;
+    /// materialization coverage and discharged gaps are not reinterpreted.
+    /// The client must independently account for results of excluded transfers
+    /// rather than treating the missing dependency as proof of absence.
+    pub fn into_class_identity_projection(mut self) -> Self {
+        let mut relations = self.relations.into_vec();
+        let mut chains = None;
+        relations.retain(|relation| relation.preserves_runtime_class(&mut chains));
+        self.relations = relations.into_boxed_slice();
+        self
     }
 
     pub fn context(&self) -> &OracleCallContext {

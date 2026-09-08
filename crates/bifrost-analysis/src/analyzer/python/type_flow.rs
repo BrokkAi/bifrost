@@ -2,51 +2,65 @@
 //! type-flow engine cannot derive from the language-neutral semantic IR.
 //!
 //! Every answer comes from structured sources: the semantic IR's exact source
-//! mappings, the analyzer's prepared tree-sitter syntax, `resolve_type_batch`
+//! mappings, the analyzer's prepared tree-sitter syntax, bounded direct-site type lookup
 //! for callee and annotation resolution, the declaration index for class
 //! members, and the active semantic-model overlay for external classes. No
 //! source text is parsed or scanned here; reading a node's text at an
 //! AST-provided span is structured access.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
+use brokk_bifrost_python::bindings::{
+    PythonLexicalNameResolution, python_comprehension_binds_name_at,
+    python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
+    python_unambiguous_module_class_binding_bounded,
+};
+use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
 use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
 
 use super::PythonAnalyzer;
+use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::type_flow::{
-    ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, ExternalMemberDeclaration,
-    GuardArmSide, MemberAccessQuery, MemberDeclaration, MemberLookup, NarrowingVerdict,
-    TypeFlowAdapter, UnknownReason,
+    ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, ExternalClassCache,
+    MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit,
+    NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter, UnknownReason,
+    analyzer_range_for_span, class_seed_from_lookup_types, external_class_identity,
+    external_member_lookup, file_for_locator, source_span_for_node,
+    validate_prepared_syntax_for_procedure,
 };
 use crate::analyzer::semantic::{
-    AllocationSite, GuardFact, GuardPredicate, MemoryLocationKind, ProcedureHandle, ProcedureKind,
-    SemanticCallSite, SemanticLocator, SemanticValue, SourceMappingKind, SourcePosition,
-    SourceSpan, ValueId,
+    AdapterSemanticsVersion, AllocationSite, CandidateCoverage, GuardFact, GuardPredicate,
+    MemoryLocationKind, ProcedureHandle, ProcedureKind, SemanticCallSite, SemanticEffect,
+    SemanticValue, SemanticValueKind, SourceMappingKind, SourceSpan, ValueFlowKind, ValueId,
 };
 use crate::analyzer::semantic_model::{
-    SemanticModelMemberTargetDisposition, SemanticModelOverlay, SemanticModelOverlayDisposition,
-    SemanticModelSymbolKind,
+    ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
+    SemanticModelOverlay, SemanticModelSymbolKind, semantic_model_callable_family_id,
+};
+use crate::analyzer::usages::get_definition::{
+    PythonDefinitionProvider, ResolutionSession, python_external_imported_symbol_bounded,
+    python_namespace_imported_class_name_bounded,
 };
 use crate::analyzer::usages::get_type::{
-    TypeLookupRequest, TypeLookupStatus, TypeLookupType, resolve_type_batch,
+    TypeLookupStatus, resolve_type_at_reference_site_with_budget,
 };
+use crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, CodeUnitIndex, Language, ProjectFile, QueryScope,
     TypeHierarchyProvider, WorkspaceAnalyzer, resolve_analyzer,
 };
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
+use crate::path_utils::rel_path_string;
 
 /// The Python [`TypeFlowAdapter`]. Zero-sized: every method receives the
 /// workspace it consults.
 pub struct PythonTypeFlowAdapter;
 
 /// One name-resolution cache, local to a single adapter call.
-type ExternalClassCache = HashMap<Box<str>, Option<ClassIdentity>>;
-
 fn python_analyzer(workspace: &WorkspaceAnalyzer) -> &PythonAnalyzer {
     resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
         .expect("PythonTypeFlowAdapter serves only workspaces that analyze Python")
@@ -59,55 +73,29 @@ fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>
         .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
 }
 
-fn external_member_lookup(
-    overlay: &SemanticModelOverlay,
-    owner_id: &str,
-    member: &str,
-) -> MemberLookup {
-    let matched = overlay.member_target_on_owner(owner_id, member);
-    match matched.disposition {
-        SemanticModelMemberTargetDisposition::Unique => {
-            MemberLookup::Present(MemberDeclaration::External(ExternalMemberDeclaration::new(
-                matched
-                    .records
-                    .into_iter()
-                    .map(|record| Box::from(record.id.as_str())),
-            )))
-        }
-        SemanticModelMemberTargetDisposition::Conflict
-            if overlay.member_present_on_owner(owner_id, member) =>
-        {
-            MemberLookup::Present(MemberDeclaration::External(ExternalMemberDeclaration::new(
-                matched
-                    .records
-                    .into_iter()
-                    .map(|record| Box::from(record.id.as_str())),
-            )))
-        }
-        SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
-        SemanticModelMemberTargetDisposition::Incomplete
-        | SemanticModelMemberTargetDisposition::Conflict => {
-            MemberLookup::Unknown(UnknownReason::PackIncomplete)
-        }
-    }
-}
-
-fn file_for_locator(
+fn prepared_for_procedure(
     workspace: &WorkspaceAnalyzer,
-    locator: &SemanticLocator,
-) -> Option<ProjectFile> {
-    workspace
-        .analyzer()
-        .project()
-        .file_by_rel_path(Path::new(locator.path().as_str()))
-}
-
-fn prepared_for(python: &PythonAnalyzer, file: &ProjectFile) -> Arc<PreparedSyntaxTree> {
+    procedure: &ProcedureHandle,
+    file: &ProjectFile,
+) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
+    let python = python_analyzer(workspace);
     let scope = AnalyzerQueryScope::new(python);
-    python
+    let prepared = python
         .inner
         .prepared_syntax(scope.token(), file)
-        .expect("a materialized procedure's file has prepared syntax")
+        .ok_or(UnknownReason::UncertainFlow)?;
+    validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
+}
+
+fn current_indexed_prepared(
+    python: &PythonAnalyzer,
+    file: &ProjectFile,
+) -> Option<Arc<PreparedSyntaxTree>> {
+    let scope = AnalyzerQueryScope::new(python);
+    let prepared = python.inner.prepared_syntax(scope.token(), file)?;
+    (matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
+        && python.indexed_source_matches(file, prepared.source()))
+    .then_some(prepared)
 }
 
 fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
@@ -125,28 +113,11 @@ fn node_text_at(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Box<s
 }
 
 fn span_for_node(node: Node<'_>) -> SourceSpan {
-    SourceSpan::new(
-        SourcePosition::new(
-            node.start_byte() as u32,
-            node.start_position().row as u32,
-            node.start_position().column as u32,
-        ),
-        SourcePosition::new(
-            node.end_byte() as u32,
-            node.end_position().row as u32,
-            node.end_position().column as u32,
-        ),
-    )
-    .expect("a tree-sitter node range is a valid source span")
+    source_span_for_node(node)
 }
 
 fn range_for_span(span: SourceSpan) -> crate::analyzer::Range {
-    crate::analyzer::Range {
-        start_byte: span.start_byte() as usize,
-        end_byte: span.end_byte() as usize,
-        start_line: span.start().line() as usize,
-        end_line: span.end().line() as usize,
-    }
+    analyzer_range_for_span(span)
 }
 
 fn enclosing_workspace_class(
@@ -178,9 +149,7 @@ fn class_node_for_unit<'tree>(
             .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
         match node.kind() {
             "class_definition" => Some(node),
-            "decorated_definition" => node
-                .named_child(0)
-                .filter(|definition| definition.kind() == "class_definition"),
+            "decorated_definition" => class_definition_node(node),
             _ => node
                 .parent()
                 .filter(|parent| parent.kind() == "class_definition"),
@@ -256,31 +225,365 @@ fn dictionary_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
     )
 }
 
-/// The overlay's unique class symbol for `name`, when exactly one active pack
-/// record publishes it as a class.
-fn external_class(
-    overlay: Option<&SemanticModelOverlay>,
-    name: &str,
-    cache: &mut ExternalClassCache,
-) -> Option<ClassIdentity> {
-    if let Some(cached) = cache.get(name) {
-        return cached.clone();
+fn class_definition_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "class_definition" {
+        return Some(node);
     }
-    let resolved = overlay.and_then(|overlay| {
-        let matches = overlay.symbols_named(name);
-        if matches.disposition != SemanticModelOverlayDisposition::Unique {
+    (node.kind() == "decorated_definition")
+        .then(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "class_definition")
+        })
+        .flatten()
+}
+
+fn writes_member_name(node: Node<'_>, source: &str, member: &str) -> bool {
+    if matches!(node.kind(), "assignment" | "augmented_assignment") {
+        if assignment_name(node, source) == Some(member) {
+            return true;
+        }
+        if let Some(left) = node.child_by_field_name("left") {
+            if left.kind() == "attribute"
+                && left
+                    .child_by_field_name("attribute")
+                    .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                    == Some(member)
+            {
+                return true;
+            }
+            if let Some(write) = dictionary_write(node, source) {
+                return match write {
+                    DynamicFieldWrite::Any => true,
+                    DynamicFieldWrite::Member(name) => name.as_ref() == member,
+                };
+            }
+        }
+    }
+    if node.kind() != "call" {
+        return false;
+    }
+    if let Some(write) = setattr_write(node, source) {
+        return match write {
+            DynamicFieldWrite::Any => true,
+            DynamicFieldWrite::Member(name) => name.as_ref() == member,
+        };
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "attribute" {
+        return false;
+    }
+    let Some(attribute) = function.child_by_field_name("attribute") else {
+        return false;
+    };
+    let Ok(attribute) = attribute.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    if attribute == "__setattr__" {
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return true;
+        };
+        let mut cursor = arguments.walk();
+        let actuals = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+        return actuals
+            .first()
+            .and_then(|name| python_plain_string_literal(*name, source))
+            .is_none_or(|name| name == member);
+    }
+    // Any operation through __dict__ can mutate this member without an
+    // assignment node (for example, self.__dict__.update(...)). The exact
+    // key is unavailable from the generic mapping, so fail closed.
+    function
+        .child_by_field_name("object")
+        .and_then(|object| object.child_by_field_name("attribute"))
+        .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+        == Some("__dict__")
+}
+
+/// Whether a workspace class can shadow an inherited modeled member through
+/// class state or an instance/dynamic write. This intentionally errs toward
+/// no narrowing: an unnameable dynamic write is enough to invalidate the
+/// external member contract.
+fn python_class_member_shadowed_bounded(
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+    member: &str,
+) -> Option<bool> {
+    let prepared = current_indexed_prepared(python, owner.source())?;
+    let class = class_node_for_unit(python, &prepared, owner)?;
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let mut stack = vec![class];
+    while let Some(node) = stack.pop() {
+        if !session.scope_step() {
             return None;
         }
-        let [symbol] = matches.records.as_slice() else {
+        if node != class && class_definition_node(node).is_some() {
+            continue;
+        }
+        if writes_member_name(node, prepared.source(), member) {
+            return Some(true);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    python
+        .indexed_source_matches(owner.source(), prepared.source())
+        .then_some(false)
+}
+
+fn python_class_hierarchy_member_unshadowed_bounded(
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+    member: &str,
+) -> Option<bool> {
+    let mut owners = vec![owner.clone()];
+    owners.extend(python.get_ancestors(owner));
+    for owner in owners {
+        match python_class_member_shadowed_bounded(python, &owner, member) {
+            Some(false) => {}
+            Some(true) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
+}
+
+fn external_instance_method_present_on_owner(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> bool {
+    let matched = overlay.member_target_on_owner(owner_id, member);
+    let [record] = matched.records.as_slice() else {
+        return false;
+    };
+    matched.disposition
+        == crate::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Unique
+        && record.language == Language::Python.config_label()
+        && record.kind == SemanticModelSymbolKind::Method
+        && !record.is_static()
+        && record.has_receiver()
+        && !record.provenance.ambiguous
+        && record.provenance.completeness == SemanticModelCompleteness::Complete
+}
+
+fn complete_builtin_external_class(overlay: &SemanticModelOverlay, class: &ClassIdentity) -> bool {
+    let ClassIdentity::External {
+        qualified_name,
+        symbol_id,
+    } = class
+    else {
+        return false;
+    };
+    if !qualified_name.starts_with("builtins.") {
+        return false;
+    }
+    let matched = overlay.symbols_with_id(symbol_id);
+    let [record] = matched.records.as_slice() else {
+        return false;
+    };
+    record.language == Language::Python.config_label()
+        && record.owner_id.is_none()
+        && record.kind == SemanticModelSymbolKind::Class
+        && record.qualified_name == qualified_name.as_ref()
+        && !record.provenance.ambiguous
+        && record.provenance.completeness == SemanticModelCompleteness::Complete
+}
+
+/// A decorator can replace the class value even when its source declaration
+/// has an ordinary metaclass. Only exact reviewed direct/factory contracts
+/// establish that the declared identity survives every decorator application.
+fn class_decorators_preserve_identity(
+    workspace: &WorkspaceAnalyzer,
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+    prepared: &PreparedSyntaxTree,
+    class: Node<'_>,
+) -> Option<bool> {
+    let Some(decorated) = class
+        .parent()
+        .filter(|node| node.kind() == "decorated_definition")
+    else {
+        return Some(true);
+    };
+    let snapshot = workspace.analyzer().active_semantic_model_snapshot()?;
+    let overlay = snapshot.semantic_model_overlay()?;
+    let active = snapshot.active_models();
+    let scope = AnalyzerQueryScope::new(python);
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let support = PythonDefinitionProvider::new(python, &session);
+    let mut cursor = decorated.walk();
+    for decorator in decorated.named_children(&mut cursor) {
+        if !session.scope_step() {
             return None;
+        }
+        if decorator.kind() != "decorator" {
+            continue;
+        }
+        let mut decorator_cursor = decorator.walk();
+        let mut expressions = decorator
+            .named_children(&mut decorator_cursor)
+            .filter(|node| !node.is_extra());
+        let expression = expressions.next()?;
+        if expressions.next().is_some() {
+            return None;
+        }
+        let mut keywords = Vec::new();
+        let callee = if expression.kind() == "call" {
+            let arguments = expression.child_by_field_name("arguments")?;
+            let mut names = HashSet::default();
+            let mut argument_cursor = arguments.walk();
+            for argument in arguments
+                .named_children(&mut argument_cursor)
+                .filter(|node| !node.is_extra())
+            {
+                if !session.scope_step() || argument.kind() != "keyword_argument" {
+                    return None;
+                }
+                let name = argument
+                    .child_by_field_name("name")?
+                    .utf8_text(prepared.source().as_bytes())
+                    .ok()?;
+                let value = match argument.child_by_field_name("value")?.kind() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return None,
+                };
+                if !names.insert(name) {
+                    return None;
+                }
+                keywords.push((name, value));
+            }
+            expression.child_by_field_name("function")?
+        } else {
+            expression
         };
-        (symbol.kind == SemanticModelSymbolKind::Class).then(|| ClassIdentity::External {
-            qualified_name: name.into(),
-            symbol_id: symbol.id.clone().into_boxed_str(),
-        })
-    });
-    cache.insert(name.into(), resolved.clone());
-    resolved
+        let (module, member) = python_external_imported_symbol_bounded(
+            &support,
+            scope.token(),
+            owner.source(),
+            prepared.source(),
+            prepared.tree().root_node(),
+            callee,
+        )?;
+        let canonical = format!("{module}.{member}");
+        let symbols = overlay.symbols_named(&canonical);
+        // Overload declarations may share this exact callable identity. Every
+        // declaration must agree; an alias posting alone is not exact binding.
+        if semantic_model_callable_family_id(&symbols.records).is_none()
+            || symbols.records.iter().any(|symbol| {
+                symbol.qualified_name != canonical
+                    || symbol.language != Language::Python.config_label()
+                    || symbol.kind != SemanticModelSymbolKind::Function
+                    || symbol.has_receiver()
+                    || symbol.provenance.ambiguous
+                    || symbol.provenance.completeness != SemanticModelCompleteness::Complete
+            })
+        {
+            return None;
+        }
+        let arity = if expression.kind() == "call" {
+            u32::try_from(keywords.len()).ok()?
+        } else {
+            1
+        };
+        let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+            Language::Python.config_label(),
+            &module,
+            &member,
+            false,
+            arity,
+        ));
+        if matched.disposition != SemanticModelMatchDisposition::Unique
+            || matched.records.len() != 1
+        {
+            return None;
+        }
+        let selected = &matched.records[0];
+        let provenance = selected.provenance(active);
+        if provenance.ambiguous || provenance.completeness != SemanticModelCompleteness::Complete {
+            return None;
+        }
+        let identity = selected.class_decorator_identity()?;
+        if expression.kind() == "call" {
+            let allowed = identity.factory_keywords.as_ref()?;
+            if keywords.iter().any(|(name, value)| {
+                !allowed
+                    .iter()
+                    .any(|keyword| keyword.name == *name && keyword.allowed_values.contains(value))
+            }) {
+                return None;
+            }
+        } else if !identity.direct {
+            return None;
+        }
+    }
+    (session.scope_step() && python.indexed_source_matches(owner.source(), prepared.source()))
+        .then_some(true)
+}
+
+fn workspace_class_uses_ordinary_metaclass(
+    workspace: &WorkspaceAnalyzer,
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
+    overlay: Option<&SemanticModelOverlay>,
+) -> bool {
+    let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
+        return false;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, owner) else {
+        return false;
+    };
+    if class.child_by_field_name("body").is_none() {
+        return false;
+    }
+    if class_decorators_preserve_identity(workspace, python, owner, &prepared, class) != Some(true)
+    {
+        return false;
+    }
+    let Some(superclasses) = class.child_by_field_name("superclasses") else {
+        return true;
+    };
+    let mut cursor = superclasses.walk();
+    for base in superclasses.named_children(&mut cursor) {
+        if base.kind() != "keyword_argument" {
+            continue;
+        }
+        let Some(name) = base.child_by_field_name("name") else {
+            return false;
+        };
+        let Ok(name) = name.utf8_text(prepared.source().as_bytes()) else {
+            return false;
+        };
+        if name != "metaclass" {
+            // Other class-header keyword arguments are also metaclass- or
+            // class-construction behavior not represented by this proof.
+            return false;
+        }
+        let Some(value) = base.child_by_field_name("value") else {
+            return false;
+        };
+        let identity = match resolve_class_at_span(
+            workspace,
+            owner.source().clone(),
+            span_for_node(value),
+            &prepared,
+        ) {
+            ClassSeed::Class(identity) => identity,
+            ClassSeed::ClassWithOpenBound(_)
+            | ClassSeed::ClassesWithOpenBound(_)
+            | ClassSeed::Unknown(_)
+            | ClassSeed::NotApplicable => return false,
+        };
+        if identity.qualified_name() != "builtins.type"
+            || overlay.is_none_or(|overlay| !complete_builtin_external_class(overlay, &identity))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn external_seed(
@@ -288,40 +591,119 @@ fn external_seed(
     name: &str,
     cache: &mut ExternalClassCache,
 ) -> ClassSeed {
-    match external_class(overlay, name, cache) {
+    match external_class_identity(overlay, Language::Python, name, None, cache) {
         Some(identity) => ClassSeed::Class(identity),
         None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
     }
 }
 
-/// Interpret one type lookup as a class seed: exactly one type whose single
-/// definition is a class is a workspace class; a definition-free type the
-/// overlay knows as a unique class is an external class. Functions and
-/// unresolved names are not classes; competing answers are ambiguous.
-fn class_seed_from_types(
+/// Raw supertypes retain source spelling, not a resolved import identity. A
+/// terminal-name overlay match such as `ABC` -> `abc.ABC` is therefore not a
+/// proof of the base. A builtin spelling is accepted only after proving that
+/// the actual base expression has no competing lexical or module binding.
+fn exact_external_base(
+    python: &PythonAnalyzer,
+    owner: &CodeUnit,
     overlay: Option<&SemanticModelOverlay>,
-    types: &[TypeLookupType],
-) -> ClassSeed {
-    let [lookup] = types else {
-        return if types.is_empty() {
-            ClassSeed::NotApplicable
-        } else {
-            ClassSeed::Unknown(UnknownReason::AmbiguousCallee)
-        };
+    raw: &str,
+    cache: &mut ExternalClassCache,
+) -> Option<ClassIdentity> {
+    let raw = raw.trim();
+    let prepared = current_indexed_prepared(python, owner.source())?;
+    let class = class_node_for_unit(python, &prepared, owner)?;
+    let bases = class.child_by_field_name("superclasses")?;
+    let mut cursor = bases.walk();
+    let base = bases
+        .named_children(&mut cursor)
+        .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(raw))?;
+    let identity = if base.kind() == "attribute" {
+        let scope = AnalyzerQueryScope::new(python);
+        let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+        let token = scope.token();
+        let support = PythonDefinitionProvider::new(python, &session);
+        let canonical = python_namespace_imported_class_name_bounded(
+            &support,
+            token,
+            owner.source(),
+            prepared.source(),
+            prepared.tree().root_node(),
+            base,
+        )?;
+        if canonical != raw {
+            return None;
+        }
+        let identity = external_class_identity(overlay, Language::Python, &canonical, None, cache)?;
+        if identity.qualified_name() != canonical {
+            // Exact exported aliases name the same external declaration.
+            // A terminal-name posting alone is not proof of this base.
+            let ClassIdentity::External { symbol_id, .. } = &identity else {
+                unreachable!("external class lookup returns an external identity")
+            };
+            let matched = overlay?.symbols_with_id(symbol_id);
+            let [record] = matched.records.as_slice() else {
+                return None;
+            };
+            if !record.aliases.iter().any(|alias| alias == &canonical) {
+                return None;
+            }
+        }
+        identity
+    } else {
+        if base.kind() != "identifier" {
+            return None;
+        }
+        let identity = external_class_identity(overlay, Language::Python, raw, None, cache)?;
+        let builtin_name = format!("builtins.{raw}");
+        if identity.qualified_name() != builtin_name || !is_python_builtin_or_constant(raw) {
+            return None;
+        }
+        if !builtin_base_is_unshadowed(base, prepared.source())? {
+            return None;
+        }
+        identity
     };
-    match lookup.definitions.as_slice() {
-        [definition] if definition.is_class() => {
-            ClassSeed::Class(ClassIdentity::Workspace(definition.clone()))
-        }
-        [_not_a_class] => ClassSeed::NotApplicable,
-        [] => {
-            let mut cache = ExternalClassCache::default();
-            external_class(overlay, &lookup.fqn, &mut cache)
-                .map(ClassSeed::Class)
-                .unwrap_or(ClassSeed::NotApplicable)
-        }
-        _ => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
+    python
+        .indexed_source_matches(owner.source(), prepared.source())
+        .then_some(identity)
+}
+
+fn builtin_base_is_unshadowed(reference: Node<'_>, source: &str) -> Option<bool> {
+    let name = reference.utf8_text(source.as_bytes()).ok()?;
+    if python_comprehension_binds_name_at(name, reference, source)
+        || python_type_parameter_binds_name_at(name, reference, source)
+    {
+        return Some(false);
     }
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let mut current = reference;
+    let mut crossed_callable_body = false;
+    while let Some(scope) = current.parent() {
+        if !session.scope_step() {
+            return None;
+        }
+        let body = scope.child_by_field_name("body");
+        let inside_body = body.is_some_and(|body| {
+            body.start_byte() <= reference.start_byte() && reference.end_byte() <= body.end_byte()
+        });
+        if inside_body && matches!(scope.kind(), "function_definition" | "lambda") {
+            let inventory =
+                python_lexical_scope_inventory_bounded(scope, source, || session.scope_step())?;
+            if inventory.name_resolution_at(name, reference) != PythonLexicalNameResolution::Unbound
+            {
+                return Some(false);
+            }
+            crossed_callable_body = true;
+        } else if (scope.kind() == "module"
+            || (!crossed_callable_body && inside_body && scope.kind() == "class_definition"))
+            && python_module_or_class_scope_binds_name_bounded(scope, name, source, || {
+                session.scope_step()
+            })?
+        {
+            return Some(false);
+        }
+        current = scope;
+    }
+    Some(true)
 }
 
 /// Resolve the expression at `span` in `file` and interpret it as a class seed.
@@ -329,19 +711,39 @@ fn resolve_class_at_span(
     workspace: &WorkspaceAnalyzer,
     file: ProjectFile,
     span: SourceSpan,
+    prepared: &PreparedSyntaxTree,
 ) -> ClassSeed {
-    let mut outcomes = resolve_type_batch(
+    let indexed_source = prepared.source();
+    if !workspace
+        .analyzer()
+        .indexed_source_matches(&file, indexed_source)
+    {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
+    let range = analyzer_range_for_span(span);
+    let Some(text) = indexed_source.get(range.start_byte..range.end_byte) else {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    };
+    let outcome = resolve_type_at_reference_site_with_budget(
         workspace.analyzer(),
-        vec![TypeLookupRequest {
-            file,
-            source: None,
-            line: None,
-            column: None,
-            start_byte: Some(span.start_byte() as usize),
-            end_byte: Some(span.end_byte() as usize),
-        }],
+        &file,
+        indexed_source,
+        Some(prepared.tree()),
+        ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: text.to_string(),
+            focus_start_byte: range.start_byte,
+            focus_end_byte: range.end_byte,
+            range,
+        },
+        INTERACTIVE_TYPE_LOOKUP_BUDGET,
     );
-    let outcome = outcomes.pop().expect("one request produces one outcome");
+    if !workspace
+        .analyzer()
+        .indexed_source_matches(&file, indexed_source)
+    {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
     match outcome.status {
         // The interactive receiver-resolution budget bounds analyzer-side
         // semantic work (scope and definition walks), not the dataflow
@@ -358,7 +760,11 @@ fn resolve_class_at_span(
         | TypeLookupStatus::InvalidLocation
         | TypeLookupStatus::NotFound => {}
     }
-    class_seed_from_types(overlay_of(workspace).as_deref(), &outcome.types)
+    class_seed_from_lookup_types(
+        overlay_of(workspace).as_deref(),
+        Language::Python,
+        &outcome.types,
+    )
 }
 
 impl PythonTypeFlowAdapter {
@@ -390,7 +796,7 @@ impl PythonTypeFlowAdapter {
             return None;
         }
         let file = file_for_locator(workspace, &mapping.locator)?;
-        let prepared = prepared_for(python_analyzer(workspace), &file);
+        let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
         let node = self.guard_value_node(procedure, value, &prepared)?;
         let nodes = if node.kind() == "tuple" {
             let mut cursor = node.walk();
@@ -405,12 +811,60 @@ impl PythonTypeFlowAdapter {
             .into_iter()
             .map(|class| {
                 let span = span_for_node(class);
-                match resolve_class_at_span(workspace, file.clone(), span) {
+                match resolve_class_at_span(workspace, file.clone(), span, &prepared) {
                     ClassSeed::Class(class) => Some(class),
-                    ClassSeed::Unknown(_) | ClassSeed::NotApplicable => None,
+                    ClassSeed::ClassWithOpenBound(_)
+                    | ClassSeed::ClassesWithOpenBound(_)
+                    | ClassSeed::Unknown(_)
+                    | ClassSeed::NotApplicable => None,
                 }
             })
             .collect()
+    }
+
+    fn guard_classes_have_supported_instance_checks(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        classes: &[ClassIdentity],
+        overlay: Option<&SemanticModelOverlay>,
+    ) -> bool {
+        let python = python_analyzer(workspace);
+        for class in classes {
+            match class {
+                ClassIdentity::External { .. } => {
+                    if overlay
+                        .is_none_or(|overlay| !complete_builtin_external_class(overlay, class))
+                    {
+                        return false;
+                    }
+                }
+                ClassIdentity::Workspace(_) => {
+                    let hierarchy = self.class_hierarchy(workspace, class);
+                    if hierarchy.unresolved_base {
+                        return false;
+                    }
+                    for ancestor in std::iter::once(class).chain(hierarchy.ancestors.iter()) {
+                        match ancestor {
+                            ClassIdentity::Workspace(owner) => {
+                                if !workspace_class_uses_ordinary_metaclass(
+                                    workspace, python, owner, overlay,
+                                ) {
+                                    return false;
+                                }
+                            }
+                            ClassIdentity::External { .. } => {
+                                if overlay.is_none_or(|overlay| {
+                                    !complete_builtin_external_class(overlay, ancestor)
+                                }) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn instance_relation(
@@ -461,7 +915,7 @@ impl PythonTypeFlowAdapter {
             if resolved {
                 continue;
             }
-            match external_class(overlay.as_deref(), &raw, &mut cache) {
+            match exact_external_base(python, unit, overlay.as_deref(), &raw, &mut cache) {
                 Some(identity) => external_bases.push(identity),
                 None => return MemberLookup::Unknown(UnknownReason::UnresolvedBase),
             }
@@ -472,7 +926,10 @@ impl PythonTypeFlowAdapter {
                 .into_iter()
                 .find(|child| child.terminal_name() == member)
             {
-                return MemberLookup::Present(MemberDeclaration::Workspace(declaration));
+                return MemberLookup::Present(MemberLookupHit::new(
+                    MemberDeclaration::Workspace(declaration),
+                    CandidateCoverage::Exhaustive,
+                ));
             }
         }
         for base in &external_bases {
@@ -497,6 +954,200 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         Language::Python
     }
 
+    fn semantics_version(&self) -> AdapterSemanticsVersion {
+        AdapterSemanticsVersion::hash_bytes(
+            "python-type-flow",
+            b"python-type-flow-exact-prepared-syntax-v11",
+        )
+        .expect("adapter name is non-empty")
+    }
+
+    fn computed_class(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        value: &SemanticValue,
+    ) -> ClassSeed {
+        let mapping = procedure
+            .semantics()
+            .source_mapping(value.source)
+            .expect("a computed value retains a source mapping");
+        if mapping.kind != SourceMappingKind::Exact {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
+        let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        };
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
+        let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        };
+        let name = match node.kind() {
+            "call" => {
+                let Some(function) = node.child_by_field_name("function") else {
+                    return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                };
+                let is_builtin_str = function.kind() == "identifier"
+                    && function.utf8_text(prepared.source().as_bytes()).ok() == Some("str")
+                    && is_python_builtin_or_constant("str")
+                    && builtin_base_is_unshadowed(function, prepared.source()) == Some(true);
+                if is_builtin_str {
+                    "builtins.str"
+                } else {
+                    return ClassSeed::NotApplicable;
+                }
+            }
+            "not_operator" => "builtins.bool",
+            "string" | "concatenated_string" => "builtins.str",
+            "boolean_operator" | "binary_operator" | "unary_operator" => {
+                return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+            }
+            _ => return ClassSeed::NotApplicable,
+        };
+        let mut cache = ExternalClassCache::default();
+        external_seed(overlay_of(workspace).as_deref(), name, &mut cache)
+    }
+
+    fn retained_value_class(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        value: &SemanticValue,
+    ) -> ClassSeed {
+        let mapping = procedure
+            .semantics()
+            .source_mapping(value.source)
+            .expect("a retained value retains a source mapping");
+        if mapping.kind != SourceMappingKind::Exact {
+            return ClassSeed::NotApplicable;
+        }
+        let Some(file) = file_for_locator(workspace, &mapping.locator) else {
+            return ClassSeed::NotApplicable;
+        };
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
+        let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
+            return ClassSeed::NotApplicable;
+        };
+        if matches!(value.kind, SemanticValueKind::DefaultArgument { .. }) {
+            // A saved default is not evaluated in the callee. In particular,
+            // identifiers must not be interpreted as reads of its parameters
+            // or locals, and container defaults are not fresh allocations.
+            let literal = self.constant_class(workspace, procedure, value);
+            if !matches!(literal, ClassSeed::NotApplicable) {
+                return literal;
+            }
+            let container = match node.kind() {
+                "list" => Some("builtins.list"),
+                "dictionary" => Some("builtins.dict"),
+                "tuple" => Some("builtins.tuple"),
+                "set" => Some("builtins.set"),
+                _ => None,
+            };
+            if let Some(name) = container {
+                let mut cache = ExternalClassCache::default();
+                return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
+            }
+            if node.kind() == "call"
+                && let Some(function) = node.child_by_field_name("function")
+            {
+                // A constructor's name must denote the same class at
+                // definition time. Do not resolve a factory, a rebound name,
+                // or a name captured from an enclosing callable as a class.
+                let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+                if function.kind() != "identifier" {
+                    return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                }
+                let Ok(name) = function.utf8_text(prepared.source().as_bytes()) else {
+                    return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                };
+                if python_unambiguous_module_class_binding_bounded(
+                    prepared.tree().root_node(),
+                    prepared.source(),
+                    name,
+                    || session.scope_step(),
+                ) != Some(true)
+                {
+                    return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                }
+                let mut ancestor = node.parent();
+                let mut defining_callable_seen = false;
+                while let Some(scope) = ancestor {
+                    if !session.scope_step() {
+                        return ClassSeed::Unknown(UnknownReason::SemanticBudget);
+                    }
+                    match scope.kind() {
+                        "function_definition" | "lambda" if !defining_callable_seen => {
+                            defining_callable_seen = true;
+                        }
+                        "function_definition" | "lambda" => {
+                            let Some(inventory) = python_lexical_scope_inventory_bounded(
+                                scope,
+                                prepared.source(),
+                                || session.scope_step(),
+                            ) else {
+                                return ClassSeed::Unknown(UnknownReason::SemanticBudget);
+                            };
+                            if !matches!(
+                                inventory.name_resolution_at(name, node),
+                                PythonLexicalNameResolution::Unbound
+                            ) {
+                                return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                            }
+                        }
+                        "class_definition"
+                            if python_module_or_class_scope_binds_name_bounded(
+                                scope,
+                                name,
+                                prepared.source(),
+                                || session.scope_step(),
+                            ) != Some(false) =>
+                        {
+                            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+                        }
+                        _ => {}
+                    }
+                    ancestor = scope.parent();
+                }
+                let seed =
+                    resolve_class_at_span(workspace, file, span_for_node(function), &prepared);
+                if let ClassSeed::Class(class @ ClassIdentity::Workspace(owner)) = &seed {
+                    let hierarchy = self.class_hierarchy(workspace, class);
+                    let overlay = overlay_of(workspace);
+                    if !hierarchy.unresolved_base
+                        && python_class_hierarchy_member_unshadowed_bounded(
+                            python_analyzer(workspace),
+                            owner,
+                            "__class__",
+                        ) == Some(true)
+                        && self.guard_classes_have_supported_instance_checks(
+                            workspace,
+                            std::slice::from_ref(class),
+                            overlay.as_deref(),
+                        )
+                        && matches!(
+                            self.member_lookup(workspace, MemberAccessKind::Call, class, "__new__"),
+                            MemberLookup::Absent
+                        )
+                    {
+                        return seed;
+                    }
+                }
+            }
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
+        if !matches!(node.kind(), "string" | "concatenated_string") {
+            return ClassSeed::NotApplicable;
+        }
+        let mut cache = ExternalClassCache::default();
+        external_seed(overlay_of(workspace).as_deref(), "builtins.str", &mut cache)
+    }
+
     fn constructed_class(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -516,7 +1167,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(file) = file_for_locator(workspace, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
-        resolve_class_at_span(workspace, file, mapping.locator.anchor().span())
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
+        resolve_class_at_span(workspace, file, mapping.locator.anchor().span(), &prepared)
     }
 
     fn constant_class(
@@ -525,7 +1180,6 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         value: &SemanticValue,
     ) -> ClassSeed {
-        let python = python_analyzer(workspace);
         let semantics = procedure.semantics();
         let mapping = semantics
             .source_mapping(value.source)
@@ -536,7 +1190,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(file) = file_for_locator(workspace, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
-        let prepared = prepared_for(python, &file);
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
         let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
             return ClassSeed::NotApplicable;
         };
@@ -558,7 +1215,6 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         allocation: &AllocationSite,
     ) -> ClassSeed {
-        let python = python_analyzer(workspace);
         let semantics = procedure.semantics();
         // An allocation that shares its result with a call site is the
         // same-file `A()` shape; `constructed_class` answers for the call.
@@ -575,7 +1231,10 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let Some(file) = file_for_locator(workspace, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
-        let prepared = prepared_for(python, &file);
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
         let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
             return ClassSeed::NotApplicable;
         };
@@ -597,12 +1256,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         ordinal: u32,
     ) -> ClassSeed {
-        let python = python_analyzer(workspace);
         let semantics = procedure.semantics();
         let Some(file) = file_for_locator(workspace, semantics.locator()) else {
             return ClassSeed::NotApplicable;
         };
-        let prepared = prepared_for(python, &file);
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(reason) => return ClassSeed::Unknown(reason),
+        };
         let Some(callable) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
             return ClassSeed::NotApplicable;
         };
@@ -668,6 +1329,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 ),
             )
             .expect("a tree-sitter node range is a valid source span"),
+            &prepared,
         )
     }
 
@@ -677,7 +1339,6 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         site: MemberAccessQuery<'_>,
     ) -> Option<Box<str>> {
-        let python = python_analyzer(workspace);
         let semantics = procedure.semantics();
         match site {
             MemberAccessQuery::Call(call) => {
@@ -688,7 +1349,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     .source_mapping(callee.source)
                     .expect("a callee value retains a source mapping");
                 let file = file_for_locator(workspace, &mapping.locator)?;
-                let prepared = prepared_for(python, &file);
+                let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
                 let node = node_at_span(&prepared, mapping.locator.anchor().span())?;
                 if node.kind() != "attribute" {
                     return None;
@@ -704,7 +1365,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                     return None;
                 };
                 let file = file_for_locator(workspace, member)?;
-                let prepared = prepared_for(python, &file);
+                let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
                 node_text_at(&prepared, member.anchor().span())
             }
         }
@@ -713,6 +1374,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     fn member_lookup(
         &self,
         workspace: &WorkspaceAnalyzer,
+        _kind: MemberAccessKind,
         class: &ClassIdentity,
         member: &str,
     ) -> MemberLookup {
@@ -764,7 +1426,13 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 }) {
                     continue;
                 }
-                match external_class(overlay.as_deref(), &raw, &mut external_cache) {
+                match exact_external_base(
+                    python,
+                    owner,
+                    overlay.as_deref(),
+                    &raw,
+                    &mut external_cache,
+                ) {
                     Some(identity) if !ancestors.contains(&identity) => ancestors.push(identity),
                     Some(_) => {}
                     None => unresolved_base = true,
@@ -818,7 +1486,9 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let python = python_analyzer(workspace);
         let file = unit.source();
-        let prepared = prepared_for(python, file);
+        let Some(prepared) = current_indexed_prepared(python, file) else {
+            return false;
+        };
         let Some(class) = class_node_for_unit(python, &prepared, unit) else {
             return false;
         };
@@ -850,12 +1520,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         workspace: &WorkspaceAnalyzer,
         procedure: &ProcedureHandle,
     ) -> Vec<DynamicFieldWrite> {
-        let python = python_analyzer(workspace);
         let semantics = procedure.semantics();
         let Some(file) = file_for_locator(workspace, semantics.locator()) else {
             return vec![DynamicFieldWrite::Any];
         };
-        let prepared = prepared_for(python, &file);
+        let prepared = match prepared_for_procedure(workspace, procedure, &file) {
+            Ok(prepared) => prepared,
+            Err(_) => return vec![DynamicFieldWrite::Any],
+        };
         let Some(callable) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
             return vec![DynamicFieldWrite::Any];
         };
@@ -888,58 +1560,554 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         writes
     }
 
-    fn narrowing_verdict(
+    fn narrowing_verdicts(
         &self,
         workspace: &WorkspaceAnalyzer,
         procedure: &ProcedureHandle,
         guard: &GuardFact,
-        atom: &ClassIdentity,
-        arm: GuardArmSide,
-    ) -> NarrowingVerdict {
-        let predicate_holds = match guard.predicate {
+        atoms: &[&ClassIdentity],
+    ) -> Vec<NarrowingVerdict> {
+        let unknown = || vec![NarrowingVerdict::Unknown; atoms.len()];
+        let verdict = |holds| match holds {
+            Some(true) => NarrowingVerdict::Keep,
+            Some(false) => NarrowingVerdict::Drop,
+            None => NarrowingVerdict::Unknown,
+        };
+        match guard.predicate {
             GuardPredicate::InstanceOf { classes, .. } => {
                 let Some(classes) = self.guard_classes(workspace, procedure, classes) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
-                let Some(relation) = self.instance_relation(workspace, atom, &classes) else {
-                    return NarrowingVerdict::Unknown;
-                };
-                relation
+                let overlay = overlay_of(workspace);
+                if !self.guard_classes_have_supported_instance_checks(
+                    workspace,
+                    &classes,
+                    overlay.as_deref(),
+                ) {
+                    return unknown();
+                }
+                atoms
+                    .iter()
+                    .map(|atom| verdict(self.instance_relation(workspace, atom, &classes)))
+                    .collect()
             }
             GuardPredicate::HasMember { member, .. } => {
                 let Some(value) = procedure.semantics().value(member) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
                 let Some(mapping) = procedure.semantics().source_mapping(value.source) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
                 let Some(file) = file_for_locator(workspace, &mapping.locator) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
-                let prepared = prepared_for(python_analyzer(workspace), &file);
+                let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+                    return unknown();
+                };
                 let Some(node) = node_at_span(&prepared, mapping.locator.anchor().span()) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
                 let Some(member) = python_plain_string_literal(node, prepared.source()) else {
-                    return NarrowingVerdict::Unknown;
+                    return unknown();
                 };
-                match self.member_lookup(workspace, atom, member) {
-                    MemberLookup::Present(_) => true,
-                    MemberLookup::Absent => false,
-                    MemberLookup::Unknown(_) => return NarrowingVerdict::Unknown,
-                }
+                atoms
+                    .iter()
+                    .map(|atom| {
+                        verdict(
+                            match self.member_lookup(
+                                workspace,
+                                MemberAccessKind::Load,
+                                atom,
+                                member,
+                            ) {
+                                MemberLookup::Present(_) => Some(true),
+                                MemberLookup::Absent => Some(false),
+                                MemberLookup::Unknown(_) => None,
+                            },
+                        )
+                    })
+                    .collect()
             }
-            GuardPredicate::NullComparison { null_on_true } => {
-                (atom.qualified_name() == "types.NoneType") == null_on_true
-            }
+            GuardPredicate::NullComparison { null_on_true } => atoms
+                .iter()
+                .map(|atom| {
+                    verdict(Some(
+                        (atom.qualified_name() == "types.NoneType") == null_on_true,
+                    ))
+                })
+                .collect(),
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::ConstantEquality { .. }
-            | GuardPredicate::Opaque { .. } => return NarrowingVerdict::Unknown,
-        };
-        if predicate_holds == matches!(arm, GuardArmSide::True) {
-            NarrowingVerdict::Keep
-        } else {
-            NarrowingVerdict::Drop
+            | GuardPredicate::Opaque { .. } => unknown(),
         }
+    }
+
+    fn normal_return_type_constraints(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        call: &SemanticCallSite,
+    ) -> Vec<NormalReturnTypeConstraint> {
+        if !matches!(
+            call.invocation_mode,
+            crate::analyzer::semantic::CallInvocationMode::Ordinary
+        ) {
+            return Vec::new();
+        }
+        let Some(receiver) = call.receiver else {
+            return Vec::new();
+        };
+        let semantics = procedure.semantics();
+        let Some(receiver_value) = semantics.value(receiver) else {
+            return Vec::new();
+        };
+        if !matches!(&receiver_value.kind, SemanticValueKind::Temporary) {
+            return Vec::new();
+        }
+        let Some(formal_receiver) = semantics.values().iter().find_map(|value| {
+            matches!(value.kind, SemanticValueKind::Receiver { dispatch: true }).then_some(value.id)
+        }) else {
+            return Vec::new();
+        };
+        if receiver == formal_receiver {
+            return Vec::new();
+        }
+        // The Python lowering represents `self.method(...)` with a temporary
+        // receiver value. Its one canonical input is a Receiver flow from the
+        // formal `self`; assignments or any other value flow into either the
+        // temporary or the formal invalidate the exact receiver proof.
+        let mut canonical_receiver_flows = 0usize;
+        for event in semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter())
+        {
+            match &event.effect {
+                SemanticEffect::Assignment { target, .. }
+                    if *target == receiver || *target == formal_receiver =>
+                {
+                    return Vec::new();
+                }
+                SemanticEffect::ValueFlow { target, .. } if *target == formal_receiver => {
+                    return Vec::new();
+                }
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                } if *target == receiver => {
+                    if *source != formal_receiver || *kind != ValueFlowKind::Receiver {
+                        return Vec::new();
+                    }
+                    canonical_receiver_flows += 1;
+                }
+                _ => {}
+            }
+        }
+        if canonical_receiver_flows != 1 {
+            return Vec::new();
+        }
+        if call.arguments.is_empty()
+            || call.arguments.iter().any(|argument| {
+                !matches!(
+                    argument.expansion,
+                    crate::analyzer::semantic::CallArgumentExpansion::Direct(
+                        crate::analyzer::semantic::ArgumentDomain::Positional
+                    )
+                )
+            })
+        {
+            return Vec::new();
+        }
+        let Some(callee_value) = semantics.value(call.callee) else {
+            return Vec::new();
+        };
+        let Some(callee_mapping) = semantics.source_mapping(callee_value.source) else {
+            return Vec::new();
+        };
+        if callee_mapping.kind != SourceMappingKind::Exact {
+            return Vec::new();
+        }
+        let Some(file) = file_for_locator(workspace, &callee_mapping.locator) else {
+            return Vec::new();
+        };
+        let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+            return Vec::new();
+        };
+        let Some(callee_node) = node_at_span(&prepared, callee_mapping.locator.anchor().span())
+        else {
+            return Vec::new();
+        };
+        if callee_node.kind() != "attribute" {
+            return Vec::new();
+        }
+        let Some(receiver_node) = callee_node.child_by_field_name("object") else {
+            return Vec::new();
+        };
+        let Some(receiver_mapping) = semantics
+            .source_mapping(receiver_value.source)
+            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+        else {
+            return Vec::new();
+        };
+        let Some(receiver_site) = node_at_span(&prepared, receiver_mapping.locator.anchor().span())
+        else {
+            return Vec::new();
+        };
+        if receiver_site.start_byte() != receiver_node.start_byte()
+            || receiver_site.end_byte() != receiver_node.end_byte()
+        {
+            return Vec::new();
+        }
+        let Some(member_node) = callee_node.child_by_field_name("attribute") else {
+            return Vec::new();
+        };
+        let Ok(member) = member_node.utf8_text(prepared.source().as_bytes()) else {
+            return Vec::new();
+        };
+        let Ok(arity) = u32::try_from(call.arguments.len()) else {
+            return Vec::new();
+        };
+        let Some(snapshot) = workspace.analyzer().active_semantic_model_snapshot() else {
+            return Vec::new();
+        };
+        let active = snapshot.active_models();
+        if !active.has_normal_return_type_refinement_candidate(
+            Language::Python.config_label(),
+            member,
+            true,
+            arity,
+        ) {
+            return Vec::new();
+        }
+        let Some(ClassIdentity::Workspace(owner)) = self.enclosing_class(workspace, procedure)
+        else {
+            return Vec::new();
+        };
+        let hierarchy = self.class_hierarchy(workspace, &ClassIdentity::Workspace(owner.clone()));
+        if hierarchy.unresolved_base
+            || hierarchy.dynamic_attributes
+            || hierarchy.descendants.as_deref() != Some(&[])
+        {
+            return Vec::new();
+        }
+        let python = python_analyzer(workspace);
+        if python_class_hierarchy_member_unshadowed_bounded(python, &owner, member) != Some(true) {
+            return Vec::new();
+        }
+        let workspace_owner = ClassIdentity::Workspace(owner.clone());
+        let MemberLookup::Present(hit) =
+            self.member_lookup(workspace, MemberAccessKind::Call, &workspace_owner, member)
+        else {
+            return Vec::new();
+        };
+        if hit.dispatch_coverage != CandidateCoverage::Exhaustive {
+            return Vec::new();
+        }
+        let MemberDeclaration::External(declaration) = hit.declaration else {
+            return Vec::new();
+        };
+        let [symbol_id] = declaration.symbol_ids() else {
+            return Vec::new();
+        };
+        let Some(overlay) = snapshot.semantic_model_overlay() else {
+            return Vec::new();
+        };
+        let symbol_match = overlay.symbols_with_id(symbol_id);
+        let [symbol] = symbol_match.records.as_slice() else {
+            return Vec::new();
+        };
+        if symbol.provenance.ambiguous
+            || symbol.provenance.completeness != SemanticModelCompleteness::Complete
+            || symbol.language != Language::Python.config_label()
+            || symbol.kind != SemanticModelSymbolKind::Method
+            || !symbol.has_receiver()
+        {
+            return Vec::new();
+        }
+        let Some(owner_id) = symbol.owner_id.as_deref() else {
+            return Vec::new();
+        };
+        let owner_match = overlay.symbols_with_id(owner_id);
+        let [modeled_owner] = owner_match.records.as_slice() else {
+            return Vec::new();
+        };
+        if modeled_owner.provenance.ambiguous
+            || modeled_owner.provenance.completeness != SemanticModelCompleteness::Complete
+            || modeled_owner.language != Language::Python.config_label()
+            || modeled_owner.kind != SemanticModelSymbolKind::Class
+            || modeled_owner.owner_id.is_some()
+        {
+            return Vec::new();
+        }
+        let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+            Language::Python.config_label(),
+            &modeled_owner.qualified_name,
+            &symbol.name,
+            true,
+            arity,
+        ));
+        if matched.disposition != SemanticModelMatchDisposition::Unique
+            || matched.records.len() != 1
+        {
+            return Vec::new();
+        }
+        let selected = &matched.records[0];
+        let provenance = selected.provenance(active);
+        if provenance.ambiguous || provenance.completeness != SemanticModelCompleteness::Complete {
+            return Vec::new();
+        }
+        let mut constraints = Vec::new();
+        for refinement in selected.normal_return_type_refinements() {
+            if refinement.required_receiver_members.iter().any(|required| {
+                let required = required.as_ref();
+                let MemberLookup::Present(required_hit) = self.member_lookup(
+                    workspace,
+                    MemberAccessKind::Call,
+                    &workspace_owner,
+                    required,
+                ) else {
+                    return true;
+                };
+                let MemberDeclaration::External(required_declaration) = required_hit.declaration
+                else {
+                    return true;
+                };
+                let expected = overlay.member_target_on_owner(modeled_owner.id.as_str(), required);
+                let [expected] = expected.records.as_slice() else {
+                    return true;
+                };
+                let [actual_id] = required_declaration.symbol_ids() else {
+                    return true;
+                };
+                if required_hit.dispatch_coverage != CandidateCoverage::Exhaustive
+                    || actual_id.as_ref() != expected.id.as_str()
+                {
+                    return true;
+                }
+                python_class_hierarchy_member_unshadowed_bounded(python, &owner, required)
+                    != Some(true)
+                    || !external_instance_method_present_on_owner(
+                        overlay,
+                        modeled_owner.id.as_str(),
+                        required,
+                    )
+            }) {
+                return Vec::new();
+            }
+            let subject = refinement.parameter_ordinal as usize;
+            let class_parameter = refinement.class_parameter_ordinal as usize;
+            if subject == class_parameter
+                || subject >= call.arguments.len()
+                || class_parameter >= call.arguments.len()
+            {
+                return Vec::new();
+            }
+            let Some(classes) =
+                self.guard_classes(workspace, procedure, call.arguments[class_parameter].value)
+            else {
+                return Vec::new();
+            };
+            if classes.is_empty() {
+                return Vec::new();
+            }
+            if !self.guard_classes_have_supported_instance_checks(
+                workspace,
+                &classes,
+                Some(overlay),
+            ) {
+                return Vec::new();
+            }
+            constraints.push(NormalReturnTypeConstraint {
+                subject: call.arguments[subject].value,
+                classes: classes.into_boxed_slice(),
+                provenance: provenance.clone(),
+            });
+        }
+        constraints
+    }
+
+    fn instance_of_verdict(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        atom: &ClassIdentity,
+        classes: &[ClassIdentity],
+    ) -> NarrowingVerdict {
+        match self.instance_relation(workspace, atom, classes) {
+            Some(true) => NarrowingVerdict::Keep,
+            Some(false) => NarrowingVerdict::Drop,
+            None => NarrowingVerdict::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PythonAnalyzer, PythonTypeFlowAdapter, prepared_for_procedure,
+        workspace_class_uses_ordinary_metaclass,
+    };
+    use crate::analyzer::semantic::{
+        CancellationToken, ClassIdentity, ClassSeed, ProcedureKind, SemanticBudget,
+        SemanticRequest, TypeFlowAdapter, UnknownReason,
+    };
+    use crate::analyzer::{AnalyzerConfig, CodeUnitIndex, Language, resolve_analyzer};
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn prepared_syntax_validator_accepts_exact_content_and_rejects_changed_content() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "def target():\n    return 1\n")
+            .build();
+        let file = project.file("app.py");
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Python semantic materialization succeeds")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact is available");
+        let procedure = artifact
+            .procedures()
+            .first()
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture has one procedure");
+
+        assert!(prepared_for_procedure(&workspace, &procedure, &file).is_ok());
+
+        std::fs::write(file.abs_path(), "def target():\n    return 2\n")
+            .expect("change fixture content");
+        let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        assert_eq!(
+            prepared_for_procedure(&changed_workspace, &procedure, &file)
+                .expect_err("changed content cannot validate an old artifact"),
+            UnknownReason::UncertainFlow
+        );
+    }
+
+    #[test]
+    fn constructed_class_uses_whole_dotted_callee_and_rejects_namespace_rebinding() {
+        for (consumer, expected) in [
+            (
+                "import models\ndef make():\n    return models.Widget()\n",
+                Some("models.Widget"),
+            ),
+            (
+                "import models\nclass Holder:\n    models = 0\n    def make(self):\n        return models.Widget()\n",
+                Some("models.Widget"),
+            ),
+            (
+                concat!(
+                    "import models\n",
+                    "models = object()\n",
+                    "def make():\n",
+                    "    return models.Widget()\n",
+                ),
+                None,
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::Python)
+                .file("models.py", "class Widget:\n    pass\n")
+                .file("consumer.py", consumer)
+                .build();
+            let file = project.file("consumer.py");
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("Python semantic materialization succeeds")
+                .available_value()
+                .cloned()
+                .expect("Python semantic artifact is available");
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    matches!(
+                        procedure.kind(),
+                        ProcedureKind::Function | ProcedureKind::Method
+                    ) && !procedure.call_sites().is_empty()
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("fixture has one callable with a constructor call");
+            let call = procedure
+                .semantics()
+                .call_sites()
+                .first()
+                .expect("fixture retains its call");
+            let seed = PythonTypeFlowAdapter.constructed_class(&workspace, &procedure, call);
+            match expected {
+                Some(expected) => {
+                    let ClassSeed::Class(class) = seed else {
+                        panic!("dotted constructor did not produce an exact class: {seed:?}");
+                    };
+                    assert_eq!(class.qualified_name(), expected);
+                }
+                None => assert_eq!(seed, ClassSeed::NotApplicable),
+            }
+        }
+    }
+
+    #[test]
+    fn shared_instance_guard_requires_identity_for_workspace_decorators() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "class Plain:\n    pass\n\nclass Actual:\n    pass\n\ndef replace(cls):\n    return Actual\n\n@replace\nclass Replaced:\n    def foo(self):\n        pass\n",
+            )
+            .build();
+        let file = project.file("app.py");
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
+            .expect("workspace has the Python analyzer");
+        let class_named = |name: &str| {
+            python
+                .top_level_declarations(&file)
+                .into_iter()
+                .find(|unit| unit.is_class() && unit.short_name() == name)
+                .unwrap_or_else(|| panic!("missing class declaration {name}"))
+        };
+        let adapter = PythonTypeFlowAdapter;
+
+        let plain = ClassIdentity::Workspace(class_named("Plain"));
+        assert!(
+            adapter.guard_classes_have_supported_instance_checks(
+                &workspace,
+                std::slice::from_ref(&plain),
+                None,
+            ),
+            "an undecorated ordinary workspace class remains a supported guard class",
+        );
+
+        let replaced = ClassIdentity::Workspace(class_named("Replaced"));
+        assert!(
+            !adapter.guard_classes_have_supported_instance_checks(
+                &workspace,
+                std::slice::from_ref(&replaced),
+                None,
+            ),
+            "an unreviewed workspace decorator cannot establish class identity",
+        );
+        assert!(
+            !workspace_class_uses_ordinary_metaclass(
+                &workspace,
+                python,
+                match &replaced {
+                    ClassIdentity::Workspace(owner) => owner,
+                    ClassIdentity::External { .. } => unreachable!(),
+                },
+                None,
+            ),
+            "the shared guard and its class proof reject the replacing decorator",
+        );
     }
 }

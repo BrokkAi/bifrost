@@ -1760,6 +1760,11 @@ fn run_rql_query_result(
                         .iter()
                         .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
                         .collect(),
+                    CodeQueryResultValue::AbsentMemberWitness { value } => value
+                        .steps
+                        .iter()
+                        .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
+                        .collect(),
                     CodeQueryResultValue::TaintFinding { value } => value
                         .witnesses
                         .iter()
@@ -1778,6 +1783,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
                     CodeQueryResultValue::ClassSetRow { value } => &value.file,
                     CodeQueryResultValue::AbsentMemberFinding { value } => &value.file,
+                    CodeQueryResultValue::AbsentMemberWitness { value } => &value.path,
                     CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::FlowEndpoint { value } => &value.path,
                     CodeQueryResultValue::FlowWitness { value } => &value.path,

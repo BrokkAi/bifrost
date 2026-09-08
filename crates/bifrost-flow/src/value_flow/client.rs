@@ -7,7 +7,8 @@ use crate::analyzer::semantic::{
 use crate::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
     ReusableSummaryProvider, SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits,
-    solve_with_reusable_end_summaries, solve_with_summaries,
+    solve_with_reusable_end_summaries, solve_with_reusable_root_and_end_summaries,
+    solve_with_summaries,
 };
 
 use super::plan::CallFlowRuleKind;
@@ -139,6 +140,10 @@ impl ValueFlowFact {
             ValueFlowFactKind::Zero => ValueFlowUncertainty(0),
         }
     }
+
+    pub(crate) const fn is_terminal_meeting(self) -> bool {
+        matches!(self.0, ValueFlowFactKind::Meeting { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -230,7 +235,7 @@ impl<'plan> ValueFlowProblem<'plan> {
         fact: ValueFlowFact,
         meetings: &mut Vec<ValueFlowFact>,
     ) -> Vec<ActiveFlow> {
-        if matches!(fact.0, ValueFlowFactKind::Meeting { .. }) {
+        if fact.is_terminal_meeting() {
             return Vec::new();
         }
         let active = self.active_before_point(point, fact);
@@ -338,7 +343,20 @@ impl<'plan> ValueFlowProblem<'plan> {
         };
         let mut mapped = Vec::new();
         for flow in active {
-            if self.plan.is_callee_port(flow.carrier, &transfer.callee) {
+            if self.plan.is_callee_port(flow.carrier, &transfer.callee)
+                && !self
+                    .plan
+                    .call_rules_to_target(
+                        &transfer.origin,
+                        &transfer.callee,
+                        CallFlowRuleKind::Call,
+                        flow.carrier,
+                    )
+                    .any(|rule| {
+                        self.plan
+                            .is_default_argument_carrier(rule.source, &transfer.callee)
+                    })
+            {
                 mapped.push(flow);
             }
             for rule in
@@ -350,6 +368,42 @@ impl<'plan> ValueFlowProblem<'plan> {
                         carrier: rule.target,
                         ..flow.with_transfer_quality(&rule.proof, &rule.completeness)
                     });
+                }
+            }
+        }
+        if matches!(fact.0, ValueFlowFactKind::Zero) {
+            // A default value belongs to the callee, was saved at definition
+            // time, and is exposed as a source at its entry. It is consequently
+            // absent from the caller's active facts. Select that entry source
+            // only for the call rule that explicitly binds the default.
+            for rule in self
+                .plan
+                .call_rules(&transfer.origin, &transfer.callee, CallFlowRuleKind::Call)
+                .filter(|rule| {
+                    self.plan
+                        .is_default_argument_carrier(rule.source, &transfer.callee)
+                })
+            {
+                for phase in [
+                    super::ValueFlowObservationPhase::BeforeEffects,
+                    super::ValueFlowObservationPhase::AfterEffects,
+                ] {
+                    for source in self
+                        .plan
+                        .sources_at(edge.target(), phase)
+                        .filter(|source| source.carrier == rule.source)
+                    {
+                        let uncertainty =
+                            quality_uncertainty(source.spec.proof(), source.spec.completeness());
+                        mapped.push(
+                            ActiveFlow {
+                                source: source.id,
+                                carrier: rule.target,
+                                uncertainty,
+                            }
+                            .with_transfer_quality(&rule.proof, &rule.completeness),
+                        );
+                    }
                 }
             }
         }
@@ -586,8 +640,47 @@ where
         return Err(ValueFlowSolveError::RootMismatch);
     }
     let problem = ValueFlowProblem::new(plan);
-    let result = solve_with_reusable_end_summaries(
+    let result = solve_with_reusable_root_and_end_summaries(
         SummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
+        provider,
+        &problem,
+        reusable,
+        semantic_budget,
+        request,
+    )?;
+    ValueFlowSummaryResult::from_result(plan, result)
+}
+
+/// Solve one procedure already present in `plan` from one exact entry fact.
+///
+/// This is the maintenance counterpart to the ordinary root solve. It reuses
+/// the immutable plan and its validated call bindings, but roots tabulation at
+/// a demanded procedure entry so an incremental summary coordinator can
+/// refresh that relation without solving an unrelated caller. The summary
+/// kernel always includes its distinguished zero entry; a nonzero
+/// `entry_fact` is the only additional entry relation. Witness retention is
+/// deliberately disabled because persisted class-set summaries retain the
+/// normalized relation rather than witness fragments.
+pub(crate) fn solve_value_flow_entry_with_reusable_summaries<Provider, Reusable>(
+    procedure: &ProcedureHandle,
+    entry_fact: ValueFlowFact,
+    provider: &Provider,
+    reusable: &mut Reusable,
+    plan: &ValueFlowPlan,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<ValueFlowSummaryResult, ValueFlowSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<ValueFlowFact> + ?Sized,
+{
+    if procedure != plan.root() && !plan.has_snapshot(procedure) {
+        return Err(ValueFlowSolveError::RootMismatch);
+    }
+    let problem = ValueFlowProblem::new(plan);
+    let explicit_entry = (entry_fact != ValueFlowFact::zero()).then_some(entry_fact);
+    let result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(procedure, explicit_entry.as_slice()),
         provider,
         &problem,
         reusable,
@@ -602,6 +695,17 @@ pub enum ValueFlowSolveError {
     RootMismatch,
     InvalidResult,
     Summary(SummaryDataflowError),
+}
+
+impl ValueFlowSolveError {
+    pub(crate) const fn mandatory_summary_cut_miss(&self) -> Option<&ProcedureHandle> {
+        match self {
+            Self::Summary(SummaryDataflowError::MandatorySummaryCutMiss { procedure }) => {
+                Some(procedure)
+            }
+            Self::RootMismatch | Self::InvalidResult | Self::Summary(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for ValueFlowSolveError {

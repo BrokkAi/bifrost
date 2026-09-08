@@ -156,6 +156,10 @@ require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-ja
 require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json
 require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/manifest.json
 require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json
+require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-javascript-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate
+require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-typescript-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-typescript-declarations/shards/declarations.buffer.deflate
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
 require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 

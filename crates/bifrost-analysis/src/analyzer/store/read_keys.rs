@@ -12,7 +12,7 @@ use crate::analyzer::Language;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
 use crate::analyzer::read_ledger::{
-    CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ReadKey,
+    CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ProcedureCallSiteLocator, ReadKey,
 };
 use crate::analyzer::semantic::ids::StableDigest;
 
@@ -77,6 +77,10 @@ impl ReadKeyColumns {
                 question,
                 digest,
             } => {
+                assert!(
+                    lookup_question_matches_kind(*kind, question),
+                    "a dispatch lookup kind and call-site question use the same address domain"
+                );
                 columns.family = Some(kind.stable_label());
                 columns.digest = Some(digest.as_bytes().to_vec());
                 match question {
@@ -94,6 +98,16 @@ impl ReadKeyColumns {
                     } => {
                         columns.rel_path = Some(rel_path.to_string());
                         columns.subject = Some(artifact.as_bytes().to_vec());
+                        columns.start_byte = Some(site.start_byte as i64);
+                        columns.end_byte = Some(site.end_byte as i64);
+                    }
+                    LookupQuestion::ProcedureCallSite {
+                        rel_path,
+                        procedure,
+                        site,
+                    } => {
+                        columns.rel_path = Some(rel_path.to_string());
+                        columns.subject = Some(procedure.as_bytes().to_vec());
                         columns.start_byte = Some(site.start_byte as i64);
                         columns.end_byte = Some(site.end_byte as i64);
                     }
@@ -174,14 +188,30 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                 (Some(rel_path), None, None, None, None) => LookupQuestion::File {
                     rel_path: Box::from(rel_path.as_str()),
                 },
-                (Some(rel_path), None, Some(artifact), Some(start), Some(end)) => {
-                    LookupQuestion::CallSite {
-                        rel_path: Box::from(rel_path.as_str()),
-                        artifact: decode_digest(&artifact, "call site artifact")?,
-                        site: CallSiteLocator {
-                            start_byte: start as usize,
-                            end_byte: end as usize,
+                (Some(rel_path), None, Some(subject), Some(start), Some(end)) => {
+                    match lookup_kind {
+                        LookupKind::Dispatch => LookupQuestion::CallSite {
+                            rel_path: Box::from(rel_path.as_str()),
+                            artifact: decode_digest(&subject, "call site artifact")?,
+                            site: CallSiteLocator {
+                                start_byte: start as usize,
+                                end_byte: end as usize,
+                            },
                         },
+                        LookupKind::ProcedureDispatch => LookupQuestion::ProcedureCallSite {
+                            rel_path: Box::from(rel_path.as_str()),
+                            procedure: decode_digest(&subject, "procedure lineage")?,
+                            site: ProcedureCallSiteLocator {
+                                start_byte: start as usize,
+                                end_byte: end as usize,
+                            },
+                        },
+                        other => {
+                            return Err(StoreError::new(format!(
+                                "lookup kind `{}` cannot carry a call-site question",
+                                other.stable_label()
+                            )));
+                        }
                     }
                 }
                 (None, None, Some(identity), None, None) => LookupQuestion::Summary {
@@ -193,6 +223,13 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
                     )));
                 }
             };
+            if !lookup_question_matches_kind(lookup_kind, &question) {
+                return Err(StoreError::new(format!(
+                    "lookup kind `{}` cannot carry question `{}`",
+                    lookup_kind.stable_label(),
+                    question.stable_label()
+                )));
+            }
             ReadKey::Lookup {
                 kind: lookup_kind,
                 question,
@@ -259,6 +296,21 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
     Ok(key)
 }
 
+fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> bool {
+    matches!(
+        (kind, question),
+        (LookupKind::Dispatch, LookupQuestion::CallSite { .. })
+            | (
+                LookupKind::ProcedureDispatch,
+                LookupQuestion::ProcedureCallSite { .. }
+            )
+    ) || (!matches!(kind, LookupKind::Dispatch | LookupKind::ProcedureDispatch)
+        && !matches!(
+            question,
+            LookupQuestion::CallSite { .. } | LookupQuestion::ProcedureCallSite { .. }
+        ))
+}
+
 /// The sorted language labels of one scope, as the one text column a scope
 /// key is found and rebuilt by.
 fn language_list(languages: &[Language]) -> String {
@@ -307,7 +359,7 @@ const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
 ];
 
 /// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 8] = [
+const ALL_LOOKUP_KINDS: [LookupKind; 9] = [
     LookupKind::Callers,
     LookupKind::Callees,
     LookupKind::Usages,
@@ -315,6 +367,7 @@ const ALL_LOOKUP_KINDS: [LookupKind; 8] = [
     LookupKind::ReferenceCandidates,
     LookupKind::Descendants,
     LookupKind::Dispatch,
+    LookupKind::ProcedureDispatch,
     LookupKind::ProcedureSummary,
 ];
 
@@ -429,6 +482,18 @@ mod tests {
                 answer,
             ),
             ReadKey::lookup(
+                LookupKind::ProcedureDispatch,
+                LookupQuestion::ProcedureCallSite {
+                    rel_path: Box::from("src/Main.java"),
+                    procedure: StableDigest::sha256(b"procedure"),
+                    site: ProcedureCallSiteLocator {
+                        start_byte: 4,
+                        end_byte: 18,
+                    },
+                },
+                answer,
+            ),
+            ReadKey::lookup(
                 LookupKind::ProcedureSummary,
                 LookupQuestion::Summary {
                     identity: StableDigest::sha256(b"summary"),
@@ -476,5 +541,24 @@ mod tests {
 
         let error = decode_columns(&columns).expect_err("the digest must bind every column");
         assert!(error.to_string().contains("did not rebuild"), "{error}");
+    }
+
+    #[test]
+    fn a_dispatch_kind_cannot_reinterpret_another_question_shape() {
+        let expected = ReadKey::lookup(
+            LookupKind::Importers,
+            LookupQuestion::File {
+                rel_path: Box::from("src/Main.java"),
+            },
+            StableDigest::sha256(b"answer"),
+        );
+        let mut columns = ReadKeyColumns::of(&expected);
+        columns.family = Some(LookupKind::ProcedureDispatch.stable_label());
+
+        let error = decode_columns(&columns).expect_err("the kind binds the question domain");
+        assert!(
+            error.to_string().contains("cannot carry question `file`"),
+            "{error}"
+        );
     }
 }

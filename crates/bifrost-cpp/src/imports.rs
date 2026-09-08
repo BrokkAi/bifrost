@@ -71,6 +71,21 @@ impl IncludeTargetIndex {
         resolved
     }
 
+    /// Whether any analyzable workspace file could answer `include`: some
+    /// indexed file's name equals the include's final path component.
+    ///
+    /// An include no indexed file can answer names a header the build supplies
+    /// from outside the analyzed sources, so nothing in this index is hidden by
+    /// failing to resolve it. Callers that otherwise fail closed on an
+    /// unresolved include use this to separate that case from a spelling the
+    /// index does hold but cannot narrow to one target.
+    pub fn names_indexed_file(&self, include: &str) -> bool {
+        Path::new(include)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| self.by_file_name.contains_key(name))
+    }
+
     fn resolve_direct(&self, source_file: &ProjectFile, include: &str) -> Vec<ProjectFile> {
         let include_path = Path::new(include);
         let mut matched = HashSet::default();

@@ -2,8 +2,8 @@ use brokk_bifrost_core::analyzer::common::IdentifierSigil;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, Range,
-    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    CallableArity, CallableOverrideModifier, CodeUnitType, DispatchExtensibility,
+    ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
@@ -14,8 +14,9 @@ use tree_sitter::{Node, Tree};
 
 use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
-    csharp_attribute_type_names, csharp_constant_pattern_type_candidate, csharp_has_modifier,
-    csharp_member_access_type_receiver, csharp_type_node_identity, csharp_type_reference_root,
+    csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
+    csharp_default_member_visibility, csharp_has_modifier, csharp_member_access_type_receiver,
+    csharp_type_node_identity, csharp_type_reference_root,
 };
 use crate::test_detection::csharp_method_has_runnable_test_attribute;
 
@@ -338,7 +339,11 @@ impl CSharpVisitor<'_, '_> {
             .with_callable_modifiers(
                 csharp_has_modifier(self.source, node, "static"),
                 false,
-                csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+                csharp_declared_visibility(
+                    node,
+                    self.source,
+                    csharp_default_member_visibility(node, self.ancestry),
+                ),
             ),
         );
     }
@@ -466,7 +471,11 @@ impl CSharpVisitor<'_, '_> {
             .with_callable_modifiers(
                 csharp_has_modifier(self.source, node, "static"),
                 true,
-                csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+                csharp_declared_visibility(
+                    node,
+                    self.source,
+                    csharp_default_member_visibility(node, self.ancestry),
+                ),
             ),
         );
     }
@@ -854,6 +863,33 @@ fn csharp_declared_visibility(
     default
 }
 
+/// Which member of the override-modifier family this declaration writes.
+///
+/// Read from the declaration's own `modifier` children through
+/// [`csharp_has_modifier`], which walks tree-sitter nodes rather than scanning
+/// text. C# forbids writing two of these together (`virtual override`,
+/// `new override` and `abstract virtual` are all compile errors), so the first
+/// one found is the only one there is.
+///
+/// A declaration that writes none of them returns `NotDeclared`, which is a
+/// positive record: in C# a derived member that redefines a base member
+/// without `override` *hides* it (implicit `new`, compiler warning CS0108).
+/// Method families (#1721) need that distinct from "nobody read the
+/// modifiers", which is the absent field rather than this value.
+fn csharp_override_modifier(source: &str, node: Node<'_>) -> CallableOverrideModifier {
+    for (modifier, recorded) in [
+        ("override", CallableOverrideModifier::Override),
+        ("virtual", CallableOverrideModifier::Virtual),
+        ("abstract", CallableOverrideModifier::Abstract),
+        ("new", CallableOverrideModifier::Hiding),
+    ] {
+        if csharp_has_modifier(source, node, modifier) {
+            return recorded;
+        }
+    }
+    CallableOverrideModifier::NotDeclared
+}
+
 fn csharp_signature_metadata<'tree>(
     signature: String,
     node: Node<'tree>,
@@ -933,12 +969,14 @@ fn csharp_signature_metadata<'tree>(
                 extension_receiver_is_unconstrained_type_parameter,
             )
     };
-    metadata.with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
-        source,
-        node,
-        crate::syntax::csharp_has_modifier(source, node, "static"),
-        ancestry,
-    ))
+    metadata
+        .with_callable_override_modifier(csharp_override_modifier(source, node))
+        .with_dispatch_extensibility(crate::syntax::csharp_callable_dispatch_extensibility(
+            source,
+            node,
+            crate::syntax::csharp_has_modifier(source, node, "static"),
+            ancestry,
+        ))
 }
 
 fn csharp_extension_receiver_type_node<'tree>(

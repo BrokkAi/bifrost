@@ -306,10 +306,114 @@ fn first_comment_offset(line: &str, language: Language) -> Option<usize> {
     }
 }
 
-/// The direct named children of `node`, in source order.
-pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+/// The direct named children of `node`, in source order, without borrowing a
+/// caller-supplied cursor.
+///
+/// This is the shape every "visit each named child" loop must use.
+/// `Node::named_child(index)` resolves a child by stepping a fresh cursor from
+/// the first child, so `for index in 0..node.named_child_count()` costs
+/// `O(k^2)` in the number of children -- and a C++ translation unit or a
+/// generated JavaScript bundle puts tens of thousands of siblings under one
+/// node (#2369, #3097). The iterator below advances one cursor across the
+/// sibling list exactly once, so the same loop costs `O(k)`.
+///
+/// `tree_sitter::Node::named_children` already walks a cursor, but it borrows
+/// one from the caller, which forces every call site to declare a `let mut
+/// cursor` whose only purpose is to satisfy the borrow. This owns its cursor,
+/// so it drops into an expression position and into `Vec::extend`.
+pub fn named_children_iter<'tree>(node: Node<'tree>) -> NamedChildren<'tree> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
+    let active = cursor.goto_first_child();
+    NamedChildren { cursor, active }
+}
+
+/// The direct children of `node`, named and anonymous alike, in source order.
+///
+/// [`named_children_iter`] for the visible-child relation grammars usually
+/// mean; this one is for the walks that must see keyword tokens too.
+pub fn children_iter<'tree>(node: Node<'tree>) -> Children<'tree> {
+    let mut cursor = node.walk();
+    let active = cursor.goto_first_child();
+    Children { cursor, active }
+}
+
+/// Iterator returned by [`named_children_iter`].
+pub struct NamedChildren<'tree> {
+    cursor: tree_sitter::TreeCursor<'tree>,
+    active: bool,
+}
+
+impl<'tree> Iterator for NamedChildren<'tree> {
+    type Item = Node<'tree>;
+
+    fn next(&mut self) -> Option<Node<'tree>> {
+        while self.active {
+            let node = self.cursor.node();
+            self.active = self.cursor.goto_next_sibling();
+            if node.is_named() {
+                return Some(node);
+            }
+        }
+        None
+    }
+}
+
+/// Iterator returned by [`children_iter`].
+pub struct Children<'tree> {
+    cursor: tree_sitter::TreeCursor<'tree>,
+    active: bool,
+}
+
+impl<'tree> Iterator for Children<'tree> {
+    type Item = Node<'tree>;
+
+    fn next(&mut self) -> Option<Node<'tree>> {
+        if !self.active {
+            return None;
+        }
+        let node = self.cursor.node();
+        self.active = self.cursor.goto_next_sibling();
+        Some(node)
+    }
+}
+
+/// The direct named children of `node`, in source order.
+///
+/// Prefer [`named_children_iter`] unless the caller needs random access or a
+/// count; this allocates.
+pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+    named_children_iter(node).collect()
+}
+
+/// Push `node`'s named children onto a LIFO `stack` so that popping visits
+/// them in source order.
+///
+/// This replaces `for index in (0..node.named_child_count()).rev() { stack
+/// .push(node.named_child(index)) }`, which is the same walk written as a
+/// quadratic indexed loop. Nothing is allocated beyond the stack the caller
+/// already owns: the children are appended through one cursor and the freshly
+/// appended span is reversed in place.
+pub fn push_named_children_reversed<'tree>(node: Node<'tree>, stack: &mut Vec<Node<'tree>>) {
+    push_named_children_reversed_as(node, stack, |child| child);
+}
+
+/// [`push_named_children_reversed`] over every child, named and anonymous.
+pub fn push_children_reversed<'tree>(node: Node<'tree>, stack: &mut Vec<Node<'tree>>) {
+    let first_pushed = stack.len();
+    stack.extend(children_iter(node));
+    stack[first_pushed..].reverse();
+}
+
+/// [`push_named_children_reversed`] for a stack whose element is a walk frame
+/// rather than a bare node.
+pub fn push_named_children_reversed_as<'tree, Frame>(
+    node: Node<'tree>,
+    stack: &mut Vec<Frame>,
+    frame: impl FnMut(Node<'tree>) -> Frame,
+) {
+    let first_pushed = stack.len();
+    stack.extend(named_children_iter(node).map(frame));
+    stack[first_pushed..].reverse();
 }
 
 /// The first direct named child of `node` whose kind is `kind`.
@@ -318,9 +422,7 @@ pub fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
 /// declaration walks reach a specific grammar slot (a `class_body`, a
 /// `type_identifier`) without assuming child order.
 pub fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
+    named_children_iter(node).find(|child| child.kind() == kind)
 }
 
 /// Whether `node` has an anonymous (token) child spelled `token`.
@@ -338,12 +440,12 @@ pub fn has_token_child(node: Node<'_>, token: &str) -> bool {
 /// descendant matching `predicate`, short-circuiting on the first match. Iterative
 /// (explicit stack) depth-first search; visit order does not affect the result.
 pub fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
+    let mut cursor = node.walk();
     let mut stack = vec![node];
     while let Some(candidate) = stack.pop() {
         if predicate(candidate) {
             return true;
         }
-        let mut cursor = candidate.walk();
         stack.extend(candidate.named_children(&mut cursor));
     }
     false
@@ -355,6 +457,10 @@ pub fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) ->
 /// resolution.
 pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut best: Option<Node<'tree>> = None;
+    // One cursor for the whole descent. `Node::walk` allocates, and this
+    // function is called once per declaration range against the same file, so
+    // a cursor per visited node was a malloc per node (#3097).
+    let mut cursor = root.walk();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
@@ -365,9 +471,15 @@ pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<N
             // deepest node encountered so far.
             best = Some(node);
         }
-        let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.start_byte() <= range.start_byte && child.end_byte() >= range.end_byte {
+            // Named siblings are in source order, so once a child starts after
+            // the range there is no later child that can contain it. A C++
+            // translation unit holds thousands of top-level children and the
+            // full scan ran once per level per call.
+            if child.start_byte() > range.start_byte {
+                break;
+            }
+            if child.end_byte() >= range.end_byte {
                 stack.push(child);
             }
         }
@@ -468,6 +580,41 @@ fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'
     stack[first_pushed..].reverse();
 }
 
+/// The grammar symbol ids that spell one node kind.
+///
+/// `Node::kind` costs a table lookup plus a `strlen` and a `strncmp` per
+/// comparison, and a scan that asks it once per visited node pays that for the
+/// whole file (#3097). `Node::kind_id` is a `u16` load, so the same question
+/// asked against resolved ids is a register compare.
+///
+/// The ids are a set rather than the single answer `Language::id_for_node_kind`
+/// gives, because a grammar may spell several distinct symbols with the same
+/// name -- tree-sitter-cpp does so for 29 of them, `argument_list` and
+/// `qualified_identifier` among them, because an alias and a rule can share a
+/// name. Matching one id would therefore answer a narrower question than
+/// `node.kind() == kind` does. Namedness is not part of the question for the
+/// same reason: `kind()` does not consider it, so neither does this.
+///
+/// Resolve once per language and hold it for the walk.
+#[derive(Debug, Clone)]
+pub struct NodeKindIds {
+    ids: Vec<u16>,
+}
+
+impl NodeKindIds {
+    pub fn new(language: &tree_sitter::Language, kind: &str) -> Self {
+        let ids = (0..u16::try_from(language.node_kind_count()).unwrap_or(u16::MAX))
+            .filter(|id| language.node_kind_for_id(*id) == Some(kind))
+            .collect::<Vec<_>>();
+        Self { ids }
+    }
+
+    /// Whether `node.kind()` is the kind this set was resolved for.
+    pub fn matches(&self, node: Node<'_>) -> bool {
+        self.ids.contains(&node.kind_id())
+    }
+}
+
 /// The parent of every node in one tree, recorded by a single downward pass.
 ///
 /// A tree-sitter node carries no parent pointer. `ts_node_parent` recovers one
@@ -549,6 +696,19 @@ impl<'tree> ParentIndex<'tree> {
         }
     }
 
+    /// Every ancestor of `node`, innermost first, ending at the root.
+    ///
+    /// This is the shape an ancestor climb must take. Written as repeated
+    /// `Node::parent` calls the same walk is quadratic in depth, because each
+    /// step re-descends from the root (#1927); through the index each step is a
+    /// hash lookup.
+    pub fn ancestors(&self, node: Node<'tree>) -> Ancestors<'_, 'tree> {
+        Ancestors {
+            index: self,
+            current: Some(node),
+        }
+    }
+
     /// Reset the number of parent questions answered by this index.
     #[cfg(any(test, feature = "test-support"))]
     pub fn reset_parent_query_count_for_test(&self) {
@@ -559,6 +719,22 @@ impl<'tree> ParentIndex<'tree> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn parent_query_count_for_test(&self) -> usize {
         self.parent_queries.get()
+    }
+}
+
+/// Iterator returned by [`ParentIndex::ancestors`].
+pub struct Ancestors<'index, 'tree> {
+    index: &'index ParentIndex<'tree>,
+    current: Option<Node<'tree>>,
+}
+
+impl<'tree> Iterator for Ancestors<'_, 'tree> {
+    type Item = Node<'tree>;
+
+    fn next(&mut self) -> Option<Node<'tree>> {
+        let parent = self.index.parent(self.current?)?;
+        self.current = Some(parent);
+        Some(parent)
     }
 }
 

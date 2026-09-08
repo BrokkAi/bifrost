@@ -476,6 +476,26 @@ impl<'a> SemanticQueryContext<'a> {
             .cloned()
     }
 
+    /// Require Python declaration-model coverage before a query can claim an
+    /// exhaustive absence relation. Individual workspace-only proofs remain
+    /// sound without the pack, but empty seed enumeration must not hide missing
+    /// capability coverage for selected Python files.
+    pub(super) fn require_python_absent_member_declaration_surface(&mut self, file: &ProjectFile) {
+        let publishes_surface = self
+            .active_semantic_model_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.semantic_model_overlay())
+            .is_some_and(|overlay| overlay.publishes_declaration_surface_for("python"));
+        if !publishes_surface {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "python absent-member analysis requires an active Python declaration surface",
+            );
+        }
+    }
+
     pub(super) fn exact_object_identity(
         &mut self,
         value: ValueHandle,
@@ -1743,6 +1763,13 @@ impl<'a> SemanticQueryContext<'a> {
         &mut self,
         procedure: &SemanticProcedureValue,
     ) -> Vec<super::type_flow::AbsentMemberFindingValue> {
+        // A typed traversal may reach a Python procedure outside its seed
+        // files. Check that actual target as well as the pre-enumeration scope.
+        if crate::analyzer::common::language_for_file(procedure.file())
+            == crate::analyzer::Language::Python
+        {
+            self.require_python_absent_member_declaration_surface(procedure.file());
+        }
         let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
         self.type_flow.absent_member_findings(
             self.workspace,
@@ -1751,6 +1778,19 @@ impl<'a> SemanticQueryContext<'a> {
             self.value_flow_limits,
             cancellation,
             self.active_semantic_model_snapshot.clone(),
+        )
+    }
+
+    pub(super) fn absent_member_witnesses(
+        &mut self,
+        finding: &super::type_flow::AbsentMemberFindingValue,
+        traversal: &WitnessTraversal,
+    ) -> Vec<super::type_flow::AbsentMemberWitnessValue> {
+        self.type_flow.absent_member_witnesses(
+            self.workspace,
+            finding,
+            traversal,
+            self.value_flow_limits,
         )
     }
 

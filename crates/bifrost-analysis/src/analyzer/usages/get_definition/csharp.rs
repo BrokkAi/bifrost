@@ -26,6 +26,11 @@ use brokk_bifrost_core::analyzer::structural::callable::{
     ApplicabilityVerdict, CallableRejectionReason,
 };
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
+use brokk_bifrost_csharp::graph::resolver::{
+    CSharpCallArgumentOwners, call_argument_parameter_index,
+    callable_parameter_type_fq_name_for_forward, callable_parameter_type_fq_name_in_session,
+    csharp_invocation_member, filter_call_argument_method_candidates_with_arities,
+};
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
     CSharpNamedArgumentLabel, csharp_constant_pattern_type_candidate,
@@ -607,6 +612,7 @@ fn csharp_using_alias_definition(
                 end_line: node.end_position().row + 1,
             };
             return Some(LexicalDefinition {
+                source_file: None,
                 identifier: reference.to_string(),
                 kind: DeclarationKind::ImportAlias,
                 name_range: range(name),
@@ -819,6 +825,7 @@ fn resolve_csharp_in_session(
             }
             if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
                 analyzer,
+                token,
                 definitions,
                 file,
                 &reference,
@@ -2307,6 +2314,7 @@ fn resolve_csharp_constructor(
     // its owner type before the constructor-overload lookup below runs.
     if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
+        token,
         definitions,
         file,
         &reference,
@@ -2453,6 +2461,7 @@ fn csharp_type_outcome(
     // resolving lookups are unaffected.
     if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
+        token,
         definitions,
         file,
         reference,
@@ -2507,6 +2516,7 @@ fn csharp_arity_free_type_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     if let Some(unit) = resolve_csharp_arity_free_nested_type_in_enclosing_classes(
         analyzer,
+        token,
         definitions,
         file,
         reference,
@@ -3186,7 +3196,7 @@ fn csharp_non_constructor_member_candidates(
 /// Which target the owner comes from is decided by
 /// `csharp_object_initializer_owners`, the ladder the inverse usage scan runs
 /// too, so the two directions answer the same construct the same way (#2173).
-/// Only the four index probes below are forward-specific.
+/// Only the index probes below are forward-specific.
 #[allow(clippy::too_many_arguments)]
 fn csharp_object_initializer_label_outcome(
     analyzer: &dyn IAnalyzer,
@@ -3215,6 +3225,37 @@ fn csharp_object_initializer_label_outcome(
             "C# object initializer target type could not be inferred",
         ));
     };
+    if !resolved.ambiguous_call_candidates.is_empty() {
+        let candidates = resolved
+            .ambiguous_call_candidates
+            .iter()
+            .map(|candidate| {
+                let signature = candidate
+                    .signature()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        definitions
+                            .signature_metadata(candidate)
+                            .into_iter()
+                            .next()
+                            .map(|metadata| metadata.label().to_string())
+                    })
+                    .unwrap_or_default();
+                if signature.is_empty() {
+                    format!("`{}`", candidate.fq_name())
+                } else {
+                    format!("`{}` ({signature})", candidate.fq_name())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(no_definition(
+            "ambiguous_object_initializer_owner",
+            format!(
+                "C# object initializer call argument target is not uniquely typed; candidates: {candidates}"
+            ),
+        ));
+    }
     Some(
         csharp_initializer_member_outcome(
             analyzer,
@@ -3229,6 +3270,12 @@ fn csharp_object_initializer_label_outcome(
                 "unresolved_object_initializer_owner",
                 format!(
                     "C# object initializer target type `{type_name}` did not resolve to an indexed C# type"
+                ),
+            ),
+            CSharpInitializerOwnerTarget::CallArgument(target) => no_definition(
+                "unknown_object_initializer_owner",
+                format!(
+                    "C# object initializer target type could not be inferred from call argument `{target}`"
                 ),
             ),
             CSharpInitializerOwnerTarget::CollectionTarget(target) => no_definition(
@@ -3254,7 +3301,7 @@ fn csharp_object_initializer_label_outcome(
 }
 
 /// The forward side of the shared object-initializer owner ladder: the same
-/// four probes the inverse scan supplies, reached through the definition
+/// probes the inverse scan supplies, reached through the definition
 /// provider's budgeted session instead of the usage index.
 struct CSharpForwardInitializerOwnerLookups<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
@@ -3277,6 +3324,66 @@ impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, 
             reference,
             type_node.start_byte(),
         )
+    }
+
+    fn call_argument_owners(&mut self, call: Node<'_>, index: usize) -> CSharpCallArgumentOwners {
+        let candidates = csharp_forward_call_argument_method_candidates(
+            self.analyzer,
+            self.token,
+            self.csharp,
+            self.definitions,
+            self.file,
+            self.source,
+            self.root,
+            call,
+        );
+        if candidates.len() != 1 {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: candidates,
+            };
+        }
+        let method = &candidates[0];
+        let metadata = self.definitions.signature_metadata(method);
+        let Some(metadata) = metadata.first() else {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: Vec::new(),
+            };
+        };
+        let Some(parameter_index) =
+            call_argument_parameter_index(call, index, metadata, self.source)
+        else {
+            return CSharpCallArgumentOwners {
+                owners: Vec::new(),
+                ambiguous_call_candidates: Vec::new(),
+            };
+        };
+        let parameter_type = match self.definitions.session() {
+            Some(session) => callable_parameter_type_fq_name_in_session(
+                self.csharp,
+                self.token,
+                method,
+                parameter_index,
+                session,
+            ),
+            None => callable_parameter_type_fq_name_for_forward(
+                self.csharp,
+                self.token,
+                method,
+                parameter_index,
+            ),
+        };
+        let mut owners: Vec<_> = parameter_type
+            .into_iter()
+            .flat_map(|fqn| self.definitions.fqn(&fqn))
+            .filter(CodeUnit::is_class)
+            .collect();
+        graph_support::sort_dedup_type_candidates(&mut owners);
+        CSharpCallArgumentOwners {
+            owners,
+            ambiguous_call_candidates: Vec::new(),
+        }
     }
 
     fn collection_target_owners(&mut self, target: Node<'_>) -> Vec<CodeUnit> {
@@ -3320,6 +3427,161 @@ impl CSharpInitializerOwnerLookups for CSharpForwardInitializerOwnerLookups<'_, 
         );
         types.normalized().units
     }
+
+    fn member_element_type_owners(&mut self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        let element = match self.definitions.session() {
+            Some(session) => csharp_member_declared_collection_element_type_fq_name_in_session(
+                self.csharp,
+                self.token,
+                owner,
+                member,
+                session,
+            ),
+            None => csharp_member_declared_collection_element_type_fq_name(
+                self.csharp,
+                self.token,
+                owner,
+                member,
+            ),
+        };
+        element
+            .into_iter()
+            .flat_map(|fqn| self.definitions.fqn(&fqn))
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_forward_call_argument_method_candidates(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some(function) = call.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let Some(invocation) = csharp_invocation_member(function, source) else {
+        return Vec::new();
+    };
+    let method_name = csharp_node_text(invocation.name.identifier, source);
+    if method_name.is_empty() {
+        return Vec::new();
+    }
+    let call_arity = csharp_argument_count_in_session(call, source, definitions);
+    let mut candidates = Vec::new();
+    if let Some(receiver) = invocation.receiver {
+        let owners = csharp_receiver_types(
+            analyzer,
+            token,
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            receiver,
+        )
+        .units;
+        for owner in owners {
+            let raw = csharp_forward_call_methods_for_owner(
+                analyzer,
+                token,
+                definitions,
+                &owner,
+                method_name,
+            );
+            if raw.is_empty() {
+                continue;
+            }
+            candidates.extend(filter_call_argument_method_candidates_with_arities(
+                raw,
+                call_arity,
+                invocation.name.explicit_generic_arity,
+                |candidate| {
+                    definitions
+                        .query(|| csharp_callable_arity(analyzer, candidate))
+                        .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
+                },
+            ));
+        }
+    } else {
+        // A simple-name invocation is resolved in lexical scope order. Once a
+        // declaring scope has a member of this name, an arity mismatch there
+        // cannot be rescued by an outer class's same-name method.
+        for owner in csharp_enclosing_class_chain(analyzer, definitions, file, call.start_byte()) {
+            let raw = csharp_forward_call_methods_for_owner(
+                analyzer,
+                token,
+                definitions,
+                &owner,
+                method_name,
+            );
+            if raw.is_empty() {
+                continue;
+            }
+            candidates = filter_call_argument_method_candidates_with_arities(
+                raw,
+                call_arity,
+                invocation.name.explicit_generic_arity,
+                |candidate| {
+                    definitions
+                        .query(|| csharp_callable_arity(analyzer, candidate))
+                        .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
+                },
+            );
+            break;
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn csharp_forward_call_methods_for_owner(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owner: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return csharp_non_constructor_member_candidates(analyzer, definitions, owner, name);
+    };
+    let mut seen = HashSet::default();
+    let mut level = vec![owner.clone()];
+    while !level.is_empty() {
+        let mut candidates = Vec::new();
+        let mut next_level = Vec::new();
+        for current in level {
+            if !definitions.scope_step() || !seen.insert(current.clone()) {
+                continue;
+            }
+            let mut parts = definitions.partial_type_parts(&current);
+            if parts.is_empty() {
+                parts.push(current.clone());
+            }
+            for part in parts {
+                candidates.extend(csharp_non_constructor_member_candidates(
+                    analyzer,
+                    definitions,
+                    &part,
+                    name,
+                ));
+            }
+            next_level.extend(definitions.direct_ancestors(provider, token, &current));
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        if !candidates.is_empty() {
+            return candidates;
+        }
+        level = next_level;
+    }
+    Vec::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3410,6 +3672,7 @@ fn csharp_constructed_type_candidates(
 ) -> Vec<CodeUnit> {
     if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
+        token,
         definitions,
         file,
         reference,
@@ -4724,6 +4987,7 @@ fn csharp_indexed_candidate_honesty_message(
 
 fn resolve_csharp_nested_type_in_enclosing_classes(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: &str,
@@ -4731,6 +4995,7 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
 ) -> Option<CodeUnit> {
     resolve_csharp_nested_type_in_enclosing_classes_with(
         analyzer,
+        token,
         definitions,
         file,
         name,
@@ -4741,6 +5006,7 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
 
 fn resolve_csharp_arity_free_nested_type_in_enclosing_classes(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: &str,
@@ -4748,6 +5014,7 @@ fn resolve_csharp_arity_free_nested_type_in_enclosing_classes(
 ) -> Option<CodeUnit> {
     resolve_csharp_nested_type_in_enclosing_classes_with(
         analyzer,
+        token,
         definitions,
         file,
         name,
@@ -4756,8 +5023,63 @@ fn resolve_csharp_arity_free_nested_type_in_enclosing_classes(
     )
 }
 
+/// The class `name` names inside `owner`: one `owner` declares itself, or one
+/// it inherits from a base type.
+///
+/// C# looks a simple type name up among the members of the enclosing type, and
+/// a type nested in a base class is one of those members, so `new Options { .. }`
+/// written inside `class Derived : Base` names `Base`'s nested `Options`
+/// (#2173). A type `owner` declares itself hides the inherited one, so the base
+/// walk runs only after the owner's own probe misses, and it is breadth first
+/// so the nearest base answers. Ancestors are read as the hierarchy states
+/// them, interfaces included, the same way the member walks here read them.
+fn csharp_nested_type_declared_or_inherited<Candidates>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owner: &CodeUnit,
+    name: &str,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Vec<CodeUnit>,
+{
+    let mut nested_class = |owner: &CodeUnit| {
+        type_candidates_by_fqn(&format!("{}.{}", owner.fq_name(), name))
+            .into_iter()
+            .find(CodeUnit::is_class)
+    };
+    if let Some(unit) = nested_class(owner) {
+        return Some(unit);
+    }
+    let provider = analyzer.type_hierarchy_provider()?;
+    let mut seen = HashSet::default();
+    seen.insert(owner.clone());
+    let mut pending: std::collections::VecDeque<CodeUnit> = definitions
+        .direct_ancestors(provider, token, owner)
+        .into_iter()
+        .filter(|ancestor| seen.insert(ancestor.clone()))
+        .collect();
+    while let Some(ancestor) = pending.pop_front() {
+        if !definitions.scope_step() {
+            return None;
+        }
+        if let Some(unit) = nested_class(&ancestor) {
+            return Some(unit);
+        }
+        pending.extend(
+            definitions
+                .direct_ancestors(provider, token, &ancestor)
+                .into_iter()
+                .filter(|next| seen.insert(next.clone())),
+        );
+    }
+    None
+}
+
 fn resolve_csharp_nested_type_in_enclosing_classes_with<Candidates>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     name: &str,
@@ -4791,11 +5113,14 @@ where
     })
     .map_while(|owner| definitions.scope_step().then_some(owner));
     for owner in owners {
-        let child_fqn = format!("{}.{}", owner.fq_name(), prefix);
-        let Some(prefix_unit) = type_candidates_by_fqn(&child_fqn)
-            .into_iter()
-            .find(CodeUnit::is_class)
-        else {
+        let Some(prefix_unit) = csharp_nested_type_declared_or_inherited(
+            analyzer,
+            token,
+            definitions,
+            &owner,
+            prefix,
+            type_candidates_by_fqn,
+        ) else {
             continue;
         };
         // The first enclosing class that binds the prefix decides: C# simple-name

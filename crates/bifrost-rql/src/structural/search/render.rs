@@ -17,6 +17,7 @@ pub(super) fn insert_pipeline_row(
     let key = value.key();
     if let Some(&index) = indexes.get(&key) {
         let row = &mut rows[index];
+        row.value.merge_evidence(value);
         let remaining = MAX_PROVENANCE_TRACES.saturating_sub(row.traces.len());
         if traces.len() > remaining {
             row.provenance_truncated = true;
@@ -2842,6 +2843,9 @@ pub(super) fn render_concurrent_access_conflict(
         }
         ConcurrencyOpenReason::RecursiveExpansion => "recursive_expansion".to_owned(),
         ConcurrencyOpenReason::BudgetExhausted => "budget_exhausted".to_owned(),
+        ConcurrencyOpenReason::UnmodeledMemory(capability) => {
+            format!("unmodeled_memory:{capability}")
+        }
     };
     CodeQueryConcurrentAccessConflict {
         id: value.id.clone(),
@@ -2914,16 +2918,20 @@ pub(super) fn render_absent_member_finding(
     value: &type_flow::AbsentMemberFindingValue,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryAbsentMemberFinding {
+    let root = value.representative();
     CodeQueryAbsentMemberFinding {
         id: value.id.clone(),
         file: rel_path_string(&value.file),
         range: render_source_range(analyzer, &value.file, &value.range, cache),
         member: value.member.clone(),
         class: value.class.clone(),
-        origin_file: rel_path_string(&value.origin_file),
-        origin_range: render_source_range(analyzer, &value.origin_file, &value.origin_range, cache),
-        caller: value.caller.clone(),
-        witness_steps: value.witness_steps,
+        origin_file: rel_path_string(&root.origin_file),
+        origin_range: render_source_range(analyzer, &root.origin_file, &root.origin_range, cache),
+        caller: root.caller.clone(),
+        witness_steps: root
+            .witness
+            .as_ref()
+            .map_or(0, |witness| witness.steps().len()),
     }
 }
 

@@ -1,0 +1,166 @@
+{
+  "schema_version": 2,
+  "pack_id": "bifrost.node-buffer-javascript-declarations",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-node-models",
+    "version": "0.1.0"
+  },
+  "language": "javascript",
+  "ecosystem": "npm",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Node.js Buffer API",
+    "revision": "v26.8.1"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "declarations.buffer",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.node.buffer.javascript",
+            "name": "Buffer",
+            "type_kind": "class",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.node.buffer.javascript.from-1",
+            "owner": "type.node.buffer.javascript",
+            "name": "from",
+            "member_kind": "method",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "value",
+                  "type": {
+                    "kind": "named",
+                    "name": "string"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "declared",
+                "id": "type.node.buffer.javascript"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.from(value)"
+            }
+          },
+          {
+            "id": "member.node.buffer.javascript.from-2",
+            "owner": "type.node.buffer.javascript",
+            "name": "from",
+            "member_kind": "method",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "value",
+                  "type": {
+                    "kind": "named",
+                    "name": "string"
+                  }
+                },
+                {
+                  "name": "encoding",
+                  "type": {
+                    "kind": "named",
+                    "name": "string"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "declared",
+                "id": "type.node.buffer.javascript"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.from(value, encoding)"
+            }
+          },
+          {
+            "id": "member.node.buffer.javascript.to-string-0",
+            "owner": "type.node.buffer.javascript",
+            "name": "toString",
+            "member_kind": "method",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "string"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.toString()"
+            }
+          },
+          {
+            "id": "member.node.buffer.javascript.to-string-1",
+            "owner": "type.node.buffer.javascript",
+            "name": "toString",
+            "member_kind": "method",
+            "visibility": "public",
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "encoding",
+                  "type": {
+                    "kind": "named",
+                    "name": "string"
+                  }
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "string"
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.toString(encoding)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

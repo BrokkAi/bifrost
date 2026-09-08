@@ -5,6 +5,7 @@
 //! so this crate does not depend on an analyzer implementation.
 
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 
 use crate::analyzer::semantic::{
     AllocationId, CallInvocationMode, CallSiteHandle, CallSiteId, CallableTarget,
@@ -328,6 +329,15 @@ pub enum ConcurrencyOpenReason {
     UnsupportedSynchronization(Box<str>),
     RecursiveExpansion,
     BudgetExhausted,
+    /// A producer walked this procedure and recorded that it did not model
+    /// one of its memory accesses, naming the capability it fell short of.
+    ///
+    /// Go's lowering says so for a store through a pointer dereference, a
+    /// multi-target assignment, and a dynamic index. An answer that omits an
+    /// access nobody modelled is not a clean answer, it is an unasked
+    /// question, and reporting it as an unknown *location* would name the
+    /// wrong thing: the location is not unknown, it was never formed.
+    UnmodeledMemory(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -393,8 +403,89 @@ pub enum ResolvedConcurrencyEffect {
     },
 }
 
+/// The field declaration one member locator stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMemberDeclaration {
+    /// The declaration's fully qualified name.
+    pub name: String,
+    /// Whether this locator anchors at that declaration rather than at a use
+    /// of it. Only a declaration-anchored locator can stand for the field
+    /// wherever it is reached.
+    pub is_declaration_site: bool,
+}
+
 /// Exact workspace answers consumed by the task-slice solver.
 pub trait ConcurrencyProvider {
+    /// The field declaration one member locator stands for, when the consumer
+    /// can name it.
+    ///
+    /// A producer resolves a field only where it can type the receiver, so a
+    /// capture inside a spawned closure keeps a per-procedure identity while
+    /// the parent uses the declaration. The two then describe one field
+    /// differently and their accesses are declared disjoint, silently.
+    ///
+    /// Abstaining keeps the producer's identity, which is the previous
+    /// behavior, so a provider that cannot resolve declarations is unaffected.
+    fn resolved_member_identity(
+        &self,
+        _member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<ResolvedMemberDeclaration> {
+        None
+    }
+
+    /// Whether this allocation yields a reference to the object it creates
+    /// rather than the object itself.
+    ///
+    /// `&T{}` yields a pointer, so a local bound to it names one object
+    /// wherever it is copied; `T{}` yields a value, and `a := b` on one copies
+    /// the object. A consumer may only carry an allocation's identity onto the
+    /// cell that stores it when the first is true.
+    fn allocation_yields_reference(
+        &self,
+        _procedure: &ProcedureHandle,
+        _allocation: crate::analyzer::semantic::AllocationId,
+    ) -> bool {
+        false
+    }
+
+    /// Whether the field a member locator names is declared as a pointer.
+    ///
+    /// A copy of a struct copies its direct fields, so a write to one cannot
+    /// reach the original. A pointer field inside that copy still addresses
+    /// one object, so a write through it does, and refusing both alike turns
+    /// a real race into silence.
+    fn member_is_pointer(&self, _member: &crate::analyzer::semantic::SemanticLocator) -> bool {
+        false
+    }
+
+    /// Whether binding this callee's receiver preserves the caller's object
+    /// identity.
+    ///
+    /// Most languages pass a receiver by reference, so a callee's field write
+    /// reaches the caller's object. Go copies it: a pointer receiver copies
+    /// the pointer and still reaches the object, a value receiver copies the
+    /// fields and cannot. Answering `true` for a value receiver reports the
+    /// callee's write as racing the caller's read, which is a false positive.
+    ///
+    /// The default is `true` because passing by reference is the common case;
+    /// a provider overrides it only for a language that copies.
+    fn receiver_binds_by_reference(&self, _procedure: &ProcedureHandle) -> bool {
+        true
+    }
+
+    /// Whether binding this callee's parameter preserves the caller's object
+    /// identity, when the declaration says so either way.
+    ///
+    /// `None` means no declared type was recorded for that ordinal, which is
+    /// the common case for a language whose adapter does not publish
+    /// parameter types; the binding then keeps its previous behavior.
+    /// `Some(false)` is a proof that the callee writes a copy, so the
+    /// caller's object must not cross, and `Some(true)` names the caller's
+    /// object the way the caller's own accesses name it.
+    fn parameter_binding(&self, _procedure: &ProcedureHandle, _ordinal: u32) -> Option<bool> {
+        None
+    }
+
     /// A complete stable source summary for `procedure`, when the workspace
     /// has published one under the active behavior and dependency closure.
     /// Absence is distinct from a partial summary: partial summaries are never
@@ -636,6 +727,11 @@ struct IndexAliasDomain {
 struct FieldAliasDomain {
     base: Option<CanonicalConcurrencyLocation>,
     member: crate::analyzer::semantic::SemanticLocator,
+    /// The field declaration both sides stand for, when the consumer named it.
+    ///
+    /// `member` agrees only where both producers could type the receiver.
+    /// `None` keeps the previous anchor comparison.
+    declaration: Option<String>,
 }
 
 struct CanonicalizedAccess {
@@ -674,6 +770,22 @@ struct LocalLocation {
     location: MemoryLocationId,
 }
 
+/// The locator that stands for one field, and the rank that chose it.
+#[derive(Debug)]
+struct CanonicalMember {
+    /// Ranks a declaration-anchored locator ahead of every use of the field,
+    /// then the lowest locator key, so the choice never depends on the order
+    /// the members were visited in.
+    ///
+    /// The declaration comes first because it is what a producer stores
+    /// wherever it could type the receiver, and so what a reusable summary's
+    /// own field selector already digests. Where no side could type the field
+    /// -- two closures that each capture `p` and reach `p.mu` -- there is no
+    /// declaration to prefer and any single choice unifies them.
+    rank: (bool, (String, u32, u32)),
+    locator: crate::analyzer::semantic::SemanticLocator,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LocalSynchronizationSubject {
     Value {
@@ -698,6 +810,22 @@ struct SynchronizationSubjectClasses {
     captured_values: Vec<LocalSynchronizationSubject>,
     captured_locations: Vec<LocalSynchronizationSubject>,
     modeled_values: Vec<LocalSynchronizationSubject>,
+    /// Member locators whose field is declared as a pointer, so a chain
+    /// through them survives a copy of the struct that holds them.
+    pointer_members: HashSet<(String, u32, u32)>,
+    /// The declaration each member locator names.
+    member_declarations: HashMap<(String, u32, u32), String>,
+    /// The one locator chosen to stand for each named field.
+    ///
+    /// A producer resolves a field only where it can type the receiver, so one
+    /// field is denoted by its declaration at one use and by the use itself at
+    /// another. Every site renders a field step by digesting a locator, and
+    /// that digest folds the source anchor, so those two spell one field
+    /// differently: their accesses are declared disjoint, and the two
+    /// acquisitions of one lock stop matching, which reports the guarded write
+    /// as a race. Composing every occurrence from one locator is what gives
+    /// one field one name.
+    declaration_locators: HashMap<String, CanonicalMember>,
     fresh_allocations: Vec<LocalSynchronizationSubject>,
     value_assignments: HashMap<LocalSynchronizationSubject, usize>,
     location_stores: HashMap<LocalLocation, usize>,
@@ -992,6 +1120,21 @@ impl SynchronizationSubjectClasses {
         ))
     }
 
+    /// The locator that stands for the field a member locator names.
+    ///
+    /// Answers the member itself where no declaration-anchored locator was
+    /// observed, which is what a member no consumer can resolve gets, and is
+    /// the naming every site already used.
+    fn canonical_member<'a>(
+        &'a self,
+        member: &'a crate::analyzer::semantic::SemanticLocator,
+    ) -> &'a crate::analyzer::semantic::SemanticLocator {
+        self.member_declarations
+            .get(&member_locator_key(member))
+            .and_then(|name| self.declaration_locators.get(name))
+            .map_or(member, |canonical| &canonical.locator)
+    }
+
     /// Recover the identity of a map or slice backing store from structured
     /// value flow, field loads, call-boundary copies, and exact captures.
     ///
@@ -1077,8 +1220,9 @@ impl SynchronizationSubjectClasses {
             };
             if let Some(mut base) = base {
                 for member in fields.iter().rev() {
+                    let selector = field_step_selector(self.canonical_member(member));
                     base = CanonicalConcurrencyLocation::new(
-                        format!("{}/{}", base.identity, field_selector(member)),
+                        format!("{}/{selector}", base.identity),
                         "object",
                     );
                 }
@@ -1103,6 +1247,87 @@ impl SynchronizationSubjectClasses {
             let origin = origin?;
             fields.push(origin.member);
             cursor = self.backing_root(origin.base);
+        }
+    }
+
+    /// Name a value loaded out of another value's field, by composing the
+    /// chain it was loaded through.
+    ///
+    /// A field load's result is neither captured nor freshly allocated, so it
+    /// has no identity of its own, and an access based on it can never pair
+    /// with anything. This walks back to a value that does have an identity
+    /// and appends each field step, which is what
+    /// [`Self::canonical_backing_identity`] already does for an indexed
+    /// aggregate.
+    ///
+    /// It walks the ordinary equivalence classes rather than the backing
+    /// ones, and that difference is the point. Backing identity deliberately
+    /// crosses a copy, because a map or slice descriptor inside a copied
+    /// struct still names one backing store. A direct field does not survive
+    /// a copy, so composing over the backing classes equates a field of a
+    /// value receiver's copy with the caller's own field, which was measured
+    /// to prove a race Go cannot have. The ordinary classes carry only the
+    /// bindings that preserve object identity, which is what the receiver and
+    /// parameter rules decide.
+    fn canonical_field_chain_identity(
+        &mut self,
+        subject: LocalSynchronizationSubject,
+    ) -> Option<CanonicalConcurrencyLocation> {
+        let mut cursor = self.root(subject);
+        let mut fields = Vec::new();
+        let mut visited = HashSet::default();
+        loop {
+            if !visited.insert(cursor.clone()) {
+                return None;
+            }
+            // A chain that has crossed a pointer field addresses one object
+            // even where the struct holding that field was copied, which is
+            // exactly what the backing classes model. Without this a value
+            // receiver writing `o.in.n` through a pointer field reports
+            // nothing, though it does race.
+            let crossed_pointer = fields
+                .iter()
+                .any(|member| self.pointer_members.contains(&member_locator_key(member)));
+            let named = self.canonical_capture_identity(cursor.clone()).or_else(|| {
+                crossed_pointer
+                    .then(|| self.canonical_backing_identity(cursor.clone()))
+                    .flatten()
+            });
+            if let Some(mut base) = named {
+                for member in fields.iter().rev() {
+                    // Name an inner step exactly as the outermost step is
+                    // named. Without this the chain composes the locator's
+                    // own digest, which differs between the declaration the
+                    // caller anchors at and the use the callee anchors at, so
+                    // `b.tx.stats.CursorCount` agreed on its first and last
+                    // steps and disagreed in the middle.
+                    let selector = field_step_selector(self.canonical_member(member));
+                    base = CanonicalConcurrencyLocation::new(
+                        format!("{}/{selector}", base.identity),
+                        "object",
+                    );
+                }
+                return Some(base);
+            }
+            // The recorded origins describe every field load, not only those
+            // that reach a backing store, so one record serves both walks.
+            let origins = self.backing_field_origins.clone();
+            let mut origin: Option<BackingFieldOrigin> = None;
+            for candidate in origins {
+                if self.root(candidate.result.clone()) != cursor {
+                    continue;
+                }
+                if let Some(existing) = origin.as_ref()
+                    && (self.root(candidate.base.clone()) != self.root(existing.base.clone())
+                        || candidate.member != existing.member)
+                {
+                    return None;
+                }
+                origin.get_or_insert(candidate);
+            }
+            let origin = origin?;
+            fields.push(origin.member);
+            cursor = self.root(origin.base);
         }
     }
 
@@ -1215,9 +1440,23 @@ pub fn concurrent_access_conflicts(
     let mut pending_summary_accesses = Vec::new();
     let mut pending_synchronizations = Vec::new();
     let mut synchronization_subjects = SynchronizationSubjectClasses::default();
+    // The procedure a callable-valued value denotes, per context. A callee
+    // named by a parameter is chosen by the caller, so lowering cannot resolve
+    // it; the binding that supplies the parameter can, and the producer
+    // records the flow from that binding to the callable value.
+    // Allocation identities that name a reference rather than a value. Only
+    // these may be carried onto the cell that stores them, because copying a
+    // reference keeps one object while copying a value makes a second.
+    let mut reference_allocations = HashSet::<CanonicalConcurrencyLocation>::default();
+    let mut callable_values =
+        HashMap::<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>::default();
     let mut task_local_allocations =
         HashMap::<TaskId, HashSet<CanonicalConcurrencyLocation>>::default();
     let mut classes = LocationClasses::default();
+    // The formal each lexical cell was bound with, for the cells whose body
+    // never assigns them. Kept apart from `location_stores` so that a cell the
+    // body does assign keeps counting only its own writes.
+    let mut formal_bound_cells = HashMap::<LocalLocation, LocalSynchronizationSubject>::default();
     let mut report = ConcurrentAccessReport::default();
     let mut modeled_by_context =
         HashMap::<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>::default();
@@ -1234,6 +1473,52 @@ pub fn concurrent_access_conflicts(
             break;
         }
         let semantics = context.procedure.semantics();
+        // A closure that captures a parameter or receiver makes the producer
+        // hold it in a lexical cell, and where the body never assigns that
+        // formal the cell's only write is the call that bound it. A binding
+        // is not a body statement, so no `MemoryStore` reports it and the
+        // cell was left with no recorded store at all: it never joined the
+        // formal's class, carried no identity, and every access reaching
+        // through it resolved to nothing -- silently, because a location with
+        // no name is not a gap any step can report.
+        //
+        // Record the binding separately rather than as a store. Counting it
+        // as one would make a cell the body *does* assign look written twice
+        // and lose the identity it already had, which was measured: cache2go
+        // stopped reporting its own race.
+        for location in semantics.memory_locations() {
+            let binding = match location.kind {
+                MemoryLocationKind::LexicalCell { binding }
+                | MemoryLocationKind::Capture {
+                    binding: Some(binding),
+                    ..
+                } => binding,
+                _ => continue,
+            };
+            let Some(bound) = semantics.value(binding) else {
+                continue;
+            };
+            if !matches!(
+                bound.kind,
+                crate::analyzer::semantic::SemanticValueKind::Parameter { .. }
+                    | crate::analyzer::semantic::SemanticValueKind::Receiver { .. }
+            ) {
+                continue;
+            }
+            let cell = LocalLocation {
+                task: context.task,
+                procedure: context.procedure.clone(),
+                location: location.id,
+            };
+            formal_bound_cells.insert(
+                cell,
+                LocalSynchronizationSubject::Value {
+                    task: context.task,
+                    procedure: context.procedure.clone(),
+                    value: binding,
+                },
+            );
+        }
         // Projection and the task solver share one SemanticRequest. A
         // complete summary proves that this exact body was already retained
         // and charged while closing the dependency graph. Do not debit the
@@ -1287,10 +1572,62 @@ pub fn concurrent_access_conflicts(
             break;
         }
 
+        // A producer that walked this body and could not model one of its
+        // memory accesses says so here. Omitting the access it never formed
+        // and still calling the answer clean is the false clean this analysis
+        // exists to avoid, so the gap becomes an open reason.
+        for gap in semantics.gaps() {
+            // `Assignments` is the capability Go falls short of when it says
+            // "indirect assignment write is not yet lowered", which is the
+            // write this analysis would otherwise omit in silence.
+            //
+            // Both halves of the test are needed, and each near miss is
+            // instructive. The memory capabilities look apt but are not: a
+            // mutex-protected fixture with no indirect write carries a
+            // `FieldMemory` gap saying a field's struct declaration identity
+            // is unresolved, which is about naming a field rather than
+            // omitting a write, and admitting it opened four correct answers.
+            // `HeapWrite` alone is not enough either, because the
+            // `ConcurrentSpawn` gap every goroutine carries claims it too.
+            // Within `Assignments` it is exactly the right question: the
+            // indirect write gap is `subject=value` and claims a heap write,
+            // while the multi-target assignment gap beside it is
+            // `subject=point` and claims none. `a, b := 0, 0` is ordinary Go,
+            // so opening on that would open nearly every real answer.
+            if gap.capability == crate::analyzer::semantic::SemanticCapability::Assignments
+                && gap
+                    .impacts
+                    .contains(crate::analyzer::semantic::SemanticGapImpact::HeapWrite)
+            {
+                report.reasons.push(ConcurrencyOpenReason::UnmodeledMemory(
+                    gap.capability.label().into(),
+                ));
+            }
+        }
+
         let allocation_results = semantics
             .allocations()
             .iter()
             .map(|allocation| allocation.result)
+            .collect::<HashSet<_>>();
+        let aggregate_copies = semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind:
+                        crate::analyzer::semantic::ValueFlowKind::Transfer(
+                            crate::analyzer::semantic::ValueTransfer {
+                                kind: crate::analyzer::semantic::TransferKind::AggregateCopy,
+                                ..
+                            },
+                        ),
+                    source,
+                    target,
+                } => Some((source, target)),
+                _ => None,
+            })
             .collect::<HashSet<_>>();
         for location in semantics.memory_locations() {
             let binding = match location.kind {
@@ -1317,6 +1654,23 @@ pub fn concurrent_access_conflicts(
         for point in semantics.points() {
             for event in &point.events {
                 match event.effect {
+                    SemanticEffect::CallableReference {
+                        result,
+                        ref callable,
+                    }
+                    | SemanticEffect::CallableCreation {
+                        result,
+                        ref callable,
+                    } => {
+                        if let CallableTargetResolution::Proven(CallableTarget::Local(target)) =
+                            callable.targets
+                            && let Some(handle) =
+                                context.procedure.artifact().procedure_handle(target)
+                        {
+                            callable_values
+                                .insert((context.task, context.procedure.clone(), result), handle);
+                        }
+                    }
                     SemanticEffect::Allocation { allocation } => {
                         let allocation = semantics
                             .allocation(allocation)
@@ -1328,6 +1682,11 @@ pub fn concurrent_access_conflicts(
                             && let Some(canonical) = resolved.exact_candidate().cloned()
                         {
                             let canonical = contextual_allocation_identity(context.task, canonical);
+                            if provider
+                                .allocation_yields_reference(&context.procedure, allocation.id)
+                            {
+                                reference_allocations.insert(canonical.clone());
+                            }
                             task_local_allocations
                                 .entry(context.task)
                                 .or_default()
@@ -1350,11 +1709,7 @@ pub fn concurrent_access_conflicts(
                         );
                         continue;
                     }
-                    SemanticEffect::ValueFlow {
-                        kind,
-                        source,
-                        target,
-                    } => {
+                    SemanticEffect::ValueFlow { source, target, .. } => {
                         let source_subject = LocalSynchronizationSubject::Value {
                             task: context.task,
                             procedure: context.procedure.clone(),
@@ -1365,41 +1720,46 @@ pub fn concurrent_access_conflicts(
                             procedure: context.procedure.clone(),
                             value: target,
                         };
-                        synchronization_subjects
-                            .union_backing(source_subject.clone(), target_subject.clone());
-                        if let Some(canonical) = synchronization_subjects
-                            .canonical_capture_identity(source_subject.clone())
+                        if let Some(callable) = callable_values
+                            .get(&(context.task, context.procedure.clone(), source))
+                            .cloned()
                         {
-                            synchronization_subjects
-                                .bind_canonical_value(target_subject.clone(), canonical);
+                            callable_values.insert(
+                                (context.task, context.procedure.clone(), target),
+                                callable,
+                            );
                         }
-                        if !matches!(
-                            kind,
-                            crate::analyzer::semantic::ValueFlowKind::Transfer(
-                                crate::analyzer::semantic::ValueTransfer {
-                                    kind: crate::analyzer::semantic::TransferKind::AggregateCopy,
-                                    ..
-                                }
-                            )
-                        ) && binding_location(semantics, target).is_none()
-                        {
-                            synchronization_subjects.union(source_subject, target_subject);
+                        if !aggregate_copies.contains(&(source, target)) {
+                            synchronization_subjects
+                                .union_backing(source_subject.clone(), target_subject.clone());
+                            if let Some(canonical) = synchronization_subjects
+                                .canonical_capture_identity(source_subject.clone())
+                            {
+                                synchronization_subjects
+                                    .bind_canonical_value(target_subject.clone(), canonical);
+                            }
+                            if binding_location(semantics, target).is_none() {
+                                synchronization_subjects.union(source_subject, target_subject);
+                            }
                         }
                         continue;
                     }
                     SemanticEffect::Assignment { target, value } => {
-                        synchronization_subjects.union_backing(
-                            LocalSynchronizationSubject::Value {
-                                task: context.task,
-                                procedure: context.procedure.clone(),
-                                value,
-                            },
-                            LocalSynchronizationSubject::Value {
-                                task: context.task,
-                                procedure: context.procedure.clone(),
-                                value: target,
-                            },
-                        );
+                        let copies_storage = aggregate_copies.contains(&(value, target));
+                        if !copies_storage {
+                            synchronization_subjects.union_backing(
+                                LocalSynchronizationSubject::Value {
+                                    task: context.task,
+                                    procedure: context.procedure.clone(),
+                                    value,
+                                },
+                                LocalSynchronizationSubject::Value {
+                                    task: context.task,
+                                    procedure: context.procedure.clone(),
+                                    value: target,
+                                },
+                            );
+                        }
                         synchronization_subjects.note_value_assignment(
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
@@ -1407,7 +1767,7 @@ pub fn concurrent_access_conflicts(
                                 value: target,
                             },
                         );
-                        if allocation_results.contains(&value) {
+                        if allocation_results.contains(&value) && !copies_storage {
                             synchronization_subjects.union(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
@@ -1453,13 +1813,23 @@ pub fn concurrent_access_conflicts(
                             location,
                         };
                         synchronization_subjects.note_location_store(local_location.clone());
-                        if !matches!(
-                            semantics
-                                .memory_location(location)
-                                .expect("validated memory store location exists")
-                                .kind,
-                            MemoryLocationKind::Index { .. }
-                        ) {
+                        // The cell receives a *copy* of this value, not the
+                        // value's own storage, so it must not inherit its
+                        // backing. `b := a` on a Go array stores `a` into
+                        // `b`'s cell while the copy duplicates the elements,
+                        // and connecting the cell to `a`'s backing made `a[0]`
+                        // and `b[0]` one location.
+                        let stores_a_copy =
+                            aggregate_copies.iter().any(|(source, _)| *source == value);
+                        if !stores_a_copy
+                            && !matches!(
+                                semantics
+                                    .memory_location(location)
+                                    .expect("validated memory store location exists")
+                                    .kind,
+                                MemoryLocationKind::Index { .. }
+                            )
+                        {
                             synchronization_subjects.note_backing_location_store(
                                 local_location,
                                 LocalSynchronizationSubject::Value {
@@ -1624,8 +1994,15 @@ pub fn concurrent_access_conflicts(
                 _ => None,
             });
             let direct_targets = if detached {
-                let (targets, reasons) =
-                    resolve_targets(provider, &context.procedure, call.id, request)?.into_parts();
+                let (targets, reasons) = resolve_targets(
+                    provider,
+                    context.task,
+                    &context.procedure,
+                    call.id,
+                    &callable_values,
+                    request,
+                )?
+                .into_parts();
                 report.reasons.extend(reasons);
                 Some((targets, None, true))
             } else {
@@ -1640,7 +2017,16 @@ pub fn concurrent_access_conflicts(
                     let child = TaskId(u32::try_from(tasks.len()).map_err(|_| {
                         SemanticProviderError::internal("concurrency task count exceeds u32")
                     })?);
-                    let repeated = point_is_cyclic(semantics, call.point);
+                    // A task spawned by a task that repeats repeats with it,
+                    // whatever its own spawn site looks like. Without this,
+                    // `for { go check() }` where `check` itself spawns the
+                    // body leaves the grandchild believing it runs once, so
+                    // its write is never compared against itself and the race
+                    // is reported as nothing at all -- silently, since a task
+                    // that runs once has no gap to declare. This is bbolt's
+                    // own shape.
+                    let repeated = point_is_cyclic(semantics, call.point)
+                        || tasks[context.task.0 as usize].repeated;
                     tasks.push(Task {
                         parent: Some(context.task),
                         entry_procedure: Some(target.clone()),
@@ -1661,6 +2047,7 @@ pub fn concurrent_access_conflicts(
                     if bind_invocation {
                         bind_call_inputs(
                             &mut synchronization_subjects,
+                            &mut callable_values,
                             &context,
                             call,
                             child,
@@ -1688,33 +2075,37 @@ pub fn concurrent_access_conflicts(
             }
 
             if !detached {
-                let (targets, reasons) =
-                    resolve_targets(provider, &context.procedure, call.id, request)?.into_parts();
+                let (targets, reasons) = resolve_targets(
+                    provider,
+                    context.task,
+                    &context.procedure,
+                    call.id,
+                    &callable_values,
+                    request,
+                )?
+                .into_parts();
                 let exact_target = reasons.is_empty() && targets.len() == 1;
                 report.reasons.extend(reasons);
                 for target in targets {
-                    union_capture_locations(
-                        &mut classes,
-                        &mut synchronization_subjects,
-                        &context,
-                        context.task,
-                        &target,
-                        call.callee,
-                    );
-                    bind_call_inputs(
-                        &mut synchronization_subjects,
-                        &context,
-                        call,
-                        context.task,
-                        &target,
-                        false,
-                        provider,
-                        request,
-                    )?;
                     let target_context = ContextKey {
                         task: context.task,
-                        procedure: target,
+                        procedure: target.clone(),
                     };
+                    // Bind through an edge only where the edge is analyzed.
+                    // A back edge is skipped just below, and binding through
+                    // it first gave the callee's formal a second actual from
+                    // a call the solver never expanded. The formal then had
+                    // two conflicting actuals and lost its identity, which
+                    // discarded the one instantiation that *was* analyzed and
+                    // correctly bound, so a write in a procedure the
+                    // recursion passes through -- `checkBucket` calling
+                    // `ForEachBucket`, whose callback calls `checkBucket` --
+                    // was reported as nothing.
+                    //
+                    // Skipping the binding loses nothing the analysis had:
+                    // the deeper instantiation is not expanded either, so it
+                    // contributes no accesses to misattribute, and
+                    // `RecursiveExpansion` already says it was not analyzed.
                     if context_reaches(&synchronous_graph, &target_context, &context) {
                         let summarized_cycle = provider
                             .complete_summary(&context.procedure)
@@ -1730,6 +2121,25 @@ pub fn concurrent_access_conflicts(
                         }
                         continue;
                     }
+                    union_capture_locations(
+                        &mut classes,
+                        &mut synchronization_subjects,
+                        &context,
+                        context.task,
+                        &target,
+                        call.callee,
+                    );
+                    bind_call_inputs(
+                        &mut synchronization_subjects,
+                        &mut callable_values,
+                        &context,
+                        call,
+                        context.task,
+                        &target,
+                        false,
+                        provider,
+                        request,
+                    )?;
                     synchronous_graph
                         .entry(context.clone())
                         .or_default()
@@ -1746,6 +2156,76 @@ pub fn concurrent_access_conflicts(
             }
         }
     }
+    // Name every field a load walked before anything composes an identity out
+    // of one. A lock taken through `p.mu` is a field load and never an
+    // access, and the subject resolution below is where its identity is
+    // composed, so naming after that step left its two acquisitions carrying
+    // use-site digests that cannot match and so protected nothing.
+    let loaded_members = synchronization_subjects
+        .backing_field_origins
+        .iter()
+        .map(|origin| origin.member.clone())
+        .collect::<Vec<_>>();
+    name_member_declarations(&mut synchronization_subjects, provider, loaded_members);
+    // A cell written once holds one object for its whole life. Where that
+    // object is a reference with a proven identity, the cell may answer with
+    // it, which is what makes a capture of the cell and a direct read of the
+    // value agree. Without this the parent reaches the object as a value and
+    // names the allocation while the closure reaches it through the cell and
+    // names the cell, and the pair is declared disjoint.
+    // A formal's cell that the body never writes holds exactly what the call
+    // bound, which is the same "written once" the loop below relies on; it is
+    // simply written by the binding rather than by a statement.
+    //
+    // Both ways the body can write it disqualify the cell, and each was
+    // measured to matter. A store to the cell means the ordinary rule already
+    // counts the writes, and counting the binding as another would make a
+    // cell that was named look written twice: cache2go stopped reporting its
+    // own race that way. An `Assignment` to the formal is the case the
+    // producer lowers as value flow rather than a cell store, so the cell
+    // carries no store at all while the body has still replaced what it
+    // holds; naming it from the binding then reports a write to a fresh
+    // task-local object as a write to the caller's.
+    let written_once = synchronization_subjects
+        .location_stores
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .map(|(location, _)| (location.clone(), None))
+        .chain(
+            formal_bound_cells
+                .iter()
+                .filter(|(cell, formal)| {
+                    !synchronization_subjects.location_stores.contains_key(*cell)
+                        && !synchronization_subjects
+                            .value_assignments
+                            .contains_key(*formal)
+                })
+                .map(|(cell, formal)| (cell.clone(), Some(formal.clone()))),
+        )
+        .collect::<Vec<_>>();
+    for (location, bound_formal) in written_once {
+        let stored = match bound_formal {
+            Some(formal) => Some(formal),
+            None => synchronization_subjects
+                .backing_location_stores
+                .get(&location)
+                .and_then(|values| match values.as_slice() {
+                    [value] => Some(value.clone()),
+                    _ => None,
+                }),
+        };
+        let Some(stored) = stored else {
+            continue;
+        };
+        let Some(canonical) = synchronization_subjects.bound_canonical_identity(stored) else {
+            continue;
+        };
+        if !reference_allocations.contains(&canonical) {
+            continue;
+        }
+        synchronization_subjects
+            .bind_canonical_value(LocalSynchronizationSubject::Location(location), canonical);
+    }
     synchronization_subjects.connect_stable_backing_stores();
     resolve_modeled_subjects(
         &mut synchronization_subjects,
@@ -1757,6 +2237,25 @@ pub fn concurrent_access_conflicts(
         pending_summary_accesses,
         &mut accesses,
     );
+    // A field store records no load origin, so the accesses carry members the
+    // first pass could not see. Everything that composes them runs after
+    // this point.
+    let accessed_members = accesses
+        .iter()
+        .filter_map(|access| {
+            let local = access.local_location.as_ref()?;
+            let row = access
+                .site
+                .procedure
+                .semantics()
+                .memory_location(local.location)?;
+            match &row.kind {
+                MemoryLocationKind::Field { member, .. } => Some(member.clone()),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    name_member_declarations(&mut synchronization_subjects, provider, accessed_members);
     canonicalize_bound_accesses(&mut synchronization_subjects, &mut accesses);
     for access in &mut accesses {
         let context = ContextKey {
@@ -2251,8 +2750,10 @@ fn append_atomic_accesses(
 
 fn resolve_targets(
     provider: &impl ConcurrencyProvider,
+    task: TaskId,
     procedure: &ProcedureHandle,
     call: CallSiteId,
+    callable_values: &HashMap<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ConcurrencyAnswer<Vec<ProcedureHandle>>, SemanticProviderError> {
     if let Some(targets) = provider.complete_call_targets(procedure, call) {
@@ -2269,6 +2770,12 @@ fn resolve_targets(
                 .procedure_handle(target)
                 .expect("validated local target belongs to its artifact"),
         ]));
+    }
+    // A callee the caller supplied resolves through the binding that supplied
+    // it. Lowering cannot see that: the value is bound at the call site, one
+    // procedure away from the call it decides.
+    if let Some(target) = callable_values.get(&(task, procedure.clone(), row.callee)) {
+        return Ok(ConcurrencyAnswer::Proven(vec![target.clone()]));
     }
     let handle = procedure
         .call_site_handle(call)
@@ -2372,6 +2879,7 @@ fn canonicalize_access(
                 index_alias_domain: None,
                 field_alias_domain: Some(FieldAliasDomain {
                     base,
+                    declaration: None,
                     member: member.clone(),
                 }),
             })
@@ -2424,12 +2932,28 @@ fn exact_field_location(
     member: &crate::analyzer::semantic::SemanticLocator,
 ) -> CanonicalConcurrencyLocation {
     CanonicalConcurrencyLocation::new(
-        format!("{}/{}", base.identity, field_selector(member)),
+        format!("{}/{}", base.identity, field_step_selector(member)),
         "field",
     )
 }
 
-fn field_selector(member: &crate::analyzer::semantic::SemanticLocator) -> String {
+/// The file and span that identify one member locator across occurrences.
+fn member_locator_key(member: &crate::analyzer::semantic::SemanticLocator) -> (String, u32, u32) {
+    let span = member.anchor().span();
+    (
+        member.path().as_str().to_owned(),
+        span.start_byte(),
+        span.end_byte(),
+    )
+}
+
+/// Name one field step inside a composed location identity.
+///
+/// Every site that folds a field into an identity renders it through here,
+/// including the selectors a reusable summary carries, so one field has one
+/// spelling. The spelling digests a locator, which makes the *choice* of
+/// locator the thing that has to agree; `canonical_member` makes that choice.
+pub fn field_step_selector(member: &crate::analyzer::semantic::SemanticLocator) -> String {
     format!("field:{}", SummaryLocationKey::from_locator(member))
 }
 
@@ -2443,6 +2967,44 @@ fn exact_index_location(domain: &IndexAliasDomain) -> Option<CanonicalConcurrenc
         format!("{}/index:{selector}", domain.base.identity),
         "index",
     ))
+}
+
+/// Resolve the declaration behind each member locator, so that every field has
+/// one name before anything composes an identity out of it.
+///
+/// This runs twice, because the members become known on either side of
+/// modeled-subject resolution: a field load is recorded during the event walk,
+/// while a field store is only visible on the accesses it produced.
+fn name_member_declarations(
+    classes: &mut SynchronizationSubjectClasses,
+    provider: &impl ConcurrencyProvider,
+    members: impl IntoIterator<Item = crate::analyzer::semantic::SemanticLocator>,
+) {
+    for member in members {
+        let key = member_locator_key(&member);
+        if let Some(declaration) = provider.resolved_member_identity(&member) {
+            let candidate = CanonicalMember {
+                rank: (!declaration.is_declaration_site, key.clone()),
+                locator: member.clone(),
+            };
+            match classes.declaration_locators.entry(declaration.name.clone()) {
+                Entry::Occupied(mut chosen) => {
+                    if candidate.rank < chosen.get().rank {
+                        chosen.insert(candidate);
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
+            }
+            classes
+                .member_declarations
+                .insert(key.clone(), declaration.name);
+        }
+        if provider.member_is_pointer(&member) {
+            classes.pointer_members.insert(key);
+        }
+    }
 }
 
 fn canonicalize_bound_accesses(
@@ -2459,9 +3021,19 @@ fn canonicalize_bound_accesses(
             .semantics()
             .memory_location(local_location.location)
             .expect("validated concurrent access location exists");
+        let declaration = match &row.kind {
+            MemoryLocationKind::Field { member, .. } => classes
+                .member_declarations
+                .get(&member_locator_key(member))
+                .cloned(),
+            _ => None,
+        };
         let (base, selector, indexed) = match &row.kind {
             MemoryLocationKind::Field { base, member } => {
-                (*base, Some(field_selector(member)), None)
+                // The selector buckets accesses before the overlap gate sees
+                // them, so it has to agree about one field too.
+                let selector = field_step_selector(classes.canonical_member(member));
+                (*base, Some(selector), None)
             }
             MemoryLocationKind::Index {
                 base,
@@ -2490,7 +3062,15 @@ fn canonicalize_bound_accesses(
             MemoryLocationKind::Index { .. } => classes
                 .canonical_backing_identity(local_base.clone())
                 .or_else(|| classes.canonical_capture_identity(local_base)),
-            _ => classes.canonical_capture_identity(local_base),
+            // A field loaded from another field is neither captured nor
+            // freshly allocated, so it has no identity of its own and can
+            // only be named by the chain it was loaded through. Trying this
+            // only after the capture identity keeps every location that
+            // resolves today resolving to the same name, so it can add a base
+            // where there was none and cannot change one that existed.
+            _ => classes
+                .canonical_capture_identity(local_base.clone())
+                .or_else(|| classes.canonical_field_chain_identity(local_base)),
         };
         let Some(base) = base else {
             if contains_formal {
@@ -2502,6 +3082,7 @@ fn canonicalize_bound_accesses(
                 if let MemoryLocationKind::Field { member, .. } = &row.kind {
                     access.field_alias_domain = Some(FieldAliasDomain {
                         base: None,
+                        declaration: declaration.clone(),
                         member: member.clone(),
                     });
                 }
@@ -2512,7 +3093,8 @@ fn canonicalize_bound_accesses(
         if let MemoryLocationKind::Field { member, .. } = &row.kind {
             access.field_alias_domain = Some(FieldAliasDomain {
                 base: Some(base.clone()),
-                member: member.clone(),
+                declaration: declaration.clone(),
+                member: classes.canonical_member(member).clone(),
             });
         }
         if let Some((identity, constant_index)) = indexed {
@@ -2608,6 +3190,7 @@ fn append_summary_accesses(
         );
         let field_alias_domain = match &memory_location.kind {
             MemoryLocationKind::Field { member, .. } => Some(FieldAliasDomain {
+                declaration: None,
                 base: None,
                 member: member.clone(),
             }),
@@ -2878,6 +3461,7 @@ fn union_capture_locations(
 #[allow(clippy::too_many_arguments)]
 fn bind_call_inputs(
     classes: &mut SynchronizationSubjectClasses,
+    callable_values: &mut HashMap<(TaskId, ProcedureHandle, ValueId), ProcedureHandle>,
     caller: &ContextKey,
     call: &crate::analyzer::semantic::SemanticCallSite,
     target_task: TaskId,
@@ -2887,6 +3471,16 @@ fn bind_call_inputs(
     request: &mut SemanticRequest<'_>,
 ) -> Result<(), SemanticProviderError> {
     for formal in target.semantics().values() {
+        let dispatch_receiver = matches!(
+            formal.kind,
+            crate::analyzer::semantic::SemanticValueKind::Receiver { dispatch: true }
+        );
+        let parameter_ordinal = match formal.kind {
+            crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => {
+                Some(ordinal)
+            }
+            _ => None,
+        };
         let actual = match formal.kind {
             crate::analyzer::semantic::SemanticValueKind::Parameter { ordinal, .. } => call
                 .arguments
@@ -2906,12 +3500,80 @@ fn bind_call_inputs(
             value: actual_value,
         };
         let formal_value = formal.id;
+        // Carry the callable the actual denotes, so a call on this formal can
+        // resolve the body it reaches. This is the callable counterpart of the
+        // object identity the rest of this loop carries.
+        if let Some(callable) = callable_values
+            .get(&(caller.task, caller.procedure.clone(), actual_value))
+            .cloned()
+        {
+            callable_values.insert((target_task, target.clone(), formal_value), callable);
+        }
         let formal = LocalSynchronizationSubject::Value {
             task: target_task,
             procedure: target.clone(),
             value: formal_value,
         };
         classes.bind_backing_formal(formal.clone(), actual.clone());
+        // A pointer receiver copies the pointer, so the callee's field
+        // accesses reach the caller's object. Name that object exactly as the
+        // caller's own field accesses name it, which is what the overlap gate
+        // compares. `canonical_capture_identity` prefers a proven runtime
+        // identity and otherwise issues a capture identity, and it issues one
+        // only for a cell stored once, so the name cannot outlive the binding
+        // it stands for.
+        if dispatch_receiver && !provider.receiver_binds_by_reference(target) {
+            // The callee writes a copy of the receiver's fields, so nothing
+            // it writes reaches the caller's object. No identity crosses.
+            classes
+                .note_formal_binding_reasons(formal, vec![ConcurrencyOpenReason::UnknownLocation]);
+            continue;
+        }
+        // Go copies an argument, so a parameter answers the same question a
+        // receiver does. A pointer parameter copies the pointer and still
+        // reaches the caller's object; a value parameter copies the fields
+        // and cannot, and binding one reported the callee's write on its own
+        // copy as racing the caller's read.
+        if let Some(ordinal) = parameter_ordinal {
+            match provider.parameter_binding(target, ordinal) {
+                Some(false) => {
+                    classes.note_formal_binding_reasons(
+                        formal,
+                        vec![ConcurrencyOpenReason::UnknownLocation],
+                    );
+                    continue;
+                }
+                Some(true) => {
+                    if let Some(canonical) = classes.canonical_capture_identity(actual.clone()) {
+                        classes.bind_canonical_value(actual.clone(), canonical);
+                        if task_transfer {
+                            classes.mark_captured_value(actual.clone());
+                        }
+                        classes.bind_formal(formal, actual);
+                        continue;
+                    }
+                }
+                // No declared type was recorded, so the previous behavior
+                // stands: only a proven runtime identity crosses.
+                None => {}
+            }
+        }
+        // A receiver that does bind by reference must name the caller's
+        // object exactly as the caller's own field accesses name it, since
+        // that is what the overlap gate compares. `canonical_capture_identity`
+        // prefers a proven runtime identity and otherwise issues a capture
+        // identity, and it issues one only for a cell stored once, so the
+        // name cannot outlive the binding it stands for.
+        if dispatch_receiver
+            && let Some(canonical) = classes.canonical_capture_identity(actual.clone())
+        {
+            classes.bind_canonical_value(actual.clone(), canonical);
+            if task_transfer {
+                classes.mark_captured_value(actual.clone());
+            }
+            classes.bind_formal(formal, actual);
+            continue;
+        }
         let mut binding_reasons = Vec::new();
         let canonicals = if let Some(canonical) = classes.bound_canonical_identity(actual.clone()) {
             vec![canonical]
@@ -3200,9 +3862,22 @@ fn compare_accesses(
         {
             continue;
         }
+        // Two runtime instances of one repeated spawn reach this write holding
+        // whatever locks the body holds there, so the access is compared
+        // against itself. Computing this rather than asserting `Unprotected`
+        // matters: a body that takes a lock before its write is protected
+        // against its own repetition exactly as it is against a sibling.
+        let protection = if access.atomic {
+            ConcurrentProtection::AtomicOnly
+        } else {
+            compatible_lock_protection(access, access, lock_states)
+        };
         let mut reasons = access.reasons.clone();
         if let Some(group) = &tasks[access.site.task.0 as usize].group {
             reasons.extend(group.reasons.iter().cloned());
+        }
+        if protection == ConcurrentProtection::Open {
+            reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
         }
         reasons.sort();
         reasons.dedup();
@@ -3212,8 +3887,8 @@ fn compare_accesses(
             second: access.site.clone(),
             task_relation: ConcurrentTaskRelation::Repeated,
             ordering: ConcurrentOrdering::Unordered,
-            protection: ConcurrentProtection::Unprotected,
-            proven: reasons.is_empty(),
+            protection,
+            proven: reasons.is_empty() && protection != ConcurrentProtection::Open,
             exhaustive: reasons.is_empty(),
             reasons,
         });
@@ -3291,9 +3966,20 @@ fn access_location_overlap(first: &Access, second: &Access) -> AccessOverlap {
     ) else {
         return first.resolved_location.overlap(&second.resolved_location);
     };
-    if first.member.path() != second.member.path()
-        || first.member.anchor() != second.member.anchor()
-    {
+    // `member` agrees only where both producers could type the receiver. A
+    // capture inside a spawned closure cannot, so it anchors at the use while
+    // the parent anchors at the declaration, and comparing anchors alone calls
+    // a real race disjoint. A named declaration is the same from either side.
+    let same_member = match (&first.declaration, &second.declaration) {
+        (Some(first_declaration), Some(second_declaration)) => {
+            first_declaration == second_declaration
+        }
+        _ => {
+            first.member.path() == second.member.path()
+                && first.member.anchor() == second.member.anchor()
+        }
+    };
+    if !same_member {
         return AccessOverlap::Disjoint;
     }
     match (&first.base, &second.base) {

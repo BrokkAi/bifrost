@@ -66,6 +66,12 @@ impl WorkspaceContentIdentity {
         self.digest
     }
 
+    /// Stable digest bytes for an exact derived-value persistence key.
+    #[doc(hidden)]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        self.digest.as_bytes()
+    }
+
     /// The stand-in identity used when a cache has to name an artifact whose
     /// content identity the analyzer could not state.
     ///
@@ -123,8 +129,8 @@ impl WorkspaceContentIdentities {
     }
 
     /// The identity of exactly one language's analyzed file set.
-    #[cfg(test)]
-    pub(crate) fn language(&self, language: Language) -> Option<WorkspaceContentIdentity> {
+    #[doc(hidden)]
+    pub fn language(&self, language: Language) -> Option<WorkspaceContentIdentity> {
         self.scope(|candidate| candidate == language)
     }
 

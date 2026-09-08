@@ -42,7 +42,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// and source/JMOD production retains both formal names and that proof (#3006).
 /// 11: Python source-set rejects retain their exact source-entry identity for
 /// release extraction accounting (#3027).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 11;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 13;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

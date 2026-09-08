@@ -30,6 +30,8 @@ pub const MAX_VALUE_FLOW_CARRIERS: usize = 262_144;
 pub const MAX_VALUE_FLOW_RELATIONS: usize = 1_000_000;
 pub const MAX_VALUE_FLOW_SOURCES: usize = 65_536;
 pub const MAX_VALUE_FLOW_SINKS: usize = 65_536;
+const FALLBACK_COMPONENT_SUMMARY_IDENTITY: &[u8] =
+    b"bifrost-value-flow-fallback-component-summary-identity-v1";
 
 /// Remove selected source facts from one carrier while traversing one exact
 /// intraprocedural edge.
@@ -203,7 +205,7 @@ pub(crate) struct ValueFlowCuratedModelSummaryRule {
 pub(crate) struct ValueFlowFallbackSummaryRule {
     call: CallSiteId,
     inputs: Box<[ValueFlowCarrierKey]>,
-    reachable_components: Box<[usize]>,
+    reachable_components: Box<[StableDigest]>,
     normal_output: Option<ValueFlowCarrierKey>,
     exceptional_output: Option<ValueFlowCarrierKey>,
 }
@@ -242,7 +244,43 @@ pub(crate) struct ValueFlowCarrierSummaryIdentity {
     edge_kills: Box<[ValueFlowEdgeKillSummaryRule]>,
 }
 
+/// Canonical query-local guard behavior needed to partition reusable entries.
+#[derive(Debug, Clone)]
+pub(crate) struct ValueFlowSourceBehaviorIdentity {
+    edge_kills: Box<[ValueFlowEdgeKillSummaryRule]>,
+}
+
+impl ValueFlowSourceBehaviorIdentity {
+    pub(crate) fn work_units(&self) -> usize {
+        1usize.saturating_add(self.edge_kills.len())
+    }
+
+    pub(crate) fn fingerprint(
+        &self,
+        procedure: &crate::analyzer::semantic::SemanticLocator,
+        source: &ValueFlowEventKey,
+    ) -> StableDigest {
+        let mut digest =
+            LengthDelimitedDigest::new(b"bifrost-value-flow-source-edge-kill-behavior-v1");
+        push_summary_len(&mut digest, self.edge_kills.len());
+        for kill in &self.edge_kills {
+            digest.push(&kill.point.get().to_le_bytes());
+            digest.push(&kill.target.get().to_le_bytes());
+            digest.push(kill.kind.label().as_bytes());
+            push_summary_carrier(&mut digest, &kill.carrier, Some(procedure));
+            push_summary_bool(&mut digest, kill.sources.binary_search(source).is_ok());
+        }
+        digest.finish()
+    }
+}
+
 impl ValueFlowCarrierSummaryIdentity {
+    /// Whether this procedure's transfer relation can distinguish entry
+    /// sources. Callers propagate this bit through their dependency closure.
+    pub(crate) fn has_source_selective_edge_kills(&self) -> bool {
+        !self.edge_kills.is_empty()
+    }
+
     /// Checkout-independent identity of the exact carrier transfer contract.
     ///
     /// This deliberately projects mounted artifact keys through their public
@@ -252,28 +290,71 @@ impl ValueFlowCarrierSummaryIdentity {
     /// identity.
     #[cfg(test)]
     pub(crate) fn stable_fingerprint(&self) -> StableDigest {
-        self.fingerprint_with(None)
+        self.fingerprint_with(None, None)
     }
 
-    /// Checkout-independent identity of this procedure's exact structured
-    /// carrier contract. Local locator coordinates are relative to the
-    /// procedure, and call rules name stable callee lineage rather than callee
-    /// content; dependency keys own callee-result validity.
+    /// Procedure-relative identity of the local structured carrier contract.
+    ///
+    /// Unlike the closure identity, this does not classify source events by a
+    /// transitive callee set. It is therefore available before call discovery
+    /// and deliberately excludes dispatch answers.
     pub(crate) fn procedure_local_fingerprint(
         &self,
         procedure: &crate::analyzer::semantic::SemanticLocator,
     ) -> StableDigest {
-        self.fingerprint_with(Some(procedure))
+        self.fingerprint_with(Some(procedure), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_component_reference_count(&self) -> usize {
+        self.fallback_rules.iter().fold(0usize, |total, rule| {
+            total.saturating_add(rule.reachable_components.len())
+        })
+    }
+
+    /// Procedure-local carrier identity with entry-parametric source events
+    /// removed from edge-kill membership. Sources declared by this procedure
+    /// or a transitive callee remain exact internal transfer semantics.
+    pub(crate) fn procedure_closure_fingerprint(
+        &self,
+        procedure: &crate::analyzer::semantic::SemanticLocator,
+        internal_source_owners: &HashMap<
+            ValueFlowEventKey,
+            crate::analyzer::semantic::SemanticLocator,
+        >,
+    ) -> StableDigest {
+        self.fingerprint_with(Some(procedure), Some(internal_source_owners))
+    }
+
+    pub(crate) fn edge_kill_sources(&self) -> impl Iterator<Item = &ValueFlowEventKey> {
+        self.edge_kills.iter().flat_map(|kill| kill.sources.iter())
+    }
+
+    /// Source-parametric transfer behavior at this procedure's guard edges.
+    ///
+    /// Exact source event identity selects membership but is never hashed. The
+    /// result therefore groups distinct callers and classes when they take the
+    /// same normalized set of kill loci, while rotating when an adapter edit
+    /// changes which arm kills the source.
+    pub(crate) fn source_behavior_identity(&self) -> ValueFlowSourceBehaviorIdentity {
+        ValueFlowSourceBehaviorIdentity {
+            edge_kills: self.edge_kills.clone(),
+        }
     }
 
     fn fingerprint_with(
         &self,
         procedure: Option<&crate::analyzer::semantic::SemanticLocator>,
+        internal_source_owners: Option<
+            &HashMap<ValueFlowEventKey, crate::analyzer::semantic::SemanticLocator>,
+        >,
     ) -> StableDigest {
-        let domain: &[u8] = if procedure.is_some() {
-            b"bifrost-value-flow-procedure-local-summary-identity-v1"
+        let domain: &[u8] = if internal_source_owners.is_some() {
+            b"bifrost-value-flow-procedure-closure-summary-identity-v5"
+        } else if procedure.is_some() {
+            b"bifrost-value-flow-procedure-local-summary-identity-v3"
         } else {
-            b"bifrost-value-flow-carrier-summary-identity-v1"
+            b"bifrost-value-flow-carrier-summary-identity-v2"
         };
         let mut digest = LengthDelimitedDigest::new(domain);
         digest.push(self.unmodeled_call_behavior.label().as_bytes());
@@ -344,11 +425,7 @@ impl ValueFlowCarrierSummaryIdentity {
             }
             push_summary_len(&mut digest, rule.reachable_components.len());
             for component in &rule.reachable_components {
-                digest.push(
-                    &u64::try_from(*component)
-                        .expect("value-flow component index fits in u64")
-                        .to_le_bytes(),
-                );
+                digest.push(component.as_bytes());
             }
             push_optional_carrier(&mut digest, rule.normal_output.as_ref(), procedure);
             push_optional_carrier(&mut digest, rule.exceptional_output.as_ref(), procedure);
@@ -362,16 +439,56 @@ impl ValueFlowCarrierSummaryIdentity {
             push_summary_carrier(&mut digest, &binding.carrier, procedure);
         }
 
-        push_summary_len(&mut digest, self.edge_kills.len());
+        // Runtime transfer unions source membership for duplicate structural
+        // kill rows. Canonicalize that same algebra before hashing, especially
+        // because removing external entry sources can make previously distinct
+        // rows identical.
+        let mut normalized_kills = Vec::<(
+            ProgramPointId,
+            ProgramPointId,
+            ControlEdgeKind,
+            &ValueFlowCarrierKey,
+            Vec<&ValueFlowEventKey>,
+        )>::new();
         for kill in &self.edge_kills {
+            let sources = kill
+                .sources
+                .iter()
+                .filter(|source| {
+                    internal_source_owners.is_none_or(|owners| owners.contains_key(source))
+                })
+                .collect::<Vec<_>>();
+            if let Some((point, target, kind, carrier, retained)) = normalized_kills.last_mut()
+                && *point == kill.point
+                && *target == kill.target
+                && *kind == kill.kind
+                && *carrier == &kill.carrier
+            {
+                retained.extend(sources);
+                retained.sort_unstable();
+                retained.dedup();
+            } else {
+                normalized_kills.push((kill.point, kill.target, kill.kind, &kill.carrier, sources));
+            }
+        }
+        push_summary_len(&mut digest, normalized_kills.len());
+        for (point, target, kind, carrier, sources) in normalized_kills {
             digest.push(b"edge_kill");
-            digest.push(&kill.point.get().to_le_bytes());
-            digest.push(&kill.target.get().to_le_bytes());
-            digest.push(kill.kind.label().as_bytes());
-            push_summary_carrier(&mut digest, &kill.carrier, procedure);
-            push_summary_len(&mut digest, kill.sources.len());
-            for source in &kill.sources {
-                push_summary_event(&mut digest, source, procedure);
+            digest.push(&point.get().to_le_bytes());
+            digest.push(&target.get().to_le_bytes());
+            digest.push(kind.label().as_bytes());
+            push_summary_carrier(&mut digest, carrier, procedure);
+            // An external source arrives as the reusable entry placeholder;
+            // its exact membership is keyed by that entry's behavior
+            // partition. Internal sources remain fixed procedure semantics
+            // and therefore retain their exact local identities here.
+            push_summary_len(&mut digest, sources.len());
+            for source in sources {
+                let source_procedure = internal_source_owners
+                    .and_then(|owners| owners.get(source))
+                    .or(procedure)
+                    .expect("a retained source has a procedure-local owner");
+                push_summary_event(&mut digest, source, Some(source_procedure));
             }
         }
         digest.finish()
@@ -471,6 +588,29 @@ fn push_summary_len(digest: &mut LengthDelimitedDigest, len: usize) {
 
 fn push_summary_bool(digest: &mut LengthDelimitedDigest, value: bool) {
     digest.push(&[u8::from(value)]);
+}
+
+fn fallback_component_fingerprint(
+    component: usize,
+    procedure: &crate::analyzer::semantic::SemanticLocator,
+    locations: &FallbackLocationIndex,
+    carrier_keys: &[ValueFlowCarrierKey],
+) -> StableDigest {
+    let mut targets = locations
+        .by_component
+        .get(&component)
+        .into_iter()
+        .flatten()
+        .map(|carrier| &carrier_keys[carrier.index()])
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    let mut digest = LengthDelimitedDigest::new(FALLBACK_COMPONENT_SUMMARY_IDENTITY);
+    push_summary_len(&mut digest, targets.len());
+    for target in targets {
+        push_summary_carrier(&mut digest, target, Some(procedure));
+    }
+    digest.finish()
 }
 
 fn push_optional_carrier(
@@ -2301,6 +2441,39 @@ impl ValueFlowPlan {
         &self.carrier_keys
     }
 
+    /// Stable carriers that an interprocedural call can seed at this callee's
+    /// summary entry. Root summaries begin with Zero and need no carrier row.
+    pub(crate) fn summary_entry_carriers_by_procedure(
+        &self,
+    ) -> HashMap<ProcedureHandle, Box<[ValueFlowCarrierKey]>> {
+        let mut by_procedure = HashMap::<ProcedureHandle, Vec<ValueFlowCarrierKey>>::default();
+        for rule in self
+            .call_rules
+            .iter()
+            .filter(|rule| rule.kind == CallFlowRuleKind::Call)
+        {
+            by_procedure
+                .entry(rule.callee.clone())
+                .or_default()
+                .push(self.carrier_keys[rule.target.index()].clone());
+        }
+        by_procedure
+            .into_iter()
+            .map(|(procedure, mut carriers)| {
+                carriers.sort_unstable();
+                carriers.dedup();
+                debug_assert!(carriers.iter().all(|carrier| {
+                    matches!(
+                        carrier,
+                        ValueFlowCarrierKey::Port { procedure: owner, .. }
+                            if owner == procedure.semantics().locator()
+                    )
+                }));
+                (procedure, carriers.into_boxed_slice())
+            })
+            .collect()
+    }
+
     pub(crate) fn carrier_id_for_key(
         &self,
         key: &ValueFlowCarrierKey,
@@ -2335,6 +2508,9 @@ impl ValueFlowPlan {
     /// sink observations are deliberately excluded so compatible clients can
     /// union their demand sets and share one fixed-point solve.
     pub fn propagation_semantics_hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Default argument flow consumes a callee-owned entry source. Rotate
+        // retained summary identities when that transfer relation changes.
+        state.write(b"bifrost-value-flow-propagation-semantics-v2");
         self.root.hash(state);
         self.unmodeled_call_behavior.hash(state);
         self.external_summaries.fingerprint().hash(state);
@@ -2654,11 +2830,18 @@ impl ValueFlowPlan {
     /// documented: `Self::public_semantic_status` merges retained semantic
     /// boundary statuses without applying the models that discharge them, so a
     /// replay that retained no boundary reports `Complete` where the fresh
-    /// solve reports the subtree's raw status. No reuse-backed consumer reads
-    /// it today -- the CodeQuery value-flow search paths that do solve through
-    /// the non-reusable entry point -- and
-    /// `a_modeled_subtree_construct_reuses_a_non_leaf_callee_without_claiming_more_completeness`
-    /// fails if that changes.
+    /// solve reports the subtree's raw status. CodeQuery's ordinary value-flow
+    /// search paths still use the non-reusable entry point. Class-set type flow
+    /// is a reuse-backed consumer, but it never uses an omitted row to prove a
+    /// root sink absent: a zero-entry root row is admitted only when every
+    /// current sink has a remapped Meeting, under the exact procedure,
+    /// dependency, dispatch-read, and root-surface identities. Otherwise it
+    /// continues with the ordinary root solve while retaining eligible callee
+    /// reuse. The tests
+    /// `a_modeled_subtree_construct_reuses_a_non_leaf_callee_without_claiming_more_completeness`,
+    /// `complete_root_meetings_skip_fresh_solving_with_identical_class_sets`,
+    /// and `root_summary_missing_a_current_sink_continues_with_callee_reuse`
+    /// pin those two contracts.
     fn execution_discovery_modeled<Fact>(
         &self,
         result: &SummaryDataflowResult<Fact>,
@@ -3309,7 +3492,28 @@ impl ValueFlowPlan {
                     model: model.model.fingerprint(),
                 });
         }
+        let mut fallback_component_identities =
+            HashMap::<(usize, ProcedureHandle), StableDigest>::default();
         for profile in &self.fallback_profiles {
+            let procedure = profile.call.procedure();
+            let mut reachable_components = profile
+                .reachable_components
+                .iter()
+                .map(|component| {
+                    *fallback_component_identities
+                        .entry((*component, procedure.clone()))
+                        .or_insert_with(|| {
+                            fallback_component_fingerprint(
+                                *component,
+                                procedure.semantics().locator(),
+                                &self.fallback_locations,
+                                &self.carrier_keys,
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            reachable_components.sort_unstable();
+            reachable_components.dedup();
             builders
                 .entry(profile.call.procedure().clone())
                 .or_default()
@@ -3321,7 +3525,9 @@ impl ValueFlowPlan {
                         .iter()
                         .map(|carrier| self.carrier_keys[carrier.index()].clone())
                         .collect(),
-                    reachable_components: profile.reachable_components.clone(),
+                    // Dense union-find roots are plan-local. Each digest names
+                    // the exact stable location set the component exposes.
+                    reachable_components: reachable_components.into_boxed_slice(),
                     normal_output: profile
                         .normal_output
                         .map(|carrier| self.carrier_keys[carrier.index()].clone()),
@@ -3384,7 +3590,7 @@ impl ValueFlowPlan {
                         curated_models: builder.curated_models.into_boxed_slice(),
                         fallback_rules: builder.fallback_rules.into_boxed_slice(),
                         location_bindings: builder.location_bindings.into_boxed_slice(),
-                        edge_kills: builder.edge_kills.into_boxed_slice(),
+                        edge_kills: normalize_summary_edge_kills(builder.edge_kills),
                     },
                 )
             })
@@ -3410,7 +3616,81 @@ impl ValueFlowPlan {
                             .saturating_add(usize::from(profile.exceptional_output.is_some()))
                     }),
             )
+            .saturating_add(self.fallback_component_identity_work_rows())
             .saturating_add(self.fallback_locations.bounded_globals.len())
+    }
+
+    fn fallback_component_identity_work_rows(&self) -> usize {
+        self.fallback_component_identity_work_rows_for(self.fallback_profiles.iter().flat_map(
+            |profile| {
+                profile
+                    .reachable_components
+                    .iter()
+                    .map(|component| (*component, profile.call.procedure().clone()))
+            },
+        ))
+    }
+
+    fn fallback_component_identity_work_rows_for(
+        &self,
+        components: impl IntoIterator<Item = (usize, ProcedureHandle)>,
+    ) -> usize {
+        let components = components.into_iter().collect::<HashSet<_>>();
+        components
+            .into_iter()
+            .fold(0usize, |total, (component, _)| {
+                total.saturating_add(1).saturating_add(
+                    self.fallback_locations
+                        .by_component
+                        .get(&component)
+                        .map_or(0, Vec::len),
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_component_identity_rows_of(&self, procedure: &ProcedureHandle) -> usize {
+        self.fallback_component_identity_work_rows_for(
+            self.fallback_profiles
+                .iter()
+                .filter(|profile| profile.call.procedure() == procedure)
+                .flat_map(|profile| {
+                    profile
+                        .reachable_components
+                        .iter()
+                        .map(|component| (*component, procedure.clone()))
+                }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_reachable_location_count_of(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> usize {
+        let components = self
+            .fallback_profiles
+            .iter()
+            .filter(|profile| profile.call.procedure() == procedure)
+            .flat_map(|profile| profile.reachable_components.iter().copied())
+            .collect::<HashSet<_>>();
+        components.into_iter().fold(0usize, |total, component| {
+            total.saturating_add(
+                self.fallback_locations
+                    .by_component
+                    .get(&component)
+                    .map_or(0, Vec::len),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_component_ordinals_of(&self, procedure: &ProcedureHandle) -> Vec<usize> {
+        self.fallback_profiles
+            .iter()
+            .filter(|profile| profile.call.procedure() == procedure)
+            .flat_map(|profile| profile.reachable_components.iter().copied())
+            .collect()
     }
 
     fn external_summary_fingerprints_for(
@@ -3834,6 +4114,28 @@ impl ValueFlowPlan {
         callee: &ProcedureHandle,
     ) -> bool {
         matches!(self.carrier(carrier), Some(ValueFlowCarrier::Port(port)) if port.procedure() == callee)
+    }
+
+    /// Whether `carrier` is the callee-owned saved value for a default
+    /// argument. A default value is evaluated at definition time and cannot
+    /// be reconstructed as a caller-side preimage at a call edge. The flow
+    /// clients consume its entry source directly when the binding selects it.
+    pub(crate) fn is_default_argument_carrier(
+        &self,
+        carrier: ValueFlowCarrierId,
+        callee: &ProcedureHandle,
+    ) -> bool {
+        let Some(ValueFlowCarrier::Value(value)) = self.carrier(carrier) else {
+            return false;
+        };
+        value.procedure().durable_key() == callee.durable_key()
+            && value
+                .procedure()
+                .semantics()
+                .value(value.id())
+                .is_some_and(|value| {
+                    matches!(value.kind, SemanticValueKind::DefaultArgument { .. })
+                })
     }
 
     pub fn source(&self, id: ValueFlowSourceId) -> Option<&ValueFlowSourceSpec> {
@@ -5305,6 +5607,29 @@ fn compare_edge_kills(left: &ValueFlowEdgeKillSpec, right: &ValueFlowEdgeKillSpe
                 .cmp(&right.carrier.stable_key().ok())
         })
         .then_with(|| left.sources.cmp(&right.sources))
+}
+
+fn normalize_summary_edge_kills(
+    rows: Vec<ValueFlowEdgeKillSummaryRule>,
+) -> Box<[ValueFlowEdgeKillSummaryRule]> {
+    let mut normalized = Vec::<ValueFlowEdgeKillSummaryRule>::new();
+    for row in rows {
+        if let Some(previous) = normalized.last_mut()
+            && previous.point == row.point
+            && previous.target == row.target
+            && previous.kind == row.kind
+            && previous.carrier == row.carrier
+        {
+            let mut sources = std::mem::take(&mut previous.sources).into_vec();
+            sources.extend(row.sources);
+            sources.sort_unstable();
+            sources.dedup();
+            previous.sources = sources.into_boxed_slice();
+        } else {
+            normalized.push(row);
+        }
+    }
+    normalized.into_boxed_slice()
 }
 
 fn build_edge_kill_index(

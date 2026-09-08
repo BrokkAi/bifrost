@@ -80,12 +80,20 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// requires those languages to agree here, which [`edge_passes`] asserts.
     fn ecosystem(&self) -> UsageEcosystem;
 
-    /// Return a language-owned transitive reverse-import answer for candidate
-    /// discovery. `None` leaves the framework's generic importer walk in
-    /// charge; `Some` is complete for this language and replaces that walk.
-    fn transitive_referencing_files(
+    /// Return this language's own answer to "which files can hold a reference
+    /// to `target`", seeded from `seed_files`. `None` leaves the framework's
+    /// generic importer walk in charge; `Some` is complete for this language
+    /// and replaces that walk.
+    ///
+    /// A language may narrow its reverse-import closure by any admission test
+    /// it can prove from structure -- a file the closure reaches but whose
+    /// syntax cannot spell `target` holds no reference to it, proven or
+    /// unproven -- so the answer stays complete while the framework's file
+    /// budget sees a set it can admit whole.
+    fn referencing_candidate_files(
         &self,
         _analyzer: &dyn IAnalyzer,
+        _target: &CodeUnit,
         _seed_files: &BTreeSet<ProjectFile>,
         _cancellation: Option<&CancellationToken>,
     ) -> Option<HashSet<ProjectFile>> {
@@ -1026,14 +1034,14 @@ language   | ecosystem            | pass   | sep | strategy | bulk   | recv | fa
 Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes | -
 Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes | -
 Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | yes | -
-JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | -
-TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | -
+JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | yes
+TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes | yes
 Python     | Python               | Python | .   | -        | Python | yes  | -     | yes | yes
 Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes | -
-Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes | -
+Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes | yes
 Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes | -
 CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes | -
-Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes | -
+Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes | yes
 Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | -     | yes | -
 ";
 

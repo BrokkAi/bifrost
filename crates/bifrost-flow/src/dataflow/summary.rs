@@ -165,6 +165,13 @@ pub struct ReusableProcedureSummary<Fact> {
 /// easier to satisfy after a replay. That is sound only while the summary's own
 /// validity contract covers the subtree, which is what the provider states
 /// here.
+///
+/// The opt-in root-reuse entry point additionally calls this method with
+/// `procedure == root` and the problem's distinguished zero fact. Only a
+/// provider whose consumer has an independent completeness rule for omitted
+/// root-body rows may answer that lookup. Ordinary reusable-callee solves never
+/// request it. The solver still refuses root rows for strict witness retention,
+/// explicit entry facts, point seeds, root cycles, and escaping call contracts.
 pub trait ReusableSummaryProvider<Fact> {
     fn summary_for(
         &mut self,
@@ -172,7 +179,40 @@ pub trait ReusableSummaryProvider<Fact> {
         root: &ProcedureHandle,
         entry_fact: Fact,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination>;
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, ReusableSummaryError>;
+
+    /// Commit provider-owned cache publications staged while answering an
+    /// accepted root lookup. Root lookup is speculative until the solver has
+    /// validated the returned relation and reserved all replay work, so a
+    /// provider must not make those publications visible before this hook.
+    /// An error must leave no partial publication: implementations check
+    /// cancellation before their first mutation and, once commit begins,
+    /// finish cooperatively and return success.
+    fn commit_root_summary(
+        &mut self,
+        _root: &ProcedureHandle,
+        _cancellation: &crate::analyzer::semantic::CancellationToken,
+    ) -> Result<(), SolverTermination> {
+        Ok(())
+    }
+
+    /// Discard provider-owned publications staged for a root relation that the
+    /// solver refused after lookup.
+    fn discard_root_summary(&mut self, _root: &ProcedureHandle) {}
+}
+
+/// A reusable-summary lookup either stopped the whole solve or proved that a
+/// speculative discovery cut cannot be honored by this plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableSummaryError {
+    Terminated(SolverTermination),
+    MandatoryCutMiss,
+}
+
+impl From<SolverTermination> for ReusableSummaryError {
+    fn from(termination: SolverTermination) -> Self {
+        Self::Terminated(termination)
+    }
 }
 
 struct NoReusableSummaries;
@@ -184,7 +224,7 @@ impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
         _root: &ProcedureHandle,
         _entry_fact: Fact,
         _request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, ReusableSummaryError> {
         Ok(None)
     }
 }
@@ -1886,7 +1926,14 @@ where
                         self.metrics.reusable_summary_misses.saturating_add(1);
                     continue;
                 }
-                Err(termination) => return Ok(Some(termination)),
+                Err(ReusableSummaryError::Terminated(termination)) => {
+                    return Ok(Some(termination));
+                }
+                Err(ReusableSummaryError::MandatoryCutMiss) => {
+                    return Err(SummaryDataflowError::MandatorySummaryCutMiss {
+                        procedure: transfer.callee.clone(),
+                    });
+                }
             };
             if summary.call_cycle == SummaryCallCycle::IncludesRoot {
                 // #2285. A relative summary carries only rows whose entry is
@@ -2092,6 +2139,251 @@ where
                     )? {
                         return Ok(Some(termination));
                     }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Replace the solve root's exact Zero-entry relation with one reusable
+    /// relation. This is deliberately a separate opt-in from callee reuse:
+    /// clients that consume arbitrary reached rows or coverage still need to
+    /// account for the whole root body being skipped.
+    fn apply_reusable_root_summary<P, Provider, Reusable>(
+        &mut self,
+        provider: &Provider,
+        reusable: &mut Reusable,
+        problem: &P,
+        semantic_budget: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError>
+    where
+        P: DistributiveDataflowProblem<Fact = Fact>,
+        Provider: IcfgProvider + ?Sized,
+        Reusable: ReusableSummaryProvider<Fact> + ?Sized,
+    {
+        if request.cancellation.is_cancelled() {
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+        if self.witness_arena.is_enabled() && !self.best_effort_witness_retention {
+            self.metrics.reusable_summary_misses =
+                self.metrics.reusable_summary_misses.saturating_add(1);
+            return Ok(None);
+        }
+
+        let root = self.procedures[self.root].clone();
+        let entry_point = root
+            .point_handle(root.semantics().entry_point())
+            .ok_or_else(|| SemanticProviderError::internal("summary root entry point is stale"))?;
+        let entry = EntryKey {
+            procedure: self.root,
+            entry_point: entry_point.id(),
+            entry_fact: ZERO_FACT_ID,
+        };
+        // A root lookup is optional speculation. Keep its solver charge in a
+        // child ledger until the returned relation passes every admission
+        // guard, so a miss or refusal leaves exactly the budget the ordinary
+        // root solve would have received.
+        let mut probe_budget = request.budget.clone();
+        let mut probe_request = DataflowRequest::new(&mut probe_budget, request.cancellation)
+            .with_query_plan_config(request.query_plan_config());
+        let summary = match reusable.summary_for(&root, &root, self.zero_fact, &mut probe_request) {
+            Ok(Some(summary)) => summary,
+            Ok(None) => {
+                reusable.discard_root_summary(&root);
+                if request.cancellation.is_cancelled() {
+                    return Ok(Some(SolverTermination::Cancelled));
+                }
+                self.metrics.reusable_summary_misses =
+                    self.metrics.reusable_summary_misses.saturating_add(1);
+                return Ok(None);
+            }
+            Err(ReusableSummaryError::Terminated(SolverTermination::Cancelled)) => {
+                reusable.discard_root_summary(&root);
+                return Ok(Some(SolverTermination::Cancelled));
+            }
+            Err(ReusableSummaryError::Terminated(SolverTermination::ExceededBudget(_))) => {
+                reusable.discard_root_summary(&root);
+                self.metrics.reusable_summary_misses =
+                    self.metrics.reusable_summary_misses.saturating_add(1);
+                return Ok(None);
+            }
+            Err(ReusableSummaryError::Terminated(SolverTermination::FixedPoint)) => {
+                reusable.discard_root_summary(&root);
+                return Err(SemanticProviderError::internal(
+                    "reusable summary provider returned fixed point as a termination",
+                )
+                .into());
+            }
+            Err(ReusableSummaryError::MandatoryCutMiss) => {
+                reusable.discard_root_summary(&root);
+                return Err(SummaryDataflowError::MandatorySummaryCutMiss { procedure: root });
+            }
+        };
+        if summary.call_cycle == SummaryCallCycle::IncludesRoot {
+            reusable.discard_root_summary(&root);
+            self.metrics.reusable_summary_cycle_refusals = self
+                .metrics
+                .reusable_summary_cycle_refusals
+                .saturating_add(1);
+            return Ok(None);
+        }
+        if summary.called_procedures == SummaryCalledProcedures::MayEscapeContract {
+            reusable.discard_root_summary(&root);
+            self.metrics.reusable_summary_called_procedure_refusals = self
+                .metrics
+                .reusable_summary_called_procedure_refusals
+                .saturating_add(1);
+            return Ok(None);
+        }
+        if summary.exits.iter().any(|row| row.qualities.is_empty())
+            || summary
+                .reached
+                .iter()
+                .any(|row| row.qualities.is_empty() || row.point.procedure() != &root)
+        {
+            reusable.discard_root_summary(&root);
+            self.metrics.reusable_summary_misses =
+                self.metrics.reusable_summary_misses.saturating_add(1);
+            return Ok(None);
+        }
+        let mut facts = summary
+            .exits
+            .iter()
+            .map(|row| row.exit_fact)
+            .chain(summary.reached.iter().map(|row| row.fact))
+            .collect::<Vec<_>>();
+        facts.sort_unstable();
+        facts.dedup();
+        let staged = match self.stage_facts(&facts, &probe_request) {
+            Ok(Some(staged)) => staged,
+            Ok(None) => {
+                reusable.discard_root_summary(&root);
+                return Ok(Some(SolverTermination::Cancelled));
+            }
+            Err(error) => {
+                reusable.discard_root_summary(&root);
+                return Err(error);
+            }
+        };
+        let staged_ids = facts
+            .iter()
+            .copied()
+            .zip(staged.ids.iter().copied())
+            .collect::<HashMap<_, _>>();
+        let new_reached_states = summary
+            .reached
+            .iter()
+            .filter(|row| {
+                !self.reached.contains_key(&PathEdgeKey {
+                    entry,
+                    point: row.point.id(),
+                    fact: staged_ids[&row.fact],
+                })
+            })
+            .count();
+        if let Some(termination) = self.reserve_publication(
+            SolverWork {
+                interned_facts: staged.new_facts.len(),
+                reached_states: new_reached_states,
+                ..SolverWork::default()
+            },
+            0,
+            &mut probe_request,
+        ) {
+            reusable.discard_root_summary(&root);
+            return match termination {
+                SolverTermination::Cancelled => Ok(Some(SolverTermination::Cancelled)),
+                SolverTermination::ExceededBudget(_) => {
+                    self.metrics.reusable_summary_misses =
+                        self.metrics.reusable_summary_misses.saturating_add(1);
+                    Ok(None)
+                }
+                SolverTermination::FixedPoint => Err(SemanticProviderError::internal(
+                    "reusable root publication returned fixed point as a termination",
+                )
+                .into()),
+            };
+        }
+        if request.cancellation.is_cancelled() {
+            reusable.discard_root_summary(&root);
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+        if let Err(termination) = reusable.commit_root_summary(&root, request.cancellation) {
+            reusable.discard_root_summary(&root);
+            return Ok(Some(termination));
+        }
+        *request.budget = (*probe_request.budget).clone();
+        if self.witness_arena.is_enabled() {
+            self.mark_reusable_witnesses_omitted();
+        }
+        self.commit_facts(staged.new_facts);
+        self.reusable_entries.insert(entry);
+        self.metrics.reusable_summary_hits = self.metrics.reusable_summary_hits.saturating_add(1);
+        self.metrics.reusable_root_summary_hits =
+            self.metrics.reusable_root_summary_hits.saturating_add(1);
+
+        for row in summary.reached {
+            let fact = self.fact_ids[&row.fact];
+            let path = PathEdgeKey {
+                entry,
+                point: row.point.id(),
+                fact,
+            };
+            let frontier = self.reached.entry(path).or_default();
+            for quality in row.qualities {
+                frontier.insert(quality);
+            }
+            self.metrics.reusable_observations =
+                self.metrics.reusable_observations.saturating_add(1);
+        }
+
+        for row in summary.exits {
+            let exit_point = match row.exit_kind {
+                crate::analyzer::semantic::ReturnTransferKind::Normal => {
+                    root.semantics().normal_exit_point()
+                }
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
+                    root.semantics().exceptional_exit_point()
+                }
+            };
+            let exit_point = root.point_handle(exit_point).ok_or_else(|| {
+                SemanticProviderError::internal("reusable root exit point is stale")
+            })?;
+            let (outcome, newly_materialized) = match self.cached_exit_profile(
+                provider,
+                &entry_point,
+                &exit_point,
+                semantic_budget,
+                request,
+            )? {
+                Ok(outcome) => outcome,
+                Err(termination) => return Ok(Some(termination)),
+            };
+            if newly_materialized
+                && let Some(termination) =
+                    self.observe_semantic_outcome(&exit_point, None, outcome.as_ref(), request)
+            {
+                return Ok(Some(termination));
+            }
+            let Some(exit) = outcome.available_value().cloned() else {
+                continue;
+            };
+            let path = PathEdgeKey {
+                entry,
+                point: exit_point.id(),
+                fact: self.fact_ids[&row.exit_fact],
+            };
+            for quality in row.qualities {
+                if let Some(termination) = self.publish_end_summary(
+                    path,
+                    Arc::clone(&exit),
+                    quality,
+                    None,
+                    problem,
+                    request,
+                )? {
+                    return Ok(Some(termination));
                 }
             }
         }
@@ -3250,6 +3542,57 @@ where
         termination
     } else {
         state.propagate(provider, reusable, problem, semantic_budget, request)?
+    };
+    let work = request.budget.used().saturating_sub(initial_work);
+    let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);
+    Ok(state.finish(termination, work, semantic_work))
+}
+
+/// Solve with optional validated cross-query summaries at both the exact
+/// Zero-entry root and ordinary callee entries.
+///
+/// Root reuse is intentionally opt-in. Replaying it omits every ordinary
+/// reached and coverage row from the root body, so only a client with its own
+/// observation-completeness guard may consume the result as a full answer.
+/// Inputs with explicit entry facts or point seeds conservatively use the
+/// ordinary reusable-callee path because those seeds are not represented by
+/// the provider's Zero-entry lookup.
+pub fn solve_with_reusable_root_and_end_summaries<P, Provider, Reusable>(
+    input: SummarySolveInput<'_, P::Fact>,
+    provider: &Provider,
+    problem: &P,
+    reusable: &mut Reusable,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<SummaryDataflowResult<P::Fact>, SummaryDataflowError>
+where
+    P: DistributiveDataflowProblem,
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<P::Fact> + ?Sized,
+{
+    let initial_work = request.budget.used();
+    let initial_semantic_work = semantic_budget.used();
+    let root_reuse_eligible = input.entry_facts().is_empty() && input.point_seeds().is_empty();
+    let mut state = SummaryState::new(problem.zero_fact(), input.witness_retention());
+    let termination = if let Some(termination) = state.initialize(input, request)? {
+        termination
+    } else {
+        let root_termination = if root_reuse_eligible {
+            state.apply_reusable_root_summary(
+                provider,
+                reusable,
+                problem,
+                semantic_budget,
+                request,
+            )?
+        } else {
+            None
+        };
+        if let Some(termination) = root_termination {
+            termination
+        } else {
+            state.propagate(provider, reusable, problem, semantic_budget, request)?
+        }
     };
     let work = request.budget.used().saturating_sub(initial_work);
     let semantic_work = semantic_budget.used().saturating_sub(initial_semantic_work);

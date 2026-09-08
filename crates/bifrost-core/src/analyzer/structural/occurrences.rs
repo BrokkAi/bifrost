@@ -173,12 +173,28 @@ labelled_enum! {
     /// The naming space an occurrence resolves in. Promoted from the semantics
     /// of the Rust resolver's private `RustSymbolNamespace`; the Rust-internal
     /// type stays where it is until the resolver work in #1474/#1475.
+    ///
+    /// `PathPrefix` is the naming space a *qualifier* resolves in: the
+    /// non-terminal segment of a qualified path selects something that can
+    /// contain further names, which in a language with nested types is a
+    /// package/module *or* a type, decided by lookup rather than by syntax.
+    /// It is a stated namespace, not a missing one: the Java Language
+    /// Specification gives qualifiers their own syntactic category
+    /// (`PackageOrTypeName`, JLS 6.5) and resolves them by reclassification,
+    /// Rust resolves a path prefix against both the module and the type
+    /// namespace (`RustReferenceNamespace::PathPrefix` in `bifrost-rust`
+    /// already spells exactly this), and Scala's stable identifiers are terms
+    /// that may be either a package or an object. An adapter whose grammar
+    /// restricts path segments further -- Python's `dotted_name`, PHP's
+    /// `namespace_name`, TypeScript's `nested_identifier` -- states
+    /// `Module` instead, because there the syntax does decide (#3064).
     Namespace, ALL_NAMESPACES {
         Type => "type",
         Value => "value",
         Module => "module",
         Macro => "macro",
         Label => "label",
+        PathPrefix => "path_prefix",
     }
 }
 
@@ -258,12 +274,15 @@ pub static NO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSup
 /// span is this token (`None` when the token names no fact).
 ///
 /// `None` means "this adapter has not said": the derivation layer omits the
-/// row and marks the file incomplete for that role rather than guessing. Only
-/// [`OccurrenceRole::PathSegment`] is left open by default, because a scope
-/// segment is a module in some grammars (`os.path`, a TypeScript namespace)
-/// and either a module or a type in others (`java.util.Map.Entry`,
-/// `Option::Some`); an adapter that can tell them apart overrides
-/// `StructuralSpec::occurrence_namespace`.
+/// row and marks the file incomplete for that role rather than guessing. No
+/// role is left open here: [`OccurrenceRole::PathSegment`] answers
+/// [`Namespace::PathPrefix`], the naming space a qualifier resolves in, which
+/// is the honest answer for a grammar where a scope segment can be either a
+/// module or a type (`java.util.Map.Entry`, `Option::Some`). An adapter whose
+/// grammar restricts path segments to module prefixes (`os.path`, a TypeScript
+/// namespace, a PHP `namespace_name`) overrides
+/// `StructuralSpec::occurrence_namespace` with the narrower
+/// [`Namespace::Module`].
 pub const fn default_occurrence_namespace(
     role: OccurrenceRole,
     declares: Option<NormalizedKind>,
@@ -271,7 +290,7 @@ pub const fn default_occurrence_namespace(
     match role {
         OccurrenceRole::TypeOperand => Some(Namespace::Type),
         OccurrenceRole::LabelOrKey => Some(Namespace::Label),
-        OccurrenceRole::PathSegment => None,
+        OccurrenceRole::PathSegment => Some(Namespace::PathPrefix),
         // A declaration name inherits the namespace of the thing it declares.
         // `declares` is deliberately not "nearest enclosing fact": a Rust
         // struct field's name sits under the `struct_item` fact but names the

@@ -51,10 +51,10 @@ use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::rust_facts::{RUST_OCCURRENCE_CODE, RustIncludeBindingKind};
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_rust::field_roles::rust_struct_field_references;
-use brokk_bifrost_rust::graph::ast::is_rust_type_node;
 pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
+use brokk_bifrost_rust::graph::ast::{is_rust_type_node, type_parameter_trait_bounds};
 use brokk_bifrost_rust::graph_support::{
     RustSource, is_rust_enum_variant_declaration, is_rust_macro_export_declaration,
     resolve_module_package,
@@ -2621,7 +2621,8 @@ fn record_instance_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut M
             ReceiverOwnerProof::Unknown => {
                 if ctx.record_unproven_receivers
                     && receiver_name.as_ref().is_some_and(|receiver_name| {
-                        !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+                        receiver_annotation_verdict(receiver_name, &enclosing, ctx)
+                            != ReceiverAnnotationVerdict::Mismatches
                     })
                 {
                     push_unproven_member_hit(
@@ -2638,26 +2639,32 @@ fn record_instance_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut M
             }
         };
 
-    // The explicit-mismatch guard only applies to a simple named receiver whose type
+    // The annotation verdict only applies to a simple named receiver whose type
     // could be re-annotated in the enclosing scope; a resolved `self.field` receiver
     // already proved its type structurally.
     if inferred_match && let Some(receiver_name) = receiver_name.as_ref() {
-        let receiver_mismatched = ctx
-            .analyzer
-            .get_source(&enclosing, false)
-            .map(|enclosing_source| {
-                receiver_explicitly_mismatched(
-                    ctx.root,
-                    ctx.source,
-                    &enclosing_source,
-                    ctx.receiver_type_names,
-                    receiver_name,
-                    ctx.cancellation,
-                )
-            })
-            .unwrap_or(false);
-        if receiver_mismatched {
-            return;
+        match receiver_annotation_verdict(receiver_name, &enclosing, ctx) {
+            ReceiverAnnotationVerdict::Admits => {}
+            ReceiverAnnotationVerdict::Mismatches => return,
+            ReceiverAnnotationVerdict::GenericParameter => {
+                // The name-based inference reads the whole file, so it would
+                // otherwise carry one function's `store: &PlanStore` over to
+                // another function's `store: &S`. A generic parameter is not
+                // that owner by name -- and not another type either, so the
+                // call stays unproven instead of being claimed or refused.
+                if ctx.record_unproven_receivers {
+                    push_unproven_member_hit(
+                        ctx.file,
+                        ctx.source,
+                        ctx.line_starts,
+                        start,
+                        end,
+                        enclosing,
+                        ctx.unproven_hits,
+                    );
+                }
+                return;
+            }
         }
     }
     if !ctx.target_is_non_callable && receiver_is_self_rooted(receiver, ctx.source) {
@@ -2745,7 +2752,8 @@ fn record_token_tree_instance_member_hits(
             ReceiverOwnerProof::Unknown => {
                 if ctx.record_unproven_receivers
                     && receiver_name.as_ref().is_some_and(|receiver_name| {
-                        !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+                        receiver_annotation_verdict(receiver_name, &enclosing, ctx)
+                            != ReceiverAnnotationVerdict::Mismatches
                     })
                 {
                     push_unproven_member_hit(
@@ -2762,22 +2770,23 @@ fn record_token_tree_instance_member_hits(
             }
         };
         if inferred_match && let Some(receiver_name) = receiver_name.as_ref() {
-            let receiver_mismatched = ctx
-                .analyzer
-                .get_source(&enclosing, false)
-                .map(|enclosing_source| {
-                    receiver_explicitly_mismatched(
-                        ctx.root,
-                        ctx.source,
-                        &enclosing_source,
-                        ctx.receiver_type_names,
-                        receiver_name,
-                        ctx.cancellation,
-                    )
-                })
-                .unwrap_or(false);
-            if receiver_mismatched {
-                continue;
+            match receiver_annotation_verdict(receiver_name, &enclosing, ctx) {
+                ReceiverAnnotationVerdict::Admits => {}
+                ReceiverAnnotationVerdict::Mismatches => continue,
+                ReceiverAnnotationVerdict::GenericParameter => {
+                    if ctx.record_unproven_receivers {
+                        push_unproven_member_hit(
+                            ctx.file,
+                            ctx.source,
+                            ctx.line_starts,
+                            start,
+                            end,
+                            enclosing,
+                            ctx.unproven_hits,
+                        );
+                    }
+                    continue;
+                }
             }
         }
         if !ctx.target_is_non_callable
@@ -3026,15 +3035,31 @@ fn rust_token_path_segment(node: Node<'_>) -> bool {
     )
 }
 
-fn receiver_name_explicitly_mismatched(
+/// What a receiver's own annotation, read from the declaration that encloses
+/// the call, says about the owner type this scan is looking for.
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiverAnnotationVerdict {
+    /// No annotation, or one naming the owner type (or an alias of it):
+    /// nothing here refuses the call.
+    Admits,
+    /// The annotation names a different nominal type. That is evidence, so the
+    /// call is refused outright.
+    Mismatches,
+    /// The annotation names a generic parameter of an enclosing scope, which
+    /// is no nominal type at all: it neither supports a name-based inference
+    /// nor refuses the call.
+    GenericParameter,
+}
+
+fn receiver_annotation_verdict(
     receiver_name: &str,
     enclosing: &CodeUnit,
     ctx: &MemberScanCtx<'_>,
-) -> bool {
+) -> ReceiverAnnotationVerdict {
     ctx.analyzer
         .get_source(enclosing, false)
         .map(|enclosing_source| {
-            receiver_explicitly_mismatched(
+            receiver_annotation_verdict_in_source(
                 ctx.root,
                 ctx.source,
                 &enclosing_source,
@@ -3043,7 +3068,7 @@ fn receiver_name_explicitly_mismatched(
                 ctx.cancellation,
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(ReceiverAnnotationVerdict::Admits)
 }
 
 /// Struct literal and destructuring labels reference fields on their resolved owner.
@@ -4326,32 +4351,40 @@ fn expanded_receiver_type_names(
     owner_type_names
 }
 
-fn receiver_explicitly_mismatched(
+fn receiver_annotation_verdict_in_source(
     file_root: Node<'_>,
     file_source: &str,
     enclosing_source: &str,
     owner_local_names: &HashSet<String>,
     receiver_name: &str,
     cancellation: Option<&CancellationToken>,
-) -> bool {
+) -> ReceiverAnnotationVerdict {
     let owner_type_names =
         expanded_receiver_type_names(file_root, file_source, owner_local_names, cancellation);
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return false;
+        return ReceiverAnnotationVerdict::Admits;
     }
     let Some(tree) = parse_rust_source(enclosing_source) else {
-        return false;
+        return ReceiverAnnotationVerdict::Admits;
     };
 
-    for (name, ty) in
+    for (name, annotation) in
         collect_explicit_receiver_annotations(tree.root_node(), enclosing_source, cancellation)
     {
         if name == receiver_name {
-            return ty.as_ref().is_none_or(|ty| !owner_type_names.contains(ty));
+            return match annotation {
+                ReceiverAnnotation::GenericParameter => ReceiverAnnotationVerdict::GenericParameter,
+                ReceiverAnnotation::Named(ty) if owner_type_names.contains(&ty) => {
+                    ReceiverAnnotationVerdict::Admits
+                }
+                ReceiverAnnotation::Named(_) | ReceiverAnnotation::Opaque => {
+                    ReceiverAnnotationVerdict::Mismatches
+                }
+            };
         }
     }
 
-    false
+    ReceiverAnnotationVerdict::Admits
 }
 
 fn infer_receiver_names(
@@ -4563,11 +4596,22 @@ fn collect_type_aliases(
     aliases
 }
 
+/// The declared type of one binding, as much of it as a name-level reader can
+/// state.
+enum ReceiverAnnotation {
+    /// A nominal type, written directly or through references.
+    Named(String),
+    /// A generic parameter of a scope enclosing the binding.
+    GenericParameter,
+    /// An annotation this reader does not reduce to one name.
+    Opaque,
+}
+
 fn collect_explicit_receiver_annotations(
     root: Node<'_>,
     source: &str,
     cancellation: Option<&CancellationToken>,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<(String, ReceiverAnnotation)> {
     let mut bindings = Vec::new();
     let mut stack = vec![root];
     let mut cancellation_checks_remaining = 0;
@@ -4714,11 +4758,25 @@ fn typed_let_binding(node: Node<'_>, source: &str) -> Option<(String, String)> {
     Some((name, ty))
 }
 
-fn explicit_receiver_annotation(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
+fn explicit_receiver_annotation(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(String, ReceiverAnnotation)> {
     let pattern = node.child_by_field_name("pattern")?;
     let name = simple_pattern_name(pattern, source)?;
     let ty = node.child_by_field_name("type")?;
-    Some((name, direct_receiver_type_name(ty, source)))
+    let annotation = match direct_receiver_type_name(ty, source) {
+        // An annotation naming a generic parameter of an enclosing scope --
+        // `store: &S` under `fn update<S: Trait>` -- names no type at all.
+        // Reading it as a nominal type turned every unresolved bound into a
+        // *proven* absence (#3056).
+        Some(type_name) if type_parameter_trait_bounds(ty, &type_name, source).is_some() => {
+            ReceiverAnnotation::GenericParameter
+        }
+        Some(type_name) => ReceiverAnnotation::Named(type_name),
+        None => ReceiverAnnotation::Opaque,
+    };
+    Some((name, annotation))
 }
 
 fn direct_receiver_type_name(node: Node<'_>, source: &str) -> Option<String> {

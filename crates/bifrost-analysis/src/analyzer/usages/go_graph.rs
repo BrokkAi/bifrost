@@ -11,9 +11,7 @@ use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
-use crate::analyzer::usages::common::{
-    analyzed_files_for_language, classify_recursive_hits, language_for_target,
-};
+use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
     EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
     parse_and_collect_with_domain,
@@ -33,8 +31,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
 };
 use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_edge_index,
-    build_go_graph_with_edge_index,
+    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_graph_with_edge_index,
 };
 use std::sync::Arc;
 
@@ -103,40 +100,37 @@ where
 /// self-declarations are derived inside the shared driver.
 pub(crate) fn build_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
+    let resolver = GoEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
 pub(crate) fn build_rooted_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
     callers: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
+    let resolver = GoEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_go_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
+    let resolver = GoEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
@@ -210,7 +204,7 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
 }
 
 pub(crate) struct GoEdgeResolver {
-    index: GoEdgeIndex,
+    index: Arc<GoEdgeIndex>,
 }
 
 /// The whole-workspace `caller -> callee` scan behind this language's
@@ -218,16 +212,26 @@ pub(crate) struct GoEdgeResolver {
 /// analyzer once, then walk every file once and finalize into either site-bearing edges or
 /// reference-kind weights.
 impl GoEdgeResolver {
-    pub(crate) fn try_new(analyzer: &dyn IAnalyzer, token: QueryToken<'_>) -> Option<Self> {
+    /// The index is the generation's shared one, not a fresh build.
+    ///
+    /// This used to call `build_go_edge_index` itself, which parsed every Go
+    /// file again even though `GoAnalyzer::workspace_indexes` already parses
+    /// the workspace once and derives both indexes from that parse (#1748).
+    /// The two file-set rules -- `analyzed_files_for_language` here,
+    /// `get_analyzed_files` filtered to Go in the memo -- name the same files:
+    /// both read the Go analyzer's own analyzed set, and both then keep only
+    /// Go paths, so build-tagged files, `_test.go` files and overlays are in
+    /// or out of each together. Checked on kubernetes (17,266 files each,
+    /// identical fact digests) before this switch landed (#3066).
+    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-        let files = analyzed_files_for_language(analyzer, Language::Go);
-        if files.is_empty() {
-            return None;
-        }
         // A tree-free resolution index; the per-file walk re-parses on demand and
         // drops each tree, so the whole-workspace build retains no syntax trees.
-        let index = build_go_edge_index(go_graph_source(go, token), &files)?;
-        Some(Self { index })
+        let index = go.usage_edge_index();
+        // A workspace with no indexed Go file states no edges at all; the
+        // callers report the language as unhandled rather than an empty answer.
+        let has_go_files = index.files().next().is_some();
+        has_go_files.then_some(Self { index })
     }
 
     pub(crate) fn build_edges<F>(

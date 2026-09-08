@@ -64,6 +64,12 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
     },
+    AbsentMemberWitness {
+        id: String,
+        finding_id: String,
+        path: String,
+        range: CodeQueryRange,
+    },
     TaintFinding {
         id: String,
         path: String,
@@ -593,6 +599,7 @@ impl CodeQueryResultRef {
             Self::Procedure { .. } => "procedure",
             Self::FlowEndpoint { .. } => "flow_endpoint",
             Self::FlowWitness { .. } => "flow_witness",
+            Self::AbsentMemberWitness { .. } => "absent_member_witness",
             Self::TaintFinding { .. } => "taint_finding",
             Self::ProgramPoint { .. } => "program_point",
             Self::ControlEdge { .. } => "control_edge",
@@ -666,6 +673,7 @@ impl CodeQueryResultRef {
             | Self::Procedure { path, .. }
             | Self::FlowEndpoint { path, .. }
             | Self::FlowWitness { path, .. }
+            | Self::AbsentMemberWitness { path, .. }
             | Self::TaintFinding { path, .. }
             | Self::ProgramPoint { path, .. }
             | Self::ControlEdge { path, .. }

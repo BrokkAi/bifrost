@@ -211,7 +211,8 @@ pub(super) fn lexical_definition_candidate(
     file: &ProjectFile,
     definition: &LexicalDefinition,
 ) -> Option<DefinitionCandidate> {
-    let source = analyzer.project().read_source(file).ok()?;
+    let file = definition.source_file.as_ref().unwrap_or(file);
+    let source = analyzer.indexed_source(file)?;
     let line_starts = compute_line_starts(&source);
     let signature = source
         .get(definition.declaration_range.start_byte..definition.declaration_range.end_byte)?
@@ -253,6 +254,7 @@ pub(super) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
         DeclarationKind::Parameter => "parameter",
         DeclarationKind::ReceiverParameter => "receiver_parameter",
         DeclarationKind::ImportAlias => "type",
+        DeclarationKind::StatementLabel => "statement_label",
         DeclarationKind::LambdaParameter => "lambda_parameter",
         DeclarationKind::LocalVariable
         | DeclarationKind::CatchParameter

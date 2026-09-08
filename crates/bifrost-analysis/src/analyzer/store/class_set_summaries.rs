@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use super::read_keys::{ReadKeyColumns, decode_read_key};
 use super::{AnalyzerStore, PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::{CancellationToken, analyzer::Language, analyzer::read_ledger::ReadKey};
 
 pub type ClassSetSummaryDigest = [u8; 32];
@@ -41,6 +41,31 @@ pub struct ClassSetSummaryRowKey {
     pub procedure_lineage: ClassSetSummaryDigest,
 }
 
+/// Exact immutable dimensions selecting one compatible procedure family.
+/// Historical rows may share lineage, so the bounded query constrains every
+/// current semantic dimension before applying its row limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassSetSummaryFamilyKey {
+    pub procedure_lineage: ClassSetSummaryDigest,
+    pub owner_rel_path: String,
+    pub language: Language,
+    pub schema_version: u32,
+    pub semantics_digest: ClassSetSummaryDigest,
+    pub context_digest: ClassSetSummaryDigest,
+    pub behavior_read_digest: ClassSetSummaryDigest,
+    pub carrier_digest: ClassSetSummaryDigest,
+    pub field_slots_digest: ClassSetSummaryDigest,
+    pub root_surface_digest: ClassSetSummaryDigest,
+}
+
+/// One bounded compatible-family member and the property needed to select a
+/// mandatory zero-entry cut without loading the complete summary first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassSetSummaryFamilyLookupRow {
+    pub lookup_digest: ClassSetSummaryDigest,
+    pub zero_entry: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSetSummaryAttachment {
     pub rel_path: String,
@@ -61,6 +86,8 @@ pub struct ClassSetSummaryHeaderRow {
     pub dependency_digest: ClassSetSummaryDigest,
     pub carrier_digest: ClassSetSummaryDigest,
     pub field_slots_digest: ClassSetSummaryDigest,
+    pub root_surface_digest: ClassSetSummaryDigest,
+    pub direct_calls_digest: ClassSetSummaryDigest,
     pub entry_fact_ordinal: u32,
 }
 
@@ -121,6 +148,18 @@ pub struct ClassSetSummaryDependencyRow {
     pub callee_entry_selector_digest: ClassSetSummaryDigest,
     pub expected_output_digest: ClassSetSummaryOutputDigest,
     pub consumed_child_lookup_digest: ClassSetSummaryDigest,
+    pub entry: ClassSetSummaryDependencyEntryRow,
+    pub source_witnesses: Vec<ClassSetSummaryDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassSetSummaryDependencyEntryRow {
+    Zero,
+    Carrier {
+        carrier_key: ClassSetSummaryDigest,
+        uncertain: bool,
+        source_behavior_digest: Option<ClassSetSummaryDigest>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +170,8 @@ pub struct ClassSetSummaryReadRow {
 
 /// One persisted direct dependency and the summary row that consumed it.
 ///
-/// This is evidence for a later invalidation coordinator; returning it does
-/// not mutate, evict, or otherwise apply invalidation policy.
+/// This is evidence consumed by the flow layer's invalidation coordinator;
+/// returning it does not itself mutate, evict, or apply invalidation policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSetSummaryDependentRow {
     pub dependent_lookup_digest: ClassSetSummaryDigest,
@@ -171,6 +210,28 @@ impl ClassSetSummaryRow {
         exits.sort_unstable_by_key(|row| row.ordinal);
         reached.sort_unstable_by_key(|row| row.ordinal);
         dependencies.sort_unstable_by_key(|row| row.ordinal);
+        for dependency in &mut dependencies {
+            dependency.source_witnesses.sort_unstable();
+            dependency.source_witnesses.dedup();
+            match dependency.entry {
+                ClassSetSummaryDependencyEntryRow::Zero
+                    if !dependency.source_witnesses.is_empty() =>
+                {
+                    return Err(StoreError::new(
+                        "zero class-set dependency has source witnesses",
+                    ));
+                }
+                ClassSetSummaryDependencyEntryRow::Carrier { .. }
+                    if dependency.source_witnesses.is_empty() =>
+                {
+                    return Err(StoreError::new(
+                        "carrier class-set dependency has no source witnesses",
+                    ));
+                }
+                ClassSetSummaryDependencyEntryRow::Zero
+                | ClassSetSummaryDependencyEntryRow::Carrier { .. } => {}
+            }
+        }
         reads.sort_unstable_by_key(|row| row.ordinal);
         charges.sort_unstable_by(|left, right| left.kind.cmp(&right.kind));
         require_dense("dependency", dependencies.iter().map(|row| row.ordinal))?;
@@ -226,7 +287,7 @@ impl ClassSetSummaryRow {
     /// Hash every logical stored value except publication time and the digest
     /// itself. Length framing makes this independent of SQLite row encoding.
     pub fn canonical_content_digest(&self) -> ClassSetSummaryDigest {
-        let mut hash = CanonicalDigest::new(b"bifrost-class-set-store-row-v2");
+        let mut hash = CanonicalDigest::new(b"bifrost-class-set-store-row-v3");
         hash.bytes(&self.header.key.lookup_digest);
         hash.bytes(&self.header.key.procedure_lineage);
         hash.text(&self.header.attachment.rel_path);
@@ -241,6 +302,8 @@ impl ClassSetSummaryRow {
         hash.bytes(&self.header.dependency_digest);
         hash.bytes(&self.header.carrier_digest);
         hash.bytes(&self.header.field_slots_digest);
+        hash.bytes(&self.header.root_surface_digest);
+        hash.bytes(&self.header.direct_calls_digest);
         hash.u64(u64::from(self.header.entry_fact_ordinal));
         hash.text("facts");
         hash.u64(self.facts.len() as u64);
@@ -297,6 +360,29 @@ impl ClassSetSummaryRow {
             hash.bytes(&row.callee_entry_selector_digest);
             hash.bytes(row.expected_output_digest.as_bytes());
             hash.bytes(&row.consumed_child_lookup_digest);
+            match &row.entry {
+                ClassSetSummaryDependencyEntryRow::Zero => hash.tag(0),
+                ClassSetSummaryDependencyEntryRow::Carrier {
+                    carrier_key,
+                    uncertain,
+                    source_behavior_digest,
+                } => {
+                    hash.tag(1);
+                    hash.bytes(carrier_key);
+                    hash.tag(u8::from(*uncertain));
+                    match source_behavior_digest {
+                        Some(digest) => {
+                            hash.tag(1);
+                            hash.bytes(digest);
+                        }
+                        None => hash.tag(0),
+                    }
+                }
+            }
+            hash.u64(row.source_witnesses.len() as u64);
+            for source in &row.source_witnesses {
+                hash.bytes(source);
+            }
         }
         hash.text("reads");
         hash.u64(self.reads.len() as u64);
@@ -311,6 +397,127 @@ impl ClassSetSummaryRow {
             hash.u64(row.amount);
         }
         hash.finish()
+    }
+
+    /// Whether two stored rows constitute the same semantic publication.
+    ///
+    /// Source-blob, whole-artifact, and common-envelope dependency identities
+    /// are provenance: they must be refreshed after an unrelated same-file
+    /// edit so liveness and cleanup remain correct, but that refresh does not
+    /// publish a new procedure-local relation. Exact dependency rows and the
+    /// procedure-local contract retain the evidence reuse validates. Path and
+    /// language remain part of this comparison because they participate in
+    /// interpreting the row.
+    pub fn has_same_semantic_publication(&self, other: &Self) -> bool {
+        let ClassSetSummaryRow {
+            header,
+            facts,
+            exits,
+            reached,
+            dependencies,
+            reads,
+            charges,
+            content_digest: _,
+        } = self;
+        let ClassSetSummaryRow {
+            header: other_header,
+            facts: other_facts,
+            exits: other_exits,
+            reached: other_reached,
+            dependencies: other_dependencies,
+            reads: other_reads,
+            charges: other_charges,
+            content_digest: _,
+        } = other;
+        let ClassSetSummaryHeaderRow {
+            key,
+            attachment,
+            artifact_public_identity: _,
+            artifact_content_identity: _,
+            schema_version,
+            semantics_digest,
+            context_digest,
+            behavior_read_digest,
+            dependency_digest: _,
+            carrier_digest,
+            field_slots_digest,
+            root_surface_digest,
+            direct_calls_digest,
+            entry_fact_ordinal,
+        } = header;
+        let ClassSetSummaryHeaderRow {
+            key: other_key,
+            attachment: other_attachment,
+            artifact_public_identity: _,
+            artifact_content_identity: _,
+            schema_version: other_schema_version,
+            semantics_digest: other_semantics_digest,
+            context_digest: other_context_digest,
+            behavior_read_digest: other_behavior_read_digest,
+            dependency_digest: _,
+            carrier_digest: other_carrier_digest,
+            field_slots_digest: other_field_slots_digest,
+            root_surface_digest: other_root_surface_digest,
+            direct_calls_digest: other_direct_calls_digest,
+            entry_fact_ordinal: other_entry_fact_ordinal,
+        } = other_header;
+        let ClassSetSummaryAttachment {
+            rel_path,
+            blob_oid: _,
+            language,
+        } = attachment;
+        let ClassSetSummaryAttachment {
+            rel_path: other_rel_path,
+            blob_oid: _,
+            language: other_language,
+        } = other_attachment;
+
+        key == other_key
+            && rel_path == other_rel_path
+            && language == other_language
+            && schema_version == other_schema_version
+            && semantics_digest == other_semantics_digest
+            && context_digest == other_context_digest
+            && behavior_read_digest == other_behavior_read_digest
+            && carrier_digest == other_carrier_digest
+            && field_slots_digest == other_field_slots_digest
+            && root_surface_digest == other_root_surface_digest
+            && direct_calls_digest == other_direct_calls_digest
+            && entry_fact_ordinal == other_entry_fact_ordinal
+            && facts == other_facts
+            && exits == other_exits
+            && reached == other_reached
+            && dependencies.len() == other_dependencies.len()
+            && dependencies
+                .iter()
+                .zip(other_dependencies)
+                .all(|(dependency, other_dependency)| {
+                    let ClassSetSummaryDependencyRow {
+                        ordinal,
+                        callee_procedure_lineage,
+                        callee_entry_selector_digest,
+                        expected_output_digest,
+                        consumed_child_lookup_digest: _,
+                        entry,
+                        source_witnesses: _,
+                    } = dependency;
+                    let ClassSetSummaryDependencyRow {
+                        ordinal: other_ordinal,
+                        callee_procedure_lineage: other_callee_procedure_lineage,
+                        callee_entry_selector_digest: other_callee_entry_selector_digest,
+                        expected_output_digest: other_expected_output_digest,
+                        consumed_child_lookup_digest: _,
+                        entry: other_entry,
+                        source_witnesses: _,
+                    } = other_dependency;
+                    ordinal == other_ordinal
+                        && callee_procedure_lineage == other_callee_procedure_lineage
+                        && callee_entry_selector_digest == other_callee_entry_selector_digest
+                        && expected_output_digest == other_expected_output_digest
+                        && entry == other_entry
+                })
+            && reads == other_reads
+            && charges == other_charges
     }
 
     pub const fn content_digest(&self) -> &ClassSetSummaryDigest {
@@ -551,7 +758,8 @@ pub(crate) static CLASS_SET_SUMMARY_LOOKUP_SQL: LazyLock<String> = LazyLock::new
             summaries.owner_rel_path, blobs.blob_oid, summaries.lang,
             artifact_public_identity, artifact_content_identity, schema_version,
             semantics_digest, context_digest, behavior_read_digest, dependency_digest,
-            carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count,
+            carrier_digest, field_slots_digest, root_surface_digest, direct_calls_digest,
+            entry_fact_ordinal, fact_count, exit_count,
             reached_count, dependency_count, read_count, charge_count, output_digest,
             content_digest
      FROM class_set_summaries AS summaries
@@ -573,12 +781,30 @@ pub(crate) static CLASS_SET_SUMMARY_PROCEDURE_SQL: LazyLock<String> = LazyLock::
      LIMIT 1"
     )
 });
-const FACTS_SQL: &str = "SELECT fact_ordinal,fact_kind,source_kind,source_event_key,
+pub(crate) static CLASS_SET_SUMMARY_FAMILY_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT summaries.lookup_digest, entry_facts.fact_kind = 'zero'
+         FROM class_set_summaries AS summaries
+         JOIN blobs ON blobs.id=summaries.owner_blob_id AND blobs.lang=summaries.lang
+         JOIN blob_meta AS meta ON meta.blob_id=blobs.id
+         JOIN class_set_summary_facts AS entry_facts
+           ON entry_facts.summary_id=summaries.summary_id
+          AND entry_facts.fact_ordinal=summaries.entry_fact_ordinal
+         WHERE summaries.procedure_lineage=?1 AND summaries.owner_rel_path=?2
+           AND summaries.lang=?3 AND summaries.schema_version=?4
+           AND summaries.semantics_digest=?5 AND summaries.context_digest=?6
+           AND summaries.behavior_read_digest=?7 AND summaries.carrier_digest=?8
+           AND summaries.field_slots_digest=?9 AND summaries.root_surface_digest=?10
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY summaries.lookup_digest LIMIT ?11"
+    )
+});
+pub(crate) const FACTS_SQL: &str = "SELECT fact_ordinal,fact_kind,source_kind,source_event_key,
         carrier_key,sink_event_key,uncertain
      FROM class_set_summary_facts WHERE summary_id=?1 ORDER BY fact_ordinal";
-const EXITS_SQL: &str = "SELECT exit_ordinal,exit_kind,fact_ordinal,quality_mask
+pub(crate) const EXITS_SQL: &str = "SELECT exit_ordinal,exit_kind,fact_ordinal,quality_mask
      FROM class_set_summary_exits WHERE summary_id=?1 ORDER BY exit_ordinal";
-const REACHED_SQL: &str = "SELECT reached_ordinal,point_id,fact_ordinal,quality_mask
+pub(crate) const REACHED_SQL: &str = "SELECT reached_ordinal,point_id,fact_ordinal,quality_mask
      FROM class_set_summary_reached WHERE summary_id=?1 ORDER BY reached_ordinal";
 pub(crate) static CLASS_SET_SUMMARY_DEPENDENTS_BY_LOOKUP_SQL: LazyLock<String> =
     LazyLock::new(|| dependent_summary_sql("dependencies.consumed_child_lookup_digest = ?1"));
@@ -609,25 +835,41 @@ fn dependent_summary_sql(predicate: &str) -> String {
             dependencies.callee_procedure_lineage,
             dependencies.callee_entry_selector_digest,
             dependencies.expected_output_digest,
-            dependencies.consumed_child_lookup_digest
+            dependencies.consumed_child_lookup_digest,
+            dependencies.entry_kind, dependencies.entry_carrier_key,
+            dependencies.entry_uncertain,
+            dependencies.entry_source_behavior_digest,
+            dependencies.entry_source_count,
+            sources.source_ordinal, sources.source_event_digest
          FROM class_set_summary_dependencies AS dependencies
+         LEFT JOIN class_set_summary_dependency_sources AS sources
+           ON sources.summary_id = dependencies.summary_id
+          AND sources.dependency_ordinal = dependencies.dependency_ordinal
          JOIN class_set_summaries AS summaries
            ON summaries.summary_id = dependencies.summary_id
          JOIN blobs ON blobs.id = summaries.owner_blob_id AND blobs.lang = summaries.lang
          JOIN blob_meta AS meta ON meta.blob_id = blobs.id
          WHERE {predicate}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY summaries.lookup_digest, dependencies.dependency_ordinal"
+         ORDER BY summaries.lookup_digest, dependencies.dependency_ordinal,
+            sources.source_ordinal"
     )
 }
 
-const DEPENDENCIES_SQL: &str = "SELECT dependency_ordinal,callee_procedure_lineage,
-        callee_entry_selector_digest,expected_output_digest,consumed_child_lookup_digest
+pub(crate) const DEPENDENCIES_SQL: &str = "SELECT dependency_ordinal,callee_procedure_lineage,
+        callee_entry_selector_digest,expected_output_digest,consumed_child_lookup_digest,
+        entry_kind,entry_carrier_key,entry_uncertain,entry_source_behavior_digest,
+        entry_source_count
      FROM class_set_summary_dependencies WHERE summary_id=?1 ORDER BY dependency_ordinal";
-const READS_SQL: &str = "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
+pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
+    "SELECT dependency_ordinal,source_ordinal,source_event_digest
+     FROM class_set_summary_dependency_sources
+     WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
+pub(crate) const READS_SQL: &str =
+    "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
         blob_oid,subject,start_byte,end_byte,digest,read_ordinal
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
-const CHARGES_SQL: &str = "SELECT charge_kind,amount
+pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
 
 impl AnalyzerStore {
@@ -659,6 +901,7 @@ impl AnalyzerStore {
                 ensure_not_cancelled(&cancellation)?;
                 let lang = summary.header.attachment.language.config_label();
                 let blob_id = live_owner_blob_id(&tx, &summary)?;
+                validate_root_surface(&tx, &summary)?;
                 if let Some(existing) =
                     load_summary_for_digest(&tx, summary.header.key.lookup_digest)?
                 {
@@ -705,6 +948,7 @@ impl AnalyzerStore {
                 ensure_not_cancelled(&cancellation)?;
                 let lang = summary.header.attachment.language.config_label();
                 let blob_id = live_owner_blob_id(&tx, &summary)?;
+                validate_root_surface(&tx, &summary)?;
                 let Some(current) = load_summary_for_digest(&tx, summary.header.key.lookup_digest)?
                 else {
                     return Err(StoreError::new(
@@ -752,6 +996,49 @@ impl AnalyzerStore {
         let summary = load_summary_for_digest(&tx, lookup_digest)?;
         tx.commit()?;
         Ok(summary)
+    }
+
+    /// Return a complete bounded compatible family. `None` reports that the
+    /// family exceeded `max_rows`; a truncated prefix is never exposed.
+    pub fn class_set_summary_family_lookups(
+        &self,
+        key: &ClassSetSummaryFamilyKey,
+        max_rows: usize,
+    ) -> Result<Option<Vec<ClassSetSummaryFamilyLookupRow>>> {
+        let limit = i64::try_from(max_rows.saturating_add(1))
+            .map_err(|_| StoreError::new("class-set summary family limit exceeds i64"))?;
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(CLASS_SET_SUMMARY_FAMILY_SQL.as_str())?;
+        let rows = statement.query_map(
+            params![
+                key.procedure_lineage.as_slice(),
+                &key.owner_rel_path,
+                key.language.config_label(),
+                key.schema_version,
+                key.semantics_digest.as_slice(),
+                key.context_digest.as_slice(),
+                key.behavior_read_digest.as_slice(),
+                key.carrier_digest.as_slice(),
+                key.field_slots_digest.as_slice(),
+                key.root_surface_digest.as_slice(),
+                limit,
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        let lookups = rows
+            .map(|row| {
+                let (lookup_digest, zero_entry) = row?;
+                Ok(ClassSetSummaryFamilyLookupRow {
+                    lookup_digest: digest(lookup_digest, "class-set family lookup")?,
+                    zero_entry,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if lookups.len() > max_rows {
+            Ok(None)
+        } else {
+            Ok(Some(lookups))
+        }
     }
 
     pub fn class_set_summary_dependents_of_lookup(
@@ -822,15 +1109,17 @@ fn load_summary_for_digest(
                     row.get::<_, Vec<u8>>(11)?,
                     row.get::<_, Vec<u8>>(12)?,
                     row.get::<_, Vec<u8>>(13)?,
-                    row.get::<_, u32>(14)?,
-                    row.get::<_, usize>(15)?,
-                    row.get::<_, usize>(16)?,
+                    row.get::<_, Vec<u8>>(14)?,
+                    row.get::<_, Vec<u8>>(15)?,
+                    row.get::<_, u32>(16)?,
                     row.get::<_, usize>(17)?,
                     row.get::<_, usize>(18)?,
                     row.get::<_, usize>(19)?,
                     row.get::<_, usize>(20)?,
-                    row.get::<_, Vec<u8>>(21)?,
-                    row.get::<_, Vec<u8>>(22)?,
+                    row.get::<_, usize>(21)?,
+                    row.get::<_, usize>(22)?,
+                    row.get::<_, Vec<u8>>(23)?,
+                    row.get::<_, Vec<u8>>(24)?,
                 ))
             },
         )
@@ -872,6 +1161,51 @@ fn live_owner_blob_id(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow)
     })
 }
 
+fn validate_root_surface(conn: &rusqlite::Connection, summary: &ClassSetSummaryRow) -> Result<()> {
+    let header = &summary.header;
+    let stored = conn
+        .query_row(
+            &format!(
+                "SELECT surfaces.procedure_lineage,surfaces.owner_rel_path,surfaces.lang,
+                        surfaces.schema_version,surfaces.behavior_read_digest,
+                        surfaces.carrier_semantics_digest,surfaces.direct_calls_digest
+                 FROM class_set_procedure_surfaces AS surfaces
+                 JOIN blobs ON blobs.id=surfaces.owner_blob_id AND blobs.lang=surfaces.lang
+                 JOIN blob_meta AS meta ON meta.blob_id=blobs.id
+                 WHERE surfaces.surface_digest=?1 AND {PARSED_BLOB_COMPLETE_CONDITION}"
+            ),
+            params![header.root_surface_digest.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((lineage, path, language, schema, behavior, carrier, direct_calls)) = stored else {
+        return Err(StoreError::new("class-set summary root surface is absent"));
+    };
+    if digest(lineage, "root surface lineage")? != header.key.procedure_lineage
+        || path != header.attachment.rel_path
+        || language != header.attachment.language.config_label()
+        || schema != header.schema_version
+        || digest(behavior, "root surface behavior")? != header.behavior_read_digest
+        || digest(carrier, "root surface carrier semantics")? != header.carrier_digest
+        || digest(direct_calls, "root surface direct calls")? != header.direct_calls_digest
+    {
+        return Err(StoreError::new(
+            "class-set summary root surface is incompatible with its header",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_cancelled() {
         Err(StoreError::new("class-set summary publication cancelled"))
@@ -889,6 +1223,85 @@ fn digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32]> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredDependency {
+    ordinal: u32,
+    lineage: Vec<u8>,
+    entry_selector: Vec<u8>,
+    output: Vec<u8>,
+    lookup: Vec<u8>,
+    entry_kind: String,
+    entry_carrier: Option<Vec<u8>>,
+    entry_uncertain: bool,
+    entry_behavior: Option<Vec<u8>>,
+    source_count: usize,
+}
+
+impl StoredDependency {
+    fn from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            ordinal: row.get(offset)?,
+            lineage: row.get(offset + 1)?,
+            entry_selector: row.get(offset + 2)?,
+            output: row.get(offset + 3)?,
+            lookup: row.get(offset + 4)?,
+            entry_kind: row.get(offset + 5)?,
+            entry_carrier: row.get(offset + 6)?,
+            entry_uncertain: row.get(offset + 7)?,
+            entry_behavior: row.get(offset + 8)?,
+            source_count: row.get(offset + 9)?,
+        })
+    }
+
+    fn finish(
+        self,
+        sources: Vec<(u32, ClassSetSummaryDigest)>,
+    ) -> Result<ClassSetSummaryDependencyRow> {
+        require_dense(
+            "dependency source",
+            sources.iter().map(|(ordinal, _)| *ordinal),
+        )?;
+        if sources.len() != self.source_count {
+            return Err(StoreError::new(
+                "class-set dependency source count does not match its rows",
+            ));
+        }
+        Ok(ClassSetSummaryDependencyRow {
+            ordinal: self.ordinal,
+            callee_procedure_lineage: digest(self.lineage, "dependency lineage")?,
+            callee_entry_selector_digest: digest(self.entry_selector, "dependency entry selector")?,
+            expected_output_digest: ClassSetSummaryOutputDigest::new(digest(
+                self.output,
+                "dependency output",
+            )?),
+            consumed_child_lookup_digest: digest(self.lookup, "dependency lookup")?,
+            entry: dependency_entry(
+                self.entry_kind,
+                self.entry_carrier,
+                self.entry_uncertain,
+                self.entry_behavior,
+            )?,
+            source_witnesses: sources.into_iter().map(|(_, source)| source).collect(),
+        })
+    }
+}
+
+fn dependency_source(
+    ordinal: Option<u32>,
+    source: Option<Vec<u8>>,
+) -> Result<Option<(u32, ClassSetSummaryDigest)>> {
+    match (ordinal, source) {
+        (None, None) => Ok(None),
+        (Some(ordinal), Some(source)) => Ok(Some((
+            ordinal,
+            digest(source, "dependency source witness")?,
+        ))),
+        _ => Err(StoreError::new(
+            "class-set dependency source row has an invalid shape",
+        )),
+    }
+}
+
 fn load_dependents(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -898,30 +1311,41 @@ fn load_dependents(
     let rows = statement.query_map(parameters, |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, u32>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
+            StoredDependency::from_row(row, 1)?,
+            row.get::<_, Option<u32>>(11)?,
+            row.get::<_, Option<Vec<u8>>>(12)?,
         ))
     })?;
-    rows.map(|row| {
-        let (dependent, ordinal, lineage, entry, output, lookup) = row?;
-        Ok(ClassSetSummaryDependentRow {
+    let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut dependents = Vec::new();
+    let mut current = None::<(Vec<u8>, StoredDependency, Vec<_>)>;
+    for (dependent, dependency, source_ordinal, source) in raw {
+        let source = dependency_source(source_ordinal, source)?;
+        if current
+            .as_ref()
+            .is_some_and(|(current_dependent, current_dependency, _)| {
+                current_dependent != &dependent || current_dependency != &dependency
+            })
+        {
+            let (dependent, dependency, sources) = current.take().expect("a row was grouped");
+            dependents.push(ClassSetSummaryDependentRow {
+                dependent_lookup_digest: digest(dependent, "dependent lookup")?,
+                dependency: dependency.finish(sources)?,
+            });
+        }
+        let (_, _, sources) = current.get_or_insert((dependent, dependency, Vec::new()));
+        if let Some(source) = source {
+            sources.push(source);
+        }
+    }
+    if let Some((dependent, dependency, sources)) = current {
+        dependents.push(ClassSetSummaryDependentRow {
             dependent_lookup_digest: digest(dependent, "dependent lookup")?,
-            dependency: ClassSetSummaryDependencyRow {
-                ordinal,
-                callee_procedure_lineage: digest(lineage, "dependency lineage")?,
-                callee_entry_selector_digest: digest(entry, "dependency entry selector")?,
-                expected_output_digest: ClassSetSummaryOutputDigest::new(digest(
-                    output,
-                    "dependency output",
-                )?),
-                consumed_child_lookup_digest: digest(lookup, "dependency lookup")?,
-            },
-        })
-    })
-    .collect()
+            dependency: dependency.finish(sources)?,
+        });
+    }
+    Ok(dependents)
 }
 
 fn insert_summary(
@@ -934,7 +1358,30 @@ fn insert_summary(
     let h = &summary.header;
     let output_digest = summary.output_digest();
     ensure_not_cancelled(cancellation)?;
-    conn.execute("INSERT INTO class_set_summaries(lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id, lang, artifact_public_identity, artifact_content_identity, schema_version, semantics_digest, context_digest, behavior_read_digest, dependency_digest, carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count, exit_count, reached_count, dependency_count, read_count, charge_count, completion, budget_mode, output_digest, content_digest, published_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,'complete','exhaustive',?22,?23,unixepoch())", params![h.key.lookup_digest.as_slice(), h.key.procedure_lineage.as_slice(), &h.attachment.rel_path, blob_id, lang, h.artifact_public_identity.as_slice(), h.artifact_content_identity.as_slice(), h.schema_version, h.semantics_digest.as_slice(), h.context_digest.as_slice(), h.behavior_read_digest.as_slice(), h.dependency_digest.as_slice(), h.carrier_digest.as_slice(), h.field_slots_digest.as_slice(), h.entry_fact_ordinal, summary.facts.len(), summary.exits.len(), summary.reached.len(), summary.dependencies.len(), summary.reads.len(), summary.charges.len(), output_digest.as_bytes().as_slice(), summary.content_digest.as_slice()])?;
+    conn.execute(
+        "INSERT INTO class_set_summaries(
+           lookup_digest,procedure_lineage,owner_rel_path,owner_blob_id,lang,
+           artifact_public_identity,artifact_content_identity,schema_version,
+           semantics_digest,context_digest,behavior_read_digest,dependency_digest,
+           carrier_digest,field_slots_digest,root_surface_digest,direct_calls_digest,entry_fact_ordinal,
+           fact_count,exit_count,reached_count,dependency_count,read_count,charge_count,
+           completion,budget_mode,output_digest,content_digest,published_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                  ?18,?19,?20,?21,?22,?23,'complete','exhaustive',?24,?25,unixepoch())",
+        params![
+            h.key.lookup_digest.as_slice(), h.key.procedure_lineage.as_slice(),
+            &h.attachment.rel_path, blob_id, lang, h.artifact_public_identity.as_slice(),
+            h.artifact_content_identity.as_slice(), h.schema_version,
+            h.semantics_digest.as_slice(), h.context_digest.as_slice(),
+            h.behavior_read_digest.as_slice(), h.dependency_digest.as_slice(),
+            h.carrier_digest.as_slice(), h.field_slots_digest.as_slice(),
+            h.root_surface_digest.as_slice(), h.direct_calls_digest.as_slice(),
+            h.entry_fact_ordinal, summary.facts.len(),
+            summary.exits.len(), summary.reached.len(), summary.dependencies.len(),
+            summary.reads.len(), summary.charges.len(), output_digest.as_bytes().as_slice(),
+            summary.content_digest.as_slice(),
+        ],
+    )?;
     let id = conn.last_insert_rowid();
     for row in &summary.facts {
         ensure_not_cancelled(cancellation)?;
@@ -972,17 +1419,42 @@ fn insert_summary(
     }
     for row in &summary.dependencies {
         ensure_not_cancelled(cancellation)?;
+        let (entry_kind, entry_carrier, entry_uncertain, entry_behavior) = match &row.entry {
+            ClassSetSummaryDependencyEntryRow::Zero => ("zero", None, false, None),
+            ClassSetSummaryDependencyEntryRow::Carrier {
+                carrier_key,
+                uncertain,
+                source_behavior_digest,
+            } => (
+                "carrier",
+                Some(carrier_key.as_slice()),
+                *uncertain,
+                source_behavior_digest.as_ref().map(<[u8; 32]>::as_slice),
+            ),
+        };
         conn.execute(
-            "INSERT INTO class_set_summary_dependencies VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO class_set_summary_dependencies VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 id,
                 row.ordinal,
                 row.callee_procedure_lineage.as_slice(),
                 row.callee_entry_selector_digest.as_slice(),
                 row.expected_output_digest.as_bytes().as_slice(),
-                row.consumed_child_lookup_digest.as_slice()
+                row.consumed_child_lookup_digest.as_slice(),
+                entry_kind,
+                entry_carrier,
+                entry_uncertain,
+                entry_behavior,
+                row.source_witnesses.len(),
             ],
         )?;
+        for (source_ordinal, source) in row.source_witnesses.iter().enumerate() {
+            ensure_not_cancelled(cancellation)?;
+            conn.execute(
+                "INSERT INTO class_set_summary_dependency_sources VALUES(?1,?2,?3,?4)",
+                params![id, row.ordinal, source_ordinal, source.as_slice()],
+            )?;
+        }
     }
     for row in &summary.reads {
         ensure_not_cancelled(cancellation)?;
@@ -1075,6 +1547,8 @@ type RawHeader = (
     Vec<u8>,
     Vec<u8>,
     Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
     u32,
     usize,
     usize,
@@ -1105,6 +1579,8 @@ fn load_summary(
         dependency_digest,
         carrier,
         fields,
+        root_surface,
+        direct_calls,
         entry,
         fact_count,
         exit_count,
@@ -1167,6 +1643,8 @@ fn load_summary(
             dependency_digest: digest(dependency_digest, "dependency digest")?,
             carrier_digest: digest(carrier, "carrier digest")?,
             field_slots_digest: digest(fields, "field-slots digest")?,
+            root_surface_digest: digest(root_surface, "root surface digest")?,
+            direct_calls_digest: digest(direct_calls, "direct calls digest")?,
             entry_fact_ordinal: entry,
         },
         facts,
@@ -1272,29 +1750,69 @@ fn load_dependencies(
     id: i64,
 ) -> Result<Vec<ClassSetSummaryDependencyRow>> {
     let mut s = conn.prepare_cached(DEPENDENCIES_SQL)?;
-    let rows = s.query_map(params![id], |r| {
+    let rows = s.query_map(params![id], |row| StoredDependency::from_row(row, 0))?;
+    let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(s);
+    let mut sources_by_dependency = load_dependency_sources(conn, id)?;
+    let mut dependencies = Vec::with_capacity(raw.len());
+    for dependency in raw {
+        let sources = sources_by_dependency
+            .remove(&dependency.ordinal)
+            .unwrap_or_default();
+        dependencies.push(dependency.finish(sources)?);
+    }
+    if !sources_by_dependency.is_empty() {
+        return Err(StoreError::new(
+            "class-set dependency sources reference an absent dependency",
+        ));
+    }
+    Ok(dependencies)
+}
+
+fn load_dependency_sources(
+    conn: &rusqlite::Connection,
+    summary_id: i64,
+) -> Result<HashMap<u32, Vec<(u32, ClassSetSummaryDigest)>>> {
+    let mut statement = conn.prepare_cached(DEPENDENCY_SOURCES_SQL)?;
+    let rows = statement.query_map(params![summary_id], |row| {
         Ok((
-            r.get::<_, u32>(0)?,
-            r.get::<_, Vec<u8>>(1)?,
-            r.get::<_, Vec<u8>>(2)?,
-            r.get::<_, Vec<u8>>(3)?,
-            r.get::<_, Vec<u8>>(4)?,
+            row.get::<_, u32>(0)?,
+            row.get::<_, u32>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
         ))
     })?;
-    rows.map(|r| {
-        let (ordinal, lineage, entry, output, lookup) = r?;
-        Ok(ClassSetSummaryDependencyRow {
-            ordinal,
-            callee_procedure_lineage: digest(lineage, "dependency lineage")?,
-            callee_entry_selector_digest: digest(entry, "dependency entry selector")?,
-            expected_output_digest: ClassSetSummaryOutputDigest::new(digest(
-                output,
-                "dependency output",
-            )?),
-            consumed_child_lookup_digest: digest(lookup, "dependency lookup")?,
-        })
-    })
-    .collect()
+    let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut grouped = HashMap::default();
+    for (dependency, ordinal, source) in rows {
+        grouped
+            .entry(dependency)
+            .or_insert_with(Vec::new)
+            .push((ordinal, digest(source, "dependency source witness")?));
+    }
+    Ok(grouped)
+}
+
+fn dependency_entry(
+    kind: String,
+    carrier: Option<Vec<u8>>,
+    uncertain: bool,
+    behavior: Option<Vec<u8>>,
+) -> Result<ClassSetSummaryDependencyEntryRow> {
+    match (kind.as_str(), carrier, uncertain, behavior) {
+        ("zero", None, false, None) => Ok(ClassSetSummaryDependencyEntryRow::Zero),
+        ("carrier", Some(carrier), uncertain, behavior) => {
+            Ok(ClassSetSummaryDependencyEntryRow::Carrier {
+                carrier_key: digest(carrier, "dependency entry carrier")?,
+                uncertain,
+                source_behavior_digest: behavior
+                    .map(|behavior| digest(behavior, "dependency source behavior"))
+                    .transpose()?,
+            })
+        }
+        _ => Err(StoreError::new(
+            "class-set dependency entry descriptor has an invalid shape",
+        )),
+    }
 }
 fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummaryReadRow>> {
     let mut s = conn.prepare_cached(READS_SQL)?;
@@ -1346,11 +1864,15 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+    use crate::analyzer::store::class_set_procedure_surfaces::{
+        ClassSetProcedureSurfaceHeaderRow, ClassSetProcedureSurfaceKey, ClassSetProcedureSurfaceRow,
+    };
     // Every EXPLAIN QUERY PLAN pin below runs its assertions once against a
     // store with no planner statistics and once with the statistics captured
     // from real corpus stores, because production carries the latter (#3016).
-    use crate::analyzer::read_ledger::{CallSiteLocator, LookupKind, LookupQuestion};
+    use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ProcedureCallSiteLocator};
     use crate::analyzer::semantic::ids::StableDigest;
+    use crate::analyzer::store::planner_statistics::tests::{explain_pin, pinned};
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
     const BLOB: &str = "1111111111111111111111111111111111111111";
@@ -1390,6 +1912,34 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         insert_complete_blob(&store, BLOB, 0);
         store
+            .publish_class_set_procedure_surface(root_surface(), &CancellationToken::new())
+            .unwrap();
+        store
+    }
+
+    fn root_surface() -> ClassSetProcedureSurfaceRow {
+        ClassSetProcedureSurfaceRow::try_new(
+            ClassSetProcedureSurfaceHeaderRow {
+                key: ClassSetProcedureSurfaceKey {
+                    procedure_lineage: digest_byte(2),
+                    owner_rel_path: "src/app.py".to_string(),
+                    language: Language::Python,
+                    schema_version: 1,
+                    local_structure_digest: digest_byte(16),
+                    behavior_read_digest: digest_byte(7),
+                },
+                owner_blob_oid: BLOB.to_string(),
+                artifact_public_identity: digest_byte(3),
+                artifact_content_identity: digest_byte(4),
+                exact_behavior_digest: digest_byte(18),
+                carrier_semantics_digest: digest_byte(9),
+                direct_calls_digest: digest_byte(17),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
     }
 
     fn row(lookup: u8) -> ClassSetSummaryRow {
@@ -1413,6 +1963,8 @@ mod tests {
                 dependency_digest: digest_byte(8),
                 carrier_digest: digest_byte(9),
                 field_slots_digest: digest_byte(10),
+                root_surface_digest: *root_surface().surface_digest(),
+                direct_calls_digest: digest_byte(17),
                 entry_fact_ordinal: 1,
             },
             vec![
@@ -1455,15 +2007,21 @@ mod tests {
                 callee_entry_selector_digest: digest_byte(12),
                 expected_output_digest: ClassSetSummaryOutputDigest::new(digest_byte(13)),
                 consumed_child_lookup_digest: digest_byte(14),
+                entry: ClassSetSummaryDependencyEntryRow::Carrier {
+                    carrier_key: digest_byte(15),
+                    uncertain: false,
+                    source_behavior_digest: Some(digest_byte(16)),
+                },
+                source_witnesses: vec![digest_byte(18), digest_byte(17)],
             }],
             vec![ClassSetSummaryReadRow {
                 ordinal: 0,
                 key: ReadKey::Lookup {
-                    kind: LookupKind::Dispatch,
-                    question: LookupQuestion::CallSite {
+                    kind: LookupKind::ProcedureDispatch,
+                    question: LookupQuestion::ProcedureCallSite {
                         rel_path: Box::from("src/callee.py"),
-                        artifact: StableDigest::sha256(b"callee"),
-                        site: CallSiteLocator {
+                        procedure: StableDigest::sha256(b"callee"),
+                        site: ProcedureCallSiteLocator {
                             start_byte: 12,
                             end_byte: 19,
                         },
@@ -1604,6 +2162,12 @@ mod tests {
         changed.dependencies[0].expected_output_digest =
             ClassSetSummaryOutputDigest::new(digest_byte(32));
         changed.dependencies[0].consumed_child_lookup_digest = digest_byte(33);
+        changed.dependencies[0].entry = ClassSetSummaryDependencyEntryRow::Carrier {
+            carrier_key: digest_byte(34),
+            uncertain: true,
+            source_behavior_digest: None,
+        };
+        changed.dependencies[0].source_witnesses = vec![digest_byte(35)];
         changed.reads[0].key = ReadKey::Configuration(StableDigest::sha256(b"configuration"));
         changed.charges[0].amount = 99;
         changed.charges[1].amount = 100;
@@ -1613,6 +2177,60 @@ mod tests {
             changed.canonical_content_digest()
         );
         assert_eq!(expected.output_digest(), changed.output_digest());
+    }
+
+    #[test]
+    fn semantic_publication_excludes_rotating_owner_and_rebind_provenance() {
+        let expected = row(1);
+        let mut refreshed = expected.clone();
+        refreshed.header.attachment.blob_oid = REPLACEMENT_BLOB.to_owned();
+        refreshed.header.artifact_public_identity = digest_byte(98);
+        refreshed.header.artifact_content_identity = digest_byte(99);
+        refreshed.header.dependency_digest = digest_byte(96);
+        refreshed.dependencies[0].consumed_child_lookup_digest = digest_byte(95);
+        refreshed.dependencies[0].source_witnesses = vec![digest_byte(94)];
+        refreshed.content_digest = refreshed.canonical_content_digest();
+
+        assert_ne!(expected, refreshed);
+        assert!(expected.has_same_semantic_publication(&refreshed));
+
+        let mut moved = refreshed.clone();
+        moved.header.attachment.rel_path = "src/other.py".to_owned();
+        assert!(!expected.has_same_semantic_publication(&moved));
+
+        let mut changed_language = refreshed.clone();
+        changed_language.header.attachment.language = Language::Go;
+        assert!(!expected.has_same_semantic_publication(&changed_language));
+
+        let mut semantic_change = refreshed;
+        semantic_change.header.semantics_digest = digest_byte(97);
+        semantic_change.content_digest = semantic_change.canonical_content_digest();
+        assert!(!expected.has_same_semantic_publication(&semantic_change));
+
+        let mut changed_dependency = expected.clone();
+        changed_dependency.dependencies[0].expected_output_digest =
+            ClassSetSummaryOutputDigest::new(digest_byte(94));
+        assert!(!expected.has_same_semantic_publication(&changed_dependency));
+
+        let mut changed_entry = expected.clone();
+        changed_entry.dependencies[0].entry = ClassSetSummaryDependencyEntryRow::Carrier {
+            carrier_key: digest_byte(93),
+            uncertain: false,
+            source_behavior_digest: Some(digest_byte(16)),
+        };
+        assert!(!expected.has_same_semantic_publication(&changed_entry));
+
+        let mut changed_relation = expected.clone();
+        changed_relation.reached[0].point_id += 1;
+        assert!(!expected.has_same_semantic_publication(&changed_relation));
+
+        let mut changed_read = expected.clone();
+        changed_read.reads[0].key = ReadKey::Configuration(StableDigest::sha256(b"changed"));
+        assert!(!expected.has_same_semantic_publication(&changed_read));
+
+        let mut changed_charge = expected.clone();
+        changed_charge.charges[0].amount += 1;
+        assert!(!expected.has_same_semantic_publication(&changed_charge));
     }
 
     #[test]
@@ -1714,11 +2332,73 @@ mod tests {
     }
 
     #[test]
+    fn bounded_summary_family_exposes_zero_entry_without_loading_full_rows() {
+        let store = store_with_blob();
+        let carrier = row(2);
+        let mut zero = row(1);
+        zero.header.entry_fact_ordinal = 0;
+        zero.content_digest = zero.canonical_content_digest();
+        for summary in [&carrier, &zero] {
+            store
+                .publish_class_set_summary(summary.clone(), &CancellationToken::new())
+                .unwrap();
+        }
+        let header = &zero.header;
+        let key = ClassSetSummaryFamilyKey {
+            procedure_lineage: header.key.procedure_lineage,
+            owner_rel_path: header.attachment.rel_path.clone(),
+            language: header.attachment.language,
+            schema_version: header.schema_version,
+            semantics_digest: header.semantics_digest,
+            context_digest: header.context_digest,
+            behavior_read_digest: header.behavior_read_digest,
+            carrier_digest: header.carrier_digest,
+            field_slots_digest: header.field_slots_digest,
+            root_surface_digest: header.root_surface_digest,
+        };
+
+        assert!(
+            store
+                .class_set_summary_family_lookups(&key, 1)
+                .unwrap()
+                .is_none(),
+            "the bounded family must not expose a truncated prefix"
+        );
+        assert_eq!(
+            store.class_set_summary_family_lookups(&key, 2).unwrap(),
+            Some(vec![
+                ClassSetSummaryFamilyLookupRow {
+                    lookup_digest: digest_byte(1),
+                    zero_entry: true,
+                },
+                ClassSetSummaryFamilyLookupRow {
+                    lookup_digest: digest_byte(2),
+                    zero_entry: false,
+                },
+            ])
+        );
+    }
+
+    #[test]
     fn reverse_dependency_queries_return_exact_deterministic_evidence() {
         let store = store_with_blob();
         let first = row(2);
         let mut second = row(1);
         second.header.key.procedure_lineage = digest_byte(42);
+        let template = root_surface();
+        let mut header = template.header.clone();
+        header.key.procedure_lineage = digest_byte(42);
+        let second_surface = ClassSetProcedureSurfaceRow::try_new(
+            header,
+            template.calls,
+            template.lexical_children,
+            template.reads,
+        )
+        .unwrap();
+        store
+            .publish_class_set_procedure_surface(second_surface.clone(), &CancellationToken::new())
+            .unwrap();
+        second.header.root_surface_digest = *second_surface.surface_digest();
         second.content_digest = second.canonical_content_digest();
         for summary in [&first, &second] {
             store
@@ -1760,6 +2440,28 @@ mod tests {
                 .unwrap(),
             vec![digest_byte(1), digest_byte(2)]
         );
+    }
+
+    #[test]
+    fn corrupt_dependency_source_count_fails_closed() {
+        let store = store_with_blob();
+        store
+            .publish_class_set_summary(row(1), &CancellationToken::new())
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE class_set_summary_dependencies SET entry_source_count = 3",
+                [],
+            )
+            .unwrap();
+
+        let error = store
+            .class_set_summary_for_digest(digest_byte(1))
+            .unwrap_err();
+        assert!(error.to_string().contains("source count"), "{error}");
     }
 
     #[test]
@@ -2060,6 +2762,21 @@ mod tests {
         );
 
         insert_complete_blob(&store, REPLACEMENT_BLOB, 1);
+        let prior_surface = root_surface();
+        let mut refreshed_surface_header = prior_surface.header.clone();
+        refreshed_surface_header.owner_blob_oid = REPLACEMENT_BLOB.to_string();
+        store
+            .publish_class_set_procedure_surface(
+                ClassSetProcedureSurfaceRow::try_new(
+                    refreshed_surface_header,
+                    prior_surface.calls,
+                    prior_surface.lexical_children,
+                    prior_surface.reads,
+                )
+                .unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         let mut replacement = row(1);
         replacement.header.attachment.blob_oid = REPLACEMENT_BLOB.to_string();
         replacement.content_digest = replacement.canonical_content_digest();
@@ -2140,8 +2857,8 @@ mod tests {
             .unwrap();
         let after = stored_cascade_cost(&store, BLOB);
 
-        assert_eq!(after.0 - before.0, 10);
-        assert_eq!(after.1 - before.1, 834);
+        assert_eq!(after.0 - before.0, 12);
+        assert_eq!(after.1 - before.1, 1043);
 
         store
             .replace_class_set_summary(
@@ -2168,26 +2885,20 @@ mod tests {
         let store = store_with_blob();
         let conn = store.conn.lock().unwrap();
         state.install(&conn);
-        let sql = super::super::stored_blob_cascade_costs_sql(1);
-        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let plan = statement
-            .query_map(params![BLOB, "python"], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let plan = explain_pin(&conn, &pinned("class_set_summary_cascade_costs"));
 
         assert!(
             plan.iter().any(|detail| {
-                detail.contains("SEARCH summary_cost USING COVERING INDEX")
+                detail.contains("SEARCH summary_cost USING INDEX")
                     && detail.contains("class_set_summaries_owner_blob")
             }),
             "{state}: {plan:#?}"
         );
         assert!(
             plan.iter()
-                .filter(|detail| detail.contains("SEARCH child_cost USING PRIMARY KEY"))
+                .filter(|detail| detail.contains("SEARCH child_cost USING"))
                 .count()
-                >= 12,
+                >= 24,
             "{state}: {plan:#?}"
         );
         assert!(
@@ -2227,37 +2938,10 @@ mod tests {
         );
     }
 
-    fn explain(
-        store: &AnalyzerStore,
-        state: PlannerStatisticsState,
-        sql: &str,
-        parameter: &[u8],
-    ) -> Vec<String> {
+    fn explain(store: &AnalyzerStore, state: PlannerStatisticsState, name: &str) -> Vec<String> {
         let conn = store.conn.lock().unwrap();
         state.install(&conn);
-        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        statement
-            .query_map(params![parameter], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
-    }
-
-    fn explain_two(
-        store: &AnalyzerStore,
-        state: PlannerStatisticsState,
-        sql: &str,
-        first: &[u8],
-        second: &[u8],
-    ) -> Vec<String> {
-        let conn = store.conn.lock().unwrap();
-        state.install(&conn);
-        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        statement
-            .query_map(params![first, second], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
+        explain_pin(&conn, &pinned(name))
     }
 
     #[test]
@@ -2269,12 +2953,7 @@ mod tests {
 
     fn reverse_dependency_queries_seek_the_named_indexes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
-        let by_lookup = explain(
-            &store,
-            state,
-            CLASS_SET_SUMMARY_DEPENDENTS_BY_LOOKUP_SQL.as_str(),
-            &digest_byte(14),
-        );
+        let by_lookup = explain(&store, state, "class_set_summary_dependents_by_lookup");
         assert!(
             by_lookup.iter().any(|detail| {
                 detail.contains("SEARCH dependencies USING INDEX")
@@ -2288,13 +2967,19 @@ mod tests {
                 .all(|detail| !detail.contains("SCAN dependencies")),
             "{state}: {by_lookup:#?}"
         );
+        assert!(
+            by_lookup.iter().any(|detail| {
+                detail.contains("SEARCH sources USING PRIMARY KEY")
+                    && detail.contains("summary_id=?")
+                    && detail.contains("dependency_ordinal=?")
+            }),
+            "{state}: {by_lookup:#?}"
+        );
 
-        let by_lineage = explain_two(
+        let by_lineage = explain(
             &store,
             state,
-            CLASS_SET_SUMMARY_DEPENDENTS_BY_LINEAGE_ENTRY_SQL.as_str(),
-            &digest_byte(11),
-            &digest_byte(12),
+            "class_set_summary_dependents_by_lineage_entry",
         );
         assert!(
             by_lineage.iter().any(|detail| {
@@ -2309,13 +2994,16 @@ mod tests {
                 .all(|detail| !detail.contains("SCAN dependencies")),
             "{state}: {by_lineage:#?}"
         );
-
-        let by_read = explain(
-            &store,
-            state,
-            CLASS_SET_SUMMARY_DEPENDENTS_BY_READ_SQL.as_str(),
-            row(1).reads[0].key.canonical_digest().as_bytes(),
+        assert!(
+            by_lineage.iter().any(|detail| {
+                detail.contains("SEARCH sources USING PRIMARY KEY")
+                    && detail.contains("summary_id=?")
+                    && detail.contains("dependency_ordinal=?")
+            }),
+            "{state}: {by_lineage:#?}"
         );
+
+        let by_read = explain(&store, state, "class_set_summary_dependents_by_read");
         assert!(
             by_read.iter().any(|detail| {
                 detail.contains("SEARCH reads USING")
@@ -2338,12 +3026,7 @@ mod tests {
 
     fn exact_summary_lookups_seek_the_named_indexes_in(state: PlannerStatisticsState) {
         let store = AnalyzerStore::open_ephemeral().unwrap();
-        let lookup = explain(
-            &store,
-            state,
-            CLASS_SET_SUMMARY_LOOKUP_SQL.as_str(),
-            &digest_byte(1),
-        );
+        let lookup = explain(&store, state, "class_set_summary_lookup");
         assert!(
             lookup
                 .iter()
@@ -2368,12 +3051,7 @@ mod tests {
                 "{state}: {lookup:#?}"
             );
         }
-        let procedure = explain(
-            &store,
-            state,
-            CLASS_SET_SUMMARY_PROCEDURE_SQL.as_str(),
-            &digest_byte(2),
-        );
+        let procedure = explain(&store, state, "class_set_summary_procedure");
         assert!(
             procedure
                 .iter()
@@ -2387,16 +3065,43 @@ mod tests {
                 .all(|detail| !detail.contains("SCAN summaries")),
             "{state}: {procedure:#?}"
         );
+        let family = explain(&store, state, "class_set_summary_family");
+        assert!(
+            family.iter().any(|detail| {
+                detail.contains("SEARCH summaries USING INDEX")
+                    && detail.contains("class_set_summaries_exact_family")
+            }),
+            "{state}: {family:#?}"
+        );
+        assert!(
+            family
+                .iter()
+                .all(|detail| !detail.contains("SCAN summaries")),
+            "{state}: {family:#?}"
+        );
+        assert!(
+            family
+                .iter()
+                .any(|detail| { detail.contains("SEARCH entry_facts USING PRIMARY KEY") }),
+            "{state}: {family:#?}"
+        );
+        assert!(
+            family
+                .iter()
+                .all(|detail| !detail.contains("SCAN entry_facts")),
+            "{state}: {family:#?}"
+        );
 
-        for (table, sql) in [
-            ("class_set_summary_facts", FACTS_SQL),
-            ("class_set_summary_exits", EXITS_SQL),
-            ("class_set_summary_reached", REACHED_SQL),
-            ("class_set_summary_dependencies", DEPENDENCIES_SQL),
-            ("class_set_summary_reads", READS_SQL),
-            ("class_set_summary_charges", CHARGES_SQL),
+        for table in [
+            "class_set_summary_facts",
+            "class_set_summary_exits",
+            "class_set_summary_reached",
+            "class_set_summary_dependencies",
+            "class_set_summary_dependency_sources",
+            "class_set_summary_reads",
+            "class_set_summary_charges",
         ] {
-            let plan = explain(&store, state, sql, &[1]);
+            let plan = explain(&store, state, table);
             assert!(
                 plan.iter().any(|detail| detail.contains("SEARCH")
                     && detail.contains(table)

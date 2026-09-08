@@ -655,6 +655,7 @@ pub(super) fn combine_set_rows(
                 }
                 if present {
                     for contribution in contributions {
+                        row.value.merge_evidence(contribution.value);
                         row.traces.extend(contribution.traces);
                         row.provenance_truncated |= contribution.provenance_truncated;
                     }
@@ -788,6 +789,51 @@ pub(super) fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
         }
     }
     false
+}
+
+/// Whether this query can ask the Python absence solver to prove a missing
+/// member from a selected Python structural seed. The declaration-surface
+/// capability gate must run before seed enumeration, including when selected
+/// files contain no procedures, so this intentionally reasons from files
+/// rather than from produced rows.
+pub(super) fn python_absent_member_file(
+    plan: &CodeQueryPlan,
+    files: &[ProjectFile],
+) -> Option<ProjectFile> {
+    let mut pending = vec![(plan, false)];
+    while let Some((plan, downstream_absence)) = pending.pop() {
+        let needs_absence = downstream_absence
+            || plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, QueryStep::AbsentMember));
+        let (languages, globs) = match &plan.source {
+            CodeQueryPlanSource::Seed(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Occurrences(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Scopes(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Bindings(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Paths(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Exports(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::Set { branches, .. } => {
+                pending.extend(branches.iter().rev().map(|branch| (branch, needs_absence)));
+                continue;
+            }
+        };
+        if needs_absence
+            && (languages.is_empty() || languages.contains(&Language::Python))
+            && let Some(file) = files.iter().find(|file| {
+                crate::analyzer::common::language_for_file(file) == Language::Python
+                    && (globs.is_empty()
+                        || globs
+                            .iter()
+                            .any(|glob| glob.matches(&rel_path_string(file))))
+            })
+        {
+            return Some(file.clone());
+        }
+    }
+    None
 }
 
 pub(super) fn query_plan_requires_taint(plan: &CodeQueryPlan) -> bool {
@@ -1438,6 +1484,17 @@ pub(super) fn apply_pipeline_step(
                 .map(PipelineValue::Semantic)
                 .map(pipeline_expansion)
                 .collect(),
+            (PipelineValue::AbsentMemberFinding(finding), QueryStep::Witness(traversal)) => {
+                semantic
+                    .as_mut()
+                    .expect("absent-member witness projection retains its semantic context")
+                    .absent_member_witnesses(finding, traversal)
+                    .into_iter()
+                    .map(SemanticPipelineValue::AbsentMemberWitness)
+                    .map(PipelineValue::Semantic)
+                    .map(pipeline_expansion)
+                    .collect()
+            }
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
                 let (enclosing, projection_omitted) =
                     enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -1461,6 +1518,11 @@ pub(super) fn apply_pipeline_step(
             (PipelineValue::Declaration(declaration), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     declaration.unit.source().clone(),
+                ))]
+            }
+            (PipelineValue::AbsentMemberFinding(finding), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    finding.file().clone(),
                 ))]
             }
             (
@@ -1509,6 +1571,12 @@ pub(super) fn apply_pipeline_step(
             ))],
             (
                 PipelineValue::Semantic(SemanticPipelineValue::FlowWitness(witness)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                witness.file().clone(),
+            ))],
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::AbsentMemberWitness(witness)),
                 QueryStep::FileOf,
             ) => vec![pipeline_expansion(PipelineValue::File(
                 witness.file().clone(),
@@ -1996,6 +2064,7 @@ pub(super) fn apply_pipeline_step(
                     limits,
                     cancellation,
                     diagnostics,
+                    &mut call_cache.reported_suppressed_shapes,
                     cache_profile,
                     &mut row_exhausted,
                 )
@@ -2056,6 +2125,7 @@ pub(super) fn apply_pipeline_step(
                     limits,
                     cancellation,
                     diagnostics,
+                    &mut call_cache.reported_suppressed_shapes,
                     cache_profile,
                     &mut row_exhausted,
                 )
@@ -2073,6 +2143,7 @@ pub(super) fn apply_pipeline_step(
                     limits,
                     cancellation,
                     diagnostics,
+                    &mut call_cache.reported_suppressed_shapes,
                     cache_profile,
                     &mut row_exhausted,
                 )

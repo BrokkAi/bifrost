@@ -24,7 +24,7 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v6";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v7";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -1165,7 +1165,9 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, ValueId>,
     local_storage: HashMap<ValueId, RubyLocalStorage>,
     constant_index_values: HashMap<u64, ValueId>,
+    instance_field_locators: HashMap<Box<str>, SemanticLocator>,
     receiver: Option<ValueId>,
+    procedure_is_static: bool,
     reuse_first_statement_entry: bool,
     nonlocal_cleanup_label: Option<Box<str>>,
     next_control_label: usize,
@@ -1224,7 +1226,9 @@ fn lower_procedure<'tree, 'request>(
         locals: HashMap::default(),
         local_storage: HashMap::default(),
         constant_index_values: HashMap::default(),
+        instance_field_locators: HashMap::default(),
         receiver: None,
+        procedure_is_static: spec.properties.is_static,
         reuse_first_statement_entry: matches!(
             spec.kind,
             ProcedureKind::Lambda | ProcedureKind::Closure
@@ -1283,16 +1287,6 @@ fn lower_procedure<'tree, 'request>(
             SemanticCapability::Captures,
             SemanticGapKind::Unsupported,
             "Ruby lexical captures require closure-environment refinement",
-        )?;
-    }
-    if spec.kind == ProcedureKind::Constructor {
-        context.add_gap(
-            &mut builder,
-            entry,
-            SemanticGapSubject::Procedure,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unsupported,
-            "Class#new allocation and initialize dispatch are not collapsed into a synthetic constructor call",
         )?;
     }
     if spec.kind == ProcedureKind::Initializer && spec.callable.kind() != "program" {
@@ -1704,6 +1698,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         ))
     }
 
+    fn instance_field_member_locator(&mut self, node: Node<'tree>) -> Option<SemanticLocator> {
+        if node.kind() != "instance_variable"
+            || self.procedure_is_static
+            || !matches!(
+                self.procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor
+            )
+        {
+            return None;
+        }
+        let name = node_text(self.source, node)?;
+        if let Some(locator) = self.instance_field_locators.get(name) {
+            return Some(locator.clone());
+        }
+        let anchor = source_anchor(node, 0).ok()?;
+        let procedure = self.session.locator();
+        let locator = SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        );
+        self.instance_field_locators
+            .insert(name.into(), locator.clone());
+        Some(locator)
+    }
+
     fn property_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, SemanticLocator)> {
         if node.kind() != "call" || node.child_by_field_name("arguments").is_some() {
             return None;
@@ -2072,6 +2095,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "element_reference" => self.element_reference(builder, node, entry, next, scope, stack),
             "identifier" => self.ambiguous_identifier(builder, node, entry, next, scope, stack),
+            "instance_variable" => self.instance_variable_access(builder, node, entry, next),
             "method" | "singleton_method" | "lambda" | "block" | "do_block" => {
                 self.callable_value(builder, node, entry, next)
             }
@@ -2086,6 +2110,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
         }
+    }
+
+    fn instance_variable_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+    ) -> Result<(), RubyLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let Some(member) = self.instance_field_member_locator(node) else {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::Unsupported,
+                "Ruby instance-variable reads outside an ordinary instance method are not receiver-rooted",
+            )?;
+            return self.edge(builder, entry, next);
+        };
+        let base = self
+            .receiver
+            .expect("an ordinary Ruby instance method has a receiver value");
+        let access = self.point(builder, node, Vec::new())?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )?;
+        self.edge(builder, entry, EdgeTarget::normal(access))?;
+        self.edge(builder, access, next)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3291,7 +3356,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             CallSiteScaffold {
                 point: invoke,
                 callee,
-                receiver,
+                receiver: (!constructor).then_some(receiver).flatten(),
                 arguments: arguments.into_boxed_slice(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -3868,7 +3933,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let element_place = (node.kind() == "assignment")
             .then(|| self.element_parts(left))
             .flatten();
-        if let Some((receiver, member)) = property_place {
+        let instance_field_place = (node.kind() == "assignment")
+            .then(|| self.instance_field_member_locator(left))
+            .flatten();
+        if let Some(member) = instance_field_place {
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base = self
+                .receiver
+                .expect("an ordinary Ruby instance method has a receiver value");
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Field { base, member },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    value,
+                },
+            )?;
+            self.expression_values.insert(node.id(), value);
+        } else if let Some((receiver, member)) = property_place {
             let value = self.expression_value(builder, right, expression_value_kind(right))?;
             let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
             let location = self.session.add_memory_location(
@@ -3949,13 +4037,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 merge.unwrap_or(terminal),
                 SemanticGapSubject::Point,
-                if dispatching_target {
+                if left.kind() == "instance_variable" {
+                    SemanticCapability::FieldMemory
+                } else if dispatching_target {
                     SemanticCapability::Assignments
                 } else {
                     SemanticCapability::LocalFlow
                 },
                 SemanticGapKind::Unsupported,
-                if dispatching_target {
+                if left.kind() == "instance_variable" {
+                    "Ruby instance-variable assignment requires an ordinary instance receiver and a plain assignment"
+                } else if dispatching_target {
                     "Ruby writer assignment does not preserve plain local identity"
                 } else {
                     "Ruby destructuring or non-local assignment is not lowered as one identity-preserving local flow"

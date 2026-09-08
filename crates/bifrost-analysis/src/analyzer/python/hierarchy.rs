@@ -20,6 +20,9 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             .raw_supertypes_of(code_unit)
             .iter()
             .filter_map(|raw| resolve_base_class(self, token, code_unit, raw))
+            // Resolving a base spelling to a value or module does not prove a
+            // superclass. In particular, a rebound builtin can name a field.
+            .filter(CodeUnit::is_class)
             .collect();
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));

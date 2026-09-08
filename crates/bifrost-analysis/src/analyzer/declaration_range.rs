@@ -6,7 +6,7 @@ use crate::analyzer::common::{
     language_for_file, language_for_target, source_identifier_for_target,
 };
 use crate::analyzer::languages::LanguageSupport;
-use crate::analyzer::tree_walk::node_for_exact_range;
+use crate::analyzer::tree_walk::{node_for_exact_range, push_named_children_reversed};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
@@ -278,6 +278,14 @@ fn declaration_name_node_from_fields<'tree>(
     content: &str,
     support: Option<&'static dyn LanguageSupport>,
 ) -> Option<(Node<'tree>, bool)> {
+    // `child_by_field_name` resolves the field id by comparing the name against
+    // the grammar's field table on every call, and this walk asks six of them
+    // per node. The ids are fixed for the grammar, so settle them once (#3097).
+    let language = declaration_node.language();
+    let name_fields = ["name", "left", "pattern"].map(|field| language.field_id_for_name(field));
+    let descend_fields =
+        ["declarator", "declaration", "definition"].map(|field| language.field_id_for_name(field));
+
     let mut stack = vec![declaration_node];
     while let Some(node) = stack.pop() {
         // Some grammars name no declaration identifier by field at all, so the
@@ -303,16 +311,16 @@ fn declaration_name_node_from_fields<'tree>(
         {
             return Some((identifier_node, false));
         }
-        for field in ["name", "left", "pattern"] {
-            if let Some(binding) = node.child_by_field_name(field)
+        for field in name_fields.iter().flatten() {
+            if let Some(binding) = node.child_by_field_id(field.get())
                 && let Some(identifier_node) =
                     matching_identifier_node(binding, identifier, content, support)
             {
                 return Some((identifier_node, false));
             }
         }
-        for field in ["declarator", "declaration", "definition"] {
-            if let Some(child) = node.child_by_field_name(field) {
+        for field in descend_fields.iter().flatten() {
+            if let Some(child) = node.child_by_field_id(field.get()) {
                 stack.push(child);
             }
         }
@@ -375,11 +383,7 @@ fn matching_identifier_node<'tree>(
             return Some(node);
         }
         // Pushed in reverse so that `pop` yields the first child first.
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
     None
 }

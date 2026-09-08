@@ -20,7 +20,7 @@ pub(crate) fn text_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "search_file_contents",
-            "Search file contents with regular expressions, returning matching lines with surrounding context. Optionally restrict the search to files matching a glob or absolute glob inside the active workspace.",
+            "Search file contents with regular expressions, returning matching lines with surrounding context. Optionally restrict the search to a file, a directory, or a glob inside the active workspace.",
             json!({
                 "type": "object",
                 "properties": {
@@ -31,7 +31,7 @@ pub(crate) fn text_tool_descriptors() -> Vec<Value> {
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "Optional glob to restrict the search to matching paths, or an absolute path/glob inside the active workspace."
+                        "description": "Optional file, directory, or glob restricting the search, project-relative or absolute inside the active workspace. A directory searches every file under it; a selector that names no workspace file or directory is returned in unmatched_paths instead of silently searching nothing."
                     },
                     "context_lines": {
                         "type": "integer",

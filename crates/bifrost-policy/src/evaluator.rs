@@ -2610,6 +2610,7 @@ fn executable_match_query(
             | QueryValueKind::ConcurrentAccessConflict
             | QueryValueKind::ClassSetRow
             | QueryValueKind::AbsentMemberFinding
+            | QueryValueKind::AbsentMemberWitness
             | QueryValueKind::DetachedTaskTransfer
             | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
@@ -4098,6 +4099,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::ConcurrentAccessConflict
         | DetailedCodeQueryDomain::ClassSetRow
         | DetailedCodeQueryDomain::AbsentMemberFinding
+        | DetailedCodeQueryDomain::AbsentMemberWitness
         | DetailedCodeQueryDomain::DetachedTaskTransfer
         | DetailedCodeQueryDomain::ProcedureEffect
         | DetailedCodeQueryDomain::CallableSignature
@@ -4404,6 +4406,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         | DetailedCodeQueryKey::AbsentMemberFinding { id } => {
             update_hash(&mut hasher, id.as_bytes());
         }
+        DetailedCodeQueryKey::AbsentMemberWitness { id, finding_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, finding_id.as_bytes());
+        }
         DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, procedure_id.as_bytes());
@@ -4597,6 +4603,12 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         // capability gap, not a budget one: the missing fact is a model or a
         // resolution, and no larger bound would recover it (#2437).
         | CodeQueryDiagnosticCode::EffectDerivationIncomplete
+        // A call shape the language's lowering could not read suppresses every
+        // row family derived from it -- argument groups, arguments, bindings.
+        // No larger budget recovers those rows, so the gap is a capability one,
+        // and it is the same reason a plan that binds the shape row itself
+        // already reports (#1949).
+        | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
         | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
@@ -4649,6 +4661,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::ValueFlowProviderFailed
         | CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted
         | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated
+        | CodeQueryDiagnosticCode::TypeFlowWitnessTruncated
+        | CodeQueryDiagnosticCode::TypeFlowWitnessUnavailable
         | CodeQueryDiagnosticCode::UnresolvedTaintResultReference
         | CodeQueryDiagnosticCode::TaintRegistrationStale
         | CodeQueryDiagnosticCode::TaintHandleStale

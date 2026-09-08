@@ -5090,11 +5090,11 @@ func unknownObjectsDistinctFields() int {
         ("unordered", "open", "open"),
         "{copied_struct:#?}"
     );
-    assert_eq!(
-        value.reasons,
-        ["unknown_location", "alias_set_truncated"],
-        "{copied_struct:#?}"
-    );
+    // `writeCopiedOptions` declares a value parameter, so the binding is
+    // refused before an alias set is built. The location is unknown because
+    // the callee writes its own copy, and there is nothing left to truncate;
+    // this used to report both reasons because it attempted the binding first.
+    assert_eq!(value.reasons, ["unknown_location"], "{copied_struct:#?}");
 
     let select_default = conflicts_for("selectWithDefaultIsUnjoined");
     assert_eq!(
@@ -5451,6 +5451,623 @@ func distinctCrossFileVars() int {
     );
 }
 
+/// A field written directly inside a spawned closure must race with the same
+/// field read in the parent, and distinct fields must stay apart.
+///
+/// The producer resolves a field only where it can type the receiver. A
+/// capture inside the closure cannot be typed, so it anchored the member at
+/// the use while the parent anchored at the declaration; the two then
+/// described one field differently and the pair was declared disjoint with
+/// nothing reported. A map or slice captured the same way was compared
+/// correctly, which is why this stayed hidden.
+#[test]
+fn go_conflicts_compare_a_field_written_inside_a_spawned_closure() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    value int
+    other int
+}
+
+func racesOnCapturedField() int {
+    c := &cell{}
+    go func() { c.value = 1 }()
+    return c.value
+}
+
+func distinctCapturedFields() int {
+    c := &cell{}
+    go func() { c.other = 1 }()
+    return c.value
+}
+
+func distinctCapturedObjects() int {
+    written := &cell{}
+    read := &cell{}
+    go func() { written.value = 1 }()
+    return read.value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("captured field concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    let raced = conflicts_for("racesOnCapturedField");
+    let value = find_concurrent_relation(&raced, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // Naming the declaration must separate two fields of one struct, and two
+    // objects of one type; giving every unresolved member one identity would
+    // merge either pair.
+    for name in ["distinctCapturedFields", "distinctCapturedObjects"] {
+        let result = conflicts_for(name);
+        assert!(
+            !result.results.iter().any(|item| matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict"
+            )),
+            "{name} must not alias: {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn go_conflicts_follow_a_pointer_receiver_into_the_method_it_calls() {
+    // The methods are declared away from their callers. A producer resolves a
+    // field only where it can type the receiver, so a same-file fixture is
+    // already answered by the caller's own typing and would pass without the
+    // call-boundary binding this test covers.
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "cell.go",
+            r#"package main
+
+type cell struct {
+    value int
+}
+
+func (c *cell) writeThrough() { c.value = 1 }
+
+func (c cell) writeCopy() { c.value = 1 }
+"#,
+        )
+        .file(
+            "main.go",
+            r#"package main
+
+func racesThroughPointerReceiver() int {
+    c := &cell{}
+    go func() { c.writeThrough() }()
+    return c.value
+}
+
+func copiesThroughValueReceiver() int {
+    c := cell{}
+    go func() { c.writeCopy() }()
+    return c.value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("receiver binding concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // Go copies the receiver. A pointer receiver copies the pointer, so the
+    // method's write reaches the caller's object and races the caller's read.
+    let raced = conflicts_for("racesThroughPointerReceiver");
+    let value = find_concurrent_relation(&raced, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // A value receiver copies the fields it writes, so the caller's object is
+    // never written and no race can be proven. Admitting every receiver
+    // binding proved this pair instead, which was a false positive.
+    let copied = conflicts_for("copiesThroughValueReceiver");
+    assert!(
+        !copied.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+        )),
+        "a value receiver copies the field it writes: {copied:#?}"
+    );
+}
+
+#[test]
+fn go_conflicts_reach_a_body_named_by_a_function_valued_parameter() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type st struct {
+    n int
+}
+
+func (s *st) bump() { s.n = 1 }
+
+func eachOf(s *st, fn func(*st)) { fn(s) }
+
+func reachesTheWriteThroughACallback() int {
+    s := &st{}
+    go func() { eachOf(s, func(x *st) { x.bump() }) }()
+    return s.n
+}
+
+func reachesTheWriteDirectly() int {
+    s := &st{}
+    go s.bump()
+    return s.n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("callback parameter concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // `fn(s)` names no declaration this procedure can resolve, because the
+    // caller chooses the body. The producer records the flow from the `fn`
+    // binding to the callable value, and the binding carries the callable
+    // across the call, so the callback's write is compared after all.
+    let through_callback = conflicts_for("reachesTheWriteThroughACallback");
+    assert_eq!(
+        through_callback.completion(),
+        CodeQueryCompletion::Complete,
+        "{through_callback:#?}"
+    );
+    let value = find_concurrent_relation(&through_callback, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{through_callback:#?}"
+    );
+
+    // The same write reached directly, as the control.
+    let direct = conflicts_for("reachesTheWriteDirectly");
+    assert_eq!(
+        direct.completion(),
+        CodeQueryCompletion::Complete,
+        "{direct:#?}"
+    );
+    let value = find_concurrent_relation(&direct, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{direct:#?}"
+    );
+}
+
+#[test]
+fn go_conflicts_read_the_declared_parameter_before_crossing_a_call_boundary() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    value int
+}
+
+func writeThrough(c *cell) { c.value = 1 }
+
+func writeCopy(c cell) { c.value = 1 }
+
+func racesThroughPointerParameter() int {
+    c := &cell{}
+    go writeThrough(c)
+    return c.value
+}
+
+func copiesThroughValueParameter() int {
+    c := cell{}
+    go writeCopy(c)
+    return c.value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("parameter binding concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // A pointer parameter copies the pointer, so the callee's write reaches
+    // the caller's object and races the caller's read.
+    let raced = conflicts_for("racesThroughPointerParameter");
+    let value = find_concurrent_relation(&raced, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // A value parameter copies the fields it writes. The caller could type its
+    // own local, which handed the binding a proven identity and proved a race
+    // Go cannot have.
+    let copied = conflicts_for("copiesThroughValueParameter");
+    assert!(
+        !copied.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+        )),
+        "a value parameter copies the field it writes: {copied:#?}"
+    );
+}
+
+#[test]
+fn go_conflicts_name_a_field_loaded_through_another_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type inner struct {
+    n int
+}
+
+type outer struct {
+    in *inner
+}
+
+func (o *outer) writeNested() { o.in.n = 1 }
+
+type innerValue struct {
+    n int
+}
+
+type outerValue struct {
+    in innerValue
+}
+
+func (o outerValue) writeCopiedChain() { o.in.n = 1 }
+
+func (o outer) writeThroughCopiedPointer() { o.in.n = 1 }
+
+type stats struct {
+    count int
+}
+
+type transaction struct {
+    counters stats
+}
+
+type holder struct {
+    tx *transaction
+}
+
+func (h *holder) writeThreeDeep() { h.tx.counters.count = 1 }
+
+func racesThroughNestedFields() int {
+    o := &outer{in: &inner{}}
+    go o.writeNested()
+    return o.in.n
+}
+
+func copiesTheWholeChain() int {
+    o := outerValue{}
+    go o.writeCopiedChain()
+    return o.in.n
+}
+
+func racesThroughACopiedPointerField() int {
+    o := &outer{in: &inner{}}
+    go o.writeThroughCopiedPointer()
+    return o.in.n
+}
+
+func racesThroughThreeFieldSteps() int {
+    h := &holder{tx: &transaction{}}
+    go h.writeThreeDeep()
+    return h.tx.counters.count
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("nested field chain concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // `o.in.n` loads a field out of a field. The inner load's result is
+    // neither captured nor freshly allocated, so without composing the chain
+    // it had no name and the write could not pair with anything at all. This
+    // is bbolt's `b.tx.stats.CursorCount++`.
+    let raced = conflicts_for("racesThroughNestedFields");
+    let value = find_concurrent_relation(&raced, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // The chain is composed over the ordinary equivalence classes, not the
+    // backing ones. Backing identity deliberately crosses a copy, because a
+    // map or slice descriptor inside a copied struct still names one store; a
+    // direct field does not survive one. Composing over backing classes
+    // proved this pair, which is a race Go cannot have.
+    let copied = conflicts_for("copiesTheWholeChain");
+    assert!(
+        !copied.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+        )),
+        "a value receiver copies the whole chain it writes: {copied:#?}"
+    );
+
+    // A value receiver copies the struct, but a pointer field inside that copy
+    // still addresses one object, so this does race. Refusing every value
+    // receiver alike reported nothing here, which is the silent miss the copy
+    // rule must not buy. The chain crossed a pointer field, so it may use the
+    // identity that survives a copy.
+    let through_pointer = conflicts_for("racesThroughACopiedPointerField");
+    let value = find_concurrent_relation(&through_pointer, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{through_pointer:#?}"
+    );
+
+    // Three steps, which is bbolt's `b.tx.stats.CursorCount++`. Every step of
+    // a composed chain must be named the way the outermost one already is.
+    // Naming an inner step by its locator's own digest made the two sides
+    // agree on their first and last steps and disagree in the middle, so a
+    // chain of three reported nothing at all while a chain of two proved.
+    let three_deep = conflicts_for("racesThroughThreeFieldSteps");
+    let value = find_concurrent_relation(&three_deep, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{three_deep:#?}"
+    );
+}
+
+#[test]
+fn go_conflicts_report_a_write_the_producer_did_not_model() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func writesThroughAPointerToALocal() int {
+    value := 0
+    cell := &value
+    go func() { *cell = 1 }()
+    return value
+}
+
+func writesTheLocalDirectly() int {
+    value := 0
+    go func() { value = 1 }()
+    return value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("unmodeled memory concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // Go does not lower a store through a pointer dereference and says so, in
+    // a gap naming the capability it fell short of. Nothing consumed that, so
+    // the write simply was not there and the answer read as clean. An omitted
+    // access is not the absence of a race, it is an unasked question.
+    let indirect = conflicts_for("writesThroughAPointerToALocal");
+    assert_ne!(
+        indirect.completion(),
+        CodeQueryCompletion::Complete,
+        "a write the producer did not model must not read as clean: \
+         {indirect:#?}"
+    );
+
+    // The same write spelled directly is modelled, so it stays complete and
+    // proven. The gap is read per procedure, not applied as a blanket doubt.
+    let direct = conflicts_for("writesTheLocalDirectly");
+    assert_eq!(
+        direct.completion(),
+        CodeQueryCompletion::Complete,
+        "{direct:#?}"
+    );
+    let value = find_concurrent_relation(&direct, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{direct:#?}"
+    );
+}
+
+#[test]
+fn go_conflicts_name_one_object_reached_through_a_second_local() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    value int
+}
+
+type plain struct {
+    value int
+}
+
+func racesThroughASecondLocal() int {
+    first := &cell{}
+    second := first
+    go func() { second.value = 1 }()
+    return first.value
+}
+
+func copiesIntoASecondLocal() int {
+    first := plain{}
+    second := first
+    go func() { second.value = 1 }()
+    return first.value
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let conflicts_for = |name: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": name },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("second local concurrent access query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+
+    // One object, reached two ways. The parent reads it as a value and names
+    // the allocation; the closure reaches it through the cell the capture
+    // unions and named the cell, so the pair read as disjoint. A cell written
+    // once may now answer with the reference it holds.
+    let raced = conflicts_for("racesThroughASecondLocal");
+    let value = find_concurrent_relation(&raced, |value| {
+        value.verdict == "conflict" && value.location_kind == "field"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("unordered", "proven", "exhaustive"),
+        "{raced:#?}"
+    );
+
+    // `second := first` on a struct copies the object, so the two locals are
+    // two objects and the closure writes its own. Only an allocation that
+    // yields a reference may be carried onto the cell that stores it.
+    let copied = conflicts_for("copiesIntoASecondLocal");
+    assert!(
+        !copied.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+        )),
+        "assigning a struct to a second local copies it: {copied:#?}"
+    );
+}
+
 #[test]
 fn go_concurrent_access_conflicts_close_summarized_recursive_slices() {
     let project = InlineTestProject::with_language(Language::Go)
@@ -5645,6 +6262,83 @@ func promotedInterproceduralLock() {
     table := &promotedTable{items: map[int]int{}}
     go table.scan()
     table.add()
+}
+
+type guardedFlag struct {
+    lock sync.Mutex
+    flag bool
+}
+
+func (guarded *guardedFlag) set() {
+    guarded.lock.Lock()
+    defer guarded.lock.Unlock()
+    guarded.flag = true
+}
+
+func repeatedFieldMutex() {
+    guarded := &guardedFlag{}
+    for index := 0; index < 2; index++ {
+        go guarded.set()
+    }
+}
+
+// One field mutex reached three ways: from a closure that captures the
+// struct, from the enclosing function directly, and from a method on it.
+// A producer stores the field's declaration only where it can type the
+// receiver, so these three occurrences carry different locators for one
+// field, and every one of them has to compose the same lock identity.
+func closureCapturedFieldMutex() int {
+    guarded := &guardedFlag{}
+    value := 0
+    go func() {
+        guarded.lock.Lock()
+        value = 1
+        guarded.lock.Unlock()
+    }()
+    guarded.lock.Lock()
+    result := value
+    guarded.lock.Unlock()
+    return result
+}
+
+// A goroutine spawned inside a repeated task repeats with it. bbolt's own
+// shape: the test spawns `check()` in a loop, `check()` calls `Tx.Check()`,
+// and `Check()` spawns the body that carries the racing write. The write is
+// in a grandchild task whose own spawn site is not in a loop.
+type counter struct {
+    total int
+}
+
+func (c *counter) bump() {
+    c.total++
+}
+
+func (c *counter) spawnBump() {
+    go c.bump()
+}
+
+func repeatedGrandchild() {
+    c := &counter{}
+    for index := 0; index < 2; index++ {
+        go c.spawnBump()
+    }
+}
+
+// The same field mutex reached only from closures, so no occurrence types
+// either field at its declaration and the two still have to agree, about
+// the lock they take and about the field they write under it.
+func twoClosuresFieldMutex() {
+    guarded := &guardedFlag{}
+    go func() {
+        guarded.lock.Lock()
+        guarded.flag = true
+        guarded.lock.Unlock()
+    }()
+    go func() {
+        guarded.lock.Lock()
+        guarded.flag = false
+        guarded.lock.Unlock()
+    }()
 }
 
 func grouped() int {
@@ -6121,6 +6815,93 @@ func unsupportedOnce() int {
     );
     assert_exact_safe_concurrent_relations(&result, "protected");
 
+    // workerpool's shape: a repeated spawn of a method that guards its write
+    // with a mutex held in a field of the receiver, released by `defer`. Both
+    // halves are load-bearing. The lock is only modeled at all when the
+    // receiver of `guarded.lock.Lock()` types through the field, and the pair
+    // is only protected when the repeated-task self-comparison consults the
+    // locks held rather than assuming none are.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedFieldMutex" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("repeated field-mutex concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{result:#?}"
+    );
+    assert_exact_safe_concurrent_relations(&result, "protected");
+
+    // A goroutine spawned inside a repeated task repeats with it, whatever
+    // its own spawn site looks like. Without that, the grandchild believes it
+    // runs once, its write is never compared against itself, and the race is
+    // reported as nothing at all -- silently, because a task that runs once
+    // has no gap to declare. This is bbolt's shape, reduced.
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedGrandchild" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("repeated grandchild concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| value.verdict == "conflict");
+    assert_eq!(
+        (value.task_relation, value.protection, value.proof),
+        ("repeated", "unprotected", "proven"),
+        "{result:#?}"
+    );
+
+    // One field must compose one identity however it is reached. Each of
+    // these guards its write with the same field mutex, and each reaches it
+    // through a locator the producer anchored differently: at the field's
+    // declaration where it could type the receiver, and at the use where it
+    // could not. Rendering a field step from whichever locator arrived left
+    // the two acquisitions of one lock naming different locks, so the lock
+    // held across the write matched nothing and the write was reported as an
+    // unprotected race.
+    for guarded in ["closureCapturedFieldMutex", "twoClosuresFieldMutex"] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": guarded },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("closure-captured field-mutex concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{guarded}: {result:#?}"
+        );
+        assert_exact_safe_concurrent_relations(&result, "protected");
+    }
+
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
         "match": { "kind": "function", "name": "promotedInterproceduralLock" },
@@ -6463,6 +7244,690 @@ func unsupportedOnce() int {
         "{result:#?}"
     );
     assert_exact_safe_concurrent_relations(&result, "ordered");
+}
+
+/// A closure that captures a parameter or receiver keeps the object that
+/// formal names, and a copy still does not borrow the caller's.
+///
+/// The producer holds a captured formal in a lexical cell, and that cell's
+/// only write is the call that bound the formal: a binding, not a body
+/// statement, so no `MemoryStore` reported it and the cell was left with no
+/// recorded store at all. The cell therefore never joined the formal's class,
+/// carried no identity, and every access reaching through it resolved to
+/// nothing -- silently, because a location with no name is not a gap any step
+/// can report. Recording the binding as the store it is lets the ordinary
+/// written-once rule name the cell.
+///
+/// The three roots here are the whole contract, and the last is what keeps the
+/// fix from buying recall with precision:
+///
+/// - `repeatedCapturedReceiver`: the write is reported through a captured
+///   pointer receiver. The closure is never called and never passed anywhere;
+///   declaring it was enough to lose the receiver.
+/// - `repeatedNoClosure`: the same write with no closure, which was always
+///   reported and must stay so.
+/// - `repeatedValueReceiver`: a *value* receiver copies the struct, so the
+///   callee's write cannot reach the caller's object and must not be
+///   reported. The written-once rule refuses it because a copy's canonical is
+///   not a reference allocation.
+///
+/// A third negative, a parameter the body reassigns, is pre-existing and is
+/// pinned separately in `go_reassigned_parameter_write_is_task_local`.
+///
+/// Found while measuring bbolt's issue-213 endpoint, whose `checkBucket` has
+/// exactly this shape: its closures capture `tx` and `b`. Closing it does not
+/// by itself reach that endpoint, so at least one further cause lies between
+/// `checkBucket` and `Bucket.Cursor`; this one stands on its own evidence.
+#[test]
+fn go_closure_capture_of_a_formal_keeps_its_identity() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "types.go",
+            r#"package main
+
+type counters struct {
+    total int
+}
+
+type inner struct {
+    counters counters
+}
+
+type holder struct {
+    inner *inner
+}
+
+type valueHolder struct {
+    total int
+}
+"#,
+        )
+        .file(
+            "use.go",
+            r#"package main
+
+// The closure is never called and never passed anywhere. Declaring it used to
+// be enough to lose the receiver.
+func (holding *holder) bumpWithUnusedClosure() {
+    holding.inner.counters.total++
+    _ = func() { _ = holding.inner }
+}
+
+func repeatedCapturedReceiver() {
+    holding := &holder{inner: &inner{}}
+    for index := 0; index < 2; index++ {
+        go holding.bumpWithUnusedClosure()
+    }
+}
+
+// The same write through the same receiver, with no closure.
+func (holding *holder) bumpWithoutClosure() {
+    holding.inner.counters.total++
+}
+
+func repeatedNoClosure() {
+    holding := &holder{inner: &inner{}}
+    for index := 0; index < 2; index++ {
+        go holding.bumpWithoutClosure()
+    }
+}
+
+// A value receiver copies the struct, so this write cannot reach the caller's
+// object however the closure captures it.
+func (holding valueHolder) bumpCopy() {
+    holding.total++
+    _ = func() { _ = holding.total }
+}
+
+func repeatedValueReceiver() {
+    holding := valueHolder{}
+    for index := 0; index < 2; index++ {
+        go holding.bumpCopy()
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let conflicts = |root: &str| {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": root },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("captured formal concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let reported = result
+            .results
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.value,
+                    CodeQueryResultValue::ConcurrentAccessConflict { value }
+                        if value.verdict == "conflict"
+                            && value.task_relation == "repeated"
+                            && value.proof == "proven"
+                )
+            })
+            .count();
+        (reported, result)
+    };
+
+    for root in ["repeatedCapturedReceiver", "repeatedNoClosure"] {
+        let (reported, result) = conflicts(root);
+        assert_eq!(reported, 1, "{root} must report its race: {result:#?}");
+    }
+    let (reported, result) = conflicts("repeatedValueReceiver");
+    assert_eq!(
+        reported, 0,
+        "a value receiver writes a copy and must not borrow the caller's identity: {result:#?}"
+    );
+}
+
+/// A write in a procedure the recursion passes through is still reported when
+/// the cycle closes through a callback.
+///
+/// The solver declines to expand a recursive edge and says so with
+/// `RecursiveExpansion`, which sounds like it costs only what is on the cycle.
+/// It used to cost the whole callee: the binding ran before the cycle check,
+/// so the skipped edge still gave the callee's formal a second actual from a
+/// call that was never expanded. The formal then had two conflicting actuals
+/// and lost its identity, discarding the one instantiation that *was*
+/// analyzed and correctly bound.
+///
+/// The three controls are what make the diagnosis specific rather than "the
+/// recursive case is broken":
+///
+/// - `repeatedFlatCallback` passes a callback and does not recurse.
+/// - `repeatedDirectRecursion` recurses, but not through the callback, so the
+///   callee holding the write is not on the cycle.
+/// - `repeatedCallbackRecursion` closes the cycle through the callback, which
+///   is the shape that failed and is bbolt's `checkBucket`.
+#[test]
+fn go_callback_recursion_keeps_the_callee_write() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type tally struct {
+    total int
+}
+
+type box struct {
+    tally *tally
+}
+
+// The callee carries the write and invokes the callback.
+func (b *box) each(visit func()) {
+    b.tally.total++
+    visit()
+}
+
+func (b *box) flat() {
+    b.each(func() {})
+}
+
+func repeatedFlatCallback() {
+    b := &box{tally: &tally{}}
+    for index := 0; index < 2; index++ {
+        go b.flat()
+    }
+}
+
+func (b *box) direct(depth int) {
+    b.each(func() {})
+    if depth > 0 {
+        b.direct(depth - 1)
+    }
+}
+
+func repeatedDirectRecursion() {
+    b := &box{tally: &tally{}}
+    for index := 0; index < 2; index++ {
+        go b.direct(2)
+    }
+}
+
+func (b *box) throughCallback(depth int) {
+    b.each(func() {
+        if depth > 0 {
+            b.throughCallback(depth - 1)
+        }
+    })
+}
+
+func repeatedCallbackRecursion() {
+    b := &box{tally: &tally{}}
+    for index := 0; index < 2; index++ {
+        go b.throughCallback(2)
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for root in [
+        "repeatedFlatCallback",
+        "repeatedDirectRecursion",
+        "repeatedCallbackRecursion",
+    ] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": ["go"],
+            "match": { "kind": "function", "name": root },
+            "steps": [
+                { "op": "procedure_of" },
+                { "op": "concurrent_access_conflicts" }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("callback recursion concurrent access query");
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let reported = result
+            .results
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.value,
+                    CodeQueryResultValue::ConcurrentAccessConflict { value }
+                        if value.verdict == "conflict" && value.task_relation == "repeated"
+                )
+            })
+            .count();
+        assert_eq!(
+            reported, 1,
+            "{root} must report the write in the callee: {result:#?}"
+        );
+    }
+}
+
+/// #2902's heap-identity routes: one object reached two ways is one location,
+/// and two objects reached the same way are not.
+///
+/// This is the paired-near-miss coverage the issue asks for. Each route has a
+/// positive that must report and a negative that must not, so a fix that
+/// buys recall by collapsing distinct allocations fails here rather than
+/// passing quietly.
+///
+/// The `result` and `interface` routes are absent on purpose: they do not hold
+/// today and are pinned separately in
+/// `go_heap_identity_survives_result_and_interface_routes`.
+#[test]
+fn go_heap_identity_survives_parameter_receiver_field_and_closure_routes() {
+    let (_project, workspace) = heap_identity_workspace();
+    // A positive asserts only that the object is recognised as shared. The
+    // number of pairs follows from the access shape -- `c.n++` is a read and a
+    // write, so it pairs twice -- and pinning it would make the test about
+    // that rather than about identity.
+    for route in [
+        "sharedParameter",
+        "sharedReceiver",
+        "sharedField",
+        "sharedClosure",
+    ] {
+        assert!(
+            proven_conflicts(&workspace, route) >= 1,
+            "{route}: one object reached from two tasks is one location"
+        );
+    }
+    for route in [
+        "distinctParameter",
+        "distinctReceiver",
+        "distinctField",
+        "taskLocalAllocation",
+    ] {
+        assert_eq!(
+            proven_conflicts(&workspace, route),
+            0,
+            "{route}: distinct allocations must stay disjoint"
+        );
+    }
+}
+
+/// #2902's container-copy semantics: a slice or map copy keeps its backing
+/// store, and a struct copied by value does not.
+///
+/// The array-copy half of this criterion does not hold today and is pinned in
+/// `go_array_copy_is_distinct_storage`.
+#[test]
+fn go_container_copies_keep_backing_and_value_copies_do_not() {
+    let (_project, workspace) = heap_identity_workspace();
+    for route in ["sliceCopy", "mapCopy", "appendWithinCapacity"] {
+        assert!(
+            proven_conflicts(&workspace, route) >= 1,
+            "{route}: a reference-like copy keeps one backing store"
+        );
+    }
+    assert_eq!(
+        proven_conflicts(&workspace, "structValueCopy"),
+        0,
+        "a struct copied by value has its own field storage"
+    );
+}
+
+/// A Go array copy duplicates the elements, so the two arrays share nothing.
+///
+/// `b := a` on `[4]int` is reported as a proven race between `a[0]` and
+/// `b[0]`. The index selector is compared correctly -- writing `a[1]` and
+/// `b[0]` reports nothing -- so it is the *base* the two copies share, not the
+/// element. The same shape on a slice must keep reporting, and does; that
+/// pairing is what makes this a copy-semantics defect rather than a
+/// container-identity one.
+///
+/// The producer distinguishes the two, marking an array assignment
+/// `TransferKind::AggregateCopy` and a slice or map assignment
+/// `ValueFlowKind::BackingStore`. Three places in the solver carried identity
+/// across the copy anyway, and all three had to stop: the `ValueFlow` and
+/// `Assignment` effects, and the backing store recorded for the cell the copy
+/// is assigned into. Only the last one moved this test, which is why the other
+/// two are not enough on their own.
+///
+/// #2902 acceptance: "Go array copies produce distinct storage while slice and
+/// map copies retain backing identity".
+#[test]
+fn go_array_copy_is_distinct_storage() {
+    let (_project, workspace) = heap_identity_workspace();
+    assert!(
+        proven_conflicts(&workspace, "sliceCopy") >= 1,
+        "the slice pairing must keep reporting"
+    );
+    assert_eq!(
+        proven_conflicts(&workspace, "arrayCopy"),
+        0,
+        "a Go array copy duplicates the elements"
+    );
+}
+
+/// One object stays one location through a call result and through an
+/// interface.
+///
+/// Both routes are listed in #2902's first acceptance criterion, alongside
+/// parameters, receivers, fields and closures, which do hold. Their negatives
+/// pass already, so neither is masked by a blanket refusal: `distinctResult`
+/// correctly reports nothing, and the positives report nothing too.
+///
+/// Owned by #2902.
+#[test]
+#[ignore = "finds real bug: identity is lost through a result and through an interface (#2902)"]
+fn go_heap_identity_survives_result_and_interface_routes() {
+    let (_project, workspace) = heap_identity_workspace();
+    assert_eq!(
+        proven_conflicts(&workspace, "distinctResult"),
+        0,
+        "distinct results stay disjoint"
+    );
+    for route in ["sharedResult", "sharedInterface"] {
+        assert!(
+            proven_conflicts(&workspace, route) >= 1,
+            "{route}: one object reached from two tasks is one location"
+        );
+    }
+}
+
+/// A channel publishes one object to another task.
+///
+/// #2902 asks that "exact channel/container transport can publish an object to
+/// another task without treating every payload as globally aliased". Sending a
+/// pointer and receiving it in a spawned task currently relates nothing, so the
+/// receiver's write and the sender's write are declared disjoint.
+///
+/// Owned by #2902.
+#[test]
+#[ignore = "finds real bug: a channel does not publish its payload's identity (#2902)"]
+fn go_channel_transport_publishes_its_payload() {
+    let (_project, workspace) = heap_identity_workspace();
+    assert!(
+        proven_conflicts(&workspace, "channelPublish") >= 1,
+        "a pointer sent through a channel is the same object on both sides"
+    );
+}
+
+/// Count the proven conflicts a root reports, which is what every heap-identity
+/// route above is asking about.
+fn proven_conflicts(workspace: &WorkspaceAnalyzer, root: &str) -> usize {
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": root },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("heap identity concurrent access query");
+    let result = execute_workspace(
+        workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    result
+        .results
+        .iter()
+        .filter(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict" && value.proof == "proven"
+            )
+        })
+        .count()
+}
+
+/// The project owns the temporary directory the analyzer reads from, so it is
+/// returned with the workspace and must be held for as long as the workspace is
+/// queried. Dropping it first makes every query fail with
+/// `SemanticProviderFailed`, which reads exactly like an analysis gap.
+fn heap_identity_workspace() -> (inline_project::BuiltInlineTestProject, WorkspaceAnalyzer) {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    n int
+}
+
+type wrap struct {
+    c *cell
+}
+
+type valueWrap struct {
+    c cell
+}
+
+type bumper interface {
+    bump()
+}
+
+func (c *cell) bump() { c.n++ }
+
+func viaParam(c *cell) { c.n = 1 }
+
+func sharedParameter() {
+    c := &cell{}
+    go viaParam(c)
+    go viaParam(c)
+}
+
+func distinctParameter() {
+    go viaParam(&cell{})
+    go viaParam(&cell{})
+}
+
+func sharedReceiver() {
+    c := &cell{}
+    go c.bump()
+    go c.bump()
+}
+
+func distinctReceiver() {
+    first := &cell{}
+    second := &cell{}
+    go first.bump()
+    go second.bump()
+}
+
+func sharedField() {
+    w := &wrap{c: &cell{}}
+    go func() { w.c.n = 1 }()
+    go func() { w.c.n = 2 }()
+}
+
+func distinctField() {
+    first := &wrap{c: &cell{}}
+    second := &wrap{c: &cell{}}
+    go func() { first.c.n = 1 }()
+    go func() { second.c.n = 2 }()
+}
+
+func sharedClosure() {
+    c := &cell{}
+    run := func() { c.n = 1 }
+    go run()
+    go func() { c.n = 2 }()
+}
+
+func taskLocalAllocation() {
+    for index := 0; index < 2; index++ {
+        go func() {
+            local := &cell{}
+            local.n = 1
+        }()
+    }
+}
+
+func makeCell() *cell { return &cell{} }
+
+func identity(c *cell) *cell { return c }
+
+func sharedResult() {
+    c := makeCell()
+    d := identity(c)
+    go func() { d.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func distinctResult() {
+    c := makeCell()
+    d := makeCell()
+    go func() { d.n = 1 }()
+    go func() { c.n = 2 }()
+}
+
+func sharedInterface() {
+    c := &cell{}
+    var b bumper = c
+    go b.bump()
+    go c.bump()
+}
+
+func sliceCopy() {
+    s := make([]int, 4)
+    t := s
+    go func() { t[0] = 1 }()
+    go func() { s[0] = 2 }()
+}
+
+func mapCopy() {
+    m := map[int]int{}
+    n := m
+    go func() { n[0] = 1 }()
+    go func() { m[0] = 2 }()
+}
+
+func appendWithinCapacity() {
+    s := make([]int, 1, 8)
+    t := append(s, 1)
+    go func() { t[0] = 1 }()
+    go func() { s[0] = 2 }()
+}
+
+func arrayCopy() {
+    var a [4]int
+    b := a
+    go func() { b[0] = 1 }()
+    go func() { a[0] = 2 }()
+}
+
+func structValueCopy() {
+    v := valueWrap{}
+    w := v
+    go func() { w.c.n = 1 }()
+    go func() { v.c.n = 2 }()
+}
+
+func channelPublish() {
+    ch := make(chan *cell, 1)
+    c := &cell{}
+    ch <- c
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    (project, workspace)
+}
+
+/// A parameter the body reassigns is not the caller's object, and its write
+/// must not be reported against the caller's.
+///
+/// Each spawned instance allocates its own `&holder{}`, so the write reaches a
+/// task-local object and no two instances touch the same one. It is reported
+/// anyway, as a **proven, exhaustive** conflict with no open reason.
+///
+/// This is pre-existing and independent of the captured-formal fix beside it:
+/// it reproduces identically with that fix reverted, because the cell takes
+/// the ordinary written-once path on the body's own store and is named from
+/// the reassignment's fresh allocation rather than being recognised as
+/// task-local.
+///
+/// Found while building the copy-negatives for
+/// `go_closure_capture_of_a_formal_keeps_its_identity`. Owned by #2902.
+#[test]
+#[ignore = "finds real bug: a reassigned parameter's task-local write is reported as a race (#2902)"]
+fn go_reassigned_parameter_write_is_task_local() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type counters struct {
+    total int
+}
+
+type inner struct {
+    counters counters
+}
+
+type holder struct {
+    inner *inner
+}
+
+func (holding *holder) bumpReassigned(other *holder) {
+    other = &holder{inner: &inner{}}
+    other.inner.counters.total++
+}
+
+func repeatedReassignedParameter() {
+    holding := &holder{inner: &inner{}}
+    for index := 0; index < 2; index++ {
+        go holding.bumpReassigned(holding)
+    }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "repeatedReassignedParameter" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("reassigned parameter concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let reported = result
+        .results
+        .iter()
+        .filter(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict" && value.proof == "proven"
+            )
+        })
+        .count();
+    assert_eq!(
+        reported, 0,
+        "each instance allocates its own holder, so the write is task-local: {result:#?}"
+    );
 }
 
 #[test]
@@ -8934,6 +10399,11 @@ fn type_flow_workspace_with_source(
         .file("app.py", source)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    activate_type_flow_builtins(&workspace);
+    (project, workspace)
+}
+
+fn activate_type_flow_builtins(workspace: &WorkspaceAnalyzer) {
     let pack = compile_source(
         SourceFormat::Json,
         TYPE_FLOW_BUILTINS_PACK.as_bytes(),
@@ -8979,7 +10449,6 @@ fn type_flow_workspace_with_source(
         matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
         "builtins fixture pack activates: {activation:#?}"
     );
-    (project, workspace)
 }
 
 fn type_flow_query(root: &str, op: &str) -> serde_json::Value {
@@ -9184,6 +10653,837 @@ fn class_set_and_absent_member_share_one_solve_per_input_procedure() {
 }
 
 #[test]
+fn field_slot_profile_distinguishes_ephemeral_build_and_memory_hit() {
+    let (_project, workspace) = type_flow_workspace();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+
+    let cold = execute_workspace_request(&workspace, &flow_state, &query);
+    let warm = execute_workspace_request(&workspace, &flow_state, &query);
+    let (CodeQueryResponse::Profile(cold), CodeQueryResponse::Profile(warm)) = (cold, warm) else {
+        panic!("profile-mode queries return profiles");
+    };
+    assert_eq!(
+        serde_json::to_value(&cold.result.results).expect("cold rows serialize"),
+        serde_json::to_value(&warm.result.results).expect("warm rows serialize")
+    );
+
+    let cold = cold.work.semantic.type_flow;
+    assert_eq!(cold.field_slot_builds, 1, "{cold:#?}");
+    assert_eq!(cold.field_slot_memory_hits, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_hits, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_misses, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_rejections, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_publications, 0, "{cold:#?}");
+    assert_eq!(cold.root_result_persistence_hits, 0, "{cold:#?}");
+    assert_eq!(cold.root_result_publications, 0, "{cold:#?}");
+    assert_eq!(cold.solves, 1, "{cold:#?}");
+
+    let warm = warm.work.semantic.type_flow;
+    assert_eq!(warm.field_slot_builds, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_memory_hits, 1, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_hits, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_misses, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_rejections, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_publications, 0, "{warm:#?}");
+    assert_eq!(warm.root_result_persistence_hits, 0, "{warm:#?}");
+    assert_eq!(warm.root_result_publications, 0, "{warm:#?}");
+    assert_eq!(warm.solves, 1, "{warm:#?}");
+}
+
+#[test]
+fn field_slot_profile_reopens_persisted_index_without_rebuild_or_republication() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", TYPE_FLOW_PURPOSE_FIXTURE)
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("cold persisted workspace builds");
+    activate_type_flow_builtins(&cold_workspace);
+    let cold = execute_workspace_request(
+        &cold_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    drop(cold_workspace);
+
+    let warm_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("warm persisted workspace builds");
+    activate_type_flow_builtins(&warm_workspace);
+    let warm = execute_workspace_request(
+        &warm_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let (CodeQueryResponse::Profile(cold), CodeQueryResponse::Profile(warm)) = (cold, warm) else {
+        panic!("profile-mode queries return profiles");
+    };
+    assert_eq!(
+        serde_json::to_value(&cold.result.results).expect("cold rows serialize"),
+        serde_json::to_value(&warm.result.results).expect("warm rows serialize"),
+        "persistent field-slot reuse must preserve canonical rows"
+    );
+    for result in [&cold.result, &warm.result] {
+        assert!(
+            result.diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::Cancelled
+                    | CodeQueryDiagnosticCode::SemanticProviderFailed
+            )),
+            "field-slot persistence must not introduce failure diagnostics: {result:#?}"
+        );
+    }
+
+    let cold = cold.work.semantic.type_flow;
+    assert_eq!(cold.field_slot_builds, 1, "{cold:#?}");
+    assert_eq!(cold.field_slot_memory_hits, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_hits, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_misses, 1, "{cold:#?}");
+    assert_eq!(cold.field_slot_persistence_rejections, 0, "{cold:#?}");
+    assert_eq!(cold.field_slot_publications, 1, "{cold:#?}");
+
+    let warm = warm.work.semantic.type_flow;
+    assert_eq!(warm.field_slot_builds, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_memory_hits, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_hits, 1, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_misses, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_persistence_rejections, 0, "{warm:#?}");
+    assert_eq!(warm.field_slot_publications, 0, "{warm:#?}");
+}
+
+#[test]
+fn finding_free_root_result_persistence_reopens_before_discovery_and_serves_both_projections() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", "def normalize():\n    return ''.strip()\n")
+        .build();
+    let branch = json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ]
+    });
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "union": [branch.clone(), branch],
+        "result_detail": "full"
+    }))
+    .expect("combined type-flow profile query");
+
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("cold persisted workspace builds");
+    activate_type_flow_builtins(&cold_workspace);
+    let cold = execute_workspace_request(
+        &cold_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let cold_store_snapshot = cold_workspace
+        .store()
+        .expect("persisted workspace has a store")
+        .class_set_root_result_store_snapshot_for_test()
+        .expect("cold root-result store snapshot");
+    assert_eq!(cold_store_snapshot.generations.len(), 1);
+    assert_eq!(cold_store_snapshot.results.len(), 1);
+    assert!(!cold_store_snapshot.results[0].result.rows.is_empty());
+    drop(cold_workspace);
+
+    let warm_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("warm persisted workspace builds");
+    activate_type_flow_builtins(&warm_workspace);
+    assert_eq!(
+        warm_workspace
+            .store()
+            .expect("persisted workspace has a store")
+            .class_set_root_result_store_snapshot_for_test()
+            .expect("pre-hit root-result store snapshot"),
+        cold_store_snapshot
+    );
+    let warm = execute_workspace_request(
+        &warm_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let absent_query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("absent-member profile query");
+    let warm_absent = execute_workspace_request(
+        &warm_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &absent_query,
+    );
+    assert_eq!(
+        warm_workspace
+            .store()
+            .expect("persisted workspace has a store")
+            .class_set_root_result_store_snapshot_for_test()
+            .expect("post-hit root-result store snapshot"),
+        cold_store_snapshot,
+        "durable hits must not mutate rows or published_at"
+    );
+    let (CodeQueryResponse::Profile(cold), CodeQueryResponse::Profile(warm)) = (cold, warm) else {
+        panic!("profile-mode queries return profiles");
+    };
+    let CodeQueryResponse::Profile(warm_absent) = warm_absent else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert!(
+        cold.result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ClassSetRow { value }
+                if value.class.as_deref() == Some("builtins.str")
+                    && value.origin == "external"
+                    && value.status == "known"
+        )),
+        "the cold solve must publish a nonempty known external projection: {cold:#?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&cold.result.results).expect("cold rows serialize"),
+        serde_json::to_value(&warm.result.results).expect("warm rows serialize"),
+        "durable rows retain IDs, ordering, classes, reasons, status, and source ranges"
+    );
+    assert_eq!(
+        serde_json::to_value(&cold.result.diagnostics).expect("cold diagnostics serialize"),
+        serde_json::to_value(&warm.result.diagnostics).expect("warm diagnostics serialize")
+    );
+
+    let cold = cold.work.semantic.type_flow;
+    assert_eq!(cold.root_result_persistence_hits, 0, "{cold:#?}");
+    assert_eq!(cold.root_result_persistence_misses, 1, "{cold:#?}");
+    assert_eq!(cold.root_result_persistence_rejections, 0, "{cold:#?}");
+    assert_eq!(cold.root_result_store_failures, 0, "{cold:#?}");
+    assert_eq!(cold.root_result_publications, 1, "{cold:#?}");
+    assert_eq!(cold.solves, 1, "{cold:#?}");
+    assert_eq!(cold.cache_hits, 1, "{cold:#?}");
+    assert_eq!(cold.finding_rows, 0, "{cold:#?}");
+
+    let warm = warm.work.semantic.type_flow;
+    assert_eq!(warm.root_result_persistence_hits, 1, "{warm:#?}");
+    assert_eq!(warm.root_result_persistence_misses, 0, "{warm:#?}");
+    assert_eq!(warm.root_result_persistence_rejections, 0, "{warm:#?}");
+    assert_eq!(warm.root_result_store_failures, 0, "{warm:#?}");
+    assert_eq!(warm.root_result_publications, 0, "{warm:#?}");
+    assert_eq!(warm.solves, 0, "{warm:#?}");
+    assert_eq!(warm.cache_hits, 1, "{warm:#?}");
+    assert_eq!(warm.snapshot_cache_hits, 0, "{warm:#?}");
+    assert_eq!(warm.snapshot_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.dispatch_cache_hits, 0, "{warm:#?}");
+    assert_eq!(warm.dispatch_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.binding_cache_hits, 0, "{warm:#?}");
+    assert_eq!(warm.binding_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.summary_cache_hits, 0, "{warm:#?}");
+    assert_eq!(warm.summary_cache_misses, 0, "{warm:#?}");
+    assert_eq!(warm.root_summary_cache_hits, 0, "{warm:#?}");
+    assert_eq!(warm.root_summary_observation_rejections, 0, "{warm:#?}");
+    assert_eq!(warm.published_summaries, 0, "{warm:#?}");
+    assert!(warm.summary_profile.is_empty(), "{warm:#?}");
+    assert_eq!(warm.class_set_rows, cold.class_set_rows, "{warm:#?}");
+    assert!(warm.class_set_rows > 0, "{warm:#?}");
+    assert_eq!(warm.finding_rows, 0, "{warm:#?}");
+
+    assert!(warm_absent.result.results.is_empty(), "{warm_absent:#?}");
+    let warm_absent = warm_absent.work.semantic.type_flow;
+    assert_eq!(
+        warm_absent.root_result_persistence_hits, 1,
+        "{warm_absent:#?}"
+    );
+    assert_eq!(warm_absent.solves, 0, "{warm_absent:#?}");
+    assert_eq!(warm_absent.finding_rows, 0, "{warm_absent:#?}");
+}
+
+#[test]
+fn finding_free_root_result_persistence_preserves_multiple_unknown_reason_order() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file(
+            "app.py",
+            "def commit(message, marker):\n    return message.split(marker)[0].rstrip()\n",
+        )
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "commit" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set profile query");
+
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace builds");
+        activate_type_flow_builtins(&workspace);
+        let response = execute_workspace_request(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let CodeQueryResponse::Profile(profile) = response else {
+            panic!("profile-mode query returns a profile");
+        };
+        runs.push(profile);
+    }
+    let origins = |profile: &CodeQueryProfile| {
+        profile
+            .result
+            .results
+            .iter()
+            .map(|item| {
+                let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                    panic!("class_set returns typed rows: {item:#?}");
+                };
+                value.origin.clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        origins(&runs[0]),
+        vec![
+            "unknown:root_parameter".to_string(),
+            "unknown:unmodeled_load".to_string(),
+        ],
+        "the root receiver and indexed element retain independent Unknown reasons; \
+         an indexed load does not inherit the split call's container classification"
+    );
+    assert_eq!(
+        serde_json::to_value(&runs[0].result.results).unwrap(),
+        serde_json::to_value(&runs[1].result.results).unwrap(),
+        "cold projection and store canonicalization use one atom order"
+    );
+    assert_eq!(
+        runs[0].work.semantic.type_flow.root_result_publications, 1,
+        "{:#?}",
+        runs[0]
+    );
+    assert_eq!(
+        runs[1].work.semantic.type_flow.root_result_persistence_hits, 1,
+        "{:#?}",
+        runs[1]
+    );
+    assert_eq!(runs[1].work.semantic.type_flow.solves, 0, "{:#?}", runs[1]);
+}
+
+#[test]
+fn root_result_persistence_misses_when_non_root_workspace_content_changes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", "def normalize():\n    return ''.strip()\n")
+        .file("sibling.py", "VALUE = 1\n")
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set profile query");
+
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("cold persisted workspace builds");
+    activate_type_flow_builtins(&cold_workspace);
+    let cold = execute_workspace_request(
+        &cold_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(cold) = cold else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        cold.work.semantic.type_flow.root_result_publications, 1,
+        "{cold:#?}"
+    );
+    let expected = serde_json::to_value(&cold.result.results).expect("cold rows serialize");
+    let before = cold_workspace
+        .store()
+        .expect("persisted workspace has a store")
+        .class_set_root_result_store_snapshot_for_test()
+        .expect("cold root-result snapshot");
+    assert_eq!(before.results.len(), 1);
+    drop(cold_workspace);
+
+    project
+        .file("sibling.py")
+        .write("VALUE = 2\n")
+        .expect("edit non-root file");
+    project.commit("change sibling only");
+    let changed_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("changed persisted workspace builds");
+    activate_type_flow_builtins(&changed_workspace);
+    let changed = execute_workspace_request(
+        &changed_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(changed) = changed else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        serde_json::to_value(&changed.result.results).unwrap(),
+        expected,
+        "a non-root edit rotates the generation without changing the root projection"
+    );
+    let changed_work = changed.work.semantic.type_flow;
+    assert_eq!(
+        changed_work.root_result_persistence_hits, 0,
+        "{changed_work:#?}"
+    );
+    assert_eq!(
+        changed_work.root_result_persistence_misses, 1,
+        "{changed_work:#?}"
+    );
+    assert_eq!(
+        changed_work.root_result_publications, 1,
+        "{changed_work:#?}"
+    );
+    assert_eq!(changed_work.solves, 1, "{changed_work:#?}");
+
+    let after = changed_workspace
+        .store()
+        .expect("persisted workspace has a store")
+        .class_set_root_result_store_snapshot_for_test()
+        .expect("changed root-result snapshot");
+    assert_eq!(after.generations.len(), 2);
+    assert_eq!(after.results.len(), 2);
+    assert_eq!(
+        after.results[0].result.key.root_public_digest,
+        after.results[1].result.key.root_public_digest,
+        "the unchanged root keeps its public identity"
+    );
+    assert_ne!(
+        after.results[0]
+            .result
+            .key
+            .generation
+            .workspace_content_digest,
+        after.results[1]
+            .result
+            .key
+            .generation
+            .workspace_content_digest,
+        "the sibling edit rotates the whole-workspace generation"
+    );
+}
+
+#[test]
+fn zero_row_finding_free_root_result_persistence_reopens_as_a_hit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", "def idle():\n    return 1\n")
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "idle" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set profile query");
+
+    let mut work = Vec::new();
+    for _ in 0..2 {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace builds");
+        activate_type_flow_builtins(&workspace);
+        let response = execute_workspace_request(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let CodeQueryResponse::Profile(profile) = response else {
+            panic!("profile-mode query returns a profile");
+        };
+        assert!(profile.result.results.is_empty(), "{profile:#?}");
+        work.push(profile.work.semantic.type_flow);
+    }
+    assert_eq!(work[0].root_result_publications, 1, "{:#?}", work[0]);
+    assert_eq!(work[0].solves, 1, "{:#?}", work[0]);
+    assert_eq!(work[1].root_result_persistence_hits, 1, "{:#?}", work[1]);
+    assert_eq!(work[1].solves, 0, "{:#?}", work[1]);
+}
+
+#[test]
+fn finding_bearing_root_result_persistence_never_publishes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", TYPE_FLOW_PURPOSE_FIXTURE)
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("absent-member profile query");
+
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace builds");
+        activate_type_flow_builtins(&workspace);
+        let response = execute_workspace_request(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let CodeQueryResponse::Profile(profile) = response else {
+            panic!("profile-mode query returns a profile");
+        };
+        runs.push(profile);
+    }
+    assert_eq!(
+        serde_json::to_value(&runs[0].result.results).unwrap(),
+        serde_json::to_value(&runs[1].result.results).unwrap()
+    );
+    for run in runs {
+        let work = run.work.semantic.type_flow;
+        assert_eq!(work.root_result_persistence_hits, 0, "{work:#?}");
+        assert_eq!(work.root_result_persistence_misses, 1, "{work:#?}");
+        assert_eq!(work.root_result_publications, 0, "{work:#?}");
+        assert_eq!(work.solves, 1, "{work:#?}");
+        assert_eq!(work.finding_rows, 1, "{work:#?}");
+    }
+}
+
+#[test]
+fn root_result_persistence_store_failure_falls_back_without_mutating_durable_rows() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", TYPE_FLOW_PURPOSE_FIXTURE)
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set profile query");
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("cold persisted workspace builds");
+    activate_type_flow_builtins(&cold_workspace);
+    let cold = execute_workspace_request(
+        &cold_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(cold) = cold else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        cold.work.semantic.type_flow.root_result_publications, 1,
+        "{cold:#?}"
+    );
+    drop(cold_workspace);
+
+    let warm_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("warm persisted workspace builds");
+    activate_type_flow_builtins(&warm_workspace);
+    let store = warm_workspace
+        .store()
+        .expect("persisted workspace has a store");
+    store.set_class_set_root_result_operational_failure_for_test(true);
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let fallback = execute_workspace_request(&warm_workspace, &flow_state, &query);
+    let CodeQueryResponse::Profile(fallback) = fallback else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        serde_json::to_value(&cold.result.results).unwrap(),
+        serde_json::to_value(&fallback.result.results).unwrap(),
+        "an operational store failure falls back to the ordinary exact solve"
+    );
+    assert!(
+        fallback
+            .result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !matches!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::Cancelled
+                    | CodeQueryDiagnosticCode::SemanticProviderFailed
+            ))
+    );
+    let fallback_work = fallback.work.semantic.type_flow;
+    assert_eq!(
+        fallback_work.root_result_store_failures, 1,
+        "{fallback_work:#?}"
+    );
+    assert_eq!(
+        fallback_work.root_result_persistence_hits, 0,
+        "{fallback_work:#?}"
+    );
+    assert_eq!(
+        fallback_work.root_result_publications, 0,
+        "{fallback_work:#?}"
+    );
+    assert_eq!(fallback_work.solves, 1, "{fallback_work:#?}");
+
+    store.set_class_set_root_result_operational_failure_for_test(false);
+    let recovered = execute_workspace_request(&warm_workspace, &flow_state, &query);
+    let CodeQueryResponse::Profile(recovered) = recovered else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        serde_json::to_value(&cold.result.results).unwrap(),
+        serde_json::to_value(&recovered.result.results).unwrap()
+    );
+    let recovered = recovered.work.semantic.type_flow;
+    assert_eq!(recovered.root_result_persistence_hits, 1, "{recovered:#?}");
+    assert_eq!(recovered.root_result_store_failures, 0, "{recovered:#?}");
+    assert_eq!(recovered.root_result_publications, 0, "{recovered:#?}");
+    assert_eq!(recovered.solves, 0, "{recovered:#?}");
+}
+
+#[test]
+fn root_result_persistence_corrupt_and_overcap_rows_fall_back_and_repair_atomically() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", "def normalize():\n    return ''.strip()\n")
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set profile query");
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted workspace builds");
+    activate_type_flow_builtins(&workspace);
+    let run = || {
+        let response = execute_workspace_request(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        let CodeQueryResponse::Profile(profile) = response else {
+            panic!("profile-mode query returns a profile");
+        };
+        profile
+    };
+
+    let cold = run();
+    assert_eq!(
+        cold.work.semantic.type_flow.root_result_publications, 1,
+        "{cold:#?}"
+    );
+    let expected = serde_json::to_value(&cold.result.results).expect("cold rows serialize");
+    let store = workspace.store().expect("persisted workspace has a store");
+
+    store
+        .corrupt_only_class_set_root_result_content_digest_for_test()
+        .expect("corrupt sole retained digest");
+    let corrupt = run();
+    assert_eq!(
+        serde_json::to_value(&corrupt.result.results).unwrap(),
+        expected
+    );
+    let corrupt_work = corrupt.work.semantic.type_flow;
+    assert_eq!(
+        corrupt_work.root_result_persistence_rejections, 1,
+        "{corrupt_work:#?}"
+    );
+    assert_eq!(
+        corrupt_work.root_result_store_failures, 0,
+        "{corrupt_work:#?}"
+    );
+    assert_eq!(
+        corrupt_work.root_result_publications, 1,
+        "{corrupt_work:#?}"
+    );
+    assert_eq!(corrupt_work.solves, 1, "{corrupt_work:#?}");
+
+    store
+        .oversize_only_class_set_root_result_row_count_for_test()
+        .expect("oversize sole retained row count");
+    let overcap = run();
+    assert_eq!(
+        serde_json::to_value(&overcap.result.results).unwrap(),
+        expected
+    );
+    let overcap_work = overcap.work.semantic.type_flow;
+    assert_eq!(
+        overcap_work.root_result_persistence_rejections, 1,
+        "{overcap_work:#?}"
+    );
+    assert_eq!(
+        overcap_work.root_result_store_failures, 0,
+        "{overcap_work:#?}"
+    );
+    assert_eq!(
+        overcap_work.root_result_publications, 1,
+        "{overcap_work:#?}"
+    );
+    assert_eq!(overcap_work.solves, 1, "{overcap_work:#?}");
+
+    let recovered = run();
+    assert_eq!(
+        serde_json::to_value(&recovered.result.results).unwrap(),
+        expected
+    );
+    let recovered = recovered.work.semantic.type_flow;
+    assert_eq!(recovered.root_result_persistence_hits, 1, "{recovered:#?}");
+    assert_eq!(recovered.root_result_publications, 0, "{recovered:#?}");
+    assert_eq!(recovered.solves, 0, "{recovered:#?}");
+}
+
+#[test]
+fn field_slot_store_failure_falls_back_without_publishing_a_memory_hit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .with_git()
+        .file("app.py", TYPE_FLOW_PURPOSE_FIXTURE)
+        .build();
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("cold persisted workspace builds");
+    activate_type_flow_builtins(&cold_workspace);
+    let cold = execute_workspace_request(
+        &cold_workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let CodeQueryResponse::Profile(cold) = cold else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        cold.work.semantic.type_flow.field_slot_publications, 1,
+        "{cold:#?}"
+    );
+    drop(cold_workspace);
+
+    let warm_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("warm persisted workspace builds");
+    activate_type_flow_builtins(&warm_workspace);
+    let store = warm_workspace
+        .store()
+        .expect("persisted workspace has a store");
+    store.set_class_set_field_slot_operational_failure_for_test(true);
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let failed_store = execute_workspace_request(&warm_workspace, &flow_state, &query);
+    let CodeQueryResponse::Profile(failed_store) = failed_store else {
+        panic!("profile-mode query returns a profile");
+    };
+    let failed_work = failed_store.work.semantic.type_flow;
+    assert_eq!(failed_work.field_slot_builds, 1, "{failed_work:#?}");
+    assert_eq!(failed_work.field_slot_memory_hits, 0, "{failed_work:#?}");
+    assert_eq!(
+        failed_work.field_slot_persistence_hits, 0,
+        "{failed_work:#?}"
+    );
+    assert_eq!(
+        failed_work.field_slot_persistence_misses, 0,
+        "{failed_work:#?}"
+    );
+    assert_eq!(
+        failed_work.field_slot_persistence_rejections, 0,
+        "an operational failure is not rejected persisted evidence: {failed_work:#?}"
+    );
+    assert_eq!(failed_work.field_slot_publications, 0, "{failed_work:#?}");
+    store.set_class_set_field_slot_operational_failure_for_test(false);
+    let recovered = execute_workspace_request(&warm_workspace, &flow_state, &query);
+    let CodeQueryResponse::Profile(recovered) = recovered else {
+        panic!("profile-mode query returns a profile");
+    };
+    assert_eq!(
+        serde_json::to_value(&failed_store.result.results).expect("fallback rows serialize"),
+        serde_json::to_value(&recovered.result.results).expect("recovered rows serialize")
+    );
+    let recovered = recovered.work.semantic.type_flow;
+    assert_eq!(recovered.field_slot_builds, 0, "{recovered:#?}");
+    assert_eq!(recovered.field_slot_memory_hits, 0, "{recovered:#?}");
+    assert_eq!(
+        recovered.field_slot_persistence_hits, 1,
+        "a failed durable acquisition must not leave a ready memory value: {recovered:#?}"
+    );
+    assert_eq!(recovered.field_slot_persistence_misses, 0, "{recovered:#?}");
+    assert_eq!(
+        recovered.field_slot_persistence_rejections, 0,
+        "{recovered:#?}"
+    );
+    assert_eq!(recovered.field_slot_publications, 0, "{recovered:#?}");
+}
+
+#[test]
 fn class_set_reuses_provider_acquisition_across_queries_without_changing_rows() {
     let (_project, workspace) = type_flow_workspace();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
@@ -9253,6 +11553,109 @@ fn class_set_reports_unsupported_languages() {
             diagnostic.code == CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
         }),
         "{result:#?}"
+    );
+}
+
+const PYTHON_ABSENT_MEMBER_CAPABILITY_MESSAGE: &str =
+    "python absent-member analysis requires an active Python declaration surface";
+
+fn has_python_absent_member_capability_diagnostic(result: &CodeQueryResult) -> bool {
+    result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+            && diagnostic.message == PYTHON_ABSENT_MEMBER_CAPABILITY_MESSAGE
+    })
+}
+
+#[test]
+fn python_absent_member_without_procedures_reports_the_missing_declaration_surface() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "value = 1\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "missing" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ]
+    }))
+    .expect("absent-member query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+
+    assert!(
+        result.results.is_empty(),
+        "no procedures exist: {result:#?}"
+    );
+    assert!(
+        has_python_absent_member_capability_diagnostic(&result),
+        "an empty Python file selection must still name the missing declaration surface: {result:#?}"
+    );
+}
+
+#[test]
+fn php_absent_member_query_in_a_mixed_workspace_does_not_report_python_pack_missing() {
+    let project = InlineTestProject::new()
+        .file("app.py", "def python_only():\n    return 1\n")
+        .file("app.php", "<?php\nfunction php_only() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["php"],
+        "match": { "kind": "function", "name": "php_only" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ]
+    }))
+    .expect("PHP absent-member query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+
+    assert!(
+        !has_python_absent_member_capability_diagnostic(&result),
+        "a PHP-only query must not report the Python declaration surface as missing: {result:#?}"
+    );
+}
+
+#[test]
+fn python_occurrence_target_to_procedure_does_not_bypass_absent_member_capability_gate() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            "def normalize(x):\n    return x.strip()\n\ndef read_config():\n    return normalize(123)\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["python"],
+        "occurrences": { "class": "reference" },
+        "steps": [
+            { "op": "occurrence_target" },
+            { "op": "procedure_of" },
+            { "op": "absent_member" }
+        ]
+    }))
+    .expect("occurrence-target absent-member query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+
+    assert!(
+        has_python_absent_member_capability_diagnostic(&result),
+        "an occurrence-target -> declaration -> procedure route must use the same Python gate: {result:#?}"
     );
 }
 

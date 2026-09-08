@@ -259,7 +259,7 @@ fn route_summary_targets_with_cancellation(
         // path cannot itself collide with a directory (a path cannot be both
         // on a real filesystem), so this reordering cannot regress plain file
         // targets.
-        if let Some(directory) = directory_listing_root(target)
+        if let Some(directory) = workspace_directory_path(target)
             && analyzer.project().has_directory(&directory)
             && let Some(listing) = directory_listing(
                 // `all_files_shared` hands back the project's own cached listing
@@ -348,22 +348,6 @@ fn route_summary_targets_with_cancellation(
     }
 }
 
-/// The workspace-relative directory `target` would list, if any: the empty
-/// path for the workspace root, `None` for spellings that cannot name a
-/// workspace directory at all (absolute, root-anchored, or `..`-escaping).
-///
-/// Split out of [`directory_listing`] so the cheap "is this even a directory?"
-/// pre-check and the listing itself normalize the target identically.
-pub(super) fn directory_listing_root(target: &str) -> Option<PathBuf> {
-    let normalized = normalize_pattern(target.trim());
-    let normalized = normalized.trim_end_matches('/');
-    if normalized.is_empty() || normalized == "." {
-        Some(PathBuf::new())
-    } else {
-        workspace_rel_path(normalized)
-    }
-}
-
 pub(super) fn directory_listing(
     files: &BTreeSet<ProjectFile>,
     target: &str,
@@ -373,7 +357,7 @@ pub(super) fn directory_listing(
     // walk that produced `files` (`project::collect_workspace_files`) and from
     // the git-status subprocess inside it (`gitblob::dirty_worktree_paths`).
     let _scope = profiling::scope("searchtools::directory_listing");
-    let directory = directory_listing_root(target)?;
+    let directory = workspace_directory_path(target)?;
 
     let mut entries_by_path = HashMap::default();
     for file in files {

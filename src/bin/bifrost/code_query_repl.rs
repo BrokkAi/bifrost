@@ -1199,6 +1199,44 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.witness_steps == 1 { "" } else { "s" },
                     ));
                 }
+                CodeQueryResultValue::AbsentMemberWitness { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({} steps; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "absent member witness:",
+                            use_color
+                        ),
+                        sanitize_terminal_text(&value.finding_id),
+                        value.steps.len(),
+                        value.witness_status.as_str(),
+                    ));
+                    if let Some(reason) = &value.unavailable_reason {
+                        out.push_str(&format!("  {}\n", sanitize_terminal_text(reason)));
+                    }
+                    for step in &value.steps {
+                        out.push_str(&format!(
+                            "  {:?}: {}:{}:{}",
+                            step.kind,
+                            sanitize_terminal_text(&step.source.path),
+                            step.source.range.start_line,
+                            step.source.range.start_column,
+                        ));
+                        if let Some(target) = &step.target {
+                            out.push_str(&format!(
+                                " -> {}:{}:{}",
+                                sanitize_terminal_text(&target.path),
+                                target.range.start_line,
+                                target.range.start_column,
+                            ));
+                        }
+                        out.push('\n');
+                    }
+                }
                 CodeQueryResultValue::FlowEndpoint { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let id = sanitize_terminal_text(&value.id);

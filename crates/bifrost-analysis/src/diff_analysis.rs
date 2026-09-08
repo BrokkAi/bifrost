@@ -645,7 +645,11 @@ impl PreparedDiff {
             self.shared_cache(),
         )?;
         let analyzer = build_revision_analyzer(&image, self.shared_cache())?;
-        Ok(EndpointAnalysis { analyzer, image })
+        Ok(EndpointAnalysis {
+            analyzer,
+            image,
+            _owner: repository._temp.as_ref().map(Arc::clone),
+        })
     }
 
     /// Materialize the source and dependency-input files that can contribute
@@ -912,11 +916,18 @@ fn analyze_prepared_symbol_changes_from_images(
 pub(crate) struct EndpointAnalysis {
     analyzer: RevisionAnalyzer,
     image: RevisionImage,
+    /// Keeps the private bare repository backing an immutable image alive when
+    /// the endpoint outlives its [`PreparedDiff`].
+    _owner: Option<Arc<RevisionTempDir>>,
 }
 
 impl EndpointAnalysis {
     pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
         self.analyzer.analyzer()
+    }
+
+    pub(crate) fn workspace(&self) -> &WorkspaceAnalyzer {
+        self.analyzer.workspace()
     }
 
     /// Directory the endpoint's files live in: a private export for a committed
@@ -969,6 +980,52 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
             prepared.shared_cache(),
         )?
     };
+    analyze_prepared_diff_from_images(
+        prepared,
+        include_tests,
+        base_image,
+        target_image,
+        changed_paths,
+    )
+}
+
+pub(crate) fn analyze_prepared_diff_with_target_image(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+    whole_target: &EndpointAnalysis,
+) -> Result<AnalyzedDiff, String> {
+    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
+    let base_repository = prepared.repository_for(prepared.base);
+    let base_image = {
+        let _scope = profiling::scope("diff_exact.materialize_base");
+        RevisionImage::materialize(
+            &base_repository.repo,
+            prepared.base,
+            Some(&base_paths),
+            &base_repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )?
+    };
+    let target_image = {
+        let _scope = profiling::scope("diff_exact.materialize_target_scope");
+        materialize_target_scope_from_whole_image(prepared, whole_target, &target_paths)?
+    };
+    analyze_prepared_diff_from_images(
+        prepared,
+        include_tests,
+        base_image,
+        target_image,
+        changed_paths,
+    )
+}
+
+fn analyze_prepared_diff_from_images(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+    base_image: RevisionImage,
+    target_image: RevisionImage,
+    changed_paths: Vec<String>,
+) -> Result<AnalyzedDiff, String> {
     let PreparedSymbolChanges {
         symbol_changes,
         context,
@@ -1006,20 +1063,28 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
         target_analyzer.analyzer(),
         &changed_paths,
     );
-    let graph_before = usage_graph(
-        base_analyzer.analyzer(),
-        UsageGraphParams {
-            include_tests,
-            paths: Some(changed_paths.clone()),
-            depth: 1,
+    // Parsing is serialized by the shared-store build lock. Once both
+    // analyzers exist, their independent query work can share the query pool.
+    let (graph_before, graph_after) = rayon::join(
+        || {
+            usage_graph(
+                base_analyzer.analyzer(),
+                UsageGraphParams {
+                    include_tests,
+                    paths: Some(changed_paths.clone()),
+                    depth: 1,
+                },
+            )
         },
-    );
-    let graph_after = usage_graph(
-        target_analyzer.analyzer(),
-        UsageGraphParams {
-            include_tests,
-            paths: Some(changed_paths),
-            depth: 1,
+        || {
+            usage_graph(
+                target_analyzer.analyzer(),
+                UsageGraphParams {
+                    include_tests,
+                    paths: Some(changed_paths.clone()),
+                    depth: 1,
+                },
+            )
         },
     );
     let CallEdgeDiff {
@@ -1106,10 +1171,12 @@ pub(crate) fn analyze_prepared_diff_with_endpoints(
         base: EndpointAnalysis {
             analyzer: base_analyzer,
             image: base_image,
+            _owner: None,
         },
         target: EndpointAnalysis {
             analyzer: target_analyzer,
             image: target_image,
+            _owner: None,
         },
     })
 }
@@ -1122,7 +1189,7 @@ struct DiffRepository {
     alternate_object_dirs: Vec<PathBuf>,
     // Must outlive `repo`: it owns the private bare repository backing an
     // immutable comparison.
-    _temp: Option<RevisionTempDir>,
+    _temp: Option<Arc<RevisionTempDir>>,
 }
 
 fn open_repository(
@@ -1134,7 +1201,7 @@ fn open_repository(
         let discovered = Repository::open(root)
             .map_err(|err| format!("not a git repository at project root: {err}"))?;
         let source_objects = discovered.commondir().join("objects");
-        let temp = RevisionTempDir::new("immutable-odb")?;
+        let temp = Arc::new(RevisionTempDir::new("immutable-odb")?);
         let repo = Repository::init_bare(temp.path()).map_err(|err| {
             format!(
                 "unable to create isolated immutable diff repository {}: {err}",
@@ -1358,6 +1425,10 @@ pub(crate) enum RevisionImage {
         /// byte: the export directory holds no Git repository, so nothing there
         /// can tell the analyzer what these files are.
         blobs: Arc<RevisionBlobIdentities>,
+        /// Blob ids for files represented only by empty placeholders. Files
+        /// materialized with their real bytes are read from disk instead of
+        /// reopening an external alternate ODB, which loses them on Windows.
+        object_blobs: Arc<RevisionBlobIdentities>,
         /// Serves the bytes of any named file the export did not write.
         objects: Arc<RevisionObjectDatabase>,
     },
@@ -1387,13 +1458,15 @@ impl RevisionImage {
             .map(|(path, _)| path.clone())
             .collect();
         let objects = RevisionObjectDatabase::new(repo, alternate_object_dirs);
-        if let Some((_, oid)) = named_only.first().or_else(|| written.first()) {
+        if let Some((_, oid)) = named_only.first() {
             objects.probe(*oid)?;
         }
+        let object_blobs = Arc::new(RevisionBlobIdentities::new(Vec::new(), named_only.clone()));
         Ok(Self::Snapshot {
             temp,
             files,
             blobs: Arc::new(RevisionBlobIdentities::new(written, named_only)),
+            object_blobs,
             objects: Arc::new(objects),
         })
     }
@@ -1569,11 +1642,17 @@ impl RevisionImage {
     fn project(&self) -> (Arc<dyn Project>, Option<Arc<RevisionBlobIdentities>>) {
         let files = FileSetProject::new(self.root().to_path_buf(), self.files().iter().cloned());
         match self {
-            Self::Snapshot { blobs, objects, .. } => (
+            Self::Snapshot {
+                blobs,
+                object_blobs,
+                objects,
+                ..
+            } => (
                 Arc::new(RevisionImageProject {
                     files,
                     objects: Arc::clone(objects),
                     blobs: Arc::clone(blobs),
+                    object_blobs: Arc::clone(object_blobs),
                     bifrost_ignore: OnceLock::new(),
                 }),
                 Some(Arc::clone(blobs)),
@@ -1581,6 +1660,77 @@ impl RevisionImage {
             Self::Worktree { .. } => (Arc::new(files), None),
         }
     }
+
+    fn hardlink_subset(whole: &Self, temp: RevisionTempDir, linked: Vec<(PathBuf, Oid)>) -> Self {
+        let Self::Snapshot { objects, .. } = whole else {
+            unreachable!("a scoped target image requires an immutable whole image");
+        };
+        let files = linked.iter().map(|(path, _)| path.clone()).collect();
+        Self::Snapshot {
+            temp,
+            files,
+            blobs: Arc::new(RevisionBlobIdentities::new(linked, Vec::new())),
+            object_blobs: Arc::new(RevisionBlobIdentities::new(Vec::new(), Vec::new())),
+            objects: Arc::clone(objects),
+        }
+    }
+}
+
+fn materialize_target_scope_from_whole_image(
+    prepared: &PreparedDiff,
+    whole_target: &EndpointAnalysis,
+    target_paths: &[String],
+) -> Result<RevisionImage, String> {
+    let target_repository = prepared.repository_for(prepared.target);
+    let tree = snapshot_tree(&target_repository.repo, prepared.target)?;
+    let temp = RevisionTempDir::new("target-scope")?;
+    let root = temp.path().to_path_buf();
+    let whole_root = whole_target.root().to_path_buf();
+    let whole_blobs = match &whole_target.image {
+        RevisionImage::Snapshot { blobs, .. } => Arc::clone(blobs),
+        RevisionImage::Worktree { .. } => {
+            unreachable!("a scoped target image requires an immutable whole image")
+        }
+    };
+    let linked = export_snapshot_files_from_tree(
+        &target_repository.repo,
+        &tree,
+        &root,
+        target_paths,
+        prepared.shared_cache(),
+        |rel, oid| {
+            let source = whole_root.join(rel);
+            let metadata = fs::symlink_metadata(&source).unwrap_or_else(|error| {
+                panic!(
+                    "whole target image is missing exported file {}: {error}",
+                    rel.display()
+                )
+            });
+            assert!(
+                metadata.file_type().is_file(),
+                "whole target image exported a non-file path {}",
+                rel.display()
+            );
+            let whole_file = ProjectFile::new(whole_root.clone(), rel.to_path_buf());
+            assert_eq!(
+                whole_blobs.oid_for(&whole_file),
+                Some(oid),
+                "whole target image file {} does not match requested target blob",
+                rel.display()
+            );
+            fs::hard_link(&source, root.join(rel)).map_err(|error| {
+                format!(
+                    "unable to hardlink whole target file {} into scoped image: {error}",
+                    rel.display()
+                )
+            })
+        },
+    )?;
+    Ok(RevisionImage::hardlink_subset(
+        &whole_target.image,
+        temp,
+        linked,
+    ))
 }
 
 /// A complete private on-disk export of one committed revision's workspace
@@ -2469,14 +2619,14 @@ impl RevisionObjectDatabase {
 ///
 /// It names every analyzer-visible file of the revision, exactly as the plain
 /// file set does, so absence still means absence and `analyzed_files` is
-/// complete. It differs in where the bytes come from: every file the image's
-/// inventory names is read from the repository's object database by the blob id
-/// the revision's tree walk recorded, and only a file the inventory does not
-/// name falls through to the filesystem, where the read fails as it should.
+/// complete. Materialized files are read from the filesystem, falling back to
+/// the object database if their private copy disappears; files represented only
+/// by placeholders are read directly from the object database.
 struct RevisionImageProject {
     files: FileSetProject,
     objects: Arc<RevisionObjectDatabase>,
     blobs: Arc<RevisionBlobIdentities>,
+    object_blobs: Arc<RevisionBlobIdentities>,
     /// The revision's own `.bifrostignore` rules, compiled on first use. The
     /// head applies the working tree's rules to its analyzable file set, so a
     /// revision analyzed for comparison against it must apply its own, or every
@@ -2540,7 +2690,13 @@ impl Project for RevisionImageProject {
             Some(bytes) => {
                 bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
             }
-            None => self.files.read_source(file),
+            None => self.files.read_source(file).or_else(|error| {
+                self.fallback_revision_bytes(file)
+                    .map(|bytes| {
+                        bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
+                    })
+                    .unwrap_or(Err(error))
+            }),
         }
     }
 
@@ -2557,7 +2713,21 @@ impl Project for RevisionImageProject {
                 }
                 brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes).map(Some)
             }
-            None => self.files.read_source_limited(file, max_bytes),
+            None => self
+                .files
+                .read_source_limited(file, max_bytes)
+                .or_else(|error| {
+                    self.fallback_revision_bytes(file)
+                        .map(|bytes| {
+                            let bytes = bytes?;
+                            if bytes.len() > max_bytes {
+                                return Ok(None);
+                            }
+                            brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes)
+                                .map(Some)
+                        })
+                        .unwrap_or(Err(error))
+                }),
         }
     }
 }
@@ -2583,11 +2753,10 @@ impl RevisionImageProject {
                 .strip_prefix(root)
                 .expect("ignore-file candidates are the project root joined with a relative path");
             let file = ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
-            match self.revision_bytes(&file) {
-                Some(bytes) => bytes
-                    .and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
-                    .map(Some),
-                None => Ok(None),
+            if self.blobs.oid_for(&file).is_some() {
+                self.read_source(&file).map(Some)
+            } else {
+                Ok(None)
             }
         })?;
         Ok(self.bifrost_ignore.get_or_init(|| ignore))
@@ -2601,13 +2770,22 @@ impl RevisionImageProject {
     /// resolution can see the path (see `create_empty_source_files`), so
     /// reading disk first would hand every caller an empty file.
     fn revision_bytes(&self, file: &ProjectFile) -> Option<std::io::Result<Vec<u8>>> {
+        let oid = self.object_blobs.oid_for(file)?;
+        Some(self.read_object_blob(file, oid))
+    }
+
+    fn fallback_revision_bytes(&self, file: &ProjectFile) -> Option<std::io::Result<Vec<u8>>> {
         let oid = self.blobs.oid_for(file)?;
-        Some(self.objects.read_blob(oid).map_err(|error| {
+        Some(self.read_object_blob(file, oid))
+    }
+
+    fn read_object_blob(&self, file: &ProjectFile, oid: Oid) -> std::io::Result<Vec<u8>> {
+        self.objects.read_blob(oid).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("{}: {error}", file.rel_path().display()),
             )
-        }))
+        })
     }
 }
 
@@ -2674,13 +2852,39 @@ fn export_snapshot_symbol_files_from_tree(
     root: &Path,
     paths: &[String],
 ) -> Result<Vec<(PathBuf, Oid)>, String> {
-    let mut exported = export_tree_paths(repo, tree, root, paths)?;
+    let exported =
+        export_snapshot_symbol_files_from_tree_with(repo, tree, root, paths, |rel, oid| {
+            let blob = repo
+                .find_blob(oid)
+                .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
+            write_private_file(&root.join(rel), blob.content())?;
+            set_private_file_permissions(&root.join(rel))
+        })?;
+    Ok(exported)
+}
+
+fn export_snapshot_symbol_files_from_tree_with<F>(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+    paths: &[String],
+    mut export_file: F,
+) -> Result<Vec<(PathBuf, Oid)>, String>
+where
+    F: FnMut(&Path, Oid) -> Result<(), String>,
+{
+    let mut exported = export_tree_paths_with(tree, root, paths, &mut export_file)?;
     let already_exported = paths.iter().cloned().collect::<BTreeSet<_>>();
     let ambient = symbol_identity_ancestor_paths(repo, tree, paths)
         .into_iter()
         .filter(|path| !already_exported.contains(path))
         .collect::<Vec<_>>();
-    exported.extend(export_tree_paths(repo, tree, root, &ambient)?);
+    exported.extend(export_tree_paths_with(
+        tree,
+        root,
+        &ambient,
+        &mut export_file,
+    )?);
     Ok(exported)
 }
 
@@ -2699,7 +2903,28 @@ fn export_snapshot_files(
     cache: Option<&SharedAnalyzerCache>,
 ) -> Result<Vec<(PathBuf, Oid)>, String> {
     let tree = snapshot_tree(repo, snapshot)?;
-    let mut exported = export_snapshot_symbol_files_from_tree(repo, &tree, root, paths)?;
+    export_snapshot_files_from_tree(repo, &tree, root, paths, cache, |rel, oid| {
+        let blob = repo
+            .find_blob(oid)
+            .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
+        write_private_file(&root.join(rel), blob.content())?;
+        set_private_file_permissions(&root.join(rel))
+    })
+}
+
+fn export_snapshot_files_from_tree<F>(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+    paths: &[String],
+    cache: Option<&SharedAnalyzerCache>,
+    mut export_file: F,
+) -> Result<Vec<(PathBuf, Oid)>, String>
+where
+    F: FnMut(&Path, Oid) -> Result<(), String>,
+{
+    let mut exported =
+        export_snapshot_symbol_files_from_tree_with(repo, tree, root, paths, &mut export_file)?;
     let already_exported = exported
         .iter()
         .map(|(path, _)| path.to_string_lossy().into_owned())
@@ -2712,10 +2937,10 @@ fn export_snapshot_files(
         .filter_map(|path| safe_tree_entry_path(path).ok())
         .collect();
     let mut expansion = BTreeSet::new();
-    for target in snapshot_import_expansion_targets(root, &tree, &changed, cache)? {
+    for target in snapshot_import_expansion_targets(root, tree, &changed, cache)? {
         match target {
             ImportExpansionTarget::Directory(dir) => {
-                expansion.extend(tree_dir_file_paths(repo, &tree, &dir));
+                expansion.extend(tree_dir_file_paths(repo, tree, &dir));
             }
             ImportExpansionTarget::File(file) => {
                 expansion.insert(file.to_string_lossy().into_owned());
@@ -2726,17 +2951,25 @@ fn export_snapshot_files(
         .into_iter()
         .filter(|path| !already_exported.contains(path))
         .collect();
-    exported.extend(export_tree_paths(repo, &tree, root, &expansion)?);
+    exported.extend(export_tree_paths_with(
+        tree,
+        root,
+        &expansion,
+        &mut export_file,
+    )?);
 
     Ok(exported)
 }
 
-fn export_tree_paths(
-    repo: &Repository,
+fn export_tree_paths_with<F>(
     tree: &git2::Tree,
     root: &Path,
     paths: &[String],
-) -> Result<Vec<(PathBuf, Oid)>, String> {
+    mut export_file: F,
+) -> Result<Vec<(PathBuf, Oid)>, String>
+where
+    F: FnMut(&Path, Oid) -> Result<(), String>,
+{
     let mut written = Vec::with_capacity(paths.len());
     let mut created_dirs = HashSet::new();
     for raw_path in paths {
@@ -2747,15 +2980,11 @@ fn export_tree_paths(
         if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
             continue;
         }
-        let blob = repo
-            .find_blob(entry.id())
-            .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
         let path = root.join(&rel);
         if let Some(parent) = path.parent() {
             create_private_dirs_cached(root, parent, &mut created_dirs)?;
         }
-        write_private_file(&path, blob.content())?;
-        set_private_file_permissions(&path)?;
+        export_file(&rel, entry.id())?;
         written.push((rel, entry.id()));
     }
     Ok(written)
@@ -3540,6 +3769,10 @@ impl RevisionAnalyzer {
 
     pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
         self.workspace.analyzer()
+    }
+
+    fn workspace(&self) -> &WorkspaceAnalyzer {
+        &self.workspace
     }
 }
 
@@ -4564,6 +4797,31 @@ mod tests {
         assert_eq!(
             "export const second = 2;\n",
             fs::read_to_string(image.root().join("deep/one/two/second.ts")).unwrap()
+        );
+    }
+
+    #[test]
+    fn materialized_revision_source_does_not_reopen_the_object_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("root.ts"), "export const root = 1;\n").unwrap();
+        let commit = test_repo::commit_all(&repo, "materialized source");
+        let image = RevisionImage::materialize_symbols(
+            &repo,
+            Snapshot::Commit(commit),
+            &["root.ts".to_string()],
+            &[],
+        )
+        .unwrap();
+
+        drop(repo);
+        fs::rename(dir.path().join(".git"), dir.path().join("git-hidden")).unwrap();
+
+        let (project, _) = image.project();
+        let source = project.file_by_rel_path(Path::new("root.ts")).unwrap();
+        assert_eq!(
+            project.read_source(&source).unwrap(),
+            "export const root = 1;\n"
         );
     }
 
@@ -6125,6 +6383,7 @@ mod tests {
 #[cfg(test)]
 mod entry_point_tests {
     use super::*;
+    use crate::gitblob::test_repo;
 
     /// A two-commit repository whose second commit edits `lib.go`, built with
     /// `git2` so the lib tests do not need a `git` binary on PATH.
@@ -6159,6 +6418,213 @@ mod entry_point_tests {
             );
         }
         head.unwrap()
+    }
+
+    /// Keep the tree-base/worktree path observable through source loading,
+    /// retained-revision GC, and deleted-line attribution. Forced collection
+    /// makes the former Windows scheduling race deterministic on every host.
+    #[test]
+    fn tree_base_worktree_keeps_base_bytes_lines_and_deleted_symbol() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        two_commit_repo(&root);
+        fs::write(root.join("lib.go"), "package sample\nfunc LiveNow() {}\n").unwrap();
+
+        // Build the tree and blob in a sibling bare repository so this is the
+        // same host-trusted alternate shape as the integration regression.
+        let snapshot_root = temp.path().join("snapshot.git");
+        let snapshot = Repository::init_bare(&snapshot_root).unwrap();
+        let blob = snapshot
+            .blob(b"package sample\nfunc SnapshotBase() {}\n")
+            .unwrap();
+        let mut tree_builder = snapshot.treebuilder(None).unwrap();
+        tree_builder.insert("lib.go", blob, 0o100644).unwrap();
+        let base_tree = tree_builder.write().unwrap();
+        let options = DiffAnalysisOptions {
+            snapshot_object_dir: Some(snapshot_root.join("objects")),
+        };
+        let prepared = PreparedDiff::at_root(
+            &root,
+            DiffEndpointParams {
+                base: Some(base_tree.to_string()),
+                target: None,
+            },
+            &options,
+        )
+        .unwrap();
+        assert_eq!(prepared.base, Snapshot::Tree(base_tree));
+        assert_eq!(prepared.target, Snapshot::Worktree);
+
+        let base_paths = vec!["lib.go".to_string()];
+        let base_repository = prepared.repository_for(prepared.base);
+        let base_image = RevisionImage::materialize(
+            &base_repository.repo,
+            prepared.base,
+            Some(&base_paths),
+            &base_repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )
+        .unwrap();
+        let (base_project, _) = base_image.project();
+        let base_file = base_project
+            .file_by_rel_path(Path::new("lib.go"))
+            .expect("base image must contain the changed path");
+        assert_eq!(
+            base_project.read_source(&base_file).unwrap(),
+            "package sample\nfunc SnapshotBase() {}\n"
+        );
+
+        // The service opens this shared cache for every immutable endpoint;
+        // keep the diagnostic on that exact path rather than validating only
+        // the ephemeral-store variant.
+        let base_analyzer = build_revision_analyzer(&base_image, prepared.shared_cache()).unwrap();
+        // Startup GC can overlap a diff request. The sibling snapshot blob is
+        // unreachable from Git refs, but this retained revision still owns its
+        // facts. Force that ordering so the regression does not depend on how
+        // quickly the host schedules the background collector.
+        let db_path = crate::analyzer::store::analyzer_db_path(&root);
+        let repo = Repository::open(&root).unwrap();
+        let retained_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
+        assert!(retained_gc.ran);
+        assert_eq!(retained_gc.analyzer_dropped, 0);
+        let base_symbols = symbol_snapshot_map(base_analyzer.analyzer(), true);
+        let base_symbol = base_symbols
+            .values()
+            .find(|snapshot| snapshot.symbol.name == "SnapshotBase")
+            .expect("base analyzer must contain SnapshotBase");
+        assert!(
+            symbol_snapshot_map(base_analyzer.analyzer(), false)
+                .values()
+                .any(|snapshot| snapshot.symbol.name == "SnapshotBase"),
+            "production-symbol filtering must retain SnapshotBase"
+        );
+        assert_eq!(
+            old_overlap(&base_symbol.symbol, &prepared.changed_lines),
+            vec![2],
+            "the base symbol must overlap the deleted old line: {:?}",
+            prepared.changed_lines
+        );
+
+        drop(base_analyzer);
+        let released_gc = crate::cache_gc::force_gc_for_path(&db_path, &repo, &root).unwrap();
+        assert!(released_gc.ran);
+        assert_eq!(released_gc.analyzer_dropped, 1);
+
+        let analyzed = analyze_prepared_diff_with_endpoints(&prepared, false).unwrap();
+        let deleted = analyzed
+            .result
+            .patch_symbols
+            .deleted
+            .iter()
+            .find(|symbol| symbol.before.name == "SnapshotBase")
+            .expect("full symbol classification must retain SnapshotBase deletion");
+        assert_eq!(deleted.touched_old_lines, vec![2]);
+    }
+
+    #[test]
+    fn scoped_target_image_matches_closure_and_keeps_whole_target_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let repo = test_repo::init_repo(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("package.json"), "{\"name\":\"reuse\"}\n").unwrap();
+        fs::write(root.join(".bifrostignore"), "ignored.ts\n").unwrap();
+        fs::write(root.join("ignored.ts"), "export const ignored = 1;\n").unwrap();
+        fs::write(
+            root.join("src/dep.ts"),
+            "export function dep(): number { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "export function caller(): number { return 1; }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "base");
+        fs::write(
+            root.join("src/main.ts"),
+            "import { dep } from './dep';\n\nexport function caller(): number { return dep(); }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "target");
+        drop(repo);
+
+        let prepared = PreparedDiff::at_root(
+            &root,
+            DiffEndpointParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+        let whole_target = prepared.whole_target_analysis().unwrap();
+        let expected_analysis = analyze_prepared_diff_with_endpoints(&prepared, false).unwrap();
+        let expected_target_files = expected_analysis
+            .target
+            .image
+            .files()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected = expected_analysis.result;
+        let scoped =
+            analyze_prepared_diff_with_target_image(&prepared, false, &whole_target).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&expected).unwrap(),
+            serde_json::to_string(&scoped.result).unwrap(),
+            "whole-image scoped analysis must preserve the closure result"
+        );
+
+        let full_files = whole_target
+            .image
+            .files()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let scoped_files = scoped
+            .target
+            .image
+            .files()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(full_files.contains(Path::new(".bifrostignore")));
+        assert!(!scoped_files.contains(Path::new(".bifrostignore")));
+        assert!(scoped_files.contains(Path::new("src/dep.ts")));
+        assert_eq!(expected_target_files, scoped_files);
+
+        let full_imported = whole_target.root().join("src/dep.ts");
+        let scoped_imported = scoped.target.root().join("src/dep.ts");
+        let original_imported = fs::read(&full_imported).unwrap();
+        assert_eq!(original_imported, fs::read(&scoped_imported).unwrap());
+        fs::write(
+            &scoped_imported,
+            b"export function dep(): number { return 3; }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&full_imported).unwrap(),
+            b"export function dep(): number { return 3; }\n",
+            "the scoped file must be backed by a hardlink to the whole image"
+        );
+        fs::write(&scoped_imported, &original_imported).unwrap();
+
+        drop(scoped);
+        drop(prepared);
+        fs::remove_file(&full_imported).unwrap();
+        let full_project = whole_target.analyzer().project();
+        let imported = full_project
+            .file_by_rel_path(Path::new("src/dep.ts"))
+            .expect("whole target keeps the imported file in its project");
+        assert_eq!(
+            full_project.read_source(&imported).unwrap(),
+            "export function dep(): number { return 2; }\n",
+            "the whole target's repository owner must outlive PreparedDiff"
+        );
     }
 
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]

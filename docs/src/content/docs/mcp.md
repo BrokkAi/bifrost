@@ -294,6 +294,8 @@ for the exact strong-identity and audit contract.
 
 For MCP tool arguments that name files, directories, or file globs, callers may pass project-relative paths or absolute paths inside the active workspace. Absolute paths outside the active workspace are rejected with an explicit tool error.
 
+A path selector names one of three things: a file, a directory, or a glob. A directory selects every file beneath it, with or without a trailing separator, so `paths: ["src/parser"]` and `paths: ["src/parser/**"]` select the same files. A selector that names none of the three selected nothing, so the tool reports it instead of answering from a search it never ran. `scan_usages_by_reference` and `scan_usages_by_location` list it in `scope.unmatched_paths`, set `complete` to false with `incomplete_reason: "unmatched_paths"`, and report absence as `unverified_absent` rather than `verified_absent`. `usage_graph` adds an `unmatched_paths` entry to `incomplete_reasons`, and `search_file_contents` returns the selector in `unmatched_paths`.
+
 For JSON-based MCP hosts, configure Bifrost as a stdio server:
 
 ```json

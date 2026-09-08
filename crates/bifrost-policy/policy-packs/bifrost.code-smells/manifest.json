@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "2.10.0",
+  "version": "2.11.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -36,6 +36,20 @@
       ],
       "severity_rationale": "General-purpose object deserializers can construct unexpected objects or execute attacker-controlled behavior.",
       "remediation": "Use a data-only format, then validate the decoded schema before use."
+    },
+    {
+      "path": "policies/python-absent-member.rqlp",
+      "id": "bifrost.correctness.python-absent-member",
+      "semantic_hash": "0018b743fcf3cd82084af3ae2cdd6f8f59573934ed5f1d33297827911b113287",
+      "category": "correctness",
+      "supported_languages": ["python"],
+      "required_capabilities": [
+        "class-set-type-flow",
+        "python-declaration-models",
+        "absent-member"
+      ],
+      "severity_rationale": "A fully classified receiver includes a Proven class whose complete member surface lacks this access; unknown receivers and open member models are excluded.",
+      "remediation": "Pass a receiver with the required member, correct the member name, or guard the access using a condition the analyzer can prove. Inspect the class origin and retained witness before changing the caller."
     },
     {
       "path": "policies/go-data-race.rqlp",

@@ -16,7 +16,10 @@ use super::materialization::DeclarationMaterializationSupport;
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
-use super::resolution::{BindingActivation, ImportActivation, LexicalEnvironmentSupport};
+use super::resolution::{
+    BindingActivation, ImportActivation, LexicalEnvironmentSupport, ScopeFormation,
+    default_scope_formation,
+};
 use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
@@ -208,6 +211,21 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// nobody implemented. Adapters that answer nothing yet return
     /// [`super::routes::NO_IDENTITY_ROUTE_SUPPORT`].
     fn identity_route_support(&self) -> &IdentityRouteSupport;
+
+    /// How a fact of normalized kind `kind` participates in this language's
+    /// lexical scope tree: whether it opens a scope at all, and whether the
+    /// binders written directly inside it are lexical bindings or members.
+    ///
+    /// The default is the C-family and Python answer
+    /// ([`default_scope_formation`]). An adapter overrides it when its
+    /// language disagrees about what a scope is rather than bending its kind
+    /// table to fit: Ruby's `while`, `for` and `rescue` do not open
+    /// variable scopes (a local assigned inside one outlives it), its
+    /// `module` bodies do, and a bare assignment in a `class` body is an
+    /// ordinary local rather than a member.
+    fn scope_formation(&self, kind: NormalizedKind) -> ScopeFormation {
+        default_scope_formation(kind)
+    }
 
     /// What binding `binder` introduces into the scope whose range is `scope`,
     /// and over which byte interval it is in effect.

@@ -2355,6 +2355,15 @@ fn relational_run(
     /// answer the coverage field exists to prevent, so the run is inconclusive
     /// instead.
     ///
+    /// This is the bound-row half of that answer, and it is no longer the only
+    /// half. Deriving a suppressed shape also emits a
+    /// `call_shape_coverage_incomplete` diagnostic, so a plan that binds only a
+    /// family projected from the shape -- argument groups, arguments, bindings
+    /// -- reaches the same inconclusive verdict through the binding's
+    /// completion (#1949). What this check adds is the binding's own
+    /// `RelationCoverage`: the relation the producer refused to describe is
+    /// `unsupported_row_set`, not merely a non-exhaustive one.
+    ///
     /// This is deliberately *not* the same judgement as the match-selector
     /// path's per-row `selected_site_quality`. A row whose own coverage is
     /// partial about the world it describes -- an open member-selection

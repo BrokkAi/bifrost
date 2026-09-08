@@ -328,6 +328,16 @@ impl RubyEdgeWalkState<'_, '_> {
             return;
         };
         if member == "new" && receiver.mode == ReceiverMode::Class {
+            let overrides = self.scan.semantic.resolve_method_candidates(
+                self.scan.support,
+                &self.scan.visible_files,
+                &receiver,
+                member,
+            );
+            if !overrides.is_empty() {
+                self.record_candidates(overrides, member, hit_node, same_owner);
+                return;
+            }
             self.record_unique_method_candidate(
                 self.initialize_receiver(&receiver),
                 "initialize",
@@ -370,10 +380,6 @@ impl RubyEdgeWalkState<'_, '_> {
         // only through same-owner calls reads INCONCLUSIVE, never confidently
         // dead. An explicit variable/constant receiver — even of the same type —
         // is a different instance and stays external.
-        if same_owner {
-            self.scan.record_unproven_name(member, node);
-            return;
-        }
         let candidates = match lookup {
             MethodLookup::Bare => self.scan.semantic.resolve_bare_method_candidates(
                 self.scan.support,
@@ -388,6 +394,20 @@ impl RubyEdgeWalkState<'_, '_> {
                 member,
             ),
         };
+        self.record_candidates(candidates, member, node, same_owner);
+    }
+
+    fn record_candidates(
+        &mut self,
+        candidates: Vec<CodeUnit>,
+        member: &str,
+        node: Node<'_>,
+        same_owner: bool,
+    ) {
+        if same_owner {
+            self.scan.record_unproven_name(member, node);
+            return;
+        }
         if let Some(fqn) = unique_candidate_fqn(candidates) {
             self.scan.record(fqn, node);
         } else {

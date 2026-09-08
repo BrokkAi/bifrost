@@ -18,13 +18,15 @@
 //! files land in [`ExcludedFiles`], and a symbol whose references could not be
 //! resolved lands in [`VerificationFeatures::unresolved_symbols`].
 
-use crate::analyzer::{DispatchExtensibility, IAnalyzer, ProjectFile};
+use crate::analyzer::{
+    DispatchExtensibility, IAnalyzer, PoolSafeMemo, ProjectFile, WorkspaceAnalyzer,
+};
 use crate::cancellation::CancellationToken;
 use crate::diff_analysis::{
     AnalyzedDiff, CommitSymbol, DiffAnalysisOptions, DiffEndpointParams, DiffEndpoints,
-    EndpointAnalysis, FileChange, ImportExpansionTarget, PatchSymbols, PreparedDiff,
-    analyze_prepared_diff_with_endpoints, path_language, path_string, primary_range,
-    resolved_imports_of,
+    EndpointAnalysis, FileChange, ImportExpansionTarget, PatchSymbols, PreparedDiff, Snapshot,
+    analyze_prepared_diff_with_endpoints, analyze_prepared_diff_with_target_image, path_language,
+    path_string, primary_range, resolved_imports_of,
 };
 use crate::searchtools::{
     ScanUsagesByLocationParams, ScanUsagesEntry, ScanUsagesInput, ScanUsagesStatus,
@@ -34,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Parameters for `score_diff`.
 ///
@@ -207,19 +210,217 @@ pub fn score_diff_at_root(
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
 ) -> Result<DiffScoreResult, String> {
-    let prepared = PreparedDiff::at_root(
-        root,
-        DiffEndpointParams {
-            base: params.base,
-            target: params.target,
-        },
-        options,
-    )?;
-    // Test symbols and edges are always in scope: verification asks whether a
-    // changed production symbol has any test reference at all.
-    let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
-    let whole_target = prepared.whole_target_analysis()?;
+    DiffScoringSession::default().score_at_root(root, params, options, cancellation)
+}
 
+/// Retains one immutable target's analysis across diff-scoring requests.
+///
+/// The retained value is an analyzer, not a score: a different base still
+/// computes its own changed symbols, edges, and feature vector. Replacing the
+/// target releases its private export after outstanding readers finish.
+#[derive(Default)]
+pub struct DiffScoringSession {
+    target: Mutex<Option<CachedTargetSlot>>,
+    #[cfg(any(test, feature = "test-support"))]
+    target_builds: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    reference_scans: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CachedTargetSlot {
+    root: PathBuf,
+    snapshot: Snapshot,
+    object_dir: Option<PathBuf>,
+    analysis: Arc<PoolSafeMemo<CachedTarget>>,
+}
+
+struct CachedTarget {
+    endpoint: EndpointAnalysis,
+    epochs: HashMap<String, i64>,
+    references: ReferenceCache,
+}
+
+fn target_epochs(endpoint: &EndpointAnalysis) -> Result<HashMap<String, i64>, String> {
+    let store = endpoint
+        .workspace()
+        .store()
+        .expect("immutable target has a persisted store");
+    let read = || -> Result<_, crate::analyzer::store::StoreError> {
+        let connection = store.read_conn()?;
+        let mut statement = connection.prepare("SELECT lang, generation FROM analysis_epochs")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    };
+    read().map_err(|error| format!("Failed to validate cached target generations: {error}"))
+}
+
+impl DiffScoringSession {
+    /// Score an immutable range without requiring a live service workspace.
+    /// Library callers may also score the worktree; service hosts should use
+    /// `score_worktree` to supply their already-current workspace snapshot.
+    pub fn score_at_root(
+        &self,
+        root: &Path,
+        params: ScoreDiffParams,
+        options: &DiffAnalysisOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<DiffScoreResult, String> {
+        let prepared = PreparedDiff::at_root(
+            root,
+            DiffEndpointParams {
+                base: params.base,
+                target: params.target,
+            },
+            options,
+        )?;
+        if !prepared.target.is_immutable() {
+            let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
+            #[cfg(any(test, feature = "test-support"))]
+            self.target_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let whole_target = prepared.whole_target_analysis()?;
+            return Ok(score_analyzed_diff(
+                analyzed,
+                whole_target.analyzer(),
+                &ReferenceCache::default(),
+                cancellation,
+            ));
+        }
+        let whole_target = loop {
+            let memo = {
+                let mut slot = self.target.lock().expect("diff scoring cache poisoned");
+                let reusable = slot.as_ref().is_some_and(|cached| {
+                    cached.root == root
+                        && cached.snapshot == prepared.target
+                        && cached.object_dir == options.snapshot_object_dir
+                });
+                if !reusable {
+                    *slot = Some(CachedTargetSlot {
+                        root: root.to_path_buf(),
+                        snapshot: prepared.target,
+                        object_dir: options.snapshot_object_dir.clone(),
+                        analysis: Arc::new(PoolSafeMemo::new()),
+                    });
+                }
+                Arc::clone(&slot.as_ref().expect("target slot installed").analysis)
+            };
+            let build = || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.target_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let endpoint = prepared.whole_target_analysis()?;
+                let epochs = target_epochs(&endpoint)?;
+                Ok::<_, String>(CachedTarget {
+                    endpoint,
+                    epochs,
+                    references: ReferenceCache {
+                        #[cfg(any(test, feature = "test-support"))]
+                        scans: Arc::clone(&self.reference_scans),
+                        complete: Mutex::default(),
+                    },
+                })
+            };
+            let target = memo.get_or_try_build(build, build)?;
+            let current = target_epochs(&target.endpoint)?;
+            if target
+                .epochs
+                .iter()
+                .all(|(language, generation)| current.get(language) == Some(generation))
+            {
+                break target;
+            }
+            let mut slot = self.target.lock().expect("diff scoring cache poisoned");
+            if slot
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(&cached.analysis, &memo))
+            {
+                *slot = None;
+            }
+        };
+        let analyzed =
+            analyze_prepared_diff_with_target_image(&prepared, true, &whole_target.endpoint)?;
+        Ok(score_analyzed_diff(
+            analyzed,
+            whole_target.endpoint.analyzer(),
+            &whole_target.references,
+            cancellation,
+        ))
+    }
+
+    /// Score a worktree target using the host's complete source generation.
+    /// A scoped service cannot supply the whole-target reference universe.
+    pub fn score_worktree(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        params: ScoreDiffParams,
+        options: &DiffAnalysisOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<DiffScoreResult, String> {
+        assert!(
+            params.targets_worktree(),
+            "workspace reuse requires a worktree target"
+        );
+        let analyzer = workspace.analyzer();
+        let project = analyzer.project();
+        if project.coverage().subset().is_some()
+            || analyzer.languages() != project.analyzer_languages()
+            || project
+                .overlay_content()
+                .is_some_and(|overlay| !overlay.entries().is_empty())
+        {
+            // Worktree endpoints select disk bytes over the complete project.
+            // Partial analyzers and unsaved editor buffers cannot answer that
+            // question, but the ordinary full disk analysis can.
+            return self.score_at_root(project.root(), params, options, cancellation);
+        }
+        let prepared = PreparedDiff::at_root(
+            workspace.analyzer().project().root(),
+            DiffEndpointParams {
+                base: params.base,
+                target: params.target,
+            },
+            options,
+        )?;
+        assert!(!prepared.target.is_immutable());
+        let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
+        Ok(score_analyzed_diff(
+            analyzed,
+            workspace.analyzer(),
+            &ReferenceCache::default(),
+            cancellation,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reference_scan_count_for_test(&self) -> usize {
+        self.reference_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn target_build_count_for_test(&self) -> usize {
+        self.target_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl ScoreDiffParams {
+    /// Whether endpoint resolution will select the live worktree as the target.
+    pub fn targets_worktree(&self) -> bool {
+        self.target
+            .as_deref()
+            .is_none_or(|target| target.trim().is_empty())
+    }
+}
+
+fn score_analyzed_diff(
+    analyzed: AnalyzedDiff,
+    whole_target: &dyn IAnalyzer,
+    cache: &ReferenceCache,
+    cancellation: &CancellationToken,
+) -> DiffScoreResult {
     let changed_paths: BTreeSet<String> = analyzed
         .result
         .file_changes
@@ -231,27 +432,28 @@ pub fn score_diff_at_root(
     let geometry = geometry_features(
         &analyzed.result.file_changes,
         &analyzed.result.patch_symbols,
-        &whole_target,
+        whole_target,
     );
-    let references =
-        resolve_reference_sites(&analyzed.result.patch_symbols, &whole_target, cancellation);
-    let coordination = coordination_features(&analyzed, &references, &changed_paths);
-    let verification = verification_features(
+    let references = resolve_reference_sites(
         &analyzed.result.patch_symbols,
-        &references,
-        whole_target.analyzer(),
+        whole_target,
+        cache,
+        cancellation,
     );
+    let coordination = coordination_features(&analyzed, &references, &changed_paths);
+    let verification =
+        verification_features(&analyzed.result.patch_symbols, &references, whole_target);
     let baseline = baseline_features(&analyzed);
     let excluded = excluded_files(&analyzed.result.file_changes);
 
-    Ok(DiffScoreResult {
+    DiffScoreResult {
         endpoints: analyzed.result.endpoints.clone(),
         geometry,
         coordination,
         verification,
         baseline,
         excluded,
-    })
+    }
 }
 
 // ---------------------------------------------------------------- geometry
@@ -259,7 +461,7 @@ pub fn score_diff_at_root(
 fn geometry_features(
     file_changes: &[FileChange],
     patch_symbols: &PatchSymbols,
-    target: &EndpointAnalysis,
+    target: &dyn IAnalyzer,
 ) -> GeometryFeatures {
     let measured = MeasuredFiles::of(file_changes);
     let (mean_directory_distance, max_directory_distance) = measured.dispersion();
@@ -365,7 +567,7 @@ impl MeasuredFiles {
     /// Union-find rather than a graph walk: the relation is symmetric and the
     /// only question asked of it is component count, so there is nothing to
     /// traverse.
-    fn edit_clusters(&self, target: &EndpointAnalysis) -> usize {
+    fn edit_clusters(&self, target: &dyn IAnalyzer) -> usize {
         if self.paths.len() < 2 {
             return self.paths.len();
         }
@@ -410,7 +612,7 @@ impl MeasuredFiles {
     }
 
     /// Index pairs `(a, b)` where `a` imports `b` in the target revision.
-    fn import_adjacency(&self, target: &EndpointAnalysis) -> Vec<(usize, usize)> {
+    fn import_adjacency(&self, target: &dyn IAnalyzer) -> Vec<(usize, usize)> {
         let index_by_path: HashMap<&str, usize> = self
             .paths
             .iter()
@@ -419,7 +621,7 @@ impl MeasuredFiles {
             .collect();
         let mut edges = Vec::new();
         for (index, path) in self.paths.iter().enumerate() {
-            for import in resolved_imports_of(target.analyzer(), target.root(), Path::new(path)) {
+            for import in resolved_imports_of(target, target.project().root(), Path::new(path)) {
                 match import {
                     ImportExpansionTarget::File(file) => {
                         if let Some(other) = index_by_path.get(path_string(&file).as_str())
@@ -615,6 +817,17 @@ struct SymbolReferences {
 /// symbol and the by-location scan echoes back in its input.
 type ReferenceSites = HashMap<SymbolKey, SymbolReferences>;
 
+/// The last complete reference query for one immutable analyzer generation.
+/// Rendering budgets apply across the requested batch, so answers from
+/// different target sets cannot be combined without changing score semantics.
+/// Incomplete or cancelled scans must be retried.
+#[derive(Default)]
+struct ReferenceCache {
+    complete: Mutex<Option<(BTreeMap<SymbolKey, String>, ReferenceSites)>>,
+    #[cfg(any(test, feature = "test-support"))]
+    scans: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// A declaration's target-endpoint `(path, start_line)`.
 type SymbolKey = (String, usize);
 
@@ -668,7 +881,8 @@ fn changed_target_symbols(
 /// never has to guess between overloads or same-named declarations.
 fn resolve_reference_sites(
     patch_symbols: &PatchSymbols,
-    whole_target: &EndpointAnalysis,
+    whole_target: &dyn IAnalyzer,
+    cache: &ReferenceCache,
     cancellation: &CancellationToken,
 ) -> ReferenceSites {
     let mut wanted: BTreeMap<SymbolKey, String> = BTreeMap::new();
@@ -681,6 +895,18 @@ fn resolve_reference_sites(
     if wanted.is_empty() {
         return ReferenceSites::default();
     }
+    if !cancellation.is_cancelled() {
+        let complete = cache.complete.lock().expect("reference cache poisoned");
+        if let Some((targets, references)) = complete.as_ref()
+            && targets == &wanted
+        {
+            return references.clone();
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    cache
+        .scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let targets: Vec<ScanUsagesTarget> = wanted
         .iter()
@@ -692,7 +918,7 @@ fn resolve_reference_sites(
         })
         .collect();
     let scanned = scan_usages_by_location_with_cancellation(
-        whole_target.analyzer(),
+        whole_target,
         ScanUsagesByLocationParams {
             targets,
             include_tests: true,
@@ -710,11 +936,24 @@ fn resolve_reference_sites(
         cancellation.clone(),
     );
 
-    scanned
+    let references: ReferenceSites = scanned
         .results
         .iter()
         .map(|entry| (entry_key(entry), symbol_references(entry)))
-        .collect()
+        .collect();
+    if !cancellation.is_cancelled()
+        && references.len() == wanted.len()
+        && references.keys().all(|key| wanted.contains_key(key))
+        && scanned.results.iter().all(|entry| {
+            entry.complete
+                && entry.incomplete_reason.is_none()
+                && entry.status != ScanUsagesStatus::Failure
+        })
+    {
+        *cache.complete.lock().expect("reference cache poisoned") =
+            Some((wanted, references.clone()));
+    }
+    references
 }
 
 /// The scanned entry's symbol key.

@@ -14,6 +14,7 @@
 pub mod extractor;
 pub mod hits;
 pub mod inverted;
+mod macro_lexical;
 pub mod resolver;
 pub mod syntax;
 

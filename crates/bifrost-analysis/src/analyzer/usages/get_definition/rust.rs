@@ -14,6 +14,7 @@ use crate::analyzer::rust::{
     rust_crate_root_package, rust_package_name,
 };
 use crate::analyzer::structural::resolution::{HierarchyRelation, MemberDispatchTier};
+use crate::analyzer::tree_walk::named_children_iter;
 use crate::analyzer::usages::rust_graph::{
     RustDefinitionProvider, resolve_rust_path_fqn, rust_smallest_named_node_covering,
 };
@@ -25,11 +26,12 @@ use brokk_bifrost_rust::declarations::rust_macro_invocation_arguments;
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
+use brokk_bifrost_rust::graph::ast::type_parameter_trait_bounds;
 use brokk_bifrost_rust::graph::resolver::{RustBareTokenTreeRole, RustTokenTreeRoleCache};
 use brokk_bifrost_rust::graph_support::{
     RustFactSource, RustSource, is_rust_export_visible_declaration,
     is_rust_macro_export_declaration, is_rust_trait_declaration,
-    is_rust_trait_impl_member_declaration, rust_declaration_node,
+    is_rust_trait_impl_member_declaration, rust_declaration_node, rust_declaration_node_is,
 };
 use brokk_bifrost_rust::lexical_scope;
 use brokk_bifrost_rust::macro_matcher::{
@@ -3034,6 +3036,12 @@ fn rust_glob_import_exposes_candidate(
         .values()
         .filter(|binding| binding.kind == ImportKind::Glob)
         .any(|binding| {
+            if rust_local_glob_enum_owners(rust, support, file, &binding.module_specifier)
+                .iter()
+                .any(|local_owner| local_owner == &owner)
+            {
+                return true;
+            }
             let scoped_package = resolve_rust_import_package_scoped(
                 rust,
                 token,
@@ -3086,9 +3094,28 @@ fn rust_scoped_glob_forward_import_candidates(
             Language::Rust,
             &binding.module_specifier,
         );
-        if binding.kind != ImportKind::Glob
-            || !matches!(segments.first().map(String::as_str), Some("self" | "super"))
+        if binding.kind != ImportKind::Glob {
+            continue;
+        }
+        if let [owner_name] = segments.as_slice()
+            && !matches!(owner_name.as_str(), "self" | "super")
         {
+            let local_owners = rust_local_glob_enum_owners(rust, support, file, owner_name);
+            if !local_owners.is_empty() {
+                saw_scoped_glob = true;
+            }
+            for owner in local_owners {
+                candidates.extend(
+                    support
+                        .fqn(&format!("{}.{reference}", owner.fq_name()))
+                        .into_iter()
+                        .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
+                        .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate)),
+                );
+            }
+            continue;
+        }
+        if !matches!(segments.first().map(String::as_str), Some("self" | "super")) {
             continue;
         }
         saw_scoped_glob = true;
@@ -3157,6 +3184,35 @@ fn rust_scoped_glob_forward_import_candidates(
         crossed_unindexed_explicit_binding,
         resolved_through_import_chain: false,
     })
+}
+
+fn rust_local_glob_enum_owners(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<CodeUnit> {
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let [owner_name] = segments.as_slice() else {
+        return Vec::new();
+    };
+    // A bare owner in `use Enum::*` is relative to the physical module. The
+    // general path resolver can represent that owner at a crate root, but in a
+    // child file it does not prepend the file's package. Rebuild that one exact
+    // module-local identity and retain only the indexed enum declaration.
+    let package = rust_package_name(file);
+    let expected_fqn = if package.is_empty() {
+        owner_name.clone()
+    } else {
+        format!("{package}.{owner_name}")
+    };
+    support
+        .file_identifier(file, owner_name)
+        .into_iter()
+        .filter(|owner| owner.fq_name() == expected_fqn)
+        .filter(|owner| rust_declaration_matches(rust, owner, |node| node.kind() == "enum_item"))
+        .collect()
 }
 
 /// True when a `self`/`super` import's module specifier resolves to the
@@ -3650,17 +3706,9 @@ fn rust_declaration_is_enum_variant(rust: &RustAnalyzer, candidate: &CodeUnit) -
 fn rust_declaration_matches(
     rust: &RustAnalyzer,
     candidate: &CodeUnit,
-    predicate: impl FnOnce(Node<'_>) -> bool,
+    predicate: impl for<'tree> Fn(Node<'tree>) -> bool,
 ) -> bool {
-    let Ok(source) = candidate.source().read_to_string() else {
-        return false;
-    };
-    let Some(tree) = lexical_scope::parse_rust_tree(&source) else {
-        return false;
-    };
-    let support = AnalyzerRustDefinitionProvider::new(rust, false);
-    rust_code_unit_declaration_node(rust, &support, candidate, tree.root_node())
-        .is_some_and(predicate)
+    rust_declaration_node_is(rust, candidate, |node, _source| predicate(node))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5574,10 +5622,7 @@ fn rust_extern_crate_binding_in_scope(
     } else {
         scope
     };
-    for index in 0..items.named_child_count() {
-        let Some(node) = items.named_child(index) else {
-            continue;
-        };
+    for node in named_children_iter(items) {
         if node.kind() == "extern_crate_declaration" {
             let bound = node
                 .child_by_field_name("alias")
@@ -6418,7 +6463,20 @@ pub(crate) fn rust_expression_type_definition_candidates_cached(
         before_byte,
         cache,
     ) else {
-        return Vec::new();
+        // One type parameter can carry several trait bounds, and each is a
+        // type the value may have. That is more than the single FQN above can
+        // say, so it declines and the bounds are read here instead.
+        return rust_type_parameter_bound_candidates(
+            analyzer,
+            token,
+            support,
+            file,
+            source,
+            root,
+            expression,
+            before_byte,
+            cache,
+        );
     };
     rust_type_definition_candidates_for_fqn(
         analyzer,
@@ -6429,6 +6487,66 @@ pub(crate) fn rust_expression_type_definition_candidates_cached(
         Some(RustCurrentSyntax { file, source, root }),
         cache,
     )
+}
+
+/// The indexed types bounding the generic parameter that `expression`'s name is
+/// declared with, when its declared type is a type parameter with more than one
+/// indexed bound. Empty for every other expression, including a type parameter
+/// with one bound, which the single-FQN resolution above already answers.
+#[allow(clippy::too_many_arguments)]
+fn rust_type_parameter_bound_candidates<'tree>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    expression: Node<'_>,
+    before_byte: usize,
+    cache: &mut RustTypeLookupCache,
+) -> Vec<CodeUnit> {
+    if expression.kind() != "identifier" {
+        return Vec::new();
+    }
+    let name = rust_node_text(expression, source).trim();
+    let mut found = RustBindingType::default();
+    let mut ctx = RustBindingLookupCtx {
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        name,
+        before_byte,
+        mode: RustTypeMode::Direct,
+        cache,
+    };
+    rust_collect_binding_type(&mut ctx, token, root, &mut found);
+    let Some(annotation) = found.annotation else {
+        return Vec::new();
+    };
+    let Some(bounds) =
+        rust_type_parameter_bound_fqns(analyzer, token, support, file, source, annotation)
+    else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<CodeUnit> = bounds
+        .iter()
+        .flat_map(|fqn| {
+            rust_type_definition_candidates_for_fqn(
+                analyzer,
+                support,
+                file,
+                fqn,
+                before_byte,
+                Some(RustCurrentSyntax { file, source, root }),
+                cache,
+            )
+        })
+        .collect();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 pub(crate) fn rust_field_definition_type_candidates_cached(
@@ -6856,7 +6974,7 @@ fn rust_binding_type_fqn(
     mode: RustTypeMode,
     cache: &mut RustTypeLookupCache,
 ) -> Option<String> {
-    let mut found = None;
+    let mut found = RustBindingType::default();
     let mut ctx = RustBindingLookupCtx {
         analyzer,
         support,
@@ -6868,8 +6986,19 @@ fn rust_binding_type_fqn(
         mode,
         cache,
     };
-    rust_collect_binding_type_fqn(&mut ctx, token, root, &mut found);
-    found
+    rust_collect_binding_type(&mut ctx, token, root, &mut found);
+    found.fqn
+}
+
+/// What the binding walk learned about the declared type of one name.
+#[derive(Default)]
+struct RustBindingType<'tree> {
+    /// The FQN the annotation resolved to, when it named an indexed type.
+    fqn: Option<String>,
+    /// The annotation node itself. It still carries structure when the
+    /// annotation named something the index holds no declaration for, which is
+    /// what a generic parameter always is.
+    annotation: Option<Node<'tree>>,
 }
 
 struct RustBindingLookupCtx<'a, 'tree, 'cache> {
@@ -6884,11 +7013,11 @@ struct RustBindingLookupCtx<'a, 'tree, 'cache> {
     cache: &'cache mut RustTypeLookupCache,
 }
 
-fn rust_collect_binding_type_fqn(
+fn rust_collect_binding_type<'tree>(
     ctx: &mut RustBindingLookupCtx<'_, '_, '_>,
     token: QueryToken<'_>,
-    root: Node<'_>,
-    found: &mut Option<String>,
+    root: Node<'tree>,
+    found: &mut RustBindingType<'tree>,
 ) {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
@@ -6903,14 +7032,16 @@ fn rust_collect_binding_type_fqn(
                 if let Some((binding, type_node)) =
                     rust_typed_binding(ctx.support, node, ctx.source)
                     && binding == ctx.name
-                    && let Some(fqn) = rust_resolve_type_node_fqn_mode(
+                {
+                    found.annotation = Some(type_node);
+                    if let Some(fqn) = rust_resolve_type_node_fqn_mode(
                         ctx,
                         token,
                         type_node,
                         Some(type_node.start_byte()),
-                    )
-                {
-                    *found = Some(fqn);
+                    ) {
+                        found.fqn = Some(fqn);
+                    }
                 }
             }
             "let_declaration" if node.end_byte() <= ctx.before_byte => {
@@ -6926,6 +7057,9 @@ fn rust_collect_binding_type_fqn(
                     if type_node.is_some() && !ctx.support.scope_step() {
                         return;
                     }
+                    if let Some(type_node) = type_node {
+                        found.annotation = Some(type_node);
+                    }
                     if let Some(type_node) = type_node
                         && let Some(fqn) = rust_resolve_type_node_fqn_mode(
                             ctx,
@@ -6934,7 +7068,7 @@ fn rust_collect_binding_type_fqn(
                             Some(type_node.start_byte()),
                         )
                     {
-                        *found = Some(fqn);
+                        found.fqn = Some(fqn);
                     } else {
                         let value = node.child_by_field_name("value");
                         if value.is_some() && !ctx.support.scope_step() {
@@ -6954,7 +7088,7 @@ fn rust_collect_binding_type_fqn(
                                 ctx.cache,
                             )
                         {
-                            *found = Some(fqn);
+                            found.fqn = Some(fqn);
                         }
                     }
                 }
@@ -7526,6 +7660,19 @@ pub(crate) fn rust_resolve_type_node_fqn(
     type_node: Node<'_>,
     reference_byte: Option<usize>,
 ) -> Option<String> {
+    // A generic parameter is not a type name: `S` in `fn f<S: Trait>(x: &S)`
+    // stands for whatever implements its bounds, so the bounds are the only
+    // type information the receiver has. This precedes both resolution
+    // semantics because a type parameter also *shadows* an ordinary type of
+    // the same name, which the name lookups below would otherwise return.
+    if let Some(mut bounds) =
+        rust_type_parameter_bound_fqns(analyzer, token, support, file, source, type_node)
+    {
+        // One indexed bound is one answer. No bound, or several, leaves the
+        // type unknown -- and the parameter's own name is still not a type, so
+        // this never falls through to the name lookups below.
+        return (bounds.len() == 1).then(|| bounds.remove(0));
+    }
     if support.is_bounded() {
         return rust_resolve_type_node_fqn_bounded(
             analyzer,
@@ -7594,6 +7741,62 @@ pub(crate) fn rust_resolve_type_node_fqn(
         .into_iter()
         .find(|unit| rust_is_type_definition(analyzer, unit))
         .map(|unit| unit.fq_name().to_string())
+}
+
+/// The indexed types named by the trait bounds of `type_node`, when `type_node`
+/// writes a generic parameter of an enclosing `fn`, `impl`, or type
+/// declaration.
+///
+/// `None` when the node names an ordinary type. `Some` lists one FQN per bound
+/// that resolves to an indexed declaration, in source order: `S: A + B` where
+/// both are indexed reports both, and a bound the index does not carry (a
+/// `std` marker trait, a dependency's trait) is simply absent -- an *unknown*
+/// bound, never evidence that the parameter is some other type.
+fn rust_type_parameter_bound_fqns(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<Vec<String>> {
+    let named = rust_named_type_node(support, type_node)?;
+    if !matches!(named.kind(), "type_identifier" | "identifier") {
+        return None;
+    }
+    let name = rust_node_text(named, source).trim();
+    let bounds = type_parameter_trait_bounds(named, name, source)?;
+    let mut fqns: Vec<String> = bounds
+        .into_iter()
+        .filter_map(|bound| {
+            // A bound that names another type parameter names no type, and
+            // refusing it is also what keeps this resolution from recurring
+            // into itself on a self-referential bound.
+            let bound_named = rust_named_type_node(support, bound)?;
+            if matches!(bound_named.kind(), "type_identifier" | "identifier")
+                && type_parameter_trait_bounds(
+                    bound_named,
+                    rust_node_text(bound_named, source).trim(),
+                    source,
+                )
+                .is_some()
+            {
+                return None;
+            }
+            rust_resolve_type_node_fqn(
+                analyzer,
+                token,
+                support,
+                file,
+                source,
+                bound,
+                Some(bound.start_byte()),
+            )
+        })
+        .collect();
+    let mut seen = HashSet::default();
+    fqns.retain(|fqn| seen.insert(fqn.clone()));
+    Some(fqns)
 }
 
 fn rust_resolve_type_node_fqn_bounded(

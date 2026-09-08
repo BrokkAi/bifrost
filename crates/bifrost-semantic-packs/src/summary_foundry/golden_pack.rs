@@ -204,7 +204,7 @@ pub const RUST_REALM: GoldenRealm = GoldenRealm {
 pub const JAVASCRIPT_REALM: GoldenRealm = GoldenRealm {
     pack_id: "bifrost.javascript-golden-summaries",
     language: "javascript",
-    content_version: "0.4.0",
+    content_version: "0.5.0",
     ecosystem: "npm",
     toolchain: None,
     targets: &[],
@@ -226,7 +226,7 @@ pub const JAVASCRIPT_REALM: GoldenRealm = GoldenRealm {
 pub const TYPESCRIPT_REALM: GoldenRealm = GoldenRealm {
     pack_id: "bifrost.typescript-golden-summaries",
     language: "typescript",
-    content_version: "0.4.0",
+    content_version: "0.5.0",
     ecosystem: "npm",
     toolchain: None,
     targets: &[],
@@ -650,6 +650,8 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         conditional_result_refinements: Vec::new(),
         conditional_indirect_writes: Vec::new(),
         normal_return_refinements: Vec::new(),
+        normal_return_type_refinements: Vec::new(),
+        class_decorator_identity: None,
     }
 }
 

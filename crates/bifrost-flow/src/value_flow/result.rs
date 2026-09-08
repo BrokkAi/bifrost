@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::hash::HashSet;
+
 use crate::analyzer::semantic::ProgramPointHandle;
 use crate::dataflow::{
     PathQuality, PathQualityFrontier, SummaryDataflowResult, SummaryEntry, SummaryWitness,
@@ -210,5 +212,100 @@ impl ValueFlowSummaryResult {
         }
         self.result
             .witness_for_reached_index(meeting.reached_index, quality, 0, limits)
+    }
+
+    /// A source-to-meeting path, including the caller contexts that supplied
+    /// the value to a callee. The local witness API above deliberately remains
+    /// available for consumers that work with procedure-relative path edges.
+    /// Caller search and all reconstruction share one expansion/step budget.
+    pub fn source_witness_for_meeting(
+        &self,
+        meeting: &ValueFlowMeeting,
+        quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        let local = self.witness_for_meeting(meeting, quality, limits)?;
+        if local.steps().is_empty() {
+            return Ok(local);
+        }
+        let mut expansions = local.work().evidence_expansions();
+        // Each node stores its next edge toward the meeting. A breadth-first
+        // search selects one deterministic, cycle-free retained caller chain.
+        // Entry identity includes the exact source-sensitive fact, so paths
+        // from an unrelated value cannot be spliced into this witness.
+        let mut nodes = vec![(meeting.entry(), None)];
+        let mut seen = HashSet::default();
+        seen.insert(meeting.entry());
+        let mut cursor = 0;
+        loop {
+            let Some(&(entry, _)) = nodes.get(cursor) else {
+                return Err(SummaryWitnessError::InvalidEvidence(
+                    "source witness has no retained seed caller context",
+                ));
+            };
+            if self.result.fact(entry.entry_fact()) == Some(&ValueFlowFact::zero()) {
+                break;
+            }
+            for incoming in self.result.incoming_calls_for(entry) {
+                if expansions == limits.max_expansions() {
+                    return Ok(SummaryWitness::reconstruction_expansion_marker(
+                        quality, expansions,
+                    ));
+                }
+                expansions += 1;
+                // A caller prefix can be weaker than the locally Proven
+                // meeting (for example an open constructor boundary). Keep
+                // that evidence and let path composition conjoin its quality;
+                // do not mistake an unavailable strong prefix for no path.
+                let call_quality = PathQuality::ALL
+                    .into_iter()
+                    .find(|quality| incoming.path_qualities().contains(*quality))
+                    .expect("a retained incoming call has at least one path quality");
+                if seen.insert(incoming.caller()) {
+                    nodes.push((incoming.caller(), Some((cursor, incoming, call_quality))));
+                }
+            }
+            cursor += 1;
+        }
+
+        let mut prefix: Option<SummaryWitness> = None;
+        while let Some((next, incoming, call_quality)) = nodes[cursor].1 {
+            let remaining = limits.max_expansions().saturating_sub(expansions);
+            if remaining == 0 {
+                return Ok(SummaryWitness::reconstruction_expansion_marker(
+                    quality, expansions,
+                ));
+            }
+            let call = self.result.witness_for_incoming_call(
+                incoming,
+                call_quality,
+                WitnessReconstructionLimits::new(limits.max_steps(), remaining)
+                    .expect("positive remaining reconstruction limits"),
+            )?;
+            expansions = expansions.saturating_add(call.work().evidence_expansions());
+            let composed = match prefix {
+                None => call,
+                Some(prefix) => {
+                    if call.steps().is_empty() {
+                        return Ok(call.with_expansion_work(expansions));
+                    }
+                    prefix
+                        .joined_at_call(&call, limits.max_steps())
+                        .expect("nonempty caller paths join at their exact entry")
+                }
+            };
+            if composed.truncated() {
+                return Ok(composed.with_expansion_work(expansions));
+            }
+            prefix = Some(composed);
+            cursor = next;
+        }
+        let witness = match prefix {
+            Some(prefix) => prefix
+                .joined_at_call(&local, limits.max_steps())
+                .expect("complete caller and local witnesses have retained steps"),
+            None => local,
+        };
+        Ok(witness.with_expansion_work(expansions))
     }
 }

@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 #[path = "../../../../../../test-support/inline_project.rs"]
-mod inline_project;
+pub(super) mod inline_project;
 use inline_project::InlineTestProject;
 
 fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnalyzer> {

@@ -7,6 +7,7 @@
 use super::kinds::Role;
 use super::spec::RoleSink;
 use crate::analyzer::Range;
+use crate::analyzer::tree_walk::named_children_iter;
 use tree_sitter::Node;
 
 /// The byte-and-line range of one syntax node, in the same 1-based line
@@ -108,10 +109,7 @@ pub fn attach_positional_argument_roles<'tree, F>(
 ) where
     F: Fn(Node<'tree>) -> Option<Node<'tree>> + Copy,
 {
-    for index in 0..arguments.named_child_count() {
-        let Some(argument) = arguments.named_child(index) else {
-            continue;
-        };
+    for argument in named_children_iter(arguments) {
         if !sink.should_continue() {
             break;
         }

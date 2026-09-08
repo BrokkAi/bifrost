@@ -147,6 +147,22 @@ impl RustSymbolIdentity {
     }
 }
 
+/// The module path reached by a declaration identity.
+///
+/// Module declarations are owned by their parent module in the identity
+/// model, while a module route names the declared child. Keeping this
+/// conversion structured avoids making callers know whether a module is
+/// represented by its parent declaration file or by the file backing it.
+pub(crate) fn module_route_for_identity(identity: &RustSymbolIdentity) -> ModuleKey {
+    if identity.namespace == RustSymbolNamespace::Module {
+        identity
+            .module
+            .with_suffix(std::slice::from_ref(&identity.name))
+    } else {
+        identity.module.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustImportExtent {
     Module {
@@ -922,7 +938,11 @@ impl RustUsageWalks<'_> {
         export_name: &str,
     ) -> BTreeSet<(ProjectFile, String)> {
         enum Work {
-            Visit(ProjectFile, String),
+            Visit {
+                file: ProjectFile,
+                name: String,
+                reached_through_reexport: bool,
+            },
             DeclarationFallback {
                 files: Vec<ProjectFile>,
                 name: String,
@@ -935,23 +955,47 @@ impl RustUsageWalks<'_> {
         let mut pending = module_files
             .iter()
             .rev()
-            .map(|file| Work::Visit(file.clone(), export_name.to_string()))
+            .map(|file| Work::Visit {
+                file: file.clone(),
+                name: export_name.to_string(),
+                reached_through_reexport: false,
+            })
             .collect::<Vec<_>>();
         while let Some(work) = pending.pop() {
-            let (module_file, export_name) = match work {
+            let (module_file, export_name, reached_through_reexport) = match work {
                 Work::DeclarationFallback {
                     files,
                     name,
                     target_count,
                 } => {
                     if targets.len() == target_count {
-                        targets.extend(rust_declaration_targets_in_files(analyzer, &files, &name));
+                        targets.extend(
+                            files
+                                .iter()
+                                .flat_map(|file| analyzer.declarations(file))
+                                .filter(|unit| {
+                                    unit.identifier() == name
+                                        && crate::graph_support::is_rust_export_visible_declaration(
+                                            analyzer.code_units(),
+                                            unit,
+                                        )
+                                })
+                                .map(|unit| (unit.source().clone(), unit.identifier().to_string())),
+                        );
                     }
                     continue;
                 }
-                Work::Visit(file, name) => (file, name),
+                Work::Visit {
+                    file,
+                    name,
+                    reached_through_reexport,
+                } => (file, name, reached_through_reexport),
             };
-            if !visited.insert((module_file.clone(), export_name.clone())) {
+            if !visited.insert((
+                module_file.clone(),
+                export_name.clone(),
+                reached_through_reexport,
+            )) {
                 continue;
             }
             if !self.is_analyzed(&module_file) {
@@ -966,18 +1010,17 @@ impl RustUsageWalks<'_> {
                     name: export_name.clone(),
                     target_count: targets.len(),
                 });
-                pending.extend(
-                    files
-                        .into_iter()
-                        .rev()
-                        .map(|file| Work::Visit(file, export_name.clone())),
-                );
+                pending.extend(files.into_iter().rev().map(|file| Work::Visit {
+                    file,
+                    name: export_name.clone(),
+                    reached_through_reexport: true,
+                }));
             }
 
             if let Some(entry) = index.exports_by_name.get(&export_name) {
                 match entry {
                     ExportEntry::Local { local_name } => {
-                        targets.insert((module_file, local_name.clone()));
+                        targets.insert((module_file.clone(), local_name.clone()));
                     }
                     ExportEntry::ReexportedNamed {
                         module_specifier,
@@ -989,15 +1032,21 @@ impl RustUsageWalks<'_> {
                             name: imported_name.clone(),
                             target_count: targets.len(),
                         });
-                        pending.extend(
-                            files
-                                .into_iter()
-                                .rev()
-                                .map(|file| Work::Visit(file, imported_name.clone())),
-                        );
+                        pending.extend(files.into_iter().rev().map(|file| Work::Visit {
+                            file,
+                            name: imported_name.clone(),
+                            reached_through_reexport: true,
+                        }));
                     }
                     ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. } => {}
                 }
+            }
+            if reached_through_reexport {
+                pending.push(Work::DeclarationFallback {
+                    files: vec![module_file],
+                    name: export_name,
+                    target_count: targets.len(),
+                });
             }
         }
         targets
@@ -1129,26 +1178,6 @@ pub fn domain_contains_module_for_file(
                     .starts_with(&domain_module.components)
         }),
     }
-}
-
-fn rust_declaration_targets_in_files(
-    analyzer: &dyn RustFactSource,
-    files: &[ProjectFile],
-    name: &str,
-) -> Vec<(ProjectFile, String)> {
-    let mut targets: Vec<_> = files
-        .iter()
-        .flat_map(|file| {
-            analyzer
-                .declarations(file)
-                .into_iter()
-                .filter(move |unit| unit.identifier() == name)
-                .map(|unit| (file.clone(), unit.identifier().to_string()))
-        })
-        .collect();
-    targets.sort();
-    targets.dedup();
-    targets
 }
 
 /// Candidate files: those importing a seed, plus the seed files themselves.
@@ -1456,13 +1485,7 @@ pub fn usage_local_module_prefix_visible_at(
         ) {
             return routes.iter().any(|route| {
                 seeds.identities.iter().any(|identity| {
-                    let target_module = if identity.namespace == RustSymbolNamespace::Module {
-                        identity
-                            .module
-                            .with_suffix(std::slice::from_ref(&identity.name))
-                    } else {
-                        identity.module.clone()
-                    };
+                    let target_module = module_route_for_identity(identity);
                     (route.target_file == identity.file
                         || walks.owners_intersect(&route.target_file, &identity.file)
                         || analyzer
@@ -1506,13 +1529,7 @@ pub fn usage_local_module_prefix_visible_at(
         .into_iter()
         .any(|route| {
             seeds.identities.iter().any(|identity| {
-                let target_module = if identity.namespace == RustSymbolNamespace::Module {
-                    identity
-                        .module
-                        .with_suffix(std::slice::from_ref(&identity.name))
-                } else {
-                    identity.module.clone()
-                };
+                let target_module = module_route_for_identity(identity);
                 (route.target_file == identity.file
                     || walks.owners_intersect(&route.target_file, &identity.file)
                     || analyzer
@@ -1531,13 +1548,7 @@ pub fn usage_local_module_prefix_visible_at(
 
     let child_module = module.with_suffix(&[name.to_string()]);
     seeds.identities.iter().any(|identity| {
-        let target_module = if identity.namespace == RustSymbolNamespace::Module {
-            identity
-                .module
-                .with_suffix(std::slice::from_ref(&identity.name))
-        } else {
-            identity.module.clone()
-        };
+        let target_module = module_route_for_identity(identity);
         child_module.contains(&target_module)
             && seeds
                 .identity_domains
@@ -1722,6 +1733,39 @@ fn seed_identities_for_resolved_module_route(
         })
         .map(|(identity, _)| identity)
         .collect::<HashSet<_>>();
+    // A file-backed module has two structured representations: its `mod`
+    // declaration in the parent file and the file that backs the child
+    // module. The route points at the latter, while the query target may be
+    // the former. Include that parent declaration when it names this route so
+    // inverse resolution preserves the module identity selected by the
+    // definition query.
+    matches.extend(
+        seeds
+            .root_origins
+            .iter()
+            .filter(|identity| {
+                identity.namespace == RustSymbolNamespace::Module
+                    && identity.namespace.accepts(namespace)
+                    && module_route_for_identity(identity) == resolved.target_module
+                    && (identity.file == resolved.target_file
+                        || walks.owners_intersect(&identity.file, &resolved.target_file)
+                        || analyzer
+                            .cargo_routes()
+                            .files_share_target(&identity.file, &resolved.target_file)
+                            == Some(true))
+                    && seeds.identity_domains.get(identity).is_some_and(|domains| {
+                        domains.iter().any(|domain| domain.contains_module(module))
+                    })
+                    && walks.resolved_declaration_visible_to(
+                        analyzer,
+                        identity,
+                        file,
+                        module,
+                        resolved.provenance,
+                    )
+            })
+            .cloned(),
+    );
     matches.extend(
         walks
             .origin_routes_of(&resolved.target_file)
@@ -2309,7 +2353,10 @@ pub fn usage_crate_export_targets(
 }
 
 pub fn edge_matches_single_seed(edge: &RustImportEdge, target: &RustSymbolIdentity) -> bool {
-    if edge.target_file != target.file || edge.target_module != target.module {
+    if edge.target_file != target.file
+        || (edge.target_module != target.module
+            && edge.target_module != module_route_for_identity(target))
+    {
         return false;
     }
     match &edge.kind {
@@ -2426,16 +2473,39 @@ fn scoped_explicit_import(
             brokk_bifrost_core::analyzer::Language::Rust,
             &binding.module_specifier,
         );
+        let route_segments = if binding.kind == ImportKind::Namespace {
+            segments
+                .get(..segments.len().saturating_sub(1))
+                .unwrap_or_default()
+        } else {
+            segments.as_slice()
+        };
         let dependency_roots = walks
-            .resolve_segments(file, &importer_module.package(), &segments)
+            .resolve_segments(file, &importer_module.package(), route_segments)
             .into_iter()
             .filter(|route| route.provenance == RustRouteProvenance::Dependency)
             .map(|route| route.target_file)
             .collect();
+        let targets = crate::graph_support::resolve_imported_export_from_binder_forward(
+            analyzer, token, file, &binder, name,
+        );
+        let fqn = if targets.len() == 1 {
+            let (target_file, target_name) = &targets[0];
+            let target_fqns = analyzer
+                .declarations(target_file)
+                .into_iter()
+                .filter(|unit| unit.identifier() == target_name)
+                .map(|unit| unit.fq_name())
+                .collect::<BTreeSet<_>>();
+            (target_fqns.len() == 1)
+                .then(|| target_fqns.into_iter().next())
+                .flatten()
+                .or(fqn)
+        } else {
+            fqn
+        };
         return Some(ScopedExplicitImport {
-            targets: crate::graph_support::resolve_imported_export_from_binder_forward(
-                analyzer, token, file, &binder, name,
-            ),
+            targets,
             dependency_roots,
             fqn,
         });

@@ -1235,6 +1235,7 @@ mod tests {
 
     fn lexical(identifier: &str) -> LexicalDefinition {
         LexicalDefinition {
+            source_file: None,
             identifier: identifier.to_owned(),
             kind: DeclarationKind::LocalVariable,
             name_range: Range {
@@ -1860,6 +1861,65 @@ mod boundary_evidence_tests {
                     && target.as_deref() == Some(type_id.as_str())
             }),
             "the activated pack publishes `Helper`: {routes:?}"
+        );
+    }
+
+    /// A PHP reference written through a `use` alias reports the candidate the
+    /// resolver considered and selected.
+    ///
+    /// The alias names a declaration this workspace holds, so the trace
+    /// carries a unit-backed `selected` row naming that declaration's FQ name
+    /// rather than a boundary route. The trace's completeness stays
+    /// `SelectionOnly`, which is exactly what PHP's adapter declares: it
+    /// supports `candidate_selection` and not `candidate_rejection` (#2962),
+    /// so an absent rejection row for PHP means nothing rather than "the
+    /// resolver rejected nothing here".
+    const PHP_USE_ALIAS_SOURCE: &str = concat!(
+        "<?php\n",
+        "\n",
+        "namespace App\\Model {\n",
+        "    class Widget {}\n",
+        "}\n",
+        "\n",
+        "namespace App\\Util {\n",
+        "    use App\\Model\\Widget as Gadget;\n",
+        "\n",
+        "    function make(): Gadget {\n",
+        "        return new Gadget();\n",
+        "    }\n",
+        "}\n",
+    );
+
+    #[test]
+    fn a_php_use_alias_reports_the_workspace_candidate_it_selected() {
+        let fixture = BoundaryFixture::new(Language::Php, "src/Service.php", PHP_USE_ALIAS_SOURCE);
+        let (outcome, trace) = fixture.trace("Gadget();");
+        assert!(
+            !outcome.definitions.is_empty(),
+            "the alias names a workspace declaration: {outcome:?}"
+        );
+        let selected: Vec<String> = trace
+            .selected()
+            .map(|candidate| match &candidate.candidate {
+                TraceCandidateRef::Unit(unit) => unit.fq_name(),
+                other => panic!("expected a unit-backed candidate, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            selected,
+            ["App.Model.Widget"],
+            "the trace names the declaration the alias resolved to: {:?}",
+            trace.candidates
+        );
+        assert_eq!(
+            trace.completeness,
+            TraceCompleteness::SelectionOnly,
+            "PHP declares candidate_selection and not candidate_rejection"
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "a name the workspace declares draws no boundary: {:?}",
+            trace.candidates
         );
     }
 

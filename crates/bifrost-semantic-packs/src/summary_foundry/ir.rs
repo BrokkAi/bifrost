@@ -511,6 +511,8 @@ impl FoundryEntry {
             conditional_result_refinements: Vec::new(),
             conditional_indirect_writes: Vec::new(),
             normal_return_refinements: Vec::new(),
+            normal_return_type_refinements: Vec::new(),
+            class_decorator_identity: None,
         })
     }
 

@@ -8,7 +8,9 @@
 //! source-and-text machinery (already used there to resolve an
 //! unmaterialized external *call* target) to prove a specific `FieldMemory`
 //! gap is a `static final` read on an external type. Every other relevance
-//! and discharge decision in this file stays IR-only.
+//! and discharge decision in this file stays IR-only. Saved Python defaults
+//! additionally consult the provider's captured workspace metadata authority;
+//! this file does not scan their source again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -27,8 +29,8 @@ use crate::analyzer::semantic::{
     CallArgumentExpansion, CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding,
     CallBindings, CallPassingMode, CandidateCoverage, CaptureSource, ControlEdgeKind,
     DeclarationSegmentKind, DispatchCandidate, EvidenceCompleteness, EvidenceHandle,
-    FormalMultiplicity, HeapOracle, IndexSelector, MemoryLocationId, MemoryLocationKind,
-    ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
+    FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector, MemoryLocationId,
+    MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProgramPointHandle,
     ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticCapability, SemanticEffect,
@@ -2271,6 +2273,13 @@ enum CallBindingDraft {
         actual: ValueHandle,
         formal: ProcedurePortHandle,
     },
+    ImplicitArgument {
+        relation: usize,
+        formal_ordinal: u32,
+        source: ValueHandle,
+        formal: ProcedurePortHandle,
+        kind: ImplicitArgumentKind,
+    },
     ArgumentGroup {
         closure_relation: usize,
         source: u32,
@@ -2394,6 +2403,19 @@ fn materialize_call_bindings(
                 relation: relation(relation_id)?,
                 actual,
                 formal,
+            }),
+            CallBindingDraft::ImplicitArgument {
+                relation: relation_id,
+                formal_ordinal,
+                source,
+                formal,
+                kind,
+            } => Ok(CallBinding::ImplicitArgument {
+                relation: relation(relation_id)?,
+                formal_ordinal,
+                source,
+                formal,
+                kind,
             }),
             CallBindingDraft::ArgumentGroup {
                 closure_relation,
@@ -3866,6 +3888,18 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 
         let call_evidence = evidence_handle(call.procedure(), call_row.evidence)?;
         let callee_evidence = evidence_handle(callee, callee.semantics().evidence())?;
+        let default_arguments = callee
+            .semantics()
+            .values()
+            .iter()
+            .filter_map(|value| match &value.kind {
+                SemanticValueKind::DefaultArgument { ordinal } => {
+                    Some((*ordinal, value.id, value.evidence))
+                }
+                _ => None,
+            })
+            .map(|(ordinal, value, evidence)| (ordinal, (value, evidence)))
+            .collect::<HashMap<_, _>>();
         let mut formals = callee
             .semantics()
             .values()
@@ -3984,6 +4018,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 
         let mut formal_cursor = 0usize;
         let mut positional_width_unknown = false;
+        // A source that did not receive a retained mapping may still supply any
+        // omitted formal (for example an unresolved spread, dynamic keyword,
+        // duplicate, or invalid argument). Defaults are therefore withheld
+        // for the whole candidate once one such source is encountered.
+        let mut argument_binding_uncertain = false;
         for (source_index, argument) in call_row.arguments.iter().enumerate() {
             if interrupted.is_some() || build.truncated {
                 break;
@@ -4136,6 +4175,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 ))
             } else {
                 build.open = true;
+                argument_binding_uncertain = true;
                 None
             };
             let group_coverage = if mapping.is_some() && proven_complete(&closure_evidence) {
@@ -4169,6 +4209,75 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 mapping,
                 coverage: group_coverage,
             });
+        }
+
+        // A default is a saved callee-owned value, not a call expression to
+        // execute. Select it only after all syntactic actuals have been
+        // mapped: an open argument source could still supply this formal, and
+        // an explicit mapping always wins. A source row with incomplete
+        // evidence also keeps the candidate open rather than manufacturing a
+        // proven implicit edge.
+        let saved_defaults_available = default_arguments.is_empty()
+            || callee.artifact().key().language()
+                != crate::analyzer::semantic::SemanticLanguage::Standard(
+                    crate::analyzer::Language::Python,
+                )
+            || self.python_saved_defaults_available() == Some(true);
+        if interrupted.is_none()
+            && !build.truncated
+            && !argument_binding_uncertain
+            && saved_defaults_available
+        {
+            for (ordinal, multiplicity, _, _, formal_evidence_id) in &formals {
+                if !matches!(multiplicity, FormalMultiplicity::One)
+                    || bound_formals.contains(ordinal)
+                {
+                    continue;
+                }
+                let Some((default_value_id, default_evidence_id)) =
+                    default_arguments.get(ordinal).copied()
+                else {
+                    continue;
+                };
+                if request.cancellation.is_cancelled() {
+                    interrupted = Some(Interruption::Cancelled);
+                    break;
+                }
+                let evidence = dedup_evidence([
+                    call_evidence.clone(),
+                    evidence_handle(callee, *formal_evidence_id)?,
+                    evidence_handle(callee, default_evidence_id)?,
+                ]);
+                if !proven_complete(&evidence) {
+                    build.open = true;
+                    continue;
+                }
+                if !build.can_retain(std::slice::from_ref(&evidence), 1, *self.limits()) {
+                    build.truncated = true;
+                    break;
+                }
+                if let Err(stop) = staged.charge(SemanticWork {
+                    values: 2,
+                    evidence: evidence.len(),
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                }) {
+                    interrupted = Some(stop);
+                    break;
+                }
+                let relation = build.push_relation(evidence);
+                build.retained_entries += 1;
+                bound_formals.insert(*ordinal);
+                build.bindings.push(CallBindingDraft::ImplicitArgument {
+                    relation,
+                    formal_ordinal: *ordinal,
+                    source: value_handle(callee, default_value_id)?,
+                    formal: ProcedurePortHandle::parameter(callee.clone(), *ordinal).map_err(
+                        |error| internal_contract("invalid callee default parameter port", error),
+                    )?,
+                    kind: ImplicitArgumentKind::Default,
+                });
+            }
         }
 
         if interrupted.is_none() && !build.truncated {

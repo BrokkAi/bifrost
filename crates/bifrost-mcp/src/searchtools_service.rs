@@ -39,7 +39,7 @@ use crate::{
     },
     cyclomatic_complexity_diff::{CyclomaticComplexityParams, cyclomatic_complexity_at_root},
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
-    diff_scoring::{ScoreDiffParams, score_diff_at_root},
+    diff_scoring::{DiffScoringSession, ScoreDiffParams},
     file_tools::{find_files_containing, get_file_contents, search_file_contents},
     path_normalization::NormalizePath,
     policy::{
@@ -1103,6 +1103,7 @@ pub struct SearchToolsService {
     startup_index_warm: StartupIndexWarm,
     watcher_starter: WatcherStarter,
     diff_snapshot_object_dir: Option<PathBuf>,
+    diff_scoring: DiffScoringSession,
     /// Whether `query_code` may spend the source-volume-scaled budget policy
     /// evaluation uses instead of the interactive defaults. Host configuration
     /// for a trusted whole-workspace caller, never a tool argument: a query
@@ -2265,31 +2266,42 @@ impl SearchToolsService {
         Self::new_with_strategy(root, UpdateStrategy::Manual)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn score_diff_target_build_count_for_test(&self) -> usize {
+        self.diff_scoring.target_build_count_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn score_diff_reference_scan_count_for_test(&self) -> usize {
+        self.diff_scoring.reference_scan_count_for_test()
+    }
+
     /// Whether a tool's answer is a pure function of its Git endpoints and
     /// never reads the live workspace analyzer.
     ///
-    /// The diff tools are such tools: each builds its own per-endpoint analyzers
-    /// over revision images and is dispatched before `snapshot_for_query` is
-    /// ever consulted, so booting a persisted whole-repo workspace to serve one
-    /// is pure waste. `score_diff` derives from the same endpoint analyzers and
-    /// adds one over the whole target revision, so it reads the live workspace
-    /// no more than its siblings do.
+    /// Immutable diff endpoints use revision images. `score_diff` reuses its
+    /// retained immutable target, while a worktree target reads the service's
+    /// current workspace snapshot and therefore requires workspace readiness.
     ///
     /// Independent means "does not read the live workspace", not "writes
     /// nothing". An immutable endpoint's revision image publishes the blobs it
     /// parses into the repository's shared content-addressed analyzer cache,
     /// which is the point: the next consumer of those blobs, revision or
     /// worktree, reads them instead of parsing them. What the image does not
-    /// leave behind is any workspace projection row naming its temporary export
-    /// directory; a request-scoped lease removes those when the request ends.
-    pub fn tool_is_workspace_independent(name: &str) -> bool {
+    /// leave behind is an orphaned workspace projection: the image's lease
+    /// removes those rows when its last retained reader releases the image.
+    pub fn tool_is_workspace_independent(name: &str, arguments: &Value) -> bool {
+        if name == "score_diff" {
+            return arguments
+                .get("target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| !target.trim().is_empty());
+        }
         matches!(
             name,
-            "analyze_diff"
-                | "blast_radius"
-                | "cyclomatic_complexity"
-                | "missing_tests"
-                | "score_diff"
+            "analyze_diff" | "blast_radius" | "cyclomatic_complexity" | "missing_tests"
         )
     }
 
@@ -2424,6 +2436,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         })
     }
@@ -2930,20 +2943,22 @@ impl SearchToolsService {
             })?;
             let root = self.service_root()?;
             let uncancelled = CancellationToken::default();
+            let token = cancellation.unwrap_or(&uncancelled);
+            let options = DiffAnalysisOptions {
+                snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+            };
+            if params.targets_worktree() {
+                let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
+                let result = self
+                    .diff_scoring
+                    .score_worktree(&snapshot, params, &options, token)
+                    .map_err(SearchToolsServiceError::internal);
+                return snapshot.finish("score_diff", result.and_then(Self::structured_only));
+            }
             return Self::structured_only(
-                score_diff_at_root(
-                    &root,
-                    params,
-                    &DiffAnalysisOptions {
-                        snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
-                    },
-                    // The whole-target-revision reference scan is the long pole
-                    // of this tool, so it runs under the caller's token rather
-                    // than a fresh one: a client that cancelled the tool call
-                    // must be able to stop the scan.
-                    cancellation.unwrap_or(&uncancelled),
-                )
-                .map_err(SearchToolsServiceError::internal)?,
+                self.diff_scoring
+                    .score_at_root(&root, params, &options, token)
+                    .map_err(SearchToolsServiceError::internal)?,
             );
         }
         if name == "query_code" {
@@ -3765,6 +3780,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         })
     }
@@ -3813,6 +3829,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         })
     }
@@ -3869,6 +3886,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         }
     }
@@ -3932,6 +3950,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         }
     }
@@ -4151,6 +4170,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         })
     }
@@ -5745,6 +5765,7 @@ mod watcher_startup_tests {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: starter,
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         }
     }
@@ -7489,6 +7510,7 @@ public partial class MudDialogContainer
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         }
     }
@@ -7724,6 +7746,7 @@ mod client_roots_tests {
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
+            diff_scoring: DiffScoringSession::default(),
             workspace_scaled_query_limits: false,
         }
     }

@@ -843,6 +843,74 @@
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "generation_strategy": "retain_until_profile_support",
       "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-buffer-javascript-declarations/manifest.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/buffer/javascript/bifrost.node-buffer-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/buffer/javascript/bifrost.node-buffer-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-buffer-typescript-declarations/manifest.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/buffer/typescript/bifrost.node-buffer-declarations.json"
+    },
+    {
+      "asset_role": "compiled_shard",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
+      "path": "crates/bifrost-semantic-packs/embedded/node-buffer-typescript-declarations/shards/declarations.buffer.deflate",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit.",
+      "source_model": "semantic-packs/node/buffer/typescript/bifrost.node-buffer-declarations.json"
+    },
+    {
+      "asset_role": "compiled_manifest",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "compiled_semantic_model",
       "path": "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/manifest.json",
       "profiles": [
         "javascript-typescript",
@@ -1736,6 +1804,46 @@
       ],
       "classification": "blocked_missing_adapter_or_identity_evidence",
       "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/node-buffer-javascript-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/node/buffer/javascript/bifrost.node-buffer-declarations.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
+        "crates/bifrost-semantic-packs/embedded/node-buffer-typescript-declarations/manifest.json",
+        "crates/bifrost-semantic-packs/embedded/node-buffer-typescript-declarations/shards/declarations.buffer.deflate"
+      ],
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/node/buffer/typescript/bifrost.node-buffer-declarations.json",
+      "profiles": [
+        "javascript-typescript",
+        "node-compatibility"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "embedded_paths": [
         "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/manifest.json",
         "crates/bifrost-semantic-packs/embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json"
       ],
@@ -1819,6 +1927,17 @@
       "classification": "not_a_semantic_model",
       "generation_strategy": "retain_native_artifact",
       "native_source_kind": "license_notice",
+      "path": "semantic-packs/python/notices/cpython-unittest-3.13.5.txt",
+      "profiles": [],
+      "reason": "License or notice text is provenance material, not a semantic model."
+    },
+    {
+      "asset_role": "license_notice",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "license_notice",
       "path": "semantic-packs/python/notices/typeshed-stdlib-2026.8.31.txt",
       "profiles": [],
       "reason": "License or notice text is provenance material, not a semantic model."
@@ -1831,6 +1950,32 @@
       "generation_strategy": "retain_native_artifact",
       "native_source_kind": "artifact_descriptor",
       "path": "semantic-packs/python/typeshed-stdlib-2026.8.31.json",
+      "profiles": [],
+      "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
+    },
+    {
+      "asset_role": "authored_semantic_model",
+      "audit_status": "pending",
+      "blockers": [
+        "missing_profile_adapter"
+      ],
+      "classification": "blocked_missing_adapter_or_identity_evidence",
+      "generation_strategy": "retain_until_profile_support",
+      "native_source_kind": "authored_semantic_model",
+      "path": "semantic-packs/python/unittest-assertions-2026.9.7.json",
+      "profiles": [
+        "python"
+      ],
+      "reason": "First-wave migration candidate; exportability remains pending lossless field and applicability audit."
+    },
+    {
+      "asset_role": "artifact_descriptor",
+      "audit_status": "not_applicable",
+      "blockers": [],
+      "classification": "not_a_semantic_model",
+      "generation_strategy": "retain_native_artifact",
+      "native_source_kind": "artifact_descriptor",
+      "path": "semantic-packs/python/unittest-assertions-2026.9.7.spec.json",
       "profiles": [],
       "reason": "Artifact acquisition and extraction instructions are inputs to model generation, not semantic model facts."
     },

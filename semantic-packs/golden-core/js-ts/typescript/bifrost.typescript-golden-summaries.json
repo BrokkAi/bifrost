@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.typescript-golden-summaries",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "producer": {
     "name": "bifrost-golden-foundry",
     "version": "0.9.0"
@@ -125,6 +125,54 @@
                 "input": {
                   "kind": "parameter",
                   "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "buffer.tostring",
+            "target": {
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.toString",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "buffer.tostring-string",
+            "target": {
+              "path": "node/lib/buffer.js",
+              "symbol": "Buffer.toString(string)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
                 },
                 "exit_kind": "normal",
                 "output": {

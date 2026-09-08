@@ -727,6 +727,9 @@ pub struct SummaryMetrics {
     pub reused_entry_contexts: usize,
     /// Exact callee entry contexts served by a cross-query reusable artifact.
     pub reusable_summary_hits: usize,
+    /// Reusable summary hits that replaced the solve root's exact Zero-entry
+    /// relation rather than a callee entry.
+    pub reusable_root_summary_hits: usize,
     /// Callee entry contexts for which the cross-query oracle had no artifact.
     pub reusable_summary_misses: usize,
     /// Reusable artifacts refused because the summarized callee sits in a call
@@ -1145,10 +1148,20 @@ fn witness_owners_match(left: Option<&Arc<()>>, right: Option<&Arc<()>>) -> bool
 /// typed results rather than operational errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryDataflowError {
-    FactIdOverflow { index: usize },
-    WitnessEvidenceIdOverflow { index: usize },
+    FactIdOverflow {
+        index: usize,
+    },
+    WitnessEvidenceIdOverflow {
+        index: usize,
+    },
     WitnessInvariant(&'static str),
     PointSeedOutsideRoot,
+    /// A speculative discovery plan omitted this summarized procedure's
+    /// descendants, but the exact entry relation could not be reused. The
+    /// client must discard this plan and rebuild without this summary cut.
+    MandatorySummaryCutMiss {
+        procedure: ProcedureHandle,
+    },
     SemanticProvider(SemanticProviderError),
 }
 
@@ -1166,6 +1179,10 @@ impl fmt::Display for SummaryDataflowError {
             }
             Self::PointSeedOutsideRoot => formatter
                 .write_str("summary point seed belongs to a procedure outside the solve root"),
+            Self::MandatorySummaryCutMiss { procedure } => write!(
+                formatter,
+                "mandatory reusable summary was unavailable for {procedure:?}; rebuild without that cut"
+            ),
             Self::SemanticProvider(error) => error.fmt(formatter),
         }
     }
@@ -1177,7 +1194,8 @@ impl Error for SummaryDataflowError {
             Self::FactIdOverflow { .. }
             | Self::WitnessEvidenceIdOverflow { .. }
             | Self::WitnessInvariant(_)
-            | Self::PointSeedOutsideRoot => None,
+            | Self::PointSeedOutsideRoot
+            | Self::MandatorySummaryCutMiss { .. } => None,
             Self::SemanticProvider(error) => Some(error),
         }
     }

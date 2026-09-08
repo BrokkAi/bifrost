@@ -22,6 +22,7 @@ use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAli
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredTypeIdentity};
 use brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo;
+use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -60,7 +61,9 @@ pub struct ParsedFile {
     /// file.
     pub line_starts: Vec<usize>,
     imports: Vec<ImportInfo>,
-    package_name: String,
+    /// The name the file's `package` clause declares, before the workspace
+    /// path index qualifies it into a canonical package.
+    pub package_name: String,
 }
 
 pub struct GoProjectGraph {
@@ -453,39 +456,11 @@ pub fn constructor_call_type_fqns(
     return_types
 }
 
-/// Build the tree-free [`GoEdgeIndex`] over `files`: parse each Go file once to
+/// Build the tree-free [`GoEdgeIndex`] from an already-parsed workspace:
 /// collect package clauses, constructor-return facts, and embedded-member
-/// promotion metadata, then drop those trees before returning. `None` when there
-/// are no Go files.
-pub fn build_go_edge_index(
-    source: GoGraphSource<'_>,
-    files: &[ProjectFile],
-) -> Option<GoEdgeIndex> {
-    let _scope = brokk_bifrost_core::profiling::scope("go_edge_index::build");
-    let go_files: Vec<ProjectFile> = files
-        .iter()
-        .filter(|file| language_for_file(file) == Language::Go)
-        .cloned()
-        .collect();
-
-    let parsed_files: Vec<_> = {
-        let _scope = brokk_bifrost_core::profiling::scope("go_edge_index::parse_files");
-        go_files
-            .par_iter()
-            .filter_map(|file| Some((file.clone(), parse_go_file(file)?)))
-            .collect()
-    };
-    if parsed_files.is_empty() {
-        return None;
-    }
-    let parsed_refs: Vec<_> = parsed_files
-        .iter()
-        .map(|(file, parsed)| (file.clone(), parsed))
-        .collect();
-    Some(build_go_edge_index_from_parsed(source, &parsed_refs))
-}
-
-fn build_go_edge_index_from_parsed(
+/// promotion metadata from each file's tree. The caller owns the parse and
+/// drops the trees afterwards, so the index retains none of them.
+pub fn build_go_edge_index_from_parsed(
     source: GoGraphSource<'_>,
     parsed_files: &[(ProjectFile, &ParsedFile)],
 ) -> GoEdgeIndex {
@@ -988,7 +963,7 @@ pub fn go_embedded_field_unit_type_text(
     let parsed = match parsed {
         Some(parsed) => parsed,
         None => {
-            parsed_file = parse_go_file(field.source())?;
+            parsed_file = parse_go_file(index.project(), field.source())?;
             &parsed_file
         }
     };
@@ -1321,8 +1296,27 @@ fn parse_go_source(source: String) -> Option<ParsedFile> {
     })
 }
 
-fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
-    parse_go_source(file.read_to_string().ok()?)
+fn parse_go_file(project: &dyn Project, file: &ProjectFile) -> Option<ParsedFile> {
+    parse_go_source(project.read_source(file).ok()?)
+}
+
+/// Parse every Go file of `files` once, in parallel.
+///
+/// The single place a whole-workspace Go index build reads and parses source.
+/// Both workspace indexes -- the type hierarchy and the usage edge index --
+/// are built from one call's result, so a request parses each Go file once
+/// instead of once per index (#1748: the hierarchy parsed the workspace
+/// sequentially while the edge index parsed the same files again).
+pub fn parse_go_workspace(
+    project: &dyn Project,
+    files: &[ProjectFile],
+) -> Vec<(ProjectFile, ParsedFile)> {
+    let _scope = brokk_bifrost_core::profiling::scope("go_workspace::parse_files");
+    files
+        .par_iter()
+        .filter(|file| language_for_file(file) == Language::Go)
+        .filter_map(|file| Some((file.clone(), parse_go_file(project, file)?)))
+        .collect()
 }
 
 pub fn build_go_graph(
@@ -1365,7 +1359,7 @@ pub fn build_go_graph(
                 }
             }
         }
-        let parsed_file = match parse_go_file(&file) {
+        let parsed_file = match parse_go_file(source.index.project(), &file) {
             Some(parsed_file) => parsed_file,
             None => continue,
         };
@@ -1499,19 +1493,7 @@ fn resolve_go_module(
 }
 
 fn package_name(root: Node<'_>, source: &str) -> String {
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() != "package_clause" {
-            continue;
-        }
-        let mut package_cursor = child.walk();
-        for package_child in child.named_children(&mut package_cursor) {
-            if matches!(package_child.kind(), "package_identifier" | "identifier") {
-                return node_text(package_child, source).to_string();
-            }
-        }
-    }
-    String::new()
+    crate::declarations::determine_go_package_name(root, source)
 }
 
 pub struct TargetSpec {

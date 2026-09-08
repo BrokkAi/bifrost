@@ -84,6 +84,7 @@ pub enum QueryValueKind {
     FlowWitness,
     ClassSetRow,
     AbsentMemberFinding,
+    AbsentMemberWitness,
     TaintFinding,
     ReferenceSite,
     CallSite,
@@ -160,6 +161,7 @@ impl QueryValueKind {
             Self::FlowWitness => "flow_witness",
             Self::ClassSetRow => "class_set_row",
             Self::AbsentMemberFinding => "absent_member_finding",
+            Self::AbsentMemberWitness => "absent_member_witness",
             Self::TaintFinding => "taint_finding",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
@@ -1296,6 +1298,9 @@ impl QueryStep {
                 Some(QueryValueKind::TypestateWitness)
             }
             (Self::Witness(_), QueryValueKind::FlowEndpoint) => Some(QueryValueKind::FlowWitness),
+            (Self::Witness(_), QueryValueKind::AbsentMemberFinding) => {
+                Some(QueryValueKind::AbsentMemberWitness)
+            }
             (
                 Self::FileOf,
                 QueryValueKind::StructuralMatch
@@ -1308,6 +1313,9 @@ impl QueryStep {
                 | QueryValueKind::TypestateWitness
                 | QueryValueKind::FlowEndpoint
                 | QueryValueKind::FlowWitness
+                | QueryValueKind::ClassSetRow
+                | QueryValueKind::AbsentMemberFinding
+                | QueryValueKind::AbsentMemberWitness
                 | QueryValueKind::TaintFinding
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
@@ -1602,9 +1610,9 @@ pub(super) fn validate_query_steps(
             QueryStep::ValueFlow(_) => "procedure",
             QueryStep::ClassSet | QueryStep::AbsentMember => "procedure",
             QueryStep::Taint(_) => "procedure",
-            QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
+            QueryStep::Witness(_) => "typestate_finding, flow_endpoint, or absent_member_finding",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, class_set_row, absent_member_finding, absent_member_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)

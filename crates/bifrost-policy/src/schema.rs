@@ -928,7 +928,7 @@ value_shapes! {
     CaptureName => "an RQL capture name bound by the subject selector",
     OccurrenceRole => "one occurrence role from the analyzer registry",
     ExpectedOccurrence => "declaration, reference, binding, or none",
-    OccurrenceNamespace => "type, value, module, macro, or label",
+    OccurrenceNamespace => "type, value, module, macro, label, or path_prefix",
     AssertCardinality => "an exactly, at-least, or at-most cardinality record",
     PrecedenceTier => "one precedence tier from the analyzer registry",
     GenerationKind => "one generation kind from the analyzer registry",
@@ -1788,6 +1788,7 @@ atom_values! {
     NamespaceModule { domain: OccurrenceNamespace, spellings: ["module"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The module naming space." }
     NamespaceMacro { domain: OccurrenceNamespace, spellings: ["macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The macro naming space." }
     NamespaceLabel { domain: OccurrenceNamespace, spellings: ["label"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The label naming space." }
+    NamespacePathPrefix { domain: OccurrenceNamespace, spellings: ["path_prefix"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The qualifier naming space: a non-terminal path segment names a module or a type, decided by lookup rather than by syntax." }
     GenerationAccessorMacro { domain: GenerationKind, spellings: ["accessor_macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A member-generating attribute macro such as attr_accessor." }
     GenerationAliasMacro { domain: GenerationKind, spellings: ["alias_macro"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An alias-generating call such as alias_method." }
     GenerationPreprocessorDefinition { domain: GenerationKind, spellings: ["preprocessor_definition"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A #define that materializes a macro unit." }

@@ -463,9 +463,9 @@ fn derive_rows(
 }
 
 /// The namespace the adapter's own occurrence classification states for this
-/// token, through exactly the rule occurrence rows use. `None` where the
-/// adapter cannot say (Java and Rust path segments), which segment resolution
-/// may later decide.
+/// token, through exactly the rule occurrence rows use. Java and Rust
+/// qualifiers state `PathPrefix`, which segment resolution may refine.
+/// `None` means the adapter does not classify the token.
 fn classified_namespace(
     spec: &dyn StructuralSpec,
     facts: &FileFacts,
@@ -528,8 +528,13 @@ fn resolve_segments(
             | DefinitionLookupStatus::InvalidLocation => SegmentResolutionStatus::Incomplete,
         };
         let targets = outcome.definitions;
-        if segment.namespace.is_none() {
-            segment.namespace = namespace_from_targets(&targets);
+        // `PathPrefix` is the adapter's "a qualifier: a module or a type, the
+        // syntax does not say" answer (#3064). A resolved target set says
+        // which, and that is strictly more precise, so it replaces the
+        // syntactic claim. A stated `Module`/`Type`/`Value` is the adapter's
+        // own decision and stands.
+        if matches!(segment.namespace, None | Some(Namespace::PathPrefix)) {
+            segment.namespace = namespace_from_targets(&targets).or(segment.namespace);
         }
         segment.resolution = Some(SegmentPrefixResolution { status, targets });
     }
@@ -644,9 +649,10 @@ mod tests {
     }
 
     /// A Java import chain is one path: ordered segments, each its own row,
-    /// the terminal anchoring the path, and — because Java cannot name a path
-    /// segment's namespace from the token alone — no namespace stated without
-    /// resolution, rather than a guessed one.
+    /// the terminal anchoring the path, and — because Java cannot say whether
+    /// a scope segment is a package or a type from the token alone — the
+    /// qualifier namespace stated on each scope segment rather than a guessed
+    /// `Module` or `Type` (#3064).
     #[test]
     fn java_import_chain_is_one_ordered_path() {
         let fixture = Fixture::new(
@@ -673,11 +679,12 @@ mod tests {
                 "ROWS_ONLY derives no resolution"
             );
         }
-        // Java cannot name a scope segment's namespace from the token alone,
-        // so the two path segments state none; the terminal is an import
-        // target, whose namespace is the adapter's existing classification.
-        assert_eq!(segments[0].namespace, None);
-        assert_eq!(segments[1].namespace, None);
+        // Java cannot say whether a scope segment is a package or a type from
+        // the token alone, so both state the qualifier namespace; the terminal
+        // is an import target, whose namespace is the adapter's existing
+        // classification.
+        assert_eq!(segments[0].namespace, Some(Namespace::PathPrefix));
+        assert_eq!(segments[1].namespace, Some(Namespace::PathPrefix));
         assert_eq!(segments[2].namespace, Some(Namespace::Value));
         assert!(result.completeness.covers(IdentityAxis::PathSegments));
     }

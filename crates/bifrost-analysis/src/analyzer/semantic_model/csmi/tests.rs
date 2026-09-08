@@ -1,10 +1,11 @@
 use super::*;
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    AuthoredConcurrencyEffect, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
-    AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryEffect, AuthoredSummaryExitKind,
-    AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer, CatalogCoordinate,
-    CatalogOptions, CompilerOptions, Completeness, ImplicitOperation, Locator, MemberKind,
+    AuthoredClassDecoratorIdentity, AuthoredConcurrencyEffect, AuthoredNormalReturnTypeRefinement,
+    AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget, AuthoredSemanticModelPack,
+    AuthoredShard, AuthoredSummaryEffect, AuthoredSummaryExitKind, AuthoredSummaryInput,
+    AuthoredSummaryOutput, AuthoredSummaryTransfer, CatalogCoordinate, CatalogOptions,
+    CompilerOptions, Completeness, ImplicitOperation, Locator, MemberKind,
     ProcedureSummaryTargetKey, SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
     SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferOperation,
@@ -900,6 +901,8 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                 conditional_result_refinements: Vec::new(),
                 conditional_indirect_writes: Vec::new(),
                 normal_return_refinements: Vec::new(),
+                normal_return_type_refinements: Vec::new(),
+                class_decorator_identity: None,
             }],
         },
     });
@@ -1652,6 +1655,60 @@ fn unsupported_effects_fail_closed_and_value_transfer_facts_export() {
     assert!(matches!(
         effect_error,
         CsmiExportError::Unsupported { path, .. } if path.contains("procedureSummaries")
+    ));
+
+    let mut type_refinement = authored_exact_pack();
+    {
+        let AuthoredPayload::DeclarationFacts { members, .. } =
+            &mut type_refinement.shards[0].payload
+        else {
+            panic!("declaration shard has the wrong payload");
+        };
+        let signature = members[0]
+            .signature
+            .as_mut()
+            .expect("callable fixture has a signature");
+        let mut parameter = signature.parameters[0].clone();
+        parameter.name = Some("class".to_owned());
+        signature.parameters.push(parameter);
+    }
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut type_refinement.shards[1].payload
+    else {
+        panic!("summary shard has the wrong payload");
+    };
+    summaries[0].target.parameter_count = 2;
+    summaries[0].normal_return_type_refinements = vec![AuthoredNormalReturnTypeRefinement {
+        parameter_ordinal: 0,
+        class_parameter_ordinal: 1,
+        required_receiver_members: Vec::new(),
+    }];
+    let type_refinement_error = export_authored_csmi_pack(&type_refinement, &artifact, &options)
+        .expect_err("normal-return type refinements must not be approximated in CSMI core");
+    assert!(matches!(
+        type_refinement_error,
+        CsmiExportError::Unsupported { path, semantic }
+            if path.contains("procedureSummaries")
+                && semantic.contains("normal-return type refinements")
+    ));
+
+    let mut decorator_identity = authored_exact_pack();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut decorator_identity.shards[1].payload
+    else {
+        panic!("summary shard has the wrong payload");
+    };
+    summaries[0].class_decorator_identity = Some(AuthoredClassDecoratorIdentity {
+        direct: true,
+        factory_keywords: None,
+    });
+    let decorator_identity_error =
+        export_authored_csmi_pack(&decorator_identity, &artifact, &options)
+            .expect_err("class decorator identity must not be approximated in CSMI core");
+    assert!(matches!(
+        decorator_identity_error,
+        CsmiExportError::Unsupported { path, semantic }
+            if path.contains("procedureSummaries")
+                && semantic.contains("class decorator identity")
     ));
 
     let mut concurrency = authored_exact_pack();

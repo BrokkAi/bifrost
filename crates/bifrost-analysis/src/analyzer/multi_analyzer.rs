@@ -466,6 +466,15 @@ pub struct MultiAnalyzer {
     /// the same snapshot, rebuilt fresh whenever the snapshot itself is.
     analyzed_files_by_language:
         Arc<brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo<Language, Vec<ProjectFile>>>,
+    /// Calls to `resolve_definition_batch_with_source` recorded against this
+    /// exact analyzer instance. That function receives whatever `&dyn
+    /// IAnalyzer` its caller was given -- for a workspace, this `MultiAnalyzer`
+    /// itself, not one of its per-language delegates -- so the count belongs
+    /// here rather than being summed from `delegates` the way most other
+    /// test-hook counters are. Kept per instance (not a process-wide static)
+    /// so a batching test can read it from its own analyzer without another
+    /// concurrently running test inflating the count (issue #3010).
+    resolve_definition_batch_with_source_call_count: Arc<AtomicUsize>,
 }
 
 impl Default for MultiAnalyzer {
@@ -484,6 +493,9 @@ impl Clone for MultiAnalyzer {
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
             analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
+            resolve_definition_batch_with_source_call_count: Arc::clone(
+                &self.resolve_definition_batch_with_source_call_count,
+            ),
         }
     }
 }
@@ -528,6 +540,7 @@ impl MultiAnalyzer {
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
+            resolve_definition_batch_with_source_call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -577,6 +590,7 @@ impl MultiAnalyzer {
             analyzed_files_by_language: Arc::new(
                 brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
             ),
+            resolve_definition_batch_with_source_call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1168,25 +1182,33 @@ impl TypeHierarchyProvider for MultiAnalyzer {
 /// Language support is stated per member, never defaulted: a member whose
 /// language has no landed family answers `unsupported`, even though this
 /// composite exposes a provider for the workspace as a whole.
-/// Java keeps an explicit arm because its relation needs the *composite*
-/// hierarchy: a Kotlin class can extend a Java class, so passing `self` as the
-/// hierarchy source is the whole reason the relation takes it separately.
-/// Every other language's family is answered by its own delegate, which is
-/// what a structural relation like Go's requires: its satisfaction index is
-/// built from Go sources alone, and no other realm can contribute an edge to
-/// it.
+/// Java and Scala keep explicit arms because their relations need the
+/// *composite* hierarchy: a Kotlin class can extend a Java class and a Scala
+/// class can extend a Java class, so passing `self` as the hierarchy source is
+/// the whole reason the relation takes it separately.
+///
+/// Every other language's family is answered by its own delegate. That is what
+/// a structural relation like Go's requires -- its satisfaction index is built
+/// from Go sources alone -- and it is also right for C#, whose types no other
+/// realm can extend.
 impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
     fn member_family_capability(
         &self,
         member: &CodeUnit,
     ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
-        if language_for_file(member.source()) == Language::Java {
-            return crate::analyzer::usages::java_member_family_capability(self, member);
+        match language_for_file(member.source()) {
+            Language::Java => crate::analyzer::usages::java_member_family_capability(self, member),
+            Language::Scala => {
+                crate::analyzer::usages::scala_member_family_capability(self, member)
+            }
+            _ => self
+                .delegate_for_code_unit(member)
+                .and_then(|delegate| delegate.analyzer().member_family_provider())
+                .map(|provider| provider.member_family_capability(member))
+                .unwrap_or(
+                    crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported,
+                ),
         }
-        self.delegate_for_code_unit(member)
-            .and_then(|delegate| delegate.analyzer().member_family_provider())
-            .map(|provider| provider.member_family_capability(member))
-            .unwrap_or(crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported)
     }
 
     fn member_family(
@@ -1194,13 +1216,19 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        if language_for_file(member.source()) == Language::Java {
-            return crate::analyzer::usages::java_member_family(self, self, member, cancellation);
+        match language_for_file(member.source()) {
+            Language::Java => {
+                crate::analyzer::usages::java_member_family(self, self, member, cancellation)
+            }
+            Language::Scala => {
+                crate::analyzer::usages::scala_member_family(self, self, member, cancellation)
+            }
+            _ => self
+                .delegate_for_code_unit(member)
+                .and_then(|delegate| delegate.analyzer().member_family_provider())
+                .map(|provider| provider.member_family(member, cancellation))
+                .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer),
         }
-        self.delegate_for_code_unit(member)
-            .and_then(|delegate| delegate.analyzer().member_family_provider())
-            .map(|provider| provider.member_family(member, cancellation))
-            .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer)
     }
 }
 
@@ -1583,6 +1611,21 @@ impl IAnalyzer for MultiAnalyzer {
         files.sort();
         files.dedup();
         files
+    }
+
+    fn workspace_declarations_with_primary_ranges(
+        &self,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Vec<(CodeUnit, Option<Range>)>> {
+        let mut declarations = Vec::new();
+        for delegate in self.delegates.values() {
+            declarations.extend(
+                delegate
+                    .analyzer()
+                    .workspace_declarations_with_primary_ranges(cancellation)?,
+            );
+        }
+        (!cancellation.is_cancelled()).then_some(declarations)
     }
 
     fn invalidate_cached_file_identities(&self) {
@@ -1970,6 +2013,9 @@ impl IAnalyzer for MultiAnalyzer {
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
             analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
+            resolve_definition_batch_with_source_call_count: Arc::clone(
+                &self.resolve_definition_batch_with_source_call_count,
+            ),
         }
     }
 
@@ -2349,6 +2395,15 @@ impl IAnalyzer for MultiAnalyzer {
             .abstract_member_implementations(code_unit)
     }
 
+    fn declaration_definition_peers(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::structural::DeclarationDefinitionPeers> {
+        self.delegate_for_file(file)?
+            .analyzer()
+            .declaration_definition_peers(file)
+    }
+
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         self.delegates
             .values()
@@ -2659,6 +2714,26 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .relational_definition_batch_call_count_for_test()
             })
             .sum()
+    }
+
+    // `resolve_definition_batch_with_source` is called with whatever
+    // `&dyn IAnalyzer` its caller holds, which for a workspace is this
+    // `MultiAnalyzer` itself rather than one of `delegates`. The count
+    // therefore lives on this instance directly instead of being summed from
+    // the delegates the way the other counters above are.
+    fn record_resolve_definition_batch_with_source_call_for_test(&self) {
+        self.resolve_definition_batch_with_source_call_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {
+        self.resolve_definition_batch_with_source_call_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
+        self.resolve_definition_batch_with_source_call_count
+            .load(Ordering::Relaxed)
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {

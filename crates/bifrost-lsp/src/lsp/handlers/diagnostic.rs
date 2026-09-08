@@ -1,18 +1,25 @@
+use brokk_bifrost_analysis::code_quality::{UnusedImportCertainty, unused_imports_for_file};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, FullDocumentDiagnosticReport, NumberOrString,
-    RelatedFullDocumentDiagnosticReport, Uri,
+    Diagnostic, DiagnosticSeverity, DiagnosticTag, DocumentDiagnosticParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
+    NumberOrString, RelatedFullDocumentDiagnosticReport, Uri,
 };
 use tree_sitter::Parser;
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::{ParseError, ParseErrorKind, Project, SemanticDiagnostic, WorkspaceAnalyzer};
+use crate::analyzer::{
+    ParseError, ParseErrorKind, Project, ProjectFile, SemanticDiagnostic, WorkspaceAnalyzer,
+};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
 
 const DIAGNOSTIC_SOURCE: &str = "bifrost-tree-sitter";
+/// The `source` and `code` an unused-import hint carries. Both are stable
+/// wire values: a client filters or suppresses on them.
+const UNUSED_IMPORT_SOURCE: &str = "bifrost-unused-imports";
+const UNUSED_IMPORT_CODE: &str = "unused-import";
 
 /// Pull-model diagnostic provider. Surfaces tree-sitter `ERROR` / `MISSING`
 /// nodes as LSP Diagnostics. Tries the analyzer's cached parse-error list
@@ -94,16 +101,64 @@ fn build_report(
         .into_iter()
         .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
         .collect();
-    if diagnostics.is_empty() && include_semantic_diagnostics {
-        diagnostics.extend(
-            workspace
-                .analyzer()
-                .semantic_diagnostics(&project_file, &content)
-                .into_iter()
-                .map(|diagnostic| semantic_diagnostic_to_lsp(diagnostic, &content, &line_starts)),
-        );
+    if diagnostics.is_empty() {
+        // Both of these read the file's derived facts, which describe a
+        // syntax tree the file does not currently have while it holds a parse
+        // error. A file that parses is the precondition for either.
+        if include_semantic_diagnostics {
+            diagnostics.extend(
+                workspace
+                    .analyzer()
+                    .semantic_diagnostics(&project_file, &content)
+                    .into_iter()
+                    .map(|diagnostic| {
+                        semantic_diagnostic_to_lsp(diagnostic, &content, &line_starts)
+                    }),
+            );
+        }
+        diagnostics.extend(unused_import_diagnostics(
+            workspace,
+            &project_file,
+            &content,
+            &line_starts,
+        ));
     }
     Some(diagnostics)
+}
+
+/// The file's provably unreferenced imports, as `Unnecessary`-tagged hints.
+///
+/// Only [`UnusedImportCertainty::Unreferenced`] findings are published. A
+/// finding whose certainty names an ambient use the derivation could not rule
+/// out (a JSX file, whose factory name is a build setting) is evidence for a
+/// consumer that reads certainty, not a claim to grey out a line in an editor.
+///
+/// `DiagnosticTag::Unnecessary` is the LSP's own tag for exactly this: a
+/// client renders the tagged range faded instead of underlining it, which is
+/// why the severity is `HINT` rather than `WARNING`. A wrong hint costs a user
+/// a greyed-out line; a wrong warning costs them a problem-list entry.
+fn unused_import_diagnostics(
+    workspace: &WorkspaceAnalyzer,
+    project_file: &ProjectFile,
+    content: &str,
+    line_starts: &[usize],
+) -> Vec<Diagnostic> {
+    unused_imports_for_file(workspace.analyzer(), project_file)
+        .findings
+        .into_iter()
+        .filter(|finding| finding.certainty == UnusedImportCertainty::Unreferenced)
+        .map(|finding| Diagnostic {
+            range: byte_range_to_lsp_range(content, line_starts, &finding.range),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String(UNUSED_IMPORT_CODE.to_string())),
+            code_description: None,
+            source: Some(UNUSED_IMPORT_SOURCE.to_string()),
+            message: format!("unused import `{}`", finding.local_name),
+            related_information: None,
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            data: None,
+        })
+        .collect()
 }
 
 /// Render a cached [`ParseError`] into the LSP `Diagnostic` shape. Both the

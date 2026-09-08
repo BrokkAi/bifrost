@@ -1,5 +1,8 @@
 use super::selectors::*;
 use super::*;
+use crate::analyzer::lexical_definitions::{
+    LexicalBindingResolution, LexicalDefinition, c_label_usage_ranges, resolve_lexical_binding,
+};
 use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
 use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, DeclarationId, QueryScope};
 use crate::cancellation::CancellationToken;
@@ -114,6 +117,15 @@ pub struct ScanUsagesScope {
     pub paths_omitted: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored_paths: Option<usize>,
+    /// Requested `paths` selectors that name no workspace file and no
+    /// workspace directory, spelled as the caller wrote them. A selector that
+    /// selects nothing cannot support an absence claim, so every entry of a
+    /// response carrying this list is reported incomplete (#3092). Bounded
+    /// like `paths`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unmatched_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmatched_paths_omitted: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,11 +217,17 @@ pub enum ScanUsagesIncompleteReason {
     TimeBudget,
     CandidateFiles,
     SourceBytes,
+    /// An admitted source file or its syntax could not be loaded.
+    SourceUnavailable,
     Callsites,
     ResponseBudget,
     /// The selector matched more declarations than the tool will resolve, so
     /// no candidate list was produced. See [`TooManyResolutionCandidates`].
     ResolutionCandidates,
+    /// One or more `paths` selectors selected no file the scan could search, so
+    /// the answer covers less of the workspace than the request named and
+    /// cannot prove absence there (#3092).
+    UnmatchedPaths,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -730,6 +748,11 @@ pub(super) fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static
 }
 
 pub(super) enum ScanUsageTargetResolution {
+    Lexical {
+        symbol: String,
+        file: ProjectFile,
+        definition: LexicalDefinition,
+    },
     Resolved {
         symbol: String,
         overloads: Vec<CodeUnit>,
@@ -787,6 +810,9 @@ pub(super) struct ScanUsagesQueryScope {
     include_tests: bool,
     ignored_paths: usize,
     session_subset: Option<SubsetCoverage>,
+    /// Selectors that name nothing in this workspace: no file, no directory,
+    /// and, for a glob, no path it matches (#3092).
+    unmatched_paths: Vec<String>,
 }
 
 impl ScanUsagesQueryScope {
@@ -797,6 +823,7 @@ impl ScanUsagesQueryScope {
             include_tests,
             ignored_paths: built.ignored_paths,
             session_subset: session_subset(analyzer),
+            unmatched_paths: built.unmatched_paths,
         }
     }
 
@@ -810,6 +837,8 @@ impl ScanUsagesQueryScope {
             .as_deref()
             .map(ScanUsagesPathFilter::summarized_paths)
             .unwrap_or_default();
+        let (unmatched_paths, unmatched_paths_omitted) =
+            bounded_scope_paths(self.unmatched_paths.iter().map(String::as_str));
         ScanUsagesScope {
             include_tests: self.include_tests,
             whole_workspace: self.whole_workspace(),
@@ -817,6 +846,8 @@ impl ScanUsagesQueryScope {
             paths,
             paths_omitted,
             ignored_paths: some_if_nonzero(self.ignored_paths),
+            unmatched_paths,
+            unmatched_paths_omitted,
         }
     }
 }
@@ -923,6 +954,210 @@ pub(super) enum ScanUsagesWorkEntry {
     },
 }
 
+fn macro_lexical_usage_rows(
+    analyzer: &dyn IAnalyzer,
+    target_file: &ProjectFile,
+    target_definition: &LexicalDefinition,
+    path_filter: Option<&ScanUsagesPathFilter>,
+    include_tests: bool,
+    context: &ScanUsagesExecutionContext,
+) -> (Vec<UsageHitRow>, Option<ScanUsagesIncompleteReason>, bool) {
+    let test_files = (!include_tests).then(|| TestFileExclusion::new(analyzer));
+    let mut files = crate::analyzer::usages::macro_lexical::macro_lexical_candidate_files(
+        analyzer,
+        target_file,
+        &context.cancellation,
+    );
+    files.retain(|file| {
+        path_filter.is_none_or(|filter| filter.matches(file))
+            && test_files
+                .as_ref()
+                .is_none_or(|tests| !tests.excludes(file))
+    });
+    files.sort_by_key(|file| (file != target_file, file.clone()));
+    if files.len() > context.max_candidate_files {
+        return (
+            Vec::new(),
+            Some(ScanUsagesIncompleteReason::CandidateFiles),
+            false,
+        );
+    }
+    let mut rows = Vec::new();
+    let mut source_bytes = 0usize;
+    for file in files {
+        if context.cancellation.is_cancelled() {
+            return (rows, Some(context.interruption_reason()), false);
+        }
+        let Some(source) = analyzer.indexed_source(&file) else {
+            return (
+                rows,
+                Some(ScanUsagesIncompleteReason::SourceUnavailable),
+                false,
+            );
+        };
+        source_bytes = source_bytes.saturating_add(source.len());
+        if source_bytes > context.max_source_bytes {
+            return (rows, Some(ScanUsagesIncompleteReason::SourceBytes), false);
+        }
+        let syntax = DeclarationNameRangeContext::new(&file, source);
+        let source = syntax.content();
+        let Some(root) = syntax.root_node() else {
+            return (
+                rows,
+                Some(ScanUsagesIncompleteReason::SourceUnavailable),
+                false,
+            );
+        };
+        let usages = crate::analyzer::usages::macro_lexical::macro_lexical_references(
+            analyzer,
+            &file,
+            root,
+            source,
+            usize::MAX,
+            || context.cancellation.is_cancelled(),
+        );
+        if usages.cancelled {
+            return (rows, Some(context.interruption_reason()), false);
+        }
+        if usages.truncated {
+            return (rows, Some(ScanUsagesIncompleteReason::Callsites), true);
+        }
+        let line_starts = syntax.line_starts();
+        for (range, binding) in usages.references {
+            if binding.definition != *target_file
+                || binding.name_range.start != target_definition.name_range.start_byte
+                || binding.name_range.end != target_definition.name_range.end_byte
+            {
+                continue;
+            }
+            if rows.len() == context.max_callsites {
+                return (rows, None, true);
+            }
+            let start = crate::text_utils::line_column_for_offset(source, line_starts, range.start);
+            let end = crate::text_utils::line_column_for_offset(source, line_starts, range.end);
+            let line_start = line_starts[start.0 - 1];
+            let line_end = line_starts.get(start.0).copied().unwrap_or(source.len());
+            let source_range = Range {
+                start_byte: range.start,
+                end_byte: range.end,
+                start_line: start.0 - 1,
+                end_line: end.0 - 1,
+            };
+            let enclosing = analyzer
+                .enclosing_code_unit(&file, &source_range)
+                .map(|unit| unit.fq_name())
+                .unwrap_or_else(|| rel_path_string(&file));
+            rows.push(UsageHitRow {
+                path: rel_path_string(&file),
+                line: start.0,
+                column: Some(start.1),
+                end_line: Some(end.0),
+                end_column: Some(end.1),
+                start_offset: range.start,
+                end_offset: range.end,
+                enclosing,
+                kind: UsageHitKind::Reference,
+                snippet: source[line_start..line_end].trim_end().to_owned(),
+                confidence: 1.0,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.path, left.start_offset).cmp(&(&right.path, right.start_offset))
+    });
+    rows.dedup_by(|left, right| {
+        left.path == right.path
+            && left.start_offset == right.start_offset
+            && left.end_offset == right.end_offset
+    });
+    (rows, None, false)
+}
+
+fn lexical_label_usage_rows(
+    analyzer: &dyn IAnalyzer,
+    target_file: &ProjectFile,
+    target_definition: &LexicalDefinition,
+    path_filter: Option<&ScanUsagesPathFilter>,
+    include_tests: bool,
+    context: &ScanUsagesExecutionContext,
+) -> (Vec<UsageHitRow>, Option<ScanUsagesIncompleteReason>, bool) {
+    let test_files = (!include_tests).then(|| TestFileExclusion::new(analyzer));
+    if context.cancellation.is_cancelled()
+        || language_for_file(target_file) != Language::Cpp
+        || path_filter.is_some_and(|filter| !filter.matches(target_file))
+        || test_files
+            .as_ref()
+            .is_some_and(|tests| tests.excludes(target_file))
+    {
+        return (
+            Vec::new(),
+            context
+                .cancellation
+                .is_cancelled()
+                .then(|| context.interruption_reason()),
+            false,
+        );
+    }
+    let Some(source) = analyzer.indexed_source(target_file) else {
+        return (Vec::new(), None, false);
+    };
+    if source.len() > context.max_source_bytes {
+        return (
+            Vec::new(),
+            Some(ScanUsagesIncompleteReason::SourceBytes),
+            false,
+        );
+    }
+    let mut rows = Vec::new();
+    let syntax_context = DeclarationNameRangeContext::new(target_file, source);
+    let source = syntax_context.content();
+    let Some(root) = syntax_context.root_node() else {
+        return (rows, None, false);
+    };
+    let line_starts = syntax_context.line_starts();
+    let usages = c_label_usage_ranges(
+        root,
+        source,
+        target_definition,
+        context.max_callsites,
+        || context.cancellation.is_cancelled(),
+    );
+    if usages.cancelled {
+        return (rows, Some(context.interruption_reason()), false);
+    }
+    for range in usages.ranges {
+        let start =
+            crate::text_utils::line_column_for_offset(source, line_starts, range.start_byte);
+        let end = crate::text_utils::line_column_for_offset(source, line_starts, range.end_byte);
+        let line_start = line_starts[start.0.saturating_sub(1)];
+        let line_end = line_starts.get(start.0).copied().unwrap_or(source.len());
+        let snippet = source[line_start..line_end].trim_end().to_owned();
+        let enclosing = analyzer
+            .enclosing_code_unit(target_file, &range)
+            .map(|unit| unit.fq_name().to_owned())
+            .unwrap_or_else(|| rel_path_string(target_file));
+        rows.push(UsageHitRow {
+            path: rel_path_string(target_file),
+            line: start.0,
+            column: Some(start.1),
+            end_line: Some(end.0),
+            end_column: Some(end.1),
+            start_offset: range.start_byte,
+            end_offset: range.end_byte,
+            enclosing,
+            kind: UsageHitKind::Reference,
+            snippet,
+            confidence: 1.0,
+        });
+    }
+    rows.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_offset.cmp(&right.start_offset))
+    });
+    (rows, None, usages.truncated)
+}
+
 impl ScanUsagesWorkEntry {
     fn index(&self) -> usize {
         match self {
@@ -993,6 +1228,10 @@ fn incomplete_recovery_message(
                 surface.tool_name()
             )
         }
+        ScanUsagesIncompleteReason::SourceUnavailable => format!(
+            "Source or syntax was unavailable for an admitted file; {} could not complete the reference scan.",
+            surface.tool_name()
+        ),
         ScanUsagesIncompleteReason::Callsites => format!(
             "usage analysis exhausted its callsite budget; narrow `paths` or use a more specific selector, then re-call {}",
             surface.tool_name()
@@ -1003,6 +1242,10 @@ fn incomplete_recovery_message(
         ),
         ScanUsagesIncompleteReason::ResolutionCandidates => format!(
             "the selector matched more declarations than usage analysis will resolve; qualify it (or use `path#symbol` from a previous ambiguous reply), then re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::UnmatchedPaths => format!(
+            "one or more `paths` selectors selected no searchable file, so this answer covers less than the request named; check the spelling in `scope.unmatched_paths` against the workspace tree, then re-call {}",
             surface.tool_name()
         ),
     }
@@ -1213,6 +1456,42 @@ pub(super) fn character_column_for_byte(source: &str, line: usize, byte: usize) 
     Some(slice.chars().count() + 1)
 }
 
+fn c_label_on_line(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    line: usize,
+    selector: Option<&str>,
+) -> Option<(String, LexicalDefinition)> {
+    let mut candidates = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "labeled_statement"
+            && node.start_position().row + 1 == line
+            && let Some(label) = node.child_by_field_name("label")
+            && let Some(identifier) = source.get(label.byte_range())
+            && selector.is_none_or(|requested| requested == identifier)
+            && let Some(definition) = resolve_lexical_binding(
+                Language::Cpp,
+                root,
+                source,
+                label.start_byte(),
+                label.end_byte(),
+                identifier,
+            )
+            && let LexicalBindingResolution::OtherLocal(definition) = definition
+            && definition.kind == DeclarationKind::StatementLabel
+        {
+            candidates.push((identifier.to_owned(), definition));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
 pub(super) fn resolve_scan_usages_target(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -1345,6 +1624,59 @@ pub(super) fn resolve_scan_usages_target(
     };
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
+    let source = range_context.content();
+
+    if let ScanUsagesLocationSelection::Point(point) = selection
+        && language_for_file(&file) == Language::Cpp
+        && let Some(root) = range_context.root_node()
+        && let Some(definition) = crate::analyzer::usages::macro_lexical::macro_lexical_definition(
+            analyzer,
+            &file,
+            root,
+            source,
+            point,
+            point.saturating_add(1),
+        )
+        && selector.is_none_or(|requested| requested == definition.identifier)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol: definition.identifier.clone(),
+            file: definition.source_file.clone().unwrap_or(file),
+            definition,
+        };
+    }
+
+    if let ScanUsagesLocationSelection::Point(point) = selection
+        && let Some(root) = range_context.root_node()
+        && let Some(node) = root.named_descendant_for_byte_range(point, point.saturating_add(1))
+        && let Some(identifier) = source.get(node.byte_range())
+        && let Some(LexicalBindingResolution::OtherLocal(definition)) = resolve_lexical_binding(
+            Language::Cpp,
+            root,
+            source,
+            node.start_byte(),
+            node.end_byte(),
+            identifier,
+        )
+        && definition.kind == DeclarationKind::StatementLabel
+        && selector.is_none_or(|requested| requested == identifier)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol: identifier.to_owned(),
+            file,
+            definition,
+        };
+    }
+    if let ScanUsagesLocationSelection::Line(line) = selection
+        && let Some(root) = range_context.root_node()
+        && let Some((symbol, definition)) = c_label_on_line(root, source, line, selector)
+    {
+        return ScanUsageTargetResolution::Lexical {
+            symbol,
+            file,
+            definition,
+        };
+    }
 
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         let path = rel_path_string(&file);
@@ -2124,6 +2456,65 @@ fn scan_usages_backend_on_pool(
             continue;
         }
         match resolution {
+            ScanUsageTargetResolution::Lexical {
+                symbol,
+                file,
+                definition,
+            } => {
+                let scan = if definition.kind == DeclarationKind::StatementLabel {
+                    lexical_label_usage_rows
+                } else {
+                    macro_lexical_usage_rows
+                };
+                let (rows, incomplete_reason, truncated) = scan(
+                    analyzer,
+                    &file,
+                    &definition,
+                    query_scope.path_filter.as_deref(),
+                    include_tests,
+                    context,
+                );
+                if let Some(reason) = incomplete_reason {
+                    work_entries.push(incomplete_work_entry(request, Some(symbol), reason));
+                    continue;
+                }
+                let resolved_definition = ResolvedUsageDefinition {
+                    fq_name: symbol.clone(),
+                    path: rel_path_string(&file),
+                    line: definition.name_range.start_line,
+                };
+                let state = SymbolUsageRenderState::new(
+                    symbol.clone(),
+                    Some(resolved_definition),
+                    false,
+                    0,
+                    rows,
+                    0,
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                    include_same_owner,
+                );
+                if truncated {
+                    work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
+                        request,
+                        state,
+                        short_name: symbol,
+                        total_callsites: context.max_callsites.saturating_add(1),
+                        limit: context.max_callsites,
+                        target_is_method: false,
+                    });
+                } else {
+                    work_entries.push(ScanUsagesWorkEntry::Usage {
+                        request,
+                        state,
+                        candidate_files_sample: None,
+                        target_is_method: false,
+                        incomplete_reason: None,
+                    });
+                }
+            }
             ScanUsageTargetResolution::Resolved { symbol, overloads } => {
                 resolved_targets.push(IndexedResolvedScanTarget {
                     request,
@@ -2798,7 +3189,9 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     assert!(params.depth > 0, "usage_graph depth must be positive");
 
     let rooted = params.paths.is_some();
-    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
+    let built_path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
+    let unmatched_paths = built_path_filter.unmatched_paths;
+    let path_filter = built_path_filter.filter;
     let test_files = test_file_exclusion(analyzer, params.include_tests);
 
     let eligible_files: Vec<ProjectFile> = analyzer
@@ -3799,6 +4192,22 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             message: "one or more symbols exceeded the call-site enumeration limit".to_string(),
         });
     }
+    // Roots come from `paths`, so a selector that names nothing in the
+    // workspace silently removes part of the graph the caller asked for
+    // (#3092).
+    if !unmatched_paths.is_empty() {
+        let (listed, omitted) = bounded_scope_paths(unmatched_paths.iter().map(String::as_str));
+        let more = omitted
+            .map(|count| format!(" (+{count} more)"))
+            .unwrap_or_default();
+        incomplete_reasons.push(UsageGraphIncompleteReason {
+            code: "unmatched_paths".to_string(),
+            message: format!(
+                "these `paths` selectors name no workspace file or directory, so they contributed no graph roots: {}{more}",
+                listed.join(", ")
+            ),
+        });
+    }
     UsageGraphResult {
         complete: incomplete_reasons.is_empty(),
         session_subset: session_subset(analyzer),
@@ -4274,8 +4683,13 @@ pub(super) fn render_scan_usages_with_budget(
 ) -> ScanUsagesResult {
     let mut entries = entries;
     loop {
-        let results: Vec<ScanUsagesEntry> =
+        let mut results: Vec<ScanUsagesEntry> =
             entries.iter().map(classify_scan_usages_entry).collect();
+        if !scope.unmatched_paths.is_empty() {
+            for entry in &mut results {
+                downgrade_for_unmatched_paths(entry, surface);
+            }
+        }
         let summary = build_scan_usages_summary(&results);
         let result = ScanUsagesResult {
             surface,
@@ -4295,6 +4709,40 @@ pub(super) fn render_scan_usages_with_budget(
         {
             return result;
         }
+    }
+}
+
+/// Withdraw an entry's proof claim because part of the requested scope was
+/// never searched.
+///
+/// A `paths` selector that selects no file leaves a hole in the scan, and a
+/// hole is exactly what an absence verdict must not be built on: a request
+/// scoped to a directory whose spelling matched nothing used to answer
+/// `verified_absent` over zero files (#3092). Absence-shaped statuses drop to
+/// `unverified_absent` with the same `scan_incomplete` caveat every other
+/// short scan uses; a hit that was actually found stays found, since an
+/// unsearched selector cannot unfind it.
+fn downgrade_for_unmatched_paths(entry: &mut ScanUsagesEntry, surface: ScanUsagesSurface) {
+    if matches!(
+        entry.status,
+        ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::NoExternalUsages
+    ) {
+        entry.status = ScanUsagesStatus::UnverifiedAbsent;
+    }
+    if entry.status == ScanUsagesStatus::UnverifiedAbsent
+        && !entry
+            .absence_caveats
+            .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete)
+    {
+        entry
+            .absence_caveats
+            .push(ScanUsagesAbsenceCaveat::ScanIncomplete);
+    }
+    // A scan that also ran out of time or budget keeps that reason: it is the
+    // more specific account of what was not searched, and the entry is already
+    // incomplete either way.
+    if entry.incomplete_reason.is_none() {
+        mark_incomplete(entry, ScanUsagesIncompleteReason::UnmatchedPaths, surface);
     }
 }
 
@@ -4471,11 +4919,13 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                     ScanUsagesIncompleteReason::TimeBudget => "time_budget",
                     ScanUsagesIncompleteReason::CandidateFiles => "candidate_files_budget",
                     ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
+                    ScanUsagesIncompleteReason::SourceUnavailable => "source_unavailable",
                     ScanUsagesIncompleteReason::Callsites => "callsites_budget",
                     ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
                     ScanUsagesIncompleteReason::ResolutionCandidates => {
                         "resolution_candidates_budget"
                     }
+                    ScanUsagesIncompleteReason::UnmatchedPaths => "unmatched_paths",
                 }
                 .to_string(),
             );
@@ -5564,45 +6014,74 @@ pub(super) struct ScanUsagesPathFilter {
 pub(super) struct BuiltScanUsagesPathFilter {
     filter: Option<Arc<ScanUsagesPathFilter>>,
     ignored_paths: usize,
+    /// Selectors that name no workspace file and no workspace directory. They
+    /// select nothing, so an absence they "prove" is an absence over zero
+    /// files (#3092).
+    unmatched_paths: Vec<String>,
 }
 
+/// One `paths` entry: what the caller wrote, and what this workspace makes of
+/// it. The spelling is kept so a selector that selects nothing can be named
+/// back to the caller as the caller wrote it.
 #[derive(Debug, Clone)]
-pub(super) enum ScanUsagesPathRule {
-    Glob(Pattern),
-    Exact(String),
+pub(super) struct ScanUsagesPathRule {
+    selector: String,
+    matcher: WorkspacePathSelector,
 }
 
 impl ScanUsagesPathFilter {
     fn matches(&self, file: &ProjectFile) -> bool {
         let rel = rel_path_string(file);
-        self.rules.iter().any(|rule| match rule {
-            ScanUsagesPathRule::Glob(glob) => glob.matches_with(&rel, strict_separator_options()),
-            ScanUsagesPathRule::Exact(path) => rel == *path,
-        })
+        self.rules.iter().any(|rule| rule.matcher.matches(&rel))
     }
 
     fn summarized_paths(&self) -> (Vec<String>, Option<usize>) {
         let mut seen = HashSet::default();
-        let mut paths = Vec::new();
-        let mut unique_count = 0usize;
-        for rule in &self.rules {
-            let path = match rule {
-                ScanUsagesPathRule::Glob(glob) => glob.as_str(),
-                ScanUsagesPathRule::Exact(path) => path.as_str(),
-            };
-            if !seen.insert(path) {
-                continue;
-            }
-            unique_count += 1;
-            if paths.len() < SCAN_USAGES_SCOPE_PATH_LIMIT {
-                paths.push(truncate_scan_usages_scope_path(path));
-            }
-        }
-        let paths_omitted = unique_count
-            .checked_sub(paths.len())
-            .and_then(some_if_nonzero);
-        (paths, paths_omitted)
+        // A selector that resolved to nothing still names the scope the caller
+        // asked for, so it stays listed here as written; `unmatched_paths`
+        // is what says it selected no file.
+        bounded_scope_paths(
+            self.rules
+                .iter()
+                .flat_map(|rule| {
+                    let paths: Vec<&str> = rule
+                        .matcher
+                        .scope_paths()
+                        .into_iter()
+                        .filter(|path| !path.is_empty())
+                        .collect();
+                    // Nothing displayable: an unmatched selector, or the
+                    // workspace root, whose prefix is the empty string. Either
+                    // way the caller's own spelling is the honest answer.
+                    if paths.is_empty() {
+                        vec![rule.selector.as_str()]
+                    } else {
+                        paths
+                    }
+                })
+                .filter(|path| seen.insert(*path)),
+        )
     }
+}
+
+/// Fit a reported selector list into the response: every entry truncated to
+/// the scope path budget, the list capped, and the count left out returned
+/// alongside.
+///
+/// A request may name hundreds of selectors, each of any length, so any list
+/// echoed back has to be bounded the same way or one request's `paths` becomes
+/// the whole response.
+fn bounded_scope_paths<'a>(paths: impl Iterator<Item = &'a str>) -> (Vec<String>, Option<usize>) {
+    let mut bounded = Vec::new();
+    let mut total = 0usize;
+    for path in paths {
+        total += 1;
+        if bounded.len() < SCAN_USAGES_SCOPE_PATH_LIMIT {
+            bounded.push(truncate_scan_usages_scope_path(path));
+        }
+    }
+    let omitted = total.checked_sub(bounded.len()).and_then(some_if_nonzero);
+    (bounded, omitted)
 }
 
 pub(super) fn truncate_scan_usages_scope_path(path: &str) -> String {
@@ -5624,49 +6103,79 @@ pub(super) fn build_scan_usages_path_filter(
         return BuiltScanUsagesPathFilter {
             filter: None,
             ignored_paths: 0,
+            unmatched_paths: Vec::new(),
         };
     };
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut rules = Vec::new();
     let mut ignored_paths = 0;
+    let mut unmatched_paths = Vec::new();
     for raw in paths {
-        let normalized = normalize_pattern(raw.trim());
-        if normalized.is_empty() {
-            ignored_paths += 1;
-            continue;
-        }
-        if is_glob_pattern(&normalized) {
-            if let Ok(glob) = Pattern::new(&normalized) {
-                rules.push(ScanUsagesPathRule::Glob(glob));
-            } else {
+        let selector = raw.trim().to_string();
+        let matcher = resolver.classify_selector(&selector);
+        match matcher {
+            // A blank entry or an uncompilable glob narrows nothing and is
+            // reported as an ignored path, exactly as before the shared
+            // classifier existed.
+            WorkspacePathSelector::Invalid => {
                 ignored_paths += 1;
+                continue;
             }
-            continue;
+            // Kept as a rule even though it selects nothing: dropping it would
+            // widen the scope to the whole workspace, which is the opposite of
+            // what the caller asked for.
+            WorkspacePathSelector::Unmatched => unmatched_paths.push(selector.clone()),
+            WorkspacePathSelector::Glob(_)
+            | WorkspacePathSelector::Files(_)
+            | WorkspacePathSelector::Directory(_) => {}
         }
-        match resolver.resolve_literal(&normalized) {
-            ResolvedFileInput::File(file) => {
-                rules.push(ScanUsagesPathRule::Exact(rel_path_string(&file)));
-            }
-            ResolvedFileInput::Ambiguous(item) => {
-                rules.extend(item.matches.into_iter().map(ScanUsagesPathRule::Exact));
-            }
-            ResolvedFileInput::NotFound(_) => {
-                rules.push(ScanUsagesPathRule::Exact(normalized));
-            }
-        }
+        rules.push(ScanUsagesPathRule { selector, matcher });
     }
+    unmatched_paths.extend(unmatched_globs(analyzer, &rules));
     BuiltScanUsagesPathFilter {
         filter: (!rules.is_empty()).then(|| Arc::new(ScanUsagesPathFilter { rules })),
         ignored_paths,
+        unmatched_paths,
     }
 }
 
-pub(super) fn strict_separator_options() -> MatchOptions {
-    MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: true,
-        require_literal_leading_dot: false,
+/// The glob selectors in `rules` that no workspace path matches.
+///
+/// A file or directory selector proves itself while it is classified, but a
+/// glob is well formed whatever it names, so the only way to learn that it
+/// selects nothing is to try it against the workspace. That costs one pass
+/// over the session's already-cached listing, and only when the request
+/// carries a glob at all. The universe is the workspace listing rather than
+/// the analyzed set on purpose: a glob that matches a file this analyzer does
+/// not analyze still selected what the caller named, and absence in a file no
+/// language frontend reads is not in doubt.
+fn unmatched_globs(analyzer: &dyn IAnalyzer, rules: &[ScanUsagesPathRule]) -> Vec<String> {
+    let mut pending: Vec<usize> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| matches!(rule.matcher, WorkspacePathSelector::Glob(_)))
+        .map(|(index, _)| index)
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
     }
+    let Ok(listing) = analyzer.project().all_files_shared() else {
+        // A workspace whose listing failed cannot say what a glob matches.
+        // `resolve_literal` records that failure on the request boundary; do
+        // not turn it into an invented "this selector names nothing".
+        return Vec::new();
+    };
+    for file in listing.iter() {
+        if pending.is_empty() {
+            break;
+        }
+        let rel = rel_path_string(file);
+        pending.retain(|index| !rules[*index].matcher.matches(&rel));
+    }
+    pending
+        .into_iter()
+        .map(|index| rules[index].selector.clone())
+        .collect()
 }
 
 pub(super) fn serialized_char_count<T: Serialize>(value: &T) -> usize {
@@ -5940,7 +6449,13 @@ mod tests {
         );
         let analyzer = fixture.analyzer.analyzer();
 
-        crate::analyzer::usages::get_definition::reset_resolve_definition_batch_with_source_call_count_for_test();
+        // Read through this exact analyzer instance's own test-hook counter,
+        // not a process-wide static: a static here was inflated by any other
+        // test calling resolve_definition_batch_with_source concurrently
+        // (issue #3010).
+        analyzer
+            .test_hooks()
+            .reset_resolve_definition_batch_with_source_call_count_for_test();
         let graph = usage_graph(
             analyzer,
             UsageGraphParams {
@@ -5949,8 +6464,9 @@ mod tests {
                 depth: 1,
             },
         );
-        let calls =
-            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_call_count_for_test();
+        let calls = analyzer
+            .test_hooks()
+            .resolve_definition_batch_with_source_call_count_for_test();
 
         // Three ambiguous targets (Widget, Gadget, Sprocket) each called
         // twice from the same file are six fallback-eligible sites; batched

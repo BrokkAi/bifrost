@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::tree_walk::push_children_reversed;
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeUnit, IAnalyzer, Language, ProjectFile, parser_language_for,
 };
@@ -114,11 +115,7 @@ fn normalize_tree_sitter_clone_source(
             // invariance against ordinary identifiers.
             continue;
         }
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                stack.push(child);
-            }
-        }
+        push_children_reversed(node, &mut stack);
     }
 
     (normalized_tokens, ast_labels.join("|"), has_candidate)

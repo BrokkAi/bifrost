@@ -18,6 +18,7 @@ mod imports;
 mod semantic;
 mod source_artifact;
 mod structural;
+mod type_flow;
 
 pub use dependency_discovery::{
     PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE, resolve_php_semantic_pack_dependencies,
@@ -836,6 +837,10 @@ impl LanguageSupport for PhpSupport {
 
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         Some(&PhpSupport)
+    }
+
+    fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
+        Some(&type_flow::PhpTypeFlowAdapter)
     }
 
     /// Both expansions are supplemental. Composer autoload visibility means any analyzed

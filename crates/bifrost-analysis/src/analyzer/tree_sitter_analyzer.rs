@@ -40,11 +40,13 @@ use crate::analyzer::store::liveness::{
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
     ActiveSearchBlob, AnalyzerStore, GenerationId, HierarchyStorageKey, HydratedCandidateRow,
-    HydratedDefinitionOrderCandidateRow, HydratedMountedCandidateRow as MountedCandidateRow,
-    LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
-    RelationalStoreOutcome, RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest,
-    StoreError, WorkspaceAnchorRow, WorkspaceContentPackageFact, WorkspaceFileRow,
-    WorkspacePackageEdgeRow, WorkspacePackageFileRow, WorkspaceSnapshots,
+    HydratedDefinitionOrderCandidateRow,
+    HydratedMountedCandidatePrimaryRangeRow as MountedCandidatePrimaryRangeRow,
+    HydratedMountedCandidateRow as MountedCandidateRow, LimitedQueryRows, PathSymbolRow,
+    PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, RelationalStoreOutcome,
+    RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest, StoreError, WorkspaceAnchorRow,
+    WorkspaceContentPackageFact, WorkspaceFileRow, WorkspacePackageEdgeRow,
+    WorkspacePackageFileRow, WorkspaceSnapshots,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::tier_demand::TierDemand;
@@ -75,6 +77,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language as TsLanguage, ParseOptions, Parser, Tree};
+
+type DeclarationPrimaryRanges = Vec<(CodeUnit, Option<Range>)>;
 
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
@@ -392,6 +396,19 @@ pub(crate) struct AnalyzerStoreContext {
     /// Finished observers remain attached to the analyzer context but ignore
     /// later incremental work.
     pub(crate) build_tier_access: Arc<AnalyzerBuildTierAccess>,
+    /// The structural-fact entries every language delegate of this build
+    /// shares, and the one byte budget they are held under.
+    ///
+    /// A per-delegate budget was a per-delegate *pool*: ten delegates each
+    /// took an eighth of the shared memo budget, so a ten-language workspace
+    /// could retain 320 MiB of facts under a 256 MiB budget (#3065). The
+    /// entries are keyed by content and language ([`StructuralSnapshotKey`]),
+    /// so one pool serves every delegate without any of them being able to
+    /// read another's. Built by the first delegate constructed against this
+    /// context, from that build's configured budget; every later delegate
+    /// takes its own counters over the same entries.
+    pub(crate) structural_facts:
+        Arc<OnceLock<crate::analyzer::structural::provider::StructuralFactsCache>>,
 }
 
 /// Build-scoped view shared by all language delegates in one workspace build.
@@ -595,10 +612,32 @@ impl RevisionBlobIdentities {
     }
 }
 
+/// The content key one file's structural facts are both memoized and
+/// persisted under.
+///
+/// The three parts are everything the facts depend on: the blob oid of the
+/// exact source bytes, the storage language key that fixes which grammar and
+/// structural spec produced them, and that language's epoch generation, which
+/// rotates whenever the store's epoch salt changes. Nothing else about the
+/// file -- its path above all -- takes part, so the same bytes analyzed under
+/// the same epoch are the same facts wherever they appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StructuralSnapshotKey {
     oid: Oid,
-    lang: String,
+    lang: &'static str,
     generation: GenerationId,
+}
+
+impl StructuralSnapshotKey {
+    /// A key for a cache test that has no analyzer to derive one from.
+    #[cfg(test)]
+    pub(crate) fn for_test(source: &str, lang: &'static str) -> Self {
+        Self {
+            oid: Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("hash test source"),
+            lang,
+            generation: GenerationId::BOOTSTRAP,
+        }
+    }
 }
 
 pub(crate) fn ephemeral_store_context(
@@ -725,6 +764,7 @@ fn store_context_from_shared_store(
         generations: Arc::new(HashMap::default()),
         build_abort: Arc::new(BuildAbort::default()),
         build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+        structural_facts: Arc::new(OnceLock::new()),
     }
 }
 
@@ -2057,18 +2097,25 @@ impl Default for SourceBlobOidMemo {
 }
 
 impl SourceBlobOidMemo {
-    fn oid_of(&self, file: &ProjectFile, source: &str) -> Oid {
+    /// The identity of `file`'s exact `source`, derived by `identify` the
+    /// first time these bytes are asked about. `identify` runs once per
+    /// (file, bytes), which is what the #2917 hash count pins.
+    fn oid_of(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        identify: impl FnOnce() -> Option<Oid>,
+    ) -> Option<Oid> {
         let source_hash = crate::analyzer::structural::provider::hash_source(source);
         if let Some(known) = self.entries.get(file)
             && known.len == source.len()
             && known.source_hash == source_hash
         {
-            return known.oid;
+            return Some(known.oid);
         }
+        let oid = identify()?;
         #[cfg(any(test, feature = "test-support"))]
         self.hashes.fetch_add(1, Ordering::Relaxed);
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
-            .expect("hashing in-memory bytes as a blob cannot fail");
         self.entries.insert(
             file.clone(),
             SourceBlobIdentity {
@@ -2077,7 +2124,7 @@ impl SourceBlobOidMemo {
                 oid,
             },
         );
-        oid
+        Some(oid)
     }
 }
 
@@ -2901,7 +2948,7 @@ pub struct TreeSitterAnalyzer<A> {
     semantic_source_digests: crate::analyzer::semantic::service::SourceContentIdentityMemo,
     /// Blob oids already derived for a file's exact source bytes, so a query
     /// path that keys facts by content does not re-hash an unchanged file.
-    /// See [`Self::blob_oid_of`].
+    /// See [`Self::content_oid_of`].
     blob_oids: Arc<SourceBlobOidMemo>,
     store_context: AnalyzerStoreContext,
     /// Immutable path-to-blob identities for the source generation that built
@@ -2982,6 +3029,14 @@ pub struct TreeSitterAnalyzer<A> {
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
     relational_definition_batch_call_count: Arc<AtomicUsize>,
+    /// Calls to [`resolve_definition_batch_with_source`](crate::analyzer::usages::get_definition::resolve_definition_batch_with_source),
+    /// recorded per instance so a batching test can read it from the exact
+    /// analyzer under test instead of a process-wide static: a static count
+    /// is inflated by any other test running the same call concurrently
+    /// (issue #3010). Incremented through
+    /// [`AnalyzerTestHooks::record_resolve_definition_batch_with_source_call_for_test`]
+    /// because the call site holds only `&dyn IAnalyzer`.
+    resolve_definition_batch_with_source_call_count: Arc<AtomicUsize>,
     definition_candidate_row_read_count: Arc<AtomicUsize>,
     /// Candidate spellings dropped by `definition_candidate_short_names`
     /// because the persisted `short_name` vocabulary for this adapter's
@@ -3048,6 +3103,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
             relational_definition_batch_call_count: Arc::clone(
                 &self.relational_definition_batch_call_count,
+            ),
+            resolve_definition_batch_with_source_call_count: Arc::clone(
+                &self.resolve_definition_batch_with_source_call_count,
             ),
             definition_candidate_row_read_count: Arc::clone(
                 &self.definition_candidate_row_read_count,
@@ -3214,7 +3272,7 @@ where
             map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
-        let structural_cache = Arc::new(Self::build_structural_cache(&config));
+        let structural_cache = Arc::new(Self::build_structural_cache(&config, &store_context));
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
         let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
         let content_identity_base = Self::build_content_identity_base(&config, adapter.as_ref());
@@ -3297,6 +3355,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
+            resolve_definition_batch_with_source_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -3309,14 +3368,25 @@ where
         })
     }
 
-    /// The structural facts cache takes a slice of the shared memo budget,
-    /// like the per-language memo caches do.
+    /// The structural facts cache takes a slice of the shared memo budget --
+    /// one slice for the workspace, not one per language delegate.
+    ///
+    /// The delegates of one build share the entries and the budget through
+    /// their shared store context, and each keeps its own extraction and
+    /// hydration counters over them. See
+    /// [`AnalyzerStoreContext::structural_facts`].
     fn build_structural_cache(
         config: &AnalyzerConfig,
+        store_context: &AnalyzerStoreContext,
     ) -> crate::analyzer::structural::provider::StructuralFactsCache {
-        crate::analyzer::structural::provider::StructuralFactsCache::new(
-            config.memo_cache_budget_bytes() / 8,
-        )
+        store_context
+            .structural_facts
+            .get_or_init(|| {
+                crate::analyzer::structural::provider::StructuralFactsCache::new(
+                    config.memo_cache_budget_bytes() / 8,
+                )
+            })
+            .sharing_entries()
     }
 
     pub(crate) fn structural_cache(
@@ -3491,22 +3561,46 @@ where
         )
     }
 
-    /// The Git blob oid of `source`, the exact bytes a caller is about to key
-    /// facts by, for `file`.
+    /// The store's content key for `file`, whose admitted text is `source`:
+    /// the Git blob oid of the bytes that text was admitted from.
     ///
     /// This is the one place a query path turns a source string into the
-    /// store's content key (#2917). The identity is a property of the bytes,
+    /// store's content key (#2917). The identity is a property of the content,
     /// not of the snapshot: a concurrent disk or overlay change hands the
-    /// caller different bytes and so a different oid, never a stale one. The
+    /// caller different text and so a different oid, never a stale one. The
     /// SHA-1 runs once per (file, bytes) and is memoized against the source's
     /// length and FxHash, so a repeat query over an unchanged file pays a
     /// hash-map probe and one FxHash pass instead of libgit2's
     /// collision-detecting SHA-1 over the whole file.
-    pub(crate) fn blob_oid_of(&self, file: &ProjectFile, source: &str) -> Oid {
-        self.blob_oids.oid_of(file, source)
+    ///
+    /// The text is usually the content, so hashing it is the content's oid.
+    /// Not always: `Project::read_source` admits legacy non-UTF-8 bytes
+    /// lossily (`decode_source_bytes`), and lossy admission is exactly the
+    /// case where the text re-encodes to bytes no file holds. Hashing it there
+    /// minted a second identity for one file -- an oid liveness never records
+    /// and no `workspace_file_versions` row names -- which a demand parse then
+    /// wrote declarations into the store under (#3106). Replacement characters
+    /// are the only thing a lossy decode introduces, so text without one is
+    /// byte-identical to what was read and text with one sends this to the
+    /// bytes themselves. Facts stay content-addressed either way, because the
+    /// admitted text is a deterministic function of those bytes.
+    ///
+    /// `None` when `file` has no content to name: it decoded lossily and is
+    /// now gone from disk.
+    pub(crate) fn content_oid_of(&self, file: &ProjectFile, source: &str) -> Option<Oid> {
+        self.blob_oids.oid_of(file, source, || {
+            if self.project.has_overlay(file) || !source.contains(char::REPLACEMENT_CHARACTER) {
+                Some(
+                    Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                        .expect("hashing in-memory bytes as a blob cannot fail"),
+                )
+            } else {
+                Oid::hash_file(ObjectType::Blob, file.abs_path()).ok()
+            }
+        })
     }
 
-    /// SHA-1 blob hashes [`Self::blob_oid_of`] computed since the last reset.
+    /// SHA-1 blob hashes [`Self::content_oid_of`] computed since the last reset.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn blob_hash_count_for_test(&self) -> usize {
@@ -3519,25 +3613,32 @@ where
         self.blob_oids.hashes.store(0, Ordering::Relaxed);
     }
 
-    /// Resolve a persistence identity for the exact source string being
-    /// normalized. Keying by the supplied bytes prevents a concurrent file or
-    /// overlay change from associating facts with a different live OID.
-    pub(crate) fn structural_snapshot_key(
+    /// The key facts for the content `oid` names are memoized and persisted
+    /// under, for `file`'s storage language at this analyzer's epoch.
+    ///
+    /// `None` when this analyzer publishes no epoch for that storage language,
+    /// which is every file it does not analyze. That is what keeps one shared
+    /// memo sound: a delegate reads and writes only entries of the language
+    /// whose grammar it would use, so a file handed to the wrong delegate
+    /// cannot answer from, or overwrite, the right one's facts.
+    pub(crate) fn structural_facts_key(
         &self,
         file: &ProjectFile,
-        source: &str,
+        oid: Oid,
     ) -> Option<StructuralSnapshotKey> {
-        if self.store_context.store.is_ephemeral() {
-            return None;
-        }
-        let oid = self.blob_oid_of(file, source);
         let lang = self.adapter.storage_language_key_for_file(file);
         let generation = self.store_context.generations.get(lang).copied()?;
         Some(StructuralSnapshotKey {
             oid,
-            lang: lang.to_string(),
+            lang,
             generation,
         })
+    }
+
+    /// Whether facts keyed by content can also be persisted. An ephemeral
+    /// store owns no durable rows, so its facts live in the memo alone.
+    pub(crate) fn persists_structural_facts(&self) -> bool {
+        !self.store_context.store.is_ephemeral()
     }
 
     pub(crate) fn load_structural_facts_rows(
@@ -3548,7 +3649,7 @@ where
     {
         self.store_context.store.load_structural_facts_rows(
             key.oid,
-            &key.lang,
+            key.lang,
             key.generation,
             facts_version,
         )
@@ -3562,7 +3663,7 @@ where
     ) -> Result<bool, StoreError> {
         self.store_context.store.upsert_structural_facts_rows(
             key.oid,
-            &key.lang,
+            key.lang,
             key.generation,
             facts_version,
             facts,
@@ -3737,6 +3838,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             relational_definition_batch_call_count: Arc::new(AtomicUsize::new(0)),
+            resolve_definition_batch_with_source_call_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
@@ -6333,7 +6435,7 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<Arc<FileState>> {
-        let oid = self.blob_oid_of(file, &source);
+        let oid = self.content_oid_of(file, &source)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
     }
@@ -6583,16 +6685,31 @@ where
         }
 
         let oid = resolved.oid;
-        let prepared = match self.prepare_exact_syntax_cancellable(
-            file,
-            origin,
-            overlay_revision,
-            resolved.snapshot.into_source(),
-            cancellation,
-        ) {
-            PreparedSyntaxPreparation::Complete(prepared) => prepared,
-            PreparedSyntaxPreparation::Cancelled => {
-                return PreparedSyntaxLimitedOutcome::Cancelled;
+        let indexed_key = PreparedSyntaxCacheKey {
+            flavor: PreparedSyntaxCacheFlavor::Indexed,
+            ..prepared_key.clone()
+        };
+        let prepared = if let Some(indexed) = self.cached_prepared_syntax(&indexed_key) {
+            Some(Arc::new(PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Exact(resolved.snapshot.into_source()),
+                indexed.tree().clone(),
+                indexed.line_starts().to_vec(),
+                indexed.dialect(),
+                origin,
+                overlay_revision,
+            )))
+        } else {
+            match self.prepare_exact_syntax_cancellable(
+                file,
+                origin,
+                overlay_revision,
+                resolved.snapshot.into_source(),
+                cancellation,
+            ) {
+                PreparedSyntaxPreparation::Complete(prepared) => prepared,
+                PreparedSyntaxPreparation::Cancelled => {
+                    return PreparedSyntaxLimitedOutcome::Cancelled;
+                }
             }
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -6612,6 +6729,24 @@ where
         prepared.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
             PreparedSyntaxLimitedOutcome::Available(oid, prepared)
         })
+    }
+
+    /// The backing flavor changes declaration access, not the parsed source.
+    /// Reuse a completed tree from the other flavor without retaining that
+    /// flavor's backing or counting another syntax-tier crossing.
+    fn cached_prepared_syntax(
+        &self,
+        key: &PreparedSyntaxCacheKey,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        self.active_query_cache_handle(|cache| &cache.prepared_syntax)
+            .and_then(|cache| {
+                cache
+                    .read()
+                    .expect("query prepared-syntax cache read lock poisoned")
+                    .get(key)
+                    .and_then(|cell| cell.get().cloned().flatten())
+            })
+            .or_else(|| self.prepared_syntax_store_get(key))
     }
 
     fn prepared_syntax_store_get(
@@ -6715,6 +6850,22 @@ where
     ) -> Option<Arc<PreparedSyntaxTree>> {
         let file_state =
             self.fetch_file_state_for_key_with_source(file, key, Some(exact_source))?;
+        let exact_key = PreparedSyntaxCacheKey {
+            file_state: key.clone(),
+            origin,
+            overlay_revision,
+            flavor: PreparedSyntaxCacheFlavor::ExactSource,
+        };
+        if let Some(exact) = self.cached_prepared_syntax(&exact_key) {
+            return Some(Arc::new(PreparedSyntaxTree::new(
+                PreparedSyntaxSource::Indexed(file_state),
+                exact.tree().clone(),
+                exact.line_starts().to_vec(),
+                exact.dialect(),
+                origin,
+                overlay_revision,
+            )));
+        }
         match self.prepare_syntax_from_source_cancellable(
             file,
             PreparedSyntaxSource::Indexed(file_state),
@@ -6871,17 +7022,6 @@ where
             crate::path_utils::rel_path_string(file),
             blob,
         )
-    }
-
-    /// The [`ReadKey::File`] naming the exact source string a funnel is about
-    /// to read facts from, whose blob identity is the hash of those bytes --
-    /// the same identity [`Self::structural_snapshot_key`] persists under.
-    pub(crate) fn source_file_read_key(
-        &self,
-        file: &ProjectFile,
-        source: &str,
-    ) -> crate::analyzer::read_ledger::ReadKey {
-        self.file_read_key(file, self.blob_oid_of(file, source))
     }
 
     /// The [`ReadKey::Scope`] naming this analyzer's whole analyzed file set,
@@ -7448,9 +7588,11 @@ where
             }
             None => self.project.read_source_snapshot(file).ok(),
         };
-        let resolved = snapshot.map(|snapshot| ResolvedPreparedSource {
-            oid: self.blob_oid_of(file, snapshot.source()),
-            snapshot,
+        let resolved = snapshot.and_then(|snapshot| {
+            Some(ResolvedPreparedSource {
+                oid: self.content_oid_of(file, snapshot.source())?,
+                snapshot,
+            })
         });
 
         if let Some(prepared_sources) = prepared_sources.as_ref() {
@@ -7494,7 +7636,7 @@ where
         let source = if self.project.has_overlay(file) {
             let source = self.project.read_source(file).ok()?;
             Some(ResolvedLiveSource {
-                oid: self.blob_oid_of(file, &source),
+                oid: self.content_oid_of(file, &source)?,
             })
         } else if let Some(oid) = self
             .store_context
@@ -7556,7 +7698,7 @@ where
 
     fn source_for_oid(&self, file: &ProjectFile, oid: Oid) -> Option<String> {
         if let Ok(source) = self.project.read_source(file)
-            && self.blob_oid_of(file, &source) == oid
+            && self.content_oid_of(file, &source) == Some(oid)
         {
             return Some(source);
         }
@@ -7871,7 +8013,7 @@ where
                     self.project
                         .read_source(&project_file)
                         .ok()
-                        .map(|source| self.blob_oid_of(&project_file, &source))
+                        .and_then(|source| self.content_oid_of(&project_file, &source))
                 } else {
                     None
                 }
@@ -8001,6 +8143,43 @@ where
         units.sort();
         units.dedup();
         Ok(units)
+    }
+
+    fn resolve_mounted_candidate_primary_range_rows(
+        &self,
+        rows: Vec<MountedCandidatePrimaryRangeRow>,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Option<DeclarationPrimaryRanges>, StoreError> {
+        let mut units = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            if index.is_multiple_of(512) && cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let MountedCandidatePrimaryRangeRow {
+                candidate: row,
+                rel_path,
+                primary_range,
+            } = row;
+            let file = ProjectFile::new(self.project.root().to_path_buf(), rel_path);
+            let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
+                self.adapter.as_ref(),
+                row.fq.as_ref(),
+                &row.content_qualifier,
+                &file,
+            )?;
+            units.push((
+                CodeUnit::from_fq(
+                    file,
+                    row.kind,
+                    fq,
+                    package_segment_count,
+                    row.signature,
+                    row.flags.synthetic,
+                ),
+                primary_range,
+            ));
+        }
+        Ok(Some(units))
     }
 
     fn resolve_candidate_rows_limited(
@@ -8797,6 +8976,31 @@ where
             .load(Ordering::Relaxed)
     }
 
+    /// Records one call to `resolve_definition_batch_with_source` against
+    /// this instance. The call site outside this module holds only
+    /// `&dyn IAnalyzer`, so it reaches this through
+    /// `AnalyzerTestHooks::record_resolve_definition_batch_with_source_call_for_test`
+    /// rather than incrementing the field directly (issue #3010: a
+    /// process-wide static here was inflated by any other test calling the
+    /// same function concurrently).
+    #[doc(hidden)]
+    pub fn record_resolve_definition_batch_with_source_call_for_test(&self) {
+        self.resolve_definition_batch_with_source_call_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {
+        self.resolve_definition_batch_with_source_call_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
+        self.resolve_definition_batch_with_source_call_count
+            .load(Ordering::Relaxed)
+    }
+
     /// Persisted candidate-row reads that actually reached the store, one per
     /// (short name, ordering) the request has not already read. Paired with
     /// `definition_candidates_query_count_for_test` it separates "one read for
@@ -9086,7 +9290,7 @@ where
             return None;
         }
         let source = self.project.read_source(file).ok()?;
-        let oid = self.blob_oid_of(file, &source);
+        let oid = self.content_oid_of(file, &source)?;
         let live_entry = self.live_entry_for_source(file, oid);
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
@@ -12790,7 +12994,7 @@ where
         let Some(indexed_oid) = self.indexed_live_snapshot.oid_for_path(file) else {
             return false;
         };
-        self.blob_oid_of(file, source) == indexed_oid
+        self.content_oid_of(file, source) == Some(indexed_oid)
     }
 
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
@@ -12955,6 +13159,46 @@ where
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// One bulk hydration per `BULK_FILE_STATE_QUERY_LIMIT` files instead of
+    /// one per file, over the same file states `Self::declarations` reads.
+    ///
+    /// The chunk bounds how many whole file states are resident at once: a
+    /// workspace-wide ask is 17,000 of them on a monorepo, and the caller
+    /// wants only each one's declarations. A file the bulk read cannot answer
+    /// -- one with no live blob id -- falls to the per-file rule, which is the
+    /// same rule with its own current-source fallback.
+    fn declarations_of_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return crate::hash::HashMap::default();
+        }
+        let mut declarations: crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> =
+            crate::hash::HashMap::default();
+        for chunk in files.chunks(BULK_FILE_STATE_QUERY_LIMIT) {
+            for (file, state) in
+                self.bulk_file_states(chunk.iter().cloned(), BulkFileStateSource::Omit)
+            {
+                declarations.insert(
+                    file,
+                    state
+                        .declarations
+                        .iter()
+                        .filter(|unit| !unit.is_file_scope())
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }
+        for file in files {
+            if !declarations.contains_key(file) {
+                declarations.insert(file.clone(), self.declarations(file));
+            }
+        }
+        declarations
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
@@ -13190,6 +13434,72 @@ where
                 crate::analyzer::common::language_for_file(file) != self.adapter.language()
             })
             .collect()
+    }
+
+    fn workspace_declarations_with_primary_ranges(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<Vec<(CodeUnit, Option<Range>)>> {
+        if cancellation.is_cancelled() || !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
+        self.full_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        let (authoritative_states, authoritative_paths) =
+            self.authoritative_file_states_for_queries();
+        let storage_languages = self.storage_language_keys_for_queries();
+        let rows = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
+            self.store_context
+                .store
+                .mounted_declaration_rows_with_primary_ranges_for_langs(
+                    self.selected_workspace_snapshots().as_ref(),
+                    &storage_languages,
+                    self.store_context.generations.as_ref(),
+                    cancellation,
+                ),
+            "scanning mounted declarations with primary ranges",
+        )?;
+        let rows = rows?;
+        let mut units = self.store_query_or_record(
+            |sink| sink.push(self.scope_read_key()),
+            self.resolve_mounted_candidate_primary_range_rows(rows, cancellation),
+            "resolving mounted declarations with primary ranges",
+        )??;
+        units.retain(|(unit, _)| !authoritative_paths.contains(unit.source()));
+        for state in authoritative_states {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            units.extend(
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .map(|unit| {
+                        let range = state.ranges.get(&unit).and_then(|ranges| {
+                            ranges
+                                .iter()
+                                .copied()
+                                .min_by_key(|range| (range.start_line, range.start_byte))
+                        });
+                        (unit, range)
+                    }),
+            );
+        }
+        let synthetic = self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+            |_| true,
+            Some(cancellation),
+        )?;
+        if !synthetic.complete || cancellation.is_cancelled() {
+            return None;
+        }
+        units.extend(synthetic.rows.into_iter().map(|unit| (unit, None)));
+        units.retain(|(unit, _)| !unit.is_file_scope());
+        units.sort_by(|(left, _), (right, _)| left.cmp(right));
+        units.dedup_by(|(left, _), (right, _)| left == right);
+        (!cancellation.is_cancelled()).then_some(units)
     }
 
     fn invalidate_cached_file_identities(&self) {
@@ -13758,6 +14068,18 @@ where
         TreeSitterAnalyzer::relational_definition_batch_call_count_for_test(self)
     }
 
+    fn record_resolve_definition_batch_with_source_call_for_test(&self) {
+        TreeSitterAnalyzer::record_resolve_definition_batch_with_source_call_for_test(self);
+    }
+
+    fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_resolve_definition_batch_with_source_call_count_for_test(self);
+    }
+
+    fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::resolve_definition_batch_with_source_call_count_for_test(self)
+    }
+
     fn reset_definition_candidate_row_read_count_for_test(&self) {
         TreeSitterAnalyzer::reset_definition_candidate_row_read_count_for_test(self);
     }
@@ -14058,6 +14380,7 @@ mod tests {
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use git2::{ObjectType, Oid};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Barrier, Condvar, RwLock};
 
     fn cache_key(name: &str) -> FileStateCacheKey {
@@ -14895,6 +15218,155 @@ mod tests {
         }
     }
 
+    /// Changes the source after the reusable-identity probe, but returns no
+    /// overlay from that probe. The following source lookup sees the changed
+    /// bytes as an overlay. This is deterministic and exercises the identity
+    /// pairing that a concurrent file/overlay transition would require.
+    struct ProbeReplacementProject {
+        delegate: TestProject,
+        source: RwLock<String>,
+        replacement: String,
+        arm_probe: AtomicBool,
+        replaced: AtomicBool,
+    }
+
+    impl ProbeReplacementProject {
+        fn new(
+            root: impl Into<std::path::PathBuf>,
+            source: impl Into<String>,
+            replacement: impl Into<String>,
+        ) -> Self {
+            Self {
+                delegate: TestProject::new(root, Language::Rust),
+                source: RwLock::new(source.into()),
+                replacement: replacement.into(),
+                arm_probe: AtomicBool::new(false),
+                replaced: AtomicBool::new(false),
+            }
+        }
+
+        fn arm_probe(&self) {
+            assert!(!self.arm_probe.swap(true, Ordering::AcqRel));
+        }
+
+        fn was_replaced(&self) -> bool {
+            self.replaced.load(Ordering::Acquire)
+        }
+
+        fn current_source(&self) -> String {
+            self.source
+                .read()
+                .expect("probe source lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Project for ProbeReplacementProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn read_source(&self, _file: &ProjectFile) -> std::io::Result<String> {
+            Ok(self.current_source())
+        }
+
+        fn read_source_snapshot(
+            &self,
+            _file: &ProjectFile,
+        ) -> std::io::Result<ProjectSourceSnapshot> {
+            let source = self.current_source();
+            if self.replaced.load(Ordering::Acquire) {
+                Ok(ProjectSourceSnapshot::overlay(
+                    source,
+                    OverlayRevision::from_monotonic_counter(1),
+                ))
+            } else {
+                Ok(ProjectSourceSnapshot::disk(source))
+            }
+        }
+
+        fn has_overlay(&self, _file: &ProjectFile) -> bool {
+            if self.arm_probe.swap(false, Ordering::AcqRel) {
+                *self.source.write().expect("probe source lock poisoned") =
+                    self.replacement.clone();
+                self.replaced.store(true, Ordering::Release);
+                false
+            } else {
+                self.replaced.load(Ordering::Acquire)
+            }
+        }
+    }
+
+    #[test]
+    fn structural_facts_miss_rekeys_after_probe_source_changes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        let source_before_probe = "fn before_probe() {}\n";
+        let source_after_probe = "fn after_probe() {}\n";
+        file.write(source_before_probe)
+            .expect("write initial Rust source");
+
+        let project = Arc::new(ProbeReplacementProject::new(
+            &root,
+            source_before_probe,
+            source_after_probe,
+        ));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let provider = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .next()
+            .expect("Rust structural provider");
+        let before_oid = analyzer
+            .content_oid_of(&file, source_before_probe)
+            .expect("the fixture source names its bytes");
+        assert_eq!(
+            analyzer.reusable_live_oid(&file),
+            Some(before_oid),
+            "the fixture must admit the old identity before the source transition"
+        );
+
+        project.arm_probe();
+        let facts = provider
+            .structural_facts(&file)
+            .expect("facts after the source transition");
+        assert!(
+            project.was_replaced(),
+            "the probe must install the replacement"
+        );
+        assert_eq!(facts.source(), source_after_probe);
+
+        let materializations =
+            provider.structural_extraction_count() + provider.structural_hydration_count();
+        let repeated = provider
+            .structural_facts(&file)
+            .expect("repeated facts after the source transition");
+        assert!(Arc::ptr_eq(&facts, &repeated));
+        assert_eq!(
+            provider.structural_extraction_count() + provider.structural_hydration_count(),
+            materializations,
+            "the replacement bytes must be retained under their actual content key"
+        );
+    }
+
     /// Records the thread each overlay OID read is billed to.
     #[derive(Clone)]
     struct OverlayReadThreadProject {
@@ -15330,6 +15802,7 @@ mod tests {
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -15834,6 +16307,7 @@ mod tests {
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
@@ -15953,6 +16427,7 @@ mod tests {
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -16046,6 +16521,7 @@ mod tests {
             )])),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let prepared = AnalyzerStore::prepare_parsed_blob(
             oid,
@@ -16080,6 +16556,7 @@ mod tests {
             AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
+                &store_context,
             )),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
@@ -16796,6 +17273,7 @@ mod tests {
             )])),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -16810,6 +17288,7 @@ mod tests {
             ),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
+                &store_context,
             )),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
@@ -16886,6 +17365,7 @@ mod tests {
             )])),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -16895,6 +17375,7 @@ mod tests {
             AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
+                &store_context,
             )),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
@@ -17929,6 +18410,62 @@ mod tests {
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
     }
 
+    #[test]
+    fn prepared_syntax_flavors_reuse_the_parse_without_sharing_index_backing() {
+        for order in [
+            [
+                PreparedSyntaxCacheFlavor::ExactSource,
+                PreparedSyntaxCacheFlavor::Indexed,
+            ],
+            [
+                PreparedSyntaxCacheFlavor::Indexed,
+                PreparedSyntaxCacheFlavor::ExactSource,
+            ],
+        ] {
+            let source = "fn target() {}\n";
+            let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+                .file("src/main.rs", source)
+                .build();
+            let file = project.file("src/main.rs");
+            let analyzer = TreeSitterAnalyzer::new(project.project_dyn(), RustAdapter);
+            let target = analyzer
+                .lookup_candidates_by_identifier("target")
+                .into_iter()
+                .next()
+                .expect("indexed target");
+            analyzer.reset_full_hydration_count_for_test();
+
+            // Exercise both the active query cells and cross-request retention.
+            for _ in 0..2 {
+                let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+                for flavor in order {
+                    let before = analyzer.full_hydration_count_for_test();
+                    let prepared = match flavor {
+                        PreparedSyntaxCacheFlavor::ExactSource => {
+                            let (_, prepared) = analyzer
+                                .prepared_syntax_limited(scope.token(), &file, source.len())
+                                .expect("admitted source")
+                                .expect("exact syntax");
+                            assert!(matches!(prepared.backing(), PreparedSyntaxSource::Exact(_)));
+                            assert!(prepared.declaration_node(&target).is_none());
+                            assert_eq!(analyzer.full_hydration_count_for_test(), before);
+                            prepared
+                        }
+                        PreparedSyntaxCacheFlavor::Indexed => {
+                            let prepared = analyzer
+                                .prepared_syntax(scope.token(), &file)
+                                .expect("indexed syntax");
+                            assert!(prepared.declaration_node(&target).is_some());
+                            prepared
+                        }
+                    };
+                    assert_eq!(prepared.source(), source);
+                    assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+                }
+            }
+        }
+    }
+
     /// The correctness claim behind retaining trees at all: entries are keyed
     /// by blob oid, so an out-of-band edit lands on a different key and the
     /// next request parses the new bytes. A path-keyed cache serves the stale
@@ -18186,6 +18723,7 @@ mod tests {
             )])),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -18195,6 +18733,7 @@ mod tests {
             AnalyzerRuntimeState::new(HashMap::default(), dirty, HashMap::default(), Vec::new()),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
+                &store_context,
             )),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
@@ -18403,12 +18942,12 @@ mod tests {
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             1,
-            "ordinary preparation must not reuse the syntax-only cache entry"
+            "ordinary preparation must still hydrate indexed declarations"
         );
         assert_eq!(
             analyzer.prepared_syntax_parse_count_for_test(&file),
-            3,
-            "indexed and syntax-only cache entries are intentionally distinct"
+            2,
+            "indexed preparation must reuse the successful syntax-only parse"
         );
     }
 
@@ -18593,6 +19132,7 @@ mod tests {
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
+            structural_facts: Arc::new(OnceLock::new()),
         };
         let config = AnalyzerConfig::default();
 
@@ -18666,7 +19206,7 @@ mod tests {
     /// rewrite of the same file, and for an unsaved overlay -- and a repeat
     /// question about unchanged bytes does not run SHA-1 again.
     #[test]
-    fn blob_oid_of_matches_git_hash_object_and_hashes_each_source_once() {
+    fn content_oid_of_matches_git_hash_object_and_hashes_each_source_once() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = temp_file(&root, "src/main.rs");
@@ -18681,12 +19221,15 @@ mod tests {
 
         analyzer.reset_blob_hash_count_for_test();
         assert_eq!(
-            analyzer.blob_oid_of(&file, disk_source),
-            expected(disk_source)
+            analyzer.content_oid_of(&file, disk_source),
+            Some(expected(disk_source))
         );
         assert_eq!(analyzer.blob_hash_count_for_test(), 1);
         let reread = base.read_source(&file).expect("disk read");
-        assert_eq!(analyzer.blob_oid_of(&file, &reread), expected(disk_source));
+        assert_eq!(
+            analyzer.content_oid_of(&file, &reread),
+            Some(expected(disk_source))
+        );
         assert_eq!(
             analyzer.blob_hash_count_for_test(),
             1,
@@ -18696,8 +19239,8 @@ mod tests {
         let dirty_source = "fn disk() {}\nfn dirty() {}\n";
         file.write(dirty_source).expect("dirty source");
         assert_eq!(
-            analyzer.blob_oid_of(&file, dirty_source),
-            expected(dirty_source)
+            analyzer.content_oid_of(&file, dirty_source),
+            Some(expected(dirty_source))
         );
         assert_eq!(
             analyzer.blob_hash_count_for_test(),
@@ -18705,8 +19248,8 @@ mod tests {
             "a dirty rewrite must miss the memo and get its own identity"
         );
         assert_eq!(
-            analyzer.blob_oid_of(&file, dirty_source),
-            expected(dirty_source)
+            analyzer.content_oid_of(&file, dirty_source),
+            Some(expected(dirty_source))
         );
         assert_eq!(analyzer.blob_hash_count_for_test(), 2);
 
@@ -18721,8 +19264,8 @@ mod tests {
             "an overlay's live identity is the hash of its unsaved bytes"
         );
         assert_eq!(
-            request.blob_oid_of(&file, overlay_source),
-            expected(overlay_source)
+            request.content_oid_of(&file, overlay_source),
+            Some(expected(overlay_source))
         );
         assert_eq!(
             analyzer.blob_hash_count_for_test(),

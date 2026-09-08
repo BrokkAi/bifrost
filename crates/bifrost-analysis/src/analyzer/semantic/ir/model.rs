@@ -404,6 +404,16 @@ pub enum SemanticValueKind {
         name: Option<Box<str>>,
         passing_mode: FormalParameterPassingMode,
     },
+    /// The value saved when the procedure definition evaluated a default
+    /// expression for the non-rest formal at `ordinal`.
+    ///
+    /// This is a definition-time value carrier. It is not an executable
+    /// per-call computation and does not imply a fresh allocation on each
+    /// invocation; a call-binding relation selects it only when that formal
+    /// is omitted by a call.
+    DefaultArgument {
+        ordinal: u32,
+    },
     /// The procedure's receiver formal. `dispatch` states whether the value
     /// is the object the call dispatches on (`this`/`self`), as opposed to a
     /// passed-in receiver -- a Kotlin or Scala extension receiver -- that
@@ -512,6 +522,7 @@ impl SemanticValueKind {
         match self {
             Self::Local => "local",
             Self::Parameter { .. } => "parameter",
+            Self::DefaultArgument { .. } => "default_argument",
             Self::Receiver { .. } => "receiver",
             Self::Return => "return",
             Self::Temporary => "temporary",
@@ -1520,6 +1531,22 @@ pub struct ValueTransfer {
     pub operation: TransferOperation,
 }
 
+impl ValueTransfer {
+    /// Whether the transfer establishes the same runtime class, not merely
+    /// numerical value preservation or value dependence.
+    pub const fn preserves_runtime_class(self) -> bool {
+        matches!(
+            self.kind,
+            TransferKind::Copy
+                | TransferKind::AggregateCopy
+                | TransferKind::Move { .. }
+                | TransferKind::Conversion {
+                    preservation: ValuePreservation::Identity
+                }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowKind {
     Local,
@@ -1553,6 +1580,21 @@ pub enum ValueFlowKind {
 }
 
 impl ValueFlowKind {
+    /// Whether this relation establishes unchanged runtime class identity.
+    /// A view can have another class than its backing storage, and an
+    /// arbitrary computation need not return the class of any operand.
+    pub const fn preserves_runtime_class(self) -> bool {
+        match self {
+            Self::Transfer(transfer) => transfer.preserves_runtime_class(),
+            Self::LanguageDefined | Self::BackingStore { .. } => false,
+            Self::Local
+            | Self::Parameter
+            | Self::Receiver
+            | Self::Return
+            | Self::IndexedReturn { .. } => true,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -1821,6 +1863,24 @@ pub struct ProgramPoint {
     pub events: Box<[SemanticEvent]>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
+}
+
+impl ProgramPoint {
+    /// Whether this assignment has an adjacent transfer interpretation.
+    /// Identity consumers use the marker's row instead of copying through
+    /// both rows. Other definitions of the same value are independent.
+    pub fn assignment_has_transfer_marker(&self, event_index: usize) -> bool {
+        let SemanticEffect::Assignment { target, value } = self.events[event_index].effect else {
+            unreachable!("the requested event is an assignment");
+        };
+        self.events.get(event_index + 1).is_some_and(|next| {
+            matches!(next.effect, SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(_) | ValueFlowKind::BackingStore { .. },
+                source,
+                target: transferred,
+            } if source == value && transferred == target)
+        })
+    }
 }
 
 /// Intraprocedural topology only.  ICFG call-to-entry and exit-to-return

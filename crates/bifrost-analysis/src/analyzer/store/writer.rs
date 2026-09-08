@@ -141,6 +141,7 @@ impl StoreWriter {
         }
 
         let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
+        repair_planner_statistics_on_open(&conn);
         let reader_source = reader_source_path(&conn).unwrap_or_else(|| registry_key.clone());
         let writer = Arc::new(PersistentWriter::spawn(
             registry_key,
@@ -212,6 +213,41 @@ impl StoreWriter {
             Self::Local(_) => 0,
             Self::Persistent(writer) => writer.repair_transactions.load(Ordering::SeqCst),
         }
+    }
+}
+
+/// Repair the planner statistics of a persistent store as it is opened, and
+/// log what that did (issue #3031).
+///
+/// This is the one place in the store that runs exactly once per process per
+/// cache path: `StoreWriter::persistent` opens the writable connection under
+/// the per-path registry slot, so every later `AnalyzerStore::open_persistent`
+/// for the same path reuses this writer and repairs nothing. The two nearby
+/// alternatives are both the wrong granularity.
+/// `cache_db::configure_connection_after_busy_timeout` runs for every writable
+/// connection, including the one each collection opens, and
+/// `open_readonly_temp_connection` runs for every pooled reader -- which is
+/// read-only and could not run `ANALYZE` at all.
+///
+/// A failed repair leaves the store exactly as it was, which is a store that
+/// serves queries with default-guess plans, so the open continues: refusing to
+/// open a repository because an optional maintenance refresh lost a race for
+/// the write lock would be worse than the cliff it was trying to fix. The
+/// evidence goes through the same profiling channel as the build and
+/// collection hooks (`BIFROST_TIMING=1`), success and failure alike.
+fn repair_planner_statistics_on_open(conn: &Connection) {
+    match brokk_bifrost_core::cache_gc::repair_planner_statistics_on_open(conn) {
+        Ok(None) => {}
+        Ok(Some(evidence)) => crate::profiling::note_with(|| {
+            format!(
+                "store.planner_statistics repaired on open: {:.1} ms, {} sqlite_stat1 rows",
+                evidence.elapsed.as_secs_f64() * 1000.0,
+                evidence.stat1_rows
+            )
+        }),
+        Err(error) => crate::profiling::note_with(|| {
+            format!("store.planner_statistics repair on open failed: {error}")
+        }),
     }
 }
 

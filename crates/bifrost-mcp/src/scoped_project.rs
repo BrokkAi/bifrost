@@ -103,6 +103,7 @@ pub fn create_scoped_service(
 pub fn create_cli_tool_service(
     root: PathBuf,
     tool_name: &str,
+    arguments: &serde_json::Value,
     sources: &[String],
     overlays: Vec<GitHistoryOverlay>,
 ) -> Result<SearchToolsService, String> {
@@ -118,7 +119,7 @@ pub fn create_cli_tool_service(
     // so what this avoids is the whole-repo parse, not every write. `--sources`
     // and git-history overlays do not apply to such tools, so they are
     // irrelevant here.
-    if SearchToolsService::tool_is_workspace_independent(tool_name) {
+    if SearchToolsService::tool_is_workspace_independent(tool_name, arguments) {
         return SearchToolsService::new_one_shot_workspace_independent(root);
     }
     if overlays.is_empty() && sources.is_empty() {

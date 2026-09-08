@@ -14,6 +14,7 @@
 //! adapter cannot model becomes incomplete rather than silently empty. This
 //! mirrors [`super::occurrences::OccurrenceRoleSupport`] exactly.
 
+use super::kinds::NormalizedKind;
 use super::occurrences::labelled_enum;
 use crate::analyzer::Range;
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,7 @@ labelled_enum! {
         ModifiersUnrecorded => "modifiers_unrecorded",
         OwnerKindUnrecorded => "owner_kind_unrecorded",
         OverloadIdentityUnproven => "overload_identity_unproven",
+        AncestorExternalUnindexed => "ancestor_external_unindexed",
         HierarchyTruncated => "hierarchy_truncated",
         FamilyRootNotCanonical => "family_root_not_canonical",
     }
@@ -255,6 +257,58 @@ labelled_enum! {
         Private => "private",
         CrateOrModule => "crate_or_module",
         Unknown => "unknown",
+    }
+}
+
+/// How a fact of a given normalized kind participates in a file's lexical
+/// scope tree.
+///
+/// Two questions travel together because one answer decides both: whether the
+/// derivation layer opens a scope row at the fact, and whether the binders
+/// written directly inside that scope are lexical bindings at all. A Java or
+/// Python class body opens a scope (its members are looked up there) whose
+/// direct binders are *members*, resolved at the member tiers rather than by
+/// [`BindingActivation`]; a Ruby class body opens a scope whose direct binders
+/// are ordinary locals. One three-valued answer states both cases without a
+/// second hook that could disagree with the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeFormation {
+    /// The kind opens no lexical scope. Binders inside it belong to the
+    /// nearest enclosing scope that does.
+    NotAScope,
+    /// The kind opens a scope whose direct binders declare members of the
+    /// declaration rather than lexical bindings.
+    MemberScope,
+    /// The kind opens a scope whose direct binders are lexical bindings.
+    BindingScope,
+}
+
+impl ScopeFormation {
+    /// Whether a scope row exists for a fact of this kind.
+    pub const fn opens_scope(self) -> bool {
+        !matches!(self, Self::NotAScope)
+    }
+}
+
+/// The scope formation an adapter gets unless it states otherwise.
+///
+/// Callables scope their parameters, classes scope their members and type
+/// parameters, loops scope their headers, catch clauses scope their exception
+/// parameter, and [`NormalizedKind::Block`] scopes a statement list. This is
+/// the C-family and Python answer; a language whose loops and rescue clauses
+/// do not open variable scopes, or whose class bodies hold real locals,
+/// overrides [`super::spec::StructuralSpec::scope_formation`] instead of
+/// bending its kind table to fit.
+pub fn default_scope_formation(kind: NormalizedKind) -> ScopeFormation {
+    if kind.satisfies(NormalizedKind::Class) {
+        ScopeFormation::MemberScope
+    } else if kind.satisfies(NormalizedKind::Callable)
+        || kind.satisfies(NormalizedKind::Loop)
+        || matches!(kind, NormalizedKind::Block | NormalizedKind::Catch)
+    {
+        ScopeFormation::BindingScope
+    } else {
+        ScopeFormation::NotAScope
     }
 }
 

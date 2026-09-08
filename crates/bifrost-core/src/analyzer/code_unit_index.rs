@@ -116,6 +116,26 @@ pub trait CodeUnitIndex: Send + Sync {
         self.declarations(file)
     }
 
+    /// [`CodeUnitIndex::declarations`] asked for a whole file set at once.
+    ///
+    /// Same rule, same answer per file; only the number of store round trips
+    /// differs. A whole-workspace pass must not pay one file-state hydration
+    /// per file: the Go hierarchy build asked per file three times over (once
+    /// per declared type, once per alias, once per method owner), which on a
+    /// 17,000-file workspace was most of its single-threaded time (#1748).
+    /// The default answers file by file, which is exactly right for an
+    /// in-memory index; a persisted analyzer overrides it with a bulk
+    /// hydration.
+    fn declarations_of_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> {
+        files
+            .iter()
+            .map(|file| (file.clone(), self.declarations(file)))
+            .collect()
+    }
+
     /// The per-file [`ClassRangeIndex`] over this index's class-like
     /// declarations.
     ///

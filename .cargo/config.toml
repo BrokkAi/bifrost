@@ -1,3 +1,5 @@
 [env]
+# Keep SQLite page-cache reclamation private to each cache to avoid the global LRU mutex.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
 BIFROST_PARALLELISM = { value = "1", force = false }
 RAYON_NUM_THREADS = { value = "1", force = false }

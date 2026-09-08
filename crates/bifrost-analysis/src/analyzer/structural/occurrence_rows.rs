@@ -1202,56 +1202,65 @@ mod tests {
         );
     }
 
-    /// Rust cannot say whether a path scope segment is a module or a type, so
-    /// those rows are dropped and the role is reported incomplete rather than
-    /// being silently guessed into the value namespace.
+    /// A Rust path scope segment can be a module or a type, and the syntax
+    /// does not decide which; it resolves in the qualifier namespace, which is
+    /// [`Namespace::PathPrefix`]. The row is kept and the role is covered:
+    /// dropping it lost the only evidence that `std` and `HashMap` are
+    /// mentioned at all (#3064).
     #[test]
-    fn rust_path_segments_are_dropped_and_reported_rather_than_guessed() {
+    fn rust_path_segments_are_kept_in_the_path_prefix_namespace() {
         let source = "use std::collections::HashMap;\nfn take(map: HashMap<u32, u32>) -> usize { map.len() }\n";
         let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
         let result = fixture.result();
 
-        assert!(
-            !result
-                .rows
-                .iter()
-                .any(|row| row.role == OccurrenceRole::PathSegment),
-            "path-segment rows must not be emitted without a namespace"
+        let segments: Vec<(&str, Namespace)> = result
+            .rows
+            .iter()
+            .filter(|row| row.role == OccurrenceRole::PathSegment)
+            .map(|row| (row.effective_spelling(), row.namespace))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("std", Namespace::PathPrefix),
+                ("collections", Namespace::PathPrefix),
+            ],
         );
-        assert!(!result.completeness.covers(OccurrenceRole::PathSegment));
-        assert!(
-            result.completeness.covers(OccurrenceRole::Binder),
-            "an unknown namespace for one role does not taint the others"
-        );
-        match &result.completeness {
-            OccurrenceCompleteness::Incomplete { reasons, .. } => assert!(
-                reasons.contains(&OccurrenceIncompleteReason::NamespaceUnknown(
-                    OccurrenceRole::PathSegment
+        assert!(result.completeness.covers(OccurrenceRole::PathSegment));
+        assert!(result.completeness.covers(OccurrenceRole::Binder));
+        if let OccurrenceCompleteness::Incomplete { reasons, .. } = &result.completeness {
+            assert!(
+                !reasons.iter().any(|reason| matches!(
+                    reason,
+                    OccurrenceIncompleteReason::NamespaceUnknown(_)
                 )),
-                "reasons: {reasons:?}"
-            ),
-            other => panic!("expected incomplete path-segment coverage, got {other:?}"),
+                "no row is dropped for want of a namespace: {reasons:?}"
+            );
         }
     }
 
     /// An adapter that classifies one role and no others reports incomplete for
     /// the roles it cannot name, and covers exactly the one it can.
     ///
-    /// PHP declares `member_position` and nothing else, so the roles it stays
+    /// Go declares `member_position` and nothing else, so the roles it stays
     /// silent about must never come back as a clean empty answer. This guard
     /// used to point at Scala, which declared no roles at all until #1597
-    /// graduated it.
+    /// graduated it, and then at PHP, which classifies every role its grammar
+    /// establishes as of #2962.
     #[test]
     fn an_adapter_with_a_partial_role_table_reports_incomplete_not_empty_complete() {
         let source = concat!(
-            "<?php\n",
-            "class Widget {\n",
-            "    public function render(Helper $helper): int {\n",
-            "        return $helper->build();\n",
-            "    }\n",
+            "package widget\n",
+            "\n",
+            "type Helper struct{}\n",
+            "\n",
+            "func (h Helper) Build() int { return 1 }\n",
+            "\n",
+            "func Render(h Helper) int {\n",
+            "\treturn h.Build()\n",
             "}\n",
         );
-        let fixture = Fixture::new(Language::Php, "src/widget.php", source);
+        let fixture = Fixture::new(Language::Go, "widget/widget.go", source);
         let result = fixture.result();
 
         assert!(
@@ -1259,7 +1268,7 @@ mod tests {
                 .rows
                 .iter()
                 .all(|row| row.role == OccurrenceRole::MemberPosition),
-            "php must publish only the role it declares: {:?}",
+            "go must publish only the role it declares: {:?}",
             result.rows
         );
         match &result.completeness {

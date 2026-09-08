@@ -43,10 +43,10 @@ use crate::graph::resolver::{
     OrdinaryTypeImportCell, TargetKind, VisibilityIndex, VisibleMemberResolution,
     anonymous_aggregate_owner, c_offsetof_member_parts, canonical_cpp_scope_components,
     cast_expression_type_node, constructor_style_local_declaration, cpp_callable_arity,
-    cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
-    designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
-    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    initialized_type_declaration_with_cast, is_c_offsetof_member_node,
+    cpp_field_expression_receiver, cpp_template_reference_arguments, cpp_type_name_components,
+    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
+    function_terminal_node, has_ancestor_kind, infer_cpp_initializer_binding,
+    infer_cpp_initializer_type, initialized_type_declaration_with_cast, is_c_offsetof_member_node,
     is_c_sizeof_expression_type_candidate, is_cpp_template_argument_type_leaf, is_declaration_name,
     is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
@@ -536,11 +536,7 @@ fn record_c_field_reference(
     if name.is_empty() {
         return;
     }
-    let Some(receiver) = node
-        .child_by_field_name("argument")
-        .or_else(|| node.child_by_field_name("object"))
-        .or_else(|| node.named_child(0))
-    else {
+    let Some(receiver) = cpp_field_expression_receiver(node) else {
         ctx.record_unproven(name, field);
         return;
     };
@@ -562,12 +558,13 @@ fn record_c_field_reference(
         .into_iter()
         .filter(|candidate| {
             candidate.is_field()
-                && ctx.visibility.declaration_visible_at_reference(
-                    &ctx.analyzer,
-                    ctx.file,
-                    candidate,
-                    field,
-                )
+                && (!ctx.analyzer.reference_uses_c_semantics(ctx.file)
+                    || ctx.visibility.declaration_visible_at_reference(
+                        &ctx.analyzer,
+                        ctx.file,
+                        candidate,
+                        field,
+                    ))
         })
         .collect::<Vec<_>>();
     match fields.as_slice() {
@@ -1385,6 +1382,33 @@ fn receiver_type_unit(
     match receiver.kind() {
         "identifier" => {
             let name = node_text(receiver, ctx.source);
+            // A function-like macro's replacement local shadows bindings from
+            // the caller at the source-backed replacement range. Resolve that
+            // structured declaration before ordinary local inference, and
+            // keep an unresolved macro type shadowed rather than treating the
+            // spelling as a static type.
+            if let Some(binding) = ctx.visibility.macro_local_binding_at(
+                ctx.file,
+                ctx.input.root(),
+                ctx.source,
+                receiver.start_byte(),
+                receiver.end_byte(),
+            ) && binding.name == name
+            {
+                return binding
+                    .proven_unit
+                    .or_else(|| {
+                        binding.type_node.and_then(|type_node| {
+                            resolve_type_node_with_recovered_scope(type_node, ctx)
+                        })
+                    })
+                    .or_else(|| {
+                        binding.type_node.and_then(|type_node| {
+                            ctx.resolve_type_node_result(type_node).ok().flatten()
+                        })
+                    })
+                    .or_else(|| ctx.resolve_type(&normalize_type_text(&binding.type_name)));
+            }
             // A typed local resolves to its type; otherwise the name may itself be a
             // type, unless it is a known (shadowed) untyped local — never reinterpret
             // a value as a static type.
@@ -1437,10 +1461,7 @@ fn receiver_type_unit(
         "field_expression" => {
             let field = receiver.child_by_field_name("field")?;
             let name = node_text(field, ctx.source);
-            let inner = receiver
-                .child_by_field_name("argument")
-                .or_else(|| receiver.child_by_field_name("object"))
-                .or_else(|| receiver.named_child(0))?;
+            let inner = cpp_field_expression_receiver(receiver)?;
             let receiver_owner = receiver_type_unit(inner, ctx, bindings, remaining_call_depth)?;
             let owner = match resolve_declaring_member_owner(
                 &ctx.analyzer,

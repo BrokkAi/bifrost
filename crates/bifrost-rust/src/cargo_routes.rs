@@ -129,6 +129,14 @@ pub struct RustCargoModuleDeclaration {
     pub declaring_module: String,
     pub target_file: ProjectFile,
     pub visibility: RustVisibility,
+    /// Byte offset of the `mod` declaration, including an item-macro argument
+    /// when the route was recovered from a passthrough expansion.
+    pub declaration_start_byte: usize,
+    /// Byte offset at which a `#[macro_use]` module becomes visible to its
+    /// parent scope. `usize::MAX` means the module does not import macros.
+    pub visibility_start_byte: usize,
+    /// Whether this module route imports its child's module-scope macros.
+    pub imports_macros: bool,
     /// Whether the `mod x;` item carries a bare `#[cfg(test)]`, so the declared
     /// file is compiled into test builds only. See
     /// [`rust_declaration_is_bare_cfg_test_gated`] for why only the bare
@@ -509,6 +517,9 @@ impl RustCargoRouteIndex {
                         declaring_module: edge.declaring_module.clone(),
                         target_file: edge.file.clone(),
                         visibility: edge.visibility.clone(),
+                        declaration_start_byte: edge.declaration_start_byte,
+                        visibility_start_byte: edge.visibility_start_byte,
+                        imports_macros: edge.imports_macros,
                         test_gated: edge.test_gated,
                     }
                 }));
@@ -3299,6 +3310,9 @@ mod frozen_orchestration {
                                 declaring_module: edge.declaring_module.clone(),
                                 target_file: edge.file.clone(),
                                 visibility: edge.visibility.clone(),
+                                declaration_start_byte: edge.declaration_start_byte,
+                                visibility_start_byte: edge.visibility_start_byte,
+                                imports_macros: edge.imports_macros,
                                 test_gated: edge.test_gated,
                             }
                         }));
@@ -4102,6 +4116,9 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
                 declaring_module: declaring_module.to_string(),
                 target_file: target_file.clone(),
                 visibility,
+                declaration_start_byte: 0,
+                visibility_start_byte: usize::MAX,
+                imports_macros: false,
                 test_gated: false,
             };
         let mut declarations = vec![

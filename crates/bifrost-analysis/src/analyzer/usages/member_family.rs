@@ -33,6 +33,7 @@
 
 use std::collections::VecDeque;
 
+use brokk_bifrost_core::analyzer::model::CallableOverrideModifier;
 use brokk_bifrost_core::analyzer::structural::resolution::{
     MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
 };
@@ -58,6 +59,88 @@ const MEMBER_FAMILY_ID_DOMAIN: &[u8] = b"bifrost.member_family.v1";
 /// [`MemberFamilyReason::HierarchyTruncated`]: the walk stopped before it saw
 /// the whole hierarchy, so the answer is `incomplete` and carries no edge.
 const MAX_FAMILY_VISITS: usize = 4_096;
+
+/// What one language answers about method families.
+///
+/// The table below is *total*: it is an exhaustive `match` over every
+/// [`Language`] variant with no wildcard arm, so adding a language to the enum
+/// fails to compile until someone states what it answers here. That is the
+/// point. Eleven independent resolvers cannot honestly inherit a default
+/// `supported`, and a language that has landed no family must say so rather
+/// than return an empty set a policy would read as proof (#1721).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberFamilySupport {
+    /// The language has a provider, and this is the strongest member-identity
+    /// evidence its declaration walk records.
+    Supported(MemberFamilyCapability),
+    /// The language has no provider. The string names the fact that is
+    /// missing, so a reader knows what closing the gap requires.
+    Unsupported(&'static str),
+}
+
+impl MemberFamilySupport {
+    /// The capability a member of this language reports. Unsupported languages
+    /// report [`MemberFamilyCapability::Unsupported`], never a weaker-but-real
+    /// level that would read as a partial answer.
+    pub const fn capability(self) -> MemberFamilyCapability {
+        match self {
+            Self::Supported(capability) => capability,
+            Self::Unsupported(_) => MemberFamilyCapability::Unsupported,
+        }
+    }
+
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported(_))
+    }
+}
+
+/// The total per-language method-family support table.
+///
+/// Every capability below is *measured*, not aspirational: it states what the
+/// language's declaration walk actually records, which is why no language
+/// claims [`MemberFamilyCapability::ErasedParameterTypes`]. No adapter resolves
+/// or erases a parameter's declared type; each records the written spelling.
+pub const fn member_family_support(language: Language) -> MemberFamilySupport {
+    match language {
+        // Nominal hierarchies walked by `nominal_member_family` below.
+        Language::Java | Language::CSharp | Language::Scala => {
+            MemberFamilySupport::Supported(MemberFamilyCapability::ParameterTypeSpellings)
+        }
+        // Structural: the workspace satisfaction index answers, and Go has no
+        // overloading, so a whole method key singles a member out.
+        Language::Go => {
+            MemberFamilySupport::Supported(MemberFamilyCapability::ParameterTypeSpellings)
+        }
+        // Trait members and their impls, answered by the Rust hierarchy index.
+        Language::Rust => {
+            MemberFamilySupport::Supported(MemberFamilyCapability::ParameterTypeSpellings)
+        }
+        Language::Kotlin => MemberFamilySupport::Unsupported(
+            "get_direct_ancestors does not distinguish a Kotlin interface edge from a superclass \
+             edge, so an edge's relation would be unstatable",
+        ),
+        Language::Php => MemberFamilySupport::Unsupported(
+            "a `use`d PHP trait flattens its members into the using class, and whether that is an \
+             `implements` edge or no edge at all is an unmade contract decision",
+        ),
+        Language::Cpp => MemberFamilySupport::Unsupported(
+            "the C++ declaration store indexes static and non-static members under one \
+             `owner.member` form and no structured `virtual` modifier reaches the resolver",
+        ),
+        Language::JavaScript | Language::Python => {
+            MemberFamilySupport::Unsupported("the language declares no override relation")
+        }
+        Language::TypeScript => MemberFamilySupport::Unsupported(
+            "TypeScript typing is structural, so `implements` is a type-level question rather \
+             than a member-level declaration",
+        ),
+        Language::Ruby => MemberFamilySupport::Unsupported(
+            "Ruby module inclusion and singleton reopening resolve at run time, so a declaration \
+             proves no family",
+        ),
+        Language::None => MemberFamilySupport::Unsupported("the file has no analyzed language"),
+    }
+}
 
 /// One proven family edge from a member to a member it overrides or
 /// implements, or -- after inversion -- from a member to a member that
@@ -184,6 +267,7 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
 struct FamilyWalk<'a> {
     analyzer: &'a dyn IAnalyzer,
     hierarchy: &'a dyn TypeHierarchyProvider,
+    rules: &'a dyn NominalFamilyRules,
     cancellation: Option<&'a CancellationToken>,
     remaining: usize,
 }
@@ -192,11 +276,13 @@ impl<'a> FamilyWalk<'a> {
     fn new(
         analyzer: &'a dyn IAnalyzer,
         hierarchy: &'a dyn TypeHierarchyProvider,
+        rules: &'a dyn NominalFamilyRules,
         cancellation: Option<&'a CancellationToken>,
     ) -> Self {
         Self {
             analyzer,
             hierarchy,
+            rules,
             cancellation,
             remaining: MAX_FAMILY_VISITS,
         }
@@ -253,7 +339,13 @@ fn forward_edges(
     walk: &mut FamilyWalk<'_>,
     member: &CodeUnit,
 ) -> Result<ForwardStep, MemberFamilyReason> {
-    if language_for_file(member.source()) != Language::Java {
+    let language = language_for_file(member.source());
+    // Two gates, and they are different questions. The first is whether this
+    // rule answers for this member's language at all; the second is whether
+    // the support table still lists that language as supported. Consulting the
+    // table here is what gives it teeth: removing a language from it disables
+    // the provider rather than leaving a stale claim beside live code.
+    if language != walk.rules.language() || !member_family_support(language).is_supported() {
         return Ok(ForwardStep::Answer(MemberFamilyAnswer::unsupported()));
     }
     let Some(facts) = MemberFacts::read(walk.analyzer, member) else {
@@ -269,7 +361,7 @@ fn forward_edges(
             MemberFamilyReason::NotAMethod,
         )));
     }
-    if let Some(reason) = facts.exclusion() {
+    if let Some(reason) = walk.rules.exclusion(&facts) {
         return Ok(ForwardStep::Answer(MemberFamilyAnswer::no_family(
             capability, reason,
         )));
@@ -295,7 +387,7 @@ fn forward_edges(
             }
             walk.spend()?;
             seen.push(ancestor.clone());
-            match java_matching_member(walk.analyzer, &ancestor, &facts) {
+            match matching_member(walk.rules, walk.analyzer, &ancestor, &facts) {
                 AncestorMatch::None => frontier.push_back((ancestor, depth + 1)),
                 AncestorMatch::Unproven(reason) => {
                     return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
@@ -316,13 +408,45 @@ fn forward_edges(
             }
         }
     }
+    if edges.is_empty() && facts.override_modifier() == Some(CallableOverrideModifier::Override) {
+        // The declaration states that it redefines an inherited member and the
+        // walk, which saw every ancestor the workspace indexes, found none. The
+        // hierarchy above this owner is therefore short: the base lives in a
+        // dependency the workspace does not index -- the .NET `object.ToString`
+        // a C# `public override string ToString()` redefines, say. That is
+        // missing evidence, not a proven empty family, so the answer is
+        // incomplete and carries no id (#1721).
+        //
+        // Stated gap: a language that records no override modifier cannot
+        // reach this. Java is the one that matters, because `@Override` is an
+        // annotation the compiler checks rather than a modifier that creates
+        // the relation, and because every Java class implicitly extends
+        // `java.lang.Object` without writing an `extends` clause the walk can
+        // see. A Java `toString` therefore still answers `proven` with no
+        // edges. Closing that needs the activated dependency-pack overlay's
+        // universal root, which is tracked as the next tranche of this issue
+        // and pinned by
+        // `java_tostring_over_an_unindexed_jdk_is_a_stated_gap`.
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+            capability,
+            MemberFamilyReason::AncestorExternalUnindexed,
+        )));
+    }
     edges.sort_by(|left, right| left.target.cmp(&right.target));
     Ok(ForwardStep::Edges { owner, edges })
 }
 
-/// The Java member family in both directions, parameterized over the analyzer
-/// that holds members and metadata and over the hierarchy provider that holds
-/// ancestor and descendant edges.
+/// One member's family in both directions for a language whose overriding is
+/// *nominal*: a member redefines a member of a named ancestor type.
+///
+/// Parameterized over three things and no more. `analyzer` holds members and
+/// their recorded declaration metadata. `hierarchy` holds ancestor and
+/// descendant edges. `rules` is the language's own override rule -- what
+/// excludes a member from families, whether an ancestor is a class or an
+/// interface, and when an ancestor member is the one this member redefines.
+/// Java, C# and Scala differ only in `rules`; the walk, the budget, the seen
+/// sets, the root closure, the inversion and the family id are shared, which
+/// is what makes their answers comparable rather than merely similar.
 ///
 /// The two are separate parameters because the multi-analyzer must supply its
 /// own realm-aware hierarchy: a Kotlin class can extend a Java class, and only
@@ -333,14 +457,15 @@ fn forward_edges(
 /// member's ancestor walk, the root closure over the forward edges that walk
 /// found, and the bounded inversion below the member's owner. The forward
 /// answer is computed once and reused by the other two.
-pub fn java_member_family(
+pub fn nominal_member_family(
     analyzer: &dyn IAnalyzer,
     hierarchy: &dyn TypeHierarchyProvider,
+    rules: &dyn NominalFamilyRules,
     member: &CodeUnit,
     cancellation: Option<&CancellationToken>,
 ) -> MemberFamilyAnswer {
-    let capability = java_member_family_capability(analyzer, member);
-    let mut walk = FamilyWalk::new(analyzer, hierarchy, cancellation);
+    let capability = nominal_member_family_capability(analyzer, rules, member);
+    let mut walk = FamilyWalk::new(analyzer, hierarchy, rules, cancellation);
     let (owner, mut edges) = match forward_edges(&mut walk, member) {
         Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
         Ok(ForwardStep::Answer(answer)) => return answer,
@@ -514,14 +639,25 @@ fn family_roots(
     Ok(roots)
 }
 
-/// The declaration facts one Java member states about itself.
-struct MemberFacts {
+/// The declaration facts one member states about itself, as its adapter
+/// recorded them.
+///
+/// Public because [`NominalFamilyRules::admits`] receives two of them; the
+/// fields stay private because the only facts a language rule needs to read
+/// are the ones with accessors below. Everything else the shared walk consumes
+/// itself.
+pub struct MemberFacts {
     identifier: String,
     is_static: bool,
     is_constructor: bool,
     is_private: bool,
     arity: Option<brokk_bifrost_core::analyzer::model::CallableArity>,
     parameter_types: Option<Vec<String>>,
+    /// Which override-family modifier the declaration states, or `None` when
+    /// the adapter never read them. The difference matters: a C# member that
+    /// declares none *hides* an inherited member, while one whose modifiers
+    /// were never read proves nothing either way.
+    override_modifier: Option<CallableOverrideModifier>,
     capability: MemberFamilyCapability,
 }
 
@@ -532,6 +668,7 @@ impl MemberFacts {
             .into_iter()
             .find(|metadata| metadata.callable_modifiers_recorded())?;
         let parameter_types = metadata.callable_parameter_types().map(<[String]>::to_vec);
+        let override_modifier = metadata.callable_override_modifier();
         let capability = if parameter_types.is_some() {
             // Measured level for Java: the declaration walk records each
             // parameter's declared type *spelling* from its own `type` node.
@@ -552,22 +689,206 @@ impl MemberFacts {
                 ),
             arity: metadata.callable_arity(),
             parameter_types,
+            override_modifier,
             capability,
         })
     }
 
-    /// The proven reason this member participates in no family, if any.
-    fn exclusion(&self) -> Option<MemberFamilyReason> {
+    /// Which override-family modifier this declaration states, or `None` when
+    /// the adapter never read its modifier nodes for that family.
+    pub fn override_modifier(&self) -> Option<CallableOverrideModifier> {
+        self.override_modifier
+    }
+
+    /// Whether the declaration is recorded as static.
+    ///
+    /// What that *means* is the language's business, which is why the family
+    /// exclusion asks for it rather than applying it: in Java and C# a static
+    /// member is not inherited, while Scala has no `static` keyword at all and
+    /// records the flag to mean "member of an `object`" -- and an `object`
+    /// extending a trait implements that trait's members.
+    pub fn is_static(&self) -> bool {
+        self.is_static
+    }
+
+    /// The reason this member participates in no family in *any* nominal
+    /// language: a constructor is never inherited, and neither is a private
+    /// member.
+    pub fn universal_exclusion(&self) -> Option<MemberFamilyReason> {
         if self.is_constructor {
             return Some(MemberFamilyReason::ConstructorExcluded);
-        }
-        if self.is_static {
-            return Some(MemberFamilyReason::StaticMemberExcluded);
         }
         if self.is_private {
             return Some(MemberFamilyReason::PrivateMemberExcluded);
         }
         None
+    }
+}
+
+/// One language's own override rule.
+///
+/// Everything a nominal method family needs that differs between languages
+/// lives behind this trait; everything that does not -- the metered ancestor
+/// walk, the root closure, the bounded inversion, the family id -- is shared.
+/// It is a trait with one unit struct per language rather than an enum
+/// parameter because these are three different rules, not three modes of one.
+pub trait NominalFamilyRules {
+    /// The language whose members this rule answers for. A member of any other
+    /// language is `unsupported`, even when this provider was reached.
+    fn language(&self) -> Language;
+
+    /// Whether an ancestor declares its members in an interface-like space
+    /// (`implements`) or a class-like one (`overrides`).
+    ///
+    /// `None` when nothing recorded the ancestor's kind, which makes the
+    /// edge's relation unstatable rather than guessed.
+    ///
+    /// The default reads the `class_like_is_interface` fact the declaration
+    /// walk records, which is genuinely one rule across all three languages
+    /// here: a Java interface, a C# interface and a Scala trait are the same
+    /// declaration space wearing three names, and each adapter records the
+    /// flag on the template itself. A language whose owner kinds do not reduce
+    /// to that -- one with two distinct interface-like spaces, say -- must
+    /// override this rather than stretch the flag.
+    fn relation(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        ancestor: &CodeUnit,
+    ) -> Option<MethodFamilyRelation> {
+        match owner_is_interface(analyzer, ancestor) {
+            Some(true) => Some(MethodFamilyRelation::Implements),
+            Some(false) => Some(MethodFamilyRelation::Overrides),
+            None => None,
+        }
+    }
+
+    /// The proven reason this member participates in no family at all, if the
+    /// language says there is one.
+    ///
+    /// The default adds `static` to the two universal exclusions, which is the
+    /// rule for a language whose `static` members are not inherited. A
+    /// language that records the flag to mean something else must override
+    /// this.
+    fn exclusion(&self, facts: &MemberFacts) -> Option<MemberFamilyReason> {
+        facts.universal_exclusion().or_else(|| {
+            facts
+                .is_static()
+                .then_some(MemberFamilyReason::StaticMemberExcluded)
+        })
+    }
+
+    /// Whether `ancestor_member` -- already narrowed to the same terminal
+    /// identifier, the same recorded arity, and inheritable -- may be the
+    /// member that `member` redefines across an edge of `relation`.
+    ///
+    /// The default admits it, which is the rule for a language where a
+    /// redeclaration in a subtype *is* an override (Java, Scala). A language
+    /// that requires the redeclaration to opt in overrides this.
+    fn admits(
+        &self,
+        _relation: MethodFamilyRelation,
+        _ancestor_member: &MemberFacts,
+        _member: &MemberFacts,
+    ) -> Admission {
+        Admission::Yes
+    }
+}
+
+/// Whether one already-narrowed ancestor member survives the language's own
+/// redefinition rule.
+pub enum Admission {
+    Yes,
+    /// The language proves this ancestor member is not the one redefined --
+    /// a C# member hidden by `new`, say. A proven exclusion, not missing
+    /// evidence, so the answer stays complete.
+    No,
+    /// The fact the rule needs was never recorded. The whole family answer
+    /// becomes `incomplete` with this reason rather than guessing either way.
+    Unproven(MemberFamilyReason),
+}
+
+/// Java: a redeclaration in a subtype is an override. The language has no
+/// opt-in keyword (`@Override` is an annotation the compiler checks, not a
+/// modifier that creates the relation), so structure alone decides.
+pub struct JavaFamilyRules;
+
+impl NominalFamilyRules for JavaFamilyRules {
+    fn language(&self) -> Language {
+        Language::Java
+    }
+}
+
+/// C#: an interface member is implemented with no keyword at all, but a class
+/// member is only *overridden* when the derived member writes `override` and
+/// the base member is `virtual`, `abstract`, or itself an `override`.
+///
+/// The class rule is not pedantry. A derived member that writes `new`, or that
+/// writes nothing, *hides* the base member: both keep their own identity and a
+/// call through the base type still reaches the base member. Reporting hiding
+/// as overriding would be wrong rather than incomplete, and would make the
+/// class-hierarchy dispatch expansion in
+/// `semantic/workspace_oracle/dispatch.rs` offer a body the call can never
+/// reach.
+pub struct CSharpFamilyRules;
+
+impl NominalFamilyRules for CSharpFamilyRules {
+    fn language(&self) -> Language {
+        Language::CSharp
+    }
+
+    fn admits(
+        &self,
+        relation: MethodFamilyRelation,
+        ancestor_member: &MemberFacts,
+        member: &MemberFacts,
+    ) -> Admission {
+        // Implicit interface implementation writes no modifier, so an
+        // interface edge is admitted on structure alone. (Explicit
+        // implementation -- `void IFoo.Bar()` -- is a known gap: the
+        // declaration walk records the written name, so the member does not
+        // narrow to the interface member's terminal identifier and never
+        // reaches this rule.)
+        if relation == MethodFamilyRelation::Implements {
+            return Admission::Yes;
+        }
+        let (Some(derived), Some(base)) = (
+            member.override_modifier(),
+            ancestor_member.override_modifier(),
+        ) else {
+            return Admission::Unproven(MemberFamilyReason::ModifiersUnrecorded);
+        };
+        if derived == CallableOverrideModifier::Override && base.is_overridable() {
+            Admission::Yes
+        } else {
+            Admission::No
+        }
+    }
+}
+
+/// Scala: `override` is mandatory only when redefining a *concrete* member and
+/// optional when implementing an abstract one, so the keyword cannot be the
+/// gate. Structure decides, exactly as in Java, and the recorded keyword is
+/// corroborating evidence rather than a condition.
+///
+/// The relation follows trait-ness, which the Scala declaration walk records
+/// on the template itself. That is the same rule `ScalaAnalyzer::relation_kind`
+/// applies to *type* relations, so a member relation and the type relation
+/// above it agree by construction rather than by coincidence.
+pub struct ScalaFamilyRules;
+
+impl NominalFamilyRules for ScalaFamilyRules {
+    fn language(&self) -> Language {
+        Language::Scala
+    }
+
+    fn exclusion(&self, facts: &MemberFacts) -> Option<MemberFamilyReason> {
+        // Scala has no `static` modifier. The declaration walk records the
+        // flag to mean "member of an `object`", which the call-shape layer
+        // needs in order to describe `Service.run()`, but an `object` is a
+        // singleton *type* and `object Service extends Runner` implements
+        // `Runner.run` exactly as a class would. Applying the default rule
+        // here would exclude every object member from every family.
+        facts.universal_exclusion()
     }
 }
 
@@ -586,16 +907,22 @@ enum AncestorMatch {
 ///
 /// The candidate set is narrowed structurally first: same terminal identifier,
 /// inheritable (not a constructor, not static, not private), and the same
-/// recorded [`CallableArity`]. If that leaves exactly one member, the edge is
-/// proven on structure alone. If it leaves more than one -- a genuine overload
-/// set at the same arity -- the recorded parameter-type spellings are used as a
-/// discriminator, and anything other than exactly one match is reported as
+/// recorded [`CallableArity`]. The language's own rule then decides which of
+/// those survive -- for C#, that the redeclaration opted in with `override`.
+/// If exactly one survives, the edge is proven on structure alone. If more
+/// than one does -- a genuine overload set at the same arity -- the recorded
+/// parameter-type spellings are used as a discriminator, and anything other
+/// than exactly one match is reported as
 /// [`MemberFamilyReason::OverloadIdentityUnproven`] rather than guessed.
-fn java_matching_member(
+fn matching_member(
+    rules: &dyn NominalFamilyRules,
     analyzer: &dyn IAnalyzer,
     ancestor: &CodeUnit,
     facts: &MemberFacts,
 ) -> AncestorMatch {
+    let Some(relation) = rules.relation(analyzer, ancestor) else {
+        return AncestorMatch::Unproven(MemberFamilyReason::OwnerKindUnrecorded);
+    };
     let mut candidates = Vec::new();
     for candidate in analyzer.direct_children(ancestor) {
         if !candidate.is_function() || candidate.identifier() != facts.identifier {
@@ -604,24 +931,23 @@ fn java_matching_member(
         let Some(candidate_facts) = MemberFacts::read(analyzer, &candidate) else {
             return AncestorMatch::Unproven(MemberFamilyReason::ModifiersUnrecorded);
         };
-        // A constructor, a static method, and a private method are never
-        // inherited, so none of them can be the member this one redefines.
-        if candidate_facts.exclusion().is_some() {
+        // A member the language never inherits cannot be the one this member
+        // redefines.
+        if rules.exclusion(&candidate_facts).is_some() {
             continue;
         }
         if candidate_facts.arity != facts.arity {
             continue;
         }
-        candidates.push((candidate, candidate_facts));
+        match rules.admits(relation, &candidate_facts, facts) {
+            Admission::Yes => candidates.push((candidate, candidate_facts)),
+            Admission::No => continue,
+            Admission::Unproven(reason) => return AncestorMatch::Unproven(reason),
+        }
     }
     if candidates.is_empty() {
         return AncestorMatch::None;
     }
-    let relation = match owner_is_interface(analyzer, ancestor) {
-        Some(true) => MethodFamilyRelation::Implements,
-        Some(false) => MethodFamilyRelation::Overrides,
-        None => return AncestorMatch::Unproven(MemberFamilyReason::OwnerKindUnrecorded),
-    };
     if candidates.len() == 1 {
         return AncestorMatch::One {
             target: candidates.remove(0).0,
@@ -645,18 +971,83 @@ fn java_matching_member(
     }
 }
 
-/// The measured capability for one Java member, read from what its declaration
-/// actually recorded.
-pub fn java_member_family_capability(
+/// The measured capability for one member of a nominal-family language, read
+/// from what its own declaration actually recorded.
+///
+/// The support table states the language's ceiling; this states what *this*
+/// declaration reached. A member whose parameter-type spellings were never
+/// recorded is [`MemberFamilyCapability::NameAndArity`] even in a language the
+/// table calls `parameter_type_spellings`, because the capability published
+/// beside an answer must describe the evidence behind that answer.
+pub fn nominal_member_family_capability(
     analyzer: &dyn IAnalyzer,
+    rules: &dyn NominalFamilyRules,
     member: &CodeUnit,
 ) -> MemberFamilyCapability {
-    if language_for_file(member.source()) != Language::Java {
+    let language = language_for_file(member.source());
+    if language != rules.language() || !member_family_support(language).is_supported() {
         return MemberFamilyCapability::Unsupported;
     }
     MemberFacts::read(analyzer, member)
         .map(|facts| facts.capability)
         .unwrap_or(MemberFamilyCapability::Unsupported)
+}
+
+/// The Java family, in both directions. See [`nominal_member_family`].
+pub fn java_member_family(
+    analyzer: &dyn IAnalyzer,
+    hierarchy: &dyn TypeHierarchyProvider,
+    member: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+) -> MemberFamilyAnswer {
+    nominal_member_family(analyzer, hierarchy, &JavaFamilyRules, member, cancellation)
+}
+
+pub fn java_member_family_capability(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+) -> MemberFamilyCapability {
+    nominal_member_family_capability(analyzer, &JavaFamilyRules, member)
+}
+
+/// The C# family, in both directions. See [`nominal_member_family`].
+pub fn csharp_member_family(
+    analyzer: &dyn IAnalyzer,
+    hierarchy: &dyn TypeHierarchyProvider,
+    member: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+) -> MemberFamilyAnswer {
+    nominal_member_family(
+        analyzer,
+        hierarchy,
+        &CSharpFamilyRules,
+        member,
+        cancellation,
+    )
+}
+
+pub fn csharp_member_family_capability(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+) -> MemberFamilyCapability {
+    nominal_member_family_capability(analyzer, &CSharpFamilyRules, member)
+}
+
+/// The Scala family, in both directions. See [`nominal_member_family`].
+pub fn scala_member_family(
+    analyzer: &dyn IAnalyzer,
+    hierarchy: &dyn TypeHierarchyProvider,
+    member: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+) -> MemberFamilyAnswer {
+    nominal_member_family(analyzer, hierarchy, &ScalaFamilyRules, member, cancellation)
+}
+
+pub fn scala_member_family_capability(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+) -> MemberFamilyCapability {
+    nominal_member_family_capability(analyzer, &ScalaFamilyRules, member)
 }
 
 /// Whether the owner is an interface, from the kind the declaration walk
@@ -680,4 +1071,68 @@ fn owner_is_interface(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> Option<bool
             .iter()
             .any(brokk_bifrost_core::analyzer::model::SignatureMetadata::class_like_is_interface),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The support table is total and honest.
+    ///
+    /// Totality is a compile-time property -- [`member_family_support`] is an
+    /// exhaustive `match` with no wildcard arm, so a new [`Language`] variant
+    /// fails to build until it is listed. This test states the two run-time
+    /// properties the match cannot: every unsupported arm names the fact that
+    /// is missing, and no arm claims a capability while reporting itself
+    /// unsupported.
+    #[test]
+    fn member_family_support_table_is_total_and_states_every_gap() {
+        for language in Language::ALL {
+            match member_family_support(language) {
+                MemberFamilySupport::Supported(capability) => {
+                    assert_ne!(
+                        capability,
+                        MemberFamilyCapability::Unsupported,
+                        "{language:?} claims support with no capability"
+                    );
+                    assert_ne!(
+                        capability,
+                        MemberFamilyCapability::ErasedParameterTypes,
+                        "{language:?} claims erased parameter types, but no adapter resolves or \
+                         erases a declared parameter type; each records the written spelling"
+                    );
+                }
+                MemberFamilySupport::Unsupported(reason) => {
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{language:?} is unsupported without naming the missing fact"
+                    );
+                    assert_eq!(
+                        member_family_support(language).capability(),
+                        MemberFamilyCapability::Unsupported,
+                        "{language:?} reports a capability it cannot back"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every language the nominal walk implements is listed as supported, and
+    /// each rule answers for exactly the language the table names.
+    ///
+    /// This is what keeps the table from drifting away from the code: adding a
+    /// rule without listing it, or listing a language whose rule was removed,
+    /// fails here rather than silently answering `unsupported` at run time.
+    #[test]
+    fn nominal_rules_and_the_support_table_agree() {
+        let rules: [&dyn NominalFamilyRules; 3] =
+            [&JavaFamilyRules, &CSharpFamilyRules, &ScalaFamilyRules];
+        for rule in rules {
+            assert!(
+                member_family_support(rule.language()).is_supported(),
+                "{:?} has a nominal family rule but the table calls it unsupported",
+                rule.language()
+            );
+        }
+    }
 }

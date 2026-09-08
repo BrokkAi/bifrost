@@ -799,6 +799,47 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
     Some(bindings)
 }
 
+/// Whether a module or class execution scope binds `target_name` anywhere in
+/// its direct scope. Nested callable and class bodies are separate scopes, but
+/// their headers still execute in this scope. A wildcard import keeps the
+/// name's runtime identity open even when it does not expose a static binder.
+pub fn python_module_or_class_scope_binds_name_bounded(
+    scope: Node<'_>,
+    target_name: &str,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    assert!(matches!(scope.kind(), "module" | "class_definition"));
+    let body = scope.child_by_field_name("body").unwrap_or(scope);
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
+        if node.kind() == "wildcard_import" {
+            return Some(true);
+        }
+        if python_direct_scope_bindings_bounded(node, source, &mut scope_step)?
+            .into_iter()
+            .any(|binding| node_text(binding.declaration, source) == target_name)
+        {
+            return Some(true);
+        }
+        let excluded_body = matches!(
+            node.kind(),
+            "class_definition" | "function_definition" | "lambda"
+        )
+        .then(|| node.child_by_field_name("body").map(|body| body.id()))
+        .flatten();
+        let mut cursor = node.walk();
+        stack.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| Some(child.id()) != excluded_body),
+        );
+    }
+    Some(false)
+}
+
 pub fn python_unambiguous_module_class_binding_bounded(
     root: Node<'_>,
     source: &str,
@@ -810,6 +851,11 @@ pub fn python_unambiguous_module_class_binding_bounded(
     while let Some(node) = stack.pop() {
         if !scope_step() {
             return None;
+        }
+        // A later unconditional class declaration replaces an earlier
+        // wildcard binding; a wildcard after the class leaves its identity open.
+        if node.kind() == "wildcard_import" && matched.is_some() {
+            return Some(false);
         }
         for binding in python_direct_scope_bindings_bounded(node, source, &mut scope_step)? {
             if node_text(binding.declaration, source) != target_name {

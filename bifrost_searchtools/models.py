@@ -1412,6 +1412,80 @@ class CodeQueryFlowWitness:
         )
 
 
+class CodeQueryAbsentMemberWitnessStatus(StrEnum):
+    AVAILABLE = "available"
+    TRUNCATED = "truncated"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class CodeQueryAbsentMemberWitness:
+    """Bounded evidence for one proven absent-member finding.
+
+    The finding remains independently proven when witness reconstruction or
+    projection is unavailable. ``witness_status`` makes that sidecar state
+    explicit instead of treating an empty step list as a complete path.
+    """
+
+    id: str
+    finding_id: str
+    witness_index: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    quality: CodeQuerySemanticEvidence
+    steps: tuple[CodeQueryFlowWitnessStep, ...]
+    retained_bytes: int
+    omitted_steps_lower_bound: int
+    truncated: bool
+    alternatives_truncated: bool
+    retention_truncated: bool
+    witness_status: CodeQueryAbsentMemberWitnessStatus
+    unavailable_reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryAbsentMemberWitness:
+        return cls(
+            id=data["id"],
+            finding_id=data["finding_id"],
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            steps=tuple(
+                CodeQueryFlowWitnessStep.from_dict(step)
+                for step in _strict_list(data, "steps")
+            ),
+            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
+            omitted_steps_lower_bound=_strict_nonnegative_int(
+                data, "omitted_steps_lower_bound"
+            ),
+            truncated=_strict_bool(data, "truncated", False),
+            alternatives_truncated=_strict_bool(
+                data, "alternatives_truncated", False
+            ),
+            retention_truncated=_strict_bool(data, "retention_truncated", False),
+            witness_status=CodeQueryAbsentMemberWitnessStatus(data["witness_status"]),
+            unavailable_reason=data.get("unavailable_reason"),
+        )
+
+    def render_text(self) -> str:
+        suffix = f"; {self.witness_status.value}"
+        if (
+            self.truncated
+            and self.witness_status is not CodeQueryAbsentMemberWitnessStatus.TRUNCATED
+        ):
+            suffix += "; truncated"
+        if self.unavailable_reason is not None:
+            suffix += f"; {self.unavailable_reason}"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[absent member witness; {len(self.steps)} steps{suffix}; "
+            f"finding {self.finding_id}]"
+        )
+
+
 class CodeQueryClassSetStatus(StrEnum):
     KNOWN = "known"
     PARTIAL = "partial"
@@ -5278,6 +5352,7 @@ CodeQueryResultItem = (
     | CodeQueryTypestateWitness
     | CodeQueryFlowEndpoint
     | CodeQueryFlowWitness
+    | CodeQueryAbsentMemberWitness
     | CodeQueryClassSetRow
     | CodeQueryAbsentMemberFinding
     | CodeQueryTaintFinding
@@ -5346,6 +5421,7 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "typestate_witness": CodeQueryTypestateWitness,
     "flow_endpoint": CodeQueryFlowEndpoint,
     "flow_witness": CodeQueryFlowWitness,
+    "absent_member_witness": CodeQueryAbsentMemberWitness,
     "class_set_row": CodeQueryClassSetRow,
     "absent_member_finding": CodeQueryAbsentMemberFinding,
     "taint_finding": CodeQueryTaintFinding,
@@ -5427,6 +5503,8 @@ class CodeQueryDiagnosticCode(StrEnum):
     NO_ENCLOSING_PROCEDURE = "no_enclosing_procedure"
     SEMANTIC_CAPABILITY_UNSUPPORTED = "semantic_capability_unsupported"
     SEMANTIC_ANALYSIS_PARTIAL = "semantic_analysis_partial"
+    TYPE_FLOW_WITNESS_TRUNCATED = "type_flow_witness_truncated"
+    TYPE_FLOW_WITNESS_UNAVAILABLE = "type_flow_witness_unavailable"
     CALL_BINDING_DISPATCH_PARTIAL = "call_binding_dispatch_partial"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
@@ -5502,6 +5580,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     EFFECT_DERIVATION_INCOMPLETE = "effect_derivation_incomplete"
     RESULT_CONTRACT_DERIVATION_INCOMPLETE = "result_contract_derivation_incomplete"
     EFFECT_BUDGET_EXHAUSTED = "effect_budget_exhausted"
+    CALL_SHAPE_COVERAGE_INCOMPLETE = "call_shape_coverage_incomplete"
     JSX_PROJECTION_INCOMPLETE = "jsx_projection_incomplete"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
@@ -6066,6 +6145,91 @@ class CodeQueryValueFlowWork:
 
 
 @dataclass(frozen=True)
+class CodeQueryTypeFlowWork:
+    field_slot_builds: int = 0
+    field_slot_memory_hits: int = 0
+    field_slot_persistence_hits: int = 0
+    field_slot_persistence_misses: int = 0
+    field_slot_persistence_rejections: int = 0
+    field_slot_publications: int = 0
+    root_result_persistence_hits: int = 0
+    root_result_persistence_misses: int = 0
+    root_result_persistence_rejections: int = 0
+    root_result_store_failures: int = 0
+    root_result_publications: int = 0
+    solves: int = 0
+    cache_hits: int = 0
+    snapshot_cache_hits: int = 0
+    snapshot_cache_misses: int = 0
+    dispatch_cache_hits: int = 0
+    dispatch_cache_misses: int = 0
+    binding_cache_hits: int = 0
+    binding_cache_misses: int = 0
+    summary_cache_hits: int = 0
+    summary_cache_misses: int = 0
+    root_summary_cache_hits: int = 0
+    root_summary_observation_rejections: int = 0
+    published_summaries: int = 0
+    class_set_rows: int = 0
+    finding_rows: int = 0
+    witnesses: int = 0
+    omitted_witnesses: int = 0
+    witness_expansions: int = 0
+    witness_steps: int = 0
+    witness_bytes: int = 0
+    incomplete_roots: int = 0
+    failed_solves: int = 0
+    witness_truncated: bool = False
+    summary_profile: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryTypeFlowWork:
+        numeric = {
+            "field_slot_builds",
+            "field_slot_memory_hits",
+            "field_slot_persistence_hits",
+            "field_slot_persistence_misses",
+            "field_slot_persistence_rejections",
+            "field_slot_publications",
+            "root_result_persistence_hits",
+            "root_result_persistence_misses",
+            "root_result_persistence_rejections",
+            "root_result_store_failures",
+            "root_result_publications",
+            "solves",
+            "cache_hits",
+            "snapshot_cache_hits",
+            "snapshot_cache_misses",
+            "dispatch_cache_hits",
+            "dispatch_cache_misses",
+            "binding_cache_hits",
+            "binding_cache_misses",
+            "summary_cache_hits",
+            "summary_cache_misses",
+            "root_summary_cache_hits",
+            "root_summary_observation_rejections",
+            "published_summaries",
+            "class_set_rows",
+            "finding_rows",
+            "witnesses",
+            "omitted_witnesses",
+            "witness_expansions",
+            "witness_steps",
+            "witness_bytes",
+            "incomplete_roots",
+            "failed_solves",
+        }
+        summary_profile = data.get("summary_profile", {})
+        if not isinstance(summary_profile, dict):
+            raise TypeError("summary_profile must be an object")
+        return cls(
+            **{key: int(data.get(key, 0)) for key in numeric},
+            witness_truncated=bool(data.get("witness_truncated", False)),
+            summary_profile=dict(summary_profile),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQuerySemanticWork:
     materialization_attempts: int = 0
     unique_materialized_files: int = 0
@@ -6079,6 +6243,7 @@ class CodeQuerySemanticWork:
     budget_exhausted: bool = False
     typestate: CodeQueryTypestateWork = field(default_factory=CodeQueryTypestateWork)
     value_flow: CodeQueryValueFlowWork = field(default_factory=CodeQueryValueFlowWork)
+    type_flow: CodeQueryTypeFlowWork = field(default_factory=CodeQueryTypeFlowWork)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticWork:
@@ -6095,6 +6260,7 @@ class CodeQuerySemanticWork:
             budget_exhausted=bool(data.get("budget_exhausted", False)),
             typestate=CodeQueryTypestateWork.from_dict(data.get("typestate", {})),
             value_flow=CodeQueryValueFlowWork.from_dict(data.get("value_flow", {})),
+            type_flow=CodeQueryTypeFlowWork.from_dict(data.get("type_flow", {})),
         )
 
 

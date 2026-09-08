@@ -1742,7 +1742,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
     let correctness_policies = packs[0]["policies"]
         .as_array()
         .expect("correctness policies");
-    assert_eq!(correctness_policies.len(), 16);
+    assert_eq!(correctness_policies.len(), 17);
     assert!(
         correctness_policies
             .iter()
@@ -1812,6 +1812,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
+            "bifrost.correctness.python-absent-member",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ],
@@ -1850,6 +1851,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
             "bifrost.correctness.go-data-race",
             "bifrost.correctness.go-nil-dereference",
             "bifrost.correctness.go-wrong-error-on-failure-path",
+            "bifrost.correctness.python-absent-member",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",

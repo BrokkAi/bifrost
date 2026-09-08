@@ -203,16 +203,23 @@ impl JsTsLexicalBindingIndex {
                     }
                 }
                 "for_in_statement" => {
-                    if let Some(pattern) = node.child_by_field_name("left")
-                        && let Some(declaration_kind) = for_in_declaration_kind(node, pattern)
-                    {
-                        let scope = if declaration_kind == "var" {
-                            enclosing_var_binding_scope(node)
+                    if let Some(pattern) = node.child_by_field_name("left") {
+                        if let Some(declaration_kind) = for_in_declaration_kind(node, pattern) {
+                            let scope = if declaration_kind == "var" {
+                                enclosing_var_binding_scope(node)
+                            } else {
+                                Some(node_scope(node))
+                            };
+                            if let Some(scope) = scope {
+                                index.insert_pattern(pattern, source, scope);
+                            }
                         } else {
-                            Some(node_scope(node))
-                        };
-                        if let Some(scope) = scope {
-                            index.insert_pattern(pattern, source, scope);
+                            // `for (binding of values)` and `for (binding in
+                            // object)` assign an existing binding on every
+                            // iteration. They are not assignment_expression
+                            // nodes, so record their structured left target
+                            // here rather than silently certifying it stable.
+                            index.record_assignment_targets(pattern, source);
                         }
                     }
                 }
@@ -938,6 +945,7 @@ pub fn is_known_js_ts_global(name: &str) -> bool {
         name,
         "Array"
             | "ArrayBuffer"
+            | "Buffer"
             | "BigInt"
             | "Boolean"
             | "Date"
@@ -1671,6 +1679,21 @@ function outer() {
         assert!(index.is_binding_reassigned_before_at("stable", inner_use_after_assignment));
         assert!(!index.is_binding_reassigned_before_at("stable", outer_use));
         assert!(!index.is_binding_reassigned_before_at("missing", outer_use));
+    }
+
+    #[test]
+    fn bare_for_in_and_for_of_targets_reassign_the_active_binding() {
+        let source = r#"
+class Item {}
+for (Item of values) {}
+for (Item in object) {}
+new Item();
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let construction = source.rfind("Item").expect("constructor use");
+
+        assert!(index.is_binding_reassigned_at("Item", construction));
     }
 
     #[test]

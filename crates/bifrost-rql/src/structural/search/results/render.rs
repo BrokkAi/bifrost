@@ -14,6 +14,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ConcurrentAccessConflict { .. }
                 | CodeQueryResultValue::ClassSetRow { .. }
                 | CodeQueryResultValue::AbsentMemberFinding { .. }
+                | CodeQueryResultValue::AbsentMemberWitness { .. }
                 | CodeQueryResultValue::TypestateWitness { .. }
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
@@ -202,6 +203,19 @@ impl CodeQueryResult {
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
+                            value.steps.len(),
+                            if value.steps.len() == 1 { "" } else { "s" },
+                            if value.truncated { "; truncated" } else { "" },
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::AbsentMemberWitness { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [absent member witness; {}; {} step{}{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.witness_status.as_str(),
                             value.steps.len(),
                             if value.steps.len() == 1 { "" } else { "s" },
                             if value.truncated { "; truncated" } else { "" },

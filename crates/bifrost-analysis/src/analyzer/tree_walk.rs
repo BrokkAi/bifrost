@@ -24,8 +24,9 @@
 use tree_sitter::Node;
 
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, first_named_child_of_kind, named_children, node_for_exact_range,
-    subtree_contains, walk_tree_iterative,
+    TreeWalkAction, children_iter, first_named_child_of_kind, named_children, named_children_iter,
+    node_for_exact_range, push_children_reversed, push_named_children_reversed,
+    push_named_children_reversed_as, subtree_contains, walk_tree_iterative,
 };
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals

@@ -26,6 +26,7 @@ use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
@@ -249,10 +250,7 @@ fn function_like_macro_names(root: Node<'_>, source: &str) -> HashSet<String> {
     let mut names = HashSet::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        for index in 0..node.named_child_count() {
-            let Some(child) = node.named_child(index) else {
-                continue;
-            };
+        for child in named_children_iter(node) {
             match child.kind() {
                 "preproc_function_def" => {
                     if let Some(name) = child.child_by_field_name("name") {
@@ -422,14 +420,19 @@ impl StructuralSpec for CppStructuralSpec {
     fn identity_route_support(&self) -> &IdentityRouteSupport {
         // C++'s occurrence adapter is shallow, so it claims no path axes. Its
         // declaration layer keeps prototype/body occurrences distinct, which
-        // the physical-grouping axis carries; the declaration-definition peer
-        // *relation* stays unclaimed until a producer emits typed peer rows
-        // rather than merged ranges (see the #1475 ExecPlan Decision Log, M6,
-        // and its follow-up issue).
+        // the physical-grouping axis carries, and the analyzer now labels each
+        // of those occurrences a head or a body and pairs a prototype with the
+        // out-of-line callable body that defines it, so the
+        // declaration-definition peer relation is supplied as typed rows with
+        // the body occurrence's own range as provenance (#1650). Classes stay
+        // outside that relation: a same-file forward declaration is not a
+        // distinct occurrence, and across files a class carries no linkage
+        // evidence to pair on.
         static SUPPORT: IdentityRouteSupport = IdentityRouteSupport::NONE
             .supported_axis(IdentityAxis::CanonicalIdentity)
             .supported_axis(IdentityAxis::PhysicalGrouping)
-            .supported_relation(RouteHopKind::NestedOwner);
+            .supported_relation(RouteHopKind::NestedOwner)
+            .supported_relation(RouteHopKind::DeclarationDefinitionPeer);
         &SUPPORT
     }
 

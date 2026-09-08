@@ -1,4 +1,9 @@
-use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
+use super::{
+    TypeLookupOutcome, TypeLookupStatus, TypeLookupType, candidates_outcome_with_target_kind,
+    no_type,
+};
+use crate::analyzer::php::diagnostics::{PhpOverlayType, php_overlay_type};
+use crate::analyzer::semantic_model::SemanticModelSymbolKind;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, PhpDefinitionProvider, ResolutionSession, php_type_lookup_resolution_bounded,
 };
@@ -40,6 +45,31 @@ pub(crate) fn resolve_php_type_bounded(
     };
     let candidates = support.fqn(&resolution.fqn);
     if candidates.is_empty() {
+        if let Some(overlay) = analyzer.semantic_model_overlay()
+            && let PhpOverlayType::Indexed(symbol_id) =
+                php_overlay_type(Some(&overlay), &resolution.fqn)
+        {
+            let records = overlay.symbols_with_id(&symbol_id).records;
+            if let [symbol] = records.as_slice()
+                && symbol.language == "php"
+                && symbol.kind == SemanticModelSymbolKind::Class
+                && symbol.owner_id.is_none()
+                && symbol.qualified_name == resolution.fqn
+                && !symbol.provenance.ambiguous
+            {
+                return session.finish(TypeLookupOutcome {
+                    status: TypeLookupStatus::Resolved,
+                    reference: None,
+                    types: vec![TypeLookupType {
+                        fqn: symbol.qualified_name.clone(),
+                        definitions: Vec::new(),
+                        semantic_model_id: Some(symbol.id.clone()),
+                    }],
+                    diagnostics: Vec::new(),
+                    target_kind: resolution.target_kind,
+                });
+            }
+        }
         return session.finish(no_type(
             "php_no_indexed_type_definition",
             format!(

@@ -27,8 +27,11 @@ impl AnalyzerStore {
     /// callers that want the refresh to happen regardless, such as a benchmark
     /// measuring the same store with and without statistics.
     pub fn refresh_planner_statistics(&self) -> Result<PlannerStatisticsRefresh> {
-        self.conn
-            .execute(|conn| refresh_planner_statistics(conn).map_err(StoreError::new))
+        let evidence = self
+            .conn
+            .execute(|conn| refresh_planner_statistics(conn).map_err(StoreError::new))?;
+        self.recycle_readers_for_new_statistics();
+        Ok(evidence)
     }
 
     /// Refresh only when the stored statistics no longer describe the store.
@@ -36,14 +39,47 @@ impl AnalyzerStore {
     /// Returns `None` when nothing has been persisted or collected since the
     /// last refresh, which is what makes a repeated no-op build free.
     pub fn refresh_planner_statistics_if_stale(&self) -> Result<Option<PlannerStatisticsRefresh>> {
-        self.conn.execute(|conn| {
-            if planner_statistics_describe_database(conn).map_err(StoreError::new)? {
-                return Ok(None);
-            }
-            refresh_planner_statistics(conn)
-                .map(Some)
-                .map_err(StoreError::new)
-        })
+        let evidence = self
+            .conn
+            .execute(|conn| -> Result<Option<PlannerStatisticsRefresh>> {
+                if planner_statistics_describe_database(conn).map_err(StoreError::new)? {
+                    return Ok(None);
+                }
+                refresh_planner_statistics(conn)
+                    .map(Some)
+                    .map_err(StoreError::new)
+            })?;
+        if evidence.is_some() {
+            self.recycle_readers_for_new_statistics();
+        }
+        Ok(evidence)
+    }
+
+    /// Make this store's pooled readers plan against the statistics the
+    /// database now holds, and report how many idle connections that closed.
+    ///
+    /// A reader loads `sqlite_stat1` when it first parses the schema and does
+    /// not read it again: SQLite re-prepares a statement only when the schema
+    /// cookie changes, and rewriting the rows of an existing `sqlite_stat1` is
+    /// not a schema change. So a reader that has answered one query before a
+    /// refresh keeps the plans it chose without it -- measured on
+    /// `kivikakk/comrak`, where planning all forty pinned queries, refreshing,
+    /// and planning them again on the same store reported zero plan changes,
+    /// and ten as soon as the store was reopened between the two dumps (issue
+    /// #3016's corpus report, finding F1). The first `ANALYZE` of a store's
+    /// life hides this, because creating `sqlite_stat1` *is* a schema change;
+    /// the collection hook, which rewrites an existing table, does not.
+    ///
+    /// Closing the connection is what fixes it, rather than the documented
+    /// `ANALYZE sqlite_schema` reload: each reader also carries a prepared
+    /// statement cache (`prepare_cached` backs the relational batch readers),
+    /// and those compiled statements keep their plans across a statistics
+    /// reload for the same reason. Dropping the connection drops both.
+    ///
+    /// A reader that is checked out right now finishes its query on the old
+    /// plans and is closed when it comes back, which is the epoch stamp's job.
+    pub fn recycle_readers_for_new_statistics(&self) -> usize {
+        self.readers.recycle() + self.active_readers.recycle() + self.streaming_readers.recycle()
     }
 
     /// How many `sqlite_stat1` rows this store carries, zero when `ANALYZE` has
@@ -63,19 +99,50 @@ impl AnalyzerStore {
     /// sqlite_schema` reloads the planner's now-empty view of them, which is
     /// the documented way to make the planner re-read that table without
     /// recomputing it.
+    ///
+    /// `sqlite_stat4` goes with it. The bundled SQLite is built with
+    /// `SQLITE_ENABLE_STAT4` (`libsqlite3-sys` 0.38 passes
+    /// `-DSQLITE_ENABLE_STAT4`), so `ANALYZE` writes per-index samples there as
+    /// well and the planner reads them; clearing only `sqlite_stat1` would
+    /// leave a "before" measurement holding half of the statistics it means to
+    /// remove.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_planner_statistics(&self) -> Result<i64> {
-        self.conn.execute(|conn| {
+        let rows = self.conn.execute(|conn| -> Result<i64> {
             let rows = planner_statistics_row_count(conn).map_err(StoreError::new)?;
             if rows == 0 {
                 return Ok(0);
             }
-            conn.execute_batch("DELETE FROM sqlite_stat1; ANALYZE sqlite_schema;")
+            // A store analyzed by a build without `SQLITE_ENABLE_STAT4` -- the
+            // system `sqlite3` CLI an operator might have run -- has no
+            // `sqlite_stat4` table to clear.
+            let sample_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM sqlite_schema
+                       WHERE type = 'table' AND name = 'sqlite_stat4'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(|error| {
-                    StoreError::new(format!("clearing planner statistics: {error}"))
+                    StoreError::new(format!("reading planner statistics tables: {error}"))
                 })?;
+            let clear_samples = if sample_table {
+                "DELETE FROM sqlite_stat4;"
+            } else {
+                ""
+            };
+            conn.execute_batch(&format!(
+                "DELETE FROM sqlite_stat1; {clear_samples} ANALYZE sqlite_schema;"
+            ))
+            .map_err(|error| StoreError::new(format!("clearing planner statistics: {error}")))?;
             Ok(rows)
-        })
+        })?;
+        if rows > 0 {
+            self.recycle_readers_for_new_statistics();
+        }
+        Ok(rows)
     }
 }
 
@@ -99,6 +166,27 @@ pub mod pinned_plans {
     use rusqlite::types::Value;
     use rusqlite::{Connection, params_from_iter};
 
+    use super::super::class_set_field_slots::{
+        CLASS_SET_FIELD_SLOT_ARTIFACTS_SQL, CLASS_SET_FIELD_SLOT_ATOMS_SQL,
+        CLASS_SET_FIELD_SLOT_INDEX_SQL, CLASS_SET_FIELD_SLOTS_SQL,
+        PRUNE_OLD_CLASS_SET_FIELD_SLOT_INDEXES_SQL,
+    };
+    use super::super::class_set_procedure_surfaces::{
+        CLASS_SET_PROCEDURE_SURFACE_DIGEST_SQL, CLASS_SET_PROCEDURE_SURFACE_FAMILY_SQL,
+        SURFACE_BINDINGS_SQL, SURFACE_CALLS_SQL, SURFACE_ENTERED_SQL, SURFACE_LEXICAL_CHILDREN_SQL,
+        SURFACE_READS_SQL,
+    };
+    use super::super::class_set_root_results::{
+        CLASS_SET_ROOT_RESULT_HEADER_SQL, CLASS_SET_ROOT_RESULT_ROWS_SQL,
+        PRUNE_OLD_CLASS_SET_ROOT_RESULT_GENERATIONS_SQL,
+    };
+    use super::super::class_set_summaries::{
+        CHARGES_SQL, CLASS_SET_SUMMARY_DEPENDENTS_BY_LINEAGE_ENTRY_SQL,
+        CLASS_SET_SUMMARY_DEPENDENTS_BY_LOOKUP_SQL, CLASS_SET_SUMMARY_DEPENDENTS_BY_READ_SQL,
+        CLASS_SET_SUMMARY_FAMILY_SQL, CLASS_SET_SUMMARY_LOOKUP_SQL,
+        CLASS_SET_SUMMARY_PROCEDURE_SQL, DEPENDENCIES_SQL, DEPENDENCY_SOURCES_SQL, EXITS_SQL,
+        FACTS_SQL, REACHED_SQL, READS_SQL,
+    };
     use super::super::{
         AnalyzerStore, EXACT_PATH_SYMBOL_FQN_SQL, NORMALIZED_PATH_SYMBOL_FQN_SQL,
         REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL, REVERSE_IMPORT_CANDIDATE_BLOBS_SQL,
@@ -108,17 +196,65 @@ pub mod pinned_plans {
         candidate_fq_segments_sql, chunk_params, chunk_placeholders,
         direct_children_limited_candidate_sql, enclosing_declarations_for_file_sql,
         identifier_prefix_candidate_sql, limited_identifier_candidate_for_blob_sql,
-        mounted_declaration_sql, parsed_blob_keys_sql, persisted_blob_mutation_cost_fallback_sql,
-        point_anchor_only_definition_candidate_sql, point_component_definition_candidate_sql,
-        ranges_bulk_sql, raw_unit_fq_segments_sql, read_path_parsed_blob_condition,
-        search_candidate_key_set_sql, search_candidate_name_rows_sql,
-        signature_metadata_for_unit_limited_sql, signature_metadata_value_columns_sql,
-        stored_blob_cascade_costs_sql, sync_active_blob_oids, sync_reverse_reference_lookup_keys,
-        workspace_content_package_facts_sql,
+        mounted_declaration_sql, mounted_declaration_sql_with_primary_ranges, parsed_blob_keys_sql,
+        persisted_blob_mutation_cost_fallback_sql, point_anchor_only_definition_candidate_sql,
+        point_component_definition_candidate_sql, ranges_bulk_sql, raw_unit_fq_segments_sql,
+        read_path_parsed_blob_condition, search_candidate_key_set_sql,
+        search_candidate_name_rows_sql, signature_metadata_for_unit_limited_sql,
+        signature_metadata_value_columns_sql, stored_blob_cascade_costs_sql,
+        structural_fact_manifest_sql, structural_fact_payload_bytes_sql, sync_active_blob_oids,
+        sync_reverse_reference_lookup_keys, workspace_content_package_facts_sql,
     };
 
     pub(crate) const OID: &str = "0123456789012345678901234567890123456789";
     pub(crate) const MEMBERSHIP: &str = "units.in_declarations = 1";
+
+    /// Request counts the batch definition-candidate statements are pinned at
+    /// (issue #3030).
+    ///
+    /// These statements carry their requests as a JSON array bound to `?1`, so
+    /// nothing chunks them: `rendered_definition_order_candidate_rows_for_langs`
+    /// serializes every component of every request in the caller's batch into
+    /// one payload, and `TreeSitterAnalyzer::prefetch_definitions` builds that
+    /// batch from however many names the resolver asked about. The rungs are
+    /// therefore observations, not a chunk size. 6 is the smallest batch the
+    /// `laravel/framework` profile issued (arity one goes down the point path
+    /// instead) and 542 is the largest single statement in it, the one that
+    /// took 58.7 s without planner statistics; the rest space the range.
+    ///
+    /// A ladder is worth pinning even though the SQL text is the same at every
+    /// rung, because the bundled SQLite is built with `SQLITE_ENABLE_STAT4`
+    /// (`libsqlite3-sys` 0.38 passes `-DSQLITE_ENABLE_STAT4`) and a STAT4 build
+    /// re-prepares a statement using its bound parameter values. The bound
+    /// payload is an input to planning, so "the pin plans the same statement"
+    /// is not by itself "the pin plans production's statement".
+    pub const DEFINITION_CANDIDATE_ARITY_LADDER: [usize; 5] = [6, 16, 64, 256, 542];
+
+    /// One `[request_index, prefix, tail, normalized, anchored]` row per
+    /// request, shaped exactly as
+    /// `rendered_definition_order_candidate_rows_for_langs` serializes them.
+    ///
+    /// Prefixes and tails vary per row because STAT4 plans from the bound
+    /// values: a payload repeating one package name would describe a batch
+    /// production does not issue.
+    fn definition_request_payload(arity: usize, anchor_only: bool) -> String {
+        let rows = (0..arity)
+            .map(|index| {
+                (
+                    index,
+                    format!("pkg.module{index}"),
+                    if anchor_only {
+                        String::new()
+                    } else {
+                        format!("Widget{index}")
+                    },
+                    0,
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&rows).expect("definition request payload serializes")
+    }
 
     fn text(value: &str) -> Value {
         Value::Text(value.to_string())
@@ -126,6 +262,10 @@ pub mod pinned_plans {
 
     fn integer(value: i64) -> Value {
         Value::Integer(value)
+    }
+
+    fn digest(value: u8) -> Value {
+        Value::Blob(vec![value; 32])
     }
 
     /// One pinned query: the SQL an EXPLAIN QUERY PLAN test in this crate
@@ -240,6 +380,22 @@ pub mod pinned_plans {
                 vec![integer(0)],
             ));
         }
+        // The manifest lookup is the hydration path's only statement that
+        // joins and subqueries instead of seeking one primary key, and the
+        // payload-bytes measurement runs three correlated subqueries on every
+        // persist. Both are therefore the structural-fact statements whose
+        // plans can move with the store's statistics; the three row-family
+        // reads above cannot.
+        queries.push(pin(
+            "structural_fact_manifest",
+            structural_fact_manifest_sql(),
+            vec![text(OID), text("java"), integer(1)],
+        ));
+        queries.push(pin(
+            "structural_fact_payload_bytes",
+            structural_fact_payload_bytes_sql(),
+            vec![integer(0)],
+        ));
 
         let langs = vec!["rust".to_string(), "python".to_string()];
         for (label, required) in [
@@ -320,6 +476,172 @@ pub mod pinned_plans {
             persisted_blob_mutation_cost_fallback_sql(),
             vec![text(OID), text("java")],
         ));
+        queries.push(pin(
+            "class_set_summary_cascade_costs",
+            stored_blob_cascade_costs_sql(1),
+            vec![text(OID), text("python")],
+        ));
+
+        for (name, sql, params) in [
+            (
+                "class_set_field_slot_index",
+                CLASS_SET_FIELD_SLOT_INDEX_SQL,
+                vec![
+                    text("python"),
+                    digest(1),
+                    digest(2),
+                    digest(3),
+                    digest(4),
+                    integer(1),
+                ],
+            ),
+            (
+                "class_set_field_slots",
+                CLASS_SET_FIELD_SLOTS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_field_slot_atoms",
+                CLASS_SET_FIELD_SLOT_ATOMS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_field_slot_artifacts",
+                CLASS_SET_FIELD_SLOT_ARTIFACTS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "prune_old_class_set_field_slot_indexes",
+                PRUNE_OLD_CLASS_SET_FIELD_SLOT_INDEXES_SQL,
+                vec![text("python")],
+            ),
+            (
+                "class_set_root_result_header",
+                CLASS_SET_ROOT_RESULT_HEADER_SQL.as_str(),
+                vec![
+                    text("python"),
+                    digest(1),
+                    digest(2),
+                    digest(3),
+                    digest(4),
+                    digest(5),
+                    integer(1),
+                    digest(6),
+                ],
+            ),
+            (
+                "class_set_root_result_rows",
+                CLASS_SET_ROOT_RESULT_ROWS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "prune_old_class_set_root_result_generations",
+                PRUNE_OLD_CLASS_SET_ROOT_RESULT_GENERATIONS_SQL,
+                vec![text("python")],
+            ),
+            (
+                "class_set_summary_lookup",
+                CLASS_SET_SUMMARY_LOOKUP_SQL.as_str(),
+                vec![digest(1)],
+            ),
+            (
+                "class_set_summary_family",
+                CLASS_SET_SUMMARY_FAMILY_SQL.as_str(),
+                vec![
+                    digest(1),
+                    text("src/app.py"),
+                    text("python"),
+                    integer(1),
+                    digest(2),
+                    digest(3),
+                    digest(4),
+                    digest(5),
+                    digest(6),
+                    digest(7),
+                    integer(2),
+                ],
+            ),
+            (
+                "class_set_procedure_surface_family",
+                CLASS_SET_PROCEDURE_SURFACE_FAMILY_SQL.as_str(),
+                vec![
+                    digest(1),
+                    text("src/app.py"),
+                    text("python"),
+                    integer(1),
+                    digest(2),
+                    digest(3),
+                    integer(2),
+                ],
+            ),
+            (
+                "class_set_procedure_surface_digest",
+                CLASS_SET_PROCEDURE_SURFACE_DIGEST_SQL.as_str(),
+                vec![digest(1)],
+            ),
+            (
+                "class_set_procedure_surface_calls",
+                SURFACE_CALLS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_procedure_surface_bindings",
+                SURFACE_BINDINGS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_procedure_surface_entered",
+                SURFACE_ENTERED_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_procedure_surface_lexical_children",
+                SURFACE_LEXICAL_CHILDREN_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_procedure_surface_reads",
+                SURFACE_READS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_summary_procedure",
+                CLASS_SET_SUMMARY_PROCEDURE_SQL.as_str(),
+                vec![digest(2)],
+            ),
+            (
+                "class_set_summary_dependents_by_lookup",
+                CLASS_SET_SUMMARY_DEPENDENTS_BY_LOOKUP_SQL.as_str(),
+                vec![digest(14)],
+            ),
+            (
+                "class_set_summary_dependents_by_lineage_entry",
+                CLASS_SET_SUMMARY_DEPENDENTS_BY_LINEAGE_ENTRY_SQL.as_str(),
+                vec![digest(11), digest(12)],
+            ),
+            (
+                "class_set_summary_dependents_by_read",
+                CLASS_SET_SUMMARY_DEPENDENTS_BY_READ_SQL.as_str(),
+                vec![digest(1)],
+            ),
+            ("class_set_summary_facts", FACTS_SQL, vec![integer(0)]),
+            ("class_set_summary_exits", EXITS_SQL, vec![integer(0)]),
+            ("class_set_summary_reached", REACHED_SQL, vec![integer(0)]),
+            (
+                "class_set_summary_dependencies",
+                DEPENDENCIES_SQL,
+                vec![integer(0)],
+            ),
+            (
+                "class_set_summary_dependency_sources",
+                DEPENDENCY_SOURCES_SQL,
+                vec![integer(0)],
+            ),
+            ("class_set_summary_reads", READS_SQL, vec![integer(0)]),
+            ("class_set_summary_charges", CHARGES_SQL, vec![integer(0)]),
+        ] {
+            queries.push(pin(name, sql, params));
+        }
 
         for arity in [1usize, 16, 64, 256, 400] {
             queries.push(pin(
@@ -368,6 +690,43 @@ pub mod pinned_plans {
             batch_anchor_only_definition_candidate_sql(MEMBERSHIP),
             vec![text("[[0,\"pkg\",\"\",0,1]]"), text("java"), integer(0)],
         ));
+        for arity in DEFINITION_CANDIDATE_ARITY_LADDER {
+            queries.push(pin(
+                format!("batch_component_definition_candidate_{arity}"),
+                batch_component_definition_candidate_sql(
+                    true,
+                    RenderedTailMatch::Exact,
+                    MEMBERSHIP,
+                ),
+                vec![
+                    text(&definition_request_payload(arity, false)),
+                    text("java"),
+                    integer(0),
+                ],
+            ));
+            queries.push(pin(
+                format!("batch_stable_component_definition_candidate_{arity}"),
+                batch_component_definition_candidate_sql(
+                    false,
+                    RenderedTailMatch::Exact,
+                    MEMBERSHIP,
+                ),
+                vec![
+                    text(&definition_request_payload(arity, false)),
+                    text("java"),
+                    integer(0),
+                ],
+            ));
+            queries.push(pin(
+                format!("batch_anchor_only_definition_candidate_{arity}"),
+                batch_anchor_only_definition_candidate_sql(MEMBERSHIP),
+                vec![
+                    text(&definition_request_payload(arity, true)),
+                    text("java"),
+                    integer(0),
+                ],
+            ));
+        }
         queries.push(pin(
             "direct_children_limited_candidate",
             direct_children_limited_candidate_sql(),
@@ -386,6 +745,11 @@ pub mod pinned_plans {
         queries.push(pin(
             "mounted_declaration_scan",
             mounted_declaration_sql(),
+            vec![text("csharp")],
+        ));
+        queries.push(pin(
+            "mounted_declaration_scan_with_primary_ranges",
+            mounted_declaration_sql_with_primary_ranges(),
             vec![text("csharp")],
         ));
         queries.push(pin(
@@ -517,7 +881,7 @@ pub(crate) mod tests {
 
     use rusqlite::Connection;
 
-    use super::super::AnalyzerStore;
+    use super::super::{AnalyzerStore, WorkspaceId};
     // The pinned SQL, its bindings, and the two helpers that plan it live in
     // `pinned_plans` so the benchmark can call them too; the pin tests in
     // `store/mod.rs` still reach them through this module's path, which is why
@@ -527,8 +891,8 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use brokk_bifrost_core::cache_gc::{
-        PlannerStatisticsState, STORE_STATISTICS_ENV, planner_statistics_row_count,
-        with_representative_statistics,
+        PlannerStatisticsState, STORE_STATISTICS_ENV, planner_statistics_repairs,
+        planner_statistics_row_count, with_representative_statistics,
     };
 
     use crate::analyzer::workspace::WorkspaceAnalyzer;
@@ -828,8 +1192,8 @@ pub(crate) mod tests {
     ///
     /// The setup makes one persisted blob genuinely unreachable: two commits,
     /// each built, then the branch is moved back to the first and the working
-    /// tree is restored to the first content, so nothing in Git or on disk
-    /// reaches the second blob any more.
+    /// tree is restored to the first content and the retained workspace
+    /// projection is released, so nothing owns the second blob any more.
     #[test]
     fn a_collection_that_drops_rows_refreshes_the_statistics() {
         let temp = tempfile::tempdir().unwrap();
@@ -841,9 +1205,11 @@ pub(crate) mod tests {
         let repository = init_repo(&root);
         let first_commit = commit_all(&repository, "first content");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should build");
+        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            Arc::clone(&project),
+            AnalyzerConfig::default(),
+        )
+        .expect("persisted analyzer should build");
         let db_path = workspace
             .persisted_store_path()
             .expect("a persisted build reports its store path");
@@ -852,8 +1218,11 @@ pub(crate) mod tests {
         std::fs::write(root.join("app.rs"), second).unwrap();
         commit_all(&repository, "second content");
         drop(
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .expect("persisted analyzer should rebuild"),
+            WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+                Arc::clone(&project),
+                AnalyzerConfig::default(),
+            )
+            .expect("persisted analyzer should rebuild"),
         );
 
         let head = repository.head().unwrap();
@@ -862,6 +1231,17 @@ pub(crate) mod tests {
             .reference(&branch, first_commit, true, "drop the second commit")
             .unwrap();
         std::fs::write(root.join("app.rs"), first).unwrap();
+
+        // Both analyzers are gone. Release their retained revision history;
+        // rewinding Git alone does not make those facts collectable.
+        let store = AnalyzerStore::open_persistent(&db_path).expect("open the collected store");
+        assert!(
+            store
+                .delete_workspace_projection(&WorkspaceId::for_root(&root))
+                .expect("release the workspace projection")
+                > 0
+        );
+        drop(store);
 
         let statistics = Connection::open(&db_path).unwrap();
         statistics
@@ -897,21 +1277,226 @@ pub(crate) mod tests {
         );
     }
 
-    /// Serializes the tests that set `BIFROST_STORE_STATISTICS`, which is
-    /// process-wide state.
+    /// A pinned query whose plan the captured corpus statistics change, so a
+    /// test can see which statistics a connection is planning with.
     ///
-    /// The lock is local to this module because the workspace has no shared
-    /// one: `grep -rn "set_var" --include=*.rs crates tests src` finds exactly
-    /// one other test that mutates the environment
-    /// (`tests/suite_bench_policy/measure_policy_substrate.rs`, which sets
-    /// `BIFROST_CACHE_DIR` and holds no lock at all), and there is no
-    /// `EnvGuard`-style helper, `temp-env`, or `serial_test` anywhere in the
-    /// tree. A shared helper for two unrelated variables in two unrelated test
-    /// binaries would serialize tests that never contend; the first module
-    /// that needs to share this variable with another is when to move it.
+    /// The path-symbol lookups are the two pins that moved on all thirty-six
+    /// corpus stores (issue #3016's corpus report), which is why one of them is
+    /// the subject here.
+    const STATISTICS_SENSITIVE_PIN: &str = "exact_path_symbol_fqn";
+
+    /// A refresh makes this store's own pooled readers plan again (issue
+    /// #3029).
+    ///
+    /// The middle assertion is the defect this test exists for: a reader that
+    /// has already answered a query keeps the statistics it loaded, so without
+    /// the recycle the new plan appears only when the whole store is reopened.
+    /// The first refresh here is what makes the second one representative of
+    /// the collection hook rather than of the build hook: creating
+    /// `sqlite_stat1` is a schema change every connection notices, and
+    /// rewriting its rows is not.
+    #[test]
+    fn a_refresh_makes_a_pooled_reader_plan_with_the_new_statistics() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        {
+            let conn = store.conn.lock().expect("store mutex");
+            insert_one_declaration(&conn);
+        }
+        store.refresh_planner_statistics().unwrap();
+        let pin = pinned(STATISTICS_SENSITIVE_PIN);
+
+        let planned_without = {
+            let conn = store.read_conn().expect("pooled reader");
+            explain_pin(&conn, &pin)
+        };
+        assert_eq!(
+            store.readers.idle_len(),
+            1,
+            "the reader must be back in the pool, checked in with the plans it just made"
+        );
+
+        // Rewrite the statistics the way a collection's refresh does, without
+        // telling the pool.
+        store
+            .conn
+            .execute(|conn| with_representative_statistics(conn));
+        let planned_by_the_stale_reader = {
+            let conn = store.read_conn().expect("pooled reader");
+            explain_pin(&conn, &pin)
+        };
+        assert_eq!(
+            planned_by_the_stale_reader, planned_without,
+            "a checked-in reader keeps the statistics it loaded, which is what the recycle is for"
+        );
+
+        assert_eq!(
+            store.recycle_readers_for_new_statistics(),
+            1,
+            "the recycle must close the one idle reader"
+        );
+        let planned_with = {
+            let conn = store.read_conn().expect("pooled reader");
+            explain_pin(&conn, &pin)
+        };
+        assert_ne!(
+            planned_with, planned_without,
+            "after the recycle the pool must hand back a reader that planned with the new statistics"
+        );
+    }
+
+    /// A reader that was out while the statistics changed is closed when it
+    /// comes back rather than returned to the idle set.
+    ///
+    /// This is the half a bare "drop the idle readers" recycle would miss: the
+    /// reader checked out across the refresh is exactly the one a busy server
+    /// has, and reusing it would keep the old plans indefinitely.
+    #[test]
+    fn a_reader_checked_out_across_a_refresh_is_not_returned_to_the_pool() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        {
+            let conn = store.conn.lock().expect("store mutex");
+            insert_one_declaration(&conn);
+        }
+        store.refresh_planner_statistics().unwrap();
+
+        let reader = store.read_conn().expect("pooled reader");
+        assert_eq!(store.readers.idle_len(), 0);
+        assert_eq!(
+            store.recycle_readers_for_new_statistics(),
+            0,
+            "there is no idle reader to close while this one is out"
+        );
+        drop(reader);
+        assert_eq!(
+            store.readers.idle_len(),
+            0,
+            "the reader that was out across the refresh must be closed on checkin"
+        );
+
+        let reader = store.read_conn().expect("pooled reader");
+        drop(reader);
+        assert_eq!(
+            store.readers.idle_len(),
+            1,
+            "and the connection opened after the refresh must be kept"
+        );
+    }
+
+    /// A store that holds blobs but no statistics gets them when it is opened
+    /// (issue #3031), and a store whose statistics are current does not pay for
+    /// the check twice.
+    ///
+    /// The repair is counted rather than timed: `ANALYZE` on a one-blob store
+    /// is too fast to distinguish from the open around it.
+    #[test]
+    fn opening_a_built_store_without_statistics_repairs_them_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        {
+            let store = AnalyzerStore::open_persistent(&db_path).unwrap();
+            store.conn.execute(|conn| insert_one_declaration(conn));
+            assert_eq!(
+                store.planner_statistics_rows().unwrap(),
+                0,
+                "this is the state a build under BIFROST_STORE_STATISTICS=off leaves behind"
+            );
+        }
+
+        let repairs = planner_statistics_repairs();
+        {
+            let store = AnalyzerStore::open_persistent(&db_path).unwrap();
+            assert_eq!(
+                planner_statistics_repairs(),
+                repairs + 1,
+                "opening a built store with no statistics must analyze it"
+            );
+            assert!(
+                store.planner_statistics_rows().unwrap() > 0,
+                "and must leave real statistics behind"
+            );
+        }
+
+        let repairs = planner_statistics_repairs();
+        drop(AnalyzerStore::open_persistent(&db_path).unwrap());
+        assert_eq!(
+            planner_statistics_repairs(),
+            repairs,
+            "a store whose statistics still describe it must not be analyzed again"
+        );
+    }
+
+    /// An empty store is not analyzed on open.
+    ///
+    /// `ANALYZE` writes no row for an empty table, so a store with nothing in
+    /// it would read as stale at every open and pay for a refresh that can
+    /// produce nothing. Every ephemeral workspace opens exactly such a store.
+    #[test]
+    fn opening_an_empty_store_does_not_analyze_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let repairs = planner_statistics_repairs();
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        assert_eq!(
+            planner_statistics_repairs(),
+            repairs,
+            "an empty database has no cardinalities to describe"
+        );
+        assert_eq!(store.planner_statistics_rows().unwrap(), 0);
+    }
+
+    /// The end-to-end shape of the repair: a workspace built with the switch
+    /// off carries no statistics, and the next open of that store -- with the
+    /// switch cleared -- gives it some.
+    #[test]
+    fn a_build_with_the_switch_off_is_repaired_at_the_next_open() {
+        let _guard = statistics_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
+        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "one file");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+
+        // SAFETY: the lock above serializes every test that reads or writes
+        // this variable, and no other thread in this binary reads it.
+        unsafe { std::env::set_var(STORE_STATISTICS_ENV, "off") };
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("persisted analyzer should build");
+        let db_path = workspace
+            .persisted_store_path()
+            .expect("a persisted build reports its store path");
+        drop(workspace);
+        unsafe { std::env::remove_var(STORE_STATISTICS_ENV) };
+
+        let statistics = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            planner_statistics_row_count(&statistics).unwrap(),
+            0,
+            "the build must have left this store without statistics"
+        );
+        drop(statistics);
+
+        let repairs = planner_statistics_repairs();
+        let store = AnalyzerStore::open_persistent(&db_path).unwrap();
+        assert_eq!(
+            planner_statistics_repairs(),
+            repairs + 1,
+            "reopening the store must repair what the switch suppressed"
+        );
+        assert!(
+            store.planner_statistics_rows().unwrap() > 0,
+            "and must leave real statistics behind"
+        );
+    }
+
+    /// Serializes the tests that set `BIFROST_STORE_STATISTICS`, which is
+    /// process-wide state, with any other test that observes the switch while
+    /// exercising a planner-statistics hook.
     fn statistics_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        brokk_bifrost_core::cache_gc::planner_statistics_test_lock()
     }
 
     /// One blob with one declaration, so `ANALYZE` has rows to describe.

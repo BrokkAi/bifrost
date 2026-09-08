@@ -377,6 +377,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryAbsentMemberFinding>,
     },
+    AbsentMemberWitness {
+        #[serde(flatten)]
+        value: Box<CodeQueryAbsentMemberWitness>,
+    },
     TaintFinding {
         #[serde(flatten)]
         value: Box<CodeQueryTaintFinding>,

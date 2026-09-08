@@ -24,3 +24,7 @@ vendor/tree-sitter-scala/src/parser.c linguist-generated=true -diff
 vendor/tree-sitter-kotlin/src/parser.c linguist-generated=true -diff
 # Preserve the scanner's reviewed upstream bytes, including its existing space.
 vendor/tree-sitter-kotlin/src/scanner.c whitespace=-trailing-space
+
+# C++ recovery fixtures depend on exact byte lengths and brace offsets (#3087).
+tests/suite_issues/issue_3087_fixture.hpp text eol=lf
+tests/suite_issues/issue_3087_namespace_overrun.cc text eol=lf whitespace=-trailing-space

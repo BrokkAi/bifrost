@@ -199,13 +199,18 @@ impl ScalaRelationalDefinitionIndex {
         )
     }
 
-    fn terminal_identifier<'a>(&self, name: &'a crate::analyzer::FqName) -> &'a str {
-        crate::analyzer::fq_name::segment_interner()
-            .resolve(
-                name.last()
-                    .expect("a Scala definition lookup name is non-empty"),
-            )
-            .0
+    /// The terminal identifier of an already-rendered qualified name.
+    ///
+    /// A rendered name is joined by `.`, and a Scala member may be spelled
+    /// with any of the *selector* splitter's other delimiters: `::` names the
+    /// cons cell, and `+` and `/` are ordinary method names. Routing a
+    /// rendered name through `parse_symbol_path` therefore reads
+    /// `scala.collection.immutable.::` as the package and, for a name that is
+    /// nothing but delimiters, produces no segment at all. So the terminal
+    /// comes from the rendered-name helper, which splits on `.` with the same
+    /// backtick rule (#3032).
+    fn terminal_identifier<'a>(&self, name: &'a str) -> &'a str {
+        brokk_bifrost_core::analyzer::symbol_path::rendered_terminal_segment(Language::Scala, name)
     }
 
     fn structured_name_query(
@@ -231,17 +236,25 @@ impl ScalaRelationalDefinitionIndex {
 
 impl ScalaDefinitionIndex for ScalaRelationalDefinitionIndex {
     fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        if fqn.is_empty() {
+        // A name with no terminal identifier names no declaration; the empty
+        // string and a malformed trailing separator are the same answer.
+        let terminal = self.terminal_identifier(fqn);
+        if terminal.is_empty() {
             return Vec::new();
         }
+        // The exact-name query needs the whole name as segments, which only
+        // the selector splitter produces; a name it cannot segment at all
+        // (`::`) is answered by the identifier query on the terminal alone.
         let structured = self.rendered_fq(fqn);
-        let mut candidates = match self
-            .structured_name_query(structured.clone(), RelationalDefinitionQuery::ExactName)
-        {
-            RelationalDefinitionValue::Definitions(units) => units,
-            _ => unreachable!("Scala exact-name query returned the wrong shape"),
+        let mut candidates = if structured.is_empty() {
+            Vec::new()
+        } else {
+            match self.structured_name_query(structured, RelationalDefinitionQuery::ExactName) {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => unreachable!("Scala exact-name query returned the wrong shape"),
+            }
         };
-        candidates.extend(self.identifier_query(self.terminal_identifier(&structured), None));
+        candidates.extend(self.identifier_query(terminal, None));
         candidates.retain(|unit| unit.fq_name() == fqn);
         candidates.sort();
         candidates.dedup();
@@ -249,16 +262,20 @@ impl ScalaDefinitionIndex for ScalaRelationalDefinitionIndex {
     }
 
     fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
-        if normalized.is_empty() {
+        let terminal = self.terminal_identifier(normalized);
+        if terminal.is_empty() {
             return Vec::new();
         }
-        let mut candidates =
-            match self.rendered_name_query(normalized, RelationalDefinitionQuery::NormalizedName) {
+        let structured = self.rendered_fq(normalized);
+        let mut candidates = if structured.is_empty() {
+            Vec::new()
+        } else {
+            match self.structured_name_query(structured, RelationalDefinitionQuery::NormalizedName)
+            {
                 RelationalDefinitionValue::Definitions(units) => units,
                 _ => unreachable!("Scala normalized-name query returned the wrong shape"),
-            };
-        let structured = self.rendered_fq(normalized);
-        let terminal = self.terminal_identifier(&structured);
+            }
+        };
         candidates.extend(self.identifier_query(terminal, None));
         candidates.extend(self.identifier_query(&format!("{terminal}$"), None));
         candidates.retain(|unit| scala_normalize_full_name(&unit.fq_name()) == normalized);
@@ -1743,6 +1760,10 @@ impl IAnalyzer for ScalaAnalyzer {
         Some(self)
     }
 
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        Some(self)
+    }
+
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
     }
@@ -1840,6 +1861,35 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+/// Scala joins the #1721 nominal-family rollout.
+///
+/// Scala makes `override` mandatory only when redefining a concrete member, so
+/// the keyword cannot gate the relation; structure decides, as in Java, and the
+/// recorded keyword is corroborating evidence. The relation follows trait-ness,
+/// which the Scala declaration walk records on the template itself, so a member
+/// found on a trait is `implements` and one found on a class is `overrides` --
+/// the same split `ScalaAnalyzer::relation_kind` applies to type relations.
+///
+/// `self` is the declaration source here, but the multi-analyzer overrides the
+/// hierarchy argument with its own realm-aware walk: a Scala class can extend a
+/// Java class, and only the composite resolves that ancestor edge.
+impl crate::analyzer::usages::MemberFamilyProvider for ScalaAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::scala_member_family_capability(self, member)
+    }
+
+    fn member_family(
+        &self,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::scala_member_family(self, self, member, cancellation)
     }
 }
 

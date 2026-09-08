@@ -19,8 +19,9 @@
 
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::Range;
+use crate::analyzer::symbol_path::rendered_terminal_segment;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::collections::BTreeMap;
@@ -330,6 +331,20 @@ pub trait NodeKey: Clone + Ord + Hash {
     fn from_unit(unit: &CodeUnit) -> Self;
     /// The fqn component used for terminal-name matching.
     fn fqn(&self) -> &str;
+
+    /// This key's terminal name segment: what a source occurrence of the
+    /// declaration spells at its reference site, and so the name a structural
+    /// pre-filter matches against ([`FileEdgeScanInput::may_match_terminal`]).
+    ///
+    /// A key is a *rendered* qualified name -- the package-scoped
+    /// instantiation is literally `String` -- so the terminal is recovered
+    /// through the shared rendered-name splitter, which knows that a Scala
+    /// backtick-quoted segment may itself contain a `.` (#2219) and that a
+    /// method may be named `+` or `::`. Wherever the declaration itself is
+    /// still in hand, take `CodeUnit::terminal_name` instead of coming here.
+    fn terminal(&self, language: Language) -> &str {
+        rendered_terminal_segment(language, self.fqn())
+    }
 }
 
 impl NodeKey for String {
@@ -505,7 +520,9 @@ pub struct FileEdgeScanInput<'a, K = String> {
     /// endpoint hydration by its analysis-owned caller.
     callees: Option<&'a HashSet<K>>,
     pub declarations: &'a FileDeclarations<K>,
-    nodes_by_terminal: HashMap<String, Vec<K>>,
+    /// `terminal name -> the callees spelling it`, borrowed from the callee
+    /// set. Empty for a rooted scan, whose callee domain is open.
+    nodes_by_terminal: HashMap<&'a str, Vec<&'a K>>,
 }
 
 impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
@@ -513,6 +530,7 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
         tree: &'a Tree,
         source: &'a str,
         line_starts: &'a [usize],
+        language: Language,
         nodes: &'a HashSet<K>,
         declarations: &'a FileDeclarations<K>,
     ) -> Self {
@@ -521,7 +539,7 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
             source,
             line_starts,
             Some(nodes),
-            Some(nodes),
+            Some((language, nodes)),
             declarations,
         )
     }
@@ -552,33 +570,40 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
         tree: &'a Tree,
         source: &'a str,
         line_starts: &'a [usize],
+        language: Language,
         callees: &'a HashSet<K>,
         declarations: &'a FileDeclarations<K>,
     ) -> Self {
-        Self::with_callees(tree, source, line_starts, None, Some(callees), declarations)
+        Self::with_callees(
+            tree,
+            source,
+            line_starts,
+            None,
+            Some((language, callees)),
+            declarations,
+        )
     }
 
+    /// `language` travels with the callee set because it is the callee names'
+    /// own spelling rules that decide where each one's terminal segment
+    /// starts. A rooted scan has no callee set and so needs no language.
     fn with_callees(
         tree: &'a Tree,
         source: &'a str,
         line_starts: &'a [usize],
         callers: Option<&'a HashSet<K>>,
-        callees: Option<&'a HashSet<K>>,
+        callees: Option<(Language, &'a HashSet<K>)>,
         declarations: &'a FileDeclarations<K>,
     ) -> Self {
-        let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
-        for node in callees.into_iter().flatten() {
-            nodes_by_terminal
-                .entry(node_terminal(node))
-                .or_default()
-                .push(node.clone());
-        }
+        let nodes_by_terminal = callees.map_or_else(HashMap::default, |(language, callees)| {
+            terminal_index(language, callees)
+        });
         Self {
             tree,
             source,
             line_starts,
             callers,
-            callees,
+            callees: callees.map(|(_, callees)| callees),
             declarations,
             nodes_by_terminal,
         }
@@ -627,9 +652,15 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
     }
 }
 
-fn node_terminal<K: NodeKey>(node: &K) -> String {
-    let fqn = node.fqn();
-    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
+/// Group a callee set by [`NodeKey::terminal`], borrowing both the terminal
+/// slice and the keys from the set the scan input already holds for its
+/// lifetime.
+fn terminal_index<K: NodeKey>(language: Language, callees: &HashSet<K>) -> HashMap<&str, Vec<&K>> {
+    let mut index: HashMap<&str, Vec<&K>> = HashMap::default();
+    for node in callees {
+        index.entry(node.terminal(language)).or_default().push(node);
+    }
+    index
 }
 
 /// One file's edge contributions -- what a language scan returns and the driver
@@ -776,9 +807,8 @@ impl<K: NodeKey> PerFileEdges<K> {
         let Some(candidates) = input.nodes_by_terminal.get(name) else {
             return;
         };
-        let candidates = candidates.clone();
-        for callee in candidates {
-            self.record_unproven(input, callee, start, end);
+        for &callee in candidates {
+            self.record_unproven(input, callee.clone(), start, end);
         }
     }
 
@@ -807,5 +837,95 @@ impl<K: NodeKey> PerFileEdges<K> {
             .entry(callee)
             .or_default()
             .insert(start);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+    use crate::analyzer::model::CodeUnitType;
+
+    /// A Scala declaration whose name is `package.terminal`, with `terminal`
+    /// interned verbatim as one segment -- exactly what the Scala declaration
+    /// walk records for a backtick-quoted name (#2219).
+    fn scala_class(package: &str, terminal: &str) -> CodeUnit {
+        let mut fq = FqName::new();
+        fq.push(segment_interner().intern(package, SegmentKind::Package));
+        fq.push(segment_interner().intern(terminal, SegmentKind::Type));
+        CodeUnit::from_fq(
+            // `temp_dir()` is absolute on every platform, which `ProjectFile`
+            // asserts; the `.scala` extension is what makes this a Scala name.
+            ProjectFile::new(std::env::temp_dir(), "scalaz/Zio.scala"),
+            CodeUnitType::Class,
+            fq,
+            1,
+            None,
+            false,
+        )
+    }
+
+    /// #3033: the key's terminal must be the segment the extractor recorded,
+    /// not the tail of a `.`-split of the rendered name. Split that way,
+    /// `` scalaz.`zio.ZIO` `` yields `` ZIO` ``, which no source site spells.
+    #[test]
+    fn scala_backtick_quoted_dotted_terminal_is_one_segment() {
+        let unit = scala_class("scalaz", "`zio.ZIO`");
+        assert_eq!(unit.fq_name(), "scalaz.`zio.ZIO`");
+        assert_eq!(unit.terminal_name(), "`zio.ZIO`");
+
+        let key = String::from_unit(&unit);
+        assert_eq!(
+            key.terminal(Language::Scala),
+            unit.terminal_name(),
+            "the key's terminal must agree with the recorded segment"
+        );
+    }
+
+    /// The control: an ordinary dotted name still yields its last segment, and
+    /// a Scala member whose own name is a delimiter of the *selector* grammar
+    /// (`::`, `+`) is still its own terminal -- which is why the rendered-name
+    /// splitter, not `symbol_path_segments`, answers here.
+    #[test]
+    fn ordinary_and_symbolic_terminals_are_unchanged() {
+        let plain = String::from_unit(&scala_class("scalaz", "Plain"));
+        assert_eq!(plain.terminal(Language::Scala), "Plain");
+
+        assert_eq!(
+            "app.a.b.target".to_string().terminal(Language::Java),
+            "target"
+        );
+        assert_eq!("scala.Int.+".to_string().terminal(Language::Scala), "+");
+        assert_eq!("scalaz.List.::".to_string().terminal(Language::Scala), "::");
+        assert_eq!("single".to_string().terminal(Language::Go), "single");
+    }
+
+    /// The terminal index the closed and inbound scan shapes consult groups the
+    /// callee set by that same terminal, so a source site spelling
+    /// `` `zio.ZIO` `` reaches its callee.
+    #[test]
+    fn terminal_index_groups_callees_by_recorded_terminal() {
+        let quoted = String::from_unit(&scala_class("scalaz", "`zio.ZIO`"));
+        let plain = String::from_unit(&scala_class("scalaz", "Plain"));
+        let callees: HashSet<String> = HashSet::from_iter([quoted.clone(), plain.clone()]);
+
+        let index = terminal_index(Language::Scala, &callees);
+        assert_eq!(index.get("`zio.ZIO`"), Some(&vec![&quoted]));
+        assert_eq!(index.get("Plain"), Some(&vec![&plain]));
+        assert!(
+            !index.contains_key("ZIO`"),
+            "the `.`-split tail must not be an index key: {index:?}"
+        );
+    }
+
+    /// A file-scoped key answers from its own fqn, so the module-scoped
+    /// ecosystem shares the one derivation.
+    #[test]
+    fn file_scoped_keys_share_the_terminal_derivation() {
+        let key = UsageNodeKey::new(
+            ProjectFile::new(std::env::temp_dir(), "src/a.ts"),
+            "mod.Widget.render".to_string(),
+        );
+        assert_eq!(key.terminal(Language::TypeScript), "render");
     }
 }

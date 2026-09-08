@@ -166,12 +166,21 @@ pub(crate) fn php_type_lookup_resolution_bounded(
 ) -> Option<PhpTypeLookupResolution> {
     let php = resolve_analyzer::<PhpAnalyzer>(analyzer)?;
     let root = tree?.root_node();
-    let node = php_smallest_named_node_covering(
-        session,
-        root,
-        site.focus_start_byte,
-        site.focus_end_byte,
-    )?;
+    let node =
+        php_smallest_named_node_covering(session, root, site.range.start_byte, site.range.end_byte)
+            .filter(|node| {
+                node.kind() == "object_creation_expression"
+                    && node.start_byte() == site.range.start_byte
+                    && node.end_byte() == site.range.end_byte
+            })
+            .or_else(|| {
+                php_smallest_named_node_covering(
+                    session,
+                    root,
+                    site.focus_start_byte,
+                    site.focus_end_byte,
+                )
+            })?;
     let ctx = php_file_context_from_tree_at(root, source, site.range.start_byte, || {
         session.scope_step()
     })?;
@@ -338,6 +347,7 @@ pub(super) fn resolve_php(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    exact_token_focus: bool,
 ) -> PhpDefinitionResolution {
     let mut call_evidence = PhpCallEvidence::default();
     let outcome = resolve_php_with_session(
@@ -349,6 +359,7 @@ pub(super) fn resolve_php(
         site,
         None,
         Some(&mut call_evidence),
+        exact_token_focus,
     );
     PhpDefinitionResolution {
         outcome,
@@ -382,6 +393,7 @@ pub(crate) fn resolve_php_bounded(
         site,
         Some(&session),
         None,
+        false,
     );
     session.finish(outcome)
 }
@@ -396,6 +408,7 @@ fn resolve_php_with_session(
     site: &ResolvedReferenceSite,
     session: Option<&ResolutionSession>,
     call_evidence: Option<&mut PhpCallEvidence>,
+    exact_token_focus: bool,
 ) -> DefinitionLookupOutcome {
     let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
@@ -488,6 +501,23 @@ fn resolve_php_with_session(
             format!(
                 "`{}` is a PHP variable reference, not an indexed definition",
                 site.text
+            ),
+        );
+    }
+    // A caller that supplied an exact target token demands the answer for that
+    // token. Point navigation on a qualified name's namespace segment
+    // historically walks up to the whole name and answers with the type it
+    // qualifies, because PHP namespaces are not indexed CodeUnits; keep that
+    // editor contract but never apply it to an exact-token request, which
+    // would answer `Monolog` with class `Monolog\Test\MonologTestCase`
+    // (#2430, the PHP facet of the #2429 C++ cure).
+    if exact_token_focus && let Some(qualified_name) = php_namespace_prefix_segment_owner(node) {
+        return no_definition(
+            "namespace_qualifier_segment",
+            format!(
+                "`{}` is a namespace segment of the PHP qualified name `{}`, not an indexed definition",
+                site.text,
+                php_node_text(qualified_name, source).trim()
             ),
         );
     }
@@ -1011,6 +1041,27 @@ fn php_static_property_access_for_name<'tree>(
         current = ancestor.parent();
     }
     None
+}
+
+/// The enclosing `qualified_name` when `node` is a segment of that name's
+/// namespace prefix rather than the name the prefix qualifies.
+///
+/// PHP spells nesting with `\` only between namespaces: the grammar builds a
+/// `qualified_name` as `prefix(namespace_name? '\') name`, so every segment
+/// before the last one is a `name` inside the prefix's `namespace_name` and
+/// names a namespace, not a declaration. `php_qualified_reference_node` climbs
+/// from any such segment to the whole `qualified_name`, which is what makes a
+/// focused prefix segment answer with the type it qualifies.
+fn php_namespace_prefix_segment_owner<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    let namespace_name = if node.kind() == "namespace_name" {
+        node
+    } else {
+        node.parent()
+            .filter(|parent| parent.kind() == "namespace_name")?
+    };
+    namespace_name
+        .parent()
+        .filter(|parent| parent.kind() == "qualified_name")
 }
 
 fn php_qualified_reference_node<'tree>(
@@ -3782,6 +3833,7 @@ mod tests {
             source,
             Some(&tree),
             &php_site(source, file, needle, text),
+            false,
         )
     }
 

@@ -409,6 +409,15 @@ impl<'a> RustReferenceContext<'a> {
             let resolved = self
                 .canonical_export_fqn(&module_files, imported)
                 .or_else(|| {
+                    resolve_exported_module_item_fqn(
+                        self.rust,
+                        self.token,
+                        &self.file,
+                        &binding.module_specifier,
+                        imported,
+                    )
+                })
+                .or_else(|| {
                     resolve_module_package(
                         self.rust,
                         self.token,
@@ -428,7 +437,31 @@ impl<'a> RustReferenceContext<'a> {
         let binding = self.binder().bindings.get(name)?;
         (binding.kind == ImportKind::Namespace)
             .then(|| {
-                resolve_module_package(self.rust, self.token, &self.file, &binding.module_specifier)
+                let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+                if segments.len() > 1 {
+                    let parent = segments[..segments.len() - 1].join("::");
+                    let terminal = segments.last().expect("non-empty parsed Rust path");
+                    let terminal_fqn = resolve_exported_module_item_fqn(
+                        self.rust, self.token, &self.file, &parent, terminal,
+                    );
+                    if let Some(fqn) = terminal_fqn {
+                        return Some(fqn);
+                    }
+                }
+                resolve_exported_module_package(
+                    self.rust,
+                    self.token,
+                    &self.file,
+                    &binding.module_specifier,
+                )
+                .or_else(|| {
+                    resolve_module_package(
+                        self.rust,
+                        self.token,
+                        &self.file,
+                        &binding.module_specifier,
+                    )
+                })
             })
             .flatten()
     }
@@ -954,11 +987,12 @@ fn resolve_imported_export_from_binder_with_mode(
             }
             ImportKind::Namespace if local_name == reference => {
                 saw_explicit_binding = true;
-                let Some((module_specifier, imported)) = binding.module_specifier.rsplit_once("::")
-                else {
+                let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+                let Some((imported, module_segments)) = segments.split_last() else {
                     continue;
                 };
-                let files = resolve_module_files(rust, token, file, module_specifier);
+                let module_specifier = module_segments.join("::");
+                let files = resolve_module_files(rust, token, file, &module_specifier);
                 targets.extend(if forward {
                     forward_exported_targets_from_files(rust, token, &files, imported)
                 } else {
@@ -1663,6 +1697,35 @@ fn resolve_exported_module_package(
         package = Some(resolved);
     }
     package
+}
+
+/// Resolve an item below a module path whose public spelling reaches the
+/// module through one or more structured facade re-exports. The final module
+/// package is physical, so its export index no longer carries the fact that
+/// the path entered through a glob. Use the item's own public declaration as
+/// the terminal proof; a private intermediary module is precisely what the
+/// facade walk is permitted to hide.
+fn resolve_exported_module_item_fqn(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+    item_name: &str,
+) -> Option<String> {
+    let module_package =
+        resolve_exported_module_package(rust, token, importing_file, module_specifier)?;
+    let target_fqn = join_rust_fqn(&module_package, item_name);
+    let targets = rust
+        .definitions(&target_fqn)
+        .filter(|unit| {
+            unit.identifier() == item_name
+                && is_rust_export_visible_declaration(rust.code_units(), unit)
+        })
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    (targets.len() == 1)
+        .then(|| targets.into_iter().next())
+        .flatten()
 }
 
 thread_local! {

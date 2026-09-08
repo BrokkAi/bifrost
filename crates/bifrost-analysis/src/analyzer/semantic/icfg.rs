@@ -6,11 +6,13 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::analyzer::read_ledger::{LookupKind, ReadKey};
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey};
-use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
+use crate::analyzer::{
+    DispatchHierarchyExpansion, Language, PythonAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
+};
 use crate::hash::{HashMap, HashSet};
 
 use super::cfg_algorithms::{
@@ -18,7 +20,8 @@ use super::cfg_algorithms::{
     forward_reachability, reverse_reachability,
 };
 use super::workspace_oracle::{
-    WorkspaceSemanticOracle, exact_source_for_procedure, semantic_locator_work,
+    PreparedWorkspaceDispatchSession, WorkspaceSemanticOracle, exact_source_for_procedure,
+    semantic_locator_work,
 };
 use super::{
     CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage,
@@ -35,13 +38,13 @@ use super::{
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v4";
+    b"bifrost-icfg-provider/workspace-behavior/v7";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v2";
+    b"bifrost-icfg-provider/workspace-read-behavior/v6";
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///
@@ -51,6 +54,9 @@ const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
 pub enum DispatchReadUnattributedReason {
     /// The semantic call site has no exact retained source range.
     SourceRangeUnavailable,
+    /// More than one lowered call row has the same exact source range inside
+    /// the owning procedure.
+    SourceRangeAmbiguous,
 }
 
 /// The replayable input read by one call-dispatch lookup, or the typed reason
@@ -88,9 +94,45 @@ fn dispatch_read_attribution_with_range(
             DispatchReadUnattributedReason::SourceRangeUnavailable,
         );
     };
+    let matching_calls = call
+        .procedure()
+        .semantics()
+        .call_sites()
+        .iter()
+        .filter(|candidate| {
+            call.procedure()
+                .semantics()
+                .source_mapping(candidate.source)
+                .is_some_and(|mapping| {
+                    let span = mapping.locator.anchor().span();
+                    span.start_byte() as usize == range.start_byte
+                        && span.end_byte() as usize == range.end_byte
+                })
+        })
+        .take(2)
+        .count();
+    dispatch_read_attribution_for_exact_range(call, outcome, range, matching_calls)
+}
+
+fn dispatch_read_attribution_for_exact_range(
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+    range: crate::analyzer::Range,
+    matching_calls: usize,
+) -> DispatchReadAttribution {
+    if matching_calls != 1 {
+        return DispatchReadAttribution::Unattributed(
+            DispatchReadUnattributedReason::SourceRangeAmbiguous,
+        );
+    }
+    let Some(question) = super::workspace_oracle::procedure_dispatch_question(call, range) else {
+        return DispatchReadAttribution::Unattributed(
+            DispatchReadUnattributedReason::SourceRangeUnavailable,
+        );
+    };
     DispatchReadAttribution::Attributed(ReadKey::lookup(
-        LookupKind::Dispatch,
-        super::workspace_oracle::dispatch_question(call.procedure().artifact(), range),
+        LookupKind::ProcedureDispatch,
+        question,
         super::workspace_oracle::one_call_dispatch_answer_digest(call, outcome),
     ))
 }
@@ -164,6 +206,7 @@ impl IcfgProviderBehaviorIdentity {
         hierarchy_expansion: DispatchHierarchyExpansion,
         snapshot: Option<&ActiveSemanticModelSnapshot>,
         dispatch_hints: StableDigest,
+        python_saved_defaults_available: Option<bool>,
     ) -> Self {
         let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
         let mut read = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN);
@@ -199,6 +242,18 @@ impl IcfgProviderBehaviorIdentity {
             }
             digest.push(b"receiver-class-dispatch-hints");
             digest.push(dispatch_hints.as_bytes());
+            // Saved defaults depend on the workspace's callable-metadata
+            // surface, not only on the callee file. Keep this small authority
+            // fact in the replay identity too: an unrelated source edit need
+            // not rotate it, but a newly observed metadata mutation must.
+            if resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).is_some() {
+                digest.push(b"python-saved-default-availability");
+                digest.push(match python_saved_defaults_available {
+                    Some(true) => b"closed",
+                    Some(false) => b"open",
+                    None => b"incomplete",
+                });
+            }
         };
         push_engine_inputs(&mut digest);
         push_engine_inputs(&mut read);
@@ -466,6 +521,191 @@ pub struct WorkspaceIcfgProvider<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     behavior_identity: IcfgProviderBehaviorIdentity,
+    outcome_cache: Arc<QueryLocalIcfgOutcomeCache<'a>>,
+}
+
+type CallTransferCacheKey = (ProcedureHandle, CallSiteId);
+type ExitProfileCacheKey = (ProgramPointHandle, ProgramPointHandle);
+
+/// One exact in-process semantic artifact allocation.
+///
+/// A validity key and materialization digest can describe independently
+/// allocated identical rows, but prepared dispatch may return artifact-local
+/// handles. Pointer identity keeps those handles inside their owner while the
+/// strong reference prevents address reuse for the lifetime of the key.
+#[derive(Clone)]
+struct ExactArtifactAllocation(Arc<super::SemanticArtifact>);
+
+impl PartialEq for ExactArtifactAllocation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ExactArtifactAllocation {}
+
+impl std::hash::Hash for ExactArtifactAllocation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+#[derive(Clone)]
+struct CachedCallTransferOutcome {
+    outcome: SemanticOutcome<CallTransferSet>,
+    dispatch_read: DispatchReadAttribution,
+}
+
+struct QueryLocalIcfgOutcomeCache<'a> {
+    parent: Option<Arc<QueryLocalIcfgOutcomeCache<'a>>>,
+    call_transfers: Mutex<HashMap<CallTransferCacheKey, CachedCallTransferOutcome>>,
+    exit_profiles: Mutex<HashMap<ExitProfileCacheKey, SemanticOutcome<IcfgExitProfile>>>,
+    dispatch_sessions:
+        Mutex<HashMap<ExactArtifactAllocation, Arc<Mutex<PreparedWorkspaceDispatchSession<'a>>>>>,
+}
+
+impl Default for QueryLocalIcfgOutcomeCache<'_> {
+    fn default() -> Self {
+        Self {
+            parent: None,
+            call_transfers: Mutex::new(HashMap::default()),
+            exit_profiles: Mutex::new(HashMap::default()),
+            dispatch_sessions: Mutex::new(HashMap::default()),
+        }
+    }
+}
+
+impl<'a> QueryLocalIcfgOutcomeCache<'a> {
+    /// Add a snapshot-private write layer over already-published provider work.
+    ///
+    /// Reads may reuse complete outcomes and paid source sessions from the
+    /// parent. New outcomes and source parses remain private to this overlay
+    /// until the snapshot's outer semantic-budget charge commits. Keeping only
+    /// local writes also makes snapshot creation independent of accumulated
+    /// query size.
+    fn snapshot_overlay(parent: Arc<Self>) -> Self {
+        Self {
+            parent: Some(parent),
+            call_transfers: Mutex::new(HashMap::default()),
+            exit_profiles: Mutex::new(HashMap::default()),
+            dispatch_sessions: Mutex::new(HashMap::default()),
+        }
+    }
+
+    fn call_transfer(&self, key: &CallTransferCacheKey) -> Option<CachedCallTransferOutcome> {
+        let local = self
+            .call_transfers
+            .lock()
+            .expect("query-local ICFG call-transfer cache mutex is not poisoned")
+            .get(key)
+            .cloned();
+        local.or_else(|| {
+            self.parent
+                .as_deref()
+                .and_then(|parent| parent.call_transfer(key))
+        })
+    }
+
+    fn exit_profile(&self, key: &ExitProfileCacheKey) -> Option<SemanticOutcome<IcfgExitProfile>> {
+        let local = self
+            .exit_profiles
+            .lock()
+            .expect("query-local ICFG exit-profile cache mutex is not poisoned")
+            .get(key)
+            .cloned();
+        local.or_else(|| {
+            self.parent
+                .as_deref()
+                .and_then(|parent| parent.exit_profile(key))
+        })
+    }
+
+    fn paid_dispatch_session(
+        &self,
+        key: &ExactArtifactAllocation,
+    ) -> Option<Arc<Mutex<PreparedWorkspaceDispatchSession<'a>>>> {
+        let local = self
+            .dispatch_sessions
+            .lock()
+            .expect("query-local ICFG dispatch-session mutex is not poisoned")
+            .get(key)
+            .cloned();
+        if local.as_ref().is_some_and(|session| {
+            session
+                .lock()
+                .expect("query-local exact-artifact dispatch session is not poisoned")
+                .retains_exact_source()
+        }) {
+            return local;
+        }
+        self.parent
+            .as_deref()
+            .and_then(|parent| parent.paid_dispatch_session(key))
+    }
+
+    /// Publish work from a snapshot whose enclosing budget has committed.
+    ///
+    /// Concurrent provider users may have won any same-key race while the
+    /// snapshot ran. Keep their already-published values and discard the
+    /// duplicate, paid snapshot result in that case.
+    fn publish_snapshot(self: &Arc<Self>, snapshot: &Self) {
+        debug_assert!(
+            snapshot
+                .parent
+                .as_ref()
+                .is_some_and(|parent| Arc::ptr_eq(parent, self)),
+            "snapshot overlay must publish to its direct parent"
+        );
+        let snapshot_transfers = std::mem::take(
+            &mut *snapshot
+                .call_transfers
+                .lock()
+                .expect("snapshot ICFG call-transfer cache mutex is not poisoned"),
+        );
+        let mut call_transfers = self
+            .call_transfers
+            .lock()
+            .expect("query-local ICFG call-transfer cache mutex is not poisoned");
+        for (key, outcome) in snapshot_transfers {
+            call_transfers.entry(key).or_insert(outcome);
+        }
+        drop(call_transfers);
+
+        let snapshot_profiles = std::mem::take(
+            &mut *snapshot
+                .exit_profiles
+                .lock()
+                .expect("snapshot ICFG exit-profile cache mutex is not poisoned"),
+        );
+        let mut exit_profiles = self
+            .exit_profiles
+            .lock()
+            .expect("query-local ICFG exit-profile cache mutex is not poisoned");
+        for (key, outcome) in snapshot_profiles {
+            exit_profiles.entry(key).or_insert(outcome);
+        }
+        drop(exit_profiles);
+
+        let snapshot_sessions = std::mem::take(
+            &mut *snapshot
+                .dispatch_sessions
+                .lock()
+                .expect("snapshot ICFG dispatch-session mutex is not poisoned"),
+        );
+        let mut dispatch_sessions = self
+            .dispatch_sessions
+            .lock()
+            .expect("query-local ICFG dispatch-session mutex is not poisoned");
+        for (key, session) in snapshot_sessions {
+            if session
+                .lock()
+                .expect("snapshot exact-artifact dispatch session is not poisoned")
+                .retains_exact_source()
+            {
+                dispatch_sessions.entry(key).or_insert(session);
+            }
+        }
+    }
 }
 
 impl<'a> WorkspaceIcfgProvider<'a> {
@@ -509,11 +749,13 @@ impl<'a> WorkspaceIcfgProvider<'a> {
             oracle.hierarchy_expansion(),
             snapshot.as_deref(),
             oracle.dispatch_hints().digest(),
+            oracle.python_saved_defaults_available(),
         );
         Self {
             oracle,
             active_semantic_model_snapshot: snapshot,
             behavior_identity,
+            outcome_cache: Arc::new(QueryLocalIcfgOutcomeCache::default()),
         }
     }
 
@@ -523,6 +765,59 @@ impl<'a> WorkspaceIcfgProvider<'a> {
 
     pub const fn oracle(&self) -> &WorkspaceSemanticOracle<'a> {
         &self.oracle
+    }
+
+    fn dispatch_session(
+        &self,
+        artifact: &Arc<super::SemanticArtifact>,
+    ) -> Arc<Mutex<PreparedWorkspaceDispatchSession<'a>>> {
+        let key = ExactArtifactAllocation(Arc::clone(artifact));
+        if let Some(session) = self.outcome_cache.paid_dispatch_session(&key) {
+            return session;
+        }
+        // Keep the global lock to one exact lookup. Calls in different
+        // artifacts can parse concurrently; calls in this artifact serialize
+        // only on their own lazy parser below.
+        let mut sessions = self
+            .outcome_cache
+            .dispatch_sessions
+            .lock()
+            .expect("query-local ICFG dispatch-session mutex is not poisoned");
+        Arc::clone(sessions.entry(key).or_insert_with(|| {
+            Arc::new(Mutex::new(
+                self.oracle
+                    .prepare_call_dispatch_session(Arc::clone(artifact)),
+            ))
+        }))
+    }
+
+    /// Run one snapshot against a private provider-cache fork and publish it
+    /// only after the snapshot's outer semantic-budget transaction commits.
+    fn with_snapshot_transaction<T>(
+        &self,
+        request: &mut SemanticRequest<'_>,
+        operation: impl FnOnce(
+            &WorkspaceIcfgProvider<'a>,
+            &mut SemanticRequest<'_>,
+        ) -> Result<T, SemanticProviderError>,
+    ) -> Result<T, SemanticProviderError> {
+        let snapshot_cache = Arc::new(QueryLocalIcfgOutcomeCache::snapshot_overlay(Arc::clone(
+            &self.outcome_cache,
+        )));
+        let snapshot_provider = Self {
+            oracle: self.oracle.clone(),
+            active_semantic_model_snapshot: self.active_semantic_model_snapshot.clone(),
+            behavior_identity: self.behavior_identity,
+            outcome_cache: Arc::clone(&snapshot_cache),
+        };
+        let mut staged_budget = request.budget.clone();
+        let result = operation(&snapshot_provider, &mut request.staged(&mut staged_budget))?;
+
+        // Make the caller's charge durable before any newly retained provider
+        // state becomes visible to clones or retries.
+        *request.budget = staged_budget;
+        self.outcome_cache.publish_snapshot(&snapshot_cache);
+        Ok(result)
     }
 
     /// Record that this provider read `procedure`'s owning semantic artifact
@@ -558,25 +853,30 @@ impl<'a> WorkspaceIcfgProvider<'a> {
     /// Dispatch is the channel a typestate or taint solve composes callee
     /// bodies through, so which targets a call site resolved to -- and whether
     /// that set was exhaustive -- is itself an input the solve depended on. The
-    /// question and the answer digest are built by the same helpers
-    /// `WorkspaceSemanticOracle::dispatch_at_source_in_artifact` uses, so
-    /// `read_verification::replay_lookup` replays this recording through the
-    /// source-range entry point without a second rendering of the answer.
+    /// question names the call by stable procedure lineage and its exact range
+    /// relative to that procedure. Replay uniquely resolves that address back
+    /// to a handle and calls `DispatchOracle::resolve_call` directly, using the
+    /// same procedure-dispatch answer domain as recording.
     ///
-    /// A call site with no retained source mapping cannot be named in the
-    /// source-range terms replay asks in. That is a funnel crossing this
-    /// provider cannot attribute, and it says so rather than staying silent.
+    /// A call site with no retained source mapping, or whose span is shared by
+    /// another lowered call in the procedure, cannot be named exactly. That is
+    /// a funnel crossing this provider cannot attribute, and it says so rather
+    /// than staying silent.
     fn record_dispatch_read(
         &self,
         call: &CallSiteHandle,
         outcome: &SemanticOutcome<DispatchResult>,
     ) {
+        self.record_dispatch_attribution(&dispatch_read_attribution(call, outcome));
+    }
+
+    fn record_dispatch_attribution(&self, attribution: &DispatchReadAttribution) {
         let analyzer = self.workspace().analyzer();
         if !analyzer.read_ledger_attached() {
             return;
         }
-        match dispatch_read_attribution(call, outcome) {
-            DispatchReadAttribution::Attributed(key) => analyzer.record_read(key),
+        match attribution {
+            DispatchReadAttribution::Attributed(key) => analyzer.record_read(key.clone()),
             DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
         }
     }
@@ -1266,6 +1566,10 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        // A direct dispatch request has no enclosing provider transaction in
+        // which newly retained syntax can be published. Keep this path
+        // one-shot; call-transfer and snapshot materialization own the cache
+        // boundaries that make prepared-session reuse safe.
         let outcome = self.oracle.resolve_call(call, request)?;
         self.record_artifact_read(call.procedure());
         self.record_dispatch_read(call, &outcome);
@@ -1289,8 +1593,29 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         callee_exit: &ProgramPointHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
         self.record_artifact_read(callee_entry.procedure());
-        materialize_exit_profile(callee_entry, callee_exit, request)
+        let cacheable_request =
+            request.execution_budget().is_none() && request.artifact_collector().is_none();
+        let key = (callee_entry.clone(), callee_exit.clone());
+        let cached = cacheable_request.then(|| self.outcome_cache.exit_profile(&key));
+        if let Some(outcome) = cached.flatten() {
+            return Ok(outcome);
+        }
+        let outcome = materialize_exit_profile(callee_entry, callee_exit, request)?;
+        if cacheable_request && let Some(cached) = outcome.completed_replay() {
+            self.outcome_cache
+                .exit_profiles
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .insert(key, cached);
+        }
+        Ok(outcome)
     }
 
     fn call_transfers(
@@ -1299,19 +1624,62 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         call: CallSiteId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
         self.record_artifact_read(caller);
-        let semantic_call = caller
-            .semantics()
-            .call_site(call)
-            .ok_or_else(|| SemanticProviderError::internal(format!("unknown call site {call}")))?
-            .clone();
+        let cacheable_request =
+            request.execution_budget().is_none() && request.artifact_collector().is_none();
         let origin = caller
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
+        let cache_key = (caller.clone(), call);
+        let cached = cacheable_request.then(|| self.outcome_cache.call_transfer(&cache_key));
+        if let Some(cached) = cached.flatten() {
+            self.record_dispatch_attribution(&cached.dispatch_read);
+            return Ok(cached.outcome);
+        }
+        let semantic_call = caller
+            .semantics()
+            .call_site(call)
+            .expect("a scoped semantic call remains in its owning procedure")
+            .clone();
         let call_evaluation_gaps = scoped_call_evaluation_gaps(caller, &semantic_call);
         let mut staged_budget = request.budget.clone();
+        let dispatch_session = self.dispatch_session(caller.artifact());
+        let mut dispatch_session = dispatch_session
+            .lock()
+            .expect("query-local exact-artifact dispatch session is not poisoned");
+        // Waiting for another call from this artifact can outlive the first
+        // cancellation check. Do not enter the retained parser after the
+        // request has been cancelled.
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        let retained_source_before = dispatch_session.retains_exact_source();
+        // The provider is itself query-local. Like its completed-outcome
+        // memo, a performed parse is shared by provider clones even when a
+        // retry uses a fresh scalar budget. The first successful transfer
+        // charged that work; replay owns no new source work.
         let dispatch_outcome =
-            self.resolve_call(&origin, &mut request.staged(&mut staged_budget))?;
+            dispatch_session.resolve_call(&origin, &mut request.staged(&mut staged_budget));
+        let dispatch_outcome = match dispatch_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if !retained_source_before {
+                    dispatch_session.discard_exact_source();
+                }
+                return Err(error);
+            }
+        };
+        self.record_dispatch_read(&origin, &dispatch_outcome);
+        let dispatch_read = dispatch_read_attribution(&origin, &dispatch_outcome);
         let mapped = try_map_semantic_outcome(dispatch_outcome, |dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
@@ -1494,7 +1862,19 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 },
             );
             Ok((transfer_set, additional_work))
-        })?;
+        });
+        let mapped = match mapped {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                // Dispatch charged only the staged ledger. If projection
+                // cannot publish a transfer, do not retain syntax whose work
+                // the caller will roll back.
+                if !retained_source_before {
+                    dispatch_session.discard_exact_source();
+                }
+                return Err(error);
+            }
+        };
         let additional_work = mapped
             .available_value()
             .map_or(SemanticWork::default(), |(_, work)| *work);
@@ -1507,6 +1887,9 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             total_work,
             request.cancellation,
         ) {
+            if !retained_source_before {
+                dispatch_session.discard_exact_source();
+            }
             return Ok(outcome);
         }
         let mut outcome = weaken_call_transfer_outcome(
@@ -1521,11 +1904,40 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         }
         if outcome.available_value().is_some() {
             *request.budget = staged_budget;
+        } else if !retained_source_before {
+            dispatch_session.discard_exact_source();
+        }
+        drop(dispatch_session);
+        if cacheable_request && let Some(cached) = outcome.completed_replay() {
+            self.outcome_cache
+                .call_transfers
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .insert(
+                    cache_key,
+                    CachedCallTransferOutcome {
+                        outcome: cached,
+                        dispatch_read,
+                    },
+                );
         }
         Ok(outcome)
     }
 
     fn snapshot(
+        &self,
+        root: &ProcedureHandle,
+        limits: IcfgSnapshotLimits,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        self.with_snapshot_transaction(request, |provider, request| {
+            provider.materialize_snapshot(root, limits, request)
+        })
+    }
+}
+
+impl WorkspaceIcfgProvider<'_> {
+    fn materialize_snapshot(
         &self,
         root: &ProcedureHandle,
         limits: IcfgSnapshotLimits,
@@ -1562,19 +1974,17 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let root_entry = root
             .point_handle(root.semantics().entry_point())
             .ok_or_else(|| SemanticProviderError::internal("root procedure has no entry point"))?;
-        let mut staged_budget = request.budget.clone();
         let root_work = SemanticWork {
             source_bytes: root_source.len(),
             ..SemanticWork::default()
         };
-        if let Err(exceeded) = staged_budget.charge(root_work) {
+        if let Err(exceeded) = request.budget.charge(root_work) {
             return Ok(SemanticOutcome::ExceededBudget {
                 partial: Some(IcfgSnapshot::empty()),
                 exceeded,
                 work: root_work,
             });
         }
-        let mut staged_request = request.staged(&mut staged_budget);
         let mut builder = SnapshotBuilder::new(limits);
         let mut transfer_cache: HashMap<CallSiteHandle, SemanticOutcome<CallTransferSet>> =
             HashMap::default();
@@ -1584,7 +1994,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 point: root_entry,
                 frames: Box::new([]),
             },
-            &mut staged_request,
+            request,
             None,
             None,
         )?;
@@ -1594,12 +2004,12 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 builder.quality = SnapshotQuality::Cancelled;
                 break;
             }
-            if !staged_request.charge_execution_traversal(1) {
+            if !request.charge_execution_traversal(1) {
                 builder.quality = merge_quality(builder.quality, SnapshotQuality::Truncated);
                 break;
             }
             let key = builder.traversal[node.index()].clone();
-            if expand_return(self, &mut builder, node, &key, &mut staged_request)? {
+            if expand_return(self, &mut builder, node, &key, request)? {
                 continue;
             }
             let call = invoked_call_at(&key.point)?;
@@ -1633,8 +2043,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     {
                         (cached.clone(), false)
                     } else {
-                        let outcome =
-                            self.call_transfers(key.point.procedure(), call, &mut staged_request)?;
+                        let outcome = self.call_transfers(key.point.procedure(), call, request)?;
                         transfer_cache.insert(origin.clone(), outcome.clone());
                         (outcome, true)
                     };
@@ -1656,7 +2065,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                                 &key,
                                 &semantic_call,
                                 boundary,
-                                &mut staged_request,
+                                request,
                             )?;
                         }
                         for transfer in transfers.transfers.into_vec() {
@@ -1677,7 +2086,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                                 proof,
                                 completeness,
                                 None,
-                                &mut staged_request,
+                                request,
                             )?;
                         }
                     }
@@ -1695,7 +2104,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     if is_call_scaffolding(edge, &semantic_call) {
                         continue;
                     }
-                    add_local_edge(&mut builder, node, &key, edge, &mut staged_request)?;
+                    add_local_edge(&mut builder, node, &key, edge, request)?;
                 }
             } else {
                 for (_, edge) in key
@@ -1704,7 +2113,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     .semantics()
                     .successor_edges(key.point.id())
                 {
-                    add_local_edge(&mut builder, node, &key, edge, &mut staged_request)?;
+                    add_local_edge(&mut builder, node, &key, edge, request)?;
                 }
             }
         }
@@ -1713,7 +2122,6 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let exceeded = builder.budget_exceeded;
         let work = builder.work;
         let snapshot = builder.freeze()?;
-        *request.budget = staged_budget;
         Ok(finish_snapshot_outcome(snapshot, quality, exceeded, work))
     }
 }
@@ -3067,7 +3475,7 @@ mod tests {
     };
     use crate::analyzer::semantic::{
         DeclarationSegment, DispatchCandidate, DispatchHintCallSiteKey, DispatchHintSet,
-        ProcedureKind, SemanticBudget, SemanticGapId, SemanticGapImpacts,
+        ProcedureKind, SemanticBudget, SemanticExecutionBudget, SemanticGapId, SemanticGapImpacts,
     };
     use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
@@ -3194,6 +3602,50 @@ mod tests {
             attribution,
             DispatchReadAttribution::Unattributed(
                 DispatchReadUnattributedReason::SourceRangeUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_span_dispatch_is_typed_ambiguous() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[(
+                "dispatch-read.ts",
+                "function target() {}\nexport function caller() { target(); }\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "dispatch-read.ts");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let call = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .and_then(|procedure| procedure.call_site_handle(CallSiteId::new(0)))
+            .expect("fixture call site");
+        let range = crate::analyzer::semantic::workspace_oracle::exact_call_range(&call)
+            .expect("fixture call has an exact range");
+        let outcome = SemanticOutcome::<DispatchResult>::Unknown {
+            partial: None,
+            work: SemanticWork::default(),
+        };
+
+        assert_eq!(
+            dispatch_read_attribution_for_exact_range(&call, &outcome, range, 2),
+            DispatchReadAttribution::Unattributed(
+                DispatchReadUnattributedReason::SourceRangeAmbiguous
             )
         );
     }
@@ -3560,10 +4012,9 @@ mod tests {
             .first()
             .and_then(|call| caller.call_site_handle(call.id))
             .expect("async_leaf call site");
-        let provider = fixture.analyzer.icfg_provider();
-
+        let dispatch_provider = fixture.analyzer.icfg_provider();
         let mut dispatch_budget = SemanticBudget::default();
-        let dispatch_outcome = provider
+        let dispatch_outcome = dispatch_provider
             .resolve_call(
                 &call,
                 &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
@@ -3578,6 +4029,10 @@ mod tests {
             1
         );
 
+        // Keep the transfer's cache temperature independent from the direct
+        // dispatch calibration so its exact work remains comparable to the
+        // cold one-below atomic-charge probe below.
+        let provider = fixture.analyzer.icfg_provider();
         let mut transfer_budget = SemanticBudget::default();
         let transfer_outcome = provider
             .call_transfers(
@@ -3686,7 +4141,10 @@ mod tests {
         limited.nested_entries = transfer_outcome.work().nested_entries.saturating_sub(1);
         let mut limited_budget =
             SemanticBudget::new(limited).expect("positive deferred projection budget");
-        let limited_outcome = provider
+        // Measure the cold atomic charge rather than replaying the completed
+        // transfer from this query-local provider's memo.
+        let limited_provider = fixture.analyzer.icfg_provider();
+        let limited_outcome = limited_provider
             .call_transfers(
                 &caller,
                 call.id(),
@@ -3902,7 +4360,7 @@ int configured_caller(int value) {
     }
 
     #[test]
-    fn ruby_procedure_call_gap_is_not_a_cpp_configuration_gap() {
+    fn ruby_constructor_is_supported_without_a_stale_call_gap() {
         let source = r#"
 class Widget
   def initialize
@@ -3938,11 +4396,10 @@ end
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("Ruby initialize procedure");
 
-        assert!(constructor.semantics().gaps().iter().any(|gap| {
+        assert!(!constructor.semantics().gaps().iter().any(|gap| {
             gap.subject == SemanticGapSubject::Procedure
                 && gap.capability == SemanticCapability::Calls
                 && gap.kind == SemanticGapKind::Unsupported
-                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
         }));
         assert!(
             crate::analyzer::semantic::workspace_oracle::scoped_procedure_dispatch_gap(
@@ -4625,6 +5082,652 @@ void raii_caller() {
     }
 
     #[test]
+    fn workspace_icfg_provider_parses_one_artifact_once_across_clones_and_retry_budgets() {
+        let source = concat!(
+            "function first() {}\n",
+            "function second() {}\n",
+            "export function caller() { first(); second(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("calls.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "calls.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.call_sites().len() == 2)
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller with two calls");
+        let calls = caller.semantics().call_sites();
+        let read_ledger = Arc::new(crate::analyzer::ReadLedger::new());
+        let _read_scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            fixture.analyzer.analyzer(),
+            Arc::clone(&read_ledger),
+        );
+        let provider = fixture.analyzer.icfg_provider();
+
+        let mut first_budget = SemanticBudget::default();
+        let first = provider
+            .call_transfers(
+                &caller,
+                calls[0].id,
+                &mut SemanticRequest::new(&mut first_budget, &cancellation),
+            )
+            .expect("first call transfer");
+        assert!(first.available_value().is_some(), "{first:#?}");
+        assert_eq!(first.work().source_bytes, source.len());
+        assert_eq!(first_budget.used().source_bytes, source.len());
+
+        // A restarted trial owns a fresh scalar ledger in the same logical
+        // query and uses a provider clone. The retained parser is performed
+        // query-local work, just like the completed-outcome memo, so the
+        // distinct second call pays no source bytes again.
+        let mut retry_budget = SemanticBudget::new_child(
+            SemanticBudget::default().limits(),
+            &first_budget.scope_snapshot(),
+        );
+        let second = provider
+            .clone()
+            .call_transfers(
+                &caller,
+                calls[1].id,
+                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+            )
+            .expect("second call transfer through cloned provider");
+        assert!(second.available_value().is_some(), "{second:#?}");
+        assert_eq!(second.work().source_bytes, 0);
+        assert_eq!(retry_budget.used().source_bytes, 0);
+        assert_eq!(
+            provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("query-local dispatch session cache is not poisoned")
+                .len(),
+            1,
+        );
+        assert_eq!(
+            read_ledger
+                .keys()
+                .iter()
+                .filter(|key| matches!(
+                    key,
+                    ReadKey::Lookup {
+                        kind: LookupKind::ProcedureDispatch,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "parser reuse must still attribute each distinct dispatch answer",
+        );
+    }
+
+    #[test]
+    fn workspace_icfg_direct_dispatch_is_one_shot_and_preserves_read_attribution() {
+        let source = concat!(
+            "function first() {}\n",
+            "function second() {}\n",
+            "export function caller() { first(); second(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("calls.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "calls.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.call_sites().len() == 2)
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller with two calls");
+        let calls = caller
+            .semantics()
+            .call_sites()
+            .iter()
+            .map(|call| caller.call_site_handle(call.id).expect("call handle"))
+            .collect::<Vec<_>>();
+        let read_ledger = Arc::new(crate::analyzer::ReadLedger::new());
+        let _read_scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+            fixture.analyzer.analyzer(),
+            Arc::clone(&read_ledger),
+        );
+        let provider = fixture.analyzer.icfg_provider();
+
+        let mut first_budget = SemanticBudget::default();
+        let first = provider
+            .resolve_call(
+                &calls[0],
+                &mut SemanticRequest::new(&mut first_budget, &cancellation),
+            )
+            .expect("first direct dispatch");
+        assert!(first.available_value().is_some(), "{first:#?}");
+        assert_eq!(first.work().source_bytes, source.len());
+
+        let mut second_budget = SemanticBudget::default();
+        let second = provider
+            .clone()
+            .resolve_call(
+                &calls[1],
+                &mut SemanticRequest::new(&mut second_budget, &cancellation),
+            )
+            .expect("second direct dispatch through provider clone");
+        assert!(second.available_value().is_some(), "{second:#?}");
+        assert_eq!(second.work().source_bytes, source.len());
+        assert_eq!(second_budget.used().source_bytes, source.len());
+        assert!(
+            provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("query-local dispatch session cache is not poisoned")
+                .is_empty(),
+            "direct dispatch has no enclosing transaction that could safely publish syntax",
+        );
+        assert_eq!(
+            read_ledger
+                .keys()
+                .iter()
+                .filter(|key| matches!(
+                    key,
+                    ReadKey::Lookup {
+                        kind: LookupKind::ProcedureDispatch,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn failed_snapshot_transaction_does_not_publish_transfer_work() {
+        let source = concat!(
+            "function first() {}\n",
+            "function second() {}\n",
+            "export function root() { first(); }\n",
+            "export function other() { second(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("calls.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "calls.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let mut callers = artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| procedure.call_sites().len() == 1)
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .collect::<Vec<_>>();
+        callers.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
+        assert_eq!(callers.len(), 2);
+        let provider = fixture.analyzer.icfg_provider();
+        let mut outer_budget = SemanticBudget::default();
+
+        let failed: Result<(), SemanticProviderError> = provider.with_snapshot_transaction(
+            &mut SemanticRequest::new(&mut outer_budget, &cancellation),
+            |snapshot_provider, snapshot_request| {
+                let outcome = snapshot_provider.call_transfers(
+                    &callers[0],
+                    callers[0].semantics().call_sites()[0].id,
+                    snapshot_request,
+                )?;
+                assert!(outcome.available_value().is_some(), "{outcome:#?}");
+                assert_eq!(outcome.work().source_bytes, source.len());
+                assert_eq!(snapshot_request.budget.used().source_bytes, source.len());
+                assert!(
+                    provider
+                        .outcome_cache
+                        .call_transfers
+                        .lock()
+                        .expect("shared call-transfer cache is not poisoned")
+                        .is_empty(),
+                    "a transfer remains private until the outer snapshot commits",
+                );
+                assert!(
+                    provider
+                        .outcome_cache
+                        .dispatch_sessions
+                        .lock()
+                        .expect("shared dispatch-session cache is not poisoned")
+                        .is_empty(),
+                    "parsed source remains private until the outer snapshot commits",
+                );
+                Err(SemanticProviderError::internal(
+                    "synthetic post-transfer snapshot failure",
+                ))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(outer_budget.used(), SemanticWork::default());
+        assert!(
+            provider
+                .outcome_cache
+                .call_transfers
+                .lock()
+                .expect("shared call-transfer cache is not poisoned")
+                .is_empty(),
+        );
+        assert!(
+            provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("shared dispatch-session cache is not poisoned")
+                .is_empty(),
+        );
+
+        let mut retry_budget = SemanticBudget::default();
+        let retry = provider
+            .call_transfers(
+                &callers[1],
+                callers[1].semantics().call_sites()[0].id,
+                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+            )
+            .expect("retry after rolled-back snapshot transaction");
+        assert!(retry.available_value().is_some(), "{retry:#?}");
+        assert_eq!(retry.work().source_bytes, source.len());
+        assert_eq!(retry_budget.used().source_bytes, source.len());
+    }
+
+    #[test]
+    fn successful_snapshot_publishes_prepared_dispatch_for_later_procedures() {
+        let source = concat!(
+            "function first() {}\n",
+            "function second() {}\n",
+            "export function root() { first(); }\n",
+            "export function other() { second(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("calls.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "calls.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let mut callers = artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| procedure.call_sites().len() == 1)
+            .filter_map(|procedure| artifact.procedure_handle(procedure.id()))
+            .collect::<Vec<_>>();
+        callers.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
+        assert_eq!(callers.len(), 2);
+        let provider = fixture.analyzer.icfg_provider();
+        let mut snapshot_budget = SemanticBudget::default();
+        let snapshot = provider
+            .snapshot(
+                &callers[1],
+                IcfgSnapshotLimits::default(),
+                &mut SemanticRequest::new(&mut snapshot_budget, &cancellation),
+            )
+            .expect("successful ICFG snapshot");
+        assert!(snapshot.available_value().is_some(), "{snapshot:#?}");
+        assert!(
+            provider
+                .outcome_cache
+                .dispatch_sessions
+                .lock()
+                .expect("shared dispatch-session cache is not poisoned")
+                .values()
+                .any(|session| session
+                    .lock()
+                    .expect("prepared dispatch session is not poisoned")
+                    .retains_exact_source()),
+            "a committed snapshot publishes its paid exact-source session",
+        );
+
+        let mut later_budget = SemanticBudget::default();
+        let later = provider
+            .call_transfers(
+                &callers[0],
+                callers[0].semantics().call_sites()[0].id,
+                &mut SemanticRequest::new(&mut later_budget, &cancellation),
+            )
+            .expect("call in an unvisited procedure reuses the snapshot session");
+        assert!(later.available_value().is_some(), "{later:#?}");
+        assert_eq!(later.work().source_bytes, 0);
+        assert_eq!(later_budget.used().source_bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_overlay_reads_parent_outcomes_without_copying_them() {
+        let source = "function target() {}\nexport function caller() { target(); }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("call.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "call.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.call_sites().len() == 1)
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let call = caller.semantics().call_sites()[0].id;
+        let provider = fixture.analyzer.icfg_provider();
+
+        let mut transfer_budget = SemanticBudget::default();
+        let transfer = provider
+            .call_transfers(
+                &caller,
+                call,
+                &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
+            )
+            .expect("parent call transfer")
+            .available_value()
+            .and_then(|transfers| transfers.transfers.first())
+            .cloned()
+            .expect("resolved target transfer");
+        let exit = transfer
+            .callee
+            .point_handle(transfer.callee.semantics().normal_exit_point())
+            .expect("target normal exit");
+        let mut profile_budget = SemanticBudget::default();
+        provider
+            .exit_profile(
+                &transfer.callee_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut profile_budget, &cancellation),
+            )
+            .expect("parent exit profile");
+
+        let mut snapshot_budget = SemanticBudget::default();
+        provider
+            .with_snapshot_transaction(
+                &mut SemanticRequest::new(&mut snapshot_budget, &cancellation),
+                |snapshot_provider, snapshot_request| {
+                    let replayed_transfer =
+                        snapshot_provider.call_transfers(&caller, call, snapshot_request)?;
+                    let replayed_profile = snapshot_provider.exit_profile(
+                        &transfer.callee_entry,
+                        &exit,
+                        snapshot_request,
+                    )?;
+                    assert_eq!(replayed_transfer.work(), SemanticWork::default());
+                    assert_eq!(replayed_profile.work(), SemanticWork::default());
+                    assert!(
+                        snapshot_provider
+                            .outcome_cache
+                            .call_transfers
+                            .lock()
+                            .expect("snapshot call-transfer cache is not poisoned")
+                            .is_empty(),
+                        "a parent hit must not be copied into the snapshot write layer",
+                    );
+                    assert!(
+                        snapshot_provider
+                            .outcome_cache
+                            .exit_profiles
+                            .lock()
+                            .expect("snapshot exit-profile cache is not poisoned")
+                            .is_empty(),
+                        "a parent hit must not be copied into the snapshot write layer",
+                    );
+                    Ok(())
+                },
+            )
+            .expect("snapshot transaction replays parent outcomes");
+        assert_eq!(snapshot_budget.used(), SemanticWork::default());
+        assert_eq!(
+            provider
+                .outcome_cache
+                .call_transfers
+                .lock()
+                .expect("parent call-transfer cache is not poisoned")
+                .len(),
+            1,
+        );
+        assert_eq!(
+            provider
+                .outcome_cache
+                .exit_profiles
+                .lock()
+                .expect("parent exit-profile cache is not poisoned")
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn failed_source_charge_does_not_publish_an_unpaid_icfg_dispatch_session() {
+        let source = concat!(
+            "function target() {}\n",
+            "export function caller() { target(); }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::TypeScript,
+            &[("call.ts", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "call.ts");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("TypeScript semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("TypeScript semantic artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let call = caller.semantics().call_sites()[0].id;
+        let provider = fixture.analyzer.icfg_provider();
+
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = source.len() - 1;
+        let mut tight_budget = SemanticBudget::new(limits).expect("positive tight source budget");
+        let failed = provider
+            .call_transfers(
+                &caller,
+                call,
+                &mut SemanticRequest::new(&mut tight_budget, &cancellation),
+            )
+            .expect("source-budget exhaustion is typed");
+        assert!(matches!(
+            failed,
+            SemanticOutcome::ExceededBudget { partial: None, .. }
+        ));
+        assert_eq!(tight_budget.used(), SemanticWork::default());
+        let session = provider
+            .outcome_cache
+            .dispatch_sessions
+            .lock()
+            .expect("query-local dispatch session cache is not poisoned")
+            .values()
+            .next()
+            .cloned()
+            .expect("failed lookup leaves a retryable empty session");
+        assert!(
+            !session
+                .lock()
+                .expect("prepared dispatch session is not poisoned")
+                .retains_exact_source(),
+            "failed source charge cannot publish retained syntax"
+        );
+
+        let mut retry_budget = SemanticBudget::default();
+        let retry = provider
+            .call_transfers(
+                &caller,
+                call,
+                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+            )
+            .expect("retry after a failed source charge");
+        assert!(retry.available_value().is_some(), "{retry:#?}");
+        assert_eq!(retry.work().source_bytes, source.len());
+        assert_eq!(retry_budget.used().source_bytes, source.len());
+    }
+
+    #[test]
+    fn failed_transfer_projection_discards_newly_parsed_dispatch_source() {
+        let source = concat!(
+            "package sample\n",
+            "func first() {}\n",
+            "func second() {}\n",
+            "func caller() { go first(); second() }\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Go,
+            &[("calls.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "calls.go");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Go semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Go semantic artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.call_sites().len() == 2)
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller with detached and ordinary calls");
+        let calls = caller.semantics().call_sites();
+
+        // Calibrate exactly the prepared dispatch portion. Projecting the
+        // detached candidate into a call boundary owns additional retained
+        // relations, so a limit at this point admits parsing and dispatch but
+        // rejects the enclosing call-transfer projection atomically.
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let first_call = caller
+            .call_site_handle(calls[0].id)
+            .expect("detached call handle");
+        let mut dispatch_budget = SemanticBudget::default();
+        let dispatch = oracle
+            .resolve_call(
+                &first_call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("detached call dispatch calibration");
+        assert!(dispatch.available_value().is_some(), "{dispatch:#?}");
+        let dispatch_nested_entries = dispatch.work().nested_entries;
+        assert!(dispatch_nested_entries > 0);
+
+        let provider = fixture.analyzer.icfg_provider();
+        let mut limits = SemanticBudget::default().limits();
+        limits.nested_entries = dispatch_nested_entries;
+        let mut tight_budget = SemanticBudget::new(limits).expect("positive projection budget");
+        let failed = provider
+            .call_transfers(
+                &caller,
+                calls[0].id,
+                &mut SemanticRequest::new(&mut tight_budget, &cancellation),
+            )
+            .expect("call-transfer projection exhaustion is typed");
+        assert!(matches!(
+            failed,
+            SemanticOutcome::ExceededBudget { partial: None, .. }
+        ));
+        assert_eq!(
+            tight_budget.used(),
+            SemanticWork::default(),
+            "the failed atomic transfer publishes none of its staged dispatch work",
+        );
+        let session = provider
+            .outcome_cache
+            .dispatch_sessions
+            .lock()
+            .expect("query-local dispatch session cache is not poisoned")
+            .values()
+            .next()
+            .cloned()
+            .expect("failed projection leaves a retryable empty session");
+        assert!(
+            !session
+                .lock()
+                .expect("prepared dispatch session is not poisoned")
+                .retains_exact_source(),
+            "syntax charged only to the rolled-back transfer cannot remain published",
+        );
+
+        let mut retry_budget = SemanticBudget::default();
+        let retry = provider
+            .call_transfers(
+                &caller,
+                calls[1].id,
+                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+            )
+            .expect("distinct call retry after projection rollback");
+        assert!(retry.available_value().is_some(), "{retry:#?}");
+        assert_eq!(retry.work().source_bytes, source.len());
+        assert_eq!(retry_budget.used().source_bytes, source.len());
+    }
+
+    #[test]
     fn dispatch_hint_order_is_canonical_and_separates_provider_behavior() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Python,
@@ -4783,6 +5886,8 @@ void raii_caller() {
                 &mut SemanticRequest::new(&mut transfer_budget, &cancellation),
             )
             .expect("target call transfer");
+        assert_ne!(transfer_outcome.work(), SemanticWork::default());
+        assert_eq!(transfer_budget.used(), transfer_outcome.work());
         let transfer_set = transfer_outcome
             .available_value()
             .expect("target transfer payload");
@@ -4888,6 +5993,188 @@ void raii_caller() {
         assert_eq!(profile.callee_entry(), &incoming.callee_entry);
         assert_eq!(profile.kind(), ReturnTransferKind::Normal);
         assert!(!profile.has_aggregate_return_affecting_gaps());
+
+        let replay_provider = provider.clone();
+        let mut replay_transfer_budget = SemanticBudget::default();
+        let replay_transfer_outcome = replay_provider
+            .call_transfers(
+                &caller,
+                semantic_call.id,
+                &mut SemanticRequest::new(&mut replay_transfer_budget, &cancellation),
+            )
+            .expect("cached target call transfer");
+        let mut replay_exit_budget = SemanticBudget::default();
+        let replay_exit_outcome = replay_provider
+            .exit_profile(
+                &incoming.callee_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut replay_exit_budget, &cancellation),
+            )
+            .expect("cached target exit profile");
+        assert_eq!(
+            transfer_outcome.available_value(),
+            replay_transfer_outcome.available_value(),
+            "a restarted trial receives the exact call transfer result"
+        );
+        assert_eq!(
+            exit_outcome.available_value(),
+            replay_exit_outcome.available_value(),
+            "a restarted trial receives the exact exit profile result"
+        );
+        assert_eq!(replay_transfer_outcome.work(), SemanticWork::default());
+        assert_eq!(replay_exit_outcome.work(), SemanticWork::default());
+        assert_eq!(replay_transfer_budget.used(), SemanticWork::default());
+        assert_eq!(replay_exit_budget.used(), SemanticWork::default());
+        assert_eq!(
+            provider
+                .outcome_cache
+                .call_transfers
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .len(),
+            1,
+            "both trials materialize one call-transfer outcome for the exact key"
+        );
+        assert_eq!(
+            provider
+                .outcome_cache
+                .exit_profiles
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .len(),
+            1,
+            "both trials materialize one exit-profile outcome for the exact key"
+        );
+
+        let other_exit = other
+            .point_handle(other.semantics().normal_exit_point())
+            .expect("other normal exit");
+        assert_eq!(
+            other_exit.id(),
+            exit.id(),
+            "fixture procedures reuse local point IDs"
+        );
+        let mut cross_procedure_budget = SemanticBudget::default();
+        assert!(
+            replay_provider
+                .exit_profile(
+                    &incoming.callee_entry,
+                    &other_exit,
+                    &mut SemanticRequest::new(&mut cross_procedure_budget, &cancellation),
+                )
+                .is_err(),
+            "an exact-handle cache key must not alias an exit from another procedure"
+        );
+        assert_eq!(cross_procedure_budget.used(), SemanticWork::default());
+
+        let enriched_provider = fixture.analyzer.icfg_provider();
+        let enriched_execution = SemanticExecutionBudget::new(16, usize::MAX);
+        let mut enriched_transfer_budget = SemanticBudget::default();
+        let enriched_transfer = enriched_provider
+            .call_transfers(
+                &caller,
+                semantic_call.id,
+                &mut SemanticRequest::with_execution_budget(
+                    &mut enriched_transfer_budget,
+                    &cancellation,
+                    &enriched_execution,
+                ),
+            )
+            .expect("execution-budgeted call transfer");
+        let enriched_incoming = enriched_transfer
+            .available_value()
+            .and_then(|transfers| {
+                transfers
+                    .transfers
+                    .iter()
+                    .find(|transfer| transfer.callee == target)
+            })
+            .expect("execution-budgeted target transfer")
+            .clone();
+        let mut enriched_exit_budget = SemanticBudget::default();
+        let enriched_exit = enriched_provider
+            .exit_profile(
+                &enriched_incoming.callee_entry,
+                &exit,
+                &mut SemanticRequest::with_execution_budget(
+                    &mut enriched_exit_budget,
+                    &cancellation,
+                    &enriched_execution,
+                ),
+            )
+            .expect("execution-budgeted exit profile");
+        assert_ne!(enriched_transfer.work(), SemanticWork::default());
+        assert_ne!(enriched_exit.work(), SemanticWork::default());
+        assert!(
+            enriched_provider
+                .outcome_cache
+                .call_transfers
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .is_empty(),
+            "an enriched request must not populate the bare-request cache"
+        );
+        assert!(
+            enriched_provider
+                .outcome_cache
+                .exit_profiles
+                .lock()
+                .expect("query-local ICFG cache mutex is not poisoned")
+                .is_empty(),
+            "an enriched request must not populate the bare-request cache"
+        );
+
+        let mut bare_transfer_budget = SemanticBudget::default();
+        let bare_transfer = enriched_provider
+            .call_transfers(
+                &caller,
+                semantic_call.id,
+                &mut SemanticRequest::new(&mut bare_transfer_budget, &cancellation),
+            )
+            .expect("bare call transfer after enriched request");
+        let mut bare_exit_budget = SemanticBudget::default();
+        let bare_exit = enriched_provider
+            .exit_profile(
+                &incoming.callee_entry,
+                &exit,
+                &mut SemanticRequest::new(&mut bare_exit_budget, &cancellation),
+            )
+            .expect("bare exit profile after enriched request");
+        assert_ne!(bare_transfer.work(), SemanticWork::default());
+        assert_ne!(bare_exit.work(), SemanticWork::default());
+        assert_eq!(
+            enriched_transfer.available_value(),
+            bare_transfer.available_value()
+        );
+        assert_eq!(enriched_exit.available_value(), bare_exit.available_value());
+
+        let replay_execution = SemanticExecutionBudget::new(16, usize::MAX);
+        let mut enriched_replay_transfer_budget = SemanticBudget::default();
+        let enriched_replay_transfer = enriched_provider
+            .call_transfers(
+                &caller,
+                semantic_call.id,
+                &mut SemanticRequest::with_execution_budget(
+                    &mut enriched_replay_transfer_budget,
+                    &cancellation,
+                    &replay_execution,
+                ),
+            )
+            .expect("enriched call transfer after bare cache population");
+        let mut enriched_replay_exit_budget = SemanticBudget::default();
+        let enriched_replay_exit = enriched_provider
+            .exit_profile(
+                &incoming.callee_entry,
+                &exit,
+                &mut SemanticRequest::with_execution_budget(
+                    &mut enriched_replay_exit_budget,
+                    &cancellation,
+                    &replay_execution,
+                ),
+            )
+            .expect("enriched exit profile after bare cache population");
+        assert_ne!(enriched_replay_transfer.work(), SemanticWork::default());
+        assert_ne!(enriched_replay_exit.work(), SemanticWork::default());
 
         let mut mismatched_profile_budget = SemanticBudget::default();
         assert!(
@@ -5255,7 +6542,10 @@ void raii_caller() {
             .expect("mixed return-gap reasons are non-empty");
         let mut limited_budget =
             SemanticBudget::new(limited_work).expect("all semantic limits remain positive");
-        let limited = provider
+        // Measure the cold atomic charge rather than replaying the completed
+        // profile from this query-local provider's memo.
+        let limited_provider = fixture.analyzer.icfg_provider();
+        let limited = limited_provider
             .exit_profile(
                 &entry,
                 &exit,
@@ -5382,7 +6672,10 @@ void raii_caller() {
             .expect("return-gap reason is non-empty");
         let mut text_limited_budget =
             SemanticBudget::new(text_limited_work).expect("all semantic limits remain positive");
-        let text_limited_outcome = provider
+        // Measure the cold atomic charge rather than replaying the completed
+        // profile from this query-local provider's memo.
+        let text_limited_provider = fixture.analyzer.icfg_provider();
+        let text_limited_outcome = text_limited_provider
             .exit_profile(
                 &canonical_entry,
                 &exit,

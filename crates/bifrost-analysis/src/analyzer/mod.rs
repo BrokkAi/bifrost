@@ -177,9 +177,9 @@ pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::{
-    CallableArity, CallableFacts, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit,
-    CodeUnitType, CommentDensityStats, DeclarationId, DeclarationInfo, DeclarationKind,
-    DispatchExtensibility, ExceptionHandlingAnalysis, ExceptionHandlingSmell,
+    CallableArity, CallableFacts, CallableOverrideModifier, CloneSmell, CloneSmellWeights,
+    CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationId, DeclarationInfo,
+    DeclarationKind, DispatchExtensibility, ExceptionHandlingAnalysis, ExceptionHandlingSmell,
     ExceptionSmellWeights, ImportInfo, Language, LanguageDialect, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, PackageAnchor, ParameterMetadata, ParseError, ParseErrorKind,
     ProjectFile, Range, RubyMethodDispatchMode, ScalaExportInfo, ScalaExportSelector,
@@ -228,8 +228,9 @@ pub use read_ledger::{
 };
 pub use read_verification::{
     ChangedFacts, ChangedRead, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
-    ReadVerdict, SummaryAnswers, WorkspaceFactIndex, analysis_epoch_digest, replay_lookup,
-    verify_read_set, verify_read_set_for_artifact,
+    ProcedureDispatchReadCallError, ReadVerdict, SummaryAnswers, WorkspaceFactIndex,
+    analysis_epoch_digest, procedure_dispatch_read_call, replay_lookup,
+    verify_procedure_dispatch_read, verify_read_set, verify_read_set_for_artifact,
 };
 pub use ruby::RubyAnalyzer;
 pub use ruby::{

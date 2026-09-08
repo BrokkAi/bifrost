@@ -38,6 +38,42 @@ fn macro_composed_fields_fixture() -> (
 }
 
 #[test]
+fn macro_owner_queries_preserve_anchored_name_provenance() {
+    use brokk_bifrost_core::analyzer::RelationalName;
+
+    let parse = |name| {
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+            Language::Cpp,
+            name,
+            crate::analyzer::fq_name::segment_interner(),
+        )
+    };
+    let prefix = parse("mount");
+    let expected_owner = RelationalName::new(prefix.clone(), parse("Owner"));
+    for (name, query) in [
+        (
+            RelationalName::new(prefix, parse("Owner.value")),
+            RelationalDefinitionQuery::ExactName,
+        ),
+        (
+            expected_owner.clone(),
+            RelationalDefinitionQuery::StructuralChildren,
+        ),
+    ] {
+        let request = RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: DefinitionLanguageScope::Language(Language::Cpp),
+            name,
+            query,
+        };
+        let owner = CppAnalyzer::macro_composed_field_owner_name(&request)
+            .expect("a generated field query has an owner");
+        assert_eq!(owner, expected_owner);
+        assert_ne!(owner, RelationalName::stable(owner.full_name()));
+    }
+}
+
+#[test]
 fn generated_field_ranges_only_build_their_source_overlay() {
     let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
     let field = analyzer
@@ -97,6 +133,44 @@ fn file_scoped_identifier_queries_only_build_the_requested_source_overlay() {
 }
 
 #[test]
+fn exact_generated_field_queries_only_build_the_owning_source_overlay() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let units = analyzer.definitions("Owner.value").collect::<Vec<_>>();
+    assert!(
+        units
+            .iter()
+            .any(|unit| unit.is_field() && unit.fq_name() == "Owner.value"),
+        "generated field missing: {units:?}"
+    );
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        1,
+        "an exact generated-field query must not build unrelated source overlays"
+    );
+}
+
+#[test]
+fn exact_single_segment_queries_do_not_build_an_empty_macro_owner_request() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let units = analyzer.definitions("Owner").collect::<Vec<_>>();
+    assert!(
+        units
+            .iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == "Owner"),
+        "owner class missing: {units:?}"
+    );
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "a single-segment exact query has no macro-field owner to build"
+    );
+}
+
+#[test]
 fn workspace_identifier_queries_retain_generated_fields_from_all_overlays() {
     let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
     let name = brokk_bifrost_core::analyzer::RelationalName::stable(
@@ -132,6 +206,77 @@ fn workspace_identifier_queries_retain_generated_fields_from_all_overlays() {
     assert!(
         analyzer.macro_composed_fields_build_count_for_test() >= 2,
         "workspace-wide query should inspect both source overlays"
+    );
+}
+
+#[test]
+fn bare_rendered_macro_lookup_does_not_build_field_overlays() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let definitions = analyzer.get_definitions("OWNER_FIELDS");
+
+    assert!(
+        definitions
+            .iter()
+            .any(|unit| unit.identifier() == "OWNER_FIELDS"),
+        "the source-spelling compatibility lookup must retain the macro: {definitions:?}"
+    );
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "a bare rendered name cannot address an owner-qualified generated field"
+    );
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    assert!(analyzer.get_definitions("MISSING_SYMBOL").is_empty());
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "a missing bare rendered name cannot address an owner-qualified generated field"
+    );
+}
+
+#[test]
+fn exact_field_queries_only_build_the_requested_owner_overlay() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+    let definitions = analyzer.get_definitions("Owner.value");
+    assert_eq!(
+        definitions.len(),
+        1,
+        "owner field definitions: {definitions:?}"
+    );
+    assert_eq!(definitions[0].fq_name(), "Owner.value");
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        1,
+        "an exact owner-qualified query must not inspect unrelated source overlays"
+    );
+}
+
+#[test]
+fn workspace_usage_inventory_does_not_build_filtered_macro_field_overlays() {
+    let (_fixture, _owner, analyzer) = macro_composed_fields_fixture();
+    analyzer.reset_macro_composed_fields_build_count_for_test();
+
+    let declarations = analyzer
+        .workspace_declarations_with_primary_ranges(&crate::CancellationToken::new())
+        .expect("uncancelled declaration inventory");
+
+    assert!(
+        declarations.iter().any(|(unit, _)| unit.is_class()),
+        "the persisted C++ declaration inventory must remain available"
+    );
+    assert!(
+        declarations.iter().all(|(unit, _)| !unit.is_field()),
+        "macro-composed fields are not usage-graph declarations"
+    );
+    assert_eq!(
+        analyzer.macro_composed_fields_build_count_for_test(),
+        0,
+        "a catalog inventory must not build overlays that its graph filter discards"
     );
 }
 

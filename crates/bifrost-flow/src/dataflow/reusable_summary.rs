@@ -514,14 +514,8 @@ impl ProcedureSummaryIdentity {
     /// replay by itself; [`Self::procedure_read_fingerprint`] adds the exact
     /// procedure-local structured semantics.
     pub fn read_lineage_fingerprint(&self) -> StableDigest {
-        let mut bytes = Vec::new();
-        push_digest_part(&mut bytes, b"bifrost-procedure-summary-lineage-v1");
-        push_digest_part(
-            &mut bytes,
-            self.artifact.procedure_environment_fingerprint().as_bytes(),
-        );
-        self.push_declaration_lineage(&mut bytes);
-        StableDigest::sha256(bytes)
+        self.artifact
+            .procedure_lineage_fingerprint(&self.declaration)
     }
 
     fn push_declaration_lineage(&self, bytes: &mut Vec<u8>) {

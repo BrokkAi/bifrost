@@ -29,6 +29,9 @@ pub fn normalize_tool_arguments(
             normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
             normalize_object_array_string_field(&mut arguments, "targets", "path", workspace_root)?;
         }
+        // `usage_graph` takes the same `paths` selector as the scan tools, so
+        // it accepts the same absolute spellings inside the workspace (#3092).
+        "usage_graph" => normalize_string_array_field(&mut arguments, "paths", workspace_root)?,
         "most_relevant_files" => {
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }

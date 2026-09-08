@@ -1,8 +1,8 @@
 # Python standard-library semantic packs
 
 This directory pins the source inputs used to build Bifrost's published Python
-standard-library declaration pack. Generated manifests and shards are release
-assets; they are not checked into Git.
+standard-library declaration and reviewed assertion packs. Generated manifests
+and shards are release assets; they are not checked into Git.
 
 The pinned-spec schema is ecosystem neutral and is documented in
 `semantic-packs/jvm/README.md`. This directory adds the first `python_stub`
@@ -12,7 +12,7 @@ typeshed revision.
 ## The pinned slice
 
 `typeshed-stdlib-2026.8.31.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 48 stub files. The
+`1620e225476597f34177351ef913dc8390dade30` and lists 52 stub files. The
 slice is deliberately bounded to common runtime and standard-library surfaces:
 
 | Module | Pinned stub files |
@@ -30,6 +30,7 @@ slice is deliberately bounded to common runtime and standard-library surfaces:
 | `codecs` | `codecs.pyi` |
 | `contextlib` | `contextlib.pyi` |
 | `ctypes` | `ctypes/__init__.pyi`, `ctypes/wintypes.pyi` |
+| `dataclasses` | `dataclasses.pyi` |
 | `enum` | `enum.pyi` |
 | `errno` | `errno.pyi` |
 | `functools` | `functools.pyi` |
@@ -54,6 +55,7 @@ slice is deliberately bounded to common runtime and standard-library surfaces:
 | `threading` | `threading.pyi` |
 | `time` | `time.pyi` |
 | `types` | `types.pyi` |
+| `unittest` | `unittest/__init__.pyi`, `unittest/async_case.pyi`, `unittest/case.pyi` |
 | `warnings` | `warnings.pyi` |
 | `weakref` | `weakref.pyi` |
 
@@ -127,6 +129,25 @@ the pinned interpreter provably does not declare. A name the slice never
 covered is still outside the pack's statements, as the module table above
 says.
 
+## Reviewed assertion behavior
+
+`unittest-assertions-2026.9.7.json` is a separate authored procedure-summary
+pack. It records the reviewed CPython 3.10.0 through 3.14.0 normal-return contract for
+`unittest.case.TestCase.assertIsInstance` at the two exact call arities (with
+and without its optional `msg`). It deliberately does not claim coverage of
+workspace overrides, and is activated alongside the declaration pack across
+the same CPython `>=3.10.0, <3.15.0` range by the public build script. Release
+measurement uses the exact CPython 3.13.5 selector.
+
+The same pack records the reviewed identity-preserving `dataclasses.dataclass`
+decorator. The direct decorator and factory form accept only structured literal
+boolean keywords named by the pack. `slots` and `weakref_slot` are accepted only
+when explicitly false; a dynamic value, positional or unpacked argument,
+unknown keyword, or true slot option does not establish class identity. The
+summary targets the canonical `dataclasses.dataclass` declaration with one
+implicit class parameter and a variadic keyword tail. This is an identity
+contract only: it does not claim that generated dataclass members are modeled.
+
 An activation supplies its target as the interpreter's own `sys.platform`
 value, which is the vocabulary typeshed's platform guards name. A target from
 another vocabulary would read as an ordinary mismatch and could drop a
@@ -150,9 +171,12 @@ that digest itself and refuses a tree that differs.
 When `CACHE_ROOT` is present, the recipe also installs the verified bundle
 into the catalog version derived from Bifrost's current catalog schema and
 writes `type-flow-python-pack-activation.json` at the cache root. The receipt
-records the pack id/version, manifest digest, catalog directory, and absolute
-bundle path used by the corpus measurement route. Omitting `CACHE_ROOT`
-preserves the generate-and-verify-only workflow.
+records the legacy declaration pack id/version and manifest digest together
+with the catalog directory and absolute bundle path used by the corpus
+measurement route. Its additive `packs` array records the complete activated
+declaration and authored-pack identities; schema-1 single-pack receipts remain
+readable. Omitting `CACHE_ROOT` preserves the generate-and-verify-only
+workflow.
 
 GitHub builds a source archive on demand. The archive digest that the script
 checks is therefore a weaker pin than the artifact digest that `generate`
@@ -166,7 +190,9 @@ To run the same steps by hand:
 ```console
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   /path/to/output \
-  semantic-packs/python/typeshed-stdlib-2026.8.31.json /path/to/typeshed-stdlib-1620e2254765
+  semantic-packs/python/typeshed-stdlib-2026.8.31.json /path/to/typeshed-stdlib-1620e2254765 \
+  semantic-packs/python/unittest-assertions-2026.9.7.spec.json \
+  semantic-packs/python/unittest-assertions-2026.9.7.json
 
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
   /path/to/output

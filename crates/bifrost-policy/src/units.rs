@@ -62,15 +62,20 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// Bump this whenever a change makes either something this engine would no
 /// longer mint.
 ///
-/// The current value is #2968, which took the compiled binding-plan hash out
-/// of a typestate finding's identity. Both persisted shapes moved with it: a
-/// published root product carries a typestate anchor field this engine no
-/// longer accepts, and a recorded base evaluation carries typestate identities
-/// this engine no longer mints. The second is the one a reader could not see.
-/// Nothing detects it -- the recorded identities simply never join the head's,
-/// so every unchanged violation reports as `fixed` and `new` forever, against
-/// exactly the bases this change exists to fix.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:2968-typestate-identity";
+/// The current value is #3054, which addressed the one byte anchor a typestate
+/// canonical locator still carries -- its own -- from the start of the
+/// innermost declaration it names instead of from the start of the file. A
+/// typestate finding's subject identity is a digest of that rendering, and the
+/// compiled binding-plan hash a root unit key carries folds it as well, so a
+/// recorded base evaluation carries typestate finding identities this engine no
+/// longer mints and a published root unit carries a key this engine no longer
+/// computes. The first is the one a reader could not see: nothing detects it,
+/// the recorded identities simply never join the head's, so every unchanged
+/// violation reports as `fixed` and `new` forever -- against exactly the bases
+/// this change exists to fix. The previous value was #3022, which took the byte
+/// anchors out of the locator's declaration segments; the one before that was
+/// #2968, which took the binding-plan hash out of the finding identity itself.
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3054-relative-locator-anchor";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {

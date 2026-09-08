@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "pack_id": "bifrost.python-stdlib",
-  "pack_version": "2026.9.4",
+  "pack_version": "2026.9.7",
   "ecosystem": "python",
   "kind": {
     "artifact_kind": "python_stub",
@@ -15,6 +15,7 @@
       "contextlib.pyi",
       "ctypes/__init__.pyi",
       "ctypes/wintypes.pyi",
+      "dataclasses.pyi",
       "enum.pyi",
       "errno.pyi",
       "functools.pyi",
@@ -51,6 +52,9 @@
       "threading.pyi",
       "time.pyi",
       "types.pyi",
+      "unittest/__init__.pyi",
+      "unittest/async_case.pyi",
+      "unittest/case.pyi",
       "typing.pyi",
       "warnings.pyi",
       "weakref.pyi"
@@ -58,7 +62,7 @@
   },
   "artifact": {
     "file_name": "typeshed-stdlib-1620e2254765",
-    "sha256": "20eea20790b760218459cbe324dc03bb5551ac04b30350049761802cfeba37ba",
+    "sha256": "7c54418f8253daed29dffcf792683204bff441968e00daf95f0421f145a92adb",
     "url": "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz",
     "container": null
   },

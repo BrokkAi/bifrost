@@ -16,11 +16,13 @@ use crate::analyzer::semantic_model::{
     CompiledLockMode, CompiledSummaryInput, Completeness, ProcedureSummaryDeclarationKey,
     ProcedureSummaryMemberKey, SemanticModelMatchDisposition,
 };
+use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
 use brokk_bifrost_flow::concurrency::{
     CanonicalConcurrencyLocation, ConcurrencyAnswer, ConcurrencyAtomicOperation, ConcurrencyEscape,
     ConcurrencyLockMode, ConcurrencyObjectCardinality, ConcurrencyOpenReason, ConcurrencyOwnership,
     ConcurrencyProvider, ConcurrencySubjectIdentity, ConcurrentAccessConflict,
     ResolvedConcurrencyEffect, ResolvedConcurrencyLocation, ResolvedConcurrencySubject,
+    ResolvedMemberDeclaration, field_step_selector,
 };
 use brokk_bifrost_flow::typestate::TypestateObjectKey;
 
@@ -28,6 +30,17 @@ pub(super) struct WorkspaceConcurrencyProvider<'a> {
     workspace: &'a WorkspaceAnalyzer,
     active_models: Option<Arc<ActiveSemanticModelSnapshot>>,
     summaries: Option<brokk_bifrost_flow::typestate::ProductionSemanticSummarySet>,
+    /// Declarations already named for a member locator, keyed by its file and
+    /// span, so one lookup serves every access repeating it.
+    member_identities: std::cell::RefCell<
+        crate::hash::HashMap<(String, u32, u32), Option<ResolvedMemberDeclaration>>,
+    >,
+    /// Whether a callee's receiver binds by reference, keyed by its file and
+    /// member name, so one declaration scan serves every call to it.
+    receiver_bindings: std::cell::RefCell<crate::hash::HashMap<(String, String), bool>>,
+    /// Whether a member locator names a pointer-typed field, keyed by its file
+    /// and span, so one declaration lookup serves every access repeating it.
+    pointer_members: std::cell::RefCell<crate::hash::HashMap<(String, u32, u32), bool>>,
 }
 
 impl<'a> WorkspaceConcurrencyProvider<'a> {
@@ -40,6 +53,9 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
             workspace,
             active_models,
             summaries,
+            member_identities: std::cell::RefCell::default(),
+            receiver_bindings: std::cell::RefCell::default(),
+            pointer_members: std::cell::RefCell::default(),
         }
     }
 
@@ -689,6 +705,125 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
         self.exact_model_effects(call, request)
     }
 
+    fn resolved_member_identity(
+        &self,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<ResolvedMemberDeclaration> {
+        let span = member.anchor().span();
+        let key = (
+            member.path().as_str().to_owned(),
+            span.start_byte(),
+            span.end_byte(),
+        );
+        if let Some(cached) = self.member_identities.borrow().get(&key) {
+            return cached.clone();
+        }
+        let resolved = self.name_member_declaration(member);
+        self.member_identities
+            .borrow_mut()
+            .insert(key, resolved.clone());
+        resolved
+    }
+
+    fn allocation_yields_reference(
+        &self,
+        procedure: &ProcedureHandle,
+        allocation: crate::analyzer::semantic::AllocationId,
+    ) -> bool {
+        let semantics = procedure.semantics();
+        let Some(site) = semantics.allocation(allocation) else {
+            return false;
+        };
+        let Some(mapping) = semantics.source_mapping(site.source) else {
+            return false;
+        };
+        let file = super::witness_projection::locator_file(self.workspace, &mapping.locator);
+        let Some(source) = self.workspace.analyzer().indexed_source(&file) else {
+            return false;
+        };
+        crate::analyzer::usages::get_definition::allocation_yields_reference_at_offset(
+            &file,
+            &source,
+            mapping.locator.anchor().span().start_byte() as usize,
+        )
+    }
+
+    fn member_is_pointer(&self, member: &crate::analyzer::semantic::SemanticLocator) -> bool {
+        let span = member.anchor().span();
+        let key = (
+            member.path().as_str().to_owned(),
+            span.start_byte(),
+            span.end_byte(),
+        );
+        if let Some(cached) = self.pointer_members.borrow().get(&key) {
+            return *cached;
+        }
+        let resolved = self.field_declares_a_pointer(member);
+        self.pointer_members.borrow_mut().insert(key, resolved);
+        resolved
+    }
+
+    fn receiver_binds_by_reference(&self, procedure: &ProcedureHandle) -> bool {
+        let locator = procedure.semantics().locator();
+        // Go is the language that copies a receiver. Everything else passes
+        // one by reference, so its callees reach the caller's object.
+        if locator.language() != LanguageDialect::Standard(Language::Go) {
+            return true;
+        }
+        let Some(member) = locator
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())
+        else {
+            return false;
+        };
+        let key = (locator.path().as_str().to_owned(), member.to_owned());
+        if let Some(cached) = self.receiver_bindings.borrow().get(&key) {
+            return *cached;
+        }
+        let resolved = !self.declares_value_receiver(locator, member);
+        self.receiver_bindings.borrow_mut().insert(key, resolved);
+        resolved
+    }
+
+    fn parameter_binding(&self, procedure: &ProcedureHandle, ordinal: u32) -> Option<bool> {
+        let locator = procedure.semantics().locator();
+        let member = locator
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        let analyzer = self.workspace.analyzer();
+        let file = super::witness_projection::locator_file(self.workspace, locator);
+        let mut declared_binding = None;
+        for unit in analyzer.get_declarations(&file) {
+            let declares_member = unit.fq().last().is_some_and(|segment| {
+                brokk_bifrost_core::analyzer::fq_name::segment_interner()
+                    .resolve(segment)
+                    .0
+                    == member
+            });
+            if !unit.is_function() || !declares_member {
+                continue;
+            }
+            for metadata in analyzer.signature_metadata(&unit) {
+                // Every declaration of this name must agree, since the call is
+                // not resolved to one of them here. One that records no type
+                // for the ordinal, or that disagrees with another, leaves the
+                // question unanswered rather than answering it wrongly.
+                let declared = metadata.parameter_type_identity(ordinal)?;
+                let binds = declared.is_pointer();
+                if declared_binding.is_some_and(|previous| previous != binds) {
+                    return None;
+                }
+                declared_binding = Some(binds);
+            }
+        }
+        declared_binding
+    }
+
     fn canonical_location(
         &self,
         procedure: &ProcedureHandle,
@@ -1029,6 +1164,146 @@ fn resolved_static(
     ))
 }
 
+impl WorkspaceConcurrencyProvider<'_> {
+    /// Name the field declaration one member locator stands for.
+    ///
+    /// A producer that could type the receiver anchors the member at the
+    /// field's declaration; one that could not, such as a capture inside a
+    /// spawned closure, anchors it at the use. A definition lookup follows the
+    /// use to the declaration, and the declaration names itself. Both sides
+    /// then agree, which is what lets their accesses be compared.
+    ///
+    /// Anything other than exactly one field declaration abstains and leaves
+    /// the producer's identity alone. Merging distinct fields would turn a
+    /// missed race into a reported one, which is worse than the miss.
+    /// Whether any declaration of `member` in the locator's file declares a
+    /// value receiver.
+    ///
+    /// A file can declare one name on more than one receiver type. Answering
+    /// from any value receiver keeps the caller's object out of a callee that
+    /// might copy it, without resolving which declaration the call reaches. A
+    /// name with no receiver at all is not a method and answers `false`.
+    fn declares_value_receiver(
+        &self,
+        locator: &crate::analyzer::semantic::SemanticLocator,
+        member: &str,
+    ) -> bool {
+        let analyzer = self.workspace.analyzer();
+        let file = super::witness_projection::locator_file(self.workspace, locator);
+        for unit in analyzer.get_declarations(&file) {
+            // A Go method's display name carries its owner, as in `box.bump`.
+            // Compare the interned last segment so the member is read from
+            // structure rather than from the rendered name.
+            let declares_member = unit.fq().last().is_some_and(|segment| {
+                brokk_bifrost_core::analyzer::fq_name::segment_interner()
+                    .resolve(segment)
+                    .0
+                    == member
+            });
+            if !unit.is_function() || !declares_member {
+                continue;
+            }
+            for metadata in analyzer.signature_metadata(&unit) {
+                let Some(receiver) = metadata.extension_receiver_type_identity() else {
+                    continue;
+                };
+                if !receiver.is_pointer() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the field a member locator names is declared as a pointer.
+    ///
+    /// A copy of a struct copies its direct fields, so a write to one cannot
+    /// reach the original. A pointer field inside that copy still addresses
+    /// one object, so a write through it does. Telling the two apart is what
+    /// keeps a value receiver from being either a false positive or a silent
+    /// miss depending on which field it writes.
+    fn field_declares_a_pointer(
+        &self,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> bool {
+        let analyzer = self.workspace.analyzer();
+        let file = super::witness_projection::locator_file(self.workspace, member);
+        let Some(source) = analyzer.indexed_source(&file) else {
+            return false;
+        };
+        let span = member.anchor().span();
+        let Some(unit) = crate::analyzer::usages::get_definition::declaration_site_at_offset(
+            analyzer,
+            &file,
+            &source,
+            span.start_byte() as usize,
+        ) else {
+            return false;
+        };
+        analyzer.signature_metadata(&unit).iter().any(|metadata| {
+            metadata
+                .return_type_identity()
+                .is_some_and(|declared| declared.is_pointer())
+        })
+    }
+
+    /// Resolve the field declaration behind one member locator, and report
+    /// whether that locator anchors at the declaration or at a use of it.
+    ///
+    /// The two answers come from different lookups and never overlap: a use
+    /// resolves as a reference to its definition, and a declaration resolves
+    /// only by being one. The solver needs the distinction because a producer
+    /// stores the declaration's locator wherever it could type the receiver
+    /// and the use's locator wherever it could not.
+    fn name_member_declaration(
+        &self,
+        member: &crate::analyzer::semantic::SemanticLocator,
+    ) -> Option<ResolvedMemberDeclaration> {
+        let analyzer = self.workspace.analyzer();
+        let file = super::witness_projection::locator_file(self.workspace, member);
+        let source = analyzer.indexed_source(&file)?;
+        let span = member.anchor().span();
+        let outcomes =
+            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
+                analyzer,
+                vec![
+                    crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file: file.clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(span.start_byte() as usize),
+                        end_byte: Some(span.end_byte() as usize),
+                    },
+                ],
+                file.clone(),
+                Arc::from(source.clone()),
+            );
+        let referenced = outcomes.into_iter().next().and_then(|outcome| {
+            let [definition] = outcome.definitions.as_slice() else {
+                return None;
+            };
+            (definition.kind() == crate::analyzer::CodeUnitType::Field)
+                .then(|| definition.fq_name().to_string())
+        });
+        if let Some(name) = referenced {
+            return Some(ResolvedMemberDeclaration {
+                name,
+                is_declaration_site: false,
+            });
+        }
+        crate::analyzer::usages::get_definition::declaration_site_at_offset(
+            analyzer,
+            &file,
+            &source,
+            span.start_byte() as usize,
+        )
+        .map(|declaration| ResolvedMemberDeclaration {
+            name: declaration.fq_name().to_string(),
+            is_declaration_site: true,
+        })
+    }
+}
+
 fn open_resolved_location() -> ConcurrencyAnswer<ResolvedConcurrencyLocation> {
     ConcurrencyAnswer::Open {
         partial: ResolvedConcurrencyLocation::unknown(),
@@ -1062,12 +1337,19 @@ fn legacy_canonical_answer(
     }
 }
 
+/// Name the tail of an exact access path the way the solver names a field step
+/// it composes itself.
+///
+/// The two renderings meet on one location: an access whose base the solver
+/// cannot name class-side keeps the answer built here, while its counterpart is
+/// recomposed there. Spelling a field with the locator's `Debug` on this side
+/// and with the storage digest on that one left the two permanently disjoint.
 fn exact_path_identity(path: &AccessPath) -> Option<String> {
     let [selector] = path.selectors() else {
         return Some("root".to_string());
     };
     match selector {
-        AccessSelector::Field(field) => Some(format!("field:{:?}", field.locator())),
+        AccessSelector::Field(field) => Some(field_step_selector(field.locator())),
         AccessSelector::Index(IndexSelector::Constant(index)) => Some(format!("index:{index}")),
         AccessSelector::Index(IndexSelector::Exact(_) | IndexSelector::Any) => None,
     }

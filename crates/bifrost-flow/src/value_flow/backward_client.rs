@@ -283,18 +283,51 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
         edge: DataflowEdge<'_, BackwardValueFlowFact>,
         demand: Demand,
         out: &mut Vec<Demand>,
+        meetings: &mut Vec<BackwardValueFlowFact>,
     ) {
         let Some(call) = edge.origin() else {
             return;
         };
         let callee = edge.target().procedure();
-        if self.plan.is_callee_port(demand.carrier, callee) {
+        let default_target = self
+            .plan
+            .call_rules_to_target(call, callee, PlanCallFlowRuleKind::Call, demand.carrier)
+            .any(|rule| self.plan.is_default_argument_carrier(rule.source, callee));
+        if self.plan.is_callee_port(demand.carrier, callee) && !default_target {
             out.push(demand);
         }
         for rule in
             self.plan
                 .call_rules_to_target(call, callee, PlanCallFlowRuleKind::Call, demand.carrier)
         {
+            if self.plan.is_default_argument_carrier(rule.source, callee) {
+                // The default value is owned by the callee, was saved at
+                // definition time, and is exposed as a source at this entry.
+                // There is no caller carrier to demand; terminate at the
+                // exact entry source instead of carrying the saved value
+                // backwards across the call boundary.
+                for phase in [
+                    super::ValueFlowObservationPhase::BeforeEffects,
+                    super::ValueFlowObservationPhase::AfterEffects,
+                ] {
+                    for source in self
+                        .plan
+                        .sources_at(edge.target(), phase)
+                        .filter(|source| source.carrier == rule.source)
+                    {
+                        let uncertainty = demand
+                            .uncertainty
+                            .with_quality(&rule.proof, &rule.completeness)
+                            .with_quality(source.spec.proof(), source.spec.completeness());
+                        meetings.push(BackwardValueFlowFact::Meeting {
+                            source: source.id,
+                            sink: demand.sink,
+                            uncertainty,
+                        });
+                    }
+                }
+                continue;
+            }
             out.push(Demand {
                 carrier: rule.source,
                 uncertainty: demand
@@ -396,10 +429,11 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
         edge: DataflowEdge<'_, BackwardValueFlowFact>,
         demand: Demand,
         out: &mut Vec<Demand>,
+        meetings: &mut Vec<BackwardValueFlowFact>,
     ) {
         match edge.kind() {
             IcfgEdgeKind::Intraprocedural(_) => out.push(demand),
-            IcfgEdgeKind::Call => self.inverse_call(edge, demand, out),
+            IcfgEdgeKind::Call => self.inverse_call(edge, demand, out, meetings),
             IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn => {
                 self.inverse_return(edge, demand, out)
             }
@@ -460,6 +494,7 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
 
         for target_demand in target_demands {
             let mut after_source = Vec::new();
+            let mut terminal_meetings = Vec::new();
             self.inverse_edge(
                 edge,
                 Demand {
@@ -467,7 +502,13 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                     ..target_demand
                 },
                 &mut after_source,
+                &mut terminal_meetings,
             );
+            for meeting in terminal_meetings {
+                if !out.emit(meeting) {
+                    return;
+                }
+            }
             for demand in after_source {
                 if !self.append_source_meetings(edge.source(), demand.phase, demand, out) {
                     return;

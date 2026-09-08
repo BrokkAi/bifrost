@@ -11,14 +11,28 @@
 //! they supply seeds and member lookup only, never a solver.
 
 use std::cmp::Ordering;
+use std::path::Path;
+use std::sync::Arc;
+
+use brokk_bifrost_core::analyzer::prepared_syntax::{
+    PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
+};
 
 use crate::analyzer::languages::language_support;
-use crate::analyzer::{CodeUnit, Language, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::semantic_model::{
+    SemanticModelMemberTargetDisposition, SemanticModelOverlay, SemanticModelProvenance,
+    SemanticModelSymbolKind,
+};
+use crate::analyzer::usages::get_type::TypeLookupType;
+use crate::analyzer::{CodeUnit, Language, ProjectFile, Range, WorkspaceAnalyzer};
+use crate::hash::HashMap;
 
+use super::oracle::CandidateCoverage;
 use super::{
-    AllocationSite, CallSiteId, GuardFact, LengthDelimitedDigest, MemoryLocation, ProcedureHandle,
-    ProcedureId, SemanticArtifactKey, SemanticCallSite, SemanticValue, SourceSpan, StableDigest,
-    WorkspaceRelativePath,
+    AdapterSemanticsVersion, AllocationSite, CallSiteId, ContentIdentity, GuardFact,
+    LengthDelimitedDigest, MemoryLocation, OverlaySnapshotId, ProcedureHandle, ProcedureId,
+    SemanticArtifactKey, SemanticCallSite, SemanticLocator, SemanticValue, SourcePosition,
+    SourceRevision, SourceSpan, StableDigest, ValueId, WorkspaceMountId, WorkspaceRelativePath,
 };
 
 /// One class a value may be an instance of, or the honest statement that
@@ -80,6 +94,12 @@ pub enum UnknownReason {
     /// root's result is incomplete for coverage reasons. Never attached to a
     /// sink the closure's coverage can name (`UnresolvedCall`, `Truncated`).
     IncompleteRoot,
+    /// One named class is useful positive evidence, but the adapter cannot
+    /// prove that it exhausts the runtime class set.
+    OpenTypeBound,
+    /// The receiver is a real scalar value, but the class-set domain does not
+    /// model a nominal member-bearing class for it.
+    ScalarReceiver,
 }
 
 impl UnknownReason {
@@ -103,6 +123,8 @@ impl UnknownReason {
             Self::SolverBudget => "solver_budget",
             Self::SemanticBudget => "semantic_budget",
             Self::IncompleteRoot => "incomplete_root",
+            Self::OpenTypeBound => "open_type_bound",
+            Self::ScalarReceiver => "scalar_receiver",
         }
     }
 }
@@ -111,9 +133,258 @@ impl UnknownReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassSeed {
     Class(ClassIdentity),
+    /// The named class is possible, but other runtime classes may also flow.
+    /// Expansion always emits the class first and the open remainder second.
+    ClassWithOpenBound(ClassIdentity),
+    /// Several named classes are possible, and other runtime classes may also
+    /// flow. Construction canonicalizes the class list; expansion emits every
+    /// class in that order followed by one open remainder.
+    ClassesWithOpenBound(Box<[ClassIdentity]>),
     Unknown(UnknownReason),
     /// The site does not produce a class (an ordinary call, an undeclared parameter).
     NotApplicable,
+}
+
+impl ClassSeed {
+    pub fn classes_with_open_bound(classes: impl IntoIterator<Item = ClassIdentity>) -> Self {
+        let mut classes = classes.into_iter().collect::<Vec<_>>();
+        classes.sort_by(class_identity_order);
+        classes.dedup();
+        assert!(
+            !classes.is_empty(),
+            "an open multi-class seed names at least one class"
+        );
+        Self::ClassesWithOpenBound(classes.into_boxed_slice())
+    }
+
+    /// Expand an adapter answer into the language-neutral facts propagated by
+    /// the flow engine. The stable class-before-unknown order is part of
+    /// reusable-summary event identity.
+    pub fn into_atoms(self) -> impl Iterator<Item = ClassAtom> {
+        let atoms = match self {
+            Self::Class(class) => vec![ClassAtom::Class(class)],
+            Self::ClassWithOpenBound(class) => vec![
+                ClassAtom::Class(class),
+                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
+            ],
+            Self::ClassesWithOpenBound(classes) => {
+                let mut classes = classes.into_vec();
+                classes.sort_by(class_identity_order);
+                classes.dedup();
+                assert!(
+                    !classes.is_empty(),
+                    "an open multi-class seed names at least one class"
+                );
+                classes
+                    .into_iter()
+                    .map(ClassAtom::Class)
+                    .chain(std::iter::once(ClassAtom::Unknown(
+                        UnknownReason::OpenTypeBound,
+                    )))
+                    .collect()
+            }
+            Self::Unknown(reason) => vec![ClassAtom::Unknown(reason)],
+            Self::NotApplicable => Vec::new(),
+        };
+        atoms.into_iter()
+    }
+}
+
+pub(crate) type ExternalClassCache =
+    HashMap<(Language, Box<str>, Option<Box<str>>), Option<ClassIdentity>>;
+
+/// Resolve one external class from the active model after filtering by the
+/// requested language, owner-less class shape, and optional exact record ID.
+/// Uniqueness is decided only after those filters are applied.
+pub(crate) fn external_class_identity(
+    overlay: Option<&SemanticModelOverlay>,
+    language: Language,
+    qualified_name: &str,
+    semantic_model_id: Option<&str>,
+    cache: &mut ExternalClassCache,
+) -> Option<ClassIdentity> {
+    let key = (
+        language,
+        qualified_name.into(),
+        semantic_model_id.map(Box::from),
+    );
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let resolved = overlay.and_then(|overlay| {
+        let records = match semantic_model_id {
+            Some(id) => overlay.symbols_with_id(id).records,
+            None => overlay.symbols_named(qualified_name).records,
+        }
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == language.config_label()
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Class
+                && !symbol.provenance.ambiguous
+        })
+        .collect::<Vec<_>>();
+        let [symbol] = records.as_slice() else {
+            return None;
+        };
+        Some(ClassIdentity::External {
+            qualified_name: symbol.qualified_name.clone().into_boxed_str(),
+            symbol_id: symbol.id.clone().into_boxed_str(),
+        })
+    });
+    cache.insert(key, resolved.clone());
+    resolved
+}
+
+pub(crate) fn class_seed_from_lookup_types(
+    overlay: Option<&SemanticModelOverlay>,
+    language: Language,
+    types: &[TypeLookupType],
+) -> ClassSeed {
+    let [lookup] = types else {
+        return if types.is_empty() {
+            ClassSeed::NotApplicable
+        } else {
+            ClassSeed::Unknown(UnknownReason::AmbiguousCallee)
+        };
+    };
+    match lookup.definitions.as_slice() {
+        [definition] if definition.is_class() => {
+            ClassSeed::Class(ClassIdentity::Workspace(definition.clone()))
+        }
+        [_] => ClassSeed::NotApplicable,
+        [] => {
+            let mut cache = ExternalClassCache::default();
+            external_class_identity(
+                overlay,
+                language,
+                &lookup.fqn,
+                lookup.semantic_model_id.as_deref(),
+                &mut cache,
+            )
+            .map(ClassSeed::Class)
+            .unwrap_or(ClassSeed::NotApplicable)
+        }
+        _ => ClassSeed::Unknown(UnknownReason::AmbiguousCallee),
+    }
+}
+
+pub(crate) fn external_member_lookup(
+    overlay: &SemanticModelOverlay,
+    owner_id: &str,
+    member: &str,
+) -> MemberLookup {
+    let matched = overlay.member_target_on_owner(owner_id, member);
+    match matched.disposition {
+        SemanticModelMemberTargetDisposition::Unique => {
+            MemberLookup::Present(MemberLookupHit::new(
+                MemberDeclaration::External(ExternalMemberDeclaration::new(
+                    matched
+                        .records
+                        .into_iter()
+                        .map(|record| Box::from(record.id.as_str())),
+                )),
+                CandidateCoverage::Exhaustive,
+            ))
+        }
+        SemanticModelMemberTargetDisposition::Conflict
+            if overlay.member_present_on_owner(owner_id, member) =>
+        {
+            MemberLookup::Present(MemberLookupHit::new(
+                MemberDeclaration::External(ExternalMemberDeclaration::new(
+                    matched
+                        .records
+                        .into_iter()
+                        .map(|record| Box::from(record.id.as_str())),
+                )),
+                CandidateCoverage::Exhaustive,
+            ))
+        }
+        SemanticModelMemberTargetDisposition::Absent => MemberLookup::Absent,
+        SemanticModelMemberTargetDisposition::Incomplete
+        | SemanticModelMemberTargetDisposition::Conflict => {
+            MemberLookup::Unknown(UnknownReason::PackIncomplete)
+        }
+    }
+}
+
+pub(crate) fn file_for_locator(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> Option<ProjectFile> {
+    workspace
+        .analyzer()
+        .project()
+        .file_by_rel_path(Path::new(locator.path().as_str()))
+}
+
+pub(crate) fn source_span_for_node(node: tree_sitter::Node<'_>) -> SourceSpan {
+    SourceSpan::new(
+        SourcePosition::new(
+            node.start_byte() as u32,
+            node.start_position().row as u32,
+            node.start_position().column as u32,
+        ),
+        SourcePosition::new(
+            node.end_byte() as u32,
+            node.end_position().row as u32,
+            node.end_position().column as u32,
+        ),
+    )
+    .expect("a tree-sitter node range is a valid source span")
+}
+
+pub(crate) fn analyzer_range_for_span(span: SourceSpan) -> Range {
+    Range {
+        start_byte: span.start_byte() as usize,
+        end_byte: span.end_byte() as usize,
+        start_line: span.start().line() as usize,
+        end_line: span.end().line() as usize,
+    }
+}
+
+/// Accept prepared syntax only when it is the exact indexed snapshot from
+/// which `procedure` was materialized. A mismatch is typed as uncertain flow:
+/// adapters must fail closed instead of reading AST fields at stale offsets.
+pub fn validate_prepared_syntax_for_procedure(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    file: &ProjectFile,
+    prepared: Arc<PreparedSyntaxTree>,
+) -> Result<Arc<PreparedSyntaxTree>, UnknownReason> {
+    let key = procedure.artifact().key();
+    let path_matches =
+        WorkspaceRelativePath::try_from_path(file.rel_path()).is_ok_and(|path| &path == key.path());
+    let content = ContentIdentity::hash_bytes(prepared.source().as_bytes());
+    let revision_matches = match (key.revision(), prepared.origin()) {
+        (SourceRevision::Disk { content: expected }, PreparedSourceOrigin::Disk) => {
+            content == expected
+        }
+        (
+            SourceRevision::Overlay {
+                content: expected,
+                snapshot,
+            },
+            PreparedSourceOrigin::Overlay,
+        ) => {
+            content == expected
+                && prepared.overlay_revision().is_some_and(|revision| {
+                    OverlaySnapshotId::hash_bytes(revision.get().to_le_bytes()) == snapshot
+                })
+        }
+        _ => false,
+    };
+    let exact = path_matches
+        && key.mount() == WorkspaceMountId::from_root(file.root())
+        && key.language() == prepared.dialect()
+        && revision_matches
+        && matches!(prepared.backing(), PreparedSyntaxSource::Indexed(_))
+        && workspace
+            .analyzer()
+            .indexed_source_matches(file, prepared.source());
+    exact
+        .then_some(prepared)
+        .ok_or(UnknownReason::UncertainFlow)
 }
 
 /// Where one class-carrying source was seeded, retained for findings,
@@ -132,6 +403,7 @@ pub enum SourceSiteKind {
     ContainerLiteral,
     DeclaredParameter,
     RootReceiver,
+    /// Unclassified origin syntax; independent of whether its class is known.
     Unknown,
 }
 
@@ -170,9 +442,25 @@ impl ExternalMemberDeclaration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberLookup {
-    Present(MemberDeclaration),
+    Present(MemberLookupHit),
     Absent,
     Unknown(UnknownReason),
+}
+
+/// Positive member evidence and whether its dispatch targets are complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberLookupHit {
+    pub declaration: MemberDeclaration,
+    pub dispatch_coverage: CandidateCoverage,
+}
+
+impl MemberLookupHit {
+    pub fn new(declaration: MemberDeclaration, dispatch_coverage: CandidateCoverage) -> Self {
+        Self {
+            declaration,
+            dispatch_coverage,
+        }
+    }
 }
 
 /// Durable identity of one call site across rematerializations of the same
@@ -496,16 +784,20 @@ fn push_member_declaration(digest: &mut LengthDelimitedDigest, declaration: &Mem
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GuardArmSide {
-    True,
-    False,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NarrowingVerdict {
     Keep,
     Drop,
     Unknown,
+}
+
+/// An exactly bound, reviewed library contract on a call's normal return.
+/// It constrains existing class possibilities; it never invents a class for
+/// an unknown value, and says nothing about the exceptional continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalReturnTypeConstraint {
+    pub subject: ValueId,
+    pub classes: Box<[ClassIdentity]>,
+    pub provenance: SemanticModelProvenance,
 }
 
 /// The workspace hierarchy facts needed to decide whether a receiver or
@@ -560,6 +852,12 @@ pub enum MemberAccessQuery<'a> {
 /// subclasses cannot exist.
 pub trait TypeFlowAdapter: Send + Sync {
     fn language(&self) -> Language;
+
+    /// Stable identity of every answer this adapter can provide. Implementors
+    /// must rotate it whenever any type-flow method changes behavior for
+    /// unchanged semantic inputs.
+    fn semantics_version(&self) -> AdapterSemanticsVersion;
+
     fn constructed_class(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -572,6 +870,32 @@ pub trait TypeFlowAdapter: Send + Sync {
         procedure: &ProcedureHandle,
         value: &SemanticValue,
     ) -> ClassSeed;
+    /// Class of a computation whose operand dependencies do not establish
+    /// class identity. An adapter may classify the result from structured
+    /// language semantics; an unmodeled computation remains explicitly open.
+    fn computed_class(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _value: &SemanticValue,
+    ) -> ClassSeed {
+        ClassSeed::Unknown(UnknownReason::UncertainFlow)
+    }
+    /// Classifies a retained value whose semantic kind has no built-in
+    /// class-set seed. This is the adapter's fail-closed seam for structured
+    /// language values such as callable expressions and literals that are
+    /// neither constants nor allocation sites in semantic IR. The planner
+    /// invokes this only for data origins; call-site callee values are excluded
+    /// because callable targets are control-flow identities, not runtime data
+    /// flowing through the call's arguments or result.
+    fn retained_value_class(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _value: &SemanticValue,
+    ) -> ClassSeed {
+        ClassSeed::NotApplicable
+    }
     fn allocation_class(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -593,6 +917,7 @@ pub trait TypeFlowAdapter: Send + Sync {
     fn member_lookup(
         &self,
         workspace: &WorkspaceAnalyzer,
+        kind: MemberAccessKind,
         class: &ClassIdentity,
         member: &str,
     ) -> MemberLookup;
@@ -630,13 +955,36 @@ pub trait TypeFlowAdapter: Send + Sync {
         Vec::new()
     }
 
-    fn narrowing_verdict(
+    /// Classify each candidate on the guard's true arm, in input order.
+    /// Resolve guard operands once for the batch. The false arm reverses
+    /// Keep and Drop; Unknown must remain on both arms.
+    fn narrowing_verdicts(
         &self,
         _workspace: &WorkspaceAnalyzer,
         _procedure: &ProcedureHandle,
         _guard: &GuardFact,
+        atoms: &[&ClassIdentity],
+    ) -> Vec<NarrowingVerdict> {
+        vec![NarrowingVerdict::Unknown; atoms.len()]
+    }
+
+    /// Return only contracts whose target, actual/formal binding, and class
+    /// arguments are established from structured evidence. An unresolved,
+    /// overridden, rebound, or conflicting invocation has no constraint.
+    fn normal_return_type_constraints(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _call: &SemanticCallSite,
+    ) -> Vec<NormalReturnTypeConstraint> {
+        Vec::new()
+    }
+
+    fn instance_of_verdict(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
         _atom: &ClassIdentity,
-        _arm: GuardArmSide,
+        _classes: &[ClassIdentity],
     ) -> NarrowingVerdict {
         NarrowingVerdict::Unknown
     }
@@ -651,7 +999,68 @@ pub fn type_flow_adapter(language: Language) -> Option<&'static dyn TypeFlowAdap
 
 #[cfg(test)]
 mod tests {
-    use super::ExternalMemberDeclaration;
+    use super::{ClassAtom, ClassIdentity, ClassSeed, ExternalMemberDeclaration, UnknownReason};
+
+    #[test]
+    fn open_class_seed_expands_to_class_then_typed_unknown() {
+        let class = ClassIdentity::External {
+            qualified_name: "pkg.Widget".into(),
+            symbol_id: "class-widget".into(),
+        };
+
+        assert_eq!(
+            ClassSeed::ClassWithOpenBound(class.clone())
+                .into_atoms()
+                .collect::<Vec<_>>(),
+            vec![
+                ClassAtom::Class(class),
+                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_class_open_seed_is_canonical_deduplicated_and_open_last() {
+        let first = ClassIdentity::External {
+            qualified_name: "pkg.A".into(),
+            symbol_id: "class-a".into(),
+        };
+        let second = ClassIdentity::External {
+            qualified_name: "pkg.B".into(),
+            symbol_id: "class-b".into(),
+        };
+
+        assert_eq!(
+            ClassSeed::classes_with_open_bound([second.clone(), first.clone(), second.clone(),])
+                .into_atoms()
+                .collect::<Vec<_>>(),
+            vec![
+                ClassAtom::Class(first.clone()),
+                ClassAtom::Class(second.clone()),
+                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
+            ]
+        );
+
+        assert_eq!(
+            ClassSeed::ClassesWithOpenBound(
+                vec![second.clone(), first.clone(), second.clone()].into_boxed_slice(),
+            )
+            .into_atoms()
+            .collect::<Vec<_>>(),
+            vec![
+                ClassAtom::Class(first),
+                ClassAtom::Class(second),
+                ClassAtom::Unknown(UnknownReason::OpenTypeBound),
+            ],
+            "even direct variant construction cannot perturb reusable event order"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "an open multi-class seed names at least one class")]
+    fn multi_class_open_seed_rejects_an_empty_class_set() {
+        ClassSeed::classes_with_open_bound(std::iter::empty());
+    }
 
     #[test]
     fn external_member_declaration_is_nonempty_canonical_and_deduplicated() {

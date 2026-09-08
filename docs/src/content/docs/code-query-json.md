@@ -217,7 +217,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `typestate` | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
 | `value_flow` | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
 | `taint` | procedure | taint finding | Project the retained production `TaintFindingReport` named by `taint_ref` for the exact procedure. |
-| `witness` | typestate finding or flow endpoint | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
+| `witness` | typestate finding, flow endpoint, or absent-member finding | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
@@ -232,7 +232,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_outcome` | receiver analysis | receiver outcome | The mandatory terminal row per analyzed site: outcome, coverage, candidate accounting, and stable `site_id`/`site_ast_id`. |
 | `receiver_evidence` | receiver analysis | receiver evidence | One flat row per retained receiver observation, parent-linked for factory chains and keyed by `site_id`. |
 | `member_selection` | occurrence | member selection | The mandatory selection summary per reference occurrence, projected from the production resolver's candidate trace. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, receiver analysis, receiver outcome, receiver evidence, occurrence, lexical scope, or binding | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, class-set row, absent-member finding, absent-member witness, reference site, call site, expression site, receiver analysis, receiver outcome, receiver evidence, occurrence, lexical scope, or binding | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -330,6 +330,41 @@ The host registers an already-built `ValueFlowPlan` under a namespaced reference
 
 `flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, ambiguity, completion, must-status (`not_established`), and solver termination as separate fields. `flow_witness` rows contain bounded ordered source-backed steps plus truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
 
+### Caller-driven absent-member witnesses
+
+`class_set` follows caller values to receiver accesses; `absent_member` emits
+only Proven class/member absences. Python absence queries require an active
+Python declaration-model surface. Unknown receivers and incomplete member
+models suppress findings; a complete empty result does not mean every runtime
+receiver was classified.
+
+<!-- code-query-test:json:absent-member-witness -->
+```json
+{
+  "schema_version": 1,
+  "languages": ["python"],
+  "match": {"kind": "function", "name": "read_config"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "absent_member"},
+    {"op": "witness", "max_steps": 32, "max_bytes": 16384}
+  ]
+}
+```
+
+`absent_member_witness` rows link to a site-keyed `finding_id` and retain ordered
+source-backed `steps`, `quality`, byte counts, and omission/truncation metadata.
+Witness IDs additionally distinguish caller contexts. `witness_status` is
+`available`, `truncated`, or `unavailable`; unavailable rows have no steps and
+include `unavailable_reason`. Retention exhaustion is a truncated marker, not an
+unavailable error or a complete empty path. Missing or truncated witness evidence
+does not revoke the independently Proven finding.
+
+Setting `max_steps` to 1 retains at most one step and labels a longer path as
+truncated. Query limits only reduce host per-witness and aggregate limits;
+projection never runs the solver again. Named `type_flow_witness_truncated` and
+`type_flow_witness_unavailable` diagnostics distinguish the two evidence limits.
+
 ### Retained production taint findings
 
 The host registers immutable results produced by the production taint policy compiler, batch planner, solver, collector, and public projector. A query selects the exact procedure root and projects only retained evidence:
@@ -389,7 +424,7 @@ Containment is expressed by `occurrences_in` over a structural query rather than
 
 `ast_id` is the content-scoped identity of the underlying AST node. In `result_detail: "full"`, a `structural_match` and each of its `captures` carry the same field, so a captured node and the occurrence at that node are joined by string equality of `ast_id` -- never by comparing ranges, paths, or spellings.
 
-Occurrence support is declared per language and per role. Where a language's adapter does not classify a role a query names -- or classifies it but cannot place it in a namespace, as Rust and Java cannot for `path_segment` -- the run reports `occurrence_role_unsupported` with `incomplete` impact instead of returning a clean empty answer. A role the adapter *does* support is not degraded by an unsupported sibling role.
+Occurrence support is declared per language and per role. Where a language's adapter does not classify a role a query names, or cannot place it in a namespace, the run reports `occurrence_role_unsupported` with `incomplete` impact instead of returning a clean empty answer. Java and Rust path qualifiers use `path_prefix`: the qualifier can name a module or a type, with resolution determining which. A role the adapter *does* support is not degraded by an unsupported sibling role.
 
 ### The lexical environment and resolution candidates
 
@@ -462,7 +497,7 @@ Three honesty rules govern candidate rows, and none of them can be read off an e
 
 Where an adapter declares a lexical-environment axis unsupported, the run reports `environment_axis_unsupported` with `incomplete` impact rather than a clean empty answer, exactly as for occurrence roles.
 
-Seed with the roles you need rather than with a class. `{"class": ["reference"]}` requires *every* reference role, so an adapter gap in an unrelated part of a file -- a pattern position it does not classify, a path segment whose namespace it cannot name -- makes the whole run incomplete and the answer unreadable. `{"role": ["receiver_position"]}` asks only for what the question is about, and reports incompleteness only when that role is genuinely unavailable.
+Seed with the roles you need rather than with a class. `{"class": ["reference"]}` requires *every* reference role, so an adapter gap in an unrelated part of a file -- such as a pattern position it does not classify -- makes the whole run incomplete. Java and Rust qualifiers using `path_prefix` are supported, not missing namespace classifications. `{"role": ["receiver_position"]}` asks only for what the question is about, and reports incompleteness only when that role is genuinely unavailable.
 
 The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
 

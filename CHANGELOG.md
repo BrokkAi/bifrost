@@ -9,18 +9,106 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- C analysis now models function-like macro parameters and
+  replacement-local declarations, with exact navigation and authoritative
+  inverse references for macro formals.
+- Python call binding now binds saved default arguments across selected
+  call edges.
+- Absent-member queries expose bounded, source-backed witnesses with explicit
+  unavailable and truncated evidence. The code-smells pack adds a guarded
+  Python absent-member rule, supported by reviewed standard-library assertion
+  contracts that preserve uncertainty and reject overridden behavior.
+- Type-flow `class_set` and `absent_member` queries now cover JavaScript,
+  TypeScript, PHP, and Ruby through conservative adapters with tested
+  soundness boundaries.
+- C++ queries now emit typed declaration-definition peer rows instead of
+  merged ranges.
+- The LSP now publishes unused-import diagnostics, powered by a dedicated
+  code-quality analyzer.
+- Reference edges now classify a free function against a type-owned target
+  as `external` when the function's module or package owner is provable
+  (Rust, Go, PHP, Kotlin, Ruby, JS/TS), where they reported `unknown`; two
+  declarations in one unnamed root scope stay `unknown`.
 - The built-in `bifrost.security` pack now ships an exact
   Servlet-parameter-to-JDBC rule backed by behavioral models for the shipped
   Java endpoints.
 
 ### Changed
 
+- Type-flow class-set summaries and their field-slot indexes are now
+  persisted, validated, and replayed across runs, with persisted cuts
+  selected before discovery and fail-closed behavior on unproven surfaces.
 - JVM dependency discovery now certifies exact callable families from JMOD
   artifacts and activates scoped evidence from partial generated packs
   without promoting their completeness.
 
 ### Fixed
 
+- Diff tools no longer collect retained diff-revision facts at startup, so
+  repeated analyses of the same base keep their caches, and `score_diff`
+  now retains one immutable target revision and reuses its reference scan
+  across calls.
+- Unused-import diagnostics now resolve Rust and Scala import targets before
+  withholding a proof, and JavaScript/TypeScript treats documentation
+  comments as an ambient import use.
+- Go data-race analysis now keeps an array copy's storage distinct from its
+  source.
+- PHP declarations are now scoped by the namespace statement that governs
+  them.
+- C# call arguments now type an object initializer from the single candidate
+  method.
+- C/C++ census membership now admits recovered call prefixes and nested
+  declarator links, and swallowed C++ declarations partition by their lexical
+  container.
+- Python lexical-cell carrier identity no longer collides.
+- Class-set analysis no longer treats a computation's operand or a container's
+  contents as proof of the result's runtime class.
+- The Linux installer recognizes glibc hosts with musl also installed instead
+  of rejecting them as unsupported musl distributions.
+- C definition navigation now binds locals and field receivers in function
+  bodies fractured by nested preprocessor conditionals, recovers field-list
+  macros truncated at comments, and activates foreign declarations by guard
+  compatibility when no build decides the configuration.
+- C++ navigation now recovers export-macro class heads with virtual bases,
+  resolves calls through file-scope function-pointer variables, and no longer
+  admits decided-away type references as unproven inverse hits.
+- Go data-race analysis now types field receivers, removing a false positive
+  on workerpool-style callbacks.
+- Python type-flow no longer lets value bindings participate in class
+  hierarchies, keeps unresolved base aliases open, and invalidates caches
+  after hierarchy corrections.
+- Rust inverse lookup now preserves resolved module prefixes.
+- C `goto` references and function-local labels now round-trip through
+  definition lookup and authoritative inverse scans.
+- Rust definition navigation now resolves receivers typed by trait bounds
+  through their bound traits and resolves forward references inside nested
+  modules.
+- Go data-race analysis no longer treats a write as clean when the model did
+  not capture its read, and now follows pointer-field chains across copies and
+  single-write cells.
+- A typestate finding's subject identity no longer contains a byte span of the
+  file or the type that declares what the tracked object was acquired through.
+  Every declaration segment of the canonical locator carried an anchor, and the
+  outermost one spans the whole file, so any edit anywhere in a file that
+  declares an acquisition callee re-keyed every subject acquired through it and
+  a `--diff-base` run listed unchanged violations as `fixed` and reported them
+  again as `new`. A segment is now named by its kind, its name, and its ordinal
+  among its same-kind siblings, which is what identifies the declaration. The
+  compiled binding-plan hash folds the same rendering, so a solver root's
+  evaluation unit also survives an unrelated edit to a file its bindings name.
+  Policy evaluation units and recorded base evaluations from earlier builds are
+  not reused, because they carry the identities the previous engine minted.
+- A typestate finding's subject identity now addresses the one byte span it
+  still carries -- the span of the procedure or call site the locator names --
+  from the start of the declaration that contains it, not from the start of the
+  file. An edit that made a declaration above that procedure longer moved every
+  byte below it, which re-keyed the subjects and the compiled binding-plan hash
+  even though nothing about the procedure changed, so a `--diff-base` run again
+  listed unchanged violations as `fixed` and reported them as `new`. A locator
+  that names a class-level member from inside a method sits outside the
+  declaration path it carries; it is tagged and keeps its file-relative offset,
+  which is what it had before. Policy evaluation units and recorded base
+  evaluations from earlier builds are not reused.
 - C definition navigation now resolves ordered, nested, and anonymous
   designated-initializer fields and fields accessed through indexed array
   elements, and macro-field relational lookups stay local to their source
@@ -51,6 +139,11 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- JavaScript, TypeScript, and TSX receiver queries now project the declared
+  return type of an exact modeled external call. The shipped Node Buffer
+  declaration packs consequently resolve `Buffer.from(...).toString(...)` to
+  the precise Buffer instance member while shadowed and unrelated lookalikes
+  remain incomplete.
 - The stable extension surface now serves typestate. A new experimental
   operation, `experimental.semantic.typestate`, answers one bounded protocol
   question about one procedure: the caller supplies its own automaton and binds

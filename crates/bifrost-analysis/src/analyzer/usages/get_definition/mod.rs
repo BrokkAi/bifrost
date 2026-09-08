@@ -11,7 +11,7 @@ use crate::analyzer::usages::cpp_graph::{
     CppBareCallTargetResolution, CppBlockUsingCallTargetResolution, CppDesignatedInitializerOwner,
     CppDispatch, CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind,
     CppTemplateResolutionError, CppVisibilityIndex, cpp_argument_children,
-    cpp_constructor_type_node, cpp_designated_initializer_owner,
+    cpp_constructor_type_node, cpp_declaration_declarator, cpp_designated_initializer_owner,
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
     cpp_function_return_type_text, cpp_initialized_effective_using_imports,
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,
@@ -172,7 +172,9 @@ pub(crate) use php::{
 };
 pub use python::python_visible_same_file_candidates;
 pub(crate) use python::{
-    PythonDefinitionProvider, python_type_lookup_resolution_bounded, resolve_python_bounded,
+    PythonDefinitionProvider, python_external_imported_symbol_bounded,
+    python_namespace_imported_class_name_bounded, python_type_lookup_resolution_bounded,
+    resolve_python_bounded,
 };
 pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
 pub(crate) use ruby::{
@@ -527,6 +529,27 @@ impl ExactExternalCallProof {
         Self {
             canonical_callee: format!("{module_specifier}.{imported_name}").into_boxed_str(),
             call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
+    pub(crate) fn js_ts_bound_external_member(
+        owner: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external receiver owner must be named"
+        );
+        assert!(!member.is_empty(), "an external member must be named");
+        Self {
+            canonical_callee: format!("{owner}.{member}").into_boxed_str(),
+            call_application: CallApplicationKind::BoundReceiver,
+            // JavaScript and TypeScript permit runtime prototype changes. The
+            // active callable family proves the selected declaration, not that
+            // the language has a closed dispatch universe.
             dispatch_extensibility: None,
             parameter_count,
         }
@@ -1006,32 +1029,21 @@ fn resolve_definition_requests_traced<'a>(
         .collect()
 }
 
-/// Test-only count of [`resolve_definition_batch_with_source`] invocations,
-/// so a batching caller can assert it collapsed many per-edge calls into one
-/// call per file rather than re-deriving that from timing (bifrost#15).
-#[cfg(test)]
-pub(crate) static RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn reset_resolve_definition_batch_with_source_call_count_for_test() {
-    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_definition_batch_with_source_call_count_for_test() -> usize {
-    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 pub fn resolve_definition_batch_with_source(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
+    // Recorded per analyzer instance through the test-hook counter on
+    // `analyzer` itself, rather than a process-wide static: a static here was
+    // inflated by any other test calling this function concurrently (#3010).
+    // A batching caller asserts this collapsed many per-edge calls into one
+    // call per file rather than re-deriving that from timing (bifrost#15).
     #[cfg(test)]
-    RESOLVE_DEFINITION_BATCH_WITH_SOURCE_CALL_COUNT
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    analyzer
+        .test_hooks()
+        .record_resolve_definition_batch_with_source_call_for_test();
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
@@ -1123,6 +1135,42 @@ pub fn navigation_declaration_site_targets(
         operation,
     )
     .targets
+}
+
+/// The declaration one offset falls inside, for a consumer holding an
+/// analyzer.
+///
+/// [`navigation_declaration_site_at_offset`] answers from source alone. Go's
+/// declarations come from the analyzer, so this takes one. A caller asking
+/// what declaration an occurrence *is*, rather than what it refers to, needs
+/// this: a definition lookup at a declaration has no reference to follow.
+/// Whether the allocation expression at `offset` yields a reference.
+///
+/// Only Go answers today. A language that has no value/reference distinction
+/// at an allocation, or whose adapter does not record one, answers `false`,
+/// which keeps a consumer's previous behavior.
+pub fn allocation_yields_reference_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> bool {
+    match language_for_file(file) {
+        Language::Go => go::allocation_yields_reference_at_offset(file, source, offset),
+        _ => false,
+    }
+}
+
+pub fn declaration_site_at_offset(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<CodeUnit> {
+    match language_for_file(file) {
+        Language::Cpp => cpp::declaration_at_offset(file, source, offset),
+        Language::Go => go::field_declaration_at_offset(analyzer, file, source, offset),
+        _ => None,
+    }
 }
 
 pub fn navigation_declaration_site_at_offset(
@@ -1934,6 +1982,38 @@ fn resolve_one_with_evidence<'a>(
             .into();
         }
     };
+    if language == Language::Cpp
+        && let Some(tree) = tree.as_ref()
+        && let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer)
+    {
+        let visibility = context.cpp_visibility(cpp, analyzer, &request.file);
+        // An explicit range inside an opaque preproc_arg has been widened to
+        // that whole parser leaf. The replacement AST, not the opaque leaf,
+        // decides whether the original selection names a macro binding.
+        let (start, end) = match (request.start_byte, request.end_byte) {
+            (Some(start), Some(end)) => (start, end),
+            _ => (site.focus_start_byte, site.focus_end_byte),
+        };
+        if let Some(binding) =
+            visibility.macro_lexical_binding(&request.file, tree.root_node(), &source, start, end)
+            && let Some(definition) = super::macro_lexical::lexical_definition(analyzer, binding)
+        {
+            let mut site = site;
+            if (start, end) != (site.focus_start_byte, site.focus_end_byte) {
+                let line_starts = context.line_starts(&request.file, &source);
+                site.focus_start_byte = start;
+                site.focus_end_byte = end;
+                site.text = source[start..end].to_string();
+                site.range = Range {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: find_line_index_for_offset(&line_starts, start) + 1,
+                    end_line: find_line_index_for_offset(&line_starts, end - 1) + 1,
+                };
+            }
+            return finish_lookup_outcome(lexical_definition_outcome(definition), site).into();
+        }
+    }
     if let Some(tree) = tree.as_ref()
         && !(!allow_rust_field_receiver_lexical
             && language == Language::Rust
@@ -2059,6 +2139,15 @@ fn resolve_one_with_evidence<'a>(
                         .get(&(request.file.clone(), language))?
                         .imports;
                     js_ts::exact_direct_named_import_call(source.as_ref(), tree, &site, imports)
+                        .or_else(|| {
+                            js_ts::exact_modeled_external_call(
+                                analyzer,
+                                language,
+                                source.as_ref(),
+                                tree,
+                                &site,
+                            )
+                        })
                 })
             {
                 let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
@@ -2143,6 +2232,7 @@ fn resolve_one_with_evidence<'a>(
                 &source,
                 tree.as_ref(),
                 &site,
+                context.exact_token_focus,
             );
             external_callee_identity = resolution.external_callee_identity;
             resolution.outcome
@@ -2362,6 +2452,12 @@ pub fn parse_tree_for_language(
     let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;
+    if language == Language::Cpp
+        && let Some(ranges) =
+            brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source)
+    {
+        parser.set_included_ranges(&ranges).ok()?;
+    }
     parser.parse(source, None)
 }
 

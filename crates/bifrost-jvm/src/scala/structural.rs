@@ -23,7 +23,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
-    IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
+    CuratedExportSurface, IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
@@ -949,6 +949,25 @@ impl StructuralSpec for ScalaStructuralSpec {
         scope_kind: Option<NormalizedKind>,
     ) -> ImportActivation {
         scala_import_binder_activation(declaration, scope, scope_kind)
+    }
+
+    /// Scala spells the two hops with two keywords: `import` brings a name
+    /// into this file, and Scala 3's `export` re-publishes it as a member of
+    /// the enclosing template, which makes it reachable from other files.
+    fn indirection_relation(
+        &self,
+        token: Node<'_>,
+        _source: &str,
+        _surface: &CuratedExportSurface,
+    ) -> Option<RouteHopKind> {
+        let declaration = nearest_ancestor(token, |kind| {
+            matches!(kind, "import_declaration" | "export_declaration")
+        })?;
+        Some(if declaration.kind() == "export_declaration" {
+            RouteHopKind::ReExport
+        } else {
+            RouteHopKind::Import
+        })
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

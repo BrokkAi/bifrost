@@ -621,7 +621,7 @@ impl UnmaterializedExternalTarget {
         }
     }
 
-    const fn has_resolver_owned_call_shape(&self) -> bool {
+    pub(crate) const fn has_resolver_owned_call_shape(&self) -> bool {
         self.resolver_owned_call_shape
     }
 
@@ -839,6 +839,7 @@ pub struct DispatchResult {
     candidates: Box<[DispatchCandidate]>,
     boundaries: Box<[DispatchBoundary]>,
     coverage: CandidateCoverage,
+    complete_receiver_hint_refinable: bool,
 }
 
 impl DispatchResult {
@@ -869,6 +870,7 @@ impl DispatchResult {
             candidates: candidates.into_boxed_slice(),
             boundaries: boundaries.into_boxed_slice(),
             coverage,
+            complete_receiver_hint_refinable: false,
         };
         let has_unresolved = result
             .boundaries
@@ -913,6 +915,19 @@ impl DispatchResult {
 
     pub const fn coverage(&self) -> CandidateCoverage {
         self.coverage
+    }
+
+    /// Whether this answer's only truncation is the workspace-override guard
+    /// on a syntax-derived external receiver arm. A complete, uncertainty-free
+    /// receiver hint may replace that arm; every other truncated answer stays
+    /// ineligible for feedback.
+    pub const fn complete_receiver_hint_refinable(&self) -> bool {
+        self.complete_receiver_hint_refinable
+    }
+
+    pub(crate) fn mark_complete_receiver_hint_refinable(&mut self) {
+        debug_assert_eq!(self.coverage, CandidateCoverage::Truncated);
+        self.complete_receiver_hint_refinable = true;
     }
 
     /// Return the receiver shape proved by one exhaustive dispatch result.

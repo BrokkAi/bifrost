@@ -838,7 +838,8 @@ mod tests {
     use crate::analyzer::content_identity::WorkspaceContentIdentity;
     use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind};
     use crate::analyzer::read_ledger::{
-        CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, read_set_digest,
+        CallSiteLocator, IndexFamily, LookupKind, LookupQuestion, ProcedureCallSiteLocator,
+        read_set_digest,
     };
     use crate::analyzer::semantic::ids::StableDigest;
     // Every EXPLAIN QUERY PLAN pin below runs its assertions once against a
@@ -923,6 +924,18 @@ mod tests {
                     site: CallSiteLocator {
                         start_byte: 10,
                         end_byte: 24,
+                    },
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::ProcedureDispatch,
+                LookupQuestion::ProcedureCallSite {
+                    rel_path: Box::from("src/Main.java"),
+                    procedure: StableDigest::sha256(b"procedure"),
+                    site: ProcedureCallSiteLocator {
+                        start_byte: 4,
+                        end_byte: 18,
                     },
                 },
                 digest,

@@ -9,8 +9,20 @@
 //! call node produces no row: the step is a projection like
 //! `occurrence_target`, not a per-input mandatory analysis, and the mandatory
 //! outcome contract applies per exact call site, not per arbitrary input.
+//!
+//! A shape whose `coverage` is not `exact` suppresses the argument-group and
+//! argument rows it heads, and every family derived from the same shape --
+//! `call_argument_groups`, `call_arguments`, `call_bindings` -- inherits that
+//! suppression. Deriving the shape is therefore where the suppression is
+//! reported, once per site, as a `call_shape_coverage_incomplete` diagnostic
+//! of `incomplete` impact (issue #1949). Reporting it at the derivation point
+//! rather than on the bound row is what lets a plan that binds only
+//! `call_arguments` see the gap: that plan's legitimately empty argument set
+//! and a real zero-argument call are byte-identical, and only the diagnostic
+//! separates them.
 
 use super::*;
+use brokk_bifrost_core::analyzer::structural::callable::CallShapeCoverage;
 
 /// Derive call-shape expansions for one pipeline input position.
 ///
@@ -31,6 +43,7 @@ pub(super) fn call_shape_expansions_for_input(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    reported_suppressed_shapes: &mut HashSet<String>,
     cache_profile: &mut Option<QueryCacheProfile>,
     shared_budget_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -66,6 +79,24 @@ pub(super) fn call_shape_expansions_for_input(
     else {
         return Vec::new();
     };
+    let outcome = &report.outcome;
+    if outcome.coverage != CallShapeCoverage::Exact
+        && reported_suppressed_shapes.insert(outcome.site_ast_id.clone())
+    {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::CallShapeCoverageIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: crate::analyzer::common::language_for_file(&outcome.file).config_label(),
+            message: format!(
+                "call_shape coverage is {} at {}:{} (site_ast_id={}), so the argument-group, argument and binding rows this shape heads were suppressed rather than emitted empty",
+                outcome.coverage.label(),
+                outcome.file,
+                outcome.range.start_line,
+                outcome.site_ast_id,
+            ),
+        });
+    }
     let value = CallShapeValue {
         report: Arc::new(report),
     };

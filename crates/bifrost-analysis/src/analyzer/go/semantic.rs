@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v47";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v48";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -8035,6 +8035,28 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             .and_then(|literal| self.procedure_targets.get(&literal))
             .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
             .unwrap_or(CallableTargetResolution::Unknown);
+        // A callee named by a binding this procedure did not prove is still a
+        // callee that came from somewhere. Recording the flow from the binding
+        // to the callable value is what lets a consumer follow the call across
+        // a boundary this procedure cannot see past, such as a callback whose
+        // body is chosen by the caller. Without it the callable value stands
+        // alone in the graph and the call can only be reported as unresolved.
+        if resolution == CallableTargetResolution::Unknown
+            && direct_function.kind() == "identifier"
+            && let Some(name) = node_text(self.prepared.source(), direct_function)
+            && let Some(source) = self.binding_value(name, direct_function.start_byte())
+            && source != callee
+        {
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source,
+                    target: callee,
+                },
+            )?;
+        }
         let metadata = self.metadata(invoke)?;
         if selector_resolution == Some(GoSelectorResolution::Unknown) {
             // The selector can still denote a function-valued field. Retain

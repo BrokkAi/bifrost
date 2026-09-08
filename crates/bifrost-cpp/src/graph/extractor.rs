@@ -19,12 +19,17 @@ use crate::graph::hits::{
     push_unproven_reference_hit_range,
 };
 use crate::graph::resolver::*;
-use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
+use crate::graph::syntax::{
+    function_macro_replacement_span, object_macro_replacement_type_references,
+    qualified_callable_value,
+};
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, WalkControl, children_iter, push_named_children_reversed, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -59,6 +64,12 @@ pub struct ScanCtx<'a> {
     pub visibility: &'a VisibilityIndex<'a>,
     pub file: &'a ProjectFile,
     pub source: &'a str,
+    /// The parent of every node in the file being scanned, recorded by one
+    /// downward pass when the scan starts. `Node::parent` recovers a parent by
+    /// re-descending from the root, so an ancestor climb is quadratic in depth
+    /// and the scan climbs from more than a dozen call sites per visited node
+    /// (#1927, #3097).
+    pub ancestry: ParentIndex<'a>,
     ordinary_type_imports: OrdinaryTypeImportCell,
     recovered_sentinel_classes: &'a [CppSentinelRecoveredClass],
     class_ranges: Option<&'a ClassRangeIndex>,
@@ -159,19 +170,28 @@ pub fn scan_prepared_file(
     {
         return;
     }
+    let macro_target_declaration_ranges = if spec.kind == TargetKind::Macro {
+        analyzer.ranges(&spec.target)
+    } else {
+        Vec::new()
+    };
     let target_declaration_ranges = if spec.kind == TargetKind::Type {
         target_group
             .iter()
             .filter(|target| target.source() == file && same_logical_symbol(target, &spec.target))
             .flat_map(|target| analyzer.ranges(target))
             .collect()
-    } else if spec.kind == TargetKind::Macro || spec.target.source() == file {
-        analyzer.ranges(&spec.target)
+    } else if spec.target.source() == file {
+        if spec.kind == TargetKind::Macro {
+            macro_target_declaration_ranges.clone()
+        } else {
+            analyzer.ranges(&spec.target)
+        }
     } else {
         Vec::new()
     };
     let target_macro_declaration_bytes = if spec.kind == TargetKind::Macro {
-        visibility.macro_declaration_bytes(&spec.target, &target_declaration_ranges)
+        visibility.macro_declaration_bytes(&spec.target, &macro_target_declaration_ranges)
     } else {
         Vec::new()
     };
@@ -197,6 +217,7 @@ pub fn scan_prepared_file(
         visibility,
         file,
         source: prepared.source(),
+        ancestry: ParentIndex::new(prepared.tree().root_node()),
         ordinary_type_imports,
         recovered_sentinel_classes,
         class_ranges,
@@ -258,7 +279,7 @@ enum UsingEnumDeclarationScope {
 }
 
 fn using_enum_declaration_scope(node: Node<'_>, ctx: &ScanCtx<'_>) -> UsingEnumDeclarationScope {
-    let mut current = node.parent();
+    let mut current = ctx.ancestry.parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -296,7 +317,7 @@ fn using_enum_declaration_scope(node: Node<'_>, ctx: &ScanCtx<'_>) -> UsingEnumD
             }
             return UsingEnumDeclarationScope::UnsupportedClass;
         }
-        current = parent.parent();
+        current = ctx.ancestry.parent(parent);
     }
     UsingEnumDeclarationScope::Namespace(enclosing_namespace_components(node, ctx.source))
 }
@@ -330,11 +351,7 @@ fn collect_semantic_using_enums(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 UsingEnumDeclarationScope::UnsupportedClass => {}
             }
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(node, &mut stack);
     }
 }
 
@@ -810,16 +827,48 @@ fn resolve_seed_type_node_lexically(
     scope: &[String],
 ) -> Option<CodeUnit> {
     let (components, global) = type_reference_components(node, ctx.source)?;
-    match ctx.visibility.resolve_type_components_lexically(
-        &ctx.analyzer,
-        ctx.file,
-        &components,
-        global,
-        scope,
-    ) {
+    let resolution = match scan_owner_type(ctx) {
+        Some(target) => ctx.visibility.resolve_type_components_lexically_for_target(
+            &ctx.analyzer,
+            ctx.file,
+            &components,
+            global,
+            scope,
+            target,
+        ),
+        None => ctx.visibility.resolve_type_components_lexically(
+            &ctx.analyzer,
+            ctx.file,
+            &components,
+            global,
+            scope,
+        ),
+    };
+    match resolution {
         LexicalTypeResolution::Resolved { unit, .. } => Some(unit),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
     }
+}
+
+/// The type this scan is asking about: the owner of a member target, or the
+/// target itself when it is a type.
+///
+/// C headers routinely declare one typedef name once per branch of an
+/// `#if`/`#else` pair, for example tinycthread's `mtx_t` as a Win32 struct and
+/// as `pthread_mutex_t` (#2996). The branches cannot both be compiled, so they
+/// are alternate spellings of one name rather than competing declarations, and
+/// canonicalizing without the scan's own type identity picks between them by
+/// declaration order. That ordering can bind a receiver to the branch that does
+/// not declare the queried member, which drops every reference in the branch
+/// that does. Naming the identity keeps the target-preserving rule the forward
+/// resolver already applies (`unique_type_candidate_preserving_target`).
+fn scan_owner_type<'a>(ctx: &'a ScanCtx<'_>) -> Option<&'a CodeUnit> {
+    // Target-preserving lookup can reconcile logical declarations across files.
+    // A receiver must not borrow an owner from a header its caller cannot see.
+    ctx.spec
+        .owner
+        .as_ref()
+        .filter(|owner| owner.is_class() && ctx.visibility.is_physically_visible(ctx.file, owner))
 }
 
 const MAX_RECEIVER_CALL_RESOLUTION_DEPTH: usize = 32;
@@ -871,6 +920,78 @@ fn infer_type_from_value_with_budget(
                 .map(|unit| CppScanBinding::from_unit(unit, 0))
         }
     }
+}
+
+/// Whether a member named `identifier` can be spelled anywhere in this file's
+/// syntax.
+///
+/// Both member scans below -- [`maybe_record_method_hit`] and
+/// [`maybe_record_member_field_hit`] -- begin by comparing the terminal name
+/// of a syntax node against the target's member name, so a file whose syntax
+/// never spells that name yields neither a proven nor an unproven hit. That
+/// makes this an exact admission test rather than an approximation: candidate
+/// discovery can drop such a file without narrowing what the query proves.
+///
+/// Only tree-sitter nodes are read. Two node kinds carry text the C++ grammar
+/// does not tokenize into identifiers -- a function-like macro's `preproc_arg`
+/// replacement, which
+/// [`maybe_record_function_macro_replacement_method_hits`] recovers by its own
+/// sentinel parse, and an `ERROR` region -- so those admit on containment
+/// instead of on a token match. A `comment` is the one subtree no scan reads,
+/// so it is skipped.
+///
+/// Defined only for a plain identifier: [`name_matches_callable`] widens the
+/// comparison for an `operator` name to the `operator` token alone, and a
+/// destructor or conversion-function name is not spelled the way it is
+/// recorded. [`cpp_member_is_spelled_at_references`] is the admission side of
+/// that condition.
+pub fn cpp_syntax_may_spell_member(root: Node<'_>, source: &str, identifier: &str) -> bool {
+    debug_assert!(
+        cpp_member_is_spelled_at_references(identifier),
+        "member admission is defined only for a plain identifier: {identifier:?}"
+    );
+    let mut spelled = false;
+    walk_named_tree_preorder(root, true, |node| match node.kind() {
+        "comment" => WalkControl::SkipChildren,
+        "identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "namespace_identifier"
+        | "statement_identifier" => {
+            if node_text(node, source).trim() == identifier {
+                spelled = true;
+                WalkControl::Break
+            } else {
+                WalkControl::SkipChildren
+            }
+        }
+        "preproc_arg" | "ERROR" => {
+            if node_text(node, source).contains(identifier) {
+                spelled = true;
+                WalkControl::Break
+            } else {
+                // The node's own text covers every descendant's bytes, so a
+                // miss here is a miss for the whole subtree.
+                WalkControl::SkipChildren
+            }
+        }
+        _ => WalkControl::Continue,
+    });
+    spelled
+}
+
+/// Whether every reference to a member named `identifier` must spell it.
+///
+/// An `operator` name is matched by [`name_matches_callable`] through the bare
+/// `operator` token, and a destructor or conversion function is recorded under
+/// a name its call sites do not write, so neither admits a spelling test.
+pub fn cpp_member_is_spelled_at_references(identifier: &str) -> bool {
+    let mut characters = identifier.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && !identifier.starts_with("operator")
 }
 
 fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -934,7 +1055,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "type_identifier"
             | "namespace_identifier"
             | "preproc_arg"
-    ) || node.parent().is_some_and(|parent| {
+    ) || ctx.ancestry.parent(node).is_some_and(|parent| {
         matches!(parent.kind(), "preproc_def" | "preproc_function_def")
             && parent
                 .child_by_field_name("name")
@@ -1073,7 +1194,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_direct_temporary_type_hit(node, ctx);
         return;
     }
-    if node.parent().is_some_and(|parent| {
+    if ctx.ancestry.parent(node).is_some_and(|parent| {
         parent.kind() == "operator_cast"
             && parent
                 .child_by_field_name("type")
@@ -1308,7 +1429,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let nested_template = if node.kind() == "template_type" {
             Some(node)
         } else {
-            node.parent().filter(|parent| {
+            ctx.ancestry.parent(node).filter(|parent| {
                 parent.kind() == "template_type" && parent.child_by_field_name("name") == Some(node)
             })
         };
@@ -1319,12 +1440,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // enclosing structured type owns the hit range; descending would emit
         // a duplicate terminal subrange.
         let nested_alias_qualifier = nested_template.is_some_and(|template| {
-            let enclosing_qualified_type_owns_range = template.parent().is_some_and(|parent| {
-                matches!(
-                    parent.kind(),
-                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
-                ) && parent.child_by_field_name("name") == Some(template)
-            });
+            let enclosing_qualified_type_owns_range =
+                ctx.ancestry.parent(template).is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                    ) && parent.child_by_field_name("name") == Some(template)
+                });
             let Some(alias_provider) = ctx.analyzer.type_alias_provider() else {
                 return false;
             };
@@ -1760,11 +1882,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         &ctx.spec.target,
         hit_node,
     ) {
-        if let Some(scope) = static_qualifier_name_scope(node, ctx) {
-            push_unproven_hit(scope, ctx);
-        } else {
-            push_unproven_hit(hit_node, ctx);
+        let unproven = static_qualifier_name_scope(node, ctx).unwrap_or(hit_node);
+        if type_reference_resolves_away_from_target(unproven, ctx) {
+            return;
         }
+        push_unproven_hit(unproven, ctx);
     }
 }
 
@@ -1860,6 +1982,8 @@ fn target_guided_nested_type_terminal_hit<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
+    // Returns a node of the caller's tree lifetime, which the context-scoped
+    // ancestry index cannot name; this is one question per call.
     let qualified = node.parent().filter(|parent| {
         matches!(
             parent.kind(),
@@ -2116,7 +2240,7 @@ fn out_of_line_dependent_return_template_owner<'tree>(
     }
     let template_name = template_reference_name_node(node)?;
     let mut scope = node;
-    while let Some(parent) = scope.parent().filter(|parent| {
+    while let Some(parent) = ctx.ancestry.parent(scope).filter(|parent| {
         matches!(
             parent.kind(),
             "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
@@ -2124,19 +2248,19 @@ fn out_of_line_dependent_return_template_owner<'tree>(
     }) {
         scope = parent;
     }
-    let qualified = scope.parent().filter(|parent| {
+    let qualified = ctx.ancestry.parent(scope).filter(|parent| {
         matches!(
             parent.kind(),
             "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
         ) && parent.child_by_field_name("scope") == Some(scope)
     })?;
-    let mut function = qualified.parent();
+    let mut function = ctx.ancestry.parent(qualified);
     let function = loop {
         let candidate = function?;
         if candidate.kind() == "function_definition" {
             break candidate;
         }
-        function = candidate.parent();
+        function = ctx.ancestry.parent(candidate);
     };
     let return_type = function.child_by_field_name("type")?;
     if return_type.start_byte() > node.start_byte() || node.end_byte() > return_type.end_byte() {
@@ -2180,13 +2304,13 @@ fn indexed_out_of_line_template_owner_hit<'tree>(
     {
         return None;
     }
-    let mut function = node.parent();
+    let mut function = ctx.ancestry.parent(node);
     let function = loop {
         let candidate = function?;
         if candidate.kind() == "function_definition" {
             break candidate;
         }
-        function = candidate.parent();
+        function = ctx.ancestry.parent(candidate);
     };
     if function
         .child_by_field_name("declarator")
@@ -2583,6 +2707,64 @@ fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
                     .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
                 && physically_visible_type_target(ctx).is_some())
     })
+}
+
+/// Whether this file decides the reference against the scan target.
+///
+/// The last resort of type admission has no structured resolution left: it
+/// only knows that the spelling mentions the target's name and that the target
+/// itself is not visible here. That is undecidable when nothing else declares
+/// the name, but it is a proven negative when the file already makes another
+/// declaration of the same name visible, because unqualified lookup binds the
+/// reference to that declaration and the include closure never reaches the
+/// target. `resolve_type_node_lexically_for_target` asks the visibility index
+/// the same question before it resolves; asking it again here keeps the
+/// inverse from admitting a site that forward resolution has already decided
+/// (#2916).
+fn type_reference_resolves_away_from_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some((components, _global)) = type_reference_components(node, ctx.source) else {
+        return false;
+    };
+    let terminal = components
+        .last()
+        .expect("type reference components are non-empty");
+    if terminal != ctx.spec.target.identifier() {
+        return false;
+    }
+    // A concrete specialization is selected from the template arguments, not
+    // from the visible primary name, so the name-level candidate set cannot
+    // decide it. `resolve_type_node_lexically_for_target` makes the same
+    // exception before its own structured prefilter.
+    if cpp_template_reference_arguments(node, ctx.source).is_some()
+        && ctx.visibility.is_template_specialization(&ctx.spec.target)
+    {
+        return false;
+    }
+    // One C++ type reached through a forward declaration in one header and its
+    // definition in another is two CodeUnits with different signatures and one
+    // qualified name. A file that sees either of them sees the target's type,
+    // so only a candidate under a different qualified name decides the
+    // reference against it. This is what separates the decoy in an unrelated
+    // namespace from a redeclaration of the target itself.
+    if ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, terminal)
+        .any(|candidate| {
+            candidate.kind() == ctx.spec.target.kind()
+                && candidate.fq_name() == ctx.spec.target.fq_name()
+        })
+    {
+        return false;
+    }
+    !ctx.visibility
+        .structured_type_reference_may_resolve_to_target(
+            &ctx.analyzer,
+            ctx.file,
+            std::slice::from_ref(terminal),
+            false,
+            &[],
+            &ctx.spec.target,
+        )
 }
 
 fn qualified_type_scope_contains_template(node: Node<'_>) -> bool {
@@ -4648,7 +4830,7 @@ fn target_guided_ambiguous_owned_alias_type_leaf<'tree>(
             "parameter_declaration" | "optional_parameter_declaration"
         )
     });
-    let placement_new_type = node.parent().is_some_and(|parent| {
+    let placement_new_type = ctx.ancestry.parent(node).is_some_and(|parent| {
         parent.kind() == "new_expression" && parent.child_by_field_name("type") == Some(node)
     });
     if !parameter && !placement_new_type {
@@ -4876,7 +5058,7 @@ fn target_guided_missing_template_argument_type_leaf<'tree>(
 fn split_macro_attribute_out_of_line_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let mut function = node;
     while function.kind() != "function_definition" {
-        function = function.parent()?;
+        function = ctx.ancestry.parent(function)?;
     }
     let macro_name = function_definition_name_node(function)?;
     if !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_name, ctx.source))) {
@@ -4897,10 +5079,7 @@ fn split_macro_attribute_out_of_line_owner(node: Node<'_>, ctx: &ScanCtx<'_>) ->
     }
     let mut missing_semicolon = false;
     let mut real_semicolon = false;
-    for index in 0..declaration.child_count() {
-        let Some(child) = declaration.child(index) else {
-            continue;
-        };
+    for child in children_iter(declaration) {
         if child.kind() == ";" {
             missing_semicolon |= child.is_missing();
             real_semicolon |= !child.is_missing();
@@ -5008,7 +5187,7 @@ fn member_alias_owner_matches_reference_for(
     }
     if let Some(reference_body) = malformed_recovered_class_body(node) {
         let mut root = node;
-        while let Some(parent) = root.parent() {
+        while let Some(parent) = ctx.ancestry.parent(root) {
             root = parent;
         }
         if ctx.analyzer.ranges(target).iter().any(|range| {
@@ -5199,13 +5378,11 @@ fn nearer_type_name_shadows_structured_reference(node: Node<'_>, ctx: &ScanCtx<'
 }
 
 fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    // One question per node in the usage scan, which does not otherwise index
-    // the tree; see `ParentIndex::unindexed`.
     if cpp_active_template_type_parameter(
         node,
         ctx.spec.target.identifier(),
         ctx.source,
-        &ParentIndex::unindexed(),
+        &ctx.ancestry,
     ) {
         return true;
     }
@@ -5213,12 +5390,12 @@ fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         return false;
     };
     let mut root_callable = callable;
-    let mut ancestor = callable.parent();
+    let mut ancestor = ctx.ancestry.parent(callable);
     while let Some(current) = ancestor {
         if matches!(current.kind(), "function_definition" | "lambda_expression") {
             root_callable = current;
         }
-        ancestor = current.parent();
+        ancestor = ctx.ancestry.parent(current);
     }
 
     let mut stack = vec![root_callable];
@@ -5390,11 +5567,11 @@ fn target_guided_missing_alias_rhs_type_leaf<'tree>(
         if candidate.kind() == "type_identifier"
             && !is_declaration_name(candidate)
             && matches!(
-                candidate.parent().map(|parent| parent.kind()),
+                ctx.ancestry.parent(candidate).map(|parent| parent.kind()),
                 Some("template_type")
             )
         {
-            let mut current = candidate.parent();
+            let mut current = ctx.ancestry.parent(candidate);
             let mut saw_qualified = false;
             let mut saw_dependent = false;
             let mut saw_type_descriptor = false;
@@ -5414,7 +5591,7 @@ fn target_guided_missing_alias_rhs_type_leaf<'tree>(
                     | "template_declaration" => {}
                     _ => {}
                 }
-                current = ancestor.parent();
+                current = ctx.ancestry.parent(ancestor);
             }
             let name = node_text(candidate, ctx.source);
             let visible_candidates = visible_type_identifier_candidates(ctx, name);
@@ -5441,11 +5618,7 @@ fn target_guided_missing_alias_rhs_type_leaf<'tree>(
                 return Some(candidate);
             }
         }
-        for index in (0..candidate.named_child_count()).rev() {
-            if let Some(child) = candidate.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(candidate, &mut stack);
     }
     None
 }
@@ -5538,12 +5711,12 @@ fn target_guided_static_cast_alias_type_descriptor<'tree>(
     if node.kind() != "type_descriptor" {
         return None;
     }
-    let argument_list = node.parent().filter(|parent| {
+    let argument_list = ctx.ancestry.parent(node).filter(|parent| {
         parent.kind() == "template_argument_list"
             && parent.named_child_count() == 1
             && parent.named_child(0) == Some(node)
     })?;
-    let template = argument_list.parent().filter(|parent| {
+    let template = ctx.ancestry.parent(argument_list).filter(|parent| {
         parent.kind() == "template_function"
             && parent.child_by_field_name("arguments") == Some(argument_list)
     })?;
@@ -6111,7 +6284,10 @@ fn free_function_target_matches(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
 /// arity; publish a proven hit only when ordinary visibility leaves one
 /// callable identity for the bare name.
 fn maybe_record_recovered_error_free_function_call(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.parent().is_none_or(|parent| parent.kind() != "ERROR")
+    if ctx
+        .ancestry
+        .parent(node)
+        .is_none_or(|parent| parent.kind() != "ERROR")
         || !has_ancestor_kind(node, "compound_statement")
     {
         return;
@@ -6444,23 +6620,23 @@ fn recovered_callable_declaration_kind(
         }) || (ctx.analyzer.reference_uses_c_semantics(ctx.file)
             && ctx.spec.target.is_function()
             && ctx.spec.target.source() == ctx.file);
-    let mut current = node.parent();
+    let mut current = ctx.ancestry.parent(node);
     while let Some(parent) = current {
         if parent.is_error() {
             // C files with an unknown return type can retain the real
             // callable name as `function_declarator > ERROR`, with the ERROR
             // as a named child rather than the declarator field itself.
             let error = parent;
-            let Some(function) = error.parent().filter(|function| {
+            let Some(function) = ctx.ancestry.parent(error).filter(|function| {
                 function.kind() == "function_declarator"
                     && function
                         .child_by_field_name("parameters")
                         .is_some_and(|parameters| error.end_byte() <= parameters.start_byte())
             }) else {
-                current = parent.parent();
+                current = ctx.ancestry.parent(parent);
                 continue;
             };
-            let container = function.parent()?;
+            let container = ctx.ancestry.parent(function)?;
             let kind = match container.kind() {
                 "declaration" => RecoveredCallableDeclarationKind::Declaration,
                 "function_definition" => RecoveredCallableDeclarationKind::Definition,
@@ -6469,14 +6645,17 @@ fn recovered_callable_declaration_kind(
             return target_identity_proven.then_some(kind);
         }
         if parent.kind() == "function_declarator" {
-            let error = parent.parent().filter(|parent| parent.is_error())?;
+            let error = ctx
+                .ancestry
+                .parent(parent)
+                .filter(|parent| parent.is_error())?;
             let declarator = parent.child_by_field_name("declarator")?;
             if declarator.start_byte() > node.start_byte()
                 || node.end_byte() > declarator.end_byte()
             {
                 return None;
             }
-            let container = error.parent()?;
+            let container = ctx.ancestry.parent(error)?;
             let kind = match container.kind() {
                 "declaration" => RecoveredCallableDeclarationKind::Declaration,
                 "function_definition" => RecoveredCallableDeclarationKind::Definition,
@@ -6485,7 +6664,7 @@ fn recovered_callable_declaration_kind(
             return target_identity_proven.then_some(kind);
         }
         if parent.is_error() {
-            current = parent.parent();
+            current = ctx.ancestry.parent(parent);
             continue;
         }
         if matches!(
@@ -6494,7 +6673,7 @@ fn recovered_callable_declaration_kind(
         ) {
             return None;
         }
-        current = parent.parent();
+        current = ctx.ancestry.parent(parent);
     }
     None
 }
@@ -6507,7 +6686,7 @@ fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut Sc
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
-    let mut declaration = node.parent();
+    let mut declaration = ctx.ancestry.parent(node);
     while let Some(candidate) = declaration {
         if candidate.kind() == "function_definition" {
             return;
@@ -6515,7 +6694,7 @@ fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut Sc
         if candidate.kind() == "declaration" {
             break;
         }
-        declaration = candidate.parent();
+        declaration = ctx.ancestry.parent(candidate);
     }
     let Some(declaration) = declaration else {
         return;
@@ -6777,7 +6956,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// structure, and every hit is reported at the bytes the member spells inside
 /// that token.
 fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let Some(definition) = node.parent().filter(|parent| {
+    let Some(definition) = ctx.ancestry.parent(node).filter(|parent| {
         parent.kind() == "preproc_function_def"
             && parent
                 .child_by_field_name("value")
@@ -6799,11 +6978,7 @@ fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut
     let mut candidates = Vec::new();
     let mut stack = vec![statements];
     while let Some(current) = stack.pop() {
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(current, &mut stack);
         if current.kind() != "call_expression" {
             continue;
         }
@@ -6831,12 +7006,17 @@ fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut
     if candidates.is_empty() {
         return;
     }
+    let Some(replacement_start) =
+        function_macro_replacement_span(definition, ctx.source).map(|span| span.start)
+    else {
+        return;
+    };
     let locals = macro_replacement_local_receivers(statements, &body, ctx);
     for (current, member, receiver) in candidates {
         if *ctx.limit_exceeded {
             return;
         }
-        let range = body.file_range(member, node.start_byte());
+        let range = body.file_range(member, replacement_start);
         debug_assert_eq!(
             ctx.source.get(range.clone()),
             Some(node_text(member, &body.source)),
@@ -6967,11 +7147,7 @@ fn macro_replacement_local_receivers(
     let mut locals = HashMap::default();
     let mut stack = vec![statements];
     while let Some(current) = stack.pop() {
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children_reversed(current, &mut stack);
         if current.kind() != "declaration" {
             continue;
         }
@@ -7728,14 +7904,17 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let receiver = node
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"));
-        match receiver.map(|receiver| explicit_receiver_target_resolution(receiver, None, ctx)) {
+        let receiver_resolution =
+            receiver.map(|receiver| explicit_receiver_target_resolution(receiver, None, ctx));
+        match receiver_resolution {
             Some(MethodReceiverTargetResolution::Target)
-                if ctx.visibility.declaration_visible_at_reference(
-                    &ctx.analyzer,
-                    ctx.file,
-                    &ctx.spec.target,
-                    field,
-                ) =>
+                if !ctx.analyzer.reference_uses_c_semantics(ctx.file)
+                    || ctx.visibility.declaration_visible_at_reference(
+                        &ctx.analyzer,
+                        ctx.file,
+                        &ctx.spec.target,
+                        field,
+                    ) =>
             {
                 push_hit(field, ctx)
             }
@@ -8110,6 +8289,37 @@ fn receiver_type_units_with_budget(
             // treat the field name as a type and lose the receiver identity.
             "identifier" | "field_identifier" => {
                 let name = node_text(current, source);
+                // Function-like macro locals are visible in the replacement
+                // range after substitution and shadow caller bindings. The
+                // receiver scan has no root field, so recover the source tree
+                // root before asking the visibility index for that binding.
+                let mut root = current;
+                while let Some(parent) = ctx.ancestry.parent(root) {
+                    root = parent;
+                }
+                if let Some(binding) = ctx.visibility.macro_local_binding_at(
+                    ctx.file,
+                    root,
+                    source,
+                    current.start_byte(),
+                    current.end_byte(),
+                ) && binding.name == name
+                {
+                    let normalized = normalize_cpp_type_name(&binding.type_name);
+                    let unit = binding
+                        .proven_unit
+                        .clone()
+                        .or_else(|| {
+                            binding.type_node.and_then(|type_node| {
+                                resolve_receiver_type_node(type_node, ctx).ok().flatten()
+                            })
+                        })
+                        .or_else(|| receiver_type_name_unit(current, &normalized, ctx));
+                    // Keep the macro declaration's shadowing boundary even
+                    // when its type is unavailable: an unresolved macro local
+                    // cannot be reinterpreted as a static type or outer value.
+                    break unit.into_iter().collect();
+                }
                 let local = ctx.bindings.resolve_symbol(name);
                 if let Some(bindings) = local.as_precise() {
                     break receiver_units_from_bindings(current, bindings, ctx);
@@ -8355,7 +8565,7 @@ fn recovered_receiver_alias_target(
     let mut node =
         root_node(reference).descendant_for_byte_range(range.start_byte, range.end_byte)?;
     while !matches!(node.kind(), "alias_declaration" | "type_definition") {
-        node = node.parent()?;
+        node = ctx.ancestry.parent(node)?;
     }
     let type_descriptor = node.child_by_field_name("type")?;
     let type_node = receiver_type_node_base(type_descriptor);
@@ -8383,12 +8593,7 @@ fn recovered_receiver_alias_target(
     let (components, global) = type_reference_components(type_node, ctx.source)?;
     if !global
         && components.len() == 2
-        && cpp_active_template_type_parameter(
-            type_node,
-            &components[0],
-            ctx.source,
-            &ParentIndex::unindexed(),
-        )
+        && cpp_active_template_type_parameter(type_node, &components[0], ctx.source, &ctx.ancestry)
     {
         let alias_provider = ctx.analyzer.type_alias_provider()?;
         let concrete = ctx
@@ -8576,6 +8781,8 @@ fn local_receiver_alias_type_node<'tree>(
 ) -> Option<Node<'tree>> {
     let callable = nearest_callable_scope(node)?;
     let mut root_callable = callable;
+    // See `target_guided_nested_type_terminal_hit`: the result carries the
+    // caller's tree lifetime.
     let mut ancestor = callable.parent();
     while let Some(current) = ancestor {
         if matches!(current.kind(), "function_definition" | "lambda_expression") {
@@ -8678,7 +8885,7 @@ fn recovered_receiver_field_type(
     let mut declaration =
         root_node(reference).descendant_for_byte_range(range.start_byte, range.end_byte)?;
     while !matches!(declaration.kind(), "declaration" | "field_declaration") {
-        declaration = declaration.parent()?;
+        declaration = ctx.ancestry.parent(declaration)?;
     }
     let type_node = first_type_child(declaration)?;
     let resolution = resolve_type_node_lexically_for_target(
@@ -8939,7 +9146,7 @@ fn call_function_target_resolution(
     function: Node<'_>,
     ctx: &ScanCtx<'_>,
 ) -> MethodReceiverTargetResolution {
-    let call_arity = function.parent().and_then(|call| {
+    let call_arity = ctx.ancestry.parent(function).and_then(|call| {
         (call.kind() == "call_expression")
             .then(|| {
                 ctx.visibility
@@ -9607,7 +9814,12 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
                         // chain real C++ unqualified lookup traverses. Only the strict
                         // callers reach this arm; the best-effort callers above keep
                         // their existing structural guess (and its query profile).
-                        match indexed_enclosing_owner_scope(analyzer, visibility, file, node) {
+                        match indexed_enclosing_owner_scope(analyzer, visibility, file, node)
+                            .or_else(|| {
+                                indexed_namespace_qualified_scope(
+                                    analyzer, visibility, file, node, &owner,
+                                )
+                            }) {
                             Some(indexed) => scope = indexed,
                             None => return LexicalScopeResolution::Missing,
                         }
@@ -9771,6 +9983,40 @@ fn indexed_enclosing_owner_scope(
     node: Node<'_>,
 ) -> Option<Vec<String>> {
     visibility.indexed_enclosing_owner_scope(analyzer, file, node)
+}
+
+/// Recover the lexical scope of an out-of-line definition whose syntactic
+/// qualifier names a *namespace* rather than a class (`void out::target(int)
+/// {...}` written at file scope, issue #3096).
+///
+/// `indexed_enclosing_owner_scope` looks for an enclosing *class*, so it finds
+/// nothing here and the strict caller would fail closed for every unqualified
+/// reference in the body. C++ unqualified lookup inside such a definition
+/// proceeds from the named namespace outward, exactly as inside a `namespace
+/// out { ... }` block, and the indexed definition already carries that scope
+/// (`["out"]` for `out::target`).
+///
+/// Take it only when a namespace of that name is visible from the file and the
+/// indexed scope ends with the syntactic qualifier. A qualifier naming a class
+/// the graph does not hold (`void MissingContainer::call()`) has no such
+/// namespace, so it still fails closed -- and it is rejected by the in-memory
+/// visibility index, before any indexed enclosing-unit query.
+fn indexed_namespace_qualified_scope(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    node: Node<'_>,
+    owner: &[String],
+) -> Option<Vec<String>> {
+    let name = owner.last().expect("a qualified owner has one component");
+    if !visibility
+        .visible_identifier_candidates(file, name)
+        .any(|unit| unit.is_module())
+    {
+        return None;
+    }
+    let indexed = indexed_enclosing_lexical_scope(analyzer, file, node)?;
+    indexed.ends_with(owner).then_some(indexed)
 }
 
 fn cached_indexed_enclosing_class_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
@@ -10933,6 +11179,7 @@ fn project_using_bindings(
                 Arc::from([ConditionalIncludeProjection {
                     activation_byte,
                     required_guards: HashSet::default(),
+                    partial_guards: HashSet::default(),
                 }])
             },
         );
@@ -12292,10 +12539,11 @@ fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 /// A bare/`this->` member call whose name resolves, through the enclosing class's base
-/// hierarchy, to the target member declared on a base (the target owner). This is a
-/// genuine external usage of the inherited base member rather than a same-type self call.
+/// hierarchy or through a lexically enclosing class, to the target member declared on
+/// another owner. This is a genuine external usage of that owner's member rather than a
+/// same-type self call.
 fn inherited_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(call) = node.parent().filter(|parent| {
+    let Some(call) = ctx.ancestry.parent(node).filter(|parent| {
         parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
     }) else {
         return matches!(
@@ -12306,10 +12554,11 @@ fn inherited_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(target_owner) = ctx.spec.owner.as_ref() else {
         return false;
     };
-    let Some(enclosing_owner) = structured_enclosing_owner(node, ctx) else {
+    let chain = structured_enclosing_owner_chain(node, ctx);
+    let Some(innermost) = chain.first() else {
         return false;
     };
-    if receiver_owner_matches_target(&enclosing_owner, target_owner, node.start_byte(), ctx) {
+    if receiver_owner_matches_target(innermost, target_owner, node.start_byte(), ctx) {
         return false;
     }
     let Some(arity) = ctx
@@ -12319,18 +12568,28 @@ fn inherited_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     else {
         return false;
     };
-    matches!(
-        resolve_declaring_callable_owner(
+    for enclosing_owner in &chain {
+        if receiver_owner_matches_target(enclosing_owner, target_owner, node.start_byte(), ctx) {
+            return true;
+        }
+        match resolve_declaring_callable_owner(
             &ctx.analyzer,
             ctx.visibility,
             ctx.file,
-            cached_declaring_member_owner(&enclosing_owner, ctx),
+            cached_declaring_member_owner(enclosing_owner, ctx),
             &ctx.spec.member_name,
             arity,
-        ),
-        EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx)
-    )
+        ) {
+            EnclosingMemberOwnerResolution::Owner(owner) => {
+                return receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx);
+            }
+            EnclosingMemberOwnerResolution::Ambiguous => return false,
+            // The name is not declared in this class or its bases, so C++
+            // unqualified lookup continues in the next enclosing class (#3095).
+            EnclosingMemberOwnerResolution::Missing => {}
+        }
+    }
+    false
 }
 
 fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -12344,7 +12603,7 @@ fn out_of_line_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(target_owner) = ctx.spec.owner.as_ref() else {
         return false;
     };
-    let mut current = node.parent();
+    let mut current = ctx.ancestry.parent(node);
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
             let Some(owner_lookup) = function_definition_owner_lookup_node(parent) else {
@@ -12365,7 +12624,7 @@ fn out_of_line_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             }
             return false;
         }
-        current = parent.parent();
+        current = ctx.ancestry.parent(parent);
     }
     false
 }
@@ -12375,10 +12634,11 @@ enum StructuredOwnerContextResolution {
     /// The enclosing class is itself the target owner: a bare/`this->` call here is a
     /// genuine same-type self call (the SelfReceiver policy from #1014-B applies).
     SelfTarget,
-    /// The enclosing class does not declare the member but inherits it from a base that
-    /// is the target owner. A bare/`this->` call to that inherited member is a genuine
-    /// external usage OF the base member (e.g. `Derived` calling inherited `Base::value`),
-    /// not a self call, so it is attributed as an ordinary Reference.
+    /// The enclosing class does not declare the member; lookup reaches the target owner
+    /// through a base of that class, or through a lexically enclosing class (a nested
+    /// class calling the outer class's member). Either way the reference is a genuine
+    /// external usage OF that owner's member (e.g. `Derived` calling inherited
+    /// `Base::value`), not a self call, so it is attributed as an ordinary Reference.
     InheritedTarget,
     NonTarget,
     Ambiguous,
@@ -12392,25 +12652,37 @@ fn structured_owner_context_resolution(
     let Some(target_owner) = ctx.spec.owner.as_ref() else {
         return StructuredOwnerContextResolution::Missing;
     };
-    let Some(enclosing_owner) = structured_enclosing_owner(node, ctx) else {
+    let chain = structured_enclosing_owner_chain(node, ctx);
+    let Some(innermost) = chain.first() else {
         return StructuredOwnerContextResolution::Missing;
     };
-    if receiver_owner_matches_target(&enclosing_owner, target_owner, node.start_byte(), ctx) {
+    if receiver_owner_matches_target(innermost, target_owner, node.start_byte(), ctx) {
         return StructuredOwnerContextResolution::SelfTarget;
     }
-    // The enclosing class is not the target owner, so any match reached by walking its
-    // base hierarchy is an inherited-member usage of the base, not a self call.
-    let member_owner = cached_declaring_member_owner(&enclosing_owner, ctx);
-    match member_owner {
-        EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
-        {
-            StructuredOwnerContextResolution::InheritedTarget
+    // Unqualified lookup searches the enclosing class and its bases, then each lexically
+    // enclosing class outward, and stops at the first scope that declares the name (#3095).
+    // Only the immediately enclosing class makes a reference a same-type self call; any
+    // other owner it reaches is a genuine usage of that owner's member.
+    for enclosing_owner in &chain {
+        if receiver_owner_matches_target(enclosing_owner, target_owner, node.start_byte(), ctx) {
+            return StructuredOwnerContextResolution::InheritedTarget;
         }
-        EnclosingMemberOwnerResolution::Owner(_) => StructuredOwnerContextResolution::NonTarget,
-        EnclosingMemberOwnerResolution::Ambiguous => StructuredOwnerContextResolution::Ambiguous,
-        EnclosingMemberOwnerResolution::Missing => StructuredOwnerContextResolution::Missing,
+        match cached_declaring_member_owner(enclosing_owner, ctx) {
+            EnclosingMemberOwnerResolution::Owner(owner)
+                if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
+            {
+                return StructuredOwnerContextResolution::InheritedTarget;
+            }
+            EnclosingMemberOwnerResolution::Owner(_) => {
+                return StructuredOwnerContextResolution::NonTarget;
+            }
+            EnclosingMemberOwnerResolution::Ambiguous => {
+                return StructuredOwnerContextResolution::Ambiguous;
+            }
+            EnclosingMemberOwnerResolution::Missing => {}
+        }
     }
+    StructuredOwnerContextResolution::Missing
 }
 
 fn cached_declaring_member_owner(
@@ -12519,6 +12791,25 @@ fn indexed_declaring_owner_for_recovered_member(
         .unwrap_or(EnclosingMemberOwnerResolution::Missing)
 }
 
+/// The lexically enclosing classes at a reference, innermost first: C++ unqualified
+/// lookup searches each in turn before it reaches the enclosing namespaces.
+fn structured_enclosing_owner_chain(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    let Some(innermost) = structured_enclosing_owner(node, ctx) else {
+        return Vec::new();
+    };
+    // The innermost owner is whatever enclosing-owner resolution produced, so
+    // it is kept as given; only the walk outward is filtered to classes.
+    let mut chain = vec![innermost.clone()];
+    chain.extend(
+        brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(innermost, |unit| {
+            ctx.analyzer.parent_of(unit)
+        })
+        .skip(1)
+        .take_while(CodeUnit::is_class),
+    );
+    chain
+}
+
 fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     // Declaration recovery can index the true class/member ranges even when
     // the original error tree wraps that region in a bogus function. Prefer
@@ -12530,7 +12821,7 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
     {
         return Some(owner);
     }
-    let mut current = node.parent();
+    let mut current = ctx.ancestry.parent(node);
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
             let owner_lookup = function_definition_owner_lookup_node(parent);
@@ -12562,7 +12853,7 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
             }
             break;
         }
-        current = parent.parent();
+        current = ctx.ancestry.parent(parent);
     }
     enclosing_context(node, ctx)
         .owner

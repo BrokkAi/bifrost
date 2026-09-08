@@ -47,18 +47,21 @@ use crate::selector_compiler::{
 };
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::invalidation::DerivedArtifactId;
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_in_artifact,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
-    CandidateCoverage, DispatchCandidate, DispatchResult, DurablePortIdentity,
-    EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest, ObservationPhase,
-    OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle,
-    ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget, SemanticOutcome,
-    SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
+    CandidateCoverage, DispatchCandidate, DispatchReadAttribution, DispatchResult,
+    DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest,
+    ObservationPhase, OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
+    ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget,
+    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
     UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle, WorkspaceIcfgProvider,
     WorkspaceRelativePath, WorkspaceSemanticOracle, authored_procedure_target_identity,
+    dispatch_read_attribution,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -1259,6 +1262,52 @@ impl<T: Clone> CachedSemanticOutcome<T> {
     }
 }
 
+/// Record one semantic artifact consumed by taint preparation or solving.
+///
+/// The plan and discovery layers retain the complete semantic artifact key but
+/// do not own an analyzer query context. Reuse the same public fingerprint and
+/// relative path encoding as the ICFG provider so a preparation cache hit and a
+/// cold oracle call name the same replayable input.
+fn record_taint_artifact_read(workspace: &WorkspaceAnalyzer, procedure: &ProcedureHandle) {
+    record_taint_artifact_key(workspace, procedure.artifact().key());
+}
+
+fn record_taint_artifact_key(workspace: &WorkspaceAnalyzer, key: &SemanticArtifactKey) {
+    let analyzer = workspace.analyzer();
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    analyzer.record_read(ReadKey::artifact(
+        DerivedArtifactId::semantic_artifact(key.public_fingerprint()),
+        Some(key.path().as_str()),
+    ));
+}
+
+fn record_taint_plan_artifacts(workspace: &WorkspaceAnalyzer, plan: &TaintAnalysisPlan) {
+    if !workspace.analyzer().read_ledger_attached() {
+        return;
+    }
+    plan.value_flow()
+        .for_each_retained_artifact_key(|key| record_taint_artifact_key(workspace, key));
+}
+
+/// Record the exact dispatch question and answer, retaining the typed
+/// unattributed result when the call has no replayable source range.
+fn record_taint_dispatch_read(
+    workspace: &WorkspaceAnalyzer,
+    call: &CallSiteHandle,
+    outcome: &SemanticOutcome<DispatchResult>,
+) {
+    let analyzer = workspace.analyzer();
+    if !analyzer.read_ledger_attached() {
+        return;
+    }
+    match dispatch_read_attribution(call, outcome) {
+        DispatchReadAttribution::Attributed(key) => analyzer.record_read(key),
+        DispatchReadAttribution::Unattributed(_) => analyzer.record_unattributed_read(),
+    }
+}
+
 struct PolicyDiscoveryProvider<'a, 'cache> {
     oracle: WorkspaceSemanticOracle<'a>,
     execution_budget: SemanticExecutionBudget,
@@ -1331,6 +1380,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<ValueFlowSnapshot>, Self::Error> {
         self.require_live()?;
+        record_taint_artifact_read(self.oracle.workspace(), procedure);
         let key = procedure.durable_key();
         if let Some(cached) = self.cache.procedures.borrow().get(&key).cloned() {
             self.cache
@@ -1371,9 +1421,12 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, Self::Error> {
         self.require_live()?;
+        record_taint_artifact_read(self.oracle.workspace(), call.procedure());
         let key = call.durable_key();
         if let Some(cached) = self.cache.dispatch.borrow().get(&key).cloned() {
-            return Ok(cached.replay());
+            let outcome = cached.replay();
+            record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
+            return Ok(outcome);
         }
         let outcome = self
             .oracle
@@ -1384,6 +1437,7 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
             .map_err(|error| {
                 self.poison(TaintPolicyCompileError::SemanticProvider(error.to_string()))
             })?;
+        record_taint_dispatch_read(self.oracle.workspace(), call, &outcome);
         self.require_outcome(&outcome, "taint call dispatch")?;
         self.cache
             .dispatch
@@ -1400,6 +1454,8 @@ impl ValueFlowProvider for PolicyDiscoveryProvider<'_, '_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallBindings>, Self::Error> {
         self.require_live()?;
+        record_taint_artifact_read(self.oracle.workspace(), call.procedure());
+        record_taint_artifact_read(self.oracle.workspace(), candidate.target());
         let key = (call.durable_key(), candidate.target().durable_key());
         if let Some(cached) = self.cache.bindings.borrow().get(&key).cloned() {
             return Ok(cached.replay());
@@ -2760,6 +2816,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             return Ok(Vec::new());
         };
         let oracle = self.selectors.workspace().semantic_oracle_provider();
+        record_taint_artifact_read(self.selectors.workspace(), procedure);
         let outcome = {
             let mut request = self.selectors.semantic_request();
             oracle
@@ -2960,12 +3017,14 @@ impl<'a> TaintPolicyCompiler<'a> {
         file: &ProjectFile,
     ) -> Result<NamedArgumentResolution, TaintPolicyCompileError> {
         let oracle = self.selectors.workspace().semantic_oracle_provider();
+        record_taint_artifact_read(self.selectors.workspace(), call.procedure());
         let dispatch = {
             let mut request = self.selectors.semantic_request();
             oracle
                 .resolve_call(call, &mut request)
                 .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
         };
+        record_taint_dispatch_read(self.selectors.workspace(), call, &dispatch);
         require_uninterrupted_outcome(&dispatch, "formal-name dispatch")?;
         self.selectors
             .require_execution_budget("formal-name dispatch")
@@ -3060,6 +3119,8 @@ impl<'a> TaintPolicyCompiler<'a> {
             } else {
                 formal_names_unavailable = true;
             }
+            record_taint_artifact_read(self.selectors.workspace(), call.procedure());
+            record_taint_artifact_read(self.selectors.workspace(), candidate.target());
             let bindings = {
                 let mut request = self.selectors.semantic_request();
                 oracle
@@ -4308,6 +4369,7 @@ fn seed_store_channels(
                 .map_err(|error| error.to_string())?;
             execution_budget.reset_per_batch_solve_budget(budget);
             let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
+            record_taint_plan_artifacts(workspace, &observation);
             let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
                 workspace,
                 active_semantic_model_snapshot.clone(),
@@ -4437,18 +4499,11 @@ fn solve_and_project_batch(
     )
     .map_err(|error| error.to_string())?;
     let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
+    record_taint_plan_artifacts(workspace, batch.analysis());
     let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
         workspace,
         active_semantic_model_snapshot,
     );
-    // The ICFG provider this solve drives records its own artifact and
-    // dispatch reads, but the solve also consumes the prepared value-flow
-    // analysis and the taint summary repository, and neither funnel holds an
-    // analyzer or names a key. Saying so is the contract: the ledger's
-    // unattributed count is what makes a taint unit `Unbounded` instead of
-    // letting it look complete with inputs nobody named. This is why the plan
-    // keeps taint and flow at `whole_policy_family`.
-    workspace.analyzer().record_unattributed_read();
     let propagation_started = Instant::now();
     let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
         batch.analysis().value_flow().root(),
@@ -6839,15 +6894,17 @@ mod tests {
     use crate::finding::{
         PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
     };
+    use crate::inline_project::InlineTestProject;
     use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::source::PolicySourceIdentity;
     use crate::suppression::PolicyEvaluationDate;
     use brokk_bifrost_analysis::CancellationToken;
+    use brokk_bifrost_analysis::analyzer::read_ledger::{LookupKind, ReadKey, ReadLedger};
     use brokk_bifrost_analysis::analyzer::semantic::{
         ProcedureHandle, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
     };
     use brokk_bifrost_analysis::analyzer::{
-        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+        AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, Language, Project, WorkspaceAnalyzer,
     };
     use brokk_bifrost_flow::dataflow::SolverWork;
     use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
@@ -7512,6 +7569,128 @@ def tail(value):
             .map(|metric| metric.value())
             .expect("discovery reports its snapshot materializations");
         assert_eq!(materializations, 2);
+    }
+
+    /// Discovery records the same replayable inputs when its per-compile cache
+    /// serves a second region. The second ledger is deliberately separate from
+    /// the cold acquisition so a missing cache-hit funnel cannot be hidden by
+    /// set deduplication in one request.
+    #[test]
+    fn discovery_cache_hits_retain_cold_read_attribution() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("relay.py", TWO_MATERIALIZATION_SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let file = workspace
+            .analyzer()
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("relay.py"))
+            .expect("the fixture file is analyzed");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("the fixture materializes")
+            .available_value()
+            .cloned()
+            .expect("the fixture artifact is available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("head")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("the fixture declares head");
+        let mut compiler = TaintPolicyCompiler::new(
+            &workspace,
+            None,
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        );
+        let cache = DiscoveryMaterializationCache::default();
+        let cold = Arc::new(ReadLedger::new());
+        {
+            let _scope =
+                AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), Arc::clone(&cold));
+            compiler
+                .discover_value_flow(&root, &std::collections::HashSet::new(), &cache)
+                .expect("the cold closure is discovered");
+        }
+        let cold_misses = cache.procedure_misses.get();
+        compiler.selectors.reset_region_semantic_budget();
+        let warm = Arc::new(ReadLedger::new());
+        {
+            let _scope =
+                AnalyzerQueryScope::with_read_ledger(workspace.analyzer(), Arc::clone(&warm));
+            compiler
+                .discover_value_flow(&root, &std::collections::HashSet::new(), &cache)
+                .expect("the cached closure is discovered");
+        }
+        let semantic_keys = |ledger: &ReadLedger| {
+            ledger
+                .keys()
+                .into_iter()
+                .filter(|key| {
+                    matches!(
+                        key,
+                        ReadKey::Artifact { .. } | ReadKey::Lookup {
+                            kind:
+                                brokk_bifrost_analysis::analyzer::read_ledger::LookupKind::ProcedureDispatch,
+                            ..
+                        }
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let cold_keys = semantic_keys(&cold);
+        let warm_keys = semantic_keys(&warm);
+        assert!(
+            !cold_keys.is_empty(),
+            "cold discovery must name semantic inputs"
+        );
+        assert!(
+            cold_keys
+                .iter()
+                .any(|key| matches!(key, ReadKey::Artifact { .. })),
+            "cold discovery must name semantic artifacts"
+        );
+        assert!(
+            cold_keys.iter().any(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    kind: LookupKind::ProcedureDispatch,
+                    ..
+                }
+            )),
+            "cold discovery must name dispatch answers"
+        );
+        assert_eq!(cold.unattributed_reads(), 0);
+        assert_eq!(warm.unattributed_reads(), 0);
+        assert!(
+            cache.procedure_hits.get() > 0,
+            "the second closure must exercise cached procedure snapshots"
+        );
+        assert_eq!(
+            cache.procedure_misses.get(),
+            cold_misses,
+            "warm discovery must not rematerialize cached procedures"
+        );
+        assert_eq!(warm_keys, cold_keys, "cache hits must name the cold inputs");
     }
 
     /// A relay chain in one file. Every procedure in it is a compile root, and

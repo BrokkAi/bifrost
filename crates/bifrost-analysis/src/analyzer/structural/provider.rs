@@ -1,5 +1,5 @@
 //! The capability surface a language analyzer exposes to structural search,
-//! plus the per-analyzer facts cache behind it.
+//! plus the content-keyed facts cache behind it.
 //!
 //! Follows the `import_analysis_provider()` idiom: `IAnalyzer` has a default
 //! `structural_fact_providers()` returning nothing; each language analyzer
@@ -19,7 +19,8 @@ use crate::analyzer::QueryScope;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::{
-    LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
+    LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, StructuralSnapshotKey,
+    TreeSitterAnalyzer,
 };
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -304,33 +305,44 @@ pub enum StructuralSourceLimitedOutcome {
     Unavailable,
 }
 
-/// Byte-budgeted facts cache keyed by file and validated by a hash of the
-/// in-memory source, so entries surviving an analyzer update (the cache is
-/// shared across `update()` generations) are self-healing rather than stale.
+/// Byte-budgeted facts cache keyed by the content its entries describe.
+///
+/// The key is the [`StructuralSnapshotKey`] the store persists the same facts
+/// under: the blob oid of the source, the storage language key that fixes the
+/// grammar, and that language's epoch generation. Keying by content rather
+/// than by path is what lets a caller consult this cache *before* it fetches
+/// the file's source (#3065). The workspace already knows a file's reusable
+/// content identity, so a hit is one map lookup, where a path key made every
+/// call -- hit or miss -- pay the source read the entry was then validated
+/// against by hashing and comparing those same bytes twice more.
+///
+/// An entry is therefore exact by construction and nothing validates it. An
+/// entry nothing asks for again -- an edited file's previous content, a
+/// rotated epoch -- is retired by the byte budget rather than by a generation
+/// rotation, which is the rule `SnapshotStructuralIndexCache` adopted in
+/// #2449: a key that is still exact keeps answering across an `update()`.
+///
+/// The entries and the budget are shared by every language delegate of one
+/// workspace (see `AnalyzerStoreContext::structural_facts`); the counters are
+/// each delegate's own, so a provider still reports the work it did.
 /// Follows the moka weigher idiom of the per-language memo caches
 /// (`src/analyzer/java/cache.rs`).
 pub struct StructuralFactsCache {
-    cache: Cache<ProjectFile, Arc<CachedFacts>>,
+    cache: Cache<StructuralSnapshotKey, Arc<FileFacts>>,
     extractions: AtomicU64,
     hydrations: AtomicU64,
 }
 
-struct CachedFacts {
-    source_hash: u64,
-    facts: Arc<FileFacts>,
-}
-
-/// The cheap identity of one in-memory source string: the FxHash the
-/// structural facts cache validates its entries with, and that the analyzer's
-/// blob-oid memo (`TreeSitterAnalyzer::blob_oid_of`) recognizes repeat bytes by.
+/// The cheap identity of one in-memory source string, which the analyzer's
+/// blob-oid memo (`TreeSitterAnalyzer::content_oid_of`) recognizes repeat bytes by.
 pub(crate) fn hash_source(source: &str) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     hasher.write(source.as_bytes());
     hasher.finish()
 }
 
-fn weigh_entry(key: &ProjectFile, value: &Arc<CachedFacts>) -> u32 {
-    let bytes = key.rel_path().as_os_str().len() as u64 + value.facts.estimated_bytes();
+fn weigh_entry(_key: &StructuralSnapshotKey, value: &Arc<FileFacts>) -> u32 {
+    let bytes = std::mem::size_of::<StructuralSnapshotKey>() as u64 + value.estimated_bytes();
     bytes.clamp(1, u32::MAX as u64) as u32
 }
 
@@ -346,18 +358,34 @@ impl StructuralFactsCache {
         }
     }
 
-    /// Return cached facts when the stored source hash still matches;
-    /// otherwise try durable hydration before falling back to extraction.
-    fn get_or_materialize(
+    /// Another view of the same entries under the same budget, counting its
+    /// own work. This is how the language delegates of one workspace share one
+    /// pool: a moka cache clone shares the store it was cloned from.
+    pub(crate) fn sharing_entries(&self) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            extractions: AtomicU64::new(0),
+            hydrations: AtomicU64::new(0),
+        }
+    }
+
+    /// Hydrate this content's facts from the store, or extract them, and
+    /// memoize the result.
+    ///
+    /// The caller has already asked [`Self::get`] for this key and been told
+    /// no. Asking again here would cost more than the lookup: a cache read is
+    /// also a vote in moka's admission policy, and voting twice for content
+    /// this pass has not seen before makes it look twice as popular as the
+    /// entry it would displace, which turns a warm working set into a cache
+    /// that evicts what it is about to be asked for (measured on django and
+    /// shardingsphere for #3065: a second forward pass fell from 688-1115
+    /// memory hits to none).
+    fn materialize(
         &self,
-        file: &ProjectFile,
-        source: &str,
+        key: StructuralSnapshotKey,
         load: impl FnOnce() -> Option<FileFacts>,
         extract: impl FnOnce() -> Option<FileFacts>,
     ) -> (Option<Arc<FileFacts>>, StructuralFactsCacheOutcome) {
-        if let Some(facts) = self.get_complete(file, source) {
-            return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
-        }
         let (facts, outcome) = if let Some(facts) = load() {
             self.hydrations.fetch_add(1, Ordering::Relaxed);
             (
@@ -371,27 +399,16 @@ impl StructuralFactsCache {
             };
             (Arc::new(facts), StructuralFactsCacheOutcome::Extracted)
         };
-        self.insert_complete(file, source, Arc::clone(&facts));
+        self.insert(key, Arc::clone(&facts));
         (Some(facts), outcome)
     }
 
-    fn get_complete(&self, file: &ProjectFile, source: &str) -> Option<Arc<FileFacts>> {
-        let source_hash = hash_source(source);
-        self.cache.get(file).and_then(|entry| {
-            (entry.source_hash == source_hash && entry.facts.source() == source)
-                .then(|| Arc::clone(&entry.facts))
-        })
+    pub(crate) fn get(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
+        self.cache.get(key)
     }
 
-    fn insert_complete(&self, file: &ProjectFile, source: &str, facts: Arc<FileFacts>) {
-        debug_assert_eq!(facts.source(), source);
-        self.cache.insert(
-            file.clone(),
-            Arc::new(CachedFacts {
-                source_hash: hash_source(source),
-                facts,
-            }),
-        );
+    pub(crate) fn insert(&self, key: StructuralSnapshotKey, facts: Arc<FileFacts>) {
+        self.cache.insert(key, facts);
     }
 
     fn record_extraction(&self) {
@@ -514,17 +531,69 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         let Some(spec) = self.adapter().structural_spec() else {
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
+        // Ask the memo for this file's content before reading that content.
+        // The workspace's reusable identity for a file is exactly the key its
+        // facts are memoized under, and answering it costs a map lookup (one
+        // stat where the analyzer does not trust its filesystem generation),
+        // against the 0.6-1.5 ms the source read below costs on a real
+        // repository (#3065). `reusable_live_oid` answers `None` for every
+        // file whose recorded identity is not provably its current content --
+        // an overlay above all -- so a hit here is a hit on the same bytes
+        // `file_source` would have returned, and a `None` leaves the key to
+        // the bytes themselves below.
+        let probed = self
+            .reusable_live_oid(file)
+            .and_then(|oid| Some((oid, self.structural_facts_key(file, oid)?)));
+        if let Some((oid, key)) = probed
+            && let Some(facts) = self.structural_cache().get(&key)
+        {
+            self.record_reads(|sink| sink.push(self.file_read_key(file, oid)));
+            return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
+        }
         let Some(source) = self.file_source(file) else {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        };
+        let Some(content_oid) = self.content_oid_of(file, &source) else {
+            // `file_source` answered, so this file had content a moment ago:
+            // bytes on disk, an overlay, or an indexed blob the live path map
+            // still names. Each of those carries an identity, so the only way
+            // to arrive here is a file that vanished between the two reads,
+            // and there is then nothing to name the read or key the facts by.
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
         // The structural facts of one file are a per-file read of exactly these
         // bytes, recorded whether the cache, the store, or a fresh extraction
         // answers: all three are the same input.
-        self.record_reads(|sink| sink.push(self.source_file_read_key(file, &source)));
-        let snapshot_key = self.structural_snapshot_key(file, &source);
-        self.structural_cache().get_or_materialize(
-            file,
-            &source,
+        self.record_reads(|sink| sink.push(self.file_read_key(file, content_oid)));
+        let key = match probed {
+            // The probe and source read are separate observations. An overlay
+            // or file replacement between them may change the content; only
+            // an unchanged identity has already missed in the memo.
+            Some((oid, key)) if oid == content_oid => key,
+            _ => {
+                let Some(key) = self.structural_facts_key(file, content_oid) else {
+                    // This analyzer publishes no epoch for the file's storage
+                    // language, so it has no key to memoize or persist under.
+                    // Answer from the grammar it does have and keep nothing.
+                    let grammar = self.adapter().parser_language_for_file(file);
+                    self.structural_cache().record_extraction();
+                    return match extract_file_facts(spec, &grammar, &source) {
+                        Some(facts) => (
+                            Some(Arc::new(facts)),
+                            StructuralFactsCacheOutcome::Extracted,
+                        ),
+                        None => (None, StructuralFactsCacheOutcome::Unavailable),
+                    };
+                };
+                if let Some(facts) = self.structural_cache().get(&key) {
+                    return (Some(facts), StructuralFactsCacheOutcome::MemoryHit);
+                }
+                key
+            }
+        };
+        let snapshot_key = self.persists_structural_facts().then_some(key);
+        self.structural_cache().materialize(
+            key,
             || {
                 let key = snapshot_key.as_ref()?;
                 let rows = self
@@ -591,7 +660,13 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return StructuralFactsLimitedOutcome::Cancelled;
         }
-        if let Some(facts) = self.structural_cache().get_complete(file, source) {
+        // The caller already holds the admitted snapshot, so this path keys
+        // the memo from the content in hand rather than from the workspace's
+        // live identity.
+        let key = self
+            .content_oid_of(file, source)
+            .and_then(|oid| self.structural_facts_key(file, oid));
+        if let Some(facts) = key.and_then(|key| self.structural_cache().get(&key)) {
             let work_items = facts.work_item_count();
             return if work_items > max_fact_nodes {
                 StructuralFactsLimitedOutcome::Exceeded {
@@ -635,8 +710,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         // clones every normalized node and role edge before insertion, so leave that optional
         // optimization to the ordinary materialization path rather than performing an
         // unmetered post-extraction traversal here.
-        self.structural_cache()
-            .insert_complete(file, source, Arc::clone(&facts));
+        if let Some(key) = key {
+            self.structural_cache().insert(key, Arc::clone(&facts));
+        }
         StructuralFactsLimitedOutcome::Available {
             facts,
             cache_outcome: StructuralFactsCacheOutcome::Extracted,
@@ -734,14 +810,13 @@ mod tests {
 
     #[test]
     fn structural_facts_cache_reports_exact_materialization_outcomes() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let file = ProjectFile::new(temp.path().to_path_buf(), "app.ts");
         let source = "export function demo() {}\n";
+        let key = StructuralSnapshotKey::for_test(source, "typescript");
         let hydrated = StructuralFactsCache::new(1024 * 1024);
 
-        let (facts, outcome) = hydrated.get_or_materialize(
-            &file,
-            source,
+        assert!(hydrated.get(&key).is_none());
+        let (facts, outcome) = hydrated.materialize(
+            key,
             || Some(empty_facts(source)),
             || panic!("persisted hydration must avoid extraction"),
         );
@@ -750,27 +825,37 @@ mod tests {
         assert_eq!(hydrated.hydration_count(), 1);
         assert_eq!(hydrated.extraction_count(), 0);
 
-        let (facts, outcome) = hydrated.get_or_materialize(
-            &file,
-            source,
-            || panic!("memory hit must avoid persistence"),
-            || panic!("memory hit must avoid extraction"),
-        );
-        assert!(facts.is_some());
-        assert_eq!(outcome, StructuralFactsCacheOutcome::MemoryHit);
+        assert!(hydrated.get(&key).is_some());
         assert_eq!(hydrated.hydration_count(), 1);
         assert_eq!(hydrated.extraction_count(), 0);
 
+        // The same bytes under a different grammar are different facts, so
+        // they are a different key rather than a hit on this one.
+        assert!(
+            hydrated
+                .get(&StructuralSnapshotKey::for_test(source, "tsx"))
+                .is_none()
+        );
+
         let extracted = StructuralFactsCache::new(1024 * 1024);
-        let (facts, outcome) =
-            extracted.get_or_materialize(&file, source, || None, || Some(empty_facts(source)));
+        let (facts, outcome) = extracted.materialize(key, || None, || Some(empty_facts(source)));
         assert!(facts.is_some());
         assert_eq!(outcome, StructuralFactsCacheOutcome::Extracted);
         assert_eq!(extracted.hydration_count(), 0);
         assert_eq!(extracted.extraction_count(), 1);
 
+        // A second view of the same entries answers from them, and counts its
+        // own work rather than the first view's.
+        let shared = extracted.sharing_entries();
+        assert!(shared.get(&key).is_some());
+        assert_eq!(shared.extraction_count(), 0);
+
         let unavailable = StructuralFactsCache::new(1024 * 1024);
-        let (facts, outcome) = unavailable.get_or_materialize(&file, source, || None, || None);
+        let (facts, outcome) = unavailable.materialize(
+            StructuralSnapshotKey::for_test("other\n", "typescript"),
+            || None,
+            || None,
+        );
         assert!(facts.is_none());
         assert_eq!(outcome, StructuralFactsCacheOutcome::Unavailable);
         assert_eq!(unavailable.hydration_count(), 0);

@@ -49,13 +49,15 @@ pub(crate) use brokk_bifrost_go::declarations;
 pub(crate) use brokk_bifrost_go::declarations::{
     determine_go_package_name, go_structured_type_identity_bounded,
 };
-use brokk_bifrost_go::graph::resolver::{GoEdgeIndex, GoGraphSource, build_go_edge_index};
+use brokk_bifrost_go::graph::resolver::{
+    GoEdgeIndex, GoGraphSource, build_go_edge_index_from_parsed, parse_go_workspace,
+};
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
 pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
 use brokk_bifrost_go::packages::{canonical_go_package_name, invalidate_nearest_go_module_cache};
 use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
-use cache::GoMemoCaches;
+use cache::{GoMemoCaches, GoWorkspaceIndexes};
 use clones::build_go_clone_candidate_data;
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
 pub use type_identity_proof::{
@@ -271,34 +273,87 @@ impl GoAnalyzer {
     }
 
     pub(crate) fn usage_edge_index(&self) -> Arc<GoEdgeIndex> {
-        let files: Vec<_> = self
-            .get_analyzed_files()
-            .into_iter()
-            .filter(|file| file_language(file) == Language::Go)
-            .collect();
-        // The Go edge index is built from import facts, so the build owns a
-        // request scope for the whole pass (issue #2423).
-        let scope = AnalyzerQueryScope::new(self);
-        let source = GoGraphSource {
-            token: scope.token(),
-            index: self,
-            imports: self,
-            type_aliases: self,
-            workspace_paths: self.workspace_path_index(),
-        };
+        Arc::clone(&self.workspace_indexes().edges)
+    }
+
+    /// The workspace's Go type hierarchy and usage edge index, built together
+    /// from one parse of every Go file.
+    ///
+    /// Both indexes are whole-workspace derivations of the same ASTs, and a
+    /// Go usage scan reaches both in one request. Building them apart parsed
+    /// the workspace twice -- `GoHierarchyIndex::build` read and parsed every
+    /// Go file in a sequential loop while the edge index parsed the same files
+    /// again -- which is where most of a cold Go scan's single-threaded time
+    /// went (#1748). The edge pass behind dead code and the ICFG reached the
+    /// second of those parses until #3066 pointed it here.
+    ///
+    /// The build runs on the dedicated pool, so its parallel parse consumes no
+    /// worker of the global pool and a global-pool worker that reaches this
+    /// memo parks on the one build instead of duplicating it (#1772, and the
+    /// `PoolSafeMemo` rule the #549 deadlock set).
+    fn workspace_indexes(&self) -> Arc<GoWorkspaceIndexes> {
         self.memo_caches
-            .usage_edge_index
+            .workspace_indexes
             .get_or_build_on_dedicated_pool(|| {
                 self.memo_caches
-                    .usage_edge_index_build_count
+                    .workspace_indexes_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                build_go_edge_index(source, &files).unwrap_or_default()
+                let _scope = crate::profiling::scope("go_workspace_indexes::build");
+                let files: Vec<_> = self
+                    .inner
+                    .get_analyzed_files()
+                    .into_iter()
+                    .filter(|file| file_language(file) == Language::Go)
+                    .collect();
+                let parsed = parse_go_workspace(self.project(), &files);
+                self.memo_caches
+                    .workspace_parse_count
+                    .fetch_add(parsed.len(), Ordering::Relaxed);
+                // Both index builds cross the import tier's storage, so the
+                // pass owns one request scope (issue #2423).
+                let scope = AnalyzerQueryScope::new(self);
+                let hierarchy = GoHierarchyIndex::build_from_parsed(
+                    scope.token(),
+                    &self.inner,
+                    self,
+                    &files,
+                    &parsed,
+                );
+                let edges = if parsed.is_empty() {
+                    GoEdgeIndex::default()
+                } else {
+                    let source = GoGraphSource {
+                        token: scope.token(),
+                        index: self,
+                        imports: self,
+                        type_aliases: self,
+                        workspace_paths: self.workspace_path_index(),
+                    };
+                    let parsed_refs: Vec<_> = parsed
+                        .iter()
+                        .map(|(file, parsed)| (file.clone(), parsed))
+                        .collect();
+                    build_go_edge_index_from_parsed(source, &parsed_refs)
+                };
+                GoWorkspaceIndexes {
+                    hierarchy: Arc::new(hierarchy),
+                    edges: Arc::new(edges),
+                }
             })
     }
 
+    /// Workspace index builds this analyzer ran. One per generation is the
+    /// pinned cost.
     #[doc(hidden)]
-    pub fn usage_edge_index_build_count_for_test(&self) -> usize {
-        self.memo_caches.usage_edge_index_build_count()
+    pub fn workspace_indexes_build_count_for_test(&self) -> usize {
+        self.memo_caches.workspace_indexes_build_count()
+    }
+
+    /// Go files the workspace index builds parsed. One parse per Go file per
+    /// build is the pinned cost (#1748).
+    #[doc(hidden)]
+    pub fn workspace_parse_count_for_test(&self) -> usize {
+        self.memo_caches.workspace_parse_count()
     }
 
     pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
@@ -353,20 +408,16 @@ impl TypeAliasProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
-    /// The workspace's Go type and member relations, built at most once per
-    /// analyzer snapshot and on the dedicated build pool.
+    /// The workspace's Go type and member relations, from the one workspace
+    /// index build.
     ///
     /// Go has no background warm, so every caller here is on the request path.
-    /// Running the build on the dedicated pool keeps it off the global request
-    /// pool and lets a global-pool worker that reaches this memo park on the
-    /// one build instead of duplicating it serially (#1772).
+    /// [`Self::workspace_indexes`] runs that build on the dedicated pool,
+    /// which keeps it off the global request pool and lets a global-pool
+    /// worker that reaches the memo park on the one build instead of
+    /// duplicating it serially (#1772).
     fn hierarchy_index(&self) -> Arc<GoHierarchyIndex> {
-        self.memo_caches
-            .hierarchy_index
-            .get_or_build_on_dedicated_pool(|| {
-                let scope = AnalyzerQueryScope::new(self);
-                GoHierarchyIndex::build(scope.token(), &self.inner, self)
-            })
+        Arc::clone(&self.workspace_indexes().hierarchy)
     }
 }
 
@@ -562,6 +613,15 @@ impl CodeUnitIndex for GoAnalyzer {
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
+    }
+
+    /// Forwarded so a whole-workspace ask reaches the inner analyzer's bulk
+    /// hydration instead of the trait default's per-file loop (#1748).
+    fn declarations_of_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> crate::hash::HashMap<ProjectFile, BTreeSet<CodeUnit>> {
+        self.inner.declarations_of_files(files)
     }
 
     fn summary_file_projection(
@@ -1050,6 +1110,24 @@ impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
             .relational_definition_batch_call_count_for_test()
     }
 
+    fn record_resolve_definition_batch_with_source_call_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .record_resolve_definition_batch_with_source_call_for_test();
+    }
+
+    fn reset_resolve_definition_batch_with_source_call_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_resolve_definition_batch_with_source_call_count_for_test();
+    }
+
+    fn resolve_definition_batch_with_source_call_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .resolve_definition_batch_with_source_call_count_for_test()
+    }
+
     fn reset_definition_candidates_query_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1183,11 +1261,11 @@ impl LanguageEdgePass for GoEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
+        // The scan's per-file declaration reads cross the import tier's
+        // storage, so the pass owns one request scope (issue #2423).
+        let _scope = AnalyzerQueryScope::new(ctx.analyzer);
         crate::analyzer::usages::go_graph::build_rooted_go_usage_edges(
             ctx.analyzer,
-            token,
             ctx.fqns,
             ctx.keep_file,
         )
@@ -1195,9 +1273,8 @@ impl LanguageEdgePass for GoEdgePass {
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        let token = scope.token();
-        build_go_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+        let _scope = AnalyzerQueryScope::new(ctx.analyzer);
+        build_go_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -1261,15 +1338,14 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
+        let _scope = AnalyzerQueryScope::new(analyzer);
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::Go,
             |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
             candidates,
         );
-        build_go_usage_edges(analyzer, token, &nodes, |_| true)
+        build_go_usage_edges(analyzer, &nodes, |_| true)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }
@@ -1385,11 +1461,203 @@ mod hierarchy_tests {
         );
     }
 
-    /// The Kubernetes-scale #1748 remainder: hierarchy construction knows all
-    /// type names after parsing, so resolving them must be one batched read,
-    /// not one rendered-definition transaction per type or alias.
+    /// A multi-package fixture that exercises every fact the hierarchy
+    /// states: value and pointer receivers, struct embedding by value and by
+    /// pointer, interface embedding, aliases on both sides of a relation,
+    /// promotion through embedding, and an interface carrying type terms.
+    fn parity_fixture() -> GoAnalyzer {
+        analyzer(&[
+            (
+                "base/engine.go",
+                "package base\n\
+                 type Engine struct{ id int }\n\
+                 func (Engine) Start() error { return nil }\n\
+                 func (engine *Engine) Stop() error { return nil }\n\
+                 type Named interface { Name() string }\n",
+            ),
+            (
+                "base/alias.go",
+                "package base\n\
+                 type EngineAlias = Engine\n\
+                 type Number interface { ~int | ~float64 }\n",
+            ),
+            (
+                "svc/service.go",
+                "package svc\n\n\
+                 import \"example.com/app/base\"\n\n\
+                 type Service struct { base.Engine\n label string }\n\
+                 func (Service) Name() string { return \"\" }\n\
+                 type Starter interface { Start() error }\n\
+                 type Stopper interface { Stop() error }\n\
+                 type Both interface { Starter\n Stopper }\n",
+            ),
+            (
+                "svc/pointer.go",
+                "package svc\n\n\
+                 import base \"example.com/app/base\"\n\n\
+                 type Ptr struct { *base.Engine }\n\
+                 type ServiceAlias = Service\n\
+                 func (holder *Ptr) Extra() error { return nil }\n",
+            ),
+            (
+                "app/wrapper.go",
+                "package app\n\n\
+                 import \"example.com/app/svc\"\n\n\
+                 type Wrapper struct { svc.Service }\n\
+                 type Runner interface { Start() error\n Name() string }\n\
+                 func (Wrapper) Extra() error { return nil }\n",
+            ),
+        ])
+    }
+
+    /// Parity for #1748: the build that parses once for both workspace
+    /// indexes, records every phase's sites in one walk per file, and reads
+    /// the workspace's declarations in one batch must state exactly what the
+    /// builder it replaced stated. The oracle is that builder, kept in
+    /// `brokk-bifrost-go` under `test-support`.
     #[test]
-    fn hierarchy_build_prefetches_type_and_alias_definitions() {
+    fn hierarchy_build_states_what_the_previous_builder_stated() {
+        let analyzer = parity_fixture();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let oracle = GoHierarchyIndex::build_oracle(scope.token(), &analyzer.inner, &analyzer);
+        let index = analyzer.hierarchy_index();
+
+        assert!(
+            oracle.facts_text().contains("ancestors "),
+            "the fixture must state relations for the parity check to mean anything:\n{}",
+            oracle.facts_text()
+        );
+        assert_eq!(
+            oracle.facts_text(),
+            index.facts_text(),
+            "digest oracle={} new={}",
+            oracle.facts_digest(),
+            index.facts_digest()
+        );
+    }
+
+    /// Cost pin for #1748: one AST walk per file per build. The build used to
+    /// walk every file five times -- once to prefetch definitions, once for
+    /// type skeletons, once for their details, once for aliases and once for
+    /// methods.
+    #[test]
+    fn hierarchy_build_walks_each_file_once() {
+        let analyzer = parity_fixture();
+        let files = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .filter(|file| file_language(file) == Language::Go)
+            .count();
+        assert_eq!(5, files, "fixture files");
+
+        let index = analyzer.hierarchy_index();
+
+        assert_eq!(
+            files,
+            index.file_traversals(),
+            "one walk per file, not one per phase"
+        );
+    }
+
+    /// Whole-workspace parity, run by hand against a real Go repository:
+    ///
+    /// ```text
+    /// BIFROST_GO_PARITY_ROOT=/path/to/kubernetes \
+    /// BIFROST_CACHE_ROOT=/path/to/store \
+    /// cargo nextest run -p brokk-bifrost-analysis --run-ignored all \
+    ///   -E 'test(go_hierarchy_parity_on_a_real_workspace)'
+    /// ```
+    ///
+    /// The inline fixture above states the same claim over a fixture small
+    /// enough to read; this states it over a workspace whose scale is what
+    /// #1748 is about, and prints both digests so a report can quote them.
+    #[test]
+    #[ignore = "needs a real Go workspace in BIFROST_GO_PARITY_ROOT"]
+    fn go_hierarchy_parity_on_a_real_workspace() {
+        use crate::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
+        use brokk_bifrost_core::analyzer::project::FilesystemProject;
+
+        let root = std::env::var("BIFROST_GO_PARITY_ROOT")
+            .expect("BIFROST_GO_PARITY_ROOT names the workspace to check");
+        let project = Arc::new(FilesystemProject::new(Path::new(&root)).expect("open workspace"));
+        let workspace = WorkspaceAnalyzer::build_persisted_for_languages(
+            project,
+            AnalyzerConfig::default(),
+            &BTreeSet::from([Language::Go]),
+        )
+        .expect("build the persisted store");
+        let analyzer = resolve_analyzer::<GoAnalyzer>(workspace.analyzer())
+            .expect("the workspace has a Go analyzer");
+
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let oracle = GoHierarchyIndex::build_oracle(scope.token(), analyzer, analyzer);
+        let index = GoHierarchyIndex::build(scope.token(), analyzer, analyzer);
+        println!(
+            "go hierarchy parity root={root} oracle={} new={} traversals={} files={}",
+            oracle.facts_digest(),
+            index.facts_digest(),
+            index.file_traversals(),
+            analyzer
+                .get_analyzed_files()
+                .into_iter()
+                .filter(|file| file_language(file) == Language::Go)
+                .count(),
+        );
+        let oracle_text = oracle.facts_text();
+        let new_text = index.facts_text();
+        if oracle_text != new_text {
+            let oracle_lines: std::collections::BTreeSet<&str> = oracle_text.lines().collect();
+            let new_lines: std::collections::BTreeSet<&str> = new_text.lines().collect();
+            for line in oracle_lines.difference(&new_lines).take(20) {
+                println!("only in oracle: {line}");
+            }
+            for line in new_lines.difference(&oracle_lines).take(20) {
+                println!("only in new:    {line}");
+            }
+            panic!(
+                "facts differ: oracle={} new={}, oracle-only={} new-only={}",
+                oracle.facts_digest(),
+                index.facts_digest(),
+                oracle_lines.difference(&new_lines).count(),
+                new_lines.difference(&oracle_lines).count(),
+            );
+        }
+    }
+
+    /// Cost pin for #1748: one parse per Go file per request, shared by both
+    /// workspace indexes. The hierarchy used to parse the workspace in a
+    /// sequential loop while the edge index parsed the same files again.
+    #[test]
+    fn workspace_indexes_parse_each_go_file_once() {
+        let analyzer = parity_fixture();
+        let files = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .filter(|file| file_language(file) == Language::Go)
+            .count();
+
+        analyzer.hierarchy_index();
+        analyzer.usage_edge_index();
+
+        assert_eq!(
+            1,
+            analyzer.workspace_indexes_build_count_for_test(),
+            "both indexes come from one build"
+        );
+        assert_eq!(
+            files,
+            analyzer.workspace_parse_count_for_test(),
+            "one parse per Go file for both indexes, not one per index"
+        );
+    }
+
+    /// The Kubernetes-scale #1748 remainder: hierarchy construction knows
+    /// every type and alias name after parsing, so it resolves them with one
+    /// batched declaration read plus one definition batch for the alias names
+    /// -- not a rendered-definition transaction per type or alias, and not one
+    /// file-state read per file in `resolve_member_units`.
+    #[test]
+    fn hierarchy_build_reads_workspace_declarations_in_one_batch() {
         let analyzer = analyzer(&[(
             "service.go",
             "package app\n\
@@ -1399,7 +1667,6 @@ mod hierarchy_tests {
              type WorkerAlias = Worker\n\
              func (Worker) Run() error { return nil }\n",
         )]);
-        let scope = AnalyzerQueryScope::new(&analyzer);
         analyzer
             .inner
             .reset_definition_candidates_query_count_for_test();
@@ -1407,7 +1674,7 @@ mod hierarchy_tests {
             .inner
             .reset_definition_prefetch_batch_count_for_test();
 
-        let index = GoHierarchyIndex::build(scope.token(), &analyzer, &analyzer);
+        let index = analyzer.hierarchy_index();
 
         assert!(index.relations().iter().any(|relation| {
             relation.kind == TypeRelationKind::StructuralSatisfaction
@@ -1417,12 +1684,12 @@ mod hierarchy_tests {
         assert_eq!(
             1,
             analyzer.inner.definition_prefetch_batch_count_for_test(),
-            "one batch must serve every type and alias in the hierarchy"
+            "one batch for the alias names, and none for the declared types"
         );
         assert_eq!(
             0,
             analyzer.inner.definition_candidates_query_count_for_test(),
-            "prefetched hierarchy names must not fall back to point reads"
+            "no per-type or per-alias definition point read"
         );
     }
 
@@ -1668,5 +1935,87 @@ mod hierarchy_tests {
             vec!["Worker.Run".to_string()],
             "an unrelated interface in the same workspace still answers"
         );
+    }
+}
+
+#[cfg(test)]
+mod edge_index_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The contract the #3066 switch rests on: the file set the Go edge pass
+    /// used to derive for itself (`analyzed_files_for_language`) is exactly
+    /// the file set the shared workspace index covers (`get_analyzed_files`
+    /// filtered to Go). Build-tagged files and `_test.go` files are ordinary
+    /// analyzed Go files to both rules, and the fixture carries both so a
+    /// future divergence in either rule fails here rather than silently
+    /// changing which files the dead-code and edge passes can see.
+    ///
+    /// Stated on kubernetes too, before the switch landed: 17,266 files and
+    /// the same fact digest either way
+    /// (`71ce49177e5189358b342254dca591a69f1b560d040b97ea2e60eed2f90d50b1`).
+    #[test]
+    fn the_shared_edge_index_covers_every_analyzed_go_file() {
+        let analyzer = test_analyzer(&[
+            (
+                "pkg/common.go",
+                "package pkg\n\
+                 type Widget struct{ id int }\n\
+                 func New() Widget { return Widget{} }\n\
+                 func (Widget) Name() string { return \"\" }\n",
+            ),
+            (
+                "pkg/platform_linux.go",
+                "//go:build linux\n\n\
+                 package pkg\n\n\
+                 type Platform struct{ Widget }\n\
+                 func Detect() Platform { return Platform{} }\n",
+            ),
+            (
+                "pkg/platform_darwin.go",
+                "//go:build darwin\n\n\
+                 package pkg\n\n\
+                 type Platform struct{ Widget }\n\
+                 func Detect() Platform { return Platform{} }\n",
+            ),
+            (
+                "pkg/pkg_test.go",
+                "package pkg\n\n\
+                 import \"testing\"\n\n\
+                 func TestNew(t *testing.T) { _ = New().Name() }\n",
+            ),
+            (
+                "app/app.go",
+                "package app\n\n\
+                 import \"example.com/app/pkg\"\n\n\
+                 func Run() string { return pkg.Detect().Name() }\n",
+            ),
+        ]);
+
+        let listed: BTreeSet<PathBuf> =
+            crate::analyzer::usages::common::analyzed_files_for_language(&analyzer, Language::Go)
+                .iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect();
+        let indexed: BTreeSet<PathBuf> = analyzer
+            .usage_edge_index()
+            .files()
+            .map(|file| file.rel_path().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            listed, indexed,
+            "the edge pass's file rule and the shared index must name the same files"
+        );
+        for file in [
+            "pkg/platform_linux.go",
+            "pkg/platform_darwin.go",
+            "pkg/pkg_test.go",
+        ] {
+            assert!(
+                listed.contains(Path::new(file)),
+                "the fixture must carry build-tagged and test files: {listed:?}"
+            );
+        }
     }
 }

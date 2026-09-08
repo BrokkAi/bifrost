@@ -32,6 +32,7 @@ pub(crate) mod java_graph;
 pub(crate) mod java_usage_evidence_cache;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
+pub mod macro_lexical;
 pub mod member_family;
 pub mod overload_selection;
 pub(crate) mod parsed_tree;
@@ -86,8 +87,11 @@ pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 pub use member_family::{
-    MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, java_member_family,
-    java_member_family_capability, member_family_id,
+    Admission, CSharpFamilyRules, JavaFamilyRules, MemberFacts, MemberFamilyAnswer,
+    MemberFamilyEdge, MemberFamilyProvider, MemberFamilySupport, NominalFamilyRules,
+    ScalaFamilyRules, csharp_member_family, csharp_member_family_capability, java_member_family,
+    java_member_family_capability, member_family_id, member_family_support, nominal_member_family,
+    nominal_member_family_capability, scala_member_family, scala_member_family_capability,
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,

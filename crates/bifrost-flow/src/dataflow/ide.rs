@@ -16,8 +16,8 @@ use super::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, FactId,
     IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
     IdeSummaryDataflowResult, IdeValueId, PathQuality, PathQualityFrontier, ReusableEndSummary,
-    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider, SolverTermination,
-    SolverWork, SummaryCallCycle, SummaryCalledProcedures, SummaryDataflowError,
+    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider,
+    SolverTermination, SolverWork, SummaryCallCycle, SummaryCalledProcedures, SummaryDataflowError,
     SummaryDataflowResult, SummaryEntry, SummarySolveInput, WitnessRetentionLimits,
     solve_with_reusable_end_summaries,
 };
@@ -1229,10 +1229,11 @@ where
         root: &ProcedureHandle,
         entry_fact: Fact,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, ReusableSummaryError> {
         let Some(mut summary) = self
             .provider
-            .summary_for(procedure, root, entry_fact, request)?
+            .summary_for(procedure, root, entry_fact, request)
+            .map_err(ReusableSummaryError::from)?
         else {
             return Ok(None);
         };
@@ -1289,7 +1290,7 @@ where
             ide_relations: relation_count,
             ..SolverWork::default()
         }) {
-            return Err(termination);
+            return Err(termination.into());
         }
         let fact_summary = ReusableProcedureSummary {
             call_cycle: summary.call_cycle,

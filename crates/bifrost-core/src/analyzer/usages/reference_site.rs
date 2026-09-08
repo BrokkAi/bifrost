@@ -124,8 +124,25 @@ pub fn resolve_reference_site_with_line_starts(
         _ => return Err("provide either start_byte or line/column".to_string()),
     };
 
-    let (scanned_start, scanned_end) =
-        expand_reference_expression(source, selection_start, selection_end, language);
+    // A JavaScript/TypeScript spread or rest marker is punctuation owned by
+    // the surrounding syntax, not part of the reference operand. The byte
+    // walk cannot distinguish `...name` from three ordinary member dots, so
+    // use the parsed operand bounds as its expansion boundary when that role
+    // is available. Without this, the walk absorbs the spread dots before
+    // the language resolver sees the reference.
+    let operand_bounds = root
+        .and_then(|root| semantic_operand_bounds(root, selection_start, selection_end, language));
+    let (scanned_start, scanned_end) = match operand_bounds {
+        Some((operand_start, operand_end)) => expand_reference_expression_bounded(
+            source,
+            selection_start,
+            selection_end,
+            language,
+            operand_start,
+            operand_end,
+        ),
+        None => expand_reference_expression(source, selection_start, selection_end, language),
+    };
     if scanned_start >= scanned_end {
         return Err("reference selection is empty".to_string());
     }
@@ -328,20 +345,31 @@ fn expand_reference_expression(
     end: usize,
     language: Language,
 ) -> (usize, usize) {
+    expand_reference_expression_bounded(source, start, end, language, 0, source.len())
+}
+
+fn expand_reference_expression_bounded(
+    source: &str,
+    start: usize,
+    end: usize,
+    language: Language,
+    lower_bound: usize,
+    upper_bound: usize,
+) -> (usize, usize) {
     let bytes = source.as_bytes();
     let mut left = start;
     let mut right = end;
     loop {
-        if left >= 2 && &bytes[left - 2..left] == b"::" {
+        if left >= lower_bound + 2 && &bytes[left - 2..left] == b"::" {
             left -= 2;
-            while left > 0 && is_ident_byte(bytes[left - 1], language) {
+            while left > lower_bound && is_ident_byte(bytes[left - 1], language) {
                 left -= 1;
             }
             continue;
         }
-        if left >= 1 && bytes[left - 1] == b'.' {
+        if left > lower_bound && bytes[left - 1] == b'.' {
             left -= 1;
-            while left > 0 && is_ident_byte(bytes[left - 1], language) {
+            while left > lower_bound && is_ident_byte(bytes[left - 1], language) {
                 left -= 1;
             }
             continue;
@@ -349,20 +377,20 @@ fn expand_reference_expression(
         break;
     }
     loop {
-        if right + 2 < bytes.len()
+        if right + 2 < upper_bound
             && &bytes[right..right + 2] == b"::"
             && (is_ident_byte(bytes[right + 2], language)
                 || matches!(bytes[right + 2], b'{' | b'*'))
         {
             right += 2;
-            while right < bytes.len() && is_ident_byte(bytes[right], language) {
+            while right < upper_bound && is_ident_byte(bytes[right], language) {
                 right += 1;
             }
             continue;
         }
-        if right < bytes.len() && bytes[right] == b'.' {
+        if right < upper_bound && bytes[right] == b'.' {
             right += 1;
-            while right < bytes.len() && is_ident_byte(bytes[right], language) {
+            while right < upper_bound && is_ident_byte(bytes[right], language) {
                 right += 1;
             }
             continue;
@@ -370,6 +398,39 @@ fn expand_reference_expression(
         break;
     }
     (left, right)
+}
+
+/// Return the parsed semantic operand surrounding a JS/TS spread or rest
+/// reference. The operand is the one named child of the role node; the
+/// punctuation belongs to the role's parent syntax and must not widen a
+/// reference site. `None` deliberately leaves the byte scanner unchanged when
+/// parsing is unavailable or the focus is outside such a role.
+fn semantic_operand_bounds(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+    language: Language,
+) -> Option<(usize, usize)> {
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return None;
+    }
+    let mut current = smallest_named_node_covering(root, start, end)?;
+    loop {
+        if matches!(current.kind(), "spread_element" | "rest_pattern") {
+            let mut cursor = current.walk();
+            let mut operands = current
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra() && !child.is_error() && !child.is_missing());
+            let operand = operands.next()?;
+            if operands.next().is_some() {
+                return None;
+            }
+            if operand.start_byte() <= start && end <= operand.end_byte() {
+                return Some((operand.start_byte(), operand.end_byte()));
+            }
+        }
+        current = current.parent()?;
+    }
 }
 
 /// One `receiver.member` step of a dotted member-access chain.

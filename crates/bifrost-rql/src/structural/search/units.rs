@@ -609,6 +609,9 @@ fn semantic_unit_row_key(key_value: &SemanticPipelineKey) -> UnitRowKey {
         }
         SemanticPipelineKey::FlowEndpoint(id) => key("semantic_flow_endpoint").text(id).finish(),
         SemanticPipelineKey::FlowWitness(id) => key("semantic_flow_witness").text(id).finish(),
+        SemanticPipelineKey::AbsentMemberWitness(id) => {
+            key("semantic_absent_member_witness").text(id).finish()
+        }
         SemanticPipelineKey::TaintFinding(id) => key("semantic_taint_finding").text(id).finish(),
     }
 }
@@ -1171,6 +1174,7 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::TypestateWitness { .. }
             | CodeQueryResultValue::FlowEndpoint { .. }
             | CodeQueryResultValue::FlowWitness { .. }
+            | CodeQueryResultValue::AbsentMemberWitness { .. }
             | CodeQueryResultValue::TaintFinding { .. }
             | CodeQueryResultValue::ConcurrentAccessConflict { .. }
             | CodeQueryResultValue::ClassSetRow { .. }
@@ -1249,6 +1253,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::TypestateWitness { value } => &value.path,
         CodeQueryResultValue::FlowEndpoint { value } => &value.path,
         CodeQueryResultValue::FlowWitness { value } => &value.path,
+        CodeQueryResultValue::AbsentMemberWitness { value } => &value.path,
         CodeQueryResultValue::TaintFinding { value } => &value.path,
         CodeQueryResultValue::ConcurrentAccessConflict { value } => &value.path,
         CodeQueryResultValue::ClassSetRow { value } => &value.file,

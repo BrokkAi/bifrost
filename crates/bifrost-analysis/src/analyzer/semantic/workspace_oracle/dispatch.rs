@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -144,13 +144,114 @@ struct PreparedCallDispatch {
     lookup: CallDispatchLookup,
 }
 
+/// Provider-local prepared dispatch sessions partitioned by exact artifact
+/// allocation.
+///
+/// The pool shares only the immutable caller source and its parsed syntax.
+/// Every call still performs its own resolver work, consumes its own remaining
+/// budget, and returns the ordinary workspace-oracle outcome. A source parse
+/// whose charge rolls back remains absent from the prepared session, so a
+/// later call must parse and pay for it again.
+#[doc(hidden)]
+pub struct PreparedWorkspaceDispatchPool<'a> {
+    oracle: WorkspaceSemanticOracle<'a>,
+    sessions: Mutex<Vec<Arc<PreparedWorkspaceDispatchPoolEntry<'a>>>>,
+}
+
+struct PreparedWorkspaceDispatchPoolEntry<'a> {
+    artifact: Arc<SemanticArtifact>,
+    session: Mutex<Option<PreparedWorkspaceDispatchSession<'a>>>,
+}
+
+impl PreparedWorkspaceDispatchPool<'_> {
+    /// Resolve one call through the prepared session for its exact artifact
+    /// allocation.
+    #[doc(hidden)]
+    pub fn resolve_call(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+
+        let entry = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("prepared workspace dispatch pool lock is not poisoned");
+            if request.cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: SemanticWork::default(),
+                });
+            }
+            if let Some(entry) = sessions
+                .iter()
+                .find(|entry| Arc::ptr_eq(&entry.artifact, call.procedure().artifact()))
+            {
+                Arc::clone(entry)
+            } else {
+                let artifact = Arc::clone(call.procedure().artifact());
+                let entry = Arc::new(PreparedWorkspaceDispatchPoolEntry {
+                    artifact,
+                    session: Mutex::new(None),
+                });
+                sessions.push(Arc::clone(&entry));
+                entry
+            }
+        };
+
+        let mut retained = entry
+            .session
+            .lock()
+            .expect("prepared workspace dispatch session lock is not poisoned");
+        if request.cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: SemanticWork::default(),
+            });
+        }
+        if let Some(session) = retained.as_mut() {
+            return session.resolve_call(call, request);
+        }
+
+        let mut session = self
+            .oracle
+            .prepare_call_dispatch_session(Arc::clone(&entry.artifact));
+        let outcome = session.resolve_call(call, request)?;
+        let replayable = matches!(
+            &outcome,
+            SemanticOutcome::Complete { .. }
+                | SemanticOutcome::Ambiguous { .. }
+                | SemanticOutcome::Unproven { .. }
+                | SemanticOutcome::Unknown {
+                    partial: Some(_),
+                    ..
+                }
+                | SemanticOutcome::Unsupported {
+                    partial: Some(_),
+                    ..
+                }
+        );
+        if replayable && session.retained_bytes() > 0 {
+            *retained = Some(session);
+        }
+        Ok(outcome)
+    }
+}
+
 /// A lazy serial dispatch session bound to one exact semantic artifact.
 ///
 /// Construction performs no source or resolver work. The first actual call
 /// reads and parses its exact source snapshot; later calls from the same
 /// artifact reuse that tree while definition lookup, target materialization,
 /// cancellation, and budgets remain ordered per call.
-pub(super) struct PreparedWorkspaceDispatchSession<'a> {
+pub(crate) struct PreparedWorkspaceDispatchSession<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
     artifact: Arc<SemanticArtifact>,
     low_level: Option<CallDispatchSession>,
@@ -169,7 +270,16 @@ impl PreparedWorkspaceDispatchSession<'_> {
             .map_or(0, CallDispatchSession::retained_bytes)
     }
 
-    pub(super) fn resolve_call(
+    pub(crate) const fn retains_exact_source(&self) -> bool {
+        self.low_level_source_paid
+    }
+
+    pub(crate) fn discard_exact_source(&mut self) {
+        self.low_level = None;
+        self.low_level_source_paid = false;
+    }
+
+    pub(crate) fn resolve_call(
         &mut self,
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
@@ -423,7 +533,16 @@ pub(crate) fn exact_call_range(call: &CallSiteHandle) -> Result<Range, SemanticP
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
-    pub(super) fn prepare_call_dispatch_session(
+    /// Open an empty provider-local pool of exact-artifact dispatch sessions.
+    #[doc(hidden)]
+    pub fn prepare_workspace_dispatch_pool(&self) -> PreparedWorkspaceDispatchPool<'a> {
+        PreparedWorkspaceDispatchPool {
+            oracle: self.clone(),
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn prepare_call_dispatch_session(
         &self,
         artifact: Arc<SemanticArtifact>,
     ) -> PreparedWorkspaceDispatchSession<'a> {
@@ -524,13 +643,27 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             self.workspace.analyzer(),
             lookup.targets,
         ));
-        let ordinary_dispatch_is_only_unresolved = target_groups.is_empty()
+        let displaceable_heuristic_external_boundaries = boundaries
+            .iter()
+            .filter(|boundary| {
+                heuristic_external_boundary_without_resolver_authority(boundary)
+                    && boundary
+                        .unmaterialized_external_target()
+                        .is_none_or(|target| !external_target_has_active_model(self, target))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let ordinary_dispatch_is_only_unresolved_or_heuristic_external = target_groups.is_empty()
             && !lookup.truncated
-            && boundaries
-                .iter()
-                .all(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
-            && (call_dispatch_gap.is_some() || !boundaries.is_empty());
-        let hinted_dispatch = ordinary_dispatch_is_only_unresolved
+            && boundaries.iter().all(|boundary| {
+                boundary.kind == DispatchBoundaryKind::Unresolved
+                    || displaceable_heuristic_external_boundaries.contains(boundary)
+            })
+            && (call_dispatch_gap.is_some()
+                || boundaries
+                    .iter()
+                    .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved));
+        let hinted_dispatch = ordinary_dispatch_is_only_unresolved_or_heuristic_external
             .then(|| self.dispatch_hints().for_call(call.procedure(), call.id()))
             .flatten();
         let mut hinted_arms_materialized = hinted_dispatch.is_some();
@@ -1049,6 +1182,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 && !request.cancellation.is_cancelled()
                 && boundaries.iter().all(|boundary| {
                     boundary.kind == DispatchBoundaryKind::Unresolved
+                        || displaceable_heuristic_external_boundaries.contains(boundary)
                         || matches!(
                             &boundary.kind,
                             DispatchBoundaryKind::External(Some(target))
@@ -1061,7 +1195,10 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 })
         });
         if hint_refinement_complete {
-            boundaries.retain(|boundary| boundary.kind != DispatchBoundaryKind::Unresolved);
+            boundaries.retain(|boundary| {
+                boundary.kind != DispatchBoundaryKind::Unresolved
+                    && !displaceable_heuristic_external_boundaries.contains(boundary)
+            });
         }
 
         let (anonymous_receiver_refined, receiver_refinement_work) = self
@@ -1137,6 +1274,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         // queue), so the ordinary CHA expansion above never runs for it and
         // "enumerated" is not satisfied by construction. Prove it here instead,
         // or else refuse: see `external_member_workspace_override_proven_absent`.
+        let mut workspace_hierarchy_unenumerated = false;
         if call_dispatch_gap.is_some()
             && !boundaries
                 .iter()
@@ -1158,6 +1296,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 });
             if unenumerated {
                 boundaries.push(workspace_hierarchy_unenumerated_boundary());
+                workspace_hierarchy_unenumerated = true;
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
             }
@@ -1230,12 +1369,24 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         } else {
             dispatch_coverage(lookup.status, &boundaries)
         };
-        let result = DispatchResult::new(call, candidates, boundaries, coverage, self.limits)
+        let mut result = DispatchResult::new(call, candidates, boundaries, coverage, self.limits)
             .map_err(|error| {
-                SemanticProviderError::internal(format!(
-                    "workspace dispatch produced invalid relation provenance: {error}"
-                ))
-            })?;
+            SemanticProviderError::internal(format!(
+                "workspace dispatch produced invalid relation provenance: {error}"
+            ))
+        })?;
+        if workspace_hierarchy_unenumerated
+            && ordinary_dispatch_is_only_unresolved_or_heuristic_external
+            && !displaceable_heuristic_external_boundaries.is_empty()
+            && hinted_dispatch.is_none()
+            && !final_candidates_truncated
+            && !cancelled_targets_truncated
+            && !provenance_truncated
+            && materialization_exceeded.is_none()
+            && !request.cancellation.is_cancelled()
+        {
+            result.mark_complete_receiver_hint_refinable();
+        }
         let retained_work = dispatch_result_work(&result);
         let total_work = sum_semantic_work(reported_work, retained_work);
         if let Err(exceeded) = staged_budget.charge(retained_work) {
@@ -2892,6 +3043,25 @@ fn hinted_external_summary_is_complete(
     }
 }
 
+fn external_target_has_active_model(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    let Some(active) = oracle.active_semantic_models() else {
+        return false;
+    };
+    active
+        .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+            target.language().semantic_pack_label(),
+            target.owner_fqn(),
+            target.member(),
+            target.has_receiver(),
+            target.arity(),
+        ))
+        .disposition
+        != SemanticModelMatchDisposition::Empty
+}
+
 fn external_flow_claims_agree(
     left: &CompiledProcedureSummary,
     right: &CompiledProcedureSummary,
@@ -2902,6 +3072,26 @@ fn external_flow_claims_agree(
         && left.locations == right.locations
         && left.transfers == right.transfers
         && left.effects == right.effects
+}
+
+/// Whether a low-level external boundary is only a syntax-derived placeholder
+/// for a receiver whose concrete type the resolver did not know.
+///
+/// A complete type-flow hint may refine this arm because none of its external
+/// identity, target, or call shape came from the language resolver. Exact and
+/// resolver-owned arms must remain; the caller separately excludes targets
+/// selected by the active semantic-model snapshot.
+fn heuristic_external_boundary_without_resolver_authority(boundary: &DispatchBoundary) -> bool {
+    matches!(
+        (&boundary.kind, boundary.unmaterialized_external_target()),
+        (DispatchBoundaryKind::External(Some(locator)), Some(target))
+            if locator == target.locator()
+                && target.language() == SemanticLanguage::Standard(Language::Python)
+                && !target.has_resolver_owned_call_shape()
+                && target.normalized_static_owner().is_none()
+                && boundary.external_callee_identity().is_none()
+                && boundary.exact_external_target().is_none()
+    )
 }
 
 fn unresolved_dispatch_boundary(status: DefinitionLookupStatus) -> DispatchBoundary {
@@ -3970,6 +4160,12 @@ mod tests {
         SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapImpacts, SourceSite,
         SourceSiteKind, WorkspaceIcfgProvider,
     };
+    use crate::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
+        acquire_active_semantic_models, compile_source,
+    };
     use crate::analyzer::{
         AnalyzerConfig, CallableArity, Language, OverlayProject, ParameterMetadata, Project,
         ProjectFile, SignatureMetadata, TestProject, WorkspaceAnalyzer,
@@ -4074,6 +4270,131 @@ mod tests {
         semantic_call_fixture().1
     }
 
+    fn python_workspace_member_hints(
+        fixture: &AnalyzerFixture,
+        call: &CallSiteHandle,
+        file_name: &str,
+        class_name: &str,
+        member_name: &str,
+        exhaustive: bool,
+    ) -> DispatchHints {
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), file_name);
+        let declarations = analyzer.get_declarations(&file);
+        let class = declarations
+            .iter()
+            .find(|declaration| declaration.is_class() && declaration.terminal_name() == class_name)
+            .cloned()
+            .expect("hint receiver class declaration");
+        let member = declarations
+            .into_iter()
+            .find(|definition| definition.terminal_name() == member_name)
+            .expect("hint member declaration");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(
+                call.procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("live call")
+                    .source,
+            )
+            .expect("call source mapping");
+        DispatchHints::new(vec![DispatchHintSet::new(
+            DispatchHintCallSiteKey::for_call(call.procedure(), call.id()),
+            vec![DispatchHint::new(
+                MemberDeclaration::Workspace(member),
+                ClassIdentity::Workspace(class),
+                SourceSite {
+                    file,
+                    span: mapping.locator.anchor().span(),
+                    kind: SourceSiteKind::DeclaredParameter,
+                },
+            )],
+            exhaustive,
+            exhaustive,
+        )])
+    }
+
+    fn activate_python_external_summary(workspace: &WorkspaceAnalyzer) {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral semantic-pack catalog");
+        let source = br#"{
+          "schema_version": 2,
+          "pack_id": "test.python.heuristic-external",
+          "version": "1.0.0",
+          "producer": {"name": "test", "version": "1.0.0"},
+          "language": "python",
+          "ecosystem": "python",
+          "compatibility": {"bifrost": ">=0.10.0, <1.0.0"},
+          "provenance": {"source": "test:python-heuristic-external"},
+          "license": "Apache-2.0",
+          "completeness": "complete",
+          "safety": {"generated_code_only": false, "review_required": false},
+          "shards": [{
+            "id": "summaries",
+            "activation": [{}],
+            "payload": {
+              "kind": "procedure_summaries",
+              "summaries": [{
+                "id": "test.python.holder-value-foo",
+                "target": {
+                  "path": "external.py",
+                  "symbol": "holder.value.foo",
+                  "has_receiver": true,
+                  "parameter_count": 0
+                },
+                "completeness": "complete",
+                "transfers": [],
+                "effects": [{
+                  "kind": "unknown_call_boundary",
+                  "event": "test.python.holder-value-foo-boundary"
+                }]
+              }]
+            }
+          }]
+        }"#;
+        let pack = compile_source(SourceFormat::Json, source, &CompilerOptions::default())
+            .unwrap_or_else(|diagnostics| panic!("external summary fixture: {diagnostics:#?}"));
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:python-heuristic-external".to_owned(),
+                },
+            )
+            .expect("register external summary fixture");
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("package version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "python".to_owned(),
+                ecosystem: "python".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let outcome = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
+            "external summary fixture activates: {outcome:#?}"
+        );
+    }
+
     #[test]
     fn propagated_singleton_receiver_resolves_an_unresolved_python_member_call() {
         let (fixture, call) = semantic_call_fixture_for_language(
@@ -4155,6 +4476,171 @@ mod tests {
     }
 
     #[test]
+    fn complete_receiver_hint_displaces_only_a_syntax_derived_python_external_arm() {
+        let source = "class A:\n    def foo(self):\n        return 1\n\ndef caller(holder):\n    return holder.value.foo()\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Python, "heuristic.py", source);
+        let cancellation = CancellationToken::default();
+
+        let unhinted = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            DispatchHints::default(),
+        );
+        let mut unhinted_budget = SemanticBudget::default();
+        let unhinted_outcome = unhinted
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut unhinted_budget, &cancellation),
+            )
+            .expect("unhinted dispatch");
+        let unhinted_result = unhinted_outcome.available_value().expect("unhinted answer");
+        assert_eq!(unhinted_result.coverage(), CandidateCoverage::Truncated);
+        assert!(unhinted_result.complete_receiver_hint_refinable());
+        assert!(
+            unhinted_result
+                .boundaries()
+                .iter()
+                .any(heuristic_external_boundary_without_resolver_authority),
+            "{unhinted_result:#?}"
+        );
+
+        let complete = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            python_workspace_member_hints(&fixture, &call, "heuristic.py", "A", "foo", true),
+        );
+        let mut complete_budget = SemanticBudget::default();
+        let complete_outcome = complete
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut complete_budget, &cancellation),
+            )
+            .expect("completely hinted dispatch");
+        let complete_result = complete_outcome
+            .available_value()
+            .expect("completely hinted answer");
+        assert_eq!(complete_result.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(
+            complete_result.candidates().len(),
+            1,
+            "{complete_result:#?}"
+        );
+        assert!(
+            complete_result
+                .boundaries()
+                .iter()
+                .all(|boundary| !heuristic_external_boundary_without_resolver_authority(boundary)),
+            "{complete_result:#?}"
+        );
+
+        let incomplete = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            python_workspace_member_hints(&fixture, &call, "heuristic.py", "A", "foo", false),
+        );
+        let mut incomplete_budget = SemanticBudget::default();
+        let incomplete_outcome = incomplete
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut incomplete_budget, &cancellation),
+            )
+            .expect("incompletely hinted dispatch");
+        let incomplete_result = incomplete_outcome
+            .available_value()
+            .expect("incompletely hinted answer");
+        assert_eq!(incomplete_result.coverage(), CandidateCoverage::Truncated);
+        assert_eq!(
+            incomplete_result.candidates().len(),
+            1,
+            "{incomplete_result:#?}"
+        );
+        assert!(matches!(
+            incomplete_result.candidates()[0].proof(),
+            ProofStatus::Unproven(_)
+        ));
+        assert!(matches!(
+            incomplete_result.candidates()[0].completeness(),
+            EvidenceCompleteness::Partial(_)
+        ));
+        assert!(
+            incomplete_result
+                .boundaries()
+                .iter()
+                .any(heuristic_external_boundary_without_resolver_authority),
+            "{incomplete_result:#?}"
+        );
+    }
+
+    #[test]
+    fn complete_receiver_hint_does_not_displace_a_resolver_owned_python_external_arm() {
+        let source = "import subprocess\n\nclass A:\n    def run(self):\n        return 1\n\ndef caller():\n    return subprocess.run()\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Python, "imported.py", source);
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            None,
+            python_workspace_member_hints(&fixture, &call, "imported.py", "A", "run", true),
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = provider
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("resolver-owned external dispatch");
+        let result = outcome
+            .available_value()
+            .expect("resolver-owned external answer");
+
+        assert!(result.candidates().is_empty(), "{result:#?}");
+        assert!(!result.complete_receiver_hint_refinable());
+        assert!(
+            result.boundaries().iter().any(|boundary| {
+                boundary
+                    .unmaterialized_external_target()
+                    .is_some_and(UnmaterializedExternalTarget::has_resolver_owned_call_shape)
+            }),
+            "{result:#?}"
+        );
+    }
+
+    #[test]
+    fn complete_receiver_hint_does_not_displace_an_active_modeled_external_arm() {
+        let source = "class A:\n    def foo(self):\n        return 1\n\ndef caller(holder):\n    return holder.value.foo()\n";
+        let (fixture, call) =
+            semantic_call_fixture_for_language(Language::Python, "modeled.py", source);
+        activate_python_external_summary(&fixture.analyzer);
+        let snapshot = fixture
+            .analyzer
+            .analyzer()
+            .active_semantic_model_snapshot()
+            .expect("external summary activation publishes a snapshot");
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+            &fixture.analyzer,
+            Some(snapshot),
+            python_workspace_member_hints(&fixture, &call, "modeled.py", "A", "foo", true),
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = provider
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("modeled external dispatch");
+        let result = outcome.available_value().expect("modeled external answer");
+
+        assert!(result.candidates().is_empty(), "{result:#?}");
+        assert!(!result.complete_receiver_hint_refinable());
+        assert!(
+            result.boundaries().iter().any(|boundary| {
+                boundary
+                    .unmaterialized_external_target()
+                    .is_some_and(|target| {
+                        target.owner_fqn() == "holder.value" && target.member() == "foo"
+                    })
+            }),
+            "{result:#?}"
+        );
+    }
+
+    #[test]
     fn unresolved_canonical_callee_is_model_bindable_but_stays_open() {
         let (_fixture, call) = semantic_call_fixture_for_language(
             Language::Java,
@@ -4192,6 +4678,10 @@ mod tests {
             named.completeness,
             EvidenceCompleteness::Partial(_)
         ));
+        assert!(
+            !heuristic_external_boundary_without_resolver_authority(&named),
+            "a resolver-normalized static owner is not syntax-only evidence"
+        );
         assert_eq!(
             dispatch_coverage(Some(DefinitionLookupStatus::NotFound), &[named]),
             CandidateCoverage::Open,

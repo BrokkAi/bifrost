@@ -189,6 +189,8 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
+/// Revision 23 adds saved definition-time default argument values, selected
+/// by conditional call bindings rather than executed in the callee body.
 /// Revision 20 replaces the fieldless aggregate-copy value-flow marker with
 /// the identity-separating transfer vocabulary (copy, aggregate copy, move
 /// with invalidation, conversion with value preservation, boxing, unboxing,
@@ -203,7 +205,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 22;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 23;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -830,6 +832,14 @@ impl SemanticLocator {
         self.anchor
     }
 
+    /// Whether this locator belongs to the same structured procedure
+    /// declaration as `procedure`.
+    pub fn belongs_to_procedure(&self, procedure: &SemanticLocator) -> bool {
+        self.path == procedure.path
+            && self.language == procedure.language
+            && declaration_shapes_equal(&self.declaration, &procedure.declaration)
+    }
+
     /// Push this locator's stable segments into a domain-separated digest.
     ///
     /// This is the sanctioned encoding of a locator inside an identity.
@@ -874,10 +884,7 @@ impl SemanticLocator {
         digest: &mut LengthDelimitedDigest,
         procedure: &SemanticLocator,
     ) {
-        if self.path == procedure.path
-            && self.language == procedure.language
-            && declaration_shapes_equal(&self.declaration, &procedure.declaration)
-        {
+        if self.belongs_to_procedure(procedure) {
             let owner_start = procedure.anchor.span().start_byte();
             let span = self.anchor.span();
             let Some(start) = span.start_byte().checked_sub(owner_start) else {
@@ -902,6 +909,60 @@ impl SemanticLocator {
             digest.push(b"external-locator");
             self.push_stable_identity(digest);
         }
+    }
+
+    /// Push this locator relative to the declaration segment that owns it.
+    ///
+    /// Semantic source mappings retain their complete enclosing declaration,
+    /// whose final segment anchor is the procedure anchor. This encoding is
+    /// therefore stable when a preceding declaration moves the procedure,
+    /// while retaining the locator's exact offset inside that procedure.
+    pub fn push_enclosing_declaration_local_identity(&self, digest: &mut LengthDelimitedDigest) {
+        let procedure = self
+            .declaration
+            .segments()
+            .last()
+            .expect("a procedure-owned semantic locator has a declaration segment");
+        let owner_start = procedure.anchor().span().start_byte();
+        let span = self.anchor.span();
+        let start = span
+            .start_byte()
+            .checked_sub(owner_start)
+            .expect("a procedure-owned locator starts within its declaration");
+        let end = span
+            .end_byte()
+            .checked_sub(owner_start)
+            .expect("a procedure-owned locator ends within its declaration");
+        digest.push(b"enclosing-procedure-local-locator");
+        digest.push(self.path.as_str().as_bytes());
+        digest.push(self.language.stable_label().as_bytes());
+        digest.push(self.role.stable_label().as_bytes());
+        digest.push(&start.to_le_bytes());
+        digest.push(&end.to_le_bytes());
+        digest.push(&self.anchor.occurrence().to_le_bytes());
+        push_declaration_shape(digest, &self.declaration);
+    }
+
+    /// Push this procedure locator's anchor-free declaration address.
+    ///
+    /// This names the same declared semantic role across edits without
+    /// claiming that its source body is unchanged. Consumers may use it for a
+    /// cross-procedure reference only when they separately retain the exact
+    /// semantic dependency or answer that reference contributed.
+    pub fn push_anchor_free_procedure_declaration_identity(
+        &self,
+        digest: &mut LengthDelimitedDigest,
+    ) {
+        assert_eq!(
+            self.role,
+            SemanticRole::Procedure,
+            "only a procedure locator has an anchor-free declaration address"
+        );
+        digest.push(b"procedure-lineage-locator");
+        digest.push(self.path.as_str().as_bytes());
+        digest.push(self.language.stable_label().as_bytes());
+        digest.push(self.role.stable_label().as_bytes());
+        push_declaration_shape(digest, &self.declaration);
     }
 }
 
@@ -1065,6 +1126,30 @@ impl SemanticArtifactKey {
         digest.push(self.ir_version.as_bytes());
         digest.push(self.configuration.as_bytes());
         digest.push(self.dependencies.as_bytes());
+        digest.finish()
+    }
+
+    /// Stable lineage of one procedure declaration in this artifact's
+    /// checkout-independent semantic environment.
+    ///
+    /// Source revision and declaration anchors are deliberately absent. The
+    /// result addresses the same declaration across an edit without claiming
+    /// that its body is unchanged. Exact procedure-local products must combine
+    /// this lineage with their own structured semantics before reuse.
+    pub fn procedure_lineage_fingerprint(&self, declaration: &DeclarationLocator) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-procedure-summary-lineage-v1");
+        digest.push(self.procedure_environment_fingerprint().as_bytes());
+        for segment in declaration.segments() {
+            digest.push(segment.kind().stable_label().as_bytes());
+            match segment.name() {
+                Some(name) => {
+                    digest.push(b"named");
+                    digest.push(name.as_bytes());
+                }
+                None => digest.push(b"anonymous"),
+            }
+            digest.push(&segment.sibling_ordinal().to_le_bytes());
+        }
         digest.finish()
     }
 }
@@ -1253,10 +1338,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "7eb1aa9df45fc1c32ef59a5892af30884789fb3eaea32f6a206a5eac6795419b"
+            "d7be6c0f078ca1a6637aac177bd346e8b7d4da03b1a420b905f38cdc863de59d"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 22);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 23);
     }
 
     fn digest(label: &str) -> StableDigest {
@@ -1484,6 +1569,41 @@ mod tests {
             base.procedure_environment_fingerprint(),
             changed_adapter.procedure_environment_fingerprint()
         );
+
+        let declaration = |start_byte, name: &str| {
+            let span = SourceSpan::new(
+                SourcePosition::new(start_byte, 1, 0),
+                SourcePosition::new(start_byte + 10, 1, 10),
+            )
+            .unwrap();
+            DeclarationLocator::new(vec![
+                DeclarationSegment::named(
+                    DeclarationSegmentKind::Function,
+                    name,
+                    SourceAnchor::new(span, 0),
+                    0,
+                )
+                .unwrap(),
+            ])
+            .unwrap()
+        };
+        let base_declaration = declaration(10, "wrapper");
+        let moved_declaration = declaration(100, "wrapper");
+        assert_eq!(
+            base.procedure_lineage_fingerprint(&base_declaration),
+            sibling_edit.procedure_lineage_fingerprint(&moved_declaration),
+            "mount, revision, and absolute declaration anchor are excluded"
+        );
+        assert_ne!(
+            base.procedure_lineage_fingerprint(&base_declaration),
+            sibling_edit.procedure_lineage_fingerprint(&declaration(100, "renamed")),
+            "declaration shape remains part of the lineage"
+        );
+        assert_ne!(
+            base.procedure_lineage_fingerprint(&base_declaration),
+            changed_adapter.procedure_lineage_fingerprint(&moved_declaration),
+            "semantic environment remains part of the lineage"
+        );
     }
 
     #[test]
@@ -1587,6 +1707,16 @@ mod tests {
         let mut changed = LengthDelimitedDigest::new(b"test-procedure-local-locator");
         changed_value.push_procedure_local_identity(&mut changed, &shifted_procedure);
         assert_ne!(first, changed.finish());
+
+        let mut first = LengthDelimitedDigest::new(b"test-procedure-lineage-locator");
+        first_procedure.push_anchor_free_procedure_declaration_identity(&mut first);
+        let mut shifted = LengthDelimitedDigest::new(b"test-procedure-lineage-locator");
+        shifted_procedure.push_anchor_free_procedure_declaration_identity(&mut shifted);
+        assert_eq!(
+            first.finish(),
+            shifted.finish(),
+            "procedure lineage excludes mount and source anchors"
+        );
     }
 
     #[test]

@@ -2,6 +2,10 @@
   "schema_version": 1,
   "scopes": [
     {
+      "path": "docs/fixtures/scan-tutorial",
+      "reason": "Intentional scan tutorial corpus: the published Scan a Codebase guide demonstrates these eval, pickle, and regex findings as expected positives."
+    },
+    {
       "path": "tests/fixtures",
       "reason": "Intentional smell corpus: these fixtures exist to trigger analyzer and policy behavior under test, so their findings are the expected positives, not defects."
     },

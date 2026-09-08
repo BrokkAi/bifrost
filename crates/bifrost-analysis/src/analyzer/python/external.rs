@@ -455,6 +455,7 @@ impl PythonArtifactPackProducer {
             limits,
             &mut diagnostics,
         );
+        expand_explicit_reexports(&surfaces, &mut types);
         dedup_declarations(&mut types, &mut members);
         resolve_hierarchy_references(&mut types);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
@@ -1785,6 +1786,116 @@ fn exported_bindings(surface: &CollectedModuleSurface) -> Vec<(&String, &ModuleB
             .iter()
             .filter(|(name, _)| !name.starts_with('_'))
             .collect(),
+    }
+}
+
+/// Publish aliases introduced by explicit named imports, such as
+/// `from .case import TestCase as TestCase` in a package `__init__` file.
+///
+/// The collector records the exact imported target in each module surface,
+/// but the declaration's `aliases` field is the identity used by the semantic
+/// model overlay. Resolve those recorded bindings through the source set until
+/// they reach a declared type, so explicit re-export chains retain the same
+/// canonical identity as wildcard re-exports. A guarded or ambiguous binding
+/// is deliberately not published: aliases have no per-alias guard, and
+/// claiming one unconditionally would turn conditional import syntax into a
+/// false external class identity.
+fn expand_explicit_reexports(surfaces: &[CollectedModuleSurface], types: &mut [TypeFact]) {
+    let declarations_by_name = types.iter().enumerate().fold(
+        std::collections::HashMap::<&str, Vec<usize>>::new(),
+        |mut declarations, (index, fact)| {
+            declarations
+                .entry(fact.name.as_str())
+                .or_default()
+                .push(index);
+            declarations
+        },
+    );
+    let declared_names = declarations_by_name
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut bindings = std::collections::HashMap::new();
+    for surface in surfaces {
+        for (name, binding) in &surface.bindings {
+            let key = format!("{}.{}", surface.module, name);
+            let target = if binding.guard.is_none() {
+                binding.target.clone()
+            } else {
+                None
+            };
+            match bindings.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(target);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &target {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut aliases = Vec::new();
+    for surface in surfaces {
+        for (name, binding) in &surface.bindings {
+            // Wildcard aliases are already published by
+            // `expand_wildcard_reexports`; this pass is for named imports.
+            if binding.expanded || binding.guard.is_some() {
+                continue;
+            }
+            let alias = format!("{}.{}", surface.module, name);
+            let Some(canonical) =
+                resolve_explicit_reexport_target(&alias, &declared_names, &bindings)
+            else {
+                continue;
+            };
+            if canonical == alias {
+                continue;
+            }
+            if let Some(declarations) = declarations_by_name.get(canonical.as_str()) {
+                aliases.extend(
+                    declarations
+                        .iter()
+                        .copied()
+                        .map(|declaration| (declaration, alias.clone())),
+                );
+            }
+        }
+    }
+    for (declaration, alias) in aliases {
+        types[declaration].aliases.push(alias);
+    }
+    for fact in types {
+        fact.aliases.sort();
+        fact.aliases.dedup();
+    }
+}
+
+/// Follow the structured binding graph for one explicit import without
+/// guessing through terminal names. A cycle, missing target, or guarded
+/// intermediate binding is not an identity proof.
+fn resolve_explicit_reexport_target(
+    target: &str,
+    declared_names: &std::collections::HashSet<&str>,
+    bindings: &std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    let mut current = target.to_owned();
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        if let Some(binding) = bindings.get(&current) {
+            let next = binding.as_ref()?;
+            if next == &current {
+                return declared_names.contains(current.as_str()).then_some(current);
+            }
+            current = next.clone();
+            continue;
+        }
+        return declared_names.contains(current.as_str()).then_some(current);
     }
 }
 
@@ -3908,6 +4019,123 @@ mod tests {
             .aliases
     }
 
+    #[test]
+    fn an_explicit_named_import_publishes_a_structured_type_alias() {
+        let production = produce_stub_set(&[
+            (
+                "unittest/__init__.pyi",
+                "from .case import TestCase as TestCase\n",
+            ),
+            ("unittest/case.pyi", "class TestCase: ...\n"),
+        ]);
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let (types, _) = declaration_facts(&production);
+        assert_eq!(
+            type_aliases(types, "unittest.case.TestCase"),
+            ["unittest.TestCase"],
+            "an explicit package re-export names the declaring class"
+        );
+    }
+
+    #[test]
+    fn a_rebound_explicit_import_does_not_publish_a_stale_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/__init__.pyi",
+                "from .case import TestCase as Public\nPublic = object\n",
+            ),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty(),
+            "a later structured binding removes the imported alias"
+        );
+    }
+
+    #[test]
+    fn a_rebound_target_type_does_not_publish_its_stale_export_alias() {
+        let production = produce_stub_set(&[
+            ("pkg/__init__.pyi", "from .case import TestCase as Public\n"),
+            ("pkg/case.pyi", "class TestCase: ...\nTestCase = object\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty(),
+            "the final target binding, not the stale class declaration, controls export identity"
+        );
+    }
+
+    #[test]
+    fn explicit_named_imports_follow_a_stable_multi_hop_chain() {
+        let production = produce_stub_set(&[
+            ("pkg/public.pyi", "from .shim import TestCase as Public\n"),
+            ("pkg/shim.pyi", "from .case import TestCase as TestCase\n"),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert_eq!(
+            type_aliases(types, "pkg.case.TestCase"),
+            ["pkg.public.Public", "pkg.shim.TestCase"],
+            "named re-export chains retain the declaring class identity"
+        );
+    }
+
+    #[test]
+    fn cyclic_explicit_named_imports_do_not_publish_an_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/a.pyi",
+                "class Thing: ...\nfrom .b import Thing as Thing\n",
+            ),
+            ("pkg/b.pyi", "from .a import Thing as Thing\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.a.Thing").is_empty(),
+            "a cyclic binding graph has no stable canonical export"
+        );
+    }
+
+    #[test]
+    fn conflicting_module_surfaces_do_not_publish_an_export_alias() {
+        let production = produce_stub_set(&[
+            ("pkg.pyi", "from first import Item as Public\n"),
+            ("pkg/__init__.pyi", "from second import Item as Public\n"),
+            ("first.pyi", "class Item: ...\n"),
+            ("second.pyi", "class Item: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        for name in ["first.Item", "second.Item"] {
+            assert!(
+                type_aliases(types, name).is_empty(),
+                "conflicting source surfaces must not publish alias pkg.Public on {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_conditional_explicit_imports_do_not_publish_an_alias() {
+        let production = produce_stub_set(&[
+            (
+                "pkg/__init__.pyi",
+                "import sys\n\nif sys.platform == \"win32\":\n    from .case import TestCase as Public\nelse:\n    from .other import TestCase as Public\n",
+            ),
+            ("pkg/case.pyi", "class TestCase: ...\n"),
+            ("pkg/other.pyi", "class TestCase: ...\n"),
+        ]);
+        let (types, _) = declaration_facts(&production);
+        assert!(
+            type_aliases(types, "pkg.case.TestCase").is_empty()
+                && type_aliases(types, "pkg.other.TestCase").is_empty(),
+            "conditional rebindings remain ambiguous rather than becoming unconditional aliases"
+        );
+    }
+
     const WILDCARD_IMPL: &str =
         "from typing import MutableSet as MutableSet\n\nclass Own: ...\n\n_private: int\n";
 
@@ -3931,7 +4159,7 @@ mod tests {
         );
         assert_eq!(
             type_aliases(types, "typing.MutableSet"),
-            ["shim.MutableSet"],
+            ["_impl.MutableSet", "shim.MutableSet"],
             "a re-export chain ends at the declaring class"
         );
         assert_eq!(
@@ -3957,9 +4185,10 @@ mod tests {
             vec!["Own"],
             "`__all__` states the whole export set"
         );
-        assert!(
-            type_aliases(types, "typing.MutableSet").is_empty(),
-            "a name `__all__` withholds is not re-exported"
+        assert_eq!(
+            type_aliases(types, "typing.MutableSet"),
+            ["_impl.MutableSet"],
+            "__all__ withholds the wildcard alias, not the source module's explicit binding"
         );
     }
 
@@ -4005,7 +4234,7 @@ mod tests {
         assert_eq!(module_members(members, "shim2"), vec!["MutableSet", "Own"]);
         assert_eq!(
             type_aliases(types, "typing.MutableSet"),
-            ["shim.MutableSet", "shim2.MutableSet"],
+            ["_impl.MutableSet", "shim.MutableSet", "shim2.MutableSet"],
             "every module in the chain names the declaring class"
         );
         assert_eq!(type_aliases(types, "_impl.Own"), ["shim.Own", "shim2.Own"]);

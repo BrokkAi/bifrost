@@ -1071,6 +1071,8 @@ impl Validator {
             && summary.conditional_result_refinements.is_empty()
             && summary.conditional_indirect_writes.is_empty()
             && summary.normal_return_refinements.is_empty()
+            && summary.normal_return_type_refinements.is_empty()
+            && summary.class_decorator_identity.is_none()
             && !summary.normal_continuation_absent
             && summary.completeness != Completeness::Complete
         {
@@ -1139,6 +1141,20 @@ impl Validator {
                     "normal_continuation_absent conflicts with normal-return refinements",
                 );
             }
+            if !summary.normal_return_type_refinements.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.normal_return_type_refinements"),
+                    "normal_continuation_absent conflicts with normal-return type refinements",
+                );
+            }
+            if summary.class_decorator_identity.is_some() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.class_decorator_identity"),
+                    "normal_continuation_absent conflicts with a class decorator identity claim",
+                );
+            }
         }
 
         self.declared_effects(path, &summary.declared_effects);
@@ -1169,6 +1185,18 @@ impl Validator {
             &summary.conditional_indirect_writes,
         );
         self.normal_return_refinements(path, &summary.target, &summary.normal_return_refinements);
+        self.normal_return_type_refinements(
+            path,
+            &summary.target,
+            &summary.normal_return_type_refinements,
+        );
+        self.class_decorator_identity(
+            path,
+            &summary.target,
+            summary.completeness,
+            summary.covers_overrides,
+            summary.class_decorator_identity.as_ref(),
+        );
 
         let mut locations = HashMap::new();
         for (index, location) in summary.locations.iter().enumerate() {
@@ -2080,6 +2108,230 @@ impl Validator {
                         refinement.parameter_ordinal
                     ),
                 );
+            }
+        }
+    }
+
+    fn normal_return_type_refinements(
+        &mut self,
+        path: &str,
+        target: &AuthoredProcedureTarget,
+        refinements: &[AuthoredNormalReturnTypeRefinement],
+    ) {
+        if refinements.len() > MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_TYPE_REFINEMENTS {
+            self.error(
+                "limit.summary_normal_return_type_refinements",
+                format!("{path}.normal_return_type_refinements"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_TYPE_REFINEMENTS} normal-return type refinements"
+                ),
+            );
+        }
+        let mut seen = HashMap::new();
+        for (index, refinement) in refinements.iter().enumerate() {
+            let refinement_path = format!("{path}.normal_return_type_refinements[{index}]");
+            if refinement.required_receiver_members.len()
+                > MAX_NORMAL_RETURN_TYPE_REFINEMENT_RECEIVER_MEMBERS
+            {
+                self.error(
+                    "limit.normal_return_type_refinement_receiver_members",
+                    format!("{refinement_path}.required_receiver_members"),
+                    format!(
+                        "normal-return type refinement declares more than {MAX_NORMAL_RETURN_TYPE_REFINEMENT_RECEIVER_MEMBERS} required receiver members"
+                    ),
+                );
+            }
+            if !refinement.required_receiver_members.is_empty() && !target.has_receiver {
+                self.error(
+                    "summary.required_receiver_members_without_receiver",
+                    format!("{refinement_path}.required_receiver_members"),
+                    "required receiver members need a receiver-bearing procedure target",
+                );
+            }
+            let mut seen_receiver_members = HashSet::new();
+            for (member_index, member) in refinement.required_receiver_members.iter().enumerate() {
+                let member_path =
+                    format!("{refinement_path}.required_receiver_members[{member_index}]");
+                self.language_identifier(&member_path, member);
+                if !seen_receiver_members.insert(member.as_str()) {
+                    self.error(
+                        "summary.duplicate_required_receiver_member",
+                        member_path,
+                        format!("required receiver member `{member}` is duplicated"),
+                    );
+                }
+            }
+            for (field, ordinal) in [
+                ("parameter_ordinal", refinement.parameter_ordinal),
+                (
+                    "class_parameter_ordinal",
+                    refinement.class_parameter_ordinal,
+                ),
+            ] {
+                if ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                    self.error(
+                        "summary.invalid_parameter_ordinal",
+                        format!("{refinement_path}.{field}"),
+                        format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                    );
+                } else if ordinal >= target.parameter_count {
+                    self.error(
+                        "summary.parameter_ordinal_out_of_range",
+                        format!("{refinement_path}.{field}"),
+                        format!(
+                            "parameter ordinal {} is outside parameter_count {}",
+                            ordinal, target.parameter_count
+                        ),
+                    );
+                } else if target.variadic && target.parameter_count.checked_sub(1) == Some(ordinal)
+                {
+                    self.error(
+                        "summary.unsupported_variadic_tail_reference",
+                        format!("{refinement_path}.{field}"),
+                        format!(
+                            "normal-return type refinement cannot reference variadic tail ordinal {}",
+                            ordinal
+                        ),
+                    );
+                }
+            }
+            if refinement.parameter_ordinal == refinement.class_parameter_ordinal {
+                self.error(
+                    "summary.same_normal_return_type_refinement_parameter",
+                    refinement_path.clone(),
+                    "normal-return type refinement subject and class parameters must differ",
+                );
+            }
+            let key = refinement.parameter_ordinal;
+            if let Some((class_parameter_ordinal, first_path)) = seen.insert(
+                key,
+                (refinement.class_parameter_ordinal, refinement_path.clone()),
+            ) {
+                if class_parameter_ordinal == refinement.class_parameter_ordinal {
+                    self.error(
+                        "summary.duplicate_normal_return_type_refinement",
+                        refinement_path,
+                        format!("normal-return type refinement duplicates {first_path}"),
+                    );
+                } else {
+                    self.error(
+                        "summary.conflicting_normal_return_type_refinement",
+                        format!("{path}.normal_return_type_refinements[{index}].class_parameter_ordinal"),
+                        format!(
+                            "class parameter ordinal conflicts with {first_path}.class_parameter_ordinal"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn class_decorator_identity(
+        &mut self,
+        path: &str,
+        target: &AuthoredProcedureTarget,
+        completeness: Completeness,
+        covers_overrides: bool,
+        identity: Option<&AuthoredClassDecoratorIdentity>,
+    ) {
+        let Some(identity) = identity else {
+            return;
+        };
+        let identity_path = format!("{path}.class_decorator_identity");
+        if completeness != Completeness::Complete {
+            self.error(
+                "summary.class_decorator_identity_requires_complete",
+                format!("{identity_path}.direct"),
+                "a class decorator identity claim requires a complete procedure summary",
+            );
+        }
+        if target.has_receiver {
+            self.error(
+                "summary.class_decorator_identity_receiver_target",
+                format!("{identity_path}.direct"),
+                "a class decorator identity target must not require a receiver",
+            );
+        }
+        if covers_overrides {
+            self.error(
+                "summary.class_decorator_identity_covers_overrides",
+                format!("{identity_path}.direct"),
+                "a class decorator identity claim cannot cover receiver overrides",
+            );
+        }
+        if !identity.direct && identity.factory_keywords.is_none() {
+            self.error(
+                "summary.empty_class_decorator_identity",
+                &identity_path,
+                "a class decorator identity claim must be direct or describe factory keywords",
+            );
+        }
+        if identity.direct {
+            let accepts_implicit_class = if target.variadic {
+                target
+                    .parameter_count
+                    .checked_sub(1)
+                    .is_some_and(|minimum| minimum <= 1)
+            } else {
+                target.parameter_count == 1
+            };
+            if !accepts_implicit_class {
+                self.error(
+                    "summary.class_decorator_identity_arity",
+                    format!("{identity_path}.direct"),
+                    "a direct class decorator must accept exactly the implicit class argument",
+                );
+            }
+        }
+        let Some(keywords) = &identity.factory_keywords else {
+            return;
+        };
+        if keywords.len() > MAX_CLASS_DECORATOR_FACTORY_KEYWORDS {
+            self.error(
+                "limit.class_decorator_factory_keywords",
+                format!("{identity_path}.factory_keywords"),
+                format!(
+                    "class decorator identity declares more than {MAX_CLASS_DECORATOR_FACTORY_KEYWORDS} factory keywords"
+                ),
+            );
+        }
+        let mut seen_names = HashSet::new();
+        for (index, keyword) in keywords.iter().enumerate() {
+            let keyword_path = format!("{identity_path}.factory_keywords[{index}]");
+            if keyword.name.is_empty() {
+                self.error(
+                    "summary.empty_class_decorator_factory_keyword",
+                    format!("{keyword_path}.name"),
+                    "class decorator factory keyword names must be non-empty",
+                );
+            }
+            self.language_identifier(&format!("{keyword_path}.name"), &keyword.name);
+            if !seen_names.insert(keyword.name.as_str()) {
+                self.error(
+                    "summary.duplicate_class_decorator_factory_keyword",
+                    format!("{keyword_path}.name"),
+                    format!(
+                        "class decorator factory keyword `{}` is duplicated",
+                        keyword.name
+                    ),
+                );
+            }
+            if keyword.allowed_values.is_empty() {
+                self.error(
+                    "summary.empty_class_decorator_factory_allowed_values",
+                    format!("{keyword_path}.allowed_values"),
+                    "class decorator factory keyword allowed_values must be non-empty",
+                );
+            }
+            let mut seen_values = HashSet::new();
+            for (value_index, value) in keyword.allowed_values.iter().enumerate() {
+                if !seen_values.insert(*value) {
+                    self.error(
+                        "summary.duplicate_class_decorator_factory_allowed_value",
+                        format!("{keyword_path}.allowed_values[{value_index}]"),
+                        format!("class decorator factory allowed value `{value}` is duplicated"),
+                    );
+                }
             }
         }
     }

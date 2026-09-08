@@ -16,11 +16,12 @@ use super::{
     dispatch::PreparedWorkspaceDispatchSession, heap::points_to_capability_surface_is_incomplete,
 };
 use crate::analyzer::semantic::{
-    AbstractObject, CallSiteHandle, CandidateCoverage, DispatchCandidate, DispatchResult,
-    HeapOracle, ObservationPhase, OracleCallContext, OracleCandidate, PointsToResult,
+    AbstractObject, CallSiteHandle, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
+    DispatchCandidate, DispatchResult, EvidenceCompleteness, HeapOracle, LengthDelimitedDigest,
+    ObservationPhase, OracleCallContext, OracleCandidate, PointsToResult, ProofStatus,
     SemanticArtifact, SemanticBudgetExceeded, SemanticBudgetScopeIdentity, SemanticCapability,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, SourceSpan,
-    ValueAtPoint, ValueHandle,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
+    SourceSpan, StableDigest, ValueAtPoint, ValueHandle,
 };
 
 /// A lazy file-window dispatch session over one immutable semantic artifact.
@@ -429,38 +430,41 @@ const fn projected_source_coverage(
     }
 }
 
-/// The answer digest [`WorkspaceSemanticOracle::dispatch_at_source_in_artifact`]
-/// would record for a source range that located exactly `call`.
+/// The answer digest the exact handle-keyed dispatch funnel records for
+/// `call`.
 ///
-/// This is what lets the handle-keyed dispatch funnel record a read that
-/// [`crate::analyzer::read_verification::replay_lookup`] can replay: replay
-/// goes through the source range, so the recording has to state its answer in
-/// the source range's terms. `source_call_sites` selects the narrowest
-/// containing mapping, so a range that is exactly one call's own span locates
-/// that call and no other, and the range answer is that call's answer with the
-/// source seam's coverage rule applied to it.
+/// Procedure-local replay resolves the structured relative-range address back
+/// to exactly one [`CallSiteHandle`] and calls [`DispatchOracle::resolve_call`]
+/// directly. Its answer therefore uses the procedure-dispatch domain and
+/// stable target lineages, not the artifact-wide source projection's identity
+/// terms.
 ///
 /// The materialization quality is `Complete` by construction here: the caller
 /// holds a `CallSiteHandle` into an artifact that materialized.
-pub(crate) fn one_call_dispatch_answer_digest(
+#[doc(hidden)]
+pub fn one_call_dispatch_answer_digest(
     call: &CallSiteHandle,
     outcome: &SemanticOutcome<DispatchResult>,
 ) -> crate::analyzer::semantic::ids::StableDigest {
+    let quality = SourceOutcomeQuality::from_outcome(outcome);
     let Some(dispatch) = outcome.available_value() else {
-        return dispatch_answer_digest(None);
+        return procedure_dispatch_answer_digest(quality, None);
     };
     let coverage = projected_source_coverage(
-        SourceOutcomeQuality::from_outcome(outcome),
+        quality,
         dispatch.coverage().is_truncated(),
         dispatch.coverage().is_exhaustive(),
     );
-    dispatch_answer_digest(Some(&SourceDispatchResult {
-        observations: Box::new([SourceDispatchObservation {
-            call: call.clone(),
-            dispatch: dispatch.clone(),
-        }]),
-        coverage,
-    }))
+    procedure_dispatch_answer_digest(
+        quality,
+        Some(&SourceDispatchResult {
+            observations: Box::new([SourceDispatchObservation {
+                call: call.clone(),
+                dispatch: dispatch.clone(),
+            }]),
+            coverage,
+        }),
+    )
 }
 
 /// The replayable question "dispatch at this range of this artifact".
@@ -476,6 +480,35 @@ pub(crate) fn dispatch_question(
         artifact.key().path().as_str(),
         artifact.key().public_fingerprint(),
         range,
+    )
+}
+
+/// The replayable question for one handle-keyed procedure-local dispatch.
+///
+/// Unlike [`dispatch_question`], this address excludes the artifact source
+/// revision and measures the call range from the owning procedure's start.
+/// That is the exact scope a procedure summary needs: another declaration in
+/// the same file may move both absolute ranges without changing this call.
+pub(crate) fn procedure_dispatch_question(
+    call: &CallSiteHandle,
+    range: Range,
+) -> Option<crate::analyzer::read_ledger::LookupQuestion> {
+    let procedure = call.procedure();
+    let procedure_start = procedure.semantics().locator().anchor().span().start_byte() as usize;
+    let start_byte = range.start_byte.checked_sub(procedure_start)?;
+    let end_byte = range.end_byte.checked_sub(procedure_start)?;
+    Some(
+        crate::analyzer::read_ledger::LookupQuestion::procedure_call_site(
+            procedure.artifact().key().path().as_str(),
+            procedure
+                .artifact()
+                .key()
+                .procedure_lineage_fingerprint(procedure.semantics().locator().declaration()),
+            crate::analyzer::read_ledger::ProcedureCallSiteLocator {
+                start_byte,
+                end_byte,
+            },
+        ),
     )
 }
 
@@ -511,6 +544,286 @@ pub(crate) fn dispatch_answer_digest(
         hasher.value(&(procedure as u64).to_be_bytes());
     }
     crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish())
+}
+
+/// Canonical answer for a procedure-local dispatch question.
+///
+/// This is the complete stable projection that can affect direct-call binding
+/// or planning. Query-local provenance is deliberately absent: it certifies
+/// the answer inside one oracle request but cannot be replayed across arenas.
+/// Stable target lineages exclude whole-artifact source revisions; consumers
+/// that enter those bodies record their semantic artifacts or summary
+/// dependencies separately.
+fn procedure_dispatch_answer_digest(
+    quality: SourceOutcomeQuality,
+    result: Option<&SourceDispatchResult>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-answer:v2");
+    push_source_outcome_quality(&mut digest, quality);
+    let Some(result) = result else {
+        digest.push(b"unavailable");
+        return digest.finish();
+    };
+    digest.push(b"available");
+    digest.push(result.coverage().label().as_bytes());
+    assert_eq!(
+        result.observations().len(),
+        1,
+        "a procedure dispatch answer belongs to exactly one procedure-local call question"
+    );
+    digest.push(
+        &u64::try_from(result.observations().len())
+            .expect("one procedure dispatch observation fits in u64")
+            .to_le_bytes(),
+    );
+    digest.push(
+        procedure_dispatch_observation_digest(result.observations()[0].dispatch()).as_bytes(),
+    );
+    digest.finish()
+}
+
+fn procedure_dispatch_observation_digest(dispatch: &DispatchResult) -> StableDigest {
+    let mut candidates = dispatch
+        .candidates()
+        .iter()
+        .map(procedure_dispatch_candidate_digest)
+        .collect::<Vec<_>>();
+    let mut boundaries = dispatch
+        .boundaries()
+        .iter()
+        .map(procedure_dispatch_boundary_digest)
+        .collect::<Vec<_>>();
+    procedure_dispatch_components_digest(
+        dispatch.coverage(),
+        dispatch.complete_receiver_hint_refinable(),
+        &mut candidates,
+        &mut boundaries,
+    )
+}
+
+fn procedure_dispatch_components_digest(
+    coverage: CandidateCoverage,
+    complete_receiver_hint_refinable: bool,
+    candidates: &mut [StableDigest],
+    boundaries: &mut [StableDigest],
+) -> StableDigest {
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-observation:v2");
+    digest.push(coverage.label().as_bytes());
+    digest.push(&[u8::from(complete_receiver_hint_refinable)]);
+
+    candidates.sort_unstable();
+    digest.push(
+        &u64::try_from(candidates.len())
+            .expect("procedure dispatch candidate count fits in u64")
+            .to_le_bytes(),
+    );
+    for candidate in candidates {
+        digest.push(candidate.as_bytes());
+    }
+
+    boundaries.sort_unstable();
+    digest.push(
+        &u64::try_from(boundaries.len())
+            .expect("procedure dispatch boundary count fits in u64")
+            .to_le_bytes(),
+    );
+    for boundary in boundaries {
+        digest.push(boundary.as_bytes());
+    }
+    digest.finish()
+}
+
+fn procedure_dispatch_candidate_digest(candidate: &DispatchCandidate) -> StableDigest {
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-candidate:v2");
+    let target = candidate.target();
+    digest.push(
+        target
+            .artifact()
+            .key()
+            .procedure_lineage_fingerprint(target.semantics().locator().declaration())
+            .as_bytes(),
+    );
+    push_proof(&mut digest, candidate.proof());
+    push_completeness(&mut digest, candidate.completeness());
+    let mut excluded = candidate
+        .excluded_targets()
+        .iter()
+        .map(|target| {
+            target
+                .artifact()
+                .key()
+                .procedure_lineage_fingerprint(target.semantics().locator().declaration())
+        })
+        .collect::<Vec<_>>();
+    excluded.sort_unstable();
+    digest.push(
+        &u64::try_from(excluded.len())
+            .expect("excluded dispatch target count fits in u64")
+            .to_le_bytes(),
+    );
+    for target in excluded {
+        digest.push(target.as_bytes());
+    }
+    digest.finish()
+}
+
+fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> StableDigest {
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost-read-ledger:procedure-dispatch-boundary:v2");
+    digest.push(boundary.kind.label().as_bytes());
+    match &boundary.kind {
+        DispatchBoundaryKind::External(target) => {
+            push_optional_locator(&mut digest, target.as_ref());
+        }
+        DispatchBoundaryKind::Unmaterialized(target) => {
+            push_locator(&mut digest, target);
+        }
+        DispatchBoundaryKind::Deferred { target, kind } => {
+            push_locator(&mut digest, target);
+            digest.push(kind.label().as_bytes());
+        }
+        DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::Truncated => {}
+    }
+
+    match boundary.external_callee_identity() {
+        Some(identity) => {
+            digest.push(b"external-callee-identity");
+            digest.push(identity.language().config_label().as_bytes());
+            digest.push(identity.owner_fqn().as_bytes());
+            digest.push(identity.member().as_bytes());
+        }
+        None => digest.push(b"no-external-callee-identity"),
+    }
+
+    match boundary.exact_external_target() {
+        Some(target) => {
+            digest.push(b"exact-external-target");
+            digest.push(target.artifact().public_fingerprint().as_bytes());
+            push_locator(&mut digest, target.procedure());
+            digest.push(target.symbol().as_bytes());
+            digest.push(&[u8::from(target.has_receiver())]);
+            let contract = target.formal_contract();
+            digest.push(contract.label().as_bytes());
+            digest.push(
+                &u64::try_from(contract.parameters().len())
+                    .expect("exact external formal count fits in u64")
+                    .to_le_bytes(),
+            );
+            for parameter in contract.parameters() {
+                digest.push(parameter.label().as_bytes());
+                push_optional_bytes(&mut digest, parameter.declared_type().map(str::as_bytes));
+                digest.push(&[u8::from(parameter.optional())]);
+                digest.push(&[u8::from(parameter.repeated())]);
+            }
+            match contract.arity() {
+                Some(arity) => {
+                    digest.push(b"arity");
+                    digest.push(
+                        &u64::try_from(arity.required())
+                            .expect("required callable arity fits in u64")
+                            .to_le_bytes(),
+                    );
+                    digest.push(
+                        &u64::try_from(arity.total())
+                            .expect("total callable arity fits in u64")
+                            .to_le_bytes(),
+                    );
+                    digest.push(&[u8::from(arity.is_repeated())]);
+                }
+                None => digest.push(b"no-arity"),
+            }
+        }
+        None => digest.push(b"no-exact-external-target"),
+    }
+
+    match boundary.unmaterialized_external_target() {
+        Some(target) => {
+            digest.push(b"unmaterialized-external-target");
+            push_locator(&mut digest, target.locator());
+            digest.push(target.owner_fqn().as_bytes());
+            digest.push(target.member().as_bytes());
+            digest.push(&target.arity().to_le_bytes());
+            digest.push(&[u8::from(target.has_receiver())]);
+            digest.push(&[u8::from(target.has_resolver_owned_call_shape())]);
+            push_optional_bytes(
+                &mut digest,
+                target.normalized_static_owner().map(str::as_bytes),
+            );
+        }
+        None => digest.push(b"no-unmaterialized-external-target"),
+    }
+    push_proof(&mut digest, &boundary.proof);
+    push_completeness(&mut digest, &boundary.completeness);
+    digest.finish()
+}
+
+fn push_source_outcome_quality(digest: &mut LengthDelimitedDigest, quality: SourceOutcomeQuality) {
+    match quality {
+        SourceOutcomeQuality::Complete => digest.push(b"complete"),
+        SourceOutcomeQuality::Ambiguous => digest.push(b"ambiguous"),
+        SourceOutcomeQuality::Unproven => digest.push(b"unproven"),
+        SourceOutcomeQuality::Unknown => digest.push(b"unknown"),
+        SourceOutcomeQuality::Unsupported(capability) => {
+            digest.push(b"unsupported");
+            digest.push(capability.label().as_bytes());
+        }
+        SourceOutcomeQuality::ExceededBudget(exceeded) => {
+            digest.push(b"exceeded-budget");
+            digest.push(exceeded.dimension().label().as_bytes());
+            digest.push(
+                &u64::try_from(exceeded.limit())
+                    .expect("semantic budget limit fits in u64")
+                    .to_le_bytes(),
+            );
+            digest.push(
+                &u64::try_from(exceeded.attempted())
+                    .expect("semantic budget attempt fits in u64")
+                    .to_le_bytes(),
+            );
+        }
+        SourceOutcomeQuality::Cancelled => digest.push(b"cancelled"),
+    }
+}
+
+fn push_proof(digest: &mut LengthDelimitedDigest, proof: &ProofStatus) {
+    digest.push(proof.label().as_bytes());
+    if let ProofStatus::Unproven(reason) = proof {
+        digest.push(reason.as_bytes());
+    }
+}
+
+fn push_completeness(digest: &mut LengthDelimitedDigest, completeness: &EvidenceCompleteness) {
+    digest.push(completeness.label().as_bytes());
+    if let EvidenceCompleteness::Partial(reason) = completeness {
+        digest.push(reason.as_bytes());
+    }
+}
+
+fn push_optional_locator(digest: &mut LengthDelimitedDigest, locator: Option<&SemanticLocator>) {
+    match locator {
+        Some(locator) => {
+            digest.push(b"locator");
+            push_locator(digest, locator);
+        }
+        None => digest.push(b"no-locator"),
+    }
+}
+
+fn push_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
+    locator.push_anchor_free_procedure_declaration_identity(digest);
+}
+
+fn push_optional_bytes(digest: &mut LengthDelimitedDigest, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            digest.push(b"some");
+            digest.push(value);
+        }
+        None => digest.push(b"none"),
+    }
 }
 
 /// One call site addressed by a source range together with its exact dispatch
@@ -1705,6 +2018,195 @@ mod tests {
         assert_eq!(
             by_source_result.target_candidates().count(),
             by_handle_result.candidates().len()
+        );
+    }
+
+    #[test]
+    fn procedure_dispatch_v2_is_order_independent_and_rotates_coverage_and_refinement() {
+        let candidate_a = StableDigest::sha256(b"candidate-a");
+        let candidate_b = StableDigest::sha256(b"candidate-b");
+        let boundary_a = StableDigest::sha256(b"boundary-a");
+        let boundary_b = StableDigest::sha256(b"boundary-b");
+        let baseline = procedure_dispatch_components_digest(
+            CandidateCoverage::Open,
+            false,
+            &mut [candidate_a, candidate_b],
+            &mut [boundary_a, boundary_b],
+        );
+        assert_eq!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Open,
+                false,
+                &mut [candidate_b, candidate_a],
+                &mut [boundary_b, boundary_a],
+            ),
+            "candidate and boundary iteration order is not answer semantics"
+        );
+        assert_ne!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Truncated,
+                false,
+                &mut [candidate_a, candidate_b],
+                &mut [boundary_a, boundary_b],
+            ),
+            "coverage is a binding-relevant axis"
+        );
+        assert_ne!(
+            baseline,
+            procedure_dispatch_components_digest(
+                CandidateCoverage::Open,
+                true,
+                &mut [candidate_a, candidate_b],
+                &mut [boundary_a, boundary_b],
+            ),
+            "the typed feedback-refinement exception is a planning-relevant axis"
+        );
+    }
+
+    #[test]
+    fn procedure_dispatch_v2_rotates_candidate_and_boundary_evidence_axes() {
+        let fixture =
+            typescript_fixture(&[("call.ts", CALL_SOURCE), ("external.ts", BATCH_CALL_SOURCE)]);
+        let call_file = ProjectFile::new(fixture.project_root(), "call.ts");
+        let call_artifact = artifact_for(&fixture, &call_file);
+        let (call, _) = only_call_site(&call_artifact);
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = oracle
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("workspace call dispatch");
+        let dispatch = outcome
+            .available_value()
+            .expect("workspace call retains dispatch");
+        let candidate = dispatch
+            .candidates()
+            .first()
+            .expect("workspace call has one target");
+        let candidate_digest = procedure_dispatch_candidate_digest(candidate);
+
+        let mut changed_proof = candidate.clone();
+        changed_proof.proof = ProofStatus::Unproven("changed proof".into());
+        assert_ne!(
+            candidate_digest,
+            procedure_dispatch_candidate_digest(&changed_proof)
+        );
+        let mut changed_completeness = candidate.clone();
+        changed_completeness.completeness =
+            EvidenceCompleteness::Partial("changed completeness".into());
+        assert_ne!(
+            candidate_digest,
+            procedure_dispatch_candidate_digest(&changed_completeness)
+        );
+        let excluded = call_artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.id() != candidate.target().id())
+            .and_then(|procedure| call_artifact.procedure_handle(procedure.id()))
+            .expect("the caller is a distinct exclusion identity");
+        let mut changed_exclusions = candidate.clone();
+        changed_exclusions.excluded_targets = Box::new([excluded]);
+        assert_ne!(
+            candidate_digest,
+            procedure_dispatch_candidate_digest(&changed_exclusions)
+        );
+
+        let external_file = ProjectFile::new(fixture.project_root(), "external.ts");
+        let external_artifact = artifact_for(&fixture, &external_file);
+        let (external_call, _) = all_call_sites(&external_artifact)
+            .into_iter()
+            .next()
+            .expect("external fixture call");
+        let mut external_budget = SemanticBudget::default();
+        let external = oracle
+            .resolve_call(
+                &external_call,
+                &mut SemanticRequest::new(&mut external_budget, &cancellation),
+            )
+            .expect("external call dispatch");
+        let boundary = external
+            .available_value()
+            .and_then(|dispatch| dispatch.boundaries().first())
+            .expect("external call retains a boundary");
+        let boundary_digest = procedure_dispatch_boundary_digest(boundary);
+        let mut changed_boundary = boundary.clone();
+        changed_boundary.kind = DispatchBoundaryKind::Unresolved;
+        assert_ne!(
+            boundary_digest,
+            procedure_dispatch_boundary_digest(&changed_boundary),
+            "same empty target set and coverage with a different boundary must rotate"
+        );
+        let mut changed_boundary_proof = boundary.clone();
+        changed_boundary_proof.proof = ProofStatus::Unproven("changed boundary proof".into());
+        assert_ne!(
+            boundary_digest,
+            procedure_dispatch_boundary_digest(&changed_boundary_proof)
+        );
+        let mut changed_boundary_completeness = boundary.clone();
+        changed_boundary_completeness.completeness =
+            EvidenceCompleteness::Partial("changed boundary completeness".into());
+        assert_ne!(
+            boundary_digest,
+            procedure_dispatch_boundary_digest(&changed_boundary_completeness)
+        );
+    }
+
+    #[test]
+    fn procedure_dispatch_v2_rotates_quality_and_cannot_equal_a_v1_answer() {
+        let fixture = typescript_fixture(&[("call.ts", CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "call.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let (call, _) = only_call_site(&artifact);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .semantic_oracle_provider()
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("workspace dispatch");
+        let result = SourceDispatchResult {
+            observations: Box::new([SourceDispatchObservation {
+                call,
+                dispatch: outcome
+                    .available_value()
+                    .expect("workspace call retains dispatch")
+                    .clone(),
+            }]),
+            coverage: CandidateCoverage::Exhaustive,
+        };
+        let complete =
+            procedure_dispatch_answer_digest(SourceOutcomeQuality::Complete, Some(&result));
+        assert_ne!(
+            complete,
+            procedure_dispatch_answer_digest(SourceOutcomeQuality::Ambiguous, Some(&result)),
+            "outcome quality changes direct-call binding status"
+        );
+
+        let mut legacy = crate::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-read-ledger:procedure-dispatch-answer:v1",
+        );
+        legacy.field("coverage", result.coverage().label().as_bytes());
+        let mut targets = result
+            .target_candidates()
+            .map(|candidate| {
+                let target = candidate.target();
+                target
+                    .artifact()
+                    .key()
+                    .procedure_lineage_fingerprint(target.semantics().locator().declaration())
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            legacy.value(target.as_bytes());
+        }
+        assert_ne!(
+            complete,
+            StableDigest::from_array(legacy.finish()),
+            "the v2 domain must invalidate every persisted v1 read answer"
         );
     }
 

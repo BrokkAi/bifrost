@@ -662,6 +662,16 @@ fn render_scan_usages_scope(
             "Note: {ignored} supplied path {label} blank or invalid."
         ));
     }
+    if !scope.unmatched_paths.is_empty() {
+        let more = scope
+            .unmatched_paths_omitted
+            .map(|count| format!(" (+{count} more)"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Note: these paths name no workspace file or directory and searched nothing: {}{more}. Check the spelling against the workspace tree.",
+            scope.unmatched_paths.join(", ")
+        ));
+    }
     if !scope.include_tests {
         lines.push(
             "Next step for absent results: retry with include_tests=true to include test usages."
@@ -1389,6 +1399,8 @@ mod tests {
             paths: Vec::new(),
             paths_omitted: None,
             ignored_paths: None,
+            unmatched_paths: Vec::new(),
+            unmatched_paths_omitted: None,
         };
         let scoped = crate::searchtools::ScanUsagesScope {
             session_subset: Some(crate::analyzer::SubsetCoverage { files: 12 }),
@@ -1422,6 +1434,8 @@ mod tests {
             paths: vec!["src/**/*.rs".to_string()],
             paths_omitted: None,
             ignored_paths: None,
+            unmatched_paths: Vec::new(),
+            unmatched_paths_omitted: None,
         };
 
         let ordinary = render_scan_usages_scope(&scope, false);

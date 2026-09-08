@@ -8,7 +8,7 @@ use crate::declarations::{
     CppVisitor, collect_cpp_identifiers, collect_cpp_includes, recover_quoted_includes,
 };
 use crate::graph::resolver::OrphanedNamespaceScopeIndex;
-use crate::graph::syntax::MacroReplacementField;
+use crate::graph::syntax::ObjectMacroReplacement;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
 use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
@@ -63,7 +63,7 @@ pub fn parse_cpp_file_with_object_macro_fields(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
-    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
 ) -> ParsedFile {
     let root = tree.root_node();
     let ancestry = ParentIndex::new(root);
@@ -200,7 +200,7 @@ fn parse_cpp_reading_with_object_macro_fields<'tree>(
     root: Node<'tree>,
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
-    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
 ) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
 
@@ -234,7 +234,7 @@ fn walk_cpp_declarations<'tree>(
     dialect: LanguageDialect,
     ancestry: &ParentIndex<'tree>,
     parsed: &mut ParsedFile,
-    object_macro_fields: HashMap<String, Vec<MacroReplacementField>>,
+    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
 ) {
     let mut visitor = CppVisitor {
         file,
@@ -244,6 +244,7 @@ fn walk_cpp_declarations<'tree>(
         recovered_class_sibling_scopes: HashMap::default(),
         consumed_fragment_regions: Vec::new(),
         orphaned_namespaces: OrphanedNamespaceScopeIndex::build(root, source),
+        partitioned_regions: Vec::new(),
         namespace_forward_scans: HashMap::default(),
         field_owners: None,
         recovery_captures: Vec::new(),

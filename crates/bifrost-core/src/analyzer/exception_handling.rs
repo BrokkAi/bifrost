@@ -13,6 +13,7 @@
 //! dispatches to the per-language detectors.
 
 use crate::analyzer::model::{ExceptionHandlingSmell, ExceptionSmellWeights};
+use crate::analyzer::tree_walk::{children_iter, push_children_reversed};
 use tree_sitter::Node;
 
 const EXCEPTION_EXCERPT_MAX_LEN: usize = 180;
@@ -91,11 +92,7 @@ pub fn collect_nodes_by_kind<'tree>(root: Node<'tree>, kind: &str) -> Vec<Node<'
         if node.kind() == kind {
             matches.push(node);
         }
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                pending.push(child);
-            }
-        }
+        push_children_reversed(node, &mut pending);
     }
     matches
 }
@@ -106,7 +103,7 @@ pub fn has_descendant_of_any_kind_inclusive(root: Node<'_>, kinds: &[&str]) -> b
         if kinds.contains(&node.kind()) {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }
@@ -119,7 +116,7 @@ pub fn has_descendant_of_kind(root: Node<'_>, kind: &str) -> bool {
         if node.kind() == kind {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }

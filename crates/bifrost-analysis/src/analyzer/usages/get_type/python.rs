@@ -180,4 +180,72 @@ def drive(car: Car):
             );
         }
     }
+
+    #[test]
+    fn facade_imported_class_identity_is_exact_and_budgeted() {
+        let source = "from facade import PublicWidget\n\ndef render(value: PublicWidget):\n    return value\n";
+        let files = [
+            ("widget.py", WIDGET_SOURCE),
+            (
+                "package/__init__.py",
+                "from widget import Widget as PublicWidget\n",
+            ),
+            ("facade.py", "from package import PublicWidget\n"),
+            ("consumer.py", source),
+        ];
+        let start = source.find("return value").expect("return") + "return ".len();
+        let result = resolve(
+            &files,
+            "consumer.py",
+            start,
+            "value".len(),
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        );
+        assert_eq!(result.status, TypeLookupStatus::Resolved, "{result:#?}");
+        assert_eq!(result.types.len(), 1, "{result:#?}");
+        assert_eq!(result.types[0].fqn, "widget.Widget", "{result:#?}");
+
+        let limited = resolve(
+            &files,
+            "consumer.py",
+            start,
+            "value".len(),
+            ReceiverAnalysisBudget::tiny(),
+        );
+        assert_eq!(
+            limited.status,
+            TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+            "{limited:#?}",
+        );
+        assert!(limited.types.is_empty(), "{limited:#?}");
+    }
+
+    #[test]
+    fn later_class_declaration_replaces_a_wildcard_import_binding() {
+        let start = CONSUMER_SOURCE.find("return value").expect("return") + "return ".len();
+        for (declaration, expected) in [
+            (
+                "from external import *\nclass Widget: pass\n",
+                vec!["widget.Widget"],
+            ),
+            ("class Widget: pass\nfrom external import *\n", vec![]),
+        ] {
+            let result = resolve(
+                &[("widget.py", declaration), ("consumer.py", CONSUMER_SOURCE)],
+                "consumer.py",
+                start,
+                "value".len(),
+                INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            );
+            assert_eq!(
+                result
+                    .types
+                    .iter()
+                    .map(|ty| ty.fqn.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{declaration}: {result:#?}",
+            );
+        }
+    }
 }

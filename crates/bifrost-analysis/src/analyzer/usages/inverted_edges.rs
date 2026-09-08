@@ -33,6 +33,7 @@ pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     UsageReferenceCounts, first_precise,
 };
 
+use crate::analyzer::common::declaration_language_for_file;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::parsed_tree::{
     ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
@@ -531,11 +532,18 @@ where
     K: NodeKey,
     S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
+    // A closed or inbound domain groups its callees by terminal name, and where
+    // a rendered qualified name's terminal segment starts is decided by the
+    // spelling rules of the language that named the declaration -- the same
+    // rules that rendered it. One edge build covers one language, so the
+    // scanned file answers for its callees (#3033).
+    let language = declaration_language_for_file(file);
     let input = match domain {
         EdgeNodeDomain::Closed(nodes) => FileEdgeScanInput::new(
             &parsed.tree,
             parsed.source.as_str(),
             &parsed.line_starts,
+            language,
             nodes,
             &declarations,
         ),
@@ -550,6 +558,7 @@ where
             &parsed.tree,
             parsed.source.as_str(),
             &parsed.line_starts,
+            language,
             callees,
             &declarations,
         ),
@@ -725,6 +734,7 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::Language;
     use crate::text_utils::find_line_index_for_offset;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::classify_reference_node;
@@ -1066,7 +1076,14 @@ mod tests {
             definitions: HashMap::default(),
         };
 
-        let input = FileEdgeScanInput::new(&tree, "", &line_starts, &nodes, &declarations);
+        let input = FileEdgeScanInput::new(
+            &tree,
+            "",
+            &line_starts,
+            Language::TypeScript,
+            &nodes,
+            &declarations,
+        );
         let mut per_file: PerFileEdges<UsageNodeKey> = PerFileEdges::default();
         per_file.record_kind(
             &input,
@@ -1103,7 +1120,14 @@ mod tests {
             enclosers: vec![(0, source.len(), caller.clone())],
             definitions: HashMap::default(),
         };
-        let input = FileEdgeScanInput::new_inbound(&tree, source, &[0], &callees, &declarations);
+        let input = FileEdgeScanInput::new_inbound(
+            &tree,
+            source,
+            &[0],
+            Language::TypeScript,
+            &callees,
+            &declarations,
+        );
         assert!(input.may_match_terminal("target"));
         assert!(!input.may_match_terminal("unknown"));
 
@@ -1126,6 +1150,65 @@ mod tests {
         );
         assert_eq!(file.unproven_inbound[&callee].len(), 1);
         assert!(!file.unproven_inbound.contains_key("app.other"));
+    }
+
+    /// #3033: the callee terminal index is grouped by the *language's* own
+    /// segment rules, so a Scala backtick-quoted name carrying a dot
+    /// (`` scalaz.`zio.ZIO` ``, one interned segment) is indexed and matched
+    /// under the spelling a Scala source site writes. Splitting the rendered
+    /// name on `.` indexed it under `` ZIO` ``, which no source site can spell,
+    /// so every reference to such a class failed the pre-filter.
+    ///
+    /// The parsed tree is irrelevant to terminal matching -- the index is built
+    /// from the callee set alone -- so this reuses the TypeScript grammar the
+    /// module already links.
+    #[test]
+    fn callee_terminals_follow_the_language_segment_rules() {
+        let source = "function caller() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let quoted = "scalaz.`zio.ZIO`".to_string();
+        let plain = "scalaz.Plain".to_string();
+        let symbolic = "scalaz.Plain.::".to_string();
+        let callees = HashSet::from_iter([quoted.clone(), plain.clone(), symbolic.clone()]);
+        let declarations = FileDeclarations {
+            enclosers: vec![(0, source.len(), "scalaz.Uses".to_string())],
+            definitions: HashMap::default(),
+        };
+        let input = FileEdgeScanInput::new_inbound(
+            &tree,
+            source,
+            &[0],
+            Language::Scala,
+            &callees,
+            &declarations,
+        );
+
+        assert!(
+            input.may_match_terminal("`zio.ZIO`"),
+            "the quoted dotted name must be indexed under its own single segment"
+        );
+        assert!(
+            !input.may_match_terminal("ZIO`"),
+            "and never under the tail of a `.`-split of the rendered name"
+        );
+        assert!(input.may_match_terminal("Plain"));
+        assert!(
+            input.may_match_terminal("::"),
+            "a symbolic Scala member is its own terminal segment"
+        );
+
+        let mut file = PerFileEdges::default();
+        file.record_unproven_name(&input, "`zio.ZIO`", 10, 19);
+        assert_eq!(
+            file.unproven_inbound.keys().collect::<Vec<_>>(),
+            vec![&quoted],
+            "record_unproven_name must reach the quoted callee: {:?}",
+            file.unproven_inbound
+        );
     }
 
     fn usage_edges_cache() -> UsageEdgesCache {

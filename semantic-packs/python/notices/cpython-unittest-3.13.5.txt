@@ -1,0 +1,48 @@
+CPython unittest assertion behavior
+
+The reviewed behavior contract is derived from CPython 3.13.5:
+
+Project: https://github.com/python/cpython
+Source: https://github.com/python/cpython/blob/v3.13.5/Lib/unittest/case.py
+Revision: v3.13.5
+Pinned source URL: https://raw.githubusercontent.com/python/cpython/v3.13.5/Lib/unittest/case.py
+Pinned source SHA-256: ce2499ee6f34a9e6e24f11ae1e2f02e71a3529cca03d5488f0bdcfea8d5d8481
+
+Compatibility review also checked the same method in the official CPython
+source at these supported-version tags:
+
+v3.10.0  https://raw.githubusercontent.com/python/cpython/v3.10.0/Lib/unittest/case.py
+          SHA-256 9daf46554125616b3dc9cbf68e2ad6d12c9e8380d9261aeea4a8bd07a178c3b1
+v3.11.0  https://raw.githubusercontent.com/python/cpython/v3.11.0/Lib/unittest/case.py
+          SHA-256 96301736f066147208ef01e3bbed2aee365d9ded11ba6ea407a998fcfd2e2b6f
+v3.12.0  https://raw.githubusercontent.com/python/cpython/v3.12.0/Lib/unittest/case.py
+          SHA-256 45bac6d80a4fc3a0dea8340a80681e30b263f017b4a5002cb8f489a632e0f987
+v3.14.0  https://raw.githubusercontent.com/python/cpython/v3.14.0/Lib/unittest/case.py
+          SHA-256 a79b422eec43c90352e25a54bce8cee106811974c8dea9405199e4caa689ffe9
+
+TestCase.assertIsInstance(self, obj, cls, msg=None) returns normally only
+when isinstance(obj, cls) is true; otherwise it raises AssertionError. The
+optional message does not affect the assertion. The summary therefore refines
+obj by cls only on the normal continuation and does not claim coverage of
+workspace overrides. Because the failing branch reports through `self.fail`,
+both arity-specific summaries require the receiver member `fail`; this is an
+explicit dependency on the external TestCase owner rather than an override
+claim. All five reviewed tags retain this normal-continuation and `self.fail`
+contract. CPython 3.14 adds tuple-specific failure-message formatting, which
+does not change the refinement or the required receiver member. The authored
+pack therefore activates for CPython `>=3.10.0, <3.15.0`; release measurement
+remains pinned to `=3.13.5`.
+
+The pack also reviews the CPython `dataclasses.dataclass` decorator identity
+contract from the official source:
+
+Source: https://github.com/python/cpython/blob/v3.13.5/Lib/dataclasses.py
+Pinned source URL: https://raw.githubusercontent.com/python/cpython/v3.13.5/Lib/dataclasses.py
+Pinned source SHA-256: 18b8b97f6c43ece379793745dfd505ed713a4c86bc6babdcdec593101b5f4399
+
+In CPython 3.13.5, `dataclass(cls=None, /, *, ...)` applies its wrapper to the
+class for both `@dataclass` and `@dataclass(...)`. `_process_class` returns the
+original class while `slots=False`; `_add_slots` constructs a replacement class
+when `slots=True`. The reviewed pack therefore permits only literal boolean
+factory options, rejects `slots=True` and `weakref_slot=True`, and does not
+claim any generated member surface.

@@ -1,19 +1,20 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledConcurrencyEffect,
-    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
-    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget,
-    CompiledLockMode, CompiledNormalReturnRefinement, CompiledOperationPrecondition,
-    CompiledPackManifest, CompiledPayload, CompiledPredicateProofEffect, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledResultContract, CompiledResultMemberContract,
-    CompiledResultPredicate, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation,
-    CompiledSummaryOutput, CompiledSummaryTransfer, CompiledSummaryValuePreservation,
-    CompiledSummaryValueTransfer, CompiledSummaryValueTransferKind,
-    CompiledSummaryValueTransferLimitation, CompiledSummaryValueTransferLimitationKind,
-    CompiledSummaryValueTransferOperation, DecodeLimits, canonical_json, content_digest,
-    manifest_content_digest, manifest_semantic_digest, payload_inventory, routing_keys,
-    semantic_digest, stored_digest,
+    ArtifactEncoding, ArtifactError, CompiledAtomicOperation, CompiledClassDecoratorIdentity,
+    CompiledClassDecoratorKeyword, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
+    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
+    CompiledDeclaredEffectTiming, CompiledIndirectWriteTarget, CompiledLockMode,
+    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
+    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
+    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
+    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
+    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
+    CompiledSummaryLocationKind, CompiledSummaryMoveInvalidation, CompiledSummaryOutput,
+    CompiledSummaryTransfer, CompiledSummaryValuePreservation, CompiledSummaryValueTransfer,
+    CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
+    CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
+    DecodeLimits, canonical_json, content_digest, manifest_content_digest,
+    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -334,6 +335,22 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     summary.conditional_indirect_writes.dedup();
                     summary.normal_return_refinements.sort();
                     summary.normal_return_refinements.dedup();
+                    for refinement in &mut summary.normal_return_type_refinements {
+                        refinement.required_receiver_members.sort();
+                        refinement.required_receiver_members.dedup();
+                    }
+                    summary.normal_return_type_refinements.sort();
+                    summary.normal_return_type_refinements.dedup();
+                    if let Some(identity) = &mut summary.class_decorator_identity
+                        && let Some(keywords) = &mut identity.factory_keywords
+                    {
+                        for keyword in keywords.iter_mut() {
+                            keyword.allowed_values.sort_unstable();
+                            keyword.allowed_values.dedup();
+                        }
+                        keywords.sort();
+                        keywords.dedup();
+                    }
                 }
                 summaries.sort_by(|left, right| left.id.cmp(&right.id));
             }
@@ -553,6 +570,29 @@ fn compile_procedure_summary(
                 predicate: compile_result_predicate(refinement.predicate),
             })
             .collect(),
+        normal_return_type_refinements: summary
+            .normal_return_type_refinements
+            .iter()
+            .map(|refinement| CompiledNormalReturnTypeRefinement {
+                parameter_ordinal: refinement.parameter_ordinal,
+                class_parameter_ordinal: refinement.class_parameter_ordinal,
+                required_receiver_members: refinement.required_receiver_members.clone(),
+            })
+            .collect(),
+        class_decorator_identity: summary.class_decorator_identity.as_ref().map(|identity| {
+            CompiledClassDecoratorIdentity {
+                direct: identity.direct,
+                factory_keywords: identity.factory_keywords.as_ref().map(|keywords| {
+                    keywords
+                        .iter()
+                        .map(|keyword| CompiledClassDecoratorKeyword {
+                            name: keyword.name.clone(),
+                            allowed_values: keyword.allowed_values.clone(),
+                        })
+                        .collect()
+                }),
+            }
+        }),
     })
 }
 

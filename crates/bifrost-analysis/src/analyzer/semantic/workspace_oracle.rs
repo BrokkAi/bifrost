@@ -6,6 +6,8 @@ mod heap;
 mod source;
 mod value_flow;
 
+#[doc(hidden)]
+pub use dispatch::PreparedWorkspaceDispatchPool;
 pub use dispatch::procedures_for_definition_with_limits;
 pub(super) use dispatch::semantic_locator_work;
 #[cfg(test)]
@@ -13,7 +15,8 @@ pub(super) use dispatch::{
     CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
 };
 pub(crate) use dispatch::{
-    exact_call_range, exact_source_for_procedure, external_constant_field_read_discharges_gap,
+    PreparedWorkspaceDispatchSession, exact_call_range, exact_source_for_procedure,
+    external_constant_field_read_discharges_gap,
 };
 // Policy lowering resolves authored source ranges to procedures through these,
 // so they are public where the rest of dispatch stays crate-internal.
@@ -24,10 +27,10 @@ pub use dispatch::{
 pub use source::PreparedSourceDispatchSession;
 // Read-set verification replays dispatch on the head workspace and must fold
 // the answer with the same helper the recording used, never a second copy.
+#[doc(hidden)]
+pub use source::one_call_dispatch_answer_digest;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
-pub(crate) use source::{
-    dispatch_answer_digest, dispatch_question, one_call_dispatch_answer_digest,
-};
+pub(crate) use source::{dispatch_answer_digest, procedure_dispatch_question};
 // The value-flow plan re-applies these relevance rules when it decides
 // whether a snapshot's residual openness was refined by its own complete
 // call resolutions (#1952).
@@ -43,7 +46,9 @@ use std::sync::Arc;
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ResolvedActiveSemanticModels, SemanticModelOverlay,
 };
-use crate::analyzer::{DispatchHierarchyExpansion, WorkspaceAnalyzer};
+use crate::analyzer::{
+    DispatchHierarchyExpansion, PythonAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
+};
 
 use super::{DispatchHints, OracleLimits};
 
@@ -56,6 +61,9 @@ pub struct WorkspaceSemanticOracle<'a> {
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
     dispatch_hints: Arc<DispatchHints>,
+    // Capture the bounded workspace authority once per provider, including an
+    // incomplete answer. A failed scan is not repeatedly retried per call.
+    python_saved_defaults_available: Option<bool>,
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
@@ -130,7 +138,15 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             semantic_model_overlay,
             active_semantic_models,
             dispatch_hints: Arc::new(dispatch_hints),
+            python_saved_defaults_available: resolve_analyzer::<PythonAnalyzer>(
+                workspace.analyzer(),
+            )
+            .and_then(PythonAnalyzer::saved_default_arguments_available),
         }
+    }
+
+    pub(crate) const fn python_saved_defaults_available(&self) -> Option<bool> {
+        self.python_saved_defaults_available
     }
 
     pub const fn workspace(&self) -> &'a WorkspaceAnalyzer {

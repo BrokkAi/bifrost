@@ -8,6 +8,7 @@
 //! the crate line.
 
 use crate::analyzer::common::{is_unparseable_source, language_for_file};
+use crate::analyzer::tree_walk::{children_iter, named_children_iter};
 use crate::analyzer::{
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer, Language,
     ProjectFile, parser_language_for_path,
@@ -787,7 +788,7 @@ fn cpp_statement_count(body: Node<'_>) -> u32 {
         if kind == "declaration" || (kind.ends_with("_statement") && !is_wrapper) {
             statements = statements.saturating_add(1);
         }
-        pending.extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+        pending.extend(named_children_iter(node));
     }
     statements
 }
@@ -844,7 +845,7 @@ fn contains_comment(root: Node<'_>) -> bool {
         if node.kind().ends_with("comment") || node.kind() == "comment" {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }
@@ -881,7 +882,7 @@ fn contains_logging_call(root: Node<'_>, source: &str) -> bool {
         {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }
@@ -912,7 +913,7 @@ fn call_target_is_logging(call: Node<'_>, source: &str) -> bool {
         {
             identifiers.push((node.start_byte(), name));
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     identifiers.sort_unstable_by_key(|(start, _)| *start);
     identifiers
@@ -953,7 +954,7 @@ fn contains_call_named(root: Node<'_>, source: &str, target: &str) -> bool {
         {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }
@@ -975,7 +976,7 @@ fn contains_call_named_before(
         {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }
@@ -990,7 +991,7 @@ fn contains_identifier(root: Node<'_>, source: &str, target: &str) -> bool {
         {
             return true;
         }
-        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+        pending.extend(children_iter(node));
     }
     false
 }

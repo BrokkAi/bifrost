@@ -2,9 +2,11 @@ use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
-    Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+    CallableArity, CallableOverrideModifier, CodeUnit, CodeUnitType, DispatchExtensibility,
+    ParameterMetadata, ProjectFile, Range, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeName,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::{Node, Tree};
@@ -696,7 +698,13 @@ impl<'a> ScalaVisitor<'a> {
                 .with_recorded_type_parameters(scala_declared_type_parameter_names(
                     node,
                     self.source,
-                )),
+                ))
+                // Trait-ness is what makes a member found on this template an
+                // `implements` edge rather than an `overrides` edge (#1721),
+                // and a bounded consumer cannot recover it from the indexed
+                // identity: a class, an object and a trait are all
+                // `CodeUnitType::Class` rows.
+                .with_class_like_interface(node.kind() == "trait_definition"),
         );
         let mut raw_supertypes = Vec::new();
         if let Some(enum_owner) = scala_full_enum_case_owner_supertype(node, self.source) {
@@ -757,6 +765,11 @@ impl<'a> ScalaVisitor<'a> {
             self.parsed.add_signature_with_metadata(
                 constructor,
                 scala_class_signature_metadata(signature, node, self.source)
+                    // The synthetic primary constructor is a constructor, and
+                    // saying so is what keeps it out of method families
+                    // (#1721) as a proven exclusion rather than as a member
+                    // whose modifiers nobody read.
+                    .with_callable_modifiers(false, true, scala_declared_visibility(node))
                     .with_dispatch_extensibility(DispatchExtensibility::Closed),
             );
             self.visit_class_parameter_fields(node, package_name, &code_unit);
@@ -1099,11 +1112,25 @@ impl<'a> ScalaVisitor<'a> {
         );
         let dispatch_extensibility =
             scala_callable_dispatch_extensibility(parent.as_ref(), raw_name);
+        // Scala has no `static` keyword: a member of an `object` is the
+        // singleton's, and the declaration walk already marks an object by
+        // giving its code unit a `$`-suffixed short name, which is the same
+        // fact `scala_callable_dispatch_extensibility` reads one line above.
+        let owner_is_object = parent
+            .as_ref()
+            .is_some_and(|owner| owner.short_name().ends_with('$'));
+        let is_constructor = raw_name == "this";
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
         let signature = signature.unwrap_or_else(|| scala_function_signature(node, self.source));
         let metadata =
             scala_function_signature_metadata(signature, node, self.source, dispatch_extensibility)
+                .with_callable_modifiers(
+                    owner_is_object,
+                    is_constructor,
+                    scala_declared_visibility(node),
+                )
+                .with_callable_override_modifier(scala_override_modifier(node))
                 .with_extension_receiver_type(extension_receiver_type.map(|receiver_type| {
                     scala_node_text(receiver_type, self.source)
                         .trim()
@@ -1723,11 +1750,94 @@ fn scala_signature_metadata_for_parameter_nodes(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    let mut metadata = SignatureMetadata::new(signature, parameters);
+    let mut metadata = SignatureMetadata::new(signature, parameters)
+        .with_callable_parameter_types(scala_parameter_type_spellings(parameter_nodes, source));
     if let Some(arity) = scala_callable_arity(parameter_nodes.first().copied()) {
         metadata = metadata.with_callable_arity(arity);
     }
     metadata
+}
+
+/// Each declared parameter's own written type spelling, in declaration order
+/// across every parameter list.
+///
+/// Read from each parameter node's tree-sitter `type` field, never by slicing
+/// the rendered signature. A parameter with no `type` field contributes an
+/// empty spelling rather than disappearing, because dropping it would shift
+/// every later parameter's index.
+///
+/// Every parameter list is included, not only the first. Recorded arity counts
+/// the first list alone (Scala's curried lists each have their own), so the
+/// spellings are strictly the more discriminating of the two; method families
+/// (#1721) use them only to separate candidates that already agree on name and
+/// arity, where more discrimination is never wrong.
+///
+/// These are spellings, not resolved or erased types: `def run(x: T)` records
+/// `T`, whatever `T` turns out to be.
+fn scala_parameter_type_spellings(parameter_nodes: &[Node<'_>], source: &str) -> Vec<String> {
+    let mut spellings = Vec::new();
+    for list in parameter_nodes {
+        let mut cursor = list.walk();
+        for parameter in list.named_children(&mut cursor) {
+            if !matches!(parameter.kind(), "parameter" | "class_parameter") {
+                continue;
+            }
+            spellings.push(
+                parameter
+                    .child_by_field_name("type")
+                    .map(|type_node| scala_node_text(type_node, source).trim().to_string())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    spellings
+}
+
+/// The declared visibility of one Scala declaration, in the shared vocabulary.
+///
+/// Scala's `private[pkg]` and `protected[pkg]` qualifiers narrow *where* the
+/// member is visible; they never widen it, so both collapse onto the
+/// unqualified form for the purposes every consumer of this field has.
+fn scala_declared_visibility(node: Node<'_>) -> DeclaredVisibility {
+    match scala_declaration_visibility(node) {
+        ScalaDeclarationVisibility::NonApi => DeclaredVisibility::Private,
+        ScalaDeclarationVisibility::Protected => DeclaredVisibility::Protected,
+        ScalaDeclarationVisibility::Public => DeclaredVisibility::Public,
+    }
+}
+
+/// Which member of the override-modifier family this Scala declaration writes.
+///
+/// Scala requires `override` only when redefining a *concrete* member; a
+/// member implementing an abstract one legitimately writes nothing. The
+/// recorded value is therefore corroborating evidence for a method family
+/// (#1721), never the gate that C# and Kotlin make it. `abstract` on a member
+/// is Scala's `def` with no body, which the declaration walk does not model
+/// here, so only the two written keywords are recorded.
+///
+/// Read from the declaration's `modifiers` subtree by node kind, never by
+/// scanning the rendered signature.
+fn scala_override_modifier(node: Node<'_>) -> CallableOverrideModifier {
+    let mut cursor = node.walk();
+    for modifiers in node.named_children(&mut cursor) {
+        if modifiers.kind() != "modifiers" {
+            continue;
+        }
+        // `override` and `abstract` are anonymous tokens of the `modifiers`
+        // node in tree-sitter-scala (only `access_modifier`, `open_modifier`
+        // and friends are named), and an anonymous token's `kind()` is the
+        // literal itself. Matching on `kind()` is therefore reading the tree,
+        // not scanning text.
+        let mut modifier_cursor = modifiers.walk();
+        for modifier in modifiers.children(&mut modifier_cursor) {
+            match modifier.kind() {
+                "override" => return CallableOverrideModifier::Override,
+                "abstract" => return CallableOverrideModifier::Abstract,
+                _ => {}
+            }
+        }
+    }
+    CallableOverrideModifier::NotDeclared
 }
 
 fn scala_callable_arity(parameters: Option<Node<'_>>) -> Option<CallableArity> {

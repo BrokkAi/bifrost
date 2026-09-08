@@ -104,9 +104,10 @@ pub(crate) use reusable_summary::{
 };
 pub(crate) use snapshot_replay::SnapshotReplayProvider;
 pub use summary::{
-    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
-    SummaryCallCycle, SummaryCalledProcedures, SummaryPointSeed, SummarySolveInput,
-    solve_with_reusable_end_summaries, solve_with_summaries,
+    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError,
+    ReusableSummaryProvider, SummaryCallCycle, SummaryCalledProcedures, SummaryPointSeed,
+    SummarySolveInput, solve_with_reusable_end_summaries,
+    solve_with_reusable_root_and_end_summaries, solve_with_summaries,
 };
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,

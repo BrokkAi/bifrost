@@ -69,6 +69,8 @@ code_query_labeled_enum! {
         ValueFlowProviderFailed => "value_flow_provider_failed",
         ValueFlowSolverBudgetExhausted => "value_flow_solver_budget_exhausted",
         ValueFlowWitnessTruncated => "value_flow_witness_truncated",
+        TypeFlowWitnessTruncated => "type_flow_witness_truncated",
+        TypeFlowWitnessUnavailable => "type_flow_witness_unavailable",
         UnresolvedTaintResultReference => "unresolved_taint_result_reference",
         TaintRegistrationStale => "taint_registration_stale",
         TaintHandleStale => "taint_handle_stale",
@@ -122,6 +124,7 @@ code_query_labeled_enum! {
         EffectDerivationIncomplete => "effect_derivation_incomplete",
         ResultContractDerivationIncomplete => "result_contract_derivation_incomplete",
         EffectBudgetExhausted => "effect_budget_exhausted",
+        CallShapeCoverageIncomplete => "call_shape_coverage_incomplete",
         JsxProjectionIncomplete => "jsx_projection_incomplete",
         ResultLimitReached => "result_limit_reached",
         BroadQuery => "broad_query",
@@ -907,7 +910,32 @@ impl CodeQueryValueFlowWork {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeQueryTypeFlowWork {
+    /// Fresh whole-workspace field-slot indexes built by this query.
     pub field_slot_builds: u64,
+    /// Ready indexes reused through the workspace's in-memory acquisition path.
+    /// Query-local reuse does not reacquire the index and is not counted here.
+    pub field_slot_memory_hits: u64,
+    /// Complete durable indexes loaded and accepted for this query.
+    pub field_slot_persistence_hits: u64,
+    /// Durable lookups for which no matching index was present.
+    pub field_slot_persistence_misses: u64,
+    /// Durable rows found but rejected by exact validation or replay admission.
+    pub field_slot_persistence_rejections: u64,
+    /// Fresh indexes inserted into the durable store by this query.
+    pub field_slot_publications: u64,
+    /// Complete finding-free root projections loaded and accepted from the
+    /// durable store by this query.
+    pub root_result_persistence_hits: u64,
+    /// Durable root-projection lookups for which no exact key was present.
+    pub root_result_persistence_misses: u64,
+    /// Durable root-projection rows found but rejected by validation or
+    /// hydration limits.
+    pub root_result_persistence_rejections: u64,
+    /// Operational failures while reading or writing durable root projections.
+    pub root_result_store_failures: u64,
+    /// Fresh finding-free root projections inserted into the durable store by
+    /// this query.
+    pub root_result_publications: u64,
     pub solves: u64,
     pub cache_hits: u64,
     pub snapshot_cache_hits: u64,
@@ -918,9 +946,24 @@ pub struct CodeQueryTypeFlowWork {
     pub binding_cache_misses: u64,
     pub summary_cache_hits: u64,
     pub summary_cache_misses: u64,
+    /// Exact Zero-entry root relations restored from reusable summaries.
+    pub root_summary_cache_hits: u64,
+    /// Restored root relations rejected because they did not carry a Meeting
+    /// for every sink in the current plan.
+    pub root_summary_observation_rejections: u64,
     pub published_summaries: u64,
+    #[serde(
+        skip_serializing_if = "brokk_bifrost_flow::type_flow::TypeFlowSummaryProfile::is_empty"
+    )]
+    pub summary_profile: brokk_bifrost_flow::type_flow::TypeFlowSummaryProfile,
     pub class_set_rows: u64,
     pub finding_rows: u64,
+    pub witnesses: u64,
+    pub omitted_witnesses: u64,
+    pub witness_expansions: u64,
+    pub witness_steps: u64,
+    pub witness_bytes: u64,
+    pub witness_truncated: bool,
     pub incomplete_roots: u64,
     pub failed_solves: u64,
 }
@@ -928,6 +971,16 @@ pub struct CodeQueryTypeFlowWork {
 impl CodeQueryTypeFlowWork {
     pub const fn is_empty(&self) -> bool {
         self.field_slot_builds == 0
+            && self.field_slot_memory_hits == 0
+            && self.field_slot_persistence_hits == 0
+            && self.field_slot_persistence_misses == 0
+            && self.field_slot_persistence_rejections == 0
+            && self.field_slot_publications == 0
+            && self.root_result_persistence_hits == 0
+            && self.root_result_persistence_misses == 0
+            && self.root_result_persistence_rejections == 0
+            && self.root_result_store_failures == 0
+            && self.root_result_publications == 0
             && self.solves == 0
             && self.cache_hits == 0
             && self.snapshot_cache_hits == 0
@@ -938,9 +991,18 @@ impl CodeQueryTypeFlowWork {
             && self.binding_cache_misses == 0
             && self.summary_cache_hits == 0
             && self.summary_cache_misses == 0
+            && self.root_summary_cache_hits == 0
+            && self.root_summary_observation_rejections == 0
             && self.published_summaries == 0
+            && self.summary_profile.is_empty()
             && self.class_set_rows == 0
             && self.finding_rows == 0
+            && self.witnesses == 0
+            && self.omitted_witnesses == 0
+            && self.witness_expansions == 0
+            && self.witness_steps == 0
+            && self.witness_bytes == 0
+            && !self.witness_truncated
             && self.incomplete_roots == 0
             && self.failed_solves == 0
     }
@@ -950,6 +1012,36 @@ impl CodeQueryTypeFlowWork {
             field_slot_builds: self
                 .field_slot_builds
                 .saturating_sub(earlier.field_slot_builds),
+            field_slot_memory_hits: self
+                .field_slot_memory_hits
+                .saturating_sub(earlier.field_slot_memory_hits),
+            field_slot_persistence_hits: self
+                .field_slot_persistence_hits
+                .saturating_sub(earlier.field_slot_persistence_hits),
+            field_slot_persistence_misses: self
+                .field_slot_persistence_misses
+                .saturating_sub(earlier.field_slot_persistence_misses),
+            field_slot_persistence_rejections: self
+                .field_slot_persistence_rejections
+                .saturating_sub(earlier.field_slot_persistence_rejections),
+            field_slot_publications: self
+                .field_slot_publications
+                .saturating_sub(earlier.field_slot_publications),
+            root_result_persistence_hits: self
+                .root_result_persistence_hits
+                .saturating_sub(earlier.root_result_persistence_hits),
+            root_result_persistence_misses: self
+                .root_result_persistence_misses
+                .saturating_sub(earlier.root_result_persistence_misses),
+            root_result_persistence_rejections: self
+                .root_result_persistence_rejections
+                .saturating_sub(earlier.root_result_persistence_rejections),
+            root_result_store_failures: self
+                .root_result_store_failures
+                .saturating_sub(earlier.root_result_store_failures),
+            root_result_publications: self
+                .root_result_publications
+                .saturating_sub(earlier.root_result_publications),
             solves: self.solves.saturating_sub(earlier.solves),
             cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
             snapshot_cache_hits: self
@@ -976,11 +1068,28 @@ impl CodeQueryTypeFlowWork {
             summary_cache_misses: self
                 .summary_cache_misses
                 .saturating_sub(earlier.summary_cache_misses),
+            root_summary_cache_hits: self
+                .root_summary_cache_hits
+                .saturating_sub(earlier.root_summary_cache_hits),
+            root_summary_observation_rejections: self
+                .root_summary_observation_rejections
+                .saturating_sub(earlier.root_summary_observation_rejections),
             published_summaries: self
                 .published_summaries
                 .saturating_sub(earlier.published_summaries),
+            summary_profile: self.summary_profile.saturating_sub(earlier.summary_profile),
             class_set_rows: self.class_set_rows.saturating_sub(earlier.class_set_rows),
             finding_rows: self.finding_rows.saturating_sub(earlier.finding_rows),
+            witnesses: self.witnesses.saturating_sub(earlier.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_sub(earlier.omitted_witnesses),
+            witness_expansions: self
+                .witness_expansions
+                .saturating_sub(earlier.witness_expansions),
+            witness_steps: self.witness_steps.saturating_sub(earlier.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_sub(earlier.witness_bytes),
+            witness_truncated: self.witness_truncated && !earlier.witness_truncated,
             incomplete_roots: self
                 .incomplete_roots
                 .saturating_sub(earlier.incomplete_roots),
@@ -993,6 +1102,36 @@ impl CodeQueryTypeFlowWork {
             field_slot_builds: self
                 .field_slot_builds
                 .saturating_add(other.field_slot_builds),
+            field_slot_memory_hits: self
+                .field_slot_memory_hits
+                .saturating_add(other.field_slot_memory_hits),
+            field_slot_persistence_hits: self
+                .field_slot_persistence_hits
+                .saturating_add(other.field_slot_persistence_hits),
+            field_slot_persistence_misses: self
+                .field_slot_persistence_misses
+                .saturating_add(other.field_slot_persistence_misses),
+            field_slot_persistence_rejections: self
+                .field_slot_persistence_rejections
+                .saturating_add(other.field_slot_persistence_rejections),
+            field_slot_publications: self
+                .field_slot_publications
+                .saturating_add(other.field_slot_publications),
+            root_result_persistence_hits: self
+                .root_result_persistence_hits
+                .saturating_add(other.root_result_persistence_hits),
+            root_result_persistence_misses: self
+                .root_result_persistence_misses
+                .saturating_add(other.root_result_persistence_misses),
+            root_result_persistence_rejections: self
+                .root_result_persistence_rejections
+                .saturating_add(other.root_result_persistence_rejections),
+            root_result_store_failures: self
+                .root_result_store_failures
+                .saturating_add(other.root_result_store_failures),
+            root_result_publications: self
+                .root_result_publications
+                .saturating_add(other.root_result_publications),
             solves: self.solves.saturating_add(other.solves),
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
             snapshot_cache_hits: self
@@ -1019,11 +1158,28 @@ impl CodeQueryTypeFlowWork {
             summary_cache_misses: self
                 .summary_cache_misses
                 .saturating_add(other.summary_cache_misses),
+            root_summary_cache_hits: self
+                .root_summary_cache_hits
+                .saturating_add(other.root_summary_cache_hits),
+            root_summary_observation_rejections: self
+                .root_summary_observation_rejections
+                .saturating_add(other.root_summary_observation_rejections),
             published_summaries: self
                 .published_summaries
                 .saturating_add(other.published_summaries),
+            summary_profile: self.summary_profile.saturating_add(other.summary_profile),
             class_set_rows: self.class_set_rows.saturating_add(other.class_set_rows),
             finding_rows: self.finding_rows.saturating_add(other.finding_rows),
+            witnesses: self.witnesses.saturating_add(other.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_add(other.omitted_witnesses),
+            witness_expansions: self
+                .witness_expansions
+                .saturating_add(other.witness_expansions),
+            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
+            witness_truncated: self.witness_truncated || other.witness_truncated,
             incomplete_roots: self.incomplete_roots.saturating_add(other.incomplete_roots),
             failed_solves: self.failed_solves.saturating_add(other.failed_solves),
         }
@@ -1101,5 +1257,159 @@ impl Default for CodeQueryTaintLimits {
             max_steps_per_witness: 4_096,
             max_witness_bytes: 4 * 1024 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod type_flow_summary_profile_tests {
+    use super::CodeQueryTypeFlowWork;
+
+    #[test]
+    fn profile_work_serializes_typed_summary_rejections() {
+        let empty = serde_json::to_value(CodeQueryTypeFlowWork::default())
+            .expect("empty type-flow work serializes");
+        assert!(empty.get("summary_profile").is_none());
+
+        let legacy: CodeQueryTypeFlowWork = serde_json::from_value(serde_json::json!({
+            "solves": 1
+        }))
+        .expect("a legacy profile without summary attribution deserializes");
+        assert!(legacy.summary_profile.is_empty());
+        assert_eq!(legacy.field_slot_memory_hits, 0);
+        assert_eq!(legacy.field_slot_persistence_hits, 0);
+        assert_eq!(legacy.field_slot_persistence_misses, 0);
+        assert_eq!(legacy.field_slot_persistence_rejections, 0);
+        assert_eq!(legacy.field_slot_publications, 0);
+        assert_eq!(legacy.root_result_persistence_hits, 0);
+        assert_eq!(legacy.root_result_persistence_misses, 0);
+        assert_eq!(legacy.root_result_persistence_rejections, 0);
+        assert_eq!(legacy.root_result_store_failures, 0);
+        assert_eq!(legacy.root_result_publications, 0);
+        assert_eq!(legacy.root_summary_cache_hits, 0);
+        assert_eq!(legacy.root_summary_observation_rejections, 0);
+
+        let mut work = CodeQueryTypeFlowWork::default();
+        work.summary_profile.lookup_relation = 3;
+        let json = serde_json::to_value(work).expect("type-flow work serializes");
+        assert_eq!(json["summary_profile"]["lookup_relation"], 3);
+    }
+
+    #[test]
+    fn field_slot_persistence_work_round_trips_and_composes() {
+        let cold = CodeQueryTypeFlowWork {
+            field_slot_builds: 1,
+            field_slot_persistence_misses: 1,
+            field_slot_publications: 1,
+            ..CodeQueryTypeFlowWork::default()
+        };
+        let warm = CodeQueryTypeFlowWork {
+            field_slot_memory_hits: 2,
+            field_slot_persistence_hits: 1,
+            field_slot_persistence_rejections: 1,
+            ..CodeQueryTypeFlowWork::default()
+        };
+
+        let combined = cold.saturating_add(warm);
+        assert!(!combined.is_empty());
+        assert_eq!(combined.saturating_sub(cold), warm);
+
+        let json = serde_json::to_value(combined).expect("field-slot work serializes");
+        assert_eq!(json["field_slot_memory_hits"], 2);
+        assert_eq!(json["field_slot_persistence_hits"], 1);
+        assert_eq!(json["field_slot_persistence_misses"], 1);
+        assert_eq!(json["field_slot_persistence_rejections"], 1);
+        assert_eq!(json["field_slot_publications"], 1);
+        assert_eq!(
+            serde_json::from_value::<CodeQueryTypeFlowWork>(json)
+                .expect("field-slot work deserializes"),
+            combined
+        );
+    }
+
+    #[test]
+    fn root_summary_work_round_trips_and_composes() {
+        let accepted = CodeQueryTypeFlowWork {
+            summary_cache_hits: 1,
+            root_summary_cache_hits: 1,
+            ..CodeQueryTypeFlowWork::default()
+        };
+        let rejected = CodeQueryTypeFlowWork {
+            summary_cache_hits: 1,
+            root_summary_cache_hits: 1,
+            root_summary_observation_rejections: 1,
+            ..CodeQueryTypeFlowWork::default()
+        };
+        let combined = accepted.saturating_add(rejected);
+        assert_eq!(combined.saturating_sub(accepted), rejected);
+        let json = serde_json::to_value(combined).expect("root summary work serializes");
+        assert_eq!(json["root_summary_cache_hits"], 2);
+        assert_eq!(json["root_summary_observation_rejections"], 1);
+        assert_eq!(
+            serde_json::from_value::<CodeQueryTypeFlowWork>(json)
+                .expect("root summary work deserializes"),
+            combined
+        );
+    }
+
+    #[test]
+    fn root_result_persistence_work_round_trips_and_composes() {
+        let lookup = CodeQueryTypeFlowWork {
+            root_result_persistence_hits: 2,
+            root_result_persistence_misses: 3,
+            root_result_persistence_rejections: 5,
+            root_result_store_failures: 7,
+            root_result_publications: 11,
+            ..CodeQueryTypeFlowWork::default()
+        };
+        let more = CodeQueryTypeFlowWork {
+            root_result_persistence_hits: 13,
+            root_result_persistence_misses: 17,
+            root_result_persistence_rejections: 19,
+            root_result_store_failures: 23,
+            root_result_publications: 29,
+            ..CodeQueryTypeFlowWork::default()
+        };
+
+        let combined = lookup.saturating_add(more);
+        assert!(!combined.is_empty());
+        assert_eq!(combined.saturating_sub(lookup), more);
+
+        let json = serde_json::to_value(combined).expect("root-result work serializes");
+        assert_eq!(json["root_result_persistence_hits"], 15);
+        assert_eq!(json["root_result_persistence_misses"], 20);
+        assert_eq!(json["root_result_persistence_rejections"], 24);
+        assert_eq!(json["root_result_store_failures"], 30);
+        assert_eq!(json["root_result_publications"], 40);
+        assert_eq!(
+            serde_json::from_value::<CodeQueryTypeFlowWork>(json)
+                .expect("root-result work deserializes"),
+            combined
+        );
+
+        let saturated = CodeQueryTypeFlowWork {
+            root_result_persistence_hits: u64::MAX,
+            root_result_persistence_misses: u64::MAX,
+            root_result_persistence_rejections: u64::MAX,
+            root_result_store_failures: u64::MAX,
+            root_result_publications: u64::MAX,
+            ..CodeQueryTypeFlowWork::default()
+        }
+        .saturating_add(CodeQueryTypeFlowWork {
+            root_result_persistence_hits: 1,
+            root_result_persistence_misses: 1,
+            root_result_persistence_rejections: 1,
+            root_result_store_failures: 1,
+            root_result_publications: 1,
+            ..CodeQueryTypeFlowWork::default()
+        });
+        assert_eq!(saturated.root_result_persistence_hits, u64::MAX);
+        assert_eq!(saturated.root_result_persistence_misses, u64::MAX);
+        assert_eq!(saturated.root_result_persistence_rejections, u64::MAX);
+        assert_eq!(saturated.root_result_store_failures, u64::MAX);
+        assert_eq!(saturated.root_result_publications, u64::MAX);
+        assert_eq!(
+            CodeQueryTypeFlowWork::default().saturating_sub(saturated),
+            CodeQueryTypeFlowWork::default()
+        );
     }
 }

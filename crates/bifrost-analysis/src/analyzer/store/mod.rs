@@ -1,3 +1,6 @@
+pub mod class_set_field_slots;
+pub mod class_set_procedure_surfaces;
+pub mod class_set_root_results;
 pub mod class_set_summaries;
 pub mod epoch;
 pub mod gc;
@@ -15,6 +18,8 @@ use std::cell::RefCell;
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
@@ -60,10 +65,11 @@ use crate::analyzer::structural::materialization::{
 };
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CallableArity, CallableLinkage, CodeUnit, CodeUnitType, CppFieldLinkage, CppTemplateMetadata,
-    DispatchExtensibility, ImportInfo, Language, PackageAnchor, ParameterMetadata, ProjectFile,
-    Range, RubyMethodDispatchMode, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, SummaryFileProjection,
+    CallableArity, CallableLinkage, CallableOverrideModifier, CodeUnit, CodeUnitType,
+    CppFieldLinkage, CppTemplateMetadata, DispatchExtensibility, ImportInfo, Language,
+    PackageAnchor, ParameterMetadata, ProjectFile, Range, RubyMethodDispatchMode,
+    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
+    StructuredTypeIdentity, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -93,6 +99,7 @@ pub enum StoreErrorKind {
     Generic,
     StaleGeneration,
     ResourceBound,
+    Corrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +130,13 @@ impl StoreError {
         }
     }
 
+    pub(crate) fn corrupt(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StoreErrorKind::Corrupt,
+        }
+    }
+
     pub fn kind(&self) -> StoreErrorKind {
         self.kind
     }
@@ -133,6 +147,10 @@ impl StoreError {
 
     pub fn is_resource_bound(&self) -> bool {
         self.kind == StoreErrorKind::ResourceBound
+    }
+
+    pub fn is_corrupt(&self) -> bool {
+        self.kind == StoreErrorKind::Corrupt
     }
 
     pub(crate) fn context(self, context: impl fmt::Display) -> Self {
@@ -483,6 +501,10 @@ pub struct AnalyzerStore {
     db_path: Option<PathBuf>,
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
+    #[cfg(any(test, feature = "test-support"))]
+    class_set_field_slot_operational_failure: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    class_set_root_result_operational_failure: AtomicBool,
     #[cfg(test)]
     parsed_blob_transaction_starts: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -544,6 +566,10 @@ struct ReaderPool {
 struct ReaderPoolState {
     idle: Vec<SelectedReader>,
     checked_out: usize,
+    /// Bumped by [`ReaderPool::recycle`] when this store's planner statistics
+    /// change. A reader stamped with an older value planned against statistics
+    /// that no longer exist and is dropped rather than reused.
+    statistics_epoch: u64,
 }
 
 /// A reader connection together with the workspace selection its temp schema
@@ -562,6 +588,9 @@ struct SelectedReader {
     /// afterwards, the selection materialized in
     /// `temp.selected_workspace_revisions`.
     selection: Option<WorkspaceSnapshots>,
+    /// The pool's [`ReaderPoolState::statistics_epoch`] when this connection
+    /// was opened.
+    statistics_epoch: u64,
 }
 
 /// What the workspace-selection path actually did, for the cost pins.
@@ -617,12 +646,16 @@ impl ReaderPool {
     }
 
     /// Take one of the pool's `capacity` checkouts, waiting while they are all
-    /// out, and hand back the idle reader it found if there was one.
+    /// out, and hand back the idle reader it found if there was one, together
+    /// with the statistics epoch the checkout is being made under.
     ///
     /// `None` means the caller owns a permit for a connection that does not
     /// exist yet and must open it, then either check it in or abandon the
-    /// checkout.
-    fn acquire(&self) -> Option<SelectedReader> {
+    /// checkout. The epoch is read here rather than after the open so that a
+    /// [`Self::recycle`] racing the open stamps the new connection stale: it
+    /// may have loaded its statistics before the refresh committed, and
+    /// discarding a reader that did not need it costs one reopen.
+    fn acquire(&self) -> (u64, Option<SelectedReader>) {
         let mut state = self
             .state
             .lock()
@@ -634,32 +667,59 @@ impl ReaderPool {
                 .expect("analyzer store reader pool poisoned");
         }
         state.checked_out += 1;
-        state.idle.pop()
+        (state.statistics_epoch, state.idle.pop())
     }
 
-    /// Return a reader and the checkout it was held under.
+    /// Return a reader and the checkout it was held under, unless the store's
+    /// planner statistics changed while it was out, in which case the
+    /// connection is closed instead of returned to the idle set.
     fn checkin(&self, reader: SelectedReader) {
-        {
+        let discarded = {
             let mut state = self
                 .state
                 .lock()
                 .expect("analyzer store reader pool poisoned");
-            // The gate is what makes this an assertion rather than a discard:
-            // `capacity` outstanding checkouts can return at most `capacity`
-            // readers, so an over-capacity idle set means the accounting broke.
-            assert!(
-                state.idle.len() < self.capacity,
-                "reader pool holds {} idle readers at capacity {}",
-                state.idle.len(),
-                self.capacity
-            );
-            state.idle.push(reader);
+            let discarded = if reader.statistics_epoch == state.statistics_epoch {
+                // The gate is what makes this an assertion rather than a discard:
+                // `capacity` outstanding checkouts can return at most `capacity`
+                // readers, so an over-capacity idle set means the accounting broke.
+                assert!(
+                    state.idle.len() < self.capacity,
+                    "reader pool holds {} idle readers at capacity {}",
+                    state.idle.len(),
+                    self.capacity
+                );
+                state.idle.push(reader);
+                None
+            } else {
+                Some(reader)
+            };
             state.checked_out = state
                 .checked_out
                 .checked_sub(1)
                 .expect("reader checkin without a matching checkout");
-        }
+            discarded
+        };
+        // Closing the connection happens outside the pool lock; a waiter should
+        // not queue behind another thread's `sqlite3_close`.
+        drop(discarded);
         self.reader_returned.notify_one();
+    }
+
+    /// Drop every idle reader and stale-mark the checked-out ones, so that the
+    /// next query plans against the statistics the store now holds.
+    ///
+    /// Reports how many idle connections were closed.
+    fn recycle(&self) -> usize {
+        let discarded = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("analyzer store reader pool poisoned");
+            state.statistics_epoch += 1;
+            std::mem::take(&mut state.idle)
+        };
+        discarded.len()
     }
 
     /// Return a checkout whose connection could not be opened.
@@ -915,6 +975,16 @@ pub(crate) struct MountedCandidateRow<I = FqIdentityHeader> {
 }
 
 pub(crate) type HydratedMountedCandidateRow = MountedCandidateRow<RelationalUnitFq>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountedCandidatePrimaryRangeRow<I = FqIdentityHeader> {
+    pub(crate) candidate: CandidateRow<I>,
+    pub(crate) rel_path: String,
+    pub(crate) primary_range: Option<Range>,
+}
+
+pub(crate) type HydratedMountedCandidatePrimaryRangeRow =
+    MountedCandidatePrimaryRangeRow<RelationalUnitFq>;
 
 #[derive(Debug, Default)]
 struct LimitedQueryByteBudget {
@@ -2145,6 +2215,10 @@ impl AnalyzerStore {
             db_path,
             lifetime: Arc::new(()),
             _ephemeral: ephemeral,
+            #[cfg(any(test, feature = "test-support"))]
+            class_set_field_slot_operational_failure: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            class_set_root_result_operational_failure: AtomicBool::new(false),
             #[cfg(test)]
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -2179,6 +2253,10 @@ impl AnalyzerStore {
             db_path: Some(db_path.to_path_buf()),
             lifetime: Arc::new(()),
             _ephemeral: None,
+            #[cfg(any(test, feature = "test-support"))]
+            class_set_field_slot_operational_failure: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            class_set_root_result_operational_failure: AtomicBool::new(false),
             #[cfg(test)]
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -2341,7 +2419,7 @@ impl AnalyzerStore {
     /// run concurrently against WAL snapshots; the writer connection is never
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
-    fn read_conn(&self) -> Result<ReaderGuard<'_>> {
+    pub(crate) fn read_conn(&self) -> Result<ReaderGuard<'_>> {
         let conn = self.checkout_read_conn()?;
         #[cfg(test)]
         let conn = {
@@ -2484,12 +2562,14 @@ impl AnalyzerStore {
             Some(path) => {
                 // The permit is held across the open, so a cold connection
                 // still counts against capacity while it is being built.
-                let reader = match pool.acquire() {
+                let (statistics_epoch, acquired) = pool.acquire();
+                let reader = match acquired {
                     Some(reader) => reader,
                     None => match open(path) {
                         Ok(conn) => SelectedReader {
                             conn,
                             selection: None,
+                            statistics_epoch,
                         },
                         Err(error) => {
                             pool.abandon_checkout();
@@ -2837,16 +2917,7 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let sql = format!(
-            "SELECT facts.blob_id, facts.source_bytes, facts.node_count, facts.role_count,
-                    facts.occurrence_role_count
-             FROM structural_fact_manifests AS facts
-             JOIN blob_meta AS meta
-               ON meta.blob_id = facts.blob_id
-             WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
-               AND facts.facts_version = ?3
-               AND {PARSED_BLOB_COMPLETE_CONDITION}"
-        );
+        let sql = structural_fact_manifest_sql();
         let manifest = tx
             .query_row(&sql, params![oid.to_string(), lang, facts_version], |row| {
                 Ok((
@@ -5016,6 +5087,55 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    /// Enumerate mounted declarations and their primary ranges through one
+    /// cancellation-aware read transaction. `None` is an incomplete answer,
+    /// never a partial prefix of the workspace inventory.
+    pub(crate) fn mounted_declaration_rows_with_primary_ranges_for_langs(
+        &self,
+        workspace_snapshots: &WorkspaceSnapshots,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<HydratedMountedCandidatePrimaryRangeRow>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = mounted_declaration_sql_with_primary_ranges();
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        let mut inspected = 0usize;
+        for lang in langs {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let mut rows = statement.query([lang])?;
+            while let Some(row) = rows.next()? {
+                inspected = inspected.saturating_add(1);
+                out.push(mounted_candidate_primary_range_row_from_row(row)?);
+                if inspected.is_multiple_of(CANDIDATE_ROWS_PER_CANCELLATION_POLL)
+                    && cancellation.is_cancelled()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        drop(statement);
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(out) = hydrate_candidate_rows(&tx, out, Some(cancellation))? else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(out))
+    }
+
     pub fn declaration_candidate_rows_with_primary_ranges_for_langs(
         &self,
         langs: &[String],
@@ -5827,6 +5947,25 @@ fn mounted_declaration_sql() -> String {
     )
 }
 
+fn mounted_declaration_sql_with_primary_ranges() -> String {
+    candidate_rows_sql_with_membership_projection_and_completeness(
+        "units",
+        "FROM live_mounted_declarations AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
+         LEFT JOIN unit_ranges AS primary_range
+           ON primary_range.blob_id = units.blob_id
+          AND primary_range.unit_key = units.unit_key
+          AND primary_range.ordinal = 0",
+        "units.lang = ?1",
+        "TRUE",
+        "TRUE",
+        "",
+        ", units.rel_path, primary_range.start_byte, primary_range.end_byte,
+           primary_range.start_line, primary_range.end_line",
+    )
+}
+
 /// `declaration_candidate_rows_by_identifier_prefix_for_langs`'s query. Named
 /// so `identifier_prefix_lookup_seeks_the_identifier_index` can plan it.
 fn identifier_prefix_candidate_sql() -> String {
@@ -6461,10 +6600,21 @@ fn batch_component_definition_candidate_sql(
                 "code_units AS units INDEXED BY idx_code_units_stable_normalized_tail"
             }
         };
+        // The request rows must drive the tail seek, the same constraint the
+        // anchored arm above states with its own CROSS JOIN (#2742). Left as a
+        // plain join, a store with no planner statistics reads `code_units`
+        // through the language prefix of the tail index alone -- every unit of
+        // the language -- builds an AUTOMATIC PARTIAL COVERING INDEX over the
+        // materialized request rows, and probes that index once per unit. That
+        // is the plan the `laravel/framework` store produces without
+        // statistics, and the one behind the 40 to 58 second calls in issue
+        // #3016's profile; with statistics SQLite picks the requests-first
+        // order on its own, so this directive only removes its freedom to pick
+        // the other one (issue #3030).
         component_definition_candidate_projection(
             &format!(
                 "FROM requests
-             JOIN {unit_source}
+             CROSS JOIN {unit_source}
                ON units.lang = ?2
              JOIN blobs AS keys
                ON keys.id = units.blob_id
@@ -11108,6 +11258,22 @@ impl CandidateRowContainer for MountedCandidateRow {
     }
 }
 
+impl CandidateRowContainer for MountedCandidatePrimaryRangeRow {
+    type Hydrated = HydratedMountedCandidatePrimaryRangeRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        MountedCandidatePrimaryRangeRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            rel_path: self.rel_path,
+            primary_range: self.primary_range,
+        }
+    }
+}
+
 impl CandidateRowContainer for DefinitionOrderCandidateRow {
     type Hydrated = HydratedDefinitionOrderCandidateRow;
 
@@ -11410,23 +11576,38 @@ fn candidate_primary_range_row_from_row(
 ) -> rusqlite::Result<CandidatePrimaryRangeRow> {
     // The relational FQ header occupies 12..=18; test-region evidence is 19
     // and the range follows at 20..=23.
-    let primary_range = match (
-        row.get::<_, Option<i64>>(20)?,
-        row.get::<_, Option<i64>>(21)?,
-        row.get::<_, Option<i64>>(22)?,
-        row.get::<_, Option<i64>>(23)?,
+    let primary_range = primary_range_from_row(row, 20)?;
+    Ok(CandidatePrimaryRangeRow {
+        candidate: candidate_row_from_row(row)?,
+        in_test_region: row.get::<_, i64>(19)? != 0,
+        primary_range,
+    })
+}
+
+fn primary_range_from_row(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Option<Range>> {
+    match (
+        row.get::<_, Option<i64>>(base)?,
+        row.get::<_, Option<i64>>(base + 1)?,
+        row.get::<_, Option<i64>>(base + 2)?,
+        row.get::<_, Option<i64>>(base + 3)?,
     ) {
-        (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
+        (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Ok(Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
             end_byte: i64_to_usize(end_byte).map_err(rusqlite_error_from_store)?,
             start_line: i64_to_usize(start_line).map_err(rusqlite_error_from_store)?,
             end_line: i64_to_usize(end_line).map_err(rusqlite_error_from_store)?,
-        }),
-        _ => None,
-    };
-    Ok(CandidatePrimaryRangeRow {
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn mounted_candidate_primary_range_row_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MountedCandidatePrimaryRangeRow> {
+    let primary_range = primary_range_from_row(row, 20)?;
+    Ok(MountedCandidatePrimaryRangeRow {
         candidate: candidate_row_from_row(row)?,
-        in_test_region: row.get::<_, i64>(19)? != 0,
+        rel_path: row.get(19)?,
         primary_range,
     })
 }
@@ -13113,11 +13294,13 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
 }
 
 fn class_set_summary_cascade_rows_sql(blob_id: &str) -> String {
+    let summary_predicate = class_set_summary_owner_or_surface_predicate("summary_cost", blob_id);
     let child_rows = [
         "class_set_summary_facts",
         "class_set_summary_exits",
         "class_set_summary_reached",
         "class_set_summary_dependencies",
+        "class_set_summary_dependency_sources",
         "class_set_summary_reads",
         "class_set_summary_charges",
     ]
@@ -13126,17 +13309,45 @@ fn class_set_summary_cascade_rows_sql(blob_id: &str) -> String {
             "(SELECT COUNT(*) FROM {table} AS child_cost
               JOIN class_set_summaries AS summary_cost
                 ON summary_cost.summary_id = child_cost.summary_id
-              WHERE summary_cost.owner_blob_id = {blob_id})"
+              WHERE {summary_predicate})"
         )
     })
     .join(" + ");
+    let surface_child_rows = [
+        "class_set_procedure_surface_calls",
+        "class_set_procedure_surface_bindings",
+        "class_set_procedure_surface_entered",
+        "class_set_procedure_surface_lexical_children",
+        "class_set_procedure_surface_reads",
+    ]
+    .map(|table| {
+        format!(
+            "(SELECT COUNT(*) FROM {table} AS child_cost
+              JOIN class_set_procedure_surfaces AS surface_cost
+                ON surface_cost.surface_id = child_cost.surface_id
+              WHERE surface_cost.owner_blob_id = {blob_id})"
+        )
+    })
+    .join(" + ");
+    let root_result_rows = format!(
+        "(SELECT COUNT(*) FROM class_set_finding_free_root_results AS root_result_cost
+          WHERE root_result_cost.owner_blob_id = {blob_id})
+         + (SELECT COUNT(*) FROM class_set_finding_free_root_rows AS child_cost
+            JOIN class_set_finding_free_root_results AS root_result_cost
+              ON root_result_cost.result_id = child_cost.result_id
+            WHERE root_result_cost.owner_blob_id = {blob_id})"
+    );
     format!(
         "(SELECT COUNT(*) FROM class_set_summaries AS summary_cost
-          WHERE summary_cost.owner_blob_id = {blob_id}) + {child_rows}"
+          WHERE {summary_predicate}) + {child_rows}
+          + (SELECT COUNT(*) FROM class_set_procedure_surfaces AS surface_cost
+             WHERE surface_cost.owner_blob_id = {blob_id}) + {surface_child_rows}
+          + {root_result_rows}"
     )
 }
 
 fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
+    let summary_predicate = class_set_summary_owner_or_surface_predicate("summary_cost", blob_id);
     let header = format!(
         "COALESCE((SELECT SUM(
             length(lookup_digest) + length(procedure_lineage)
@@ -13145,10 +13356,12 @@ fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
             + length(semantics_digest) + length(context_digest)
             + length(behavior_read_digest) + length(dependency_digest)
             + length(carrier_digest) + length(field_slots_digest)
+            + length(root_surface_digest)
+            + length(direct_calls_digest)
             + length(CAST(completion AS BLOB)) + length(CAST(budget_mode AS BLOB))
             + length(output_digest) + length(content_digest))
           FROM class_set_summaries AS summary_cost
-          WHERE summary_cost.owner_blob_id = {blob_id}), 0)"
+          WHERE {summary_predicate}), 0)"
     );
     let child_payloads = [
         (
@@ -13169,7 +13382,14 @@ fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
             "length(child_cost.callee_procedure_lineage)
              + length(child_cost.callee_entry_selector_digest)
              + length(child_cost.expected_output_digest)
-             + length(child_cost.consumed_child_lookup_digest)",
+             + length(child_cost.consumed_child_lookup_digest)
+             + length(CAST(child_cost.entry_kind AS BLOB))
+             + COALESCE(length(child_cost.entry_carrier_key), 0)
+             + COALESCE(length(child_cost.entry_source_behavior_digest), 0)",
+        ),
+        (
+            "class_set_summary_dependency_sources",
+            "length(child_cost.source_event_digest)",
         ),
         (
             "class_set_summary_reads",
@@ -13193,11 +13413,105 @@ fn class_set_summary_cascade_payload_bytes_sql(blob_id: &str) -> String {
             "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
               JOIN class_set_summaries AS summary_cost
                 ON summary_cost.summary_id = child_cost.summary_id
-              WHERE summary_cost.owner_blob_id = {blob_id}), 0)"
+              WHERE {summary_predicate}), 0)"
         )
     })
     .join(" + ");
-    format!("{header} + {child_payloads}")
+    let surface_header = format!(
+        "COALESCE((SELECT SUM(
+            length(surface_digest) + length(procedure_lineage)
+            + length(CAST(owner_rel_path AS BLOB)) + length(CAST(lang AS BLOB))
+            + length(artifact_public_identity) + length(artifact_content_identity)
+            + length(local_structure_digest) + length(behavior_read_digest)
+            + length(carrier_semantics_digest) + length(direct_calls_digest)
+            + length(CAST(completion AS BLOB)))
+          FROM class_set_procedure_surfaces AS surface_cost
+          WHERE surface_cost.owner_blob_id = {blob_id}), 0)"
+    );
+    let surface_child_payloads = [
+        (
+            "class_set_procedure_surface_calls",
+            "length(CAST(child_cost.dispatch_kind AS BLOB))
+             + length(CAST(child_cost.dispatch_status AS BLOB))
+             + COALESCE(length(CAST(child_cost.dispatch_capability AS BLOB)), 0)
+             + COALESCE(length(CAST(child_cost.dispatch_coverage AS BLOB)), 0)",
+        ),
+        (
+            "class_set_procedure_surface_bindings",
+            "length(CAST(child_cost.binding_status AS BLOB))
+             + COALESCE(length(CAST(child_cost.binding_capability AS BLOB)), 0)",
+        ),
+        (
+            "class_set_procedure_surface_entered",
+            "length(child_cost.target_procedure_lineage)
+             + length(CAST(child_cost.target_rel_path AS BLOB))
+             + length(CAST(child_cost.target_lang AS BLOB))
+             + length(child_cost.target_artifact_public_identity)
+             + length(child_cost.target_artifact_content_identity)
+             + length(child_cost.target_local_structure_digest)",
+        ),
+        (
+            "class_set_procedure_surface_lexical_children",
+            "length(child_cost.child_procedure_lineage)
+             + length(CAST(child_cost.child_rel_path AS BLOB))
+             + length(CAST(child_cost.child_lang AS BLOB))
+             + length(child_cost.child_artifact_public_identity)
+             + length(child_cost.child_artifact_content_identity)
+             + length(child_cost.child_local_structure_digest)",
+        ),
+        (
+            "class_set_procedure_surface_reads",
+            "length(child_cost.key_digest) + length(CAST(child_cost.kind AS BLOB))
+             + length(CAST(child_cost.family AS BLOB))
+             + length(CAST(child_cost.rel_path AS BLOB))
+             + length(child_cost.subject) + length(child_cost.digest)",
+        ),
+    ]
+    .map(|(table, payload)| {
+        format!(
+            "COALESCE((SELECT SUM({payload}) FROM {table} AS child_cost
+              JOIN class_set_procedure_surfaces AS surface_cost
+                ON surface_cost.surface_id = child_cost.surface_id
+              WHERE surface_cost.owner_blob_id = {blob_id}), 0)"
+        )
+    })
+    .join(" + ");
+    let root_result_header = format!(
+        "COALESCE((SELECT SUM(
+            length(root_public_digest) + length(CAST(owner_rel_path AS BLOB))
+            + length(CAST(lang AS BLOB)) + length(CAST(completion AS BLOB))
+            + length(content_digest))
+          FROM class_set_finding_free_root_results AS root_result_cost
+          WHERE root_result_cost.owner_blob_id = {blob_id}), 0)"
+    );
+    let root_result_children = format!(
+        "COALESCE((SELECT SUM(
+            length(CAST(child_cost.rel_path AS BLOB))
+            + length(CAST(child_cost.member AS BLOB))
+            + length(CAST(child_cost.atom_kind AS BLOB))
+            + COALESCE(length(CAST(child_cost.class_name AS BLOB)), 0)
+            + COALESCE(length(CAST(child_cost.unknown_reason AS BLOB)), 0)
+            + length(CAST(child_cost.class_set_status AS BLOB)))
+          FROM class_set_finding_free_root_rows AS child_cost
+          JOIN class_set_finding_free_root_results AS root_result_cost
+            ON root_result_cost.result_id = child_cost.result_id
+          WHERE root_result_cost.owner_blob_id = {blob_id}), 0)"
+    );
+    format!(
+        "{header} + {child_payloads} + {surface_header} + {surface_child_payloads}
+         + {root_result_header} + {root_result_children}"
+    )
+}
+
+fn class_set_summary_owner_or_surface_predicate(summary: &str, blob_id: &str) -> String {
+    format!(
+        "({summary}.owner_blob_id = {blob_id}
+          OR {summary}.root_surface_digest IN (
+            SELECT surface_cost.surface_digest
+            FROM class_set_procedure_surfaces AS surface_cost
+            WHERE surface_cost.owner_blob_id = {blob_id}
+          ))"
+    )
 }
 
 fn persisted_blob_mutation_cost_fallback_statement(
@@ -13892,7 +14206,7 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
 /// makes positional decoding safe among them: a column added to the schema is
 /// added to this list once, and the encoder and decoder beside it are the only
 /// two places that have to agree about what index it lands on.
-const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 31] = [
+const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 33] = [
     "label",
     "parameters",
     "return_type_text",
@@ -13924,6 +14238,8 @@ const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 31] = [
     "class_like_is_static",
     "type_parameters_recorded",
     "result_type_identities",
+    "parameter_type_identities",
+    "callable_override_modifier",
 ];
 
 /// The variable-length subset of the columns above.
@@ -13933,7 +14249,7 @@ const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 31] = [
 /// spellings are bounded by their own CHECK constraints and are not worth
 /// summing. The Rust accounting in [`SignatureMetadataColumns::stored_text_bytes`]
 /// must sum exactly this set, because a test compares it against the SQL sum.
-const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 11] = [
+const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 12] = [
     "label",
     "parameters",
     "return_type_text",
@@ -13945,6 +14261,7 @@ const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 11] = [
     "extension_receiver_type_identity",
     "callable_parameter_types",
     "result_type_identities",
+    "parameter_type_identities",
 ];
 
 /// The value columns as a SELECT list, each qualified by `qualifier`, which is
@@ -14036,6 +14353,8 @@ struct SignatureMetadataColumns {
     class_like_is_static: i64,
     type_parameters_recorded: i64,
     result_type_identities: String,
+    parameter_type_identities: String,
+    callable_override_modifier: Option<&'static str>,
 }
 
 impl SignatureMetadataColumns {
@@ -14104,6 +14423,13 @@ impl SignatureMetadataColumns {
                 "result_type_identities",
                 value.result_type_identities(),
             )?,
+            parameter_type_identities: encode_signature_metadata_json(
+                "parameter_type_identities",
+                value.parameter_type_identities(),
+            )?,
+            callable_override_modifier: value
+                .callable_override_modifier()
+                .map(CallableOverrideModifier::label),
         })
     }
 
@@ -14130,6 +14456,7 @@ impl SignatureMetadataColumns {
                 .as_ref()
                 .map_or(0, String::len),
             self.result_type_identities.len(),
+            self.parameter_type_identities.len(),
         ])
     }
 
@@ -14177,6 +14504,8 @@ impl SignatureMetadataColumns {
             self.class_like_is_static,
             self.type_parameters_recorded,
             self.result_type_identities,
+            self.parameter_type_identities,
+            self.callable_override_modifier,
         ])?;
         Ok(())
     }
@@ -14355,6 +14684,16 @@ fn signature_metadata_from_row(
         "result_type_identities",
         &row.get::<_, String>(base + 30)?,
     )?);
+    metadata = metadata.with_parameter_type_identities(decode_signature_metadata_json(
+        "parameter_type_identities",
+        &row.get::<_, String>(base + 31)?,
+    )?);
+    metadata =
+        metadata.with_persisted_callable_override_modifier(signature_metadata_enum_from_label(
+            "callable_override_modifier",
+            row.get::<_, Option<String>>(base + 32)?,
+            CallableOverrideModifier::from_label,
+        )?);
     Ok(metadata)
 }
 
@@ -14448,6 +14787,25 @@ fn persisted_structural_fact_payload_bytes(facts: &PersistedStructuralFacts) -> 
         })
 }
 
+/// The one manifest row that admits a blob's persisted structural facts.
+///
+/// This is the only statement in the hydration path that joins and subqueries
+/// rather than seeking one primary key, so it is the only one whose plan can
+/// move with the store's statistics. It is written here once and pinned by
+/// name from the registry in `store::planner_statistics`.
+fn structural_fact_manifest_sql() -> String {
+    format!(
+        "SELECT facts.blob_id, facts.source_bytes, facts.node_count, facts.role_count,
+                facts.occurrence_role_count
+         FROM structural_fact_manifests AS facts
+         JOIN blob_meta AS meta
+           ON meta.blob_id = facts.blob_id
+         WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+           AND facts.facts_version = ?3
+           AND {PARSED_BLOB_COMPLETE_CONDITION}"
+    )
+}
+
 fn structural_fact_payload_bytes_sql() -> &'static str {
     "SELECT
        COALESCE((SELECT SUM(
@@ -14530,6 +14888,7 @@ mod tests {
     // pinned-query registry in `planner_statistics`, so each pinned statement
     // is written once, and run each assertion in both planner-statistics
     // states (issue #3016).
+    use super::planner_statistics::pinned_plans::DEFINITION_CANDIDATE_ARITY_LADDER;
     use super::planner_statistics::tests::{explain_pin, pinned};
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::csharp::CSharpAdapter;
@@ -16549,6 +16908,69 @@ mod tests {
         }
     }
 
+    /// The two structural-fact statements whose plans the store's statistics
+    /// can move (issue #2763).
+    ///
+    /// The three row-family reads pinned above seek one primary key and can do
+    /// nothing else. The manifest lookup joins `blob_meta`, subqueries `blobs`
+    /// twice and tests the completeness condition, and the payload-bytes
+    /// measurement runs three correlated subqueries per persist; those are the
+    /// structural statements worth pinning against a plan flip.
+    #[test]
+    fn structural_fact_manifest_and_payload_costs_seek_their_indexes() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            state.install(&conn);
+
+            let plan = explain_pin(&conn, &pinned("structural_fact_manifest"));
+            // The statement names its tables by alias, which is what the plan
+            // reports: `facts` is the manifest, `meta` its blob metadata, and
+            // `active_blob` / `active_epoch` the completeness condition.
+            for alias in ["facts", "meta", "blobs", "active_blob", "active_epoch"] {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains(&format!("SEARCH {alias} USING"))),
+                    "the structural fact manifest lookup must seek {alias} {state}: {plan:?}"
+                );
+            }
+            assert!(
+                plan.iter().all(|step| !step.contains("SCAN")),
+                "the structural fact manifest lookup must not scan a table {state}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("AUTOMATIC")),
+                "the structural fact manifest lookup must not build an automatic index \
+                 {state}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "the structural fact manifest lookup must not sort through a temporary \
+                 b-tree {state}: {plan:?}"
+            );
+
+            let plan = explain_pin(&conn, &pinned("structural_fact_payload_bytes"));
+            for table in [
+                "structural_fact_nodes",
+                "structural_fact_roles",
+                "structural_fact_occurrence_roles",
+            ] {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                    "the structural fact payload cost must seek {table} {state}: {plan:?}"
+                );
+            }
+            assert!(
+                // The statement has no FROM of its own, so its outer step is
+                // SQLite's constant row, not a table scan.
+                plan.iter()
+                    .all(|step| !step.contains("SCAN") || step == "SCAN CONSTANT ROW"),
+                "the structural fact payload cost must not scan a table {state}: {plan:?}"
+            );
+        }
+    }
+
     #[test]
     fn parsed_blob_keys_batches_mixed_languages_and_incomplete_rows() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -18287,6 +18709,133 @@ mod tests {
             )
             .unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn mounted_declaration_primary_ranges_follow_the_selected_revision() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/demo/Sample.java",
+            "package demo; class Old { void before() {} }\n",
+        );
+        let adapter = JavaAdapter;
+        let old_source = file.read_to_string().unwrap();
+        let old_oid = oid_for(old_source.as_bytes());
+        let old_state = parse_state(&adapter, &file);
+
+        let new_source = "package demo; class New { void after() {} }\n";
+        write_file(temp.path(), "src/demo/Sample.java", new_source);
+        let new_oid = oid_for(new_source.as_bytes());
+        let new_state = parse_state(&adapter, &file);
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(old_oid, "java", &adapter, &old_state)
+            .unwrap();
+        store
+            .write_parsed_blob(new_oid, "java", &adapter, &new_state)
+            .unwrap();
+        let old_snapshot = store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                &[WorkspaceFileRow {
+                    rel_path: "src/demo/Sample.java".to_string(),
+                    blob_oid: old_oid,
+                }],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let new_snapshot = store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                &[WorkspaceFileRow {
+                    rel_path: "src/demo/Sample.java".to_string(),
+                    blob_oid: new_oid,
+                }],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let languages = ["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let read = |snapshot: WorkspaceSnapshotId| {
+            store
+                .mounted_declaration_rows_with_primary_ranges_for_langs(
+                    &WorkspaceSnapshots::from_iter([("java".to_string(), snapshot)]),
+                    &languages,
+                    &generations,
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .expect("uncancelled mounted inventory")
+        };
+
+        let old_rows = read(old_snapshot);
+        let new_rows = read(new_snapshot);
+        let names = |rows: &[HydratedMountedCandidatePrimaryRangeRow]| {
+            rows.iter()
+                .map(|row| row.candidate.short_name.clone())
+                .collect::<HashSet<_>>()
+        };
+        let old_names = names(&old_rows);
+        assert!(old_names.contains("Old"));
+        assert!(old_names.contains("Old.before"));
+        assert!(!old_names.contains("New"));
+        assert!(!old_names.contains("New.after"));
+        let new_names = names(&new_rows);
+        assert!(new_names.contains("New"));
+        assert!(new_names.contains("New.after"));
+        assert!(!new_names.contains("Old"));
+        assert!(!new_names.contains("Old.before"));
+        for row in old_rows.iter().chain(&new_rows) {
+            assert_eq!(row.rel_path, "src/demo/Sample.java");
+            assert!(
+                row.primary_range.is_some(),
+                "every parsed declaration in this fixture has a primary range: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_declaration_primary_range_read_discards_a_cancelled_prefix() {
+        const BLOBS: usize = CANDIDATE_ROWS_PER_CANCELLATION_POLL + 1;
+        let (_temp, store) = store_with_repeated_short_name(BLOBS);
+        let languages = ["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let snapshots = store
+            .workspace_snapshots_for_langs(
+                &WorkspaceId(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ),
+                &languages,
+                &generations,
+            )
+            .unwrap();
+
+        // The first two checks enter the statement. The third occurs after
+        // one complete row block, so `None` proves that prefix never escapes.
+        let cancellation = CancellationToken::cancel_after_checks_for_test(3);
+        assert!(
+            store
+                .mounted_declaration_rows_with_primary_ranges_for_langs(
+                    &snapshots,
+                    &languages,
+                    &generations,
+                    &cancellation,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Release-only same-process baseline for the FQ2-to-relational hydration
@@ -21636,6 +22185,109 @@ mod tests {
         }
     }
 
+    // Issue #3030. The batch definition-candidate statements are pinned above
+    // with one bound request, and the `laravel/framework` profile that motivated
+    // issue #3016 shows the same statements issued with 6 to 542 of them, single
+    // calls costing 40 to 58 s without planner statistics. Nothing chunks the
+    // batch -- the requests ride in one JSON parameter -- so the SQL text is the
+    // same at every arity, but the bound payload still reaches the planner: the
+    // bundled SQLite is a `SQLITE_ENABLE_STAT4` build, which re-prepares a
+    // statement using its bound values. This runs the production ladder and
+    // asserts that the plan is the arity-one plan at every rung, in both
+    // statistics states.
+    #[test]
+    fn definition_candidate_batches_keep_their_plan_at_production_arity() {
+        for state in PlannerStatisticsState::BOTH {
+            definition_candidate_batches_keep_their_plan_at_production_arity_in(state);
+        }
+    }
+
+    fn definition_candidate_batches_keep_their_plan_at_production_arity_in(
+        state: PlannerStatisticsState,
+    ) {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        state.install(&conn);
+
+        for (family, unit_relation, label) in [
+            (
+                "batch_component_definition_candidate",
+                "idx_code_units_anchored_blob_exact_tail",
+                "the anchored batch component lookup",
+            ),
+            (
+                "batch_anchor_only_definition_candidate",
+                "SEARCH units USING PRIMARY KEY",
+                "the anchor-only batch lookup",
+            ),
+        ] {
+            let mut baseline: Option<(usize, Vec<String>)> = None;
+            for arity in DEFINITION_CANDIDATE_ARITY_LADDER {
+                let plan = explain_pin(&conn, &pinned(&format!("{family}_{arity}")));
+                let at = format!("{label} at {arity} requests {state}");
+                // The request rows must stay the driver: the anchor package
+                // seek is the only selective entry point, and a batch that
+                // enumerates workspace files first pays that per request
+                // (#2742).
+                assert_anchor_package_seek_is_outermost(&plan, unit_relation, &at);
+                assert!(
+                    plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+                    "{at} must not build a transient index over the request rows: {plan:#?}"
+                );
+                assert!(
+                    plan.iter().all(|detail| !detail.contains("SCAN units")
+                        && !detail.contains("SCAN anchors")
+                        && !detail.contains("SCAN keys")),
+                    "{at} must not enumerate a persisted relation: {plan:#?}"
+                );
+                match &baseline {
+                    None => baseline = Some((arity, plan)),
+                    Some((base_arity, base_plan)) => assert_eq!(
+                        &plan, base_plan,
+                        "{label} plans {arity} requests differently from {base_arity} {state}, \
+                         so the arity-one pin above does not cover production's statement"
+                    ),
+                }
+            }
+        }
+
+        // The unanchored arm of the same statement reaches units through the
+        // stable-tail index instead of an anchor package, so it is pinned on
+        // that index rather than on the seek order.
+        let mut baseline: Option<(usize, Vec<String>)> = None;
+        for arity in DEFINITION_CANDIDATE_ARITY_LADDER {
+            let plan = explain_pin(
+                &conn,
+                &pinned(&format!(
+                    "batch_stable_component_definition_candidate_{arity}"
+                )),
+            );
+            let at = format!("the stable batch component lookup at {arity} requests {state}");
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_code_units_stable_exact_tail")
+                        && detail.contains("<expr>=?")),
+                "{at} must seek the complete request tail, not the language: {plan:#?}"
+            );
+            assert!(
+                plan.iter().all(|detail| !detail.contains("SCAN units")),
+                "{at} must not enumerate language units: {plan:#?}"
+            );
+            assert!(
+                plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+                "{at} must not index the request rows to probe them per unit: {plan:#?}"
+            );
+            match &baseline {
+                None => baseline = Some((arity, plan)),
+                Some((base_arity, base_plan)) => assert_eq!(
+                    &plan, base_plan,
+                    "the stable batch component lookup plans {arity} requests differently from \
+                     {base_arity} {state}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn anchor_only_lookup_uses_the_null_tail_relation() {
         let sql = point_anchor_only_definition_candidate_sql("units.in_declarations = 1");
@@ -21673,31 +22325,39 @@ mod tests {
         state.install(&conn);
         let plan = explain_pin(&conn, &pinned("mounted_declaration_scan"));
 
+        assert_mounted_declaration_scan_plan(&plan, state, "mounted-declaration scan");
+    }
+
+    fn assert_mounted_declaration_scan_plan(
+        plan: &[String],
+        state: PlannerStatisticsState,
+        label: &str,
+    ) {
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("SEARCH units USING PRIMARY KEY")),
-            "each mounted file's declarations must be a primary-key range {state}: {plan:#?}"
+            "each mounted file's declarations must be a primary-key range in the {label} {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the mounted-declaration scan must never read code_units end to end {state}: {plan:#?}"
+            "the {label} must never read code_units end to end {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
-            "the mounted-declaration scan must not build a transient index {state}: {plan:#?}"
+            "the {label} must not build a transient index {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("CO-ROUTINE")),
-            "the mounted-declaration scan must not materialize a compound view {state}: {plan:#?}"
+            "the {label} must not materialize a compound view {state}: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-            "the caller sorts in Rust, so the query must not sort {state}: {plan:#?}"
+            "the caller sorts in Rust, so the {label} must not sort {state}: {plan:#?}"
         );
         assert!(
             plan.iter()
                 .all(|detail| !detail.contains("workspace_file_path_symbol_rows")),
-            "the path-symbol arm is discarded by the caller and must not be read {state}: {plan:#?}"
+            "the path-symbol arm is discarded by the {label} and must not be read {state}: {plan:#?}"
         );
         // The workspace's own file versions are the outermost relation this
         // query is meant to walk, but they must be reached through a snapshot
@@ -21724,16 +22384,39 @@ mod tests {
         // (9,687 rows, 1,001 per snapshot prefix).
         assert!(
             plan.iter().all(|detail| detail.trim() != "SCAN versions"),
-            "the mounted-declaration scan must not read workspace_file_versions end to end {state}: {plan:#?}"
+            "the {label} must not read workspace_file_versions end to end {state}: {plan:#?}"
         );
         assert!(
             plan.iter().any(|detail| {
                 detail.contains("idx_workspace_file_versions_snapshot_blob")
                     || detail.contains("idx_blobs_lang_generation")
             }),
-            "the mounted-declaration scan must enter through the snapshot range or the \
+            "the {label} must enter through the snapshot range or the \
              live-blob set {state}: {plan:#?}"
         );
+    }
+
+    #[test]
+    fn mounted_declaration_primary_range_scan_seeks_indexed_rows() {
+        for state in PlannerStatisticsState::BOTH {
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            state.install(&conn);
+            let plan = explain_pin(
+                &conn,
+                &pinned("mounted_declaration_scan_with_primary_ranges"),
+            );
+            assert_mounted_declaration_scan_plan(
+                &plan,
+                state,
+                "mounted-declaration primary-range scan",
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("SEARCH primary_range USING PRIMARY KEY")),
+                "primary-range mounted scan must seek ranges by their primary key {state}: {plan:#?}"
+            );
+        }
     }
 
     // Issue #2794. Every candidate query in the store hydrates its relational

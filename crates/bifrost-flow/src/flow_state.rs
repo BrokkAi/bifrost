@@ -38,9 +38,9 @@ use crate::analyzer::semantic::{
     ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
     SemanticArtifactKey, SemanticBudget, SemanticCallSite, SemanticCapabilities,
     SemanticCapability, SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapId,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome,
-    SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId, SourceMappingKind,
-    SourceSpan, ValueFlowKind, ValueId, WorkspaceIcfgProvider,
+    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticRequest,
+    SemanticValueKind, SemanticWork, SourceMappingId, SourceMappingKind, SourceSpan, StableDigest,
+    ValueFlowKind, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -96,11 +96,23 @@ pub use brokk_bifrost_core::analyzer::structural::flow_state::{
 /// canonical locations it publishes and cannot reach a wire id defined above
 /// it.
 pub fn procedure_wire_id(handle: &ProcedureHandle) -> String {
+    procedure_public_digest(handle).to_string()
+}
+
+/// Stable binary form of [`procedure_wire_id`].
+///
+/// Persisted result keys use the digest directly so they share the exact
+/// mount-independent artifact and structured-locator identity used by public
+/// semantic rows without decoding a rendered identifier.
+pub fn procedure_public_digest(handle: &ProcedureHandle) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
     digest.push(handle.artifact().key().public_fingerprint().as_bytes());
     digest.push(b"procedure");
-    push_locator(&mut digest, handle.semantics().locator());
-    digest.finish().to_string()
+    handle
+        .semantics()
+        .locator()
+        .push_stable_identity(&mut digest);
+    digest.finish()
 }
 
 /// Stable content-scoped identity for one semantic program point.
@@ -117,9 +129,12 @@ pub fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-code-query-semantic-wire-id-v2");
     digest.push(procedure.artifact().key().public_fingerprint().as_bytes());
     digest.push(b"program_point");
-    push_locator(&mut digest, procedure.semantics().locator());
+    procedure
+        .semantics()
+        .locator()
+        .push_stable_identity(&mut digest);
     digest.push(&handle.id().get().to_le_bytes());
-    push_locator(&mut digest, &mapping.locator);
+    mapping.locator.push_stable_identity(&mut digest);
     let semantics = procedure.semantics();
     let boundary = if handle.id() == semantics.entry_point() {
         "entry"
@@ -132,25 +147,6 @@ pub fn program_point_wire_id(handle: &ProgramPointHandle) -> String {
     };
     digest.push(boundary.as_bytes());
     digest.finish().to_string()
-}
-
-fn push_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
-    digest.push(locator.path().as_str().as_bytes());
-    digest.push(locator.language().stable_label().as_bytes());
-    digest.push(locator.role().stable_label().as_bytes());
-    digest.push_anchor(locator.anchor());
-    for segment in locator.declaration().segments() {
-        digest.push(segment.kind().stable_label().as_bytes());
-        match segment.name() {
-            Some(name) => {
-                digest.push(b"named");
-                digest.push(name.as_bytes());
-            }
-            None => digest.push(b"anonymous"),
-        }
-        digest.push_anchor(segment.anchor());
-        digest.push(&segment.sibling_ordinal().to_le_bytes());
-    }
 }
 
 /// What a state event is about.
@@ -5905,6 +5901,53 @@ mod tests {
                 .procedure_handle(id)
                 .expect("the test artifact owns its derived procedure")
         }
+    }
+
+    #[test]
+    fn procedure_public_digest_is_mount_independent_and_structurally_separated() {
+        const SOURCE: &str = r#"package sample
+
+func first(input int) int { return input }
+func second(input int) int { return input }
+"#;
+        let first_mount = Fixture::new(Language::Go, &[("main.go", SOURCE)]);
+        let second_mount = Fixture::new(Language::Go, &[("main.go", SOURCE)]);
+        let first = first_mount.procedure(0, ProcedureId::new(0));
+        let remounted_first = second_mount.procedure(0, ProcedureId::new(0));
+        let second = first_mount.procedure(0, ProcedureId::new(1));
+
+        assert_eq!(
+            procedure_public_digest(&first),
+            procedure_public_digest(&remounted_first),
+            "an equivalent checkout mount must not rotate public identity"
+        );
+        assert_eq!(
+            procedure_wire_id(&first),
+            procedure_public_digest(&first).to_string(),
+            "rendered and binary procedure identities share one recipe"
+        );
+        assert_ne!(
+            procedure_public_digest(&first),
+            procedure_public_digest(&second),
+            "distinct structured procedure locators must remain separate"
+        );
+
+        let changed = Fixture::new(
+            Language::Go,
+            &[(
+                "main.go",
+                r#"package sample
+
+func first(input int) int { return input + 1 }
+func second(input int) int { return input }
+"#,
+            )],
+        );
+        assert_ne!(
+            procedure_public_digest(&first),
+            procedure_public_digest(&changed.procedure(0, ProcedureId::new(0))),
+            "artifact content must remain part of the public root identity"
+        );
     }
 
     #[test]

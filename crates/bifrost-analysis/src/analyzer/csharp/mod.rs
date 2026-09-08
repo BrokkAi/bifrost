@@ -1306,6 +1306,39 @@ impl IAnalyzer for CSharpAnalyzer {
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
+
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        Some(self)
+    }
+}
+
+/// C# joins the #1721 nominal-family rollout.
+///
+/// The relation the shared walk uses is C#'s own: an interface member is
+/// implemented with no keyword, while a class member is overridden only when
+/// the derived member writes `override` and the base member is `virtual`,
+/// `abstract`, or itself an `override`. A member that writes `new` -- or
+/// nothing, which is implicit `new` -- hides rather than overrides, and gets no
+/// edge.
+///
+/// `self` is both the declaration source and the hierarchy source. Unlike Java,
+/// no other realm can contribute an ancestor edge to a C# type, so the
+/// multi-analyzer delegates here unchanged.
+impl crate::analyzer::usages::MemberFamilyProvider for CSharpAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::csharp_member_family_capability(self, member)
+    }
+
+    fn member_family(
+        &self,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::csharp_member_family(self, self, member, cancellation)
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

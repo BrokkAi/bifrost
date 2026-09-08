@@ -283,8 +283,8 @@ fn collect_candidate_ranges(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Option<ReferenceCandidateRanges> {
     let mut ranges = Vec::new();
-    let mut stack = vec![(root, false)];
-    while let Some((node, inside_error)) = stack.pop() {
+    let mut stack = vec![(root, false, false)];
+    while let Some((node, inside_error, rust_token_tree_member)) = stack.pop() {
         if is_cancelled() {
             return None;
         }
@@ -327,6 +327,9 @@ fn collect_candidate_ranges(
             CandidateFrontier::Census | CandidateFrontier::CensusMembership => {
                 is_semantic_token_identifier_node(language, node.kind())
                     || is_reference_candidate_node(language, node.kind())
+                    || (matches!(frontier, CandidateFrontier::CensusMembership)
+                        && language == Language::Rust
+                        && rust_token_tree_member)
                     || (matches!(frontier, CandidateFrontier::CensusMembership)
                         && matches!(language, Language::JavaScript | Language::TypeScript)
                         && node.kind() == "shorthand_property_identifier_pattern")
@@ -371,8 +374,24 @@ fn collect_candidate_ranges(
         }
 
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push((child, inside_error));
+        // A member terminal the Rust inverse scanner can prove inside a raw
+        // macro token tree may be an anonymous contextual keyword or a named
+        // primitive-type leaf. Carry the preceding separator while visiting
+        // every direct child so those nodes occupy the same structured member
+        // role as an ordinary identifier without rescanning parent siblings.
+        if matches!(frontier, CandidateFrontier::CensusMembership)
+            && language == Language::Rust
+            && node.kind() == "token_tree"
+        {
+            let mut member_separator = false;
+            for child in node.children(&mut cursor) {
+                stack.push((child, inside_error, member_separator));
+                member_separator = matches!(child.kind(), "." | "::");
+            }
+        } else {
+            for child in node.named_children(&mut cursor) {
+                stack.push((child, inside_error, false));
+            }
         }
     }
     ranges.sort_unstable();
@@ -826,6 +845,35 @@ mod tests {
             assert!(
                 go_census.contains(&offset),
                 "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_census_membership_backs_macro_member_keyword_terminals() {
+        let source = concat!(
+            "macro_rules! wrap { ($e:expr) => { $e } }\n",
+            "wrap!(tensor.bool());\n",
+            "wrap!(Type::default());\n",
+            "wrap!(bool);\n",
+            "wrap!(default);\n",
+        );
+        let membership = census_membership_offsets(Language::Rust, "lib.rs", source);
+        let bool_member = source.find("tensor.bool").expect("bool member") + "tensor.".len();
+        let default_member = source.find("Type::default").expect("default member") + "Type::".len();
+        let bare_bool = source.rfind("wrap!(bool)").expect("bare bool") + "wrap!(".len();
+        let bare_default = source.rfind("wrap!(default)").expect("bare default") + "wrap!(".len();
+
+        for member in [bool_member, default_member] {
+            assert!(
+                membership.contains(&member),
+                "Rust macro member terminal at byte {member} must back an inverse hit: {membership:?}"
+            );
+        }
+        for non_member in [bare_bool, bare_default] {
+            assert!(
+                !membership.contains(&non_member),
+                "an unqualified keyword token at byte {non_member} has no structured reference role: {membership:?}"
             );
         }
     }

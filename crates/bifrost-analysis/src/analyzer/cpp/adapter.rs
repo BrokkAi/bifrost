@@ -79,6 +79,14 @@ impl LanguageAdapter for CppAdapter {
         ]
     }
 
+    fn parser_included_ranges(
+        &self,
+        _file: &ProjectFile,
+        source: &str,
+    ) -> Option<Vec<tree_sitter::Range>> {
+        brokk_bifrost_cpp::graph::syntax::function_macro_included_ranges(source)
+    }
+
     fn contains_tests(
         &self,
         _file: &ProjectFile,

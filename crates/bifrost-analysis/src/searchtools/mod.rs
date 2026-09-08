@@ -34,8 +34,9 @@ use crate::hash::{HashMap, HashSet};
 use crate::model_context;
 pub use crate::navigation::NavigationOperation;
 use crate::path_utils::{
-    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
-    normalize_pattern, percent_decode, rel_path_string, workspace_rel_path,
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, WorkspacePathSelector,
+    has_drive_letter_prefix, is_glob_pattern, normalize_pattern, percent_decode, rel_path_string,
+    workspace_directory_path, workspace_rel_path,
 };
 use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
@@ -48,13 +49,12 @@ use crate::relevance::{
 use crate::text_utils::{
     compute_line_starts, find_line_index_for_offset, render_location_diagnostic,
 };
-use glob::MatchOptions;
 use glob::Pattern;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 mod definitions;
@@ -681,7 +681,7 @@ fn resolve_file_patterns(
             }
         }
 
-        let directory_matches = summaries::directory_listing_root(&normalized)
+        let directory_matches = workspace_directory_path(&normalized)
             .filter(|directory| analyzer.project().has_directory(directory))
             .map(|_| resolve_directory_target(analyzer, &normalized))
             .unwrap_or_default();
@@ -880,10 +880,6 @@ fn looks_like_explicit_source_file_target(target: &str) -> bool {
         return false;
     };
     Language::is_source_extension(extension)
-}
-
-fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '['])
 }
 
 /// Map one batched request's items, fanning out on rayon only when there is
