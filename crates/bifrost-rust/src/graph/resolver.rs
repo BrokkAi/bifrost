@@ -14,6 +14,7 @@ use crate::usage::{
     usage_crate_export_targets, usage_exact_root_for_resolution,
     usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
 };
+use crate::usage_walks::RustUsageWalks;
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
@@ -1303,13 +1304,45 @@ fn trait_visible_at_call_site(
 ) -> bool {
     let roots = [trait_unit.clone()].into_iter().collect::<BTreeSet<_>>();
     let seeds = usage_binding_seeds(rust, token, &roots);
-    let mut names = usage_binding_local_names(rust, token, file, &seeds);
-    names.insert(trait_unit.identifier().to_string());
+    let walks = RustUsageWalks::new(rust, token);
     let Some(prepared) = rust.prepared_syntax(token, file) else {
         return false;
     };
-    let lexical_scope =
-        lexical_scope::rust_lexical_scope_index(prepared.tree().root_node(), prepared.source());
+    let root = prepared.tree().root_node();
+    let Some(mut node) = root.descendant_for_byte_range(reference_byte, reference_byte) else {
+        return false;
+    };
+    let mut call_cfg_conditions = Vec::new();
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "function_item"
+            || parent.kind() == "impl_item"
+            || parent.kind() == "trait_item"
+            || parent.kind() == "mod_item"
+        {
+            call_cfg_conditions.push(lexical_scope::rust_cfg_condition(parent, prepared.source()));
+        }
+        node = parent;
+    }
+    let unnamed_target = walks.identity_of(trait_unit).is_some_and(|identity| {
+        walks
+            .queries()
+            .module_at_byte(file, reference_byte)
+            .is_some_and(|module| {
+                seeds.unnamed_target_visible_at(
+                    &identity,
+                    file,
+                    &module,
+                    reference_byte,
+                    &call_cfg_conditions,
+                )
+            })
+    });
+    if unnamed_target {
+        return true;
+    }
+    let mut names = usage_binding_local_names(rust, token, file, &seeds);
+    names.insert(trait_unit.identifier().to_string());
+    let lexical_scope = lexical_scope::rust_lexical_scope_index(root, prepared.source());
     names.into_iter().any(|name| {
         let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
             || (lexical_scope.local_item_bound_at(&name, reference_byte)

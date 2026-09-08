@@ -8,7 +8,8 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::imports::{
-    rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
+    RustImportBindingName, rust_import_binding_name, rust_import_body,
+    rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
 
 /// Re-exported from core, where the persisted `rust_import_targets` row shape
@@ -239,6 +240,12 @@ pub fn reset_rust_tree_parse_counters_for_test() {
 }
 
 pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
+    if matches!(
+        rust_import_binding_name(import),
+        RustImportBindingName::Unnamed
+    ) {
+        return;
+    }
     let raw = import.raw_snippet.trim();
     if raw.ends_with("::*;") {
         let module_specifier = rust_import_body(raw)
@@ -1300,6 +1307,15 @@ fn apply_from_stdin() -> u8 { 1 }
 
         assert_eq!(binding.kind, ImportKind::Named);
         assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
+    }
+
+    #[test]
+    fn unnamed_import_does_not_enter_the_ordinary_name_map() {
+        let source = "use crate::Trait as _;\nuse crate::Named;\n";
+        let binder = visible_import_binder_at(source, source.len());
+
+        assert!(!binder.bindings.contains_key("_"));
+        assert!(binder.bindings.contains_key("Named"));
     }
 
     #[test]

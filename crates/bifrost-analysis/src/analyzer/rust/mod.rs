@@ -71,7 +71,7 @@ pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
 pub use brokk_bifrost_rust::graph::ast::rust_reference_namespace;
 pub(crate) use brokk_bifrost_rust::imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package, rust_focused_use_path,
+    rust_crate_root_package, rust_focused_use_path, rust_import_binding_name,
 };
 use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
 use cache::weight_export_index;
@@ -1473,7 +1473,8 @@ fn expand_rust_imported_external_callee(
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut expanded: Option<String> = None;
     for import in provider.import_info_of(scope.token(), file) {
-        if import.is_wildcard || import.local_name() != Some(owner) {
+        let binding_name = rust_import_binding_name(&import);
+        if binding_name.is_glob() || binding_name.named() != Some(owner) {
             continue;
         }
         let Some(path) = import.path.as_ref() else {

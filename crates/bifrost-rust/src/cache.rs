@@ -50,9 +50,35 @@ pub fn weight_declaration_facts(
                     .sum::<usize>()
         })
         .sum::<usize>();
+    let domain_cfg_occurrences = value
+        .domain_cfg_occurrences
+        .iter()
+        .map(|(identity, occurrences)| {
+            identity_bytes(identity)
+                + occurrences
+                    .iter()
+                    .map(|(domain, condition)| {
+                        domain.weight_bytes()
+                            + match condition {
+                                crate::lexical_scope::RustCfgCondition::Always => 0,
+                                crate::lexical_scope::RustCfgCondition::Atom(atom)
+                                | crate::lexical_scope::RustCfgCondition::NotAtom(atom) => {
+                                    atom.len()
+                                }
+                                crate::lexical_scope::RustCfgCondition::Unknown => 0,
+                            }
+                            + size_of::<(
+                                crate::usage::Domain,
+                                crate::lexical_scope::RustCfgCondition,
+                            )>()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
     (identities
         + declared_modules
         + domains
+        + domain_cfg_occurrences
         + size_of::<crate::usage_queries::RustDeclarationFacts>())
     .min(u32::MAX as usize) as u32
 }
@@ -159,7 +185,7 @@ pub fn weight_alias_routes(
 }
 
 /// Byte weight of one file's forward import edges. Each edge owns the importer
-/// and target paths, two module keys, its local name, and its domain.
+/// and target paths, two module keys, its typed binding names, and its domain.
 pub fn weight_forward_import_edges(
     _key: &ProjectFile,
     value: &Arc<Vec<crate::usage::RustImportEdge>>,
@@ -189,7 +215,16 @@ fn weight_import_edge(edge: &crate::usage::RustImportEdge) -> usize {
         + edge.importer_module.weight_bytes()
         + edge.target_module.weight_bytes()
         + edge.source_path.iter().map(String::len).sum::<usize>()
-        + edge.local_name.len()
+        + match &edge.kind {
+            crate::usage::RustImportEdgeKind::Named {
+                imported_name,
+                local_name,
+            } => imported_name.len() + local_name.len(),
+            crate::usage::RustImportEdgeKind::Unnamed { imported_name } => imported_name.len(),
+            crate::usage::RustImportEdgeKind::Namespace { local_name } => local_name.len(),
+            crate::usage::RustImportEdgeKind::Glob => 0,
+            crate::usage::RustImportEdgeKind::Qualified(path) => path.iter().map(String::len).sum(),
+        }
         + edge.domain.weight_bytes()
         + size_of::<crate::usage::RustImportEdge>()
 }

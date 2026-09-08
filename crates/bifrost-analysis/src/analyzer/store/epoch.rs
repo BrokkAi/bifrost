@@ -824,11 +824,15 @@ lang_epoch!(
 // the old `Field`/`Member` identity for every Rust type alias -- and, where an
 // alias and a `const` share one owner and one name, holds only one of the two
 // declarations.
+// Salt bumped again (#3080): Rust underscore imports now retain their target
+// in usage facts while carrying no local binding name, and eligible `pub use`
+// rows preserve those unnamed exports. Warm rows carry the old producer
+// semantics and must be re-extracted before the new reader can use them.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09"
 );
 
 #[cfg(test)]

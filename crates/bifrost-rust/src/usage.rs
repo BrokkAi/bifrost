@@ -39,15 +39,22 @@ use crate::lexical_scope::{
 use crate::usage_queries::RustUsageQueries;
 use crate::usage_walks::RustUsageWalks;
 
-/// How a local binding in an importer refers to its target: a named import
-/// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
-/// (`use path::*;`) carries no single name, so it is lowered to one `Named` edge
-/// per export of the target file in [`build_importer_reverse`] rather than getting
-/// its own variant.
+/// How a local binding in an importer refers to its target. An underscore import
+/// carries the imported target but deliberately introduces no local name. A
+/// glob carries no single target name and is lowered to one named edge per
+/// export when a referenceable binding is requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustImportEdgeKind {
-    Named(String),
-    Namespace,
+    Named {
+        imported_name: String,
+        local_name: String,
+    },
+    Unnamed {
+        imported_name: String,
+    },
+    Namespace {
+        local_name: String,
+    },
     Glob,
     Qualified(Vec<String>),
 }
@@ -61,7 +68,6 @@ pub struct RustImportEdge {
     /// Seed consumers use it to identify an import binder without rebuilding
     /// the import graph from every other binding in the file.
     pub source_path: Vec<String>,
-    pub local_name: String,
     pub target_file: ProjectFile,
     pub target_module: ModuleKey,
     pub kind: RustImportEdgeKind,
@@ -336,6 +342,30 @@ pub struct RustBindingSeeds {
     identities: HashSet<RustSymbolIdentity>,
     identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
     edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>>,
+    /// Files with verified import visibility, including consumers discovered
+    /// through an unnamed binding propagated by a glob import.
+    verified_importers: HashSet<ProjectFile>,
+    /// Exact targets made visible by `use path::Item as _`. These are kept
+    /// apart from `identities`: an underscore import enables trait visibility
+    /// without creating a name that a reference can resolve.
+    unnamed_visibility: Vec<RustUnnamedImportVisibility>,
+}
+
+/// One exact target made visible by an unnamed import route.
+///
+/// `cfg_conditions` is the conjunction collected across a direct unnamed
+/// import and any public glob imports that propagate it. Keeping the route as
+/// a separate value preserves compatible alternatives and avoids pretending
+/// that the core four-valued cfg predicate can express conjunction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustUnnamedImportVisibility {
+    pub target: RustSymbolIdentity,
+    pub importer: ProjectFile,
+    pub importer_module: ModuleKey,
+    pub extent: RustImportExtent,
+    pub domain: Domain,
+    pub provenance: RustRouteProvenance,
+    pub cfg_conditions: Vec<RustCfgCondition>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,7 +432,7 @@ impl RustBindingSeeds {
     }
 
     pub fn verified_importer_files(&self) -> impl Iterator<Item = &ProjectFile> {
-        self.edges_by_importer.keys()
+        self.verified_importers.iter()
     }
 
     pub fn identities_in_file<'a>(
@@ -415,7 +445,34 @@ impl RustBindingSeeds {
     }
 
     pub fn has_import_edges(&self) -> bool {
-        !self.edges_by_importer.is_empty()
+        !self.verified_importers.is_empty()
+    }
+
+    pub fn unnamed_visibility(&self) -> impl Iterator<Item = &RustUnnamedImportVisibility> {
+        self.unnamed_visibility.iter()
+    }
+
+    pub fn unnamed_target_visible_at(
+        &self,
+        target: &RustSymbolIdentity,
+        file: &ProjectFile,
+        module: &ModuleKey,
+        byte: usize,
+        call_cfg_conditions: &[RustCfgCondition],
+    ) -> bool {
+        self.unnamed_visibility.iter().any(|route| {
+            route.target == *target
+                && route.importer == *file
+                && route.importer_module == *module
+                && route.extent.contains(byte)
+                && route.domain.contains_module(module)
+                && combine_rust_cfg_conditions(&route.cfg_conditions, call_cfg_conditions)
+                    .is_some_and(|conditions| {
+                        conditions
+                            .iter()
+                            .all(|condition| !matches!(condition, RustCfgCondition::Unknown))
+                    })
+        })
     }
 
     /// Visibility domains carried by the prepared seed closure.
@@ -731,7 +788,7 @@ impl RustUsageWalks<'_> {
     ) -> Option<HashSet<ProjectFile>> {
         keep_going().then_some(())?;
         let mut out = HashSet::default();
-        for importer in seeds.edges_by_importer.keys() {
+        for importer in seeds.verified_importer_files() {
             keep_going().then_some(())?;
             out.insert(importer.clone());
         }
@@ -833,24 +890,41 @@ impl RustUsageWalks<'_> {
                     .entry(identity.clone())
                     .or_default()
                     .insert(identity.clone());
-                if let Some(domains) = self.declared_domains_of(&identity) {
+                if let Some(occurrences) = self.declared_domain_cfg_occurrences_of(&identity) {
                     identity_domains
                         .entry(identity.clone())
                         .or_default()
-                        .extend(domains.iter().cloned());
-                    pending.extend(
-                        domains
-                            .into_iter()
-                            .map(|domain| (identity.clone(), domain, identity.clone())),
-                    );
+                        .extend(occurrences.iter().map(|(domain, _)| domain.clone()));
+                    pending.extend(occurrences.into_iter().map(|(domain, condition)| {
+                        (
+                            identity.clone(),
+                            domain,
+                            identity.clone(),
+                            vec![condition],
+                            RustRouteProvenance::Local,
+                        )
+                    }));
                 }
             }
         }
         let mut edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
         let mut visited = HashSet::default();
-        while let Some((target, domain, canonical_origin)) = pending.pop_front() {
+        let mut unnamed_visibility = Vec::new();
+        let mut unnamed_pending = VecDeque::new();
+        while let Some((target, domain, canonical_origin, route_conditions, route_provenance)) =
+            pending.pop_front()
+        {
             keep_going().then_some(())?;
-            if !visited.insert((target.clone(), domain.clone(), canonical_origin.clone())) {
+            if !visited.insert((
+                target.clone(),
+                domain.clone(),
+                canonical_origin.clone(),
+                route_conditions
+                    .iter()
+                    .map(RustCfgConditionKey::from)
+                    .collect::<Vec<_>>(),
+                route_provenance,
+            )) {
                 continue;
             }
             for edge in self.edges_binding_identity(&target) {
@@ -884,15 +958,25 @@ impl RustUsageWalks<'_> {
                 if !effective_domain.contains_module(&edge.importer_module) {
                     continue;
                 }
+                let Some(edge_conditions) = combine_rust_cfg_conditions(
+                    &route_conditions,
+                    std::slice::from_ref(&edge.cfg_condition),
+                ) else {
+                    continue;
+                };
+                let edge_provenance =
+                    combine_rust_route_provenance(route_provenance, edge.provenance);
                 let mut matched = edge.clone();
                 matched.namespace = Some(target.namespace);
-                if matches!(matched.kind, RustImportEdgeKind::Glob) {
-                    matched.local_name = target.name.clone();
-                    matched.kind = RustImportEdgeKind::Named(target.name.clone());
+                if matches!(&matched.kind, RustImportEdgeKind::Glob) {
+                    matched.kind = RustImportEdgeKind::Named {
+                        imported_name: target.name.clone(),
+                        local_name: target.name.clone(),
+                    };
                 }
-                if matches!(matched.kind, RustImportEdgeKind::Namespace) {
+                if let RustImportEdgeKind::Namespace { local_name } = &matched.kind {
                     matched.kind = RustImportEdgeKind::Qualified(vec![
-                        matched.local_name.clone(),
+                        local_name.clone(),
                         target.name.clone(),
                     ]);
                 }
@@ -900,11 +984,31 @@ impl RustUsageWalks<'_> {
                     .entry(edge.importer.clone())
                     .or_default()
                     .push(matched.clone());
-                if edge.propagate_alias && matches!(matched.kind, RustImportEdgeKind::Named(_)) {
+                if matches!(&matched.kind, RustImportEdgeKind::Unnamed { .. }) {
+                    let route = RustUnnamedImportVisibility {
+                        target: canonical_origin.clone(),
+                        importer: edge.importer.clone(),
+                        importer_module: edge.importer_module.clone(),
+                        extent: edge.extent.clone(),
+                        domain: effective_domain.clone(),
+                        provenance: edge_provenance,
+                        cfg_conditions: edge_conditions.clone(),
+                    };
+                    if edge.propagate_alias {
+                        unnamed_pending.push_back(route.clone());
+                    }
+                    if !unnamed_visibility.contains(&route) {
+                        unnamed_visibility.push(route);
+                    }
+                }
+                if edge.propagate_alias {
+                    let RustImportEdgeKind::Named { local_name, .. } = &matched.kind else {
+                        continue;
+                    };
                     let alias = RustSymbolIdentity {
                         file: edge.importer.clone(),
                         module: edge.importer_module.clone(),
-                        name: matched.local_name.clone(),
+                        name: local_name.clone(),
                         namespace: target.namespace,
                     };
                     identities.insert(alias.clone());
@@ -916,10 +1020,31 @@ impl RustUsageWalks<'_> {
                         .entry(alias.clone())
                         .or_default()
                         .push(effective_domain.clone());
-                    pending.push_back((alias, effective_domain, canonical_origin.clone()));
+                    pending.push_back((
+                        alias,
+                        effective_domain,
+                        canonical_origin.clone(),
+                        edge_conditions,
+                        edge_provenance,
+                    ));
                 }
             }
         }
+        self.propagate_unnamed_visibility(
+            &mut unnamed_visibility,
+            &mut unnamed_pending,
+            keep_going,
+        )?;
+        let mut verified_importers = HashSet::default();
+        for importer in edges_by_importer.keys() {
+            keep_going().then_some(())?;
+            verified_importers.insert(importer.clone());
+        }
+        for route in &unnamed_visibility {
+            keep_going().then_some(())?;
+            verified_importers.insert(route.importer.clone());
+        }
+        keep_going().then_some(())?;
         Some(RustBindingSeeds {
             roots: roots.clone(),
             root_origins: root_identities.values().flatten().cloned().collect(),
@@ -928,7 +1053,72 @@ impl RustUsageWalks<'_> {
             identities,
             identity_domains,
             edges_by_importer,
+            verified_importers,
+            unnamed_visibility,
         })
+    }
+
+    fn propagate_unnamed_visibility(
+        &self,
+        visibility: &mut Vec<RustUnnamedImportVisibility>,
+        pending: &mut VecDeque<RustUnnamedImportVisibility>,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<()> {
+        let mut visited = HashSet::default();
+        while let Some(route) = pending.pop_front() {
+            keep_going().then_some(())?;
+            let key = (
+                route.target.clone(),
+                route.importer.clone(),
+                route.importer_module.clone(),
+                route.domain.clone(),
+                route.provenance,
+                rust_import_extent_key(&route.extent),
+                route
+                    .cfg_conditions
+                    .iter()
+                    .map(RustCfgConditionKey::from)
+                    .collect::<Vec<_>>(),
+            );
+            if !visited.insert(key) {
+                continue;
+            }
+            let edges =
+                self.unnamed_glob_import_edges_of(&route.importer_module, &route.importer)?;
+            keep_going().then_some(())?;
+            for edge in edges
+                .iter()
+                .filter(|edge| route.domain.contains_module(&edge.importer_module))
+            {
+                keep_going().then_some(())?;
+                let Some(domain) = self.effective_import_domain(&route.target, &route.domain, edge)
+                else {
+                    continue;
+                };
+                let Some(cfg_conditions) = combine_rust_cfg_conditions(
+                    &route.cfg_conditions,
+                    std::slice::from_ref(&edge.cfg_condition),
+                ) else {
+                    continue;
+                };
+                let propagated = RustUnnamedImportVisibility {
+                    target: route.target.clone(),
+                    importer: edge.importer.clone(),
+                    importer_module: edge.importer_module.clone(),
+                    extent: edge.extent.clone(),
+                    domain,
+                    provenance: combine_rust_route_provenance(route.provenance, edge.provenance),
+                    cfg_conditions,
+                };
+                if !visibility.contains(&propagated) {
+                    visibility.push(propagated.clone());
+                    if edge.propagate_alias {
+                        pending.push_back(propagated);
+                    }
+                }
+            }
+        }
+        keep_going().then_some(())
     }
 
     pub fn export_targets_from_files(
@@ -1256,19 +1446,19 @@ pub fn usage_binding_names(
     let mut qualified = HashSet::default();
     for edge in seeds.edges_by_importer.get(file).into_iter().flatten() {
         match &edge.kind {
-            RustImportEdgeKind::Namespace => {
+            RustImportEdgeKind::Namespace { local_name } => {
                 qualified.extend(
                     seeds
                         .identities
                         .iter()
                         .filter(|identity| identity.file == edge.target_file)
-                        .map(|identity| format!("{}::{}", edge.local_name, identity.name)),
+                        .map(|identity| format!("{}::{}", local_name, identity.name)),
                 );
             }
-            RustImportEdgeKind::Named(_) => {
-                direct.insert(edge.local_name.clone());
+            RustImportEdgeKind::Named { local_name, .. } => {
+                direct.insert(local_name.clone());
             }
-            RustImportEdgeKind::Glob => {}
+            RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => {}
             RustImportEdgeKind::Qualified(name) => {
                 qualified.insert(name.join("::"));
             }
@@ -1353,7 +1543,19 @@ pub fn usage_import_path_matches_seed(
         edge.importer_module == importer_module
             && edge.extent.contains(byte)
             && edge.source_path == path
-            && edge.local_name == local_name
+            && match &edge.kind {
+                RustImportEdgeKind::Named {
+                    local_name: edge_name,
+                    ..
+                }
+                | RustImportEdgeKind::Namespace {
+                    local_name: edge_name,
+                } => edge_name == local_name,
+                RustImportEdgeKind::Qualified(path) => path
+                    .first()
+                    .is_some_and(|edge_name| edge_name == local_name),
+                RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => false,
+            }
             && edge.cfg_condition == *cfg_condition
             && edge.namespace.is_some_and(|bound| bound.accepts(namespace))
     })
@@ -1369,7 +1571,12 @@ pub fn usage_binding_local_names(
 ) -> HashSet<String> {
     RustUsageWalks::new(analyzer, token)
         .matching_edges_for_importer(file, seeds)
-        .map(|edge| edge.local_name.clone())
+        .filter_map(|edge| match &edge.kind {
+            RustImportEdgeKind::Named { local_name, .. }
+            | RustImportEdgeKind::Namespace { local_name } => Some(local_name.clone()),
+            RustImportEdgeKind::Qualified(path) => path.first().cloned(),
+            RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => None,
+        })
         .collect()
 }
 
@@ -1504,9 +1711,16 @@ pub fn usage_local_module_prefix_visible_at(
     if walks.matching_edges_for_importer(file, seeds).any(|edge| {
         edge.importer_module == *module
             && edge.extent.contains(byte)
-            && edge.local_name == name
-            && (edge.namespace == Some(RustSymbolNamespace::Module)
-                || matches!(edge.kind, RustImportEdgeKind::Qualified(_)))
+            && match &edge.kind {
+                RustImportEdgeKind::Named { local_name, .. }
+                | RustImportEdgeKind::Namespace { local_name } => {
+                    local_name == name && edge.namespace == Some(RustSymbolNamespace::Module)
+                }
+                RustImportEdgeKind::Qualified(path) => {
+                    path.first().is_some_and(|first| first == name)
+                }
+                RustImportEdgeKind::Unnamed { .. } | RustImportEdgeKind::Glob => false,
+            }
     }) {
         return true;
     }
@@ -1796,6 +2010,83 @@ fn cfg_conditions_proven_disjoint(left: &[RustCfgCondition], right: &[RustCfgCon
                 .iter()
                 .all(|right| left.proven_mutually_exclusive(right))
         })
+}
+
+/// Join two route guard sets without inventing a richer cfg predicate.
+///
+/// A route is impossible when any guard on it excludes any other guard. The
+/// surviving conditions are canonicalized as a set so cycles cannot create
+/// ever-growing copies of the same conjunction.
+pub(crate) fn combine_rust_cfg_conditions(
+    left: &[RustCfgCondition],
+    right: &[RustCfgCondition],
+) -> Option<Vec<RustCfgCondition>> {
+    let mut conditions = left.to_vec();
+    for condition in right {
+        if !conditions.contains(condition) {
+            conditions.push(condition.clone());
+        }
+    }
+    conditions.sort_by(|left, right| {
+        rust_cfg_condition_sort_key(left).cmp(&rust_cfg_condition_sort_key(right))
+    });
+    conditions.dedup();
+    let has_contradiction = conditions.iter().enumerate().any(|(index, left)| {
+        conditions[index + 1..]
+            .iter()
+            .any(|right| left.proven_mutually_exclusive(right))
+    });
+    (!has_contradiction).then_some(conditions)
+}
+
+fn rust_cfg_condition_sort_key(condition: &RustCfgCondition) -> (u8, &str) {
+    match condition {
+        RustCfgCondition::Always => (0, ""),
+        RustCfgCondition::Atom(atom) => (1, atom),
+        RustCfgCondition::NotAtom(atom) => (2, atom),
+        RustCfgCondition::Unknown => (3, ""),
+    }
+}
+
+/// Hashable identity for one route condition. `RustCfgCondition` intentionally
+/// remains a storage vocabulary without a hash implementation; this key is
+/// only for the in-memory route worklists and does not reinterpret predicates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum RustCfgConditionKey {
+    Always,
+    Atom(String),
+    NotAtom(String),
+    Unknown,
+}
+
+impl From<&RustCfgCondition> for RustCfgConditionKey {
+    fn from(condition: &RustCfgCondition) -> Self {
+        match condition {
+            RustCfgCondition::Always => Self::Always,
+            RustCfgCondition::Atom(atom) => Self::Atom(atom.clone()),
+            RustCfgCondition::NotAtom(atom) => Self::NotAtom(atom.clone()),
+            RustCfgCondition::Unknown => Self::Unknown,
+        }
+    }
+}
+
+pub(crate) fn combine_rust_route_provenance(
+    left: RustRouteProvenance,
+    right: RustRouteProvenance,
+) -> RustRouteProvenance {
+    left.max(right)
+}
+
+fn rust_import_extent_key(extent: &RustImportExtent) -> (u8, usize, usize, usize, usize) {
+    match extent {
+        RustImportExtent::Module { start, end } => (0, *start, *end, 0, 0),
+        RustImportExtent::LocalOnly {
+            module_start,
+            module_end,
+            start,
+            end,
+        } => (1, *module_start, *module_end, *start, *end),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2339,12 +2630,16 @@ pub fn usage_crate_export_targets(
         crate_roots
             .iter()
             .flat_map(|root| walks.forward_import_edges_of(root).as_ref().clone())
-            .filter(|edge| edge.local_name == export_name)
             .filter_map(|edge| match &edge.kind {
-                RustImportEdgeKind::Named(target_name) => {
-                    Some((edge.target_file.clone(), target_name.clone()))
+                RustImportEdgeKind::Named {
+                    imported_name,
+                    local_name,
+                } if local_name == export_name => {
+                    Some((edge.target_file.clone(), imported_name.clone()))
                 }
-                RustImportEdgeKind::Namespace
+                RustImportEdgeKind::Named { .. }
+                | RustImportEdgeKind::Unnamed { .. }
+                | RustImportEdgeKind::Namespace { .. }
                 | RustImportEdgeKind::Glob
                 | RustImportEdgeKind::Qualified(_) => None,
             }),
@@ -2360,8 +2655,9 @@ pub fn edge_matches_single_seed(edge: &RustImportEdge, target: &RustSymbolIdenti
         return false;
     }
     match &edge.kind {
-        RustImportEdgeKind::Named(name) => name == &target.name,
-        RustImportEdgeKind::Namespace => true,
+        RustImportEdgeKind::Named { imported_name, .. }
+        | RustImportEdgeKind::Unnamed { imported_name } => imported_name == &target.name,
+        RustImportEdgeKind::Namespace { .. } => true,
         RustImportEdgeKind::Glob => true,
         RustImportEdgeKind::Qualified(_) => false,
     }
@@ -2642,7 +2938,7 @@ pub fn imported_identity_domain(
         && target.file == edge.importer
         && target.module == edge.importer_module
         && matches!(target_domain, Domain::Module(module) if module == &target.module)
-        && matches!(edge.kind, RustImportEdgeKind::Named(_))
+        && matches!(&edge.kind, RustImportEdgeKind::Named { .. })
     {
         // A module commonly gives a local `macro_rules!` definition a stable
         // path with `pub(crate) use name;`. That declaration creates a new
@@ -2661,4 +2957,70 @@ pub fn imported_identity_domain(
 pub fn edge_target_matches_exact_module(edge: &RustImportEdge, crate_root_package: &str) -> bool {
     ModuleKey::with_crate_root(crate_root_package, &rust_package_name(&edge.target_file))
         == edge.target_module
+}
+
+#[cfg(test)]
+mod unnamed_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_conjunction_rejects_internal_and_cross_set_contradictions() {
+        let yes = RustCfgCondition::Atom("feature = a".into());
+        let no = RustCfgCondition::NotAtom("feature = a".into());
+        assert!(combine_rust_cfg_conditions(&[yes.clone(), no.clone()], &[]).is_none());
+        assert!(combine_rust_cfg_conditions(&[], &[yes.clone(), no.clone()]).is_none());
+        assert!(combine_rust_cfg_conditions(std::slice::from_ref(&yes), &[no]).is_none());
+        assert_eq!(
+            combine_rust_cfg_conditions(&[yes.clone(), yes.clone()], std::slice::from_ref(&yes)),
+            Some(vec![yes])
+        );
+    }
+
+    #[test]
+    fn unnamed_visibility_requires_known_guards_exact_identity_and_scope() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let file = ProjectFile::new(root.path().to_path_buf(), "lib.rs");
+        let module = ModuleKey::new(&file, "");
+        let target = RustSymbolIdentity {
+            file: file.clone(),
+            module: module.clone(),
+            name: "Trait".into(),
+            namespace: RustSymbolNamespace::Type,
+        };
+        let mut seeds = RustBindingSeeds {
+            roots: BTreeSet::new(),
+            root_origins: HashSet::default(),
+            root_identities: HashMap::default(),
+            canonical_identities: HashMap::default(),
+            identities: HashSet::default(),
+            identity_domains: HashMap::default(),
+            edges_by_importer: HashMap::default(),
+            verified_importers: HashSet::default(),
+            unnamed_visibility: vec![RustUnnamedImportVisibility {
+                target: target.clone(),
+                importer: file.clone(),
+                importer_module: module.clone(),
+                extent: RustImportExtent::Module { start: 0, end: 100 },
+                domain: Domain::Public,
+                provenance: RustRouteProvenance::Local,
+                cfg_conditions: vec![RustCfgCondition::Always],
+            }],
+        };
+        assert!(seeds.unnamed_target_visible_at(&target, &file, &module, 10, &[]));
+        assert!(!seeds.unnamed_target_visible_at(&target, &file, &module, 101, &[]));
+        let other = RustSymbolIdentity {
+            name: "Other".into(),
+            ..target.clone()
+        };
+        assert!(!seeds.unnamed_target_visible_at(&other, &file, &module, 10, &[]));
+        assert!(!seeds.unnamed_target_visible_at(
+            &target,
+            &file,
+            &module,
+            10,
+            &[RustCfgCondition::Unknown]
+        ));
+        seeds.unnamed_visibility[0].cfg_conditions = vec![RustCfgCondition::Unknown];
+        assert!(!seeds.unnamed_target_visible_at(&target, &file, &module, 10, &[]));
+    }
 }

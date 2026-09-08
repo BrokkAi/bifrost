@@ -29,7 +29,9 @@ use crate::declarations::{
     rust_identifier_like_node_kind, rust_macro_invocation_arguments, rust_node_text,
     rust_unqualified_macro_invocation_name,
 };
-use crate::imports::{RustImportOwner, rust_import_projection, rust_module_extents};
+use crate::imports::{
+    RustImportBindingName, RustImportOwner, rust_import_projection, rust_module_extents,
+};
 
 /// Extract every per-file usage fact from one already-parsed Rust file.
 ///
@@ -132,36 +134,36 @@ fn include_host_bindings(
             continue;
         }
         let (local_name, module_specifier, imported_name, kind) =
-            if projected.import.info.is_wildcard {
-                (
+            match projected.import.binding_name() {
+                RustImportBindingName::Glob => (
                     "*".to_string(),
                     projected.import.path.join("::"),
                     None,
                     RustIncludeBindingKind::Glob,
-                )
-            } else if projected.import.is_extern_crate || projected.import.path.len() <= 1 {
-                let Some(local_name) = projected.import.info.local_name() else {
-                    continue;
-                };
-                (
-                    local_name.to_string(),
-                    projected.import.path.join("::"),
-                    None,
-                    RustIncludeBindingKind::Namespace,
-                )
-            } else {
-                let Some((imported_name, module_path)) = projected.import.path.split_last() else {
-                    continue;
-                };
-                let Some(local_name) = projected.import.info.local_name() else {
-                    continue;
-                };
-                (
-                    local_name.to_string(),
-                    module_path.join("::"),
-                    Some(imported_name.clone()),
-                    RustIncludeBindingKind::Named,
-                )
+                ),
+                RustImportBindingName::Unnamed => continue,
+                RustImportBindingName::Named(local_name)
+                    if projected.import.is_extern_crate || projected.import.path.len() <= 1 =>
+                {
+                    (
+                        local_name.to_string(),
+                        projected.import.path.join("::"),
+                        None,
+                        RustIncludeBindingKind::Namespace,
+                    )
+                }
+                RustImportBindingName::Named(local_name) => {
+                    let Some((imported_name, module_path)) = projected.import.path.split_last()
+                    else {
+                        continue;
+                    };
+                    (
+                        local_name.to_string(),
+                        module_path.join("::"),
+                        Some(imported_name.clone()),
+                        RustIncludeBindingKind::Named,
+                    )
+                }
             };
         if module_specifier.is_empty() {
             continue;
@@ -276,24 +278,26 @@ fn extract_import_targets(root: Node<'_>, source: &str) -> Vec<RustImportTargetF
                 } => (module, module_start, module_end, Some((start, end))),
             };
             let path = &projected.import.path;
-            let (module_path, imported_name, bound_name) = if projected.import.info.is_wildcard {
-                (path.join("::"), None, None)
-            } else {
-                let (prefix, name) = path.split_last().map_or_else(
-                    || (Vec::new(), None),
-                    |(name, prefix)| (prefix.to_vec(), Some(name.clone())),
-                );
-                (
-                    prefix.join("::"),
-                    name,
-                    projected.import.info.local_name().map(str::to_string),
-                )
+            let binding_name = projected.import.binding_name();
+            let (module_path, imported_name) = match &binding_name {
+                RustImportBindingName::Glob => (path.join("::"), None),
+                RustImportBindingName::Named(_) | RustImportBindingName::Unnamed => {
+                    let (prefix, name) = path.split_last().map_or_else(
+                        || (Vec::new(), None),
+                        |(name, prefix)| (prefix.to_vec(), Some(name.clone())),
+                    );
+                    (prefix.join("::"), name)
+                }
+            };
+            let bound_name = match &binding_name {
+                RustImportBindingName::Named(name) => Some(name.to_string()),
+                RustImportBindingName::Unnamed | RustImportBindingName::Glob => None,
             };
             RustImportTargetFact {
                 module_path,
                 bound_name,
                 imported_name,
-                is_glob: projected.import.info.is_wildcard,
+                is_glob: matches!(&binding_name, RustImportBindingName::Glob),
                 is_extern_crate: projected.import.is_extern_crate,
                 visibility: projected.import.visibility,
                 cfg_condition: projected.cfg_condition,
@@ -325,9 +329,7 @@ fn extract_exports(import_targets: &[RustImportTargetFact]) -> Vec<RustExportFac
             )
         })
         .filter(|target| !(target.is_glob && target.module_path.is_empty()))
-        .filter(|target| {
-            target.is_glob || (target.bound_name.is_some() && target.imported_name.is_some())
-        })
+        .filter(|target| target.is_glob || target.imported_name.is_some())
         .map(|target| RustExportFact {
             exported_name: target.bound_name.clone(),
             source_path: target.module_path.clone(),
@@ -504,6 +506,39 @@ mod inner {
             ],
             "targets were {targets:?}"
         );
+    }
+
+    #[test]
+    fn unnamed_imports_keep_the_target_without_a_local_binding() {
+        let source = "pub use alpha::Trait as _;\nuse beta::Other as _;\n";
+        let facts = facts(source);
+
+        let described: Vec<_> = facts
+            .import_targets
+            .iter()
+            .map(|target| {
+                (
+                    target.module_path.as_str(),
+                    target.bound_name.as_deref(),
+                    target.imported_name.as_deref(),
+                    target.is_glob,
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                ("alpha", None, Some("Trait"), false),
+                ("beta", None, Some("Other"), false),
+            ],
+            "targets were {:?}",
+            facts.import_targets
+        );
+        assert_eq!(facts.exports.len(), 1);
+        assert_eq!(facts.exports[0].exported_name, None);
+        assert_eq!(facts.exports[0].source_path, "alpha");
+        assert_eq!(facts.exports[0].imported_name.as_deref(), Some("Trait"));
+        assert!(!facts.exports[0].is_glob);
     }
 
     #[test]

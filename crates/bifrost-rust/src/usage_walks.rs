@@ -43,8 +43,9 @@ use crate::graph_support::{
     rust_relative_module_segments,
 };
 use crate::imports::{
-    resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_external_module_segments, rust_target_kind_root_alternative,
+    RustImportBindingName, resolve_rust_module_path_with_crate,
+    resolve_rust_module_segments_with_crate, rust_external_module_segments,
+    rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
@@ -862,7 +863,7 @@ impl<'a> RustUsageWalks<'a> {
                 ) else {
                     continue;
                 };
-                if binding.is_glob {
+                if binding.local_name.is_glob() {
                     for imported in self.resolve_segments(file, &owner_package, &binding.path) {
                         let inherited = self.alias_routes_at(
                             &imported
@@ -889,7 +890,7 @@ impl<'a> RustUsageWalks<'a> {
                     }
                     continue;
                 }
-                if binding.local_name != name {
+                if binding.local_name.named() != Some(name.as_str()) {
                     continue;
                 }
                 for resolved in self.resolve_segments(file, &owner_package, &binding.path) {
@@ -1407,14 +1408,11 @@ impl<'a> RustUsageWalks<'a> {
         ) else {
             return;
         };
-        let template = |target: RustResolvedModuleRoute,
-                        local_name: String,
-                        kind: RustImportEdgeKind| RustImportEdge {
+        let template = |target: RustResolvedModuleRoute, kind: RustImportEdgeKind| RustImportEdge {
             importer: file.clone(),
             importer_module: binding.importer_module.clone(),
             extent: binding.extent.clone(),
             source_path: binding.path.clone(),
-            local_name,
             target_file: target.target_file,
             target_module: target.target_module,
             kind,
@@ -1424,21 +1422,39 @@ impl<'a> RustUsageWalks<'a> {
             provenance: target.provenance,
             cfg_condition: binding.cfg_condition.clone(),
         };
-        if binding.is_glob {
+        if binding.local_name.is_glob() {
             for resolved in self.resolve_segments(file, owner, &binding.path) {
-                self.admit_import_edge(
-                    edges,
-                    template(resolved, String::new(), RustImportEdgeKind::Glob),
-                );
+                self.admit_import_edge(edges, template(resolved, RustImportEdgeKind::Glob));
             }
             return;
         }
         let Some(imported_name) = binding.path.last().cloned() else {
             return;
         };
+        if matches!(&binding.local_name, RustImportBindingName::Unnamed) {
+            for resolved in
+                self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
+            {
+                self.admit_import_edge(
+                    edges,
+                    template(
+                        resolved,
+                        RustImportEdgeKind::Unnamed {
+                            imported_name: imported_name.clone(),
+                        },
+                    ),
+                );
+            }
+            return;
+        }
         // `extern crate dep as tk;` binds only the crate namespace. Giving
         // it a named edge would also bind whatever `dep` names in this
         // module, so `tk::Item` would reach a same-named local `mod dep`.
+        let local_name = binding
+            .local_name
+            .named()
+            .expect("non-glob, non-underscore import edges have a local binding name")
+            .to_string();
         if !binding.is_extern_crate {
             for resolved in
                 self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
@@ -1447,8 +1463,10 @@ impl<'a> RustUsageWalks<'a> {
                     edges,
                     template(
                         resolved,
-                        binding.local_name.clone(),
-                        RustImportEdgeKind::Named(imported_name.clone()),
+                        RustImportEdgeKind::Named {
+                            imported_name: imported_name.clone(),
+                            local_name: local_name.clone(),
+                        },
                     ),
                 );
             }
@@ -1458,8 +1476,9 @@ impl<'a> RustUsageWalks<'a> {
                 edges,
                 template(
                     resolved,
-                    binding.local_name.clone(),
-                    RustImportEdgeKind::Namespace,
+                    RustImportEdgeKind::Namespace {
+                        local_name: local_name.clone(),
+                    },
                 ),
             );
         }
@@ -1585,7 +1604,7 @@ impl<'a> RustUsageWalks<'a> {
                     .import_bindings_of(candidate)
                     .iter()
                     .any(|binding| {
-                        let imports_from_parent = if binding.is_glob {
+                        let imports_from_parent = if binding.local_name.is_glob() {
                             binding.path.as_slice() == ["super"]
                         } else {
                             binding.path.len() == 2 && binding.path[0] == "super"
@@ -1617,7 +1636,7 @@ impl<'a> RustUsageWalks<'a> {
             return true;
         }
         let crate_package = &self.queries.path_identity_of(candidate).crate_root_package;
-        let module_path_end = if binding.is_glob {
+        let module_path_end = if binding.local_name.is_glob() {
             binding.path.len()
         } else {
             binding.path.len().saturating_sub(1)
@@ -1704,6 +1723,33 @@ impl<'a> RustUsageWalks<'a> {
         importers.sort();
         importers.dedup();
         importers
+    }
+
+    /// The glob edges that consume an unnamed binding exported by one exact
+    /// module file. The target file check matters when two files declare the
+    /// same module key under different Cargo roots or target layouts.
+    pub(crate) fn unnamed_glob_import_edges_of(
+        &self,
+        module: &ModuleKey,
+        target_file: &ProjectFile,
+    ) -> Option<Vec<RustImportEdge>> {
+        let mut edges = Vec::new();
+        for importer in self.importers_of_module(module) {
+            if self.cancelled() {
+                return None;
+            }
+            edges.extend(
+                self.forward_import_edges_of(&importer)
+                    .iter()
+                    .filter(|edge| {
+                        matches!(&edge.kind, RustImportEdgeKind::Glob)
+                            && edge.target_module == *module
+                            && edge.target_file == *target_file
+                    })
+                    .cloned(),
+            );
+        }
+        (!self.cancelled()).then_some(edges)
     }
 
     // ---------------------------------------------------- export chain walks
@@ -1797,9 +1843,11 @@ impl<'a> RustUsageWalks<'a> {
                 break;
             }
             let name = match &edge.kind {
-                RustImportEdgeKind::Named(_) => Some(edge.local_name.clone()),
+                RustImportEdgeKind::Named { local_name, .. } => Some(local_name.clone()),
                 RustImportEdgeKind::Glob => None,
-                RustImportEdgeKind::Namespace | RustImportEdgeKind::Qualified(_) => continue,
+                RustImportEdgeKind::Unnamed { .. }
+                | RustImportEdgeKind::Namespace { .. }
+                | RustImportEdgeKind::Qualified(_) => continue,
             };
             for (target, incoming) in self.edge_targets(edge) {
                 let bound_name = name.clone().unwrap_or_else(|| target.name.clone());
@@ -1829,8 +1877,9 @@ impl<'a> RustUsageWalks<'a> {
         self.bindings_at(&edge.target_file, &edge.target_module)
             .iter()
             .filter(|binding| match &edge.kind {
-                RustImportEdgeKind::Named(name) => binding.name == *name,
-                RustImportEdgeKind::Namespace | RustImportEdgeKind::Glob => true,
+                RustImportEdgeKind::Named { imported_name, .. }
+                | RustImportEdgeKind::Unnamed { imported_name } => binding.name == *imported_name,
+                RustImportEdgeKind::Namespace { .. } | RustImportEdgeKind::Glob => true,
                 RustImportEdgeKind::Qualified(_) => false,
             })
             .map(|binding| {
@@ -1849,7 +1898,7 @@ impl<'a> RustUsageWalks<'a> {
 
     /// The domain an imported name carries in the importing module, or `None`
     /// when the import cannot see it at all.
-    fn effective_import_domain(
+    pub(crate) fn effective_import_domain(
         &self,
         target: &RustSymbolIdentity,
         domain: &Domain,
@@ -1901,11 +1950,12 @@ impl<'a> RustUsageWalks<'a> {
                     continue;
                 };
                 let path = match &edge.kind {
-                    RustImportEdgeKind::Named(_) => vec![edge.local_name.clone()],
-                    RustImportEdgeKind::Namespace => {
-                        vec![edge.local_name.clone(), target.name.clone()]
+                    RustImportEdgeKind::Named { local_name, .. } => vec![local_name.clone()],
+                    RustImportEdgeKind::Namespace { local_name } => {
+                        vec![local_name.clone(), target.name.clone()]
                     }
                     RustImportEdgeKind::Glob => vec![target.name.clone()],
+                    RustImportEdgeKind::Unnamed { .. } => continue,
                     RustImportEdgeKind::Qualified(path) => path.clone(),
                 };
                 let first_segment = path
@@ -1919,7 +1969,7 @@ impl<'a> RustUsageWalks<'a> {
                         importer_module: edge.importer_module.clone(),
                         extent: edge.extent.clone(),
                         path,
-                        is_glob_import: matches!(edge.kind, RustImportEdgeKind::Glob),
+                        is_glob_import: matches!(&edge.kind, RustImportEdgeKind::Glob),
                         namespace: target.namespace,
                         origin: binding.origin,
                         domain: effective,
@@ -2300,6 +2350,21 @@ impl<'a> RustUsageWalks<'a> {
             .map(|(_, conditions)| conditions.clone())
     }
 
+    /// The exact visibility-domain/cfg pairs for one declaration identity.
+    /// Unlike the separately grouped legacy views, each pair remains attached
+    /// to the declaration occurrence that produced it.
+    pub fn declared_domain_cfg_occurrences_of(
+        &self,
+        identity: &RustSymbolIdentity,
+    ) -> Option<Vec<(Domain, RustCfgCondition)>> {
+        self.queries
+            .declaration_facts_of(&identity.file)
+            .domain_cfg_occurrences
+            .iter()
+            .find(|(candidate, _)| candidate == identity)
+            .map(|(_, occurrences)| occurrences.clone())
+    }
+
     /// Macro declarations in the workspace named `name`. The v1 lookup scanned
     /// every macro's visible-range entry; this is the store's indexed short-name
     /// lookup plus the per-candidate check that the name really is a macro.
@@ -2326,7 +2391,7 @@ fn binding_names_module_component(binding: &RustImportBinding, component: &str) 
         .path
         .last()
         .is_some_and(|path_component| path_component == component)
-        || (!binding.is_glob
+        || (!binding.local_name.is_glob()
             && binding.path.len() > 1
             && binding.path[binding.path.len() - 2] == component)
 }
@@ -2345,9 +2410,10 @@ fn edge_binds_identity(edge: &RustImportEdge, identity: &RustSymbolIdentity) -> 
         return false;
     }
     match &edge.kind {
-        RustImportEdgeKind::Named(imported_name) => imported_name == &identity.name,
+        RustImportEdgeKind::Named { imported_name, .. }
+        | RustImportEdgeKind::Unnamed { imported_name } => imported_name == &identity.name,
         RustImportEdgeKind::Glob
-        | RustImportEdgeKind::Namespace
+        | RustImportEdgeKind::Namespace { .. }
         | RustImportEdgeKind::Qualified(_) => true,
     }
 }

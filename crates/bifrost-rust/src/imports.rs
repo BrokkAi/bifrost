@@ -20,6 +20,52 @@ use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 /// caller, because visibility arithmetic is this module's subject.
 pub use brokk_bifrost_core::analyzer::rust_facts::RustVisibility;
 
+/// The semantic binding introduced by one Rust import leaf.
+///
+/// Rust's `use path as _` deliberately imports the target without introducing
+/// a referenceable local name. That is distinct from a glob, which imports the
+/// target module's public names into the importing scope. The distinction is
+/// kept here, beside the parser-owned [`ImportInfo`] projection, so consumers
+/// do not infer it from rendered snippets or use `_` as a sentinel name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustImportBindingName<'a> {
+    Named(Cow<'a, str>),
+    Unnamed,
+    Glob,
+}
+
+impl<'a> RustImportBindingName<'a> {
+    pub fn named(&self) -> Option<&str> {
+        match self {
+            Self::Named(name) => Some(name.as_ref()),
+            Self::Unnamed | Self::Glob => None,
+        }
+    }
+
+    pub fn is_glob(&self) -> bool {
+        matches!(self, Self::Glob)
+    }
+}
+
+/// Classify the local binding represented by parser-derived import fields.
+///
+/// `ImportInfo::local_name` already implements the parser field precedence
+/// (`alias`, `identifier`, then the structured path tail). Reusing that
+/// projection keeps all Rust import consumers on the same structured source of
+/// truth while giving underscore imports their semantic no-name state.
+pub fn rust_import_binding_name<'a>(import: &'a ImportInfo) -> RustImportBindingName<'a> {
+    if import.is_wildcard {
+        return RustImportBindingName::Glob;
+    }
+    if import.alias.as_deref() == Some("_") {
+        return RustImportBindingName::Unnamed;
+    }
+    let name = import
+        .local_name()
+        .expect("non-glob Rust import must have a parser-derived local name");
+    RustImportBindingName::Named(Cow::Borrowed(name))
+}
+
 #[derive(Debug, Clone)]
 pub struct RustImportInfo {
     pub info: ImportInfo,
@@ -28,6 +74,12 @@ pub struct RustImportInfo {
     /// An `extern crate` declaration binds the crate namespace only. It must
     /// not produce the zero-prefix named edge that a normal `use item` emits.
     pub is_extern_crate: bool,
+}
+
+impl RustImportInfo {
+    pub fn binding_name(&self) -> RustImportBindingName<'_> {
+        rust_import_binding_name(&self.info)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +674,45 @@ fn rust_use_leaf_binder_node(node: Node<'_>, prefix_was_empty: bool) -> Option<N
         "identifier" | "metavariable" | "crate" | "super" => Some(node),
         "self" if prefix_was_empty => Some(node),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn import_binding_name_distinguishes_unnamed_named_and_glob() {
+        let source = "use crate::Trait as _;\nuse crate::Named;\nuse crate::module::*;\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load Rust grammar");
+        let tree = parser.parse(source, None).expect("parse Rust imports");
+        let mut cursor = tree.root_node().walk();
+        let imports: Vec<_> = tree
+            .root_node()
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "use_declaration")
+            .flat_map(|node| rust_imports_with_visibility_from_use_declaration(node, source))
+            .collect();
+
+        assert_eq!(imports[0].binding_name(), RustImportBindingName::Unnamed);
+        assert_eq!(imports[0].info.alias.as_deref(), Some("_"));
+        assert_eq!(
+            imports[0]
+                .path
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["crate", "Trait"]
+        );
+        assert_eq!(
+            imports[1].binding_name(),
+            RustImportBindingName::Named(Cow::Borrowed("Named"))
+        );
+        assert_eq!(imports[2].binding_name(), RustImportBindingName::Glob);
     }
 }
 

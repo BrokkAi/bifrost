@@ -116,11 +116,14 @@ pub struct RustRulesItemMacroDefinition {
 /// A name this file publishes through a non-private `use` at its root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustExportFact {
-    /// The name importers see, after any `as` alias. `None` for a glob.
+    /// The name importers see, after any `as` alias. `None` for a glob or an
+    /// underscore import, which is intentionally not referenceable by name.
     pub exported_name: Option<String>,
     /// The `::`-joined module prefix the name is published from, verbatim.
     pub source_path: String,
-    /// The name inside `source_path` that is published. `None` for a glob.
+    /// The name inside `source_path` that is published. `None` for a glob;
+    /// underscore imports retain the imported target here while leaving
+    /// `exported_name` unnamed.
     pub imported_name: Option<String>,
     pub is_glob: bool,
 }
@@ -131,9 +134,11 @@ pub struct RustImportTargetFact {
     /// For a named import, the `::`-joined prefix as written; for a glob, the
     /// whole written path.
     pub module_path: String,
-    /// The name the import binds locally. `None` for a glob.
+    /// The name the import binds locally. `None` for a glob or an underscore
+    /// import, which introduces no referenceable local name.
     pub bound_name: Option<String>,
-    /// The final written segment. `None` for a glob.
+    /// The final written segment. `None` for a glob; underscore imports retain
+    /// their target segment here.
     pub imported_name: Option<String>,
     pub is_glob: bool,
     /// True for `extern crate name as alias;`, which binds only a namespace.

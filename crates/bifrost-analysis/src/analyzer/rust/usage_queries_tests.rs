@@ -170,13 +170,13 @@ mod tests {
         let lib_bindings = queries.import_bindings_of(&lib);
         let described: Vec<_> = lib_bindings
             .iter()
-            .map(|binding| (binding.path.join("::"), binding.local_name.as_str()))
+            .map(|binding| (binding.path.join("::"), binding.local_name.named()))
             .collect();
         assert_eq!(
             described,
             vec![
-                ("worker::Job".to_string(), "Task"),
-                ("std::fmt::Debug".to_string(), "Debug"),
+                ("worker::Job".to_string(), Some("Task")),
+                ("std::fmt::Debug".to_string(), Some("Debug")),
             ],
             "lib bindings were {lib_bindings:?}"
         );
@@ -320,5 +320,213 @@ mod tests {
             "the module-scope unit struct still declares a type and its \
              value-namespace constructor: {holder_identities:?}"
         );
+    }
+}
+#[cfg(test)]
+mod issue_3080_phase_two {
+    use crate::analyzer::rust::RustAnalyzer;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+    use crate::analyzer::{CodeUnitIndex, Language};
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_rust::lexical_scope::RustCfgCondition;
+    use brokk_bifrost_rust::usage::{
+        RustImportEdgeKind, RustSymbolNamespace, usage_binding_local_names, usage_binding_names,
+        usage_binding_seeds_while, usage_candidate_files_from_binding_seeds_while,
+    };
+    use brokk_bifrost_rust::usage_queries::RustUsageQueries;
+    use brokk_bifrost_rust::usage_walks::RustUsageWalks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture() -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+        let project = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname = \"unnamed_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        .file("src/lib.rs", "pub mod model; pub mod barrel; pub mod consumer; pub mod named; pub mod namespace; pub mod glob;\n")
+        .file("src/model.rs", "pub trait Trait { fn ping(&self); }\npub struct Value;\nimpl Trait for Value { fn ping(&self) {} }\n#[cfg(feature = \"a\")] pub struct Pair<T>(pub T);\n#[cfg(not(feature = \"a\"))] pub struct Pair<T, U>(T, U);\n")
+        .file("src/barrel.rs", "pub use crate::model::Trait as _;\n")
+        .file("src/consumer.rs", "use crate::barrel::*;\nfn call(value: crate::model::Value) { value.ping(); }\n")
+        .file("src/named.rs", "use crate::model::Trait as Alias;\nfn call(value: crate::model::Value) { value.ping(); }\n")
+        .file("src/namespace.rs", "use crate::model as ns;\nfn call(value: ns::Value) { ns::Trait::ping(&value); }\n")
+        .file("src/glob.rs", "use crate::model::*;\nfn call(value: Value) { value.ping(); }\n")
+        .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        (project, analyzer)
+    }
+
+    #[test]
+    fn unnamed_glob_consumers_are_candidates_without_reference_names() {
+        let (project, analyzer) = fixture();
+        let roots = analyzer
+            .declarations(&project.file("src/model.rs"))
+            .into_iter()
+            .filter(|unit| unit.identifier() == "Trait")
+            .collect();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let seeds = usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| true)
+            .expect("complete seeds");
+        let consumer = project.file("src/consumer.rs");
+        assert!(
+            seeds
+                .verified_importer_files()
+                .any(|file| file == &consumer)
+        );
+        let candidates = usage_candidate_files_from_binding_seeds_while(
+            &analyzer,
+            scope.token(),
+            &seeds,
+            &|| true,
+        )
+        .expect("complete candidates");
+        assert!(candidates.contains(&consumer), "{candidates:?}");
+        assert!(
+            seeds
+                .unnamed_visibility()
+                .any(|route| route.importer == consumer && route.target.name == "Trait")
+        );
+        assert!(
+            !usage_binding_local_names(&analyzer, scope.token(), &consumer, &seeds).contains("_")
+        );
+        assert!(
+            usage_binding_local_names(
+                &analyzer,
+                scope.token(),
+                &project.file("src/named.rs"),
+                &seeds
+            )
+            .contains("Alias")
+        );
+        assert!(
+            usage_binding_local_names(
+                &analyzer,
+                scope.token(),
+                &project.file("src/glob.rs"),
+                &seeds
+            )
+            .contains("Trait")
+        );
+        let (_, qualified) = usage_binding_names(
+            &analyzer,
+            scope.token(),
+            &project.file("src/namespace.rs"),
+            &seeds,
+        );
+        assert!(qualified.contains("ns::Trait"), "{qualified:?}");
+        let walks = RustUsageWalks::new(&analyzer, scope.token());
+        assert!(walks.forward_import_edges_of(&project.file("src/barrel.rs")).iter().any(|edge| matches!(&edge.kind, RustImportEdgeKind::Unnamed { imported_name } if imported_name == "Trait")));
+        assert!(walks.forward_import_edges_of(&project.file("src/named.rs")).iter().any(|edge| matches!(&edge.kind, RustImportEdgeKind::Named { imported_name, local_name } if imported_name == "Trait" && local_name == "Alias")));
+        assert!(walks.forward_import_edges_of(&project.file("src/namespace.rs")).iter().any(|edge| matches!(&edge.kind, RustImportEdgeKind::Namespace { local_name } if local_name == "ns")));
+        assert!(
+            walks
+                .forward_import_edges_of(&consumer)
+                .iter()
+                .any(|edge| matches!(&edge.kind, RustImportEdgeKind::Glob))
+        );
+    }
+
+    #[test]
+    fn declaration_and_constructor_guards_remain_paired() {
+        let (project, analyzer) = fixture();
+        let queries = RustUsageQueries::new(&analyzer);
+        let facts = queries.declaration_facts_of(&project.file("src/model.rs"));
+        for namespace in [RustSymbolNamespace::Type, RustSymbolNamespace::Value] {
+            let (_, occurrences) = facts
+                .domain_cfg_occurrences
+                .iter()
+                .find(|(identity, _)| identity.name == "Pair" && identity.namespace == namespace)
+                .expect("paired identity");
+            assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+            for (domain, guard) in occurrences {
+                let public_expected = namespace == RustSymbolNamespace::Type
+                    || matches!(guard, RustCfgCondition::Atom(_));
+                assert_eq!(
+                    *domain == brokk_bifrost_rust::usage::Domain::Public,
+                    public_expected,
+                    "visibility must remain paired with its occurrence guard: {occurrences:?}"
+                );
+            }
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::Atom(_))),
+                "{occurrences:?}"
+            );
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::NotAtom(_))),
+                "{occurrences:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_seed_or_candidate_walk_publishes_no_partial_set() {
+        let (project, analyzer) = fixture();
+        let roots = analyzer
+            .declarations(&project.file("src/model.rs"))
+            .into_iter()
+            .filter(|unit| unit.identifier() == "Trait")
+            .collect();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        assert!(usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| false).is_none());
+        let calls = AtomicUsize::new(0);
+        assert!(
+            usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| calls
+                .fetch_add(1, Ordering::Relaxed)
+                < 8)
+            .is_none()
+        );
+        let seeds = usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| true)
+            .expect("complete seeds after cancellation");
+        assert!(
+            usage_candidate_files_from_binding_seeds_while(
+                &analyzer,
+                scope.token(),
+                &seeds,
+                &|| false
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn macro_item_occurrences_preserve_both_guards() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"macro_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                r#"
+macro_rules! items { ($($item:item)*) => { $($item)* }; }
+items! {
+    #[cfg(feature = "a")] pub struct Pair(pub u8);
+    #[cfg(not(feature = "a"))] pub struct Pair(pub u16);
+}
+"#,
+            )
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let queries = RustUsageQueries::new(&analyzer);
+        let facts = queries.declaration_facts_of(&project.file("src/lib.rs"));
+        for namespace in [RustSymbolNamespace::Type, RustSymbolNamespace::Value] {
+            let (_, occurrences) = facts
+                .domain_cfg_occurrences
+                .iter()
+                .find(|(identity, _)| identity.name == "Pair" && identity.namespace == namespace)
+                .expect("macro item identity");
+            assert_eq!(occurrences.len(), 2, "{occurrences:?}");
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::Atom(_))),
+                "{occurrences:?}"
+            );
+            assert!(
+                occurrences
+                    .iter()
+                    .any(|(_, guard)| matches!(guard, RustCfgCondition::NotAtom(_))),
+                "{occurrences:?}"
+            );
+        }
     }
 }

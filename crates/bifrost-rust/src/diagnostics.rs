@@ -631,7 +631,7 @@ impl RustDiagnosticCollector<'_, '_> {
                 continue;
             }
             for import in &visible_use.imports {
-                if import.local_name() != Some(name) {
+                if crate::imports::rust_import_binding_name(import).named() != Some(name) {
                     continue;
                 }
                 if let Some(path) = import.path.as_ref()

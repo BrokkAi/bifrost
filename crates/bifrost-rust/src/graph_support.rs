@@ -11,7 +11,7 @@ use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
-use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::profiling;
@@ -920,13 +920,14 @@ pub fn export_index_of_declarations(
                 continue;
             }
             for import in rust_imports_with_visibility_from_use_declaration(node, source) {
+                let binding_name = import.binding_name();
                 if matches!(
                     import.visibility,
                     RustVisibility::Private | RustVisibility::SelfModule
                 ) {
                     continue;
                 }
-                if import.info.is_wildcard {
+                if binding_name.is_glob() {
                     if !import.path.is_empty() {
                         index.reexport_stars.push(ReexportStar {
                             module_specifier: import.path.join("::"),
@@ -937,7 +938,7 @@ pub fn export_index_of_declarations(
                 let Some(imported_name) = import.path.last().cloned() else {
                     continue;
                 };
-                let Some(local_name) = import.info.local_name().map(str::to_string) else {
+                let Some(local_name) = binding_name.named().map(str::to_string) else {
                     continue;
                 };
                 let module_specifier = import.path[..import.path.len() - 1].join("::");
@@ -1969,9 +1970,17 @@ pub fn is_rust_type_alias_declaration(index: &dyn CodeUnitIndex, code_unit: &Cod
 pub fn is_rust_macro_export_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
     code_unit.is_macro()
         && rust_declaration_node_is(index, code_unit, |node, source| {
-            node.kind() == "macro_definition"
-                && rust_item_has_attribute(node, source, "macro_export")
+            is_rust_macro_export_node(node, source)
         })
+}
+
+/// Whether this exact macro declaration occurrence carries `#[macro_export]`.
+///
+/// Declaration facts use this node-level form because a CodeUnit can represent
+/// multiple cfg or macro-expanded occurrences and each occurrence has its own
+/// export visibility.
+pub fn is_rust_macro_export_node(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "macro_definition" && rust_item_has_attribute(node, source, "macro_export")
 }
 
 pub fn is_rust_public_like_declaration(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {
@@ -2192,22 +2201,89 @@ pub fn inspect_rust_named_declaration_node<T>(
     source: &str,
     inspect: impl for<'tree> Fn(Node<'tree>, &str) -> T,
 ) -> Option<T> {
-    if let Some(node) = rust_named_declaration_node(index, code_unit, root, source) {
-        return Some(inspect(node, source));
+    let range = index.ranges(code_unit).into_iter().next()?;
+    inspect_rust_named_declaration_node_at_range(code_unit, root, source, range, &|| true, &inspect)
+        .flatten()
+}
+
+/// Inspect every recorded source occurrence of a declaration in deterministic order.
+///
+/// `CodeUnit` equality intentionally collapses duplicate declarations such as two
+/// `#[cfg]` alternatives or two item-macro expansions. Their navigation ranges still
+/// identify distinct syntax occurrences, so metadata readers must inspect each range
+/// before grouping it by identity. The inner `None` means that one occurrence has no
+/// recoverable AST; the outer `None` means the walk was cancelled.
+pub fn inspect_rust_named_declaration_nodes_while<T>(
+    index: &dyn CodeUnitIndex,
+    code_unit: &CodeUnit,
+    root: Node<'_>,
+    source: &str,
+    keep_going: &impl Fn() -> bool,
+    inspect: impl for<'tree> Fn(Node<'tree>, &str) -> T,
+) -> Option<Vec<Option<T>>> {
+    let mut ranges = index.ranges(code_unit);
+    ranges.sort_unstable_by_key(|range| {
+        (
+            range.start_byte,
+            range.end_byte,
+            range.start_line,
+            range.end_line,
+        )
+    });
+
+    let mut occurrences = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if !keep_going() {
+            return None;
+        }
+        occurrences.push(inspect_rust_named_declaration_node_at_range(
+            code_unit, root, source, range, keep_going, &inspect,
+        )?);
+    }
+    if !keep_going() {
+        return None;
+    }
+    Some(occurrences)
+}
+
+fn inspect_rust_named_declaration_node_at_range<T>(
+    code_unit: &CodeUnit,
+    root: Node<'_>,
+    source: &str,
+    range: Range,
+    keep_going: &impl Fn() -> bool,
+    inspect: &impl for<'tree> Fn(Node<'tree>, &str) -> T,
+) -> Option<Option<T>> {
+    if let Some(node) = rust_named_declaration_node_at_range(code_unit, root, source, range) {
+        return Some(Some(inspect(node, source)));
     }
 
-    let range = index.ranges(code_unit).into_iter().next()?;
-    let mut region = enclosing_macro_token_tree_interior(root, range.start_byte, range.end_byte)?;
+    let Some(mut region) =
+        enclosing_macro_token_tree_interior(root, range.start_byte, range.end_byte)
+    else {
+        return Some(None);
+    };
     loop {
-        let tree = crate::lexical_scope::parse_rust_region_tree(source, region.0, region.1)?;
-        let reparsed_root = tree.root_node();
-        if let Some(node) = rust_named_declaration_node(index, code_unit, reparsed_root, source) {
-            return Some(inspect(node, source));
-        }
-        let next =
-            enclosing_macro_token_tree_interior(reparsed_root, range.start_byte, range.end_byte)?;
-        if next == region {
+        if !keep_going() {
             return None;
+        }
+        let Some(tree) = crate::lexical_scope::parse_rust_region_tree(source, region.0, region.1)
+        else {
+            return Some(None);
+        };
+        let reparsed_root = tree.root_node();
+        if let Some(node) =
+            rust_named_declaration_node_at_range(code_unit, reparsed_root, source, range)
+        {
+            return Some(Some(inspect(node, source)));
+        }
+        let Some(next) =
+            enclosing_macro_token_tree_interior(reparsed_root, range.start_byte, range.end_byte)
+        else {
+            return Some(None);
+        };
+        if next == region {
+            return Some(None);
         }
         region = next;
     }
@@ -2242,7 +2318,17 @@ pub fn rust_named_declaration_node<'tree>(
     root: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    let mut node = rust_declaration_node(index, code_unit, root)?;
+    let range = index.ranges(code_unit).into_iter().next()?;
+    rust_named_declaration_node_at_range(code_unit, root, source, range)
+}
+
+fn rust_named_declaration_node_at_range<'tree>(
+    code_unit: &CodeUnit,
+    root: Node<'tree>,
+    source: &str,
+    range: Range,
+) -> Option<Node<'tree>> {
+    let mut node = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
     loop {
         if node
             .child_by_field_name("name")

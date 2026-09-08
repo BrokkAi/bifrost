@@ -1102,6 +1102,9 @@ pub(crate) mod tests {
     /// when the second build skipped the refresh.
     #[test]
     fn a_persisted_build_analyzes_once_and_a_no_op_build_does_not_repeat_it() {
+        let _guard = statistics_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
@@ -1196,6 +1199,9 @@ pub(crate) mod tests {
     /// projection is released, so nothing owns the second blob any more.
     #[test]
     fn a_collection_that_drops_rows_refreshes_the_statistics() {
+        let _guard = statistics_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let first = "pub fn widget() -> u32 { 1 }\n";
@@ -1390,6 +1396,9 @@ pub(crate) mod tests {
     /// is too fast to distinguish from the open around it.
     #[test]
     fn opening_a_built_store_without_statistics_repairs_them_once() {
+        let _guard = statistics_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("cache.db");
         {
@@ -1432,6 +1441,9 @@ pub(crate) mod tests {
     /// produce nothing. Every ephemeral workspace opens exactly such a store.
     #[test]
     fn opening_an_empty_store_does_not_analyze_it() {
+        let _guard = statistics_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let repairs = planner_statistics_repairs();
         let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();

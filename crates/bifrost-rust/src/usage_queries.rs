@@ -38,7 +38,7 @@ use crate::graph_support::RustFactSource;
 
 use crate::declarations::rust_package_name;
 use crate::graph_support::rust_value_constructor_visibilities;
-use crate::imports::RustVisibility;
+use crate::imports::{RustImportBindingName, RustVisibility, rust_item_visibility};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 use crate::usage::{
     Domain, ModuleKey, RustImportExtent, RustPathIdentity, RustSymbolIdentity, RustSymbolNamespace,
@@ -63,10 +63,9 @@ pub struct RustImportBinding {
     /// module path; for a named import it is the module path plus the imported
     /// name, which is exactly `RustProjectedImport::import.path`.
     pub path: Vec<String>,
-    /// The name the import binds locally, empty for a glob -- matching what
-    /// `ImportInfo::local_name().unwrap_or_default()` yields today.
-    pub local_name: String,
-    pub is_glob: bool,
+    /// The semantic local binding. Globs and explicit underscore aliases do
+    /// not introduce a referenceable local name.
+    pub local_name: RustImportBindingName<'static>,
     /// True for `extern crate name as alias;`: it binds a namespace and nothing
     /// in the current module's own namespace.
     pub is_extern_crate: bool,
@@ -114,6 +113,12 @@ pub struct RustDeclarationFacts {
     /// rest of this struct and needs no stored row: the predicate sits on the
     /// declaration's own item, in the file that declares it.
     pub cfg_conditions: Vec<(RustSymbolIdentity, Vec<RustCfgCondition>)>,
+    /// Identity -> the exact declaration occurrences that contributed a
+    /// visibility domain and its cfg guard. This paired view avoids assuming
+    /// that the separately grouped `domains` and `cfg_conditions` vectors
+    /// still have positional alignment after declarations without a domain
+    /// are filtered out.
+    pub domain_cfg_occurrences: Vec<(RustSymbolIdentity, Vec<(Domain, RustCfgCondition)>)>,
 }
 
 /// Derive one file's declaration facts.
@@ -133,6 +138,8 @@ pub fn rust_declaration_facts(
     let mut facts = RustDeclarationFacts::default();
     let mut ordered_domains: Vec<(RustSymbolIdentity, Domain)> = Vec::new();
     let mut ordered_cfg_conditions: Vec<(RustSymbolIdentity, RustCfgCondition)> = Vec::new();
+    let mut ordered_domain_cfg_occurrences: Vec<(RustSymbolIdentity, Domain, RustCfgCondition)> =
+        Vec::new();
     let prepared = analyzer.prepared_syntax(token, file);
     let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file);
     for declaration in declarations {
@@ -163,74 +170,105 @@ pub fn rust_declaration_facts(
         facts
             .identities
             .push((declaration.clone(), identity.clone()));
-        let declaration_cfg_condition = prepared.as_ref().and_then(|syntax| {
-            crate::graph_support::inspect_rust_named_declaration_node(
+        let occurrence_metadata = if let Some(syntax) = prepared.as_ref() {
+            let mut occurrences = crate::graph_support::inspect_rust_named_declaration_nodes_while(
                 analyzer.code_units(),
                 declaration,
                 syntax.tree().root_node(),
                 syntax.source(),
-                rust_cfg_condition,
-            )
-        });
-        // A declaration whose node this build cannot find proves nothing about
-        // its guard, so it is `Unknown` rather than `Always`.
-        ordered_cfg_conditions.push((
-            identity.clone(),
-            declaration_cfg_condition.unwrap_or(RustCfgCondition::Unknown),
-        ));
-        let constructor_domain = prepared.as_ref().and_then(|syntax| {
-            crate::graph_support::inspect_rust_named_declaration_node(
-                analyzer.code_units(),
-                declaration,
-                syntax.tree().root_node(),
-                syntax.source(),
-                rust_value_constructor_visibilities,
-            )??
-            .into_iter()
-            .map(|visibility| {
+                keep_going,
+                |node, source| {
+                    (
+                        rust_cfg_condition(node, source),
+                        rust_item_visibility(node, source),
+                        rust_value_constructor_visibilities(node, source),
+                        crate::graph_support::is_rust_macro_export_node(node, source),
+                    )
+                },
+            )?;
+            if occurrences.is_empty() {
+                occurrences.push(None);
+            }
+            occurrences
+        } else {
+            vec![None]
+        };
+        let mut recorded_constructor = false;
+        for occurrence in occurrence_metadata {
+            keep_going().then_some(())?;
+            let (
+                declaration_cfg_condition,
+                declaration_visibility,
+                constructor_visibilities,
+                macro_export,
+            ) = match occurrence {
+                Some(metadata) => metadata,
+                None => {
+                    // A declaration whose node this build cannot find proves nothing about
+                    // its guard or visibility. Retain the identity and unknown guard, but
+                    // do not manufacture a private domain for this occurrence.
+                    ordered_cfg_conditions.push((identity.clone(), RustCfgCondition::Unknown));
+                    continue;
+                }
+            };
+            ordered_cfg_conditions.push((identity.clone(), declaration_cfg_condition.clone()));
+            let declaration_domain = if namespace == RustSymbolNamespace::Macro && macro_export {
+                Some(Domain::Public)
+            } else {
                 direct_import_scope_for_module(
                     file,
                     &owner.package(),
-                    visibility,
+                    declaration_visibility,
                     is_actual_crate_root,
                 )
-            })
-            .try_fold(Domain::Public, |effective, domain| {
-                effective.intersect(&domain?)
-            })
-        });
-        let declaration_domain = if namespace == RustSymbolNamespace::Macro
-            && crate::graph_support::is_rust_macro_export_declaration(
-                analyzer.code_units(),
-                declaration,
-            ) {
-            Some(Domain::Public)
-        } else {
-            direct_import_scope_for_module(
-                file,
-                &owner.package(),
-                crate::graph_support::rust_declaration_visibility(analyzer, token, declaration),
-                is_actual_crate_root,
-            )
-        };
-        let Some(domain) = declaration_domain else {
-            continue;
-        };
-        if let Some(declared_module) = declared_module {
-            facts
-                .declared_module_domains
-                .push((declared_module, domain.clone()));
-        }
-        ordered_domains.push((identity.clone(), domain));
-        if let Some(constructor_domain) = constructor_domain {
-            let constructor = RustSymbolIdentity {
-                namespace: RustSymbolNamespace::Value,
-                ..identity
             };
-            ordered_domains.push((constructor.clone(), constructor_domain));
-            facts
-                .value_constructors
-                .push((declaration.clone(), constructor));
+            let Some(domain) = declaration_domain else {
+                continue;
+            };
+            if let Some(declared_module) = declared_module.as_ref() {
+                facts
+                    .declared_module_domains
+                    .push((declared_module.clone(), domain.clone()));
+            }
+            ordered_domain_cfg_occurrences.push((
+                identity.clone(),
+                domain.clone(),
+                declaration_cfg_condition.clone(),
+            ));
+            ordered_domains.push((identity.clone(), domain));
+            let constructor_domain = constructor_visibilities.and_then(|visibilities| {
+                visibilities
+                    .into_iter()
+                    .map(|visibility| {
+                        direct_import_scope_for_module(
+                            file,
+                            &owner.package(),
+                            visibility,
+                            is_actual_crate_root,
+                        )
+                    })
+                    .try_fold(Domain::Public, |effective, domain| {
+                        effective.intersect(&domain?)
+                    })
+            });
+            if let Some(constructor_domain) = constructor_domain {
+                let constructor = RustSymbolIdentity {
+                    namespace: RustSymbolNamespace::Value,
+                    ..identity.clone()
+                };
+                ordered_domain_cfg_occurrences.push((
+                    constructor.clone(),
+                    constructor_domain.clone(),
+                    declaration_cfg_condition,
+                ));
+                ordered_domains.push((constructor.clone(), constructor_domain));
+                if !recorded_constructor {
+                    facts
+                        .value_constructors
+                        .push((declaration.clone(), constructor));
+                    recorded_constructor = true;
+                }
+            }
         }
     }
     for (identity, domain) in ordered_domains {
@@ -253,6 +291,19 @@ pub fn rust_declaration_facts(
         {
             Some((_, conditions)) => conditions.push(condition),
             None => facts.cfg_conditions.push((identity, vec![condition])),
+        }
+    }
+    for (identity, domain, condition) in ordered_domain_cfg_occurrences {
+        keep_going().then_some(())?;
+        match facts
+            .domain_cfg_occurrences
+            .iter_mut()
+            .find(|(existing, _)| *existing == identity)
+        {
+            Some((_, occurrences)) => occurrences.push((domain, condition)),
+            None => facts
+                .domain_cfg_occurrences
+                .push((identity, vec![(domain, condition)])),
         }
     }
     Some(facts)
@@ -559,10 +610,20 @@ fn binding_from_fact(
             end: target.owner_end,
         },
     };
+    let local_name = match (&target.bound_name, target.is_glob) {
+        (_, true) => RustImportBindingName::Glob,
+        (Some(name), false) => RustImportBindingName::Named(name.clone().into()),
+        (None, false) => {
+            assert!(
+                target.imported_name.is_some(),
+                "non-glob Rust import without a bound or imported name"
+            );
+            RustImportBindingName::Unnamed
+        }
+    };
     RustImportBinding {
         path,
-        local_name: target.bound_name.clone().unwrap_or_default(),
-        is_glob: target.is_glob,
+        local_name,
         is_extern_crate: target.is_extern_crate,
         visibility: target.visibility.clone(),
         cfg_condition: target.cfg_condition.clone(),
