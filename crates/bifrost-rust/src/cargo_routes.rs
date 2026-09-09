@@ -16,7 +16,8 @@ use crate::declarations::{
     rust_macro_invocation_arguments, rust_package_name, rust_unqualified_macro_invocation_name,
 };
 use crate::imports::{
-    rust_external_module_route, rust_external_module_segments, rust_item_visibility,
+    rust_external_module_route, rust_external_module_segments, rust_item_has_attribute,
+    rust_item_visibility,
 };
 
 // How many times one Cargo-route build has iterated the complete analyzed
@@ -1622,7 +1623,8 @@ fn collect_module_route_facts(
             };
             let name = strip_raw_identifier_prefix(name);
             let inherits_macros = facts.scopes[scope].imports_macros;
-            let imports_macros = inherits_macros && rust_has_macro_use_attribute(child, source);
+            let imports_macros =
+                inherits_macros && rust_item_has_attribute(child, source, "macro_use");
             let path_attribute = rust_path_attribute_value(child, source);
             if let Some(body) = child.child_by_field_name("body") {
                 facts.scopes.push(RustModuleScopeFact {
@@ -2034,8 +2036,8 @@ fn collect_external_module_children(
             };
             let name = strip_raw_identifier_prefix(name);
             if let Some(body) = child.child_by_field_name("body") {
-                let imports_macros =
-                    imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
+                let imports_macros = imports_macros_to_file_scope
+                    && rust_item_has_attribute(child, source, "macro_use");
                 let inline_directory = match rust_path_attribute(child, source) {
                     Some(path) => {
                         let Some(relative) = workspace_relative_path(
@@ -2070,8 +2072,8 @@ fn collect_external_module_children(
                 };
                 let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
-                    let imports_macros =
-                        imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
+                    let imports_macros = imports_macros_to_file_scope
+                        && rust_item_has_attribute(child, source, "macro_use");
                     children.push(RustExternalModuleChild {
                         file: candidate,
                         declaring_module: declaring_module.clone(),
@@ -2094,8 +2096,8 @@ fn collect_external_module_children(
             ] {
                 let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
-                    let imports_macros =
-                        imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
+                    let imports_macros = imports_macros_to_file_scope
+                        && rust_item_has_attribute(child, source, "macro_use");
                     children.push(RustExternalModuleChild {
                         file: candidate,
                         declaring_module: declaring_module.clone(),
@@ -2138,26 +2140,6 @@ fn rust_latest_visible_item_macro(
     matching
         .all(|definition| definition.passthrough == passthrough)
         .then_some(passthrough)
-}
-
-fn rust_has_macro_use_attribute(module: Node<'_>, source: &str) -> bool {
-    let mut sibling = module.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
-        let Some(attribute) = attribute_item.named_child(0) else {
-            return false;
-        };
-        let Some(path) = attribute.named_child(0) else {
-            return false;
-        };
-        if source.get(path.start_byte()..path.end_byte()) == Some("macro_use") {
-            return true;
-        }
-        sibling = attribute_item.prev_named_sibling();
-    }
-    false
 }
 
 /// Whether the `mod x;` item at `module` is gated by a bare `#[cfg(test)]`.

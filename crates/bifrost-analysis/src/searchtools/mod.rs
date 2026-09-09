@@ -95,6 +95,7 @@ pub use definitions::DefinitionReferenceSite;
 pub use definitions::GetDefinitionByReferenceParams;
 pub use definitions::GetDefinitionByReferenceResult;
 pub use definitions::get_definitions_by_reference;
+pub use definitions::get_definitions_by_reference_with_cancellation;
 pub use navigation::DeclarationLookupResult;
 pub use navigation::DefinitionLookupResult;
 pub use navigation::DefinitionReferenceQuery;
@@ -181,6 +182,7 @@ pub use scan_usages::{
 pub use selectors::AmbiguousSymbol;
 pub use selectors::DefinitionCandidate;
 pub use selectors::DefinitionDiagnostic;
+pub use selectors::DefinitionLookupIncompleteReason;
 pub use selectors::NotFoundInput;
 pub use sources::SourceBlock;
 pub use sources::SymbolSourcesBudgetExceeded;

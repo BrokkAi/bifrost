@@ -58,13 +58,14 @@ use crate::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
         classify_test_files, get_declarations_by_location_with_cancellation,
-        get_definitions_by_location_with_cancellation, get_definitions_by_reference,
-        get_summaries_with_cancellation, get_symbol_ancestors,
-        get_symbol_locations_with_cancellation, get_symbol_sources_with_source_budget,
-        get_type_by_location, list_symbols, most_relevant_files_with_cancellation, refresh_result,
-        rename_symbol, scan_usages_by_location_with_cancellation,
-        scan_usages_by_reference_with_cancellation, search_symbols_with_cancellation,
-        session_subset, symbol_source_candidate_files, usage_graph,
+        get_definitions_by_location_with_cancellation,
+        get_definitions_by_reference_with_cancellation, get_summaries_with_cancellation,
+        get_symbol_ancestors, get_symbol_locations_with_cancellation,
+        get_symbol_sources_with_source_budget, get_type_by_location, list_symbols,
+        most_relevant_files_with_cancellation, refresh_result, rename_symbol,
+        scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
+        search_symbols_with_cancellation, session_subset, symbol_source_candidate_files,
+        usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
@@ -3184,7 +3185,11 @@ impl SearchToolsService {
             }
             "get_definitions_by_reference" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_definitions_by_reference(workspace.analyzer(), params)
+                    get_definitions_by_reference_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
                 })
             }
             "get_type_by_location" => {

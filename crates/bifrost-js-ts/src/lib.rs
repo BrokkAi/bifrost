@@ -33,6 +33,7 @@
 //! both `LanguageAdapter` shells, both `LanguageSupport` registrations, and the
 //! downcasts that produce the arguments.
 
+pub mod access_chain;
 pub mod clones;
 pub mod diagnostics;
 pub mod graph;

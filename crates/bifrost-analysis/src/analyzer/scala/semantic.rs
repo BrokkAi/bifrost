@@ -476,6 +476,7 @@ fn callable_shape<'tree>(
             is_synthetic: synthetic,
             invocation,
             dispatch_extensibility,
+            call_boundary: ProcedureCallBoundary::Direct,
         },
         attach_lexical_parent,
     ))

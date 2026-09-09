@@ -288,9 +288,36 @@ impl ForwardQueryProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    /// Share only completed file-derived values. A waiter receives the same
+    /// typed failure as its builder, and records it on its own open scopes.
+    fn cached_complete_read<K, T>(
+        &self,
+        cache: &Cache<K, Arc<T>>,
+        key: &K,
+        read: impl FnOnce() -> T,
+    ) -> Arc<T>
+    where
+        K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
+        T: Default + Send + Sync + 'static,
+    {
+        match cache.try_get_with_by_ref(key, || {
+            let scope = AnalyzerQueryScope::new(self);
+            let value = read();
+            scope.read_completion()?;
+            Ok::<_, crate::analyzer::QueryReadIncomplete>(Arc::new(value))
+        }) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.record_query_incomplete((*reason).clone());
+                Arc::default()
+            }
+        }
+    }
+
     fn macro_composed_fields(&self, file: &ProjectFile) -> Arc<Vec<MacroComposedField>> {
-        self.macro_composed_fields_by_file
-            .get_with_by_ref(file, || Arc::new(self.build_macro_composed_fields(file)))
+        self.cached_complete_read(&self.macro_composed_fields_by_file, file, || {
+            self.build_macro_composed_fields(file)
+        })
     }
 
     fn all_macro_composed_fields(&self) -> Vec<MacroComposedField> {
@@ -371,27 +398,26 @@ impl CppAnalyzer {
     /// hydrates every declaration in this include closure, undoing the
     /// visibility resolver's target-directed declaration reads, so the read
     /// stays on `prepared_syntax_limited`. A file whose source cannot be
-    /// prepared declares no events, which is what a caller walking an include
-    /// closure needs from it either way.
+    /// prepared returns an empty compatibility value with a query-incomplete
+    /// reason; that value must never be cached as a completed event set.
     fn object_macro_field_events(
         &self,
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<Vec<ObjectMacroFieldEvent>> {
-        self.object_macro_field_events_by_file
-            .get_with_by_ref(file, || {
-                let Some((_, prepared)) = self
-                    .inner
-                    .prepared_syntax_limited(token, file, usize::MAX)
-                    .expect("an unbounded syntax read cannot exceed its source limit")
-                else {
-                    return Arc::new(Vec::new());
-                };
-                Arc::new(collect_cpp_object_macro_field_events(
-                    prepared.tree().root_node(),
-                    prepared.source(),
-                ))
-            })
+        self.cached_complete_read(&self.object_macro_field_events_by_file, file, || {
+            let Some((_, prepared)) = self
+                .inner
+                .prepared_syntax_limited(token, file, usize::MAX)
+                .expect("an unbounded syntax read cannot exceed its source limit")
+            else {
+                self.record_query_incomplete(
+                    crate::analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+                );
+                return Vec::new();
+            };
+            collect_cpp_object_macro_field_events(prepared.tree().root_node(), prepared.source())
+        })
     }
 
     fn macro_composed_field_owner_name(
@@ -427,6 +453,7 @@ impl CppAnalyzer {
                 .active_query_cancellation()
                 .is_some_and(|cancellation| cancellation.is_cancelled())
             {
+                self.record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
                 return Vec::new();
             }
             if !visited.insert(file.clone()) {
@@ -451,6 +478,7 @@ impl CppAnalyzer {
                     .active_query_cancellation()
                     .is_some_and(|cancellation| cancellation.is_cancelled())
                 {
+                    self.record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
                     return Vec::new();
                 }
                 match event {
@@ -690,9 +718,9 @@ impl CppAnalyzer {
     /// definition that (identifier, owner terminal) pair yields, indexed by the
     /// canonical fq name it belongs under. This query is then a map lookup.
     ///
-    /// Both use `optionally_get_with_by_ref`, not `get_with_by_ref`: a build
-    /// that stopped on the request's deadline returns `None` and publishes
-    /// nothing, because a truncated candidate set or a truncated group is
+    /// Both use `try_get_with_by_ref`: a stopped build returns its typed
+    /// incompleteness to every waiter and publishes nothing. A truncated
+    /// candidate set or a truncated group is
     /// indistinguishable from an identifier with fewer namesakes, and every
     /// later reader would silently lose definitions. That is moka's form of the
     /// complete-or-nothing contract `PoolSafeMemo::get_or_build_while` carries
@@ -719,13 +747,18 @@ impl CppAnalyzer {
             .cloned()
             .or_else(|| self.inner.active_query_cancellation());
         let keep_going = || {
-            !cancellation
+            let cancelled = cancellation
                 .as_ref()
-                .is_some_and(crate::CancellationToken::is_cancelled)
+                .is_some_and(crate::CancellationToken::is_cancelled);
+            if cancelled {
+                self.record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
+            }
+            !cancelled
         };
-        let Some(candidates) = self
-            .reconcile_candidates_by_identifier
-            .optionally_get_with_by_ref(key.member_identifier.as_str(), || {
+        let candidates = self.reconcile_candidates_by_identifier.try_get_with_by_ref(
+            key.member_identifier.as_str(),
+            || {
+                let scope = AnalyzerQueryScope::new(self);
                 #[cfg(any(test, feature = "test-support"))]
                 self.reconcile_candidate_scan_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -744,14 +777,20 @@ impl CppAnalyzer {
                 };
                 let local_cancellation = crate::CancellationToken::new();
                 let query_cancellation = cancellation.as_ref().unwrap_or(&local_cancellation);
-                let crate::analyzer::RelationalBatchOutcome::Complete(mut results) =
-                    crate::analyzer::RelationalDefinitionLookup::batch(
-                        &self.inner,
-                        &[request],
-                        query_cancellation,
-                    )
-                else {
-                    return None;
+                let mut results = match crate::analyzer::RelationalDefinitionLookup::batch(
+                    &self.inner,
+                    &[request],
+                    query_cancellation,
+                ) {
+                    crate::analyzer::RelationalBatchOutcome::Complete(results) => results,
+                    crate::analyzer::RelationalBatchOutcome::Cancelled => {
+                        return Err(crate::analyzer::QueryReadIncomplete::Cancelled);
+                    }
+                    crate::analyzer::RelationalBatchOutcome::Failed(error) => {
+                        let error = crate::analyzer::store::StoreError::new(error.message());
+                        self.record_query_failure(error.clone());
+                        return Err(crate::analyzer::QueryReadIncomplete::StoreFailure(error));
+                    }
                 };
                 let result = results
                     .pop()
@@ -760,36 +799,52 @@ impl CppAnalyzer {
                 else {
                     panic!("an identifier reconcile query returned the wrong value shape");
                 };
-                cpp_reconcile_candidates_from_units(units, &keep_going).map(Arc::new)
-            })
-        else {
-            return empty();
+                let candidates = cpp_reconcile_candidates_from_units(units, &keep_going);
+                scope.read_completion()?;
+                candidates
+                    .map(Arc::new)
+                    .ok_or(crate::analyzer::QueryReadIncomplete::Cancelled)
+            },
+        );
+        let candidates = match candidates {
+            Ok(candidates) => candidates,
+            Err(reason) => {
+                self.record_query_incomplete((*reason).clone());
+                return empty();
+            }
         };
         let on_candidate = || {
             #[cfg(any(test, feature = "test-support"))]
             self.reconcile_candidate_evaluation_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        let Some(groups) = self
+        let groups = self
             .reconciled_definitions_by_group
-            .optionally_get_with_by_ref(&key, || {
+            .try_get_with_by_ref(&key, || {
                 // This builder runs on a cache miss, inside whatever request
                 // scope the caller opened; nesting one here makes the syntax
                 // reads below provable without changing what they memoize
                 // (issue #2414 step 3).
                 let scope = AnalyzerQueryScope::new(self);
-                cpp_reconcile_group(
+                let groups = cpp_reconcile_group(
                     self,
                     scope.token(),
                     &key,
                     &candidates,
                     &keep_going,
                     &on_candidate,
-                )
-                .map(Arc::new)
-            })
-        else {
-            return empty();
+                );
+                scope.read_completion()?;
+                groups
+                    .map(Arc::new)
+                    .ok_or(crate::analyzer::QueryReadIncomplete::Cancelled)
+            });
+        let groups = match groups {
+            Ok(groups) => groups,
+            Err(reason) => {
+                self.record_query_incomplete((*reason).clone());
+                return empty();
+            }
         };
         groups.get(fq_name).map_or_else(empty, Arc::clone)
     }
@@ -1039,7 +1094,13 @@ impl CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        self.inner.prepared_syntax(token, file)
+        let prepared = self.inner.prepared_syntax(token, file);
+        if prepared.is_none() {
+            self.inner.record_query_incomplete(
+                crate::analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+            );
+        }
+        prepared
     }
 
     /// Drop the files whose C++ syntax cannot spell a reference to the member
@@ -1486,16 +1547,22 @@ impl CppSource for CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<SourceUsingIndex> {
-        self.source_using_index_by_file.get_with_by_ref(file, || {
+        self.cached_complete_read(&self.source_using_index_by_file, file, || {
             #[cfg(any(test, feature = "test-support"))]
             self.source_using_index_build_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(build_source_using_index(self, token, file))
+            build_source_using_index(self, token, file)
         })
     }
 
     fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        self.inner.file_source(file)
+        let source = self.inner.file_source(file);
+        if source.is_none() {
+            self.record_query_incomplete(
+                crate::analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+            );
+        }
+        source
     }
 
     fn prepared_syntax(
@@ -1539,6 +1606,11 @@ impl CppSource for CppAnalyzer {
         reference_is_c: bool,
         reaches: bool,
     ) {
+        let scope = AnalyzerQueryScope::new(self);
+        if scope.read_completion().is_err() {
+            return;
+        }
+
         self.unconditional_include_reachability.insert(
             (first.clone(), donor_source.clone(), reference_is_c),
             reaches,
@@ -1550,16 +1622,12 @@ impl CppSource for CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<CppRecoveredExportClassIndex> {
-        self.recovered_export_class_index_by_file
-            .get_with_by_ref(file, || {
-                let Some(prepared) = self.prepared_syntax(token, file) else {
-                    return Arc::new(CppRecoveredExportClassIndex::default());
-                };
-                Arc::new(CppRecoveredExportClassIndex::build(
-                    prepared.tree().root_node(),
-                    prepared.source(),
-                ))
-            })
+        self.cached_complete_read(&self.recovered_export_class_index_by_file, file, || {
+            let Some(prepared) = self.prepared_syntax(token, file) else {
+                return CppRecoveredExportClassIndex::default();
+            };
+            CppRecoveredExportClassIndex::build(prepared.tree().root_node(), prepared.source())
+        })
     }
 
     fn orphaned_namespace_scopes(
@@ -1567,16 +1635,12 @@ impl CppSource for CppAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<OrphanedNamespaceScopeIndex> {
-        self.orphaned_namespace_scopes_by_file
-            .get_with_by_ref(file, || {
-                let Some(prepared) = self.prepared_syntax(token, file) else {
-                    return Arc::new(OrphanedNamespaceScopeIndex::default());
-                };
-                Arc::new(OrphanedNamespaceScopeIndex::build(
-                    prepared.tree().root_node(),
-                    prepared.source(),
-                ))
-            })
+        self.cached_complete_read(&self.orphaned_namespace_scopes_by_file, file, || {
+            let Some(prepared) = self.prepared_syntax(token, file) else {
+                return OrphanedNamespaceScopeIndex::default();
+            };
+            OrphanedNamespaceScopeIndex::build(prepared.tree().root_node(), prepared.source())
+        })
     }
 
     fn cached_class_declaration_strength(
@@ -1591,6 +1655,11 @@ impl CppSource for CppAnalyzer {
         candidate: &CodeUnit,
         strength: CppClassDeclarationStrength,
     ) {
+        let scope = AnalyzerQueryScope::new(self);
+        if scope.read_completion().is_err() {
+            return;
+        }
+
         self.class_declaration_strength
             .insert(candidate.clone(), strength);
     }
@@ -2378,6 +2447,10 @@ impl IAnalyzer for CppAnalyzer {
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
+    }
+
+    fn record_query_incomplete(&self, reason: crate::analyzer::QueryReadIncomplete) {
+        self.inner.record_query_incomplete(reason);
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

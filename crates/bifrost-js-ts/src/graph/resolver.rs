@@ -566,10 +566,11 @@ fn build_importer_reverse(
         let Some(binder) = binders_by_file.get(file) else {
             continue;
         };
-        for (local_name, binding) in binder.all_bindings() {
+        for (local_name, binding_record) in binder.all_binding_records() {
             if is_cancelled(cancellation) {
                 return None;
             }
+            let binding = &binding_record.binding;
             for target_file in resolve(file, &binding.module_specifier) {
                 if matches!(binding.kind, ImportKind::Glob) {
                     let Some(exports) = exports_by_file.get(&target_file) else {

@@ -72,6 +72,14 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
 
+    /// The module represented by the file itself, when this language has one.
+    /// Use the same constructor as the storage adapter's path module projection.
+    /// Such a module has no declaration token and navigates to file start;
+    /// source-declared modules use their ordinary declaration name ranges.
+    fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
+        None
+    }
+
     /// The name universe this language's declarations belong to.
     ///
     /// The single owner of ecosystem knowledge: [`UsageEcosystem::of`] delegates here,

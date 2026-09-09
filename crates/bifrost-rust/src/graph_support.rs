@@ -26,8 +26,8 @@ use crate::crate_naming;
 use crate::declarations::{rust_node_text, rust_package_name};
 use crate::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
-    rust_imports_with_visibility_from_use_declaration, rust_item_visibility,
-    rust_target_kind_root_alternative,
+    rust_imports_with_visibility_from_use_declaration, rust_item_has_attribute,
+    rust_item_visibility, rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
 use crate::usage::exported_targets_from_files;
@@ -2466,26 +2466,6 @@ pub fn rust_value_constructor_visibilities(
 
 fn rust_visibility_modifier(node: Node<'_>, source: &str) -> RustVisibility {
     crate::imports::rust_visibility_from_modifier(node, source)
-}
-
-fn rust_item_has_attribute(node: Node<'_>, source: &str, expected: &str) -> bool {
-    let mut sibling = node.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
-        let Some(attribute) = attribute_item.named_child(0) else {
-            break;
-        };
-        let Some(path) = attribute.named_child(0) else {
-            break;
-        };
-        if source.get(path.start_byte()..path.end_byte()) == Some(expected) {
-            return true;
-        }
-        sibling = attribute_item.prev_named_sibling();
-    }
-    false
 }
 
 #[derive(Clone, Copy)]

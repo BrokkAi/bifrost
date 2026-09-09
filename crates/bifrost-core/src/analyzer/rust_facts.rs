@@ -145,6 +145,9 @@ pub struct RustImportTargetFact {
     /// A plain `use name as alias;` is written identically in every other
     /// stored column, so the distinction cannot be recovered by the reader.
     pub is_extern_crate: bool,
+    /// True when an `extern crate` item carries `#[macro_use]` and imports the
+    /// target crate's exported macros into the macro-use prelude.
+    pub is_macro_use: bool,
     pub visibility: RustVisibility,
     /// The `#[cfg(...)]` predicate on the `use` declaration that introduced this
     /// binding. Two bindings of one name under proven-disjoint conditions are

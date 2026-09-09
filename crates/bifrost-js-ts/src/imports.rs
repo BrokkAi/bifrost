@@ -1,11 +1,18 @@
+use crate::access_chain::{ImportMemberChainOwner, JsTsImportedMemberChain};
 use crate::providers::JsTsSource;
 use crate::syntax::JsTsImportBinder;
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
+use brokk_bifrost_core::analyzer::usages::model::ImportBinding;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, Language, ProjectFile};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, Language, ProjectFile, Range,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -799,6 +806,161 @@ pub fn resolve_js_ts_direct_import_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     Some(candidates)
+}
+
+/// One exact imported member endpoint. The declaration identity and the source
+/// endpoint travel together so navigation and inverse usage extraction cannot
+/// substitute an owner token for a descendant member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsTsResolvedImportedMember {
+    pub declaration: CodeUnit,
+    pub endpoint_range: Range,
+}
+
+/// Resolve a structured member chain from an already proven import binding.
+///
+/// This function deliberately accepts the binder's selected `ImportBinding`
+/// instead of looking up a name itself. Binding selection is source-position
+/// sensitive and belongs to `JsTsImportBinder`; module/export/member traversal
+/// belongs here. Every branch remains in `ReceiverAnalysisOutcome`, and a
+/// terminal is precise only when one declaration survives every segment.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_js_ts_imported_member_chain(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    binding: &ImportBinding,
+    chain: &JsTsImportedMemberChain<'_>,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<JsTsResolvedImportedMember> {
+    let (exported_name, remaining) = match binding.kind {
+        ImportKind::Namespace | ImportKind::CommonJsRequire => {
+            let Some((exported, remaining)) = chain.members.split_first() else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            (exported.name.as_str(), remaining)
+        }
+        ImportKind::Named => {
+            let Some(imported_name) = binding.imported_name.as_deref() else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            (imported_name, chain.members.as_slice())
+        }
+        ImportKind::Default => ("default", chain.members.as_slice()),
+        ImportKind::Glob => {
+            return ReceiverAnalysisOutcome::Unsupported {
+                reason: "glob_import_member_chain",
+            };
+        }
+    };
+
+    let resolved_files =
+        resolve_js_ts_module_specifier(file, &binding.module_specifier, language, aliases);
+    if resolved_files.is_empty() {
+        return ReceiverAnalysisOutcome::Unknown;
+    }
+    if resolved_files.len() != 1 {
+        return ReceiverAnalysisOutcome::Ambiguous(Vec::new());
+    }
+
+    let owners = resolve_js_ts_module_binding_candidates(
+        host,
+        support,
+        language,
+        file,
+        &binding.module_specifier,
+        exported_name,
+        aliases,
+        value_position,
+    );
+    let mut outcome = ReceiverAnalysisOutcome::single_precise_or_ambiguous(owners, budget);
+    for member in remaining {
+        outcome = resolve_imported_member_step(support, outcome, member, value_position, budget);
+    }
+
+    let Some(endpoint) = chain.endpoint() else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(declarations) => ReceiverAnalysisOutcome::Precise(
+            declarations
+                .into_iter()
+                .map(|declaration| JsTsResolvedImportedMember {
+                    declaration,
+                    endpoint_range: endpoint.range,
+                })
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Ambiguous(declarations) => ReceiverAnalysisOutcome::Ambiguous(
+            declarations
+                .into_iter()
+                .map(|declaration| JsTsResolvedImportedMember {
+                    declaration,
+                    endpoint_range: endpoint.range,
+                })
+                .collect(),
+        ),
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
+    }
+}
+
+fn resolve_imported_member_step(
+    support: &dyn BoundedDefinitionLookup,
+    owners: ReceiverAnalysisOutcome<CodeUnit>,
+    member: &ImportMemberChainOwner<'_>,
+    value_position: bool,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    let (owners, inherited_ambiguity) = match owners {
+        ReceiverAnalysisOutcome::Precise(owners) => (owners, false),
+        ReceiverAnalysisOutcome::Ambiguous(owners) => (owners, true),
+        ReceiverAnalysisOutcome::Unknown => return ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            return ReceiverAnalysisOutcome::Unsupported { reason };
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            return ReceiverAnalysisOutcome::ExceededBudget { limit };
+        }
+    };
+    let branches = owners.into_iter().map(|owner| {
+        let members_named = |name: &str| {
+            support
+                .members_for_owner(&owner, name)
+                .into_iter()
+                .filter(|candidate| candidate.source() == owner.source())
+                .filter(|candidate| candidate.fq().parent().as_ref() == Some(owner.fq()))
+                .collect::<Vec<_>>()
+        };
+        let mut candidates = members_named(&member.name);
+        if value_position && owner.is_class() {
+            let static_candidates = members_named(&format!("{}$static", member.name));
+            if !static_candidates.is_empty() {
+                candidates = static_candidates;
+            }
+        }
+        ReceiverAnalysisOutcome::single_precise_or_ambiguous(candidates, budget)
+    });
+    let merged = ReceiverAnalysisOutcome::merge_branch_outcomes(branches, budget);
+    if inherited_ambiguity {
+        match merged {
+            ReceiverAnalysisOutcome::Precise(values)
+            | ReceiverAnalysisOutcome::Ambiguous(values) => {
+                ReceiverAnalysisOutcome::Ambiguous(values)
+            }
+            other => other,
+        }
+    } else {
+        merged
+    }
 }
 
 fn jsts_module_export_candidates(

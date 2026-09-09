@@ -1,13 +1,17 @@
+use crate::bindings::python_direct_scope_bindings_bounded;
 use crate::imports::python_import_infos_from_node;
-use crate::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
+use crate::syntax::{
+    PythonOverloadDecoratorBindings, expression_name_node, python_plain_string_literal,
+};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
+    StructuredImportPathKind,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::{Path, PathBuf};
@@ -90,8 +94,9 @@ fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
 
 /// Find the nearest setuptools import root that contains this source file.
 ///
-/// The manifest is parsed as TOML. An unrelated or malformed `pyproject.toml`
-/// does not change the existing `__init__.py` package-root convention.
+/// `pyproject.toml` roots take precedence over legacy `setup.py` evidence at
+/// each ancestor. An unrelated or malformed packaging file does not change the
+/// existing `__init__.py` package-root convention.
 fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Option<PathBuf> {
     let mut manifest_dir_rel = Some(parent_rel);
     while let Some(directory) = manifest_dir_rel {
@@ -106,9 +111,31 @@ fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Optio
         if let Some(root) = roots.pop() {
             return Some(root);
         }
+        if let Some(package_dir) = setuptools_setup_py_import_root(&manifest_dir.join("setup.py")) {
+            let root = manifest_dir.join(package_dir).normalize();
+            if let Ok(root) = root.strip_prefix(file.root())
+                && parent_rel.starts_with(root)
+            {
+                return Some(root.to_path_buf());
+            }
+        }
         manifest_dir_rel = directory.parent();
     }
     None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 /// One manifest's memoized `tool.setuptools.packages.find.where` entries.
@@ -116,8 +143,7 @@ fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Optio
 /// The stamp is what the memo is validated against, so a manifest edited in a
 /// long-running server is re-read instead of being answered from a stale parse.
 struct ManifestWhereEntries {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
+    stamp: FileStamp,
     entries: Vec<String>,
 }
 
@@ -137,13 +163,11 @@ fn setuptools_where_entries(manifest: &Path) -> Vec<String> {
     > = std::sync::OnceLock::new();
     let memo = MEMO.get_or_init(Default::default);
 
-    let Ok(metadata) = std::fs::metadata(manifest) else {
+    let Some(stamp) = file_stamp(manifest) else {
         return Vec::new();
     };
-    let (len, modified) = (metadata.len(), metadata.modified().ok());
     if let Some(cached) = memo.read().expect("manifest memo").get(manifest)
-        && cached.len == len
-        && cached.modified == modified
+        && cached.stamp == stamp
     {
         return cached.entries.clone();
     }
@@ -152,12 +176,347 @@ fn setuptools_where_entries(manifest: &Path) -> Vec<String> {
     memo.write().expect("manifest memo").insert(
         manifest.to_path_buf(),
         ManifestWhereEntries {
-            len,
-            modified,
+            stamp,
             entries: entries.clone(),
         },
     );
     entries
+}
+
+/// A memoized static package root recovered from one legacy `setup.py`.
+/// `Some(PathBuf::new())` represents the setup script's directory, which is
+/// setuptools' default when no `package_dir` is supplied.
+struct SetupPyImportRoot {
+    stamp: FileStamp,
+    package_dir: Option<PathBuf>,
+}
+
+/// Read a legacy setuptools import root without executing `setup.py`.
+///
+/// This is intentionally narrower than Python's runtime packaging semantics:
+/// a direct top-level call to an imported setuptools or distutils.core
+/// `setup` binding must provide a `packages` argument. A literal `package_dir`
+/// establishes the root regardless of the package expression; without one,
+/// the package expression must be either a nonempty literal collection or a
+/// supported setuptools discovery call. Unsupported argument shapes or a
+/// shadowed import leave the source path-derived.
+fn setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<PathBuf, SetupPyImportRoot>>,
+    > = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+
+    let stamp = file_stamp(setup_py)?;
+    if let Some(cached) = memo.read().expect("setup.py memo").get(setup_py)
+        && cached.stamp == stamp
+    {
+        return cached.package_dir.clone();
+    }
+
+    let package_dir = parse_setuptools_setup_py_import_root(setup_py);
+    memo.write().expect("setup.py memo").insert(
+        setup_py.to_path_buf(),
+        SetupPyImportRoot {
+            stamp,
+            package_dir: package_dir.clone(),
+        },
+    );
+    package_dir
+}
+
+fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
+    let source = std::fs::read_to_string(setup_py).ok()?;
+    let tree = parse_python_tree(&source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut setup_bindings: HashMap<Vec<String>, String> = HashMap::default();
+    let mut import_root = None;
+    let mut cursor = root.walk();
+
+    for statement in root.named_children(&mut cursor) {
+        if matches!(
+            statement.kind(),
+            "import_statement" | "import_from_statement"
+        ) {
+            for binding in setup_py_bound_names(statement, &source) {
+                setup_bindings.retain(|path, _| path.first() != Some(&binding));
+            }
+            for import in python_import_infos_from_node(statement, &source) {
+                if import.is_wildcard {
+                    setup_bindings.clear();
+                    continue;
+                }
+                let Some(path) = import.path else { continue };
+                let segments = path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+                match path.kind {
+                    Some(StructuredImportPathKind::ImportFrom) => {
+                        let function_name = match segments.as_slice() {
+                            ["setuptools", "setup"] | ["distutils", "core", "setup"] => "setup",
+                            ["setuptools", "find_packages"] => "find_packages",
+                            ["setuptools", "find_namespace_packages"] => "find_namespace_packages",
+                            _ => continue,
+                        };
+                        setup_bindings.insert(
+                            vec![import.identifier.expect("imported function binds a name")],
+                            function_name.to_string(),
+                        );
+                    }
+                    Some(StructuredImportPathKind::Namespace) => {
+                        let function_names = match segments.as_slice() {
+                            ["setuptools"] => {
+                                ["setup", "find_packages", "find_namespace_packages"].as_slice()
+                            }
+                            ["distutils", "core"] => ["setup"].as_slice(),
+                            _ => continue,
+                        };
+                        let binding_prefix = import
+                            .alias
+                            .map(|alias| vec![alias])
+                            .unwrap_or_else(|| path.segments.clone());
+                        for function_name in function_names {
+                            let mut callable = binding_prefix.clone();
+                            callable.push((*function_name).to_string());
+                            setup_bindings.insert(callable, (*function_name).to_string());
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            continue;
+        }
+
+        if statement.kind() == "expression_statement"
+            && statement.named_child_count() == 1
+            && let Some(call) = statement.named_child(0)
+            && call.kind() == "call"
+            && setup_py_call_imported_function(call, &source, &setup_bindings)
+                .is_some_and(|function| function == "setup")
+        {
+            let candidate = setup_py_import_root_from_call(call, &source, &setup_bindings)?;
+            if import_root
+                .replace(candidate.clone())
+                .is_some_and(|root| root != candidate)
+            {
+                return None;
+            }
+        }
+
+        for binding in setup_py_bound_names(statement, &source) {
+            setup_bindings.retain(|path, _| path.first() != Some(&binding));
+        }
+    }
+    import_root
+}
+
+/// Return names that a top-level statement binds in the module scope.
+///
+/// The walk is iterative and does not enter function, class, or lambda bodies.
+/// Bindings in control-flow statements still invalidate an imported setup name:
+/// their execution is conditional, so retaining the import would overclaim its
+/// identity at a later top-level call.
+fn setup_py_bound_names(statement: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = vec![statement];
+    while let Some(node) = pending.pop() {
+        for binding in python_direct_scope_bindings_bounded(node, source, || true)
+            .expect("unbounded setup.py binding walk")
+        {
+            let name = py_node_text(binding.declaration, source).trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+        let excluded_body = matches!(
+            node.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        )
+        .then(|| node.child_by_field_name("body").map(|body| body.id()))
+        .flatten();
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .filter(|child| Some(child.id()) != excluded_body),
+        );
+    }
+    names
+}
+
+fn setup_py_call_imported_function<'a>(
+    call: Node<'_>,
+    source: &str,
+    setup_bindings: &'a HashMap<Vec<String>, String>,
+) -> Option<&'a str> {
+    let mut function = call.child_by_field_name("function")?;
+    let mut path = Vec::new();
+    while function.kind() == "attribute" {
+        let attribute = function.child_by_field_name("attribute")?;
+        path.push(py_node_text(attribute, source).to_string());
+        let object = function.child_by_field_name("object")?;
+        function = object;
+    }
+    if function.kind() != "identifier" {
+        return None;
+    }
+    path.push(py_node_text(function, source).to_string());
+    path.reverse();
+    setup_bindings.get(&path).map(String::as_str)
+}
+
+fn setup_py_import_root_from_call(
+    call: Node<'_>,
+    source: &str,
+    setup_bindings: &HashMap<Vec<String>, String>,
+) -> Option<PathBuf> {
+    let arguments = call.child_by_field_name("arguments")?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+
+    let mut packages = None;
+    let mut package_dir = None;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() == "comment" {
+            continue;
+        }
+        // Positional dictionaries and expansions can supply packaging options.
+        if argument.kind() != "keyword_argument" {
+            return None;
+        }
+        let name = argument.child_by_field_name("name")?;
+        let value = argument.child_by_field_name("value")?;
+        match py_node_text(name, source).trim() {
+            "packages" if packages.is_none() => packages = Some(value),
+            "packages" => return None,
+            "package_dir" if package_dir.is_none() => package_dir = Some(value),
+            "package_dir" => return None,
+            _ => {}
+        }
+    }
+
+    let packages = packages?;
+    if let Some(package_dir) = package_dir {
+        return setup_py_static_package_dir(package_dir, source);
+    }
+    if setup_py_nonempty_literal_packages(packages, source) {
+        return Some(PathBuf::new());
+    }
+    setup_py_discovery_root_from_call(packages, source, setup_bindings)
+}
+
+fn setup_py_discovery_root_from_call(
+    call: Node<'_>,
+    source: &str,
+    setup_bindings: &HashMap<Vec<String>, String>,
+) -> Option<PathBuf> {
+    let function = setup_py_call_imported_function(call, source, setup_bindings)?;
+    if !matches!(function, "find_packages" | "find_namespace_packages") {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+
+    let mut where_value = None;
+    let mut seen_exclude = false;
+    let mut seen_include = false;
+    let mut positional_index = 0;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() == "comment" {
+            continue;
+        }
+        if matches!(argument.kind(), "list_splat" | "dictionary_splat") {
+            return None;
+        }
+        if argument.kind() == "keyword_argument" {
+            let name = py_node_text(argument.child_by_field_name("name")?, source).trim();
+            let value = argument.child_by_field_name("value")?;
+            match name {
+                "where" if where_value.is_none() => where_value = Some(value),
+                "where" => return None,
+                "exclude" if !seen_exclude => seen_exclude = true,
+                "exclude" => return None,
+                "include" if !seen_include => seen_include = true,
+                "include" => return None,
+                _ => return None,
+            }
+            continue;
+        }
+
+        let slot = positional_index;
+        positional_index += 1;
+        match slot {
+            0 if where_value.is_none() => where_value = Some(argument),
+            0 => return None,
+            1 if !seen_exclude => seen_exclude = true,
+            1 => return None,
+            2 if !seen_include => seen_include = true,
+            2 => return None,
+            _ => return None,
+        }
+    }
+
+    where_value
+        .map(|value| python_plain_string_literal(value, source))
+        .unwrap_or(Some(""))
+        .map(PathBuf::from)
+}
+
+fn setup_py_nonempty_literal_packages(value: Node<'_>, source: &str) -> bool {
+    let value = setup_py_unwrap_parenthesized(value);
+    if !matches!(value.kind(), "list" | "set" | "tuple") {
+        return false;
+    }
+    let mut cursor = value.walk();
+    let mut nonempty = false;
+    for element in value.named_children(&mut cursor) {
+        if element.kind() == "comment" {
+            continue;
+        }
+        let Some(package) = python_plain_string_literal(element, source) else {
+            return false;
+        };
+        if package.is_empty() {
+            return false;
+        }
+        nonempty = true;
+    }
+    nonempty
+}
+
+fn setup_py_static_package_dir(value: Node<'_>, source: &str) -> Option<PathBuf> {
+    let value = setup_py_unwrap_parenthesized(value);
+    if value.kind() != "dictionary" {
+        return None;
+    }
+    let mut cursor = value.walk();
+    let mut pairs = value
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() != "comment");
+    let Some(pair) = pairs.next() else {
+        return Some(PathBuf::new());
+    };
+    if pairs.next().is_some() || pair.kind() != "pair" {
+        return None;
+    }
+    let key = python_plain_string_literal(pair.child_by_field_name("key")?, source)?;
+    if !key.is_empty() {
+        return None;
+    }
+    let root = python_plain_string_literal(pair.child_by_field_name("value")?, source)?;
+    let root = PathBuf::from(root);
+    (!root.is_absolute()).then_some(root)
+}
+
+fn setup_py_unwrap_parenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0).expect("parenthesized expression child");
+    }
+    node
 }
 
 fn parse_setuptools_where_entries(manifest: &Path) -> Vec<String> {

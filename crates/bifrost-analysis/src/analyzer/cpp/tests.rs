@@ -38,6 +38,69 @@ fn macro_composed_fields_fixture() -> (
 }
 
 #[test]
+fn cancelled_macro_composed_fields_does_not_poison_cache() {
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let cancellation = crate::CancellationToken::new();
+    cancellation.cancel();
+
+    {
+        let _scope = AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
+        assert!(
+            analyzer.macro_composed_fields(&owner).is_empty(),
+            "a cancelled macro-field producer must return no partial fields"
+        );
+    }
+
+    let definitions = analyzer.get_definitions("Owner.value");
+    assert!(
+        definitions
+            .iter()
+            .any(|unit| unit.is_field() && unit.fq_name() == "Owner.value"),
+        "a cancelled producer must not cache an empty overlay: {definitions:?}"
+    );
+}
+
+#[test]
+fn nested_cancelled_macro_composed_field_read_marks_outer_scope_incomplete() {
+    let (_fixture, owner, analyzer) = macro_composed_fields_fixture();
+    let owner_unit = analyzer
+        .get_definitions("Owner")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("fixture owner class");
+    let outer_scope = AnalyzerQueryScope::new(&analyzer);
+    let cancellation = crate::CancellationToken::new();
+    cancellation.cancel();
+
+    {
+        let _inner_scope = AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
+        assert!(analyzer.macro_composed_fields(&owner).is_empty());
+    }
+
+    assert!(analyzer.active_query_cancellation().is_none());
+    assert!(
+        matches!(
+            outer_scope.read_completion(),
+            Err(crate::analyzer::QueryReadIncomplete::Cancelled)
+        ),
+        "an outer query must retain cancellation observed by a nested read"
+    );
+    let later_scope = AnalyzerQueryScope::new(&analyzer);
+    assert!(
+        matches!(
+            later_scope.read_completion(),
+            Err(crate::analyzer::QueryReadIncomplete::Cancelled)
+        ),
+        "a later scope sharing the request memos must inherit their incompleteness"
+    );
+    assert!(analyzer.get_direct_ancestors(&owner_unit).is_empty());
+    assert!(
+        analyzer.direct_ancestors.get(&owner_unit).is_none(),
+        "an incomplete dependency must neither panic nor publish an ancestor cache entry"
+    );
+}
+
+#[test]
 fn macro_owner_queries_preserve_anchored_name_provenance() {
     use brokk_bifrost_core::analyzer::RelationalName;
 

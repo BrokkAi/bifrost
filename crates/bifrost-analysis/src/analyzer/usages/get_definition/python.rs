@@ -6,6 +6,7 @@ use crate::analyzer::python::lexical_scope::python_lexical_scope_inventory_bound
 use crate::analyzer::python::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
@@ -3856,19 +3857,54 @@ fn python_import_module_fqn(file: &ProjectFile, source: &str, focus: Node<'_>) -
             && module.start_byte() <= focus.start_byte()
             && focus.end_byte() <= module.end_byte()
         {
-            let raw = python_slice(module, source);
-            if raw.is_empty() {
-                return None;
-            }
+            let raw = python_focused_import_module(module, focus, source)?;
             return if module.kind() == "relative_import" {
-                resolve_python_relative_module(file, raw)
+                resolve_python_relative_module(file, &raw)
             } else {
-                Some(raw.to_string())
+                Some(raw)
             };
         }
         current = node.parent();
     }
     None
+}
+
+fn python_focused_import_module(module: Node<'_>, focus: Node<'_>, source: &str) -> Option<String> {
+    match module.kind() {
+        "identifier" => same_node(module, focus).then(|| python_slice(module, source).to_string()),
+        "dotted_name" => {
+            let mut segments = Vec::new();
+            let mut cursor = module.walk();
+            for segment in module
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "identifier")
+            {
+                segments.push(python_slice(segment, source));
+                if same_node(segment, focus) {
+                    return Some(segments.join("."));
+                }
+            }
+            None
+        }
+        "relative_import" => {
+            let mut cursor = module.walk();
+            let children: Vec<_> = module.named_children(&mut cursor).collect();
+            let prefix = children
+                .iter()
+                .find(|child| child.kind() == "import_prefix")
+                .copied()?;
+            let raw_prefix = python_slice(prefix, source);
+            if same_node(prefix, focus) {
+                return Some(raw_prefix.to_string());
+            }
+            let path = children
+                .into_iter()
+                .find(|child| matches!(child.kind(), "identifier" | "dotted_name"))?;
+            let suffix = python_focused_import_module(path, focus, source)?;
+            Some(format!("{raw_prefix}{suffix}"))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

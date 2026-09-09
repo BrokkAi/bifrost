@@ -18,10 +18,11 @@ use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::{
     CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
     DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, MemberAccessKind,
-    MemberAccessQuery, MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle,
-    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget, SemanticCallSite,
-    SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind, SourceSite,
-    SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowSnapshot,
+    MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict, ProcedureHandle,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind,
+    SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
+    ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -40,7 +41,7 @@ use crate::value_flow::{
 };
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
-use super::field_slots::{FieldSlotIndex, receiver_values};
+use super::field_slots::{FieldSlotIndex, MemberStoreEvidence, receiver_values};
 use super::summary::class_set_local_structure_digest;
 use crate::scalar_state::BindingOriginIndex;
 
@@ -350,6 +351,7 @@ fn call_result_anchor(
 fn guard_edge_kills(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
     procedures: &[ProcedureHandle],
     sources: &[ValueFlowSourceSpec],
     atoms_by_key: &HashMap<ValueFlowEventKey, (ClassAtom, SourceSite)>,
@@ -392,7 +394,23 @@ fn guard_edge_kills(
             if classes.is_empty() || (guard.true_edge.is_none() && guard.false_edge.is_none()) {
                 continue;
             }
-            let verdicts = adapter.narrowing_verdicts(workspace, procedure, guard, &classes);
+            let member_lookup = |class: &ClassIdentity, member: &str| {
+                match adapter.member_lookup(workspace, MemberAccessKind::Load, class, member) {
+                    MemberLookup::DeclarationAbsent => {
+                        match field_slots.member_store_evidence(workspace, adapter, class, member) {
+                            MemberStoreEvidence::NoStore => MemberLookup::Absent,
+                            // A store can be conditional. It defeats absence
+                            // but does not prove that a guard is always true.
+                            MemberStoreEvidence::Stored | MemberStoreEvidence::Unknown => {
+                                MemberLookup::Unknown(UnknownReason::FieldSlotIncomplete)
+                            }
+                        }
+                    }
+                    result => result,
+                }
+            };
+            let verdicts =
+                adapter.narrowing_verdicts(workspace, procedure, guard, &classes, &member_lookup);
             assert_eq!(
                 verdicts.len(),
                 classes.len(),
@@ -637,6 +655,7 @@ impl TypeFlowPlan {
         let edge_kills = guard_edge_kills(
             workspace,
             adapter,
+            field_slots,
             &closure.procedures,
             &source_specs,
             &atoms_by_key,

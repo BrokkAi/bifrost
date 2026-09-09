@@ -19,7 +19,8 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::store::class_set_field_slots::{
     ClassSetFieldSlotArtifactRow, ClassSetFieldSlotAtomRow, ClassSetFieldSlotAtomValueRow,
     ClassSetFieldSlotClassRow, ClassSetFieldSlotIndexKey, ClassSetFieldSlotIndexRow,
-    ClassSetFieldSlotRow, ClassSetFieldSlotSourceRow,
+    ClassSetFieldSlotRow, ClassSetFieldSlotSourceRow, ClassSetFieldStoreRow,
+    ClassSetFieldStoreSurveyRow,
 };
 use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
@@ -80,6 +81,7 @@ pub struct FieldSlotIndex {
     slots: Vec<FieldSlot>,
     lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>>,
     digest: StableDigest,
+    store_survey: FieldStoreSurvey,
     semantic_budget_exhaustion: Option<SemanticBudgetExceeded>,
     transient_resolver_budget: bool,
     persistent_artifacts: Vec<ClassSetFieldSlotArtifactRow>,
@@ -149,11 +151,111 @@ struct CollectedSlots {
     )>,
 }
 
+/// Store evidence is separate from a callable declaration or a field value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MemberStoreEvidence {
+    Stored,
+    NoStore,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FieldStoreSurvey {
+    stores: HashMap<ClassIdentity, HashSet<Box<str>>>,
+    unowned_members: HashSet<Box<str>>,
+    unknown_members: bool,
+}
+
+impl FieldStoreSurvey {
+    fn from_collected(collected: &CollectedSlots) -> Self {
+        let mut stores: HashMap<ClassIdentity, HashSet<Box<str>>> = HashMap::default();
+        for (class, member) in collected.stores.keys() {
+            stores
+                .entry(class.clone())
+                .or_default()
+                .insert(member.clone());
+        }
+        Self {
+            stores,
+            unowned_members: collected
+                .foreign_members
+                .union(&collected.dynamic_members)
+                .cloned()
+                .collect(),
+            unknown_members: collected.globally_incomplete || collected.dynamic_any,
+        }
+    }
+
+    fn ordered_stores(&self) -> Vec<(Option<&ClassIdentity>, &str)> {
+        let mut rows = self
+            .unowned_members
+            .iter()
+            .map(|member| (None, member.as_ref()))
+            .collect::<Vec<_>>();
+        rows.extend(self.stores.iter().flat_map(|(class, members)| {
+            members
+                .iter()
+                .map(move |member| (Some(class), member.as_ref()))
+        }));
+        rows.sort_unstable_by(|(left, left_member), (right, right_member)| {
+            match (left, right) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(left), Some(right)) => class_order(left, right),
+            }
+            .then_with(|| left_member.cmp(right_member))
+        });
+        rows
+    }
+
+    fn to_persisted(&self) -> Option<ClassSetFieldStoreSurveyRow> {
+        Some(ClassSetFieldStoreSurveyRow {
+            stores: self
+                .ordered_stores()
+                .into_iter()
+                .map(|(owner, member)| {
+                    Some(ClassSetFieldStoreRow {
+                        owner: match owner {
+                            Some(owner) => Some(persist_class(owner)?),
+                            None => None,
+                        },
+                        member: member.to_owned(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            unknown_members: self.unknown_members,
+        })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let member_bytes = |members: &HashSet<Box<str>>| {
+            members
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Box<str>>())
+                .saturating_add(members.iter().map(|member| member.len()).sum::<usize>())
+        };
+        self.stores
+            .iter()
+            .fold(
+                self.stores
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(ClassIdentity, HashSet<Box<str>>)>()),
+                |bytes, (class, members)| {
+                    bytes
+                        .saturating_add(class_identity_heap_bytes(class))
+                        .saturating_add(member_bytes(members))
+                },
+            )
+            .saturating_add(member_bytes(&self.unowned_members))
+    }
+}
+
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 4;
+    const ALGORITHM_VERSION: u32 = 5;
     // Bump only when the persisted row encoding changes.
-    const REPRESENTATION_VERSION: u32 = 1;
+    const REPRESENTATION_VERSION: u32 = 2;
 
     /// Load one exact complete index when possible, otherwise build it.
     ///
@@ -486,6 +588,7 @@ impl FieldSlotIndex {
         collected: CollectedSlots,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        let store_survey = FieldStoreSurvey::from_collected(&collected);
         let persistable = !collected.globally_incomplete
             && !collected.transient_resolver_budget
             && collected.semantic_budget_exhaustion.is_none();
@@ -579,7 +682,7 @@ impl FieldSlotIndex {
                 atoms,
             });
         }
-        let digest = digest_slots(&slots, field_slot_semantics_digest(adapter));
+        let digest = digest_index(&slots, &store_survey, field_slot_semantics_digest(adapter));
         let mut lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>> = HashMap::default();
         for (index, slot) in slots.iter().enumerate() {
             lookup
@@ -591,6 +694,7 @@ impl FieldSlotIndex {
             slots,
             lookup,
             digest,
+            store_survey,
             semantic_budget_exhaustion: collected.semantic_budget_exhaustion,
             transient_resolver_budget: collected.transient_resolver_budget,
             persistent_artifacts,
@@ -637,7 +741,16 @@ impl FieldSlotIndex {
         else {
             return Ok(None);
         };
-        ClassSetFieldSlotIndexRow::try_new(key, slots, self.persistent_artifacts.clone()).map(Some)
+        let Some(store_survey) = self.store_survey.to_persisted() else {
+            return Ok(None);
+        };
+        ClassSetFieldSlotIndexRow::try_new(
+            key,
+            slots,
+            self.persistent_artifacts.clone(),
+            store_survey,
+        )
+        .map(Some)
     }
 
     fn from_persisted(
@@ -671,6 +784,11 @@ impl FieldSlotIndex {
                 }
             }
         }
+        for store in &row.store_survey.stores {
+            if let Some(ClassSetFieldSlotClassRow::Workspace { fq_name, .. }) = &store.owner {
+                workspace_class_names.insert(fq_name.clone());
+            }
+        }
         let mut workspace_class_names = workspace_class_names.into_iter().collect::<Vec<_>>();
         workspace_class_names.sort_unstable();
         for names in workspace_class_names.chunks(256) {
@@ -682,6 +800,31 @@ impl FieldSlotIndex {
 
         let mut workspace_classes = HashMap::default();
         let mut source_files = HashMap::default();
+        let mut store_survey = FieldStoreSurvey {
+            unknown_members: row.store_survey.unknown_members,
+            ..FieldStoreSurvey::default()
+        };
+        for store in row.store_survey.stores {
+            if cancellation.is_cancelled() {
+                return Err(PersistedHydrationRejection::Cancelled);
+            }
+            match store.owner {
+                Some(owner) => {
+                    let owner = rehydrate_class(workspace, owner, &mut workspace_classes)
+                        .ok_or(PersistedHydrationRejection::Hydration)?;
+                    store_survey
+                        .stores
+                        .entry(owner)
+                        .or_default()
+                        .insert(store.member.into_boxed_str());
+                }
+                None => {
+                    store_survey
+                        .unowned_members
+                        .insert(store.member.into_boxed_str());
+                }
+            }
+        }
         let slots = row
             .slots
             .into_iter()
@@ -742,7 +885,7 @@ impl FieldSlotIndex {
         }) {
             return Err(PersistedHydrationRejection::Hydration);
         }
-        let digest = digest_slots(&slots, semantics_digest);
+        let digest = digest_index(&slots, &store_survey, semantics_digest);
         let mut lookup: HashMap<ClassIdentity, HashMap<Box<str>, usize>> = HashMap::default();
         for (index, slot) in slots.iter().enumerate() {
             if lookup
@@ -758,6 +901,7 @@ impl FieldSlotIndex {
             slots,
             lookup,
             digest,
+            store_survey,
             semantic_budget_exhaustion: None,
             transient_resolver_budget: false,
             persistent_artifacts,
@@ -767,6 +911,39 @@ impl FieldSlotIndex {
         (index.retained_bytes() <= FIELD_SLOT_CACHE_BYTES as usize)
             .then_some(index)
             .ok_or(PersistedHydrationRejection::Hydration)
+    }
+
+    /// An exact receiver class can inherit stores from ancestors, never from
+    /// descendants. Named writes without an owner keep only that name open.
+    pub(super) fn member_store_evidence(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> MemberStoreEvidence {
+        let has_store = |owner: &ClassIdentity| {
+            self.store_survey
+                .stores
+                .get(owner)
+                .is_some_and(|members| members.contains(member))
+        };
+        if has_store(class) {
+            return MemberStoreEvidence::Stored;
+        }
+        let hierarchy = adapter.class_hierarchy(workspace, class);
+        if hierarchy.ancestors.iter().any(has_store) {
+            return MemberStoreEvidence::Stored;
+        }
+        if self.store_survey.unknown_members
+            || self.store_survey.unowned_members.contains(member)
+            || hierarchy.unresolved_base
+            || hierarchy.dynamic_attributes
+        {
+            MemberStoreEvidence::Unknown
+        } else {
+            MemberStoreEvidence::NoStore
+        }
     }
 
     pub fn slot(&self, class: &ClassIdentity, member: &str) -> Option<&FieldSlot> {
@@ -864,6 +1041,7 @@ impl FieldSlotIndex {
             |total, artifact| total.saturating_add(artifact.rel_path.len()),
         );
         std::mem::size_of::<Self>()
+            .saturating_add(self.store_survey.retained_bytes())
             .saturating_add(slot_bytes)
             .saturating_add(lookup_bytes)
             .saturating_add(artifact_bytes)
@@ -1640,6 +1818,27 @@ fn dedup_atoms(atoms: &mut Vec<(ClassAtom, SourceSite)>) {
     atoms.dedup();
 }
 
+fn digest_index(
+    slots: &[FieldSlot],
+    survey: &FieldStoreSurvey,
+    semantics: StableDigest,
+) -> StableDigest {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-index-v2");
+    digest.push(digest_slots(slots, semantics).as_bytes());
+    digest.push(&[u8::from(survey.unknown_members)]);
+    for (owner, member) in survey.ordered_stores() {
+        match owner {
+            Some(owner) => {
+                digest.push(b"owned");
+                push_class(&mut digest, owner);
+            }
+            None => digest.push(b"unowned"),
+        }
+        digest.push(member.as_bytes());
+    }
+    digest.finish()
+}
+
 fn digest_slots(slots: &[FieldSlot], semantics: StableDigest) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-slots-v1");
     digest.push(semantics.as_bytes());
@@ -2068,6 +2267,106 @@ mod tests {
         ) -> Vec<DynamicFieldWrite> {
             self.inner.dynamic_field_writes(workspace, procedure)
         }
+    }
+
+    #[test]
+    fn member_store_survey_survives_memory_and_persistent_replay() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .with_git()
+            .file(
+                "app.py",
+                concat!(
+                    "class Base:\n",
+                    "    def assign(self):\n",
+                    "        self.item = 1\n",
+                    "class Child(Base):\n",
+                    "    def assign_child(self):\n",
+                    "        self.child_item = 1\n",
+                    "def attach(target):\n",
+                    "    target.extra = 1\n",
+                    "    target.item = 1\n",
+                ),
+            )
+            .build();
+        let adapter = type_flow_adapter(Language::Python).expect("Python adapter");
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace");
+        let class = |name: &str| {
+            ClassIdentity::Workspace(
+                workspace
+                    .analyzer()
+                    .get_definitions(name)
+                    .into_iter()
+                    .next()
+                    .expect("fixture class"),
+            )
+        };
+        let base = class("app.Base");
+        let child = class("app.Child");
+        let cache = FieldSlotIndexCache::default();
+        let cold = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("cold survey");
+        assert_eq!(cold.kind, FieldSlotIndexAcquisitionKind::Built);
+        assert!(cold.published);
+        let memory = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("memory survey");
+        assert_eq!(memory.kind, FieldSlotIndexAcquisitionKind::MemoryHit);
+        let persisted = acquire(
+            &workspace,
+            adapter,
+            &FieldSlotIndexCache::default(),
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("persistent survey");
+        assert_eq!(persisted.kind, FieldSlotIndexAcquisitionKind::PersistentHit);
+        for index in [&cold.index, &memory.index, &persisted.index] {
+            assert_eq!(index.digest(), cold.index.digest());
+            assert_eq!(index.store_survey, cold.index.store_survey);
+            assert_eq!(
+                index.member_store_evidence(&workspace, adapter, &base, "item"),
+                MemberStoreEvidence::Stored
+            );
+            assert_eq!(
+                index.member_store_evidence(&workspace, adapter, &child, "item"),
+                MemberStoreEvidence::Stored
+            );
+            assert_eq!(
+                index.member_store_evidence(&workspace, adapter, &base, "child_item"),
+                MemberStoreEvidence::NoStore
+            );
+            assert_eq!(
+                index.member_store_evidence(&workspace, adapter, &child, "extra"),
+                MemberStoreEvidence::Unknown
+            );
+            assert_eq!(
+                index.member_store_evidence(&workspace, adapter, &child, "missing"),
+                MemberStoreEvidence::NoStore
+            );
+        }
+        let mut starved = SemanticBudget::new(crate::analyzer::semantic::SemanticWork::uniform(1))
+            .expect("positive budget");
+        let incomplete = FieldSlotIndex::build(&workspace, adapter, &mut starved, &cancellation)
+            .expect("bounded survey");
+        assert_eq!(
+            incomplete.member_store_evidence(&workspace, adapter, &child, "missing"),
+            MemberStoreEvidence::Unknown
+        );
+        assert!(!incomplete.persistable);
     }
 
     #[test]

@@ -7,15 +7,19 @@ use crate::analyzer::usages::js_ts_graph::{
 };
 use crate::navigation::NavigationOperation;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor;
+use brokk_bifrost_js_ts::access_chain::{
+    JsTsImportedMemberChainResolution, resolve_import_member_chain,
+};
 use brokk_bifrost_js_ts::imports::{
     js_ts_module_identity, js_ts_module_specifier_probed_paths, require_call_module_specifier,
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
+    resolve_js_ts_module_binding_candidates,
 };
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsDestructuringSource, JsTsImportBinder, JsTsLexicalBindingIndex,
-    MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
+    JsTsDestructuringSource, JsTsImportBinder, JsTsImportBindingResolution,
+    JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
     is_export_alias_identifier, is_known_js_ts_global, js_program_is_external_module,
     js_ts_statement_module_specifier, pattern_binder_identifiers, slice, static_member_property,
@@ -772,6 +776,75 @@ pub(super) fn resolve_js_ts(
         return boundary_unchecked(format!(
             "`{reference}` resolves through an active JS/TS declaration-model return type"
         ));
+    }
+
+    if let Some(member_expression) =
+        focused.and_then(|focus| jsts_import_member_expression_at_focus(focus, source))
+        && let JsTsImportedMemberChainResolution::Exact(chain) =
+            resolve_import_member_chain(member_expression, source)
+        && imports.has_binding_records(chain.root_name(source))
+        // Ambiguity is handled by the dotted route below, which merges every
+        // structurally visible import binding and retains its candidates.
+        && !matches!(
+            imports.binding_at(chain.root_name(source), chain.root.start_byte()),
+            JsTsImportBindingResolution::Ambiguous
+        )
+    {
+        let binding = match imports.binding_at(chain.root_name(source), chain.root.start_byte()) {
+            JsTsImportBindingResolution::Exact(binding) => binding,
+            JsTsImportBindingResolution::Ambiguous
+            | JsTsImportBindingResolution::Shadowed
+            | JsTsImportBindingResolution::Reassigned
+            | JsTsImportBindingResolution::Truncated
+            | JsTsImportBindingResolution::Inactive
+            | JsTsImportBindingResolution::Incomplete
+            | JsTsImportBindingResolution::Unresolved => {
+                return no_definition(
+                    "unproven_import_binding",
+                    format!(
+                        "`{}` is not one exact active JS/TS import binding at this reference",
+                        chain.root_name(source)
+                    ),
+                );
+            }
+        };
+        match resolve_js_ts_imported_member_chain(
+            host,
+            support,
+            language,
+            file,
+            &binding.binding,
+            &chain,
+            Some(aliases),
+            value_position,
+            ReceiverAnalysisBudget::default(),
+        ) {
+            ReceiverAnalysisOutcome::Precise(endpoints) => {
+                let candidates = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.declaration)
+                    .collect();
+                return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(endpoints) if !endpoints.is_empty() => {
+                let candidates = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.declaration)
+                    .collect();
+                return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Unknown
+            | ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+                return no_definition(
+                    "unresolved_import_member_chain",
+                    format!(
+                        "`{reference}` did not resolve through one complete imported member chain"
+                    ),
+                );
+            }
+        }
     }
 
     if let Some((qualifier, name)) = reference.split_once('.') {
@@ -2791,6 +2864,25 @@ fn jsts_static_member_reference_at_focus(
                 let receiver = jsts_dotted_chain_text(object, source, language)?;
                 return Some(format!("{receiver}.{name}"));
             }
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn jsts_import_member_expression_at_focus<'tree>(
+    focus: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut current = Some(focus);
+    while let Some(node) = current {
+        if matches!(node.kind(), "member_expression" | "subscript_expression")
+            && static_member_property(node, source).is_some_and(|(property, _)| {
+                property.start_byte() <= focus.start_byte()
+                    && focus.end_byte() <= property.end_byte()
+            })
+        {
+            return Some(node);
         }
         current = node.parent();
     }

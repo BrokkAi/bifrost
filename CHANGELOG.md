@@ -5,7 +5,7 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## [Unreleased]
+## [0.11.1] - 2026-09-09
 
 ### Added
 
@@ -41,6 +41,10 @@ projection and its commit history does not contain every source commit.
 - JVM dependency discovery now certifies exact callable families from JMOD
   artifacts and activates scoped evidence from partial generated packs
   without promoting their completeness.
+- On Linux hosts configured above 32 analysis threads, Bifrost now caps glibc
+  allocator arenas before starting analyzer workers, substantially reducing
+  allocator lock contention during large initial workspace builds. Smaller
+  hosts and non-glibc targets are unchanged.
 
 ### Fixed
 
@@ -48,6 +52,26 @@ projection and its commit history does not contain every source commit.
   repeated analyses of the same base keep their caches, and `score_diff`
   now retains one immutable target revision and reuses its reference scan
   across calls.
+- JavaScript and TypeScript definition navigation now keeps spread and rest
+  operand references focused on the operand, and usage proofs preserve exact
+  imported owners through computed member chains and CommonJS re-exports.
+- Rust navigation now ignores standalone `_` placeholders as references and
+  resolves proc macros brought into scope through `#[macro_use] extern crate`
+  and facade re-exports.
+- C++ definition lookup now reports typed incompleteness after interrupted
+  reads instead of converting an empty result into a confident unresolved
+  include boundary, and incomplete results are no longer cached as complete.
+- Python package discovery now reads supported `setup.py` packaging shapes to
+  establish import roots without executing the file. Decorated callables keep
+  their receiver, argument, default, and return bindings explicitly unknown
+  when decoration may replace the exposed function, and member guards consult
+  complete dynamic-store evidence before proving absence.
+- C# and Python qualified-name navigation now resolves the focused path segment
+  independently instead of returning a definition for an adjacent segment.
+- Go concurrency analysis now distinguishes reference equality from independent
+  storage, preserves proven allocation identity through exact synchronous
+  results, rejects stale identities after mutable formal reassignment, and
+  keeps repeated loop-local capture cells out of singleton alias proofs.
 - Unused-import diagnostics now resolve Rust and Scala import targets before
   withholding a proof, and JavaScript/TypeScript treats documentation
   comments as an ambient import use.

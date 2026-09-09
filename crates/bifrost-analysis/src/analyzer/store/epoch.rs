@@ -756,11 +756,12 @@ pub(super) fn typescript_epoch_before_callable_modifier_metadata() -> String {
 // Salt bumped again (#2052): repeated assignments to one logical class field
 // now retain every physical navigation range so class-body lookup can select
 // the binding active at the reference site.
+// Salt bumped (#3075): static setup.py packaging evidence establishes import roots.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09"
 );
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
@@ -828,11 +829,18 @@ lang_epoch!(
 // in usage facts while carrying no local binding name, and eligible `pub use`
 // rows preserve those unnamed exports. Warm rows carry the old producer
 // semantics and must be re-extracted before the new reader can use them.
+// Salt bumped again (#3081): external module signatures retain the source
+// declaration item instead of a fabricated inline-module header.
+// Salt bumped again (#3072): a `#[proc_macro]` function is now persisted in
+// the macro namespace instead of the function namespace, and an `extern
+// crate` import fact now records whether `#[macro_use]` imports that crate's
+// exported macros. Warm rows carry the old declaration identity and omit the
+// import route needed to resolve the macro through a facade re-export.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08;include-edge-facts-2026-08;import-cfg-and-extern-crate-2026-08;enum-variant-named-fields-2026-08;callable-parameter-type-spellings-2026-08;raw-identifier-cargo-module-routes-2026-08;bounded-declaration-labels-2026-08;nested-and-extern-crate-import-facts-2026-08;declaration-type-parameter-arity-2026-09;rust-type-alias-type-identity-2026-09;unnamed-rust-import-binding-facts-2026-09;source-external-module-signatures-2026-09;proc-macro-kind-and-macro-use-extern-facts-2026-09"
 );
 
 #[cfg(test)]

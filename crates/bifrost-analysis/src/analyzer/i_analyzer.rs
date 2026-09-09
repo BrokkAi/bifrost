@@ -526,6 +526,18 @@ fn escape_sigil_anchors(pattern: &str) -> String {
     escaped
 }
 
+/// A typed reason a request could not establish a complete read.
+#[derive(Debug, Clone)]
+pub enum QueryReadIncomplete {
+    /// Cooperative cancellation stopped a read before it could establish a
+    /// complete answer.
+    Cancelled,
+    /// The structured source needed by a read was unavailable.
+    StructureUnavailable(ProjectFile),
+    /// A store failure prevented a read from establishing a complete answer.
+    StoreFailure(StoreError),
+}
+
 /// Failure state and deadline for one top-level analyzer request.
 ///
 /// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
@@ -546,6 +558,7 @@ fn escape_sigil_anchors(pattern: &str) -> String {
 #[derive(Debug)]
 pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
+    first_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
     cancellation: Option<CancellationToken>,
     /// A resolver overlay frozen by this scope's owner thread. The outer
     /// `Option` distinguishes no override from a deliberately frozen absence;
@@ -575,6 +588,7 @@ impl Default for AnalyzerQueryContext {
     fn default() -> Self {
         Self {
             first_store_error: Mutex::new(None),
+            first_read_incomplete: Mutex::new(None),
             cancellation: None,
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
@@ -872,6 +886,7 @@ impl AnalyzerQueryContext {
     pub fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
             first_store_error: Mutex::new(None),
+            first_read_incomplete: Mutex::new(None),
             cancellation: Some(cancellation),
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
@@ -885,6 +900,7 @@ impl AnalyzerQueryContext {
     ) -> Self {
         Self {
             first_store_error: Mutex::new(None),
+            first_read_incomplete: Mutex::new(None),
             cancellation: None,
             semantic_model_overlay_override: Some((
                 std::thread::current().id(),
@@ -901,6 +917,7 @@ impl AnalyzerQueryContext {
     ) -> Self {
         Self {
             first_store_error: Mutex::new(None),
+            first_read_incomplete: Mutex::new(None),
             cancellation: None,
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: Some((std::thread::current().id(), snapshot)),
@@ -931,6 +948,7 @@ impl AnalyzerQueryContext {
     fn with_read_ledger(ledger: Arc<crate::analyzer::read_ledger::ReadLedger>) -> Self {
         Self {
             first_store_error: Mutex::new(None),
+            first_read_incomplete: Mutex::new(None),
             cancellation: None,
             semantic_model_overlay_override: None,
             active_semantic_model_snapshot_override: None,
@@ -992,6 +1010,35 @@ impl AnalyzerQueryContext {
             .lock()
             .expect("analyzer query error mutex poisoned")
             .clone()
+    }
+
+    /// Records the first structured reason this request could not establish a
+    /// complete read. The reason is sticky so an outer scope retains an inner
+    /// scope's cancellation after that inner scope closes.
+    pub fn record_read_incomplete(&self, reason: QueryReadIncomplete) {
+        let mut slot = self
+            .first_read_incomplete
+            .lock()
+            .expect("analyzer query incompleteness mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
+
+    /// Returns the first typed read incompleteness, falling back to the first
+    /// recorded store failure when no more specific reason was recorded.
+    pub fn read_completion(&self) -> Result<(), QueryReadIncomplete> {
+        if let Some(reason) = self
+            .first_read_incomplete
+            .lock()
+            .expect("analyzer query incompleteness mutex poisoned")
+            .clone()
+        {
+            return Err(reason);
+        }
+        self.store_error().map_or(Ok(()), |error| {
+            Err(QueryReadIncomplete::StoreFailure(error))
+        })
     }
 }
 
@@ -1163,6 +1210,11 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     #[doc(hidden)]
     fn record_query_failure(&self, _error: StoreError) {}
 
+    /// Records a typed reason a collection-returning read could not establish
+    /// a complete answer, on every request boundary currently open.
+    #[doc(hidden)]
+    fn record_query_incomplete(&self, _reason: QueryReadIncomplete) {}
+
     /// Build the expensive lazily-initialized per-generation query indexes
     /// ahead of demand (#1442). Idempotent and safe to call from a background
     /// thread: concurrent demand for the same index blocks on its one-time
@@ -1299,10 +1351,14 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     ) -> crate::analyzer::RelationalBatchOutcome {
         let local_cancellation = CancellationToken::new();
         let active_cancellation = self.active_query_cancellation();
-        self.relational_definition_batch(
+        let outcome = self.relational_definition_batch(
             requests,
             active_cancellation.as_ref().unwrap_or(&local_cancellation),
-        )
+        );
+        if matches!(&outcome, crate::analyzer::RelationalBatchOutcome::Cancelled) {
+            self.record_query_incomplete(QueryReadIncomplete::Cancelled);
+        }
+        outcome
     }
 
     /// Return the declaration node's tree-sitter kind when structured syntax
@@ -2216,6 +2272,10 @@ impl<'a> AnalyzerQueryScope<'a> {
 
     pub fn store_error(&self) -> Option<StoreError> {
         self.context.store_error()
+    }
+
+    pub fn read_completion(&self) -> Result<(), QueryReadIncomplete> {
+        self.context.read_completion()
     }
 
     /// How often `tier`'s storage funnel was crossed since this scope opened

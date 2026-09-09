@@ -1002,6 +1002,11 @@ impl LanguageSupport for PythonSupport {
         Language::Python
     }
 
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        use brokk_bifrost_python::declarations::{module_code_unit, python_module_name};
+        module_code_unit(file, &python_module_name(file))
+    }
+
     fn signature_metadata_limited(
         &self,
         analyzer: &dyn IAnalyzer,

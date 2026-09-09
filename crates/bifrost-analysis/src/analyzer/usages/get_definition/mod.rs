@@ -989,7 +989,10 @@ fn resolve_definition_requests_traced<'a>(
     trace_session: Option<&trace::TraceSession>,
     traces: &mut Vec<Vec<TraceCandidate>>,
 ) -> Vec<DefinitionLookupOutcome> {
-    let _query_scope = AnalyzerQueryScope::new(analyzer);
+    let _query_scope = cancellation.map_or_else(
+        || AnalyzerQueryScope::new(analyzer),
+        |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+    );
     record_definition_batch_probe_reads(analyzer, context, &requests);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
@@ -1062,14 +1065,25 @@ pub(crate) fn resolve_definition_batch_with_source_exact_token_focus(
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<DefinitionLookupOutcome> {
-    let scope = AnalyzerQueryScope::new(analyzer);
+    let scope = cancellation.map_or_else(
+        || AnalyzerQueryScope::new(analyzer),
+        |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+    );
     let token = scope.token();
-    let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.exact_token_focus = true;
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true)
+    resolve_definition_requests(
+        analyzer,
+        token,
+        &mut context,
+        requests,
+        cancellation,
+        None,
+        true,
+    )
 }
 
 /// The traced counterpart of [`resolve_definition_batch_with_source`]: same
@@ -1576,6 +1590,9 @@ struct DefinitionBatchContext<'a> {
     sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
+    // Covers visibility construction as well as candidate lookup. Incomplete
+    // inputs stay visible after a nested or concurrent cancelling scope closes.
+    cpp_read_scope: AnalyzerQueryScope<'a>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'a>>>,
     cpp_live_sources_seeded: bool,
     // Candidate declaration ranges belong to the analyzer generation, so these
@@ -1613,6 +1630,7 @@ impl<'a> DefinitionBatchContext<'a> {
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
+            cpp_read_scope: AnalyzerQueryScope::new(analyzer),
             cpp_visibility: HashMap::default(),
             cpp_live_sources_seeded: false,
             cpp_indexed_sources: HashMap::default(),
@@ -1794,7 +1812,15 @@ impl<'a> DefinitionBatchContext<'a> {
     fn cpp_indexed_source(&mut self, file: &ProjectFile) -> Option<Arc<String>> {
         self.cpp_indexed_sources
             .entry(file.clone())
-            .or_insert_with(|| self.analyzer.indexed_source(file).map(Arc::new))
+            .or_insert_with(|| {
+                let source = self.analyzer.indexed_source(file).map(Arc::new);
+                if source.is_none() {
+                    self.analyzer.record_query_incomplete(
+                        crate::analyzer::QueryReadIncomplete::StructureUnavailable(file.clone()),
+                    );
+                }
+                source
+            })
             .clone()
     }
 
@@ -2614,7 +2640,10 @@ fn navigation_lookup_outcome(
             cpp::select_navigation_targets(context, token, reference_file, &definitions, operation);
         (
             selection.targets,
-            selection.structure_unavailable,
+            selection.structure_unavailable
+                || diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC
+                }),
             selection.unproven_link_unit,
             selection.truncated,
         )
@@ -2643,7 +2672,6 @@ fn navigation_lookup_outcome(
                 | "no_declaration"
                 | NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC
                 | cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
-                | CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC
         )
     });
 
@@ -2692,7 +2720,11 @@ fn navigation_lookup_outcome(
         }
     }
 
-    if structure_unavailable {
+    if structure_unavailable
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC)
+    {
         diagnostics.push(DefinitionLookupDiagnostic {
             kind: CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC.to_string(),
             message: "one or more C/C++ candidates could not be classified from indexed syntax"

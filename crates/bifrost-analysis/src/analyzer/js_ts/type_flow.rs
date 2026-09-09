@@ -1137,6 +1137,9 @@ fn member_lookup(
                     present @ MemberLookup::Present(_) => return present,
                     MemberLookup::Unknown(UnknownReason::PackIncomplete) => {}
                     MemberLookup::Unknown(reason) => return MemberLookup::Unknown(reason),
+                    MemberLookup::DeclarationAbsent => {
+                        unreachable!("external model lookup is declaration-complete or unknown")
+                    }
                     MemberLookup::Absent => {
                         unreachable!("the JS/TS external lookup never proves runtime absence")
                     }

@@ -69,6 +69,9 @@ pub struct RustImportBinding {
     /// True for `extern crate name as alias;`: it binds a namespace and nothing
     /// in the current module's own namespace.
     pub is_extern_crate: bool,
+    /// Whether this extern-crate binding imports exported macros into the
+    /// owning crate's macro-use prelude.
+    pub is_macro_use: bool,
     pub visibility: RustVisibility,
     /// The `#[cfg(...)]` predicate the `use` was written under.
     pub cfg_condition: RustCfgCondition,
@@ -625,6 +628,7 @@ fn binding_from_fact(
         path,
         local_name,
         is_extern_crate: target.is_extern_crate,
+        is_macro_use: target.is_macro_use,
         visibility: target.visibility.clone(),
         cfg_condition: target.cfg_condition.clone(),
         importer_module: ModuleKey::with_crate_root(crate_root_package, &owner_module),

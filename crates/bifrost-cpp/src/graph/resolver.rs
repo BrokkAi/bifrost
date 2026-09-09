@@ -29,6 +29,8 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSourceOrigin, PreparedSyntaxSource};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::field_name_in_parent;
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -40,6 +42,8 @@ use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+#[cfg(test)]
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
@@ -650,6 +654,13 @@ type MacroLocalBindingTemplateCache =
     HashMap<(ProjectFile, usize), Option<Arc<MacroLocalBindingTemplate>>>;
 type MacroReplacementBodyCache = HashMap<(ProjectFile, usize), Option<Arc<ParsedReplacementBody>>>;
 type MacroTypeParameterCache = HashMap<(ProjectFile, usize), Option<Arc<[usize]>>>;
+type StructuredIncludeFactCell = Arc<OnceLock<Arc<[StructuredIncludeFact]>>>;
+
+struct StructuredIncludeFact {
+    start_byte: usize,
+    end_byte: usize,
+    path: String,
+}
 
 #[derive(Clone, Default)]
 pub struct MacroEnvironment {
@@ -963,6 +974,7 @@ pub struct VisibilityIndex<'a> {
     project_using_index: OnceLock<ProjectUsingIndex>,
     callable_reference_specs:
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
+    structured_include_fact_cells: Mutex<HashMap<ProjectFile, StructuredIncludeFactCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     compile_proven_guard_cells: Mutex<HashMap<ProjectFile, Arc<HashSet<PreprocessorGuard>>>>,
     include_path_admission_cells: Mutex<HashMap<ProjectFile, IncludePathAdmission>>,
@@ -1811,6 +1823,38 @@ impl<'a> VisibilityIndex<'a> {
         self.token
     }
 
+    /// Whether `file` has a structured unresolved include that is active before
+    /// the reference at `before_byte`.
+    ///
+    /// Include facts are collected from the prepared tree once per visibility
+    /// query. The reference position is still evaluated for each call because
+    /// preprocessor visibility depends on the reference's own conditional
+    /// context.
+    pub fn has_unresolved_include_visible_before(
+        &self,
+        file: &ProjectFile,
+        before_byte: usize,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        let cell = self
+            .structured_include_fact_cells
+            .lock()
+            .expect("C++ structured include-fact cache poisoned")
+            .entry(file.clone())
+            .or_default()
+            .clone();
+        let facts = cell.get_or_init(|| collect_structured_include_facts(prepared.as_ref()));
+        has_unresolved_include_visible_before_in_prepared(
+            file,
+            prepared.as_ref(),
+            self.cpp.include_target_index(),
+            facts,
+            before_byte,
+        )
+    }
+
     /// A [`VisibilityIndex`] over a caller-supplied visible-declaration map,
     /// bypassing the include-closure walk [`Self::build`] performs.
     ///
@@ -1856,6 +1900,7 @@ impl<'a> VisibilityIndex<'a> {
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
+            structured_include_fact_cells: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             compile_proven_guard_cells: Mutex::new(HashMap::default()),
             include_path_admission_cells: Mutex::new(HashMap::default()),
@@ -2123,6 +2168,7 @@ impl<'a> VisibilityIndex<'a> {
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
+            structured_include_fact_cells: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             compile_proven_guard_cells: Mutex::new(HashMap::default()),
             include_path_admission_cells: Mutex::new(HashMap::default()),
@@ -13455,6 +13501,68 @@ fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a st
     }
 }
 
+fn collect_structured_include_facts(prepared: &PreparedSyntaxTree) -> Arc<[StructuredIncludeFact]> {
+    let source = prepared.source();
+    let mut facts = Vec::new();
+    let mut nodes = vec![prepared.tree().root_node()];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "preproc_include" {
+            let Some(path) = node
+                .child_by_field_name("path")
+                .and_then(|path| structured_include_path(path, source))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            facts.push(StructuredIncludeFact {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                path,
+            });
+            continue;
+        }
+        push_named_children_reversed(node, &mut nodes);
+    }
+    Arc::from(facts.into_boxed_slice())
+}
+
+fn has_unresolved_include_visible_before_in_prepared(
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    include_targets: &IncludeTargetIndex,
+    facts: &[StructuredIncludeFact],
+    before_byte: usize,
+) -> bool {
+    let guards = OnceCell::new();
+    let reference = CallableReferenceContext {
+        file,
+        position: Some(CallableReferencePosition {
+            prepared,
+            byte: before_byte,
+            guards: &guards,
+        }),
+    };
+    let root = prepared.tree().root_node();
+    facts
+        .iter()
+        .filter(|fact| fact.end_byte <= before_byte)
+        .any(|fact| {
+            let node = root
+                .descendant_for_byte_range(fact.start_byte, fact.end_byte)
+                .expect("structured include fact range must be in prepared tree");
+            assert_eq!(
+                node.kind(),
+                "preproc_include",
+                "structured include fact range must identify its include node"
+            );
+            callable_preprocessor_context_is_visible_for_reference(
+                node,
+                prepared.source(),
+                &reference,
+            ) && resolve_include_targets_with_index(file, &fact.path, include_targets).is_empty()
+        })
+}
+
 fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
     let descendant = node;
     while let Some(parent) = node.parent() {
@@ -17665,6 +17773,61 @@ mod tests {
         tree.root_node()
             .named_descendant_for_byte_range(start, start + needle.len())
             .expect("node at needle")
+    }
+
+    fn prepared_cpp(source: &str) -> PreparedSyntaxTree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Cpp),
+            PreparedSourceOrigin::Disk,
+            None,
+        )
+    }
+
+    fn unresolved_include_before(source: &str, reference: &str) -> bool {
+        let file = ProjectFile::new(std::env::temp_dir(), "issue-3078.cpp");
+        let prepared = prepared_cpp(source);
+        let facts = collect_structured_include_facts(&prepared);
+        let include_targets = IncludeTargetIndex::build([&file]);
+        has_unresolved_include_visible_before_in_prepared(
+            &file,
+            &prepared,
+            &include_targets,
+            &facts,
+            source.find(reference).expect("reference fixture"),
+        )
+    }
+
+    #[test]
+    fn unresolved_include_before_reference_is_visible() {
+        let source = "#include \"missing.h\"\nint use = Missing;\n";
+        assert!(unresolved_include_before(source, "Missing"));
+    }
+
+    #[test]
+    fn unresolved_include_after_reference_is_not_visible() {
+        let source = "int use = Missing;\n#include \"missing.h\"\n";
+        assert!(!unresolved_include_before(source, "Missing"));
+    }
+
+    #[test]
+    fn unresolved_include_in_incompatible_sibling_branch_is_not_visible() {
+        let source = "#if FEATURE\n#include \"missing.h\"\n#else\nint use = Missing;\n#endif\n";
+        assert!(!unresolved_include_before(source, "Missing"));
+    }
+
+    #[test]
+    fn unresolved_include_in_current_branch_is_visible() {
+        let source =
+            "#if FEATURE\n#include \"missing.h\"\nint use = Missing;\n#else\nint other;\n#endif\n";
+        assert!(unresolved_include_before(source, "Missing"));
     }
 
     /// Two macro-decorated class heads make tree-sitter close `detail` at the

@@ -229,8 +229,14 @@ fn relational_definitions(
         |frontier| definitions_from_frontier(frontier, name, query.clone()),
     ) {
         brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Complete(units) => units,
-        brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Cancelled
-        | brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Failed(_) => Vec::new(),
+        brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Cancelled => {
+            analyzer.record_query_incomplete(crate::analyzer::QueryReadIncomplete::Cancelled);
+            Vec::new()
+        }
+        brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            analyzer.record_query_failure(crate::analyzer::store::StoreError::new(error.message()));
+            Vec::new()
+        }
     }
 }
 

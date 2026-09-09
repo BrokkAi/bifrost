@@ -26,7 +26,9 @@ use brokk_bifrost_rust::declarations::rust_macro_invocation_arguments;
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
-use brokk_bifrost_rust::graph::ast::type_parameter_trait_bounds;
+use brokk_bifrost_rust::graph::ast::{
+    is_rust_non_reference_underscore, type_parameter_trait_bounds,
+};
 use brokk_bifrost_rust::graph::resolver::{RustBareTokenTreeRole, RustTokenTreeRoleCache};
 use brokk_bifrost_rust::graph_support::{
     RustFactSource, RustSource, is_rust_export_visible_declaration,
@@ -39,6 +41,7 @@ use brokk_bifrost_rust::macro_matcher::{
     enclosing_macro_invocation_for_argument, is_macro_rules_definition, match_macro_rules,
     token_namespace_evidence,
 };
+use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use std::cell::RefCell;
 
 use super::{
@@ -226,6 +229,12 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     }
 }
 
+fn rust_site_is_non_reference(tree: &Tree, source: &str, site: &ResolvedReferenceSite) -> bool {
+    tree.root_node()
+        .descendant_for_byte_range(site.focus_start_byte, site.focus_end_byte)
+        .is_some_and(|node| is_rust_non_reference_underscore(node, source))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
@@ -244,6 +253,12 @@ pub(super) fn resolve_rust(
     let _deep = trace::DeepScope::enter(&site.text);
     if !support.observe_cancellation() {
         return no_definition("cancelled", "Rust definition resolution was cancelled");
+    }
+    if tree.is_some_and(|tree| rust_site_is_non_reference(tree, source, site)) {
+        return no_definition(
+            "rust_non_reference_syntax",
+            "the focused Rust underscore is a placeholder, not a reference",
+        );
     }
     let outcome = resolve_rust_unscoped(
         analyzer, token, support, file, source, tree, site, cache, operation,
@@ -340,6 +355,12 @@ fn resolve_rust_bounded_in_session(
     let Some(tree) = tree else {
         return no_definition("rust_parse_failed", "Rust source could not be parsed");
     };
+    if rust_site_is_non_reference(tree, source, site) {
+        return no_definition(
+            "rust_non_reference_syntax",
+            "the focused Rust underscore is a placeholder, not a reference",
+        );
+    }
     let Some(node) = rust_smallest_named_node_covering(
         support,
         tree.root_node(),
@@ -531,6 +552,13 @@ fn rust_cargo_reference_scope(
     let tree = tree?;
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    // Macro-name resolution already applies the macro namespace and composes
+    // structured import/export routes. Re-scoping its physical declaration to
+    // the caller's Cargo target would reject proc macros that a facade crate
+    // re-exports from its codegen dependency.
+    if rust_enclosing_macro_name(focused).is_some() {
+        return None;
+    }
     if let Some(focused_use) = rust_focused_use_path(focused, source)
         && let Some(targets) =
             rust_import_path_target_files(rust, token, file, &focused_use.segments)
@@ -1940,6 +1968,10 @@ fn rust_collect_macro_units(
     if candidates.is_empty() {
         candidates = rust_same_package_macros(rust, file, name);
     }
+    if candidates.is_empty() {
+        candidates =
+            RustUsageWalks::new(rust, token).macro_use_imported_declarations_named(file, name);
+    }
     MacroUnitResolution::Found(candidates)
 }
 
@@ -2177,9 +2209,19 @@ fn rust_macro_argument_outcome(
         {
             return None;
         }
-        return Some(boundary_unchecked(format!(
-            "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
-        )));
+        // gated upstream: the workspace-internal predicate supplied to
+        // `gated_boundary` probes the complete Rust declaration index for a
+        // same-named macro before permitting the external claim.
+        return Some(gated_boundary(
+            || rust_workspace_contains_macro(rust, &macro_name),
+            format!(
+                "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
+            ),
+            MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+            format!(
+                "a Rust macro named `{macro_name}` is indexed in this workspace, but matcher evidence is unavailable"
+            ),
+        ));
     }
     let mut evidences = Vec::new();
     let mut saw_macro_rules = false;
@@ -2243,9 +2285,19 @@ fn rust_macro_argument_outcome(
         }
     }
     if !saw_macro_rules {
-        return Some(boundary_unchecked(format!(
-            "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
-        )));
+        // gated upstream: the workspace-internal predicate supplied to
+        // `gated_boundary` probes the complete Rust declaration index for a
+        // same-named macro before permitting the external claim.
+        return Some(gated_boundary(
+            || rust_workspace_contains_macro(rust, &macro_name),
+            format!(
+                "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
+            ),
+            MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+            format!(
+                "Rust macro `{macro_name}` is indexed in this workspace, but has no replayable `macro_rules!` matcher"
+            ),
+        ));
     }
     if evidences.is_empty() {
         return Some(no_definition(
@@ -2275,6 +2327,12 @@ fn rust_macro_argument_outcome(
     Some(rust_matcher_namespace_outcome(
         analyzer, token, rust, support, file, source, tree, site, focused, first,
     ))
+}
+
+fn rust_workspace_contains_macro(rust: &RustAnalyzer, name: &str) -> bool {
+    rust.declaration_candidates_by_identifier(name)
+        .into_iter()
+        .any(|candidate| candidate.is_macro())
 }
 
 fn rust_macro_argument_has_structured_reference(

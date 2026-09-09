@@ -444,6 +444,10 @@ impl ExternalMemberDeclaration {
 pub enum MemberLookup {
     Present(MemberLookupHit),
     Absent,
+    /// No declaration was found, but runtime stores can extend this class.
+    /// A workspace store survey must close that remainder before absence is
+    /// authoritative. This result never authorizes negative narrowing alone.
+    DeclarationAbsent,
     Unknown(UnknownReason),
 }
 
@@ -957,13 +961,16 @@ pub trait TypeFlowAdapter: Send + Sync {
 
     /// Classify each candidate on the guard's true arm, in input order.
     /// Resolve guard operands once for the batch. The false arm reverses
-    /// Keep and Drop; Unknown must remain on both arms.
+    /// Keep and Drop; Unknown must remain on both arms. Member lookup is
+    /// supplied by the flow engine so declaration-only absence can consult
+    /// the same workspace store survey as final member interpretation.
     fn narrowing_verdicts(
         &self,
         _workspace: &WorkspaceAnalyzer,
         _procedure: &ProcedureHandle,
         _guard: &GuardFact,
         atoms: &[&ClassIdentity],
+        _member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
     ) -> Vec<NarrowingVerdict> {
         vec![NarrowingVerdict::Unknown; atoms.len()]
     }

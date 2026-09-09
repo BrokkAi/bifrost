@@ -299,6 +299,7 @@ fn extract_import_targets(root: Node<'_>, source: &str) -> Vec<RustImportTargetF
                 imported_name,
                 is_glob: matches!(&binding_name, RustImportBindingName::Glob),
                 is_extern_crate: projected.import.is_extern_crate,
+                is_macro_use: projected.import.is_macro_use,
                 visibility: projected.import.visibility,
                 cfg_condition: projected.cfg_condition,
                 owner_module,

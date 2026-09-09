@@ -443,6 +443,7 @@ fn callable_shape<'tree>(
                 ProcedureInvocationKind::Immediate
             },
             dispatch_extensibility: rust_callable_dispatch_extensibility(node),
+            call_boundary: ProcedureCallBoundary::Direct,
         },
     ))
 }

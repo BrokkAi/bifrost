@@ -135,6 +135,7 @@ pub(super) fn callable_shape<'tree>(
             is_synthetic: false,
             invocation: ProcedureInvocationKind::Immediate,
             dispatch_extensibility,
+            call_boundary: ProcedureCallBoundary::Direct,
         },
     ))
 }

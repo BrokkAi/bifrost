@@ -586,6 +586,10 @@ impl LanguageSupport for JavascriptSupport {
         Language::JavaScript
     }
 
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
+    }
+
     fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {
         Some(&JavascriptSupport)
     }
@@ -690,6 +694,10 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
+        Some(module_code_unit(file))
     }
 
     fn type_flow_adapter(&self) -> Option<&'static dyn crate::analyzer::semantic::TypeFlowAdapter> {

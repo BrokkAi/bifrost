@@ -35,7 +35,7 @@ use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
     CSharpNamedArgumentLabel, csharp_constant_pattern_type_candidate,
     csharp_implicit_accessor_value, csharp_local_binder_name, csharp_named_argument_label,
-    csharp_nameof_type_candidates, csharp_using_directive_is_static,
+    csharp_nameof_type_candidates, csharp_type_node_identity, csharp_using_directive_is_static,
     csharp_using_directive_target_node,
 };
 
@@ -794,8 +794,15 @@ fn resolve_csharp_in_session(
         Some(CSharpReferenceNode::Attribute(name)) => {
             csharp_attribute_outcome(analyzer, token, csharp, definitions, file, name, source)
         }
-        Some(CSharpReferenceNode::Type(type_node)) => {
-            let reference = csharp_reference_type_text(type_node, source);
+        Some(CSharpReferenceNode::Type(type_reference)) => {
+            let (type_node, reference) = match type_reference {
+                CSharpTypeReference::Complete(type_node) => {
+                    (type_node, csharp_reference_type_text(type_node, source))
+                }
+                CSharpTypeReference::FocusedSegment(type_node) => {
+                    (type_node, csharp_type_node_identity(type_node, source))
+                }
+            };
             if csharp_type_parameter_shadows_reference(type_node, source, &reference) {
                 return no_definition(
                     LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
@@ -2120,7 +2127,7 @@ pub(super) fn parse_csharp_tree(source: &str) -> Option<Tree> {
 
 enum CSharpReferenceNode<'tree> {
     Attribute(Node<'tree>),
-    Type(Node<'tree>),
+    Type(CSharpTypeReference<'tree>),
     Constructor(Node<'tree>),
     Member {
         receiver: Node<'tree>,
@@ -2132,6 +2139,11 @@ enum CSharpReferenceNode<'tree> {
         shape: CSharpNamedArgumentLabel<'tree>,
     },
     Identifier(Node<'tree>),
+}
+
+enum CSharpTypeReference<'tree> {
+    Complete(Node<'tree>),
+    FocusedSegment(Node<'tree>),
 }
 
 fn csharp_reference_node<'tree>(
@@ -2161,8 +2173,16 @@ fn csharp_reference_node<'tree>(
         if (matches!(
             parent.kind(),
             "generic_name" | "qualified_name" | "alias_qualified_name"
-        ) && parent.start_byte() <= current.start_byte()
-            && parent.end_byte() >= current.end_byte())
+        ) && parent
+            .child_by_field_name("name")
+            .or_else(|| {
+                if parent.kind() == "generic_name" {
+                    parent.named_child(0)
+                } else {
+                    None
+                }
+            })
+            .is_some_and(|name| same_node(name, current) || same_node(name, original)))
             || (parent.kind() == "member_access_expression"
                 && !csharp_member_access_receiver(parent)
                     .is_some_and(|receiver| same_node(receiver, current))
@@ -2206,7 +2226,9 @@ fn csharp_reference_node<'tree>(
                 return Some(CSharpReferenceNode::UnqualifiedMember(current));
             }
             if csharp_is_type_reference_node(current) {
-                return Some(CSharpReferenceNode::Type(current));
+                return Some(CSharpReferenceNode::Type(
+                    CSharpTypeReference::FocusedSegment(current),
+                ));
             }
             if csharp_is_unqualified_member_reference(current) {
                 return Some(CSharpReferenceNode::Identifier(current));
@@ -2220,7 +2242,9 @@ fn csharp_reference_node<'tree>(
         | "alias_qualified_name"
         | "generic_name"
         | "nullable_type"
-        | "array_type" => Some(CSharpReferenceNode::Type(current)),
+        | "array_type" => Some(CSharpReferenceNode::Type(CSharpTypeReference::Complete(
+            current,
+        ))),
         _ => None,
     }
 }

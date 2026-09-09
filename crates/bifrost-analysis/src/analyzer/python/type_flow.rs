@@ -260,46 +260,51 @@ fn writes_member_name(node: Node<'_>, source: &str, member: &str) -> bool {
             }
         }
     }
+    match dynamic_call_write(node, source) {
+        Some(DynamicFieldWrite::Any) => true,
+        Some(DynamicFieldWrite::Member(name)) => name.as_ref() == member,
+        None => false,
+    }
+}
+
+/// Shared structured interpretation for member shadowing and the store survey.
+fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
     if node.kind() != "call" {
-        return false;
+        return None;
     }
     if let Some(write) = setattr_write(node, source) {
-        return match write {
-            DynamicFieldWrite::Any => true,
-            DynamicFieldWrite::Member(name) => name.as_ref() == member,
-        };
+        return Some(write);
     }
-    let Some(function) = node.child_by_field_name("function") else {
-        return false;
-    };
+    let function = node.child_by_field_name("function")?;
     if function.kind() != "attribute" {
-        return false;
+        return None;
     }
-    let Some(attribute) = function.child_by_field_name("attribute") else {
-        return false;
-    };
-    let Ok(attribute) = attribute.utf8_text(source.as_bytes()) else {
-        return false;
-    };
+    let attribute = function
+        .child_by_field_name("attribute")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
     if attribute == "__setattr__" {
         let Some(arguments) = node.child_by_field_name("arguments") else {
-            return true;
+            return Some(DynamicFieldWrite::Any);
         };
         let mut cursor = arguments.walk();
-        let actuals = arguments.named_children(&mut cursor).collect::<Vec<_>>();
-        return actuals
-            .first()
-            .and_then(|name| python_plain_string_literal(*name, source))
-            .is_none_or(|name| name == member);
+        let name = arguments
+            .named_children(&mut cursor)
+            .next()
+            .and_then(|name| python_plain_string_literal(name, source));
+        return Some(
+            name.map(|name| DynamicFieldWrite::Member(name.into()))
+                .unwrap_or(DynamicFieldWrite::Any),
+        );
     }
-    // Any operation through __dict__ can mutate this member without an
-    // assignment node (for example, self.__dict__.update(...)). The exact
-    // key is unavailable from the generic mapping, so fail closed.
-    function
+    // Calls through an instance dictionary can install unspelled members
+    // without a MemoryStore event, for example self.__dict__.update(...).
+    (function
         .child_by_field_name("object")
         .and_then(|object| object.child_by_field_name("attribute"))
         .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
-        == Some("__dict__")
+        == Some("__dict__"))
+    .then_some(DynamicFieldWrite::Any)
 }
 
 /// Whether a workspace class can shadow an inherited modeled member through
@@ -943,9 +948,12 @@ impl PythonTypeFlowAdapter {
                 present @ MemberLookup::Present(_) => return present,
                 MemberLookup::Unknown(reason) => return MemberLookup::Unknown(reason),
                 MemberLookup::Absent => {}
+                MemberLookup::DeclarationAbsent => {
+                    unreachable!("external model lookup is declaration-complete or unknown")
+                }
             }
         }
-        MemberLookup::Absent
+        MemberLookup::DeclarationAbsent
     }
 }
 
@@ -957,7 +965,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     fn semantics_version(&self) -> AdapterSemanticsVersion {
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-exact-prepared-syntax-v11",
+            b"python-type-flow-exact-prepared-syntax-v12",
         )
         .expect("adapter name is non-empty")
     }
@@ -1132,7 +1140,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                         )
                         && matches!(
                             self.member_lookup(workspace, MemberAccessKind::Call, class, "__new__"),
-                            MemberLookup::Absent
+                            MemberLookup::Absent | MemberLookup::DeclarationAbsent
                         )
                     {
                         return seed;
@@ -1543,9 +1551,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             {
                 continue;
             }
-            if node.kind() == "call"
-                && let Some(write) = setattr_write(node, prepared.source())
-            {
+            if let Some(write) = dynamic_call_write(node, prepared.source()) {
                 writes.push(write);
             }
             if matches!(node.kind(), "assignment" | "augmented_assignment")
@@ -1566,6 +1572,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         guard: &GuardFact,
         atoms: &[&ClassIdentity],
+        member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
     ) -> Vec<NarrowingVerdict> {
         let unknown = || vec![NarrowingVerdict::Unknown; atoms.len()];
         let verdict = |holds| match holds {
@@ -1613,18 +1620,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 atoms
                     .iter()
                     .map(|atom| {
-                        verdict(
-                            match self.member_lookup(
-                                workspace,
-                                MemberAccessKind::Load,
-                                atom,
-                                member,
-                            ) {
-                                MemberLookup::Present(_) => Some(true),
-                                MemberLookup::Absent => Some(false),
-                                MemberLookup::Unknown(_) => None,
-                            },
-                        )
+                        verdict(match member_lookup(atom, member) {
+                            MemberLookup::Present(_) => Some(true),
+                            MemberLookup::Absent => Some(false),
+                            MemberLookup::Unknown(_) | MemberLookup::DeclarationAbsent => None,
+                        })
                     })
                     .collect()
             }

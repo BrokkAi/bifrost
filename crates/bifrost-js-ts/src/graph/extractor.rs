@@ -1,3 +1,4 @@
+use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
 use crate::graph::hits::{
     record_declared_reference_hit, record_hit, record_import_hit, record_reexport_hit,
     record_self_receiver_hit, record_unproven_hit,
@@ -7,13 +8,13 @@ use crate::graph::resolver::{
     JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name, target_language,
     unbound_browser_global_property,
 };
-use crate::imports::require_call_module_specifier;
+use crate::imports::{require_call_module_specifier, resolve_js_ts_imported_member_chain};
 use crate::parse::{flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file};
 use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
-    declarator_module_value_specifier, direct_pattern_binding, direct_property_definitions,
-    is_declaration_identifier, is_lexically_nested_type_declaration,
+    JsTsImportBinder, JsTsImportBindingResolution, JsTsLexicalBindingIndex,
+    JsTsLexicalBindingScope, declarator_module_value_specifier, direct_pattern_binding,
+    direct_property_definitions, is_declaration_identifier, is_lexically_nested_type_declaration,
     is_named_function_expression_declaration, is_object_in_member_expression,
     is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
     object_pattern_entries, pattern_binder_identifiers, slice, static_member_property,
@@ -30,6 +31,7 @@ use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, Impo
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
+use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
 };
@@ -2481,6 +2483,9 @@ fn namespace_member_matches_target(
 }
 
 fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if handle_imported_member_chain(node, ctx) {
+        return;
+    }
     // member_expression has `object` (expr) and `property` (property_identifier).
     let Some(object) = node.child_by_field_name("object") else {
         return;
@@ -2618,6 +2623,123 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ReceiverMatchStatus::NoMatch => {}
         }
     }
+}
+
+/// Handle one imported member chain as a unit. Intermediate owner expressions
+/// are candidates used to reach the endpoint, never proof that the endpoint's
+/// declaration was read. This is the distinction that prevents
+/// `mapping.aliasToReal[name]` from becoming a proven use of every
+/// `aliasToReal.*` member.
+fn handle_imported_member_chain(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    if ctx.target_member.is_none() || ctx.edges.is_empty() {
+        return false;
+    }
+
+    let chain_root_matches_edge = |root_name: &str| {
+        ctx.edges.iter().any(|edge| edge.local_name == root_name)
+            && ctx.imports.has_binding_records(root_name)
+    };
+
+    // The syntax walker visits both `mapping.aliasToReal` and its enclosing
+    // `.each`/`[name]`. Once the root is an imported candidate, only the
+    // outermost chain may classify a usage; otherwise the owner token is
+    // counted before the endpoint is even inspected.
+    if node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "member_expression" | "subscript_expression")
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == node.id())
+    }) && let JsTsImportedMemberChainResolution::Exact(chain) =
+        resolve_import_member_chain(node, ctx.source)
+        && chain_root_matches_edge(chain.root_name(ctx.source))
+    {
+        return true;
+    }
+
+    let chain = match resolve_import_member_chain(node, ctx.source) {
+        JsTsImportedMemberChainResolution::Exact(chain) => {
+            if chain.members.len() == 1 {
+                return false;
+            }
+            chain
+        }
+        JsTsImportedMemberChainResolution::Dynamic { range } => {
+            let Some(object) = node.child_by_field_name("object") else {
+                return false;
+            };
+            let JsTsImportedMemberChainResolution::Exact(owner_chain) =
+                resolve_import_member_chain(object, ctx.source)
+            else {
+                return false;
+            };
+            if owner_chain.members.is_empty()
+                || !chain_root_matches_edge(owner_chain.root_name(ctx.source))
+            {
+                return false;
+            }
+            if let Some(index) =
+                smallest_named_node_covering(node, range.start_byte, range.end_byte)
+            {
+                record_unproven_hit(index, ctx);
+            }
+            return true;
+        }
+        JsTsImportedMemberChainResolution::Unsupported { .. }
+        | JsTsImportedMemberChainResolution::ExceededBudget { .. } => return false,
+    };
+    let root_name = chain.root_name(ctx.source);
+    if !chain_root_matches_edge(root_name) {
+        return false;
+    }
+    let binding = match ctx.imports.binding_at(root_name, chain.root.start_byte()) {
+        JsTsImportBindingResolution::Exact(binding) => binding,
+        JsTsImportBindingResolution::Ambiguous
+        | JsTsImportBindingResolution::Shadowed
+        | JsTsImportBindingResolution::Reassigned
+        | JsTsImportBindingResolution::Truncated
+        | JsTsImportBindingResolution::Inactive
+        | JsTsImportBindingResolution::Incomplete
+        | JsTsImportBindingResolution::Unresolved => return true,
+    };
+    match resolve_js_ts_imported_member_chain(
+        ctx.host,
+        ctx.definitions,
+        ctx.language,
+        ctx.file,
+        &binding.binding,
+        &chain,
+        Some(ctx.host.alias_resolver().as_ref()),
+        !ctx.target_is_type_alias,
+        ReceiverAnalysisBudget::default(),
+    ) {
+        ReceiverAnalysisOutcome::Precise(resolved)
+            if resolved.len() == 1 && resolved[0].declaration == *ctx.target =>
+        {
+            if let Some(endpoint) = chain.endpoint() {
+                record_hit(endpoint.property, ctx);
+            }
+        }
+        ReceiverAnalysisOutcome::Unknown => {
+            // A whole-module CommonJS barrel can retain an exact target-specific
+            // re-export edge without materializing its intermediate owner.
+            if let Some(object) = node.child_by_field_name("object")
+                && let Some(endpoint) = chain.endpoint()
+                && namespace_member_matches_target(
+                    object,
+                    slice(object, ctx.source),
+                    &endpoint.name,
+                    ctx,
+                )
+            {
+                record_hit(endpoint.property, ctx);
+            }
+        }
+        ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. }
+        | ReceiverAnalysisOutcome::Precise(_) => {}
+    }
+    true
 }
 
 fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

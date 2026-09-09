@@ -154,7 +154,8 @@ pub use go::{
 pub use i_analyzer::AnalyzerStreamingFileScope;
 pub use i_analyzer::{
     AnalyzerBuildTierAccess, AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch,
-    SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
+    QueryReadIncomplete, SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex,
+    WorkspaceFileIndexCell,
 };
 pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken};
 #[cfg(any(test, feature = "test-support"))]

@@ -282,3 +282,10 @@ constructor syntax. The name offsets remain nonnegative and ordered in SQL;
 hydration validates source bounds and UTF-8 boundaries. The structural tables
 are recreated to replace the old node-name containment checks while preserving
 all rows and foreign-key cascades.
+
+Migration `0058-rust-macro-use-imports.sql` records whether a Rust `extern
+crate` item carries `#[macro_use]`. The attribute imports a dependency's
+exported macros into a distinct macro-use prelude, so it cannot be inferred
+from the existing namespace-binding columns. Existing rows default to false;
+the Rust language epoch rotates so live Rust blobs are re-extracted under the
+new producer semantics.

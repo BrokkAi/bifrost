@@ -32,13 +32,13 @@ use crate::analyzer::semantic::{
     FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector, MemoryLocationId,
     MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProgramPointHandle,
-    ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticCapability, SemanticEffect,
-    SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind,
-    ValueFlowSnapshot, ValueHandle, ValueId, ValueTransfer, assignment_transfer,
-    gap_certifies_canonical_index_identity,
+    OracleRelationRecord, ProcedureCallBoundary, ProcedureHandle, ProcedureKind,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator,
+    SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId,
+    ValueTransfer, assignment_transfer, gap_certifies_canonical_index_identity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3778,6 +3778,31 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let callee = candidate.target();
         let mut interrupted = None;
 
+        if callee.semantics().properties().call_boundary == ProcedureCallBoundary::Unknown {
+            // Candidate provenance remains attached to the result, while no
+            // call-binding relation is minted for an authored boundary that
+            // may not be the callable the caller observes.
+            let bindings = materialize_call_bindings(
+                call,
+                candidate,
+                context,
+                BindingBuild::new(true),
+                CandidateCoverage::Open,
+                *self.limits(),
+            )?;
+            if request.cancellation.is_cancelled() {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: Some(bindings),
+                    work: staged.work,
+                });
+            }
+            *request.budget = staged.budget;
+            return Ok(SemanticOutcome::Unknown {
+                partial: Some(bindings),
+                work: staged.work,
+            });
+        }
+
         let mut build = BindingBuild::new(false);
         let caller_abort_user_code = abort_paths_run_user_code(call.procedure().semantics());
         for gap in call.procedure().semantics().gaps() {
@@ -4444,6 +4469,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic::{CallSiteHandle, DispatchOracle, ProcedureSemantics};
     use crate::analyzer::{AnalyzerConfig, Language};
     use crate::cancellation::CancellationToken;
 
@@ -5182,5 +5208,196 @@ func shifted(dynamic int) int {
         assert_eq!(exceeded.limit(), 1);
         assert_eq!(exceeded.attempted(), 2);
         assert_eq!(budget.used().memory_locations, 1);
+    }
+
+    #[test]
+    fn decorated_call_bindings_are_empty_open_and_unknown() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "decorators.py",
+                r#"def replace(function):
+    return "replacement"
+
+@replace
+def decorated(value="fallback"):
+    return value
+
+def direct(value="fallback"):
+    return value
+
+def caller():
+    decorated_result = decorated()
+    direct_default = direct()
+    direct_argument = direct("actual")
+"#,
+            )
+            .build();
+        let file = project.file("decorators.py");
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let artifact = analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Python semantic materialization runs")
+            .available_value()
+            .cloned()
+            .expect("Python semantic artifact is available");
+        fn procedure_name(procedure: &ProcedureSemantics) -> Option<&str> {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+        }
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| procedure_name(procedure) == Some("caller"))
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let calls = caller
+            .semantics()
+            .call_sites()
+            .iter()
+            .map(|call| {
+                caller
+                    .call_site_handle(call.id)
+                    .expect("caller call-site handle")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3, "caller retains its three call sites");
+
+        let oracle = analyzer.semantic_oracle_provider();
+        let candidate_for = |call: &CallSiteHandle, target_name: &str| {
+            let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+            let dispatch = oracle
+                .resolve_call(call, &mut SemanticRequest::new(&mut budget, &cancellation))
+                .expect("call dispatch runs");
+            dispatch
+                .available_value()
+                .expect("call dispatch retains a result")
+                .candidates()
+                .iter()
+                .find(|candidate| {
+                    procedure_name(candidate.target().semantics()) == Some(target_name)
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("missing dispatch candidate {target_name}"))
+        };
+        let decorated_candidate = candidate_for(&calls[0], "decorated");
+        let direct_default_candidate = candidate_for(&calls[1], "direct");
+        let direct_argument_candidate = candidate_for(&calls[2], "direct");
+
+        let mut decorated_budget =
+            crate::analyzer::semantic::SemanticBudget::uniform(1).expect("positive small budget");
+        let decorated_outcome = oracle
+            .call_bindings(
+                &calls[0],
+                &decorated_candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut decorated_budget, &cancellation),
+            )
+            .expect("decorated call bindings run");
+        assert!(
+            matches!(&decorated_outcome, SemanticOutcome::Unknown { .. }),
+            "decorated call boundary is unknown: {decorated_outcome:#?}"
+        );
+        let decorated_bindings = decorated_outcome
+            .available_value()
+            .expect("unknown decorated call retains empty bindings");
+        assert_eq!(decorated_bindings.coverage(), CandidateCoverage::Open);
+        assert!(decorated_bindings.bindings().is_empty());
+        assert_eq!(decorated_budget.used().procedures, 1);
+        assert_eq!(decorated_budget.used().call_sites, 1);
+        assert_eq!(decorated_budget.used().nested_entries, 1);
+
+        let mut direct_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let direct_default_outcome = oracle
+            .call_bindings(
+                &calls[1],
+                &direct_default_candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut direct_budget, &cancellation),
+            )
+            .expect("undecorated default call bindings run");
+        let SemanticOutcome::Complete {
+            value: direct_default_bindings,
+            ..
+        } = direct_default_outcome
+        else {
+            panic!("undecorated default call bindings close: {direct_default_outcome:#?}");
+        };
+        assert!(direct_default_bindings.bindings().iter().any(|binding| {
+            matches!(
+                binding,
+                CallBinding::ImplicitArgument {
+                    kind: ImplicitArgumentKind::Default,
+                    ..
+                }
+            )
+        }));
+        assert!(
+            direct_default_bindings
+                .bindings()
+                .iter()
+                .any(|binding| matches!(binding, CallBinding::NormalReturn { .. }))
+        );
+        assert_eq!(
+            direct_default_bindings.coverage(),
+            CandidateCoverage::Exhaustive
+        );
+
+        let mut direct_argument_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let direct_argument_outcome = oracle
+            .call_bindings(
+                &calls[2],
+                &direct_argument_candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut direct_argument_budget, &cancellation),
+            )
+            .expect("undecorated argument call bindings run");
+        let SemanticOutcome::Complete {
+            value: direct_argument_bindings,
+            ..
+        } = direct_argument_outcome
+        else {
+            panic!("undecorated argument call bindings close: {direct_argument_outcome:#?}");
+        };
+        assert!(
+            direct_argument_bindings
+                .bindings()
+                .iter()
+                .any(|binding| matches!(binding, CallBinding::ArgumentGroup(_)))
+        );
+        assert!(
+            direct_argument_bindings
+                .bindings()
+                .iter()
+                .any(|binding| matches!(binding, CallBinding::NormalReturn { .. }))
+        );
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let mut cancelled_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let cancelled_outcome = oracle
+            .call_bindings(
+                &calls[0],
+                &decorated_candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+            )
+            .expect("cancelled decorated call bindings return an outcome");
+        assert!(matches!(
+            &cancelled_outcome,
+            SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            } if *work == SemanticWork::default()
+        ));
+        assert_eq!(cancelled_budget.used(), SemanticWork::default());
     }
 }

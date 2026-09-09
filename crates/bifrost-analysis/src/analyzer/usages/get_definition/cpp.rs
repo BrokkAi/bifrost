@@ -3284,7 +3284,7 @@ fn resolve_cpp_type(
                         },
                     )
                     .is_some()
-                        || !cpp_unresolved_include_boundary(analyzer, file, &reference)
+                        || !cpp_unresolved_include_boundary(visibility, file, &reference, node)
                 },
                 format!(
                     "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
@@ -3516,7 +3516,7 @@ fn resolve_cpp_type(
                 unit,
             ));
         }
-        if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
+        if cpp_unresolved_include_boundary(visibility, file, &qualifier.reference, node) {
             // gated upstream: the enclosing-scope parameter probe above returned
             // early for any workspace-declared qualifier; only an external one
             // (with an unresolved include) reaches here.
@@ -3533,17 +3533,78 @@ fn resolve_cpp_type(
             ),
         );
     }
-    resolve_cpp_type_without_focused_qualifier(
+    let candidates = resolve_cpp_type_without_focused_qualifier(
         analyzer,
         token,
         context.bounded_support(),
+        &context.cpp_read_scope,
         file,
         visibility,
         source,
         node,
         &text,
         class_ranges,
+    );
+    cpp_type_candidates_outcome(
+        candidates,
+        &context.cpp_read_scope,
+        visibility,
+        file,
+        &text,
+        node,
     )
+}
+
+fn cpp_type_candidates_outcome(
+    candidates: Result<CppTypeCandidates, crate::analyzer::QueryReadIncomplete>,
+    read_scope: &AnalyzerQueryScope<'_>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    text: &str,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    match candidates {
+        Ok(CppTypeCandidates::Outcome(outcome)) => *outcome,
+        Ok(CppTypeCandidates::Empty) => {
+            let boundary = cpp_unresolved_include_boundary(visibility, file, text, node);
+            if let Err(reason) = read_scope.read_completion() {
+                return cpp_incomplete_type_outcome(reason);
+            }
+            if boundary {
+                boundary_unchecked(format!(
+                    "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+                ))
+            } else {
+                no_definition(
+                    "no_indexed_definition",
+                    format!("`{text}` did not resolve to an indexed C++ type"),
+                )
+            }
+        }
+        Err(reason) => cpp_incomplete_type_outcome(reason),
+    }
+}
+
+fn cpp_incomplete_type_outcome(
+    reason: crate::analyzer::QueryReadIncomplete,
+) -> DefinitionLookupOutcome {
+    use crate::analyzer::QueryReadIncomplete;
+    match reason {
+        QueryReadIncomplete::Cancelled => no_definition(
+            "cancelled",
+            "C++ type candidate resolution was cancelled; results are incomplete",
+        ),
+        QueryReadIncomplete::StructureUnavailable(file) => no_definition(
+            CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC,
+            format!(
+                "C++ type candidate resolution could not read indexed syntax for {file}; results are incomplete"
+            ),
+        ),
+        QueryReadIncomplete::StoreFailure(error) => no_definition(
+            "analysis_incomplete",
+            format!("C++ type candidate resolution could not finish its indexed reads: {error}"),
+        ),
+    }
 }
 
 fn cpp_qualified_type_candidate_matches_reference(
@@ -3652,8 +3713,50 @@ fn cpp_macro_candidates(
         .collect()
 }
 
+// An empty candidate set proves absence only after every input read completed.
+// The Result carries interruptions independently of the candidate cardinality.
+enum CppTypeCandidates {
+    Outcome(Box<DefinitionLookupOutcome>),
+    Empty,
+}
+
+impl CppTypeCandidates {
+    fn outcome(outcome: DefinitionLookupOutcome) -> Self {
+        Self::Outcome(Box::new(outcome))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_cpp_type_without_focused_qualifier(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn BoundedDefinitionLookup,
+    read_scope: &AnalyzerQueryScope<'_>,
+    file: &ProjectFile,
+    visibility: &CppVisibilityIndex,
+    source: &str,
+    node: Node<'_>,
+    text: &str,
+    class_ranges: Option<&ClassRangeIndex>,
+) -> Result<CppTypeCandidates, crate::analyzer::QueryReadIncomplete> {
+    read_scope.read_completion()?;
+    let candidates = cpp_type_candidates_without_focused_qualifier(
+        analyzer,
+        token,
+        support,
+        file,
+        visibility,
+        source,
+        node,
+        text,
+        class_ranges,
+    );
+    read_scope.read_completion()?;
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_type_candidates_without_focused_qualifier(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
@@ -3663,7 +3766,7 @@ fn resolve_cpp_type_without_focused_qualifier(
     node: Node<'_>,
     text: &str,
     class_ranges: Option<&ClassRangeIndex>,
-) -> DefinitionLookupOutcome {
+) -> CppTypeCandidates {
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
     let declaration_type_context = cpp_type_node_is_declaration_type(node);
@@ -3673,18 +3776,18 @@ fn resolve_cpp_type_without_focused_qualifier(
         if let Some(alias) =
             cpp_indexed_type_alias_for_node(analyzer, support, file, alias_node, text)
         {
-            return candidates_outcome(vec![alias]);
+            return CppTypeCandidates::outcome(candidates_outcome(vec![alias]));
         }
-        return no_definition(
+        return CppTypeCandidates::outcome(no_definition(
             "unresolved_local_type",
             format!("`{text}` names a local C++ type alias without a resolved definition"),
-        );
+        ));
     }
     if cpp_active_template_parameter_reference(node, source) {
-        return no_definition(
+        return CppTypeCandidates::outcome(no_definition(
             "unresolved_template_parameter",
             format!("`{text}` is an active C++ template parameter without an indexed definition"),
-        );
+        ));
     }
     if node.kind() == "type_identifier"
         && let Some(alias) = cpp_malformed_class_alias_candidate(
@@ -3703,7 +3806,7 @@ fn resolve_cpp_type_without_focused_qualifier(
         // under a sibling compound_statement. Prefer that recovered owner for
         // aliases in the body; retain the unresolved outcome when no indexed
         // class range proves the ownership.
-        return candidates_outcome(vec![alias]);
+        return CppTypeCandidates::outcome(candidates_outcome(vec![alias]));
     }
     if node.kind() == "type_identifier"
         && let Some(owner) = cpp_out_of_line_function_owner_for_type(
@@ -3718,7 +3821,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             })
             .collect::<Vec<_>>();
         if !candidates.is_empty() {
-            return candidates_outcome(candidates);
+            return CppTypeCandidates::outcome(candidates_outcome(candidates));
         }
     }
     let mut qualified_owner_lookup_attempted = false;
@@ -3759,9 +3862,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                     CppLexicalTypeResolution::Ambiguous => {
                         // no candidates: `LexicalTypeResolution::Ambiguous`
                         // reports the fail-closed verdict without the units.
-                        return ambiguous_without_candidates(format!(
+                        return CppTypeCandidates::outcome(ambiguous_without_candidates(format!(
                             "`{owner_reference}` resolves ambiguously in its enclosing C++ class or namespace"
-                        ));
+                        )));
                     }
                     CppLexicalTypeResolution::Missing => fallback_owner(),
                 }
@@ -3769,9 +3872,9 @@ fn resolve_cpp_type_without_focused_qualifier(
             CppLexicalScopeResolution::Ambiguous => {
                 // no candidates: the ambiguity is in the enclosing scope, so no
                 // member candidate was ever collected.
-                return ambiguous_without_candidates(format!(
+                return CppTypeCandidates::outcome(ambiguous_without_candidates(format!(
                     "enclosing C++ scope for `{owner_reference}` is ambiguous"
-                ));
+                )));
             }
             CppLexicalScopeResolution::Missing => fallback_owner(),
         }
@@ -3837,12 +3940,14 @@ fn resolve_cpp_type_without_focused_qualifier(
                     // decide applicability.
                     state.stage_winners(analyzer, &candidates, None);
                 }
-                return candidates_outcome(candidates);
+                return CppTypeCandidates::outcome(candidates_outcome(candidates));
             }
             if let Some(error) = specialization_failure {
                 // no candidates: the contenders are template specialization
                 // patterns, not indexed units; the message names every one.
-                return ambiguous_without_candidates(cpp_template_resolution_message(text, &error));
+                return CppTypeCandidates::outcome(ambiguous_without_candidates(
+                    cpp_template_resolution_message(text, &error),
+                ));
             }
         } else {
             // A template type parameter names no indexed type but is
@@ -3873,7 +3978,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                 })
                 .collect::<Vec<_>>();
                 if !candidates.is_empty() {
-                    return candidates_outcome(candidates);
+                    return CppTypeCandidates::outcome(candidates_outcome(candidates));
                 }
                 // Only a parameter-like scope hit (a field, not a real
                 // type) may stand in for the qualified reference: its
@@ -3882,7 +3987,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                 // the owner resolves (cpp_macro_decorated_out_of_line
                 // regression).
                 if parameter.is_field() {
-                    return candidates_outcome(vec![parameter]);
+                    return CppTypeCandidates::outcome(candidates_outcome(vec![parameter]));
                 }
             }
         }
@@ -3939,12 +4044,14 @@ fn resolve_cpp_type_without_focused_qualifier(
         })
         .collect::<Vec<_>>();
         if !candidates.is_empty() {
-            return candidates_outcome(candidates);
+            return CppTypeCandidates::outcome(candidates_outcome(candidates));
         }
         if let Some(error) = specialization_failure {
             // no candidates: the contenders are template specialization
             // patterns, not indexed units; the message names every one.
-            return ambiguous_without_candidates(cpp_template_resolution_message(text, &error));
+            return CppTypeCandidates::outcome(ambiguous_without_candidates(
+                cpp_template_resolution_message(text, &error),
+            ));
         }
         // #1163 (was pinned at cpp.rs:2402): a `::`-qualified/scoped identifier
         // whose qualifier names a *sibling* nested namespace now resolves through
@@ -3964,15 +4071,15 @@ fn resolve_cpp_type_without_focused_qualifier(
                     && visibility.external_type_candidate_visible_at(file, unit, node.start_byte())
             },
         ) {
-            return candidates_outcome(cpp_type_definition_candidates(
+            return CppTypeCandidates::outcome(candidates_outcome(cpp_type_definition_candidates(
                 analyzer, visibility, file, support, node, unit,
-            ));
+            )));
         }
         // Only a genuinely-external qualified identifier reaches the include
         // boundary. `gated_boundary` makes the workspace-internal check structural:
         // if the namespace-outward net finds a *visible* indexed declaration for the
         // qualifier, the honest outcome is no_definition, never a boundary.
-        return gated_boundary(
+        return CppTypeCandidates::outcome(gated_boundary(
             || {
                 cpp_resolve_qualified_via_enclosing_namespaces(
                     analyzer,
@@ -3984,14 +4091,14 @@ fn resolve_cpp_type_without_focused_qualifier(
                     },
                 )
                 .is_some()
-                    || !cpp_unresolved_include_boundary(analyzer, file, text)
+                    || !cpp_unresolved_include_boundary(visibility, file, text, node)
             },
             format!(
                 "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
             ),
             "no_indexed_definition",
             format!("`{text}` did not resolve to an indexed C++ type"),
-        );
+        ));
     }
     // Prefer a type declared in the lexically enclosing scope (namespace/class)
     // over the scope-blind visibility index, so a bare `Config` inside `namespace B`
@@ -4017,8 +4124,8 @@ fn resolve_cpp_type_without_focused_qualifier(
                     node,
                 ) =>
             {
-                return candidates_outcome(cpp_type_definition_candidates(
-                    analyzer, visibility, file, support, node, unit,
+                return CppTypeCandidates::outcome(candidates_outcome(
+                    cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit),
                 ));
             }
             CppLexicalTypeResolution::Ambiguous => {
@@ -4026,27 +4133,27 @@ fn resolve_cpp_type_without_focused_qualifier(
                     analyzer, support, visibility, file, source, node, text,
                 );
                 if !candidates.is_empty() {
-                    return ambiguous_candidates_outcome(
+                    return CppTypeCandidates::outcome(ambiguous_candidates_outcome(
                         candidates,
                         format!(
                             "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
                         ),
-                    );
+                    ));
                 }
                 // no candidates: `LexicalTypeResolution::Ambiguous` reports
                 // the fail-closed verdict without the units.
-                return ambiguous_without_candidates(format!(
+                return CppTypeCandidates::outcome(ambiguous_without_candidates(format!(
                     "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
-                ));
+                )));
             }
             CppLexicalTypeResolution::Missing => {
                 if cpp_active_block_tag_type_node(node, text, source).is_some() {
-                    return no_definition(
+                    return CppTypeCandidates::outcome(no_definition(
                         "unresolved_local_type",
                         format!(
                             "`{text}` names a local C++ tag type without an indexed definition"
                         ),
-                    );
+                    ));
                 }
                 // A file-scope definition such as
                 // `bool ValueFlow::isLifetimeBorrowed()` has a qualified
@@ -4070,15 +4177,19 @@ fn resolve_cpp_type_without_focused_qualifier(
                                 node.start_byte(),
                             ) =>
                         {
-                            return candidates_outcome(cpp_type_definition_candidates(
-                                analyzer, visibility, file, support, node, unit,
+                            return CppTypeCandidates::outcome(candidates_outcome(
+                                cpp_type_definition_candidates(
+                                    analyzer, visibility, file, support, node, unit,
+                                ),
                             ));
                         }
                         CppLexicalTypeResolution::Ambiguous => {
                             // no candidates: `LexicalTypeResolution::Ambiguous`
                             // reports the fail-closed verdict without the units.
-                            return ambiguous_without_candidates(format!(
-                                "`{text}` resolves ambiguously in its enclosing C++ namespace"
+                            return CppTypeCandidates::outcome(ambiguous_without_candidates(
+                                format!(
+                                    "`{text}` resolves ambiguously in its enclosing C++ namespace"
+                                ),
                             ));
                         }
                         CppLexicalTypeResolution::Resolved { .. }
@@ -4119,7 +4230,7 @@ fn resolve_cpp_type_without_focused_qualifier(
         {
             let candidates =
                 cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit);
-            return candidates_outcome(candidates);
+            return CppTypeCandidates::outcome(candidates_outcome(candidates));
         }
     }
     // A bare type_identifier has already exhausted lexical tiers, block/class
@@ -4133,9 +4244,9 @@ fn resolve_cpp_type_without_focused_qualifier(
         if let Some(unit) = visibility.resolve_type(file, text)
             && visibility.external_type_candidate_visible_at(file, &unit, node.start_byte())
         {
-            return candidates_outcome(cpp_type_definition_candidates(
+            return CppTypeCandidates::outcome(candidates_outcome(cpp_type_definition_candidates(
                 analyzer, visibility, file, support, node, unit,
-            ));
+            )));
         }
         let namespace = cpp_lexical_namespace(node, source);
         let candidates = cpp_visible_name_candidates(
@@ -4160,25 +4271,14 @@ fn resolve_cpp_type_without_focused_qualifier(
                     cpp_type_definition_candidates(analyzer, visibility, file, support, node, unit)
                 })
                 .collect();
-            return candidates_outcome(candidates);
+            return CppTypeCandidates::outcome(candidates_outcome(candidates));
         }
     }
     let macros = cpp_macro_candidates(analyzer, visibility, file, text, node.start_byte());
     if !macros.is_empty() {
-        return candidates_outcome(macros);
+        return CppTypeCandidates::outcome(candidates_outcome(macros));
     }
-    // gated upstream: the type_identifier branch already ran the enclosing-scope
-    // member fallback and the visible-name/lexical resolvers; a workspace-owned
-    // bare type would have resolved there, so only an external one reaches here.
-    if cpp_unresolved_include_boundary(analyzer, file, text) {
-        return boundary_unchecked(format!(
-            "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
-        "no_indexed_definition",
-        format!("`{text}` did not resolve to an indexed C++ type"),
-    )
+    CppTypeCandidates::Empty
 }
 
 fn cpp_type_alias_declaration_contains_node(
@@ -5466,7 +5566,7 @@ fn resolve_cpp_call(
             // gated upstream: the owner/member candidate resolution above is the
             // workspace check; a workspace-declared callable resolves there, so
             // only an external one (with an unresolved include) reaches here.
-            if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
+            if cpp_unresolved_include_boundary(ctx.visibility, ctx.file, &text, function) {
                 return boundary_unchecked(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
@@ -6061,6 +6161,7 @@ fn resolve_cpp_construction_type(
     construction: Node<'_>,
     preserve_alias_declaration: bool,
 ) -> DefinitionLookupOutcome {
+    let read_scope = AnalyzerQueryScope::new(ctx.analyzer);
     let Some(type_node) = cpp_constructor_type_node(construction) else {
         return no_definition("no_reference_text", "C++ constructor call has no type");
     };
@@ -6209,16 +6310,25 @@ fn resolve_cpp_construction_type(
     if !owners.is_empty() {
         return candidates_outcome(owners);
     }
-    resolve_cpp_type_without_focused_qualifier(
+    let candidates = resolve_cpp_type_without_focused_qualifier(
         ctx.analyzer,
         token,
         ctx.support,
+        &read_scope,
         ctx.file,
         ctx.visibility,
         ctx.source,
         type_node,
         &text,
         ctx.class_ranges,
+    );
+    cpp_type_candidates_outcome(
+        candidates,
+        &read_scope,
+        ctx.visibility,
+        ctx.file,
+        &text,
+        type_node,
     )
 }
 
@@ -10859,23 +10969,15 @@ fn cpp_function_return_type(
 }
 
 fn cpp_unresolved_include_boundary(
-    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     reference: &str,
+    node: Node<'_>,
 ) -> bool {
     if !reference.contains("::") && !reference.chars().next().is_some_and(char::is_uppercase) {
         return false;
     }
-    let include_targets =
-        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
-    analyzer.import_statements(file).iter().any(|import| {
-        cpp_include_paths(std::slice::from_ref(import)).iter().any(
-            |include| match include_targets {
-                Some(index) => resolve_include_targets_with_index(file, include, index).is_empty(),
-                None => resolve_include_targets(analyzer.project(), file, include).is_empty(),
-            },
-        )
-    })
+    visibility.has_unresolved_include_visible_before(file, node.start_byte())
 }
 
 fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {

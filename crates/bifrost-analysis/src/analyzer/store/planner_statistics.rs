@@ -168,7 +168,7 @@ pub mod pinned_plans {
 
     use super::super::class_set_field_slots::{
         CLASS_SET_FIELD_SLOT_ARTIFACTS_SQL, CLASS_SET_FIELD_SLOT_ATOMS_SQL,
-        CLASS_SET_FIELD_SLOT_INDEX_SQL, CLASS_SET_FIELD_SLOTS_SQL,
+        CLASS_SET_FIELD_SLOT_INDEX_SQL, CLASS_SET_FIELD_SLOT_STORES_SQL, CLASS_SET_FIELD_SLOTS_SQL,
         PRUNE_OLD_CLASS_SET_FIELD_SLOT_INDEXES_SQL,
     };
     use super::super::class_set_procedure_surfaces::{
@@ -498,6 +498,11 @@ pub mod pinned_plans {
             (
                 "class_set_field_slots",
                 CLASS_SET_FIELD_SLOTS_SQL,
+                vec![integer(0), integer(2)],
+            ),
+            (
+                "class_set_field_slot_stores",
+                CLASS_SET_FIELD_SLOT_STORES_SQL,
                 vec![integer(0), integer(2)],
             ),
             (

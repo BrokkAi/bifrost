@@ -54,7 +54,9 @@ use brokk_bifrost_rust::field_roles::rust_struct_field_references;
 pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
-use brokk_bifrost_rust::graph::ast::{is_rust_type_node, type_parameter_trait_bounds};
+use brokk_bifrost_rust::graph::ast::{
+    is_rust_non_reference_underscore, is_rust_type_node, type_parameter_trait_bounds,
+};
 use brokk_bifrost_rust::graph_support::{
     RustSource, is_rust_enum_variant_declaration, is_rust_macro_export_declaration,
     resolve_module_package,
@@ -1512,6 +1514,9 @@ fn scan_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
                         .ok()
                         .map(str::trim)
                         .unwrap_or_default();
+                    if is_rust_non_reference_underscore(node, ctx.source) {
+                        return TreeWalkAction::Descend;
+                    }
                     if !ctx.name_gate.admits(text) {
                         return TreeWalkAction::Descend;
                     }

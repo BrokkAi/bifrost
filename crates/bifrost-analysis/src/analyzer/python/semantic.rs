@@ -19,10 +19,10 @@ use crate::analyzer::{Language, ProjectFile, PythonAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_python::bindings::{
     PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
-    python_direct_scope_bindings_bounded,
+    python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v14";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v15";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -346,6 +346,43 @@ fn enumerate_procedures<'tree>(
         }
     }
 
+    if !module_wildcard_import {
+        for spec in &mut specs {
+            if spec.properties.call_boundary != ProcedureCallBoundary::Unknown {
+                continue;
+            }
+            let mut stopped = None;
+            let preserves = builtin_descriptor_preserves_call_boundary(
+                spec.callable,
+                prepared.source(),
+                &module_bindings,
+                || {
+                    if cancellation.is_cancelled() {
+                        return false;
+                    }
+                    match inventory.charge_traversal_entry() {
+                        Ok(()) => true,
+                        Err(stop) => {
+                            stopped = Some(stop);
+                            false
+                        }
+                    }
+                },
+            );
+            let Some(preserves) = preserves else {
+                if cancellation.is_cancelled() {
+                    return Ok(inventory.cancelled());
+                }
+                return Ok(stopped
+                    .expect("descriptor proof stopped without a cause")
+                    .into_outcome());
+            };
+            if preserves {
+                spec.properties.call_boundary = ProcedureCallBoundary::Direct;
+            }
+        }
+    }
+
     let range_builtin_proof = !module_bindings.contains_key("range") && !module_wildcard_import;
     let exception_builtin_proof =
         !module_bindings.contains_key("Exception") && !module_wildcard_import;
@@ -386,6 +423,71 @@ fn enumerate_procedures<'tree>(
         isinstance_builtin_proof,
         hasattr_builtin_proof,
     }))
+}
+
+/// The built-in descriptors keep the authored callable's parameters and
+/// returns; the existing method-binding lowering accounts for their receiver.
+/// Prove the built-in identity in an ordinary class namespace rather than
+/// trusting the decorator's spelling. Other scopes and transformations remain
+/// unknown until their name and namespace contracts are modeled.
+fn builtin_descriptor_preserves_call_boundary(
+    callable: Node<'_>,
+    source: &str,
+    module_bindings: &HashMap<Box<str>, PythonDirectScopeBindingKind>,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<bool> {
+    if !scope_step() {
+        return None;
+    }
+    let decorated = callable.parent().expect("decorated callable has a parent");
+    debug_assert_eq!(decorated.kind(), "decorated_definition");
+    let Some(class) = decorated.parent().and_then(|body| body.parent()) else {
+        return Some(false);
+    };
+    if class.kind() != "class_definition"
+        || class
+            .child_by_field_name("superclasses")
+            .is_some_and(|bases| bases.named_child_count() != 0)
+    {
+        return Some(false);
+    }
+    let parent = class
+        .parent()
+        .expect("class declaration has an enclosing scope");
+    let outer = if parent.kind() == "decorated_definition" {
+        parent
+            .parent()
+            .expect("decorated class has an enclosing scope")
+    } else {
+        parent
+    };
+    if outer.kind() != "module" {
+        return Some(false);
+    }
+    let mut expression = None;
+    let mut cursor = decorated.walk();
+    for child in decorated.named_children(&mut cursor) {
+        if !scope_step() {
+            return None;
+        }
+        if child.kind() == "decorator" {
+            if expression.is_some() {
+                return Some(false);
+            }
+            expression = child.named_child(0);
+        }
+    }
+    let Some(expression) = expression.filter(|node| node.kind() == "identifier") else {
+        return Some(false);
+    };
+    let Some(name @ ("staticmethod" | "classmethod")) = node_text(source, expression) else {
+        return Some(false);
+    };
+    if module_bindings.contains_key(name) {
+        return Some(false);
+    }
+    python_module_or_class_scope_binds_name_bounded(class, name, source, scope_step)
+        .map(|shadowed| !shadowed)
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -470,6 +572,18 @@ fn callable_shape<'tree>(
     };
     let is_async = has_direct_token(node, "async");
     let is_generator = body_contains_yield(body);
+    // A decorator may replace the function object that callers invoke, so the
+    // authored parameters and returns are not an authoritative call boundary.
+    // This deliberately uses only the AST relationship: even wraps-like
+    // metadata does not prove that the replacement preserves the boundary.
+    let call_boundary = if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "decorated_definition")
+    {
+        ProcedureCallBoundary::Unknown
+    } else {
+        ProcedureCallBoundary::Direct
+    };
     // PEP 591 is Python's own closed-dispatch declaration, and it is the only
     // one the language has: `@final` on a method forbids an override, and
     // `@final` on a class forbids a subclass, so no override of any of its
@@ -501,6 +615,7 @@ fn callable_shape<'tree>(
                 ProcedureInvocationKind::Immediate
             },
             dispatch_extensibility,
+            call_boundary,
         },
     ))
 }

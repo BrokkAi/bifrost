@@ -7,12 +7,12 @@ use crate::analyzer::{
     DeclarationInfo, DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights,
     FileDependencyFacts, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     ImportReachability, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, Range, RelationalBatchError, RelationalBatchOutcome,
-    RelationalDefinitionRequest, RelationalDefinitionResult, RelationalDefinitionValue,
-    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    TypescriptAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, QueryReadIncomplete, Range, RelationalBatchError,
+    RelationalBatchOutcome, RelationalDefinitionRequest, RelationalDefinitionResult,
+    RelationalDefinitionValue, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates,
+    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
@@ -1656,6 +1656,11 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned");
         if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
+            for active in contexts.iter() {
+                if let Err(reason) = active.read_completion() {
+                    context.record_read_incomplete(reason);
+                }
+            }
             contexts.push(Arc::clone(context));
             if context.read_ledger().is_some() {
                 self.attached_read_ledgers.fetch_add(1, Ordering::Relaxed);
@@ -1883,6 +1888,17 @@ impl IAnalyzer for MultiAnalyzer {
             .clone();
         for context in contexts {
             context.record_store_error(error.clone());
+        }
+    }
+
+    fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .clone();
+        for context in contexts {
+            context.record_read_incomplete(reason.clone());
         }
     }
 

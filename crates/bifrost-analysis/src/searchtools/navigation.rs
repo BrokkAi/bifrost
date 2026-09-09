@@ -334,6 +334,13 @@ pub struct DefinitionLookupResult {
     /// deliberately open: a new inconclusive state is an additive change, not a
     /// contract break, so this is not a closed enumeration.
     pub status: String,
+    #[serde(
+        default = "definition_lookup_complete_default",
+        skip_serializing_if = "definition_lookup_complete"
+    )]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -921,6 +928,8 @@ fn get_navigation_by_location_with_cancellation(
             },
             operation,
             status: "invalid_location".to_string(),
+            complete: true,
+            incomplete_reason: None,
             reference: None,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
@@ -985,6 +994,8 @@ fn get_navigation_by_location_with_cancellation(
                         path: query.path.clone(),
                         target: matched.records[0].qualified_name.clone(),
                     }),
+                    complete: true,
+                    incomplete_reason: None,
                     definitions,
                     diagnostics: if conflict {
                         vec![DefinitionDiagnostic {
@@ -1018,6 +1029,8 @@ fn get_navigation_by_location_with_cancellation(
                     query,
                     operation,
                     status: "not_found".to_string(),
+                    complete: true,
+                    incomplete_reason: None,
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
@@ -1035,6 +1048,8 @@ fn get_navigation_by_location_with_cancellation(
                     query,
                     operation,
                     status: "not_found".to_string(),
+                    complete: true,
+                    incomplete_reason: None,
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
@@ -1511,10 +1526,13 @@ pub(super) fn render_definition_lookup(
         let _scope = profiling::scope("searchtools::render_definition_lookup.candidates");
         navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache)
     };
-    if let Some(definition) = outcome.lexical_definition.as_ref()
-        && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
-    {
-        definitions.push(candidate);
+    let mut source_unavailable = definitions.len() < outcome.targets.len();
+    if let Some(definition) = outcome.lexical_definition.as_ref() {
+        if let Some(candidate) = lexical_definition_candidate(analyzer, file, definition) {
+            definitions.push(candidate);
+        } else {
+            source_unavailable = true;
+        }
     }
     let reference_target = outcome.reference.as_ref().map(|site| site.text.clone());
     let imported_model_target = outcome
@@ -1529,6 +1547,15 @@ pub(super) fn render_definition_lookup(
             kind: diagnostic.kind,
         })
         .collect();
+    if source_unavailable {
+        diagnostics.push(DefinitionDiagnostic {
+            kind: "source_unavailable".to_string(),
+            message: format!(
+                "not all definition targets could be rendered: {:?}, lexical definition: {:?}",
+                outcome.targets, outcome.lexical_definition
+            ),
+        });
+    }
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         if !definitions.is_empty()
             && let Some(target) = reference_target.as_deref()
@@ -1755,10 +1782,13 @@ pub(super) fn render_definition_lookup(
             },
         );
     }
+    let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
     DefinitionLookupResult {
         query,
         operation,
         status,
+        complete,
+        incomplete_reason,
         reference: outcome.reference.map(|site| DefinitionReferenceSite {
             path: site.path,
             target: site.text,

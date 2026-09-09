@@ -1989,6 +1989,55 @@ impl<'a> RustUsageWalks<'a> {
 
     // --------------------------------------------------------- macro scopes
 
+    /// Macro declarations imported by `#[macro_use] extern crate` for the
+    /// Cargo target that owns `file`.
+    ///
+    /// The extern-crate fact proves which dependency root is imported, and the
+    /// existing export walk proves which declaration that root publishes under
+    /// `name`, including through public glob re-exports. The final kind check
+    /// keeps this lookup in Rust's macro namespace.
+    pub fn macro_use_imported_declarations_named(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        let mut candidates = Vec::new();
+        for root in self.owner_roots_of(file).iter() {
+            let Some(root_module) = self.queries.module_at_byte(root, 0) else {
+                continue;
+            };
+            for binding in self
+                .queries
+                .import_bindings_of(root)
+                .iter()
+                .filter(|binding| {
+                    binding.is_extern_crate
+                        && binding.is_macro_use
+                        && !binding.extent.is_local_only()
+                        && binding.importer_module == root_module
+                })
+            {
+                for route in self.resolve_segments(root, &binding.owner_module, &binding.path) {
+                    let module_files = [route.target_file];
+                    for (target_file, target_name) in
+                        self.export_targets_from_files(self.analyzer, &module_files, name)
+                    {
+                        candidates.extend(
+                            self.analyzer.declarations(&target_file).into_iter().filter(
+                                |candidate| {
+                                    candidate.identifier() == target_name && candidate.is_macro()
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
     /// One file's macro scope edges: the `mod` items it declares, with the
     /// bytes at which each becomes visible and whether it imports macros.
     ///

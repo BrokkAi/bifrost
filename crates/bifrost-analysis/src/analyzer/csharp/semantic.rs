@@ -689,6 +689,7 @@ fn callable_shape<'tree>(
                 ProcedureInvocationKind::Immediate
             },
             dispatch_extensibility,
+            call_boundary: ProcedureCallBoundary::Direct,
         },
     ))
 }

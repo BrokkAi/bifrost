@@ -75,11 +75,24 @@ pub struct ClassSetFieldSlotRow {
     pub atoms: Vec<ClassSetFieldSlotAtomRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClassSetFieldStoreSurveyRow {
+    pub stores: Vec<ClassSetFieldStoreRow>,
+    pub unknown_members: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassSetFieldStoreRow {
+    pub owner: Option<ClassSetFieldSlotClassRow>,
+    pub member: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSetFieldSlotIndexRow {
     pub key: ClassSetFieldSlotIndexKey,
     pub slots: Vec<ClassSetFieldSlotRow>,
     pub artifacts: Vec<ClassSetFieldSlotArtifactRow>,
+    pub store_survey: ClassSetFieldStoreSurveyRow,
     content_digest: ClassSetFieldSlotDigest,
 }
 
@@ -88,14 +101,16 @@ impl ClassSetFieldSlotIndexRow {
         key: ClassSetFieldSlotIndexKey,
         slots: Vec<ClassSetFieldSlotRow>,
         artifacts: Vec<ClassSetFieldSlotArtifactRow>,
+        store_survey: ClassSetFieldStoreSurveyRow,
     ) -> Result<Self> {
-        Self::try_new_cancellable(key, slots, artifacts, None)
+        Self::try_new_cancellable(key, slots, artifacts, store_survey, None)
     }
 
     fn try_new_cancellable(
         key: ClassSetFieldSlotIndexKey,
         slots: Vec<ClassSetFieldSlotRow>,
         artifacts: Vec<ClassSetFieldSlotArtifactRow>,
+        store_survey: ClassSetFieldStoreSurveyRow,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self> {
         ensure_optional_cancellation(cancellation)?;
@@ -162,6 +177,26 @@ impl ClassSetFieldSlotIndexRow {
                 "class-set field-slot rows are not canonical",
             ));
         }
+        for store in &store_survey.stores {
+            ensure_optional_cancellation(cancellation)?;
+            if store.member.is_empty() {
+                return Err(StoreError::new(
+                    "class-set field-store survey has an empty member",
+                ));
+            }
+            if let Some(owner) = &store.owner {
+                validate_class(owner)?;
+            }
+        }
+        if store_survey
+            .stores
+            .windows(2)
+            .any(|pair| field_store_row_order(&pair[0], &pair[1]).is_ge())
+        {
+            return Err(StoreError::new(
+                "class-set field-store survey rows are not canonical",
+            ));
+        }
         if artifacts
             .windows(2)
             .any(|pair| pair[0].rel_path >= pair[1].rel_path)
@@ -173,11 +208,12 @@ impl ClassSetFieldSlotIndexRow {
                 "class-set field-slot artifact identities are not canonical",
             ));
         }
-        enforce_payload_bounds_cancellable(&slots, &artifacts, cancellation)?;
+        enforce_payload_bounds_cancellable(&store_survey, &slots, &artifacts, cancellation)?;
         let mut row = Self {
             key,
             slots,
             artifacts,
+            store_survey,
             content_digest: [0; 32],
         };
         row.content_digest = row.canonical_content_digest_cancellable(cancellation)?;
@@ -192,13 +228,26 @@ impl ClassSetFieldSlotIndexRow {
         &self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ClassSetFieldSlotDigest> {
-        let mut hash = FieldSlotDigest::new(b"bifrost-class-set-field-slot-store-v1");
+        let mut hash = FieldSlotDigest::new(b"bifrost-class-set-field-slot-store-v2");
         hash.text(self.key.language.config_label());
         hash.bytes(&self.key.workspace_content_digest);
         hash.bytes(&self.key.provider_behavior_digest);
         hash.bytes(&self.key.active_pack_digest);
         hash.bytes(&self.key.adapter_semantics_digest);
         hash.u64(u64::from(self.key.representation_version));
+        hash.u64(self.store_survey.stores.len() as u64);
+        for store in &self.store_survey.stores {
+            ensure_optional_cancellation(cancellation)?;
+            match &store.owner {
+                Some(owner) => {
+                    hash.tag(1);
+                    hash.class(owner);
+                }
+                None => hash.tag(0),
+            }
+            hash.text(&store.member);
+        }
+        hash.tag(u8::from(self.store_survey.unknown_members));
         hash.u64(self.artifacts.len() as u64);
         for artifact in &self.artifacts {
             ensure_optional_cancellation(cancellation)?;
@@ -272,6 +321,20 @@ fn class_row_order(
         ) => left_name
             .cmp(right_name)
             .then_with(|| left_id.cmp(right_id)),
+    }
+}
+
+fn field_store_row_order(
+    left: &ClassSetFieldStoreRow,
+    right: &ClassSetFieldStoreRow,
+) -> std::cmp::Ordering {
+    match (&left.owner, &right.owner) {
+        (None, None) => left.member.cmp(&right.member),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left_owner), Some(right_owner)) => {
+            class_row_order(left_owner, right_owner).then_with(|| left.member.cmp(&right.member))
+        }
     }
 }
 
@@ -364,6 +427,7 @@ fn valid_rel_path(path: &str) -> bool {
 }
 
 fn payload_text_bytes_cancellable(
+    store_survey: &ClassSetFieldStoreSurveyRow,
     slots: &[ClassSetFieldSlotRow],
     artifacts: &[ClassSetFieldSlotArtifactRow],
     cancellation: Option<&CancellationToken>,
@@ -395,6 +459,13 @@ fn payload_text_bytes_cancellable(
         ensure_optional_cancellation(cancellation)?;
         total = checked_add(total, artifact.rel_path.len())?;
     }
+    for store in &store_survey.stores {
+        ensure_optional_cancellation(cancellation)?;
+        if let Some(owner) = &store.owner {
+            total = checked_add(total, class_bytes(owner)?)?;
+        }
+        total = checked_add(total, store.member.len())?;
+    }
     for slot in slots {
         ensure_optional_cancellation(cancellation)?;
         total = checked_add(total, class_bytes(&slot.owner)?)?;
@@ -414,6 +485,7 @@ fn payload_text_bytes_cancellable(
 }
 
 fn enforce_payload_bounds_cancellable(
+    store_survey: &ClassSetFieldStoreSurveyRow,
     slots: &[ClassSetFieldSlotRow],
     artifacts: &[ClassSetFieldSlotArtifactRow],
     cancellation: Option<&CancellationToken>,
@@ -429,6 +501,11 @@ fn enforce_payload_bounds_cancellable(
             "class-set field-slot artifact count exceeds {MAX_FIELD_SLOT_ARTIFACTS}"
         )));
     }
+    if store_survey.stores.len() > MAX_FIELD_SLOT_STORES {
+        return Err(StoreError::resource_bound(format!(
+            "class-set field-store survey count exceeds {MAX_FIELD_SLOT_STORES}"
+        )));
+    }
     let atom_count = slots.iter().try_fold(0usize, |total, slot| {
         ensure_optional_cancellation(cancellation)?;
         total.checked_add(slot.atoms.len()).ok_or_else(|| {
@@ -441,21 +518,28 @@ fn enforce_payload_bounds_cancellable(
         )));
     }
     enforce_declared_payload_bounds(
+        store_survey.stores.len(),
         slots.len(),
         atom_count,
         artifacts.len(),
-        payload_text_bytes_cancellable(slots, artifacts, cancellation)?,
+        payload_text_bytes_cancellable(store_survey, slots, artifacts, cancellation)?,
     )
 }
 
 fn enforce_declared_payload_bounds(
+    store_count: usize,
     slot_count: usize,
     atom_count: usize,
     artifact_count: usize,
     text_bytes: usize,
 ) -> Result<()> {
-    let fixed_bytes = slot_count
-        .checked_mul(std::mem::size_of::<ClassSetFieldSlotRow>())
+    let fixed_bytes = store_count
+        .checked_mul(std::mem::size_of::<ClassSetFieldStoreRow>())
+        .and_then(|stores| {
+            slot_count
+                .checked_mul(std::mem::size_of::<ClassSetFieldSlotRow>())
+                .and_then(|slots| stores.checked_add(slots))
+        })
         .and_then(|bytes| {
             atom_count
                 .checked_mul(std::mem::size_of::<ClassSetFieldSlotAtomRow>())
@@ -539,12 +623,14 @@ impl FieldSlotDigest {
 const MAX_FIELD_SLOTS: usize = 262_144;
 const MAX_FIELD_SLOT_ATOMS: usize = 262_144;
 const MAX_FIELD_SLOT_ARTIFACTS: usize = 262_144;
+const MAX_FIELD_SLOT_STORES: usize = 262_144;
 const MAX_FIELD_SLOT_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FIELD_SLOT_TEXT_BYTES: usize = MAX_FIELD_SLOT_RETAINED_BYTES;
 
 pub(crate) const CLASS_SET_FIELD_SLOT_INDEX_SQL: &str = "SELECT index_id,
             CASE WHEN length(content_digest)=32 THEN content_digest END,
-            slot_count,atom_count,artifact_count,payload_text_bytes
+            slot_count,atom_count,artifact_count,payload_text_bytes,
+            store_survey_count,store_survey_unknown_members
      FROM class_set_field_slot_indexes
      WHERE lang=?1 AND workspace_content_digest=?2
        AND provider_behavior_digest=?3 AND active_pack_digest=?4
@@ -560,6 +646,17 @@ pub(crate) const CLASS_SET_FIELD_SLOTS_SQL: &str =
             slot_ordinal,owner_kind,owner_declaration_id,owner_fq_name,
             owner_rel_path,owner_symbol_id,member
      FROM class_set_field_slots WHERE index_id=?1 ORDER BY slot_ordinal LIMIT ?2";
+
+pub(crate) const CLASS_SET_FIELD_SLOT_STORES_SQL: &str =
+    "SELECT length(CAST(COALESCE(owner_declaration_id,'') AS BLOB))
+              + length(CAST(COALESCE(owner_fq_name,'') AS BLOB))
+              + length(CAST(COALESCE(owner_rel_path,'') AS BLOB))
+              + length(CAST(COALESCE(owner_symbol_id,'') AS BLOB))
+              + length(CAST(member AS BLOB)),
+            store_ordinal,owner_kind,owner_declaration_id,owner_fq_name,
+            owner_rel_path,owner_symbol_id,member
+     FROM class_set_field_slot_stores WHERE index_id=?1
+     ORDER BY store_ordinal LIMIT ?2";
 
 pub(crate) const CLASS_SET_FIELD_SLOT_ATOMS_SQL: &str =
     "SELECT length(CAST(COALESCE(class_declaration_id,'') AS BLOB))
@@ -642,7 +739,12 @@ impl AnalyzerStore {
         #[cfg(any(test, feature = "test-support"))]
         self.reject_injected_class_set_field_slot_operation_for_test()?;
         ensure_not_cancelled(cancellation)?;
-        enforce_payload_bounds_cancellable(&row.slots, &row.artifacts, Some(cancellation))?;
+        enforce_payload_bounds_cancellable(
+            &row.store_survey,
+            &row.slots,
+            &row.artifacts,
+            Some(cancellation),
+        )?;
         if row.content_digest != row.canonical_content_digest_cancellable(Some(cancellation))? {
             return Err(StoreError::new(
                 "class-set field-slot index changed after construction",
@@ -720,12 +822,13 @@ fn different_complete_content(
     StoreError::new(format!(
         "class-set field-slot key names different complete content: \
          existing_digest={} candidate_digest={} artifact_identities_differ={} \
-         artifact_work_differ={} slots_differ={}",
+         artifact_work_differ={} slots_differ={} store_survey_differ={}",
         StableDigest::from_array(*existing.content_digest()),
         StableDigest::from_array(*candidate.content_digest()),
         artifact_identities_differ,
         artifact_work_differ,
         existing.slots != candidate.slots,
+        existing.store_survey != candidate.store_survey,
     ))
 }
 
@@ -754,13 +857,23 @@ fn load_index(
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )
         .optional()?;
     ensure_not_cancelled(cancellation)?;
-    let Some((index_id, content_digest, slot_count, atom_count, artifact_count, text_bytes)) =
-        header
+    let Some((
+        index_id,
+        content_digest,
+        slot_count,
+        atom_count,
+        artifact_count,
+        text_bytes,
+        store_count,
+        unknown_members,
+    )) = header
     else {
         return Ok(None);
     };
@@ -770,9 +883,24 @@ fn load_index(
     let slot_count = bounded_count(slot_count, MAX_FIELD_SLOTS, "slot")?;
     let atom_count = bounded_count(atom_count, MAX_FIELD_SLOT_ATOMS, "atom")?;
     let artifact_count = bounded_count(artifact_count, MAX_FIELD_SLOT_ARTIFACTS, "artifact")?;
+    let store_count = bounded_count(store_count, MAX_FIELD_SLOT_STORES, "store survey")?;
     let text_bytes = bounded_count(text_bytes, MAX_FIELD_SLOT_TEXT_BYTES, "payload text byte")?;
-    enforce_declared_payload_bounds(slot_count, atom_count, artifact_count, text_bytes)?;
+    enforce_declared_payload_bounds(
+        store_count,
+        slot_count,
+        atom_count,
+        artifact_count,
+        text_bytes,
+    )?;
+    let unknown_members = bool_value(unknown_members, "store survey unknown-members bit")?;
     let mut actual_text_bytes = 0usize;
+    let stores = load_store_survey(
+        conn,
+        index_id,
+        store_count,
+        &mut actual_text_bytes,
+        cancellation,
+    )?;
     let mut artifacts = load_artifacts(
         conn,
         index_id,
@@ -788,8 +916,13 @@ fn load_index(
         &mut actual_text_bytes,
         cancellation,
     )?;
+    let store_survey = ClassSetFieldStoreSurveyRow {
+        stores,
+        unknown_members,
+    };
     if actual_text_bytes != text_bytes
-        || payload_text_bytes_cancellable(&slots, &artifacts, Some(cancellation))? != text_bytes
+        || payload_text_bytes_cancellable(&store_survey, &slots, &artifacts, Some(cancellation))?
+            != text_bytes
     {
         return Err(StoreError::corrupt(
             "class-set field-slot payload text size is corrupt",
@@ -804,6 +937,7 @@ fn load_index(
         key.clone(),
         slots,
         artifacts,
+        store_survey,
         Some(cancellation),
     )
     .map_err(|error| {
@@ -819,6 +953,76 @@ fn load_index(
         ));
     }
     Ok(Some(row))
+}
+
+fn load_store_survey(
+    conn: &rusqlite::Connection,
+    index_id: i64,
+    store_count: usize,
+    actual_text_bytes: &mut usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<ClassSetFieldStoreRow>> {
+    let limit = i64::try_from(store_count.saturating_add(1))
+        .map_err(|_| StoreError::new("class-set field-store survey limit exceeds i64"))?;
+    let mut statement = conn.prepare_cached(CLASS_SET_FIELD_SLOT_STORES_SQL)?;
+    let mut rows = statement.query(params![index_id, limit])?;
+    let mut stores = Vec::new();
+    while let Some(row) = rows.next()? {
+        ensure_not_cancelled(cancellation)?;
+        admit_text_bytes(actual_text_bytes, row.get(0)?)?;
+        let ordinal = row.get::<_, i64>(1)?;
+        if ordinal != stores.len() as i64 {
+            return Err(StoreError::corrupt(
+                "class-set field-store survey ordinals are not dense",
+            ));
+        }
+        let owner_kind = row.get::<_, Option<String>>(2)?;
+        let declaration_id = row.get::<_, Option<String>>(3)?;
+        let fq_name = row.get::<_, Option<String>>(4)?;
+        let rel_path = row.get::<_, Option<String>>(5)?;
+        let symbol_id = row.get::<_, Option<String>>(6)?;
+        let owner = match owner_kind.as_deref() {
+            None => {
+                if declaration_id.is_some()
+                    || fq_name.is_some()
+                    || rel_path.is_some()
+                    || symbol_id.is_some()
+                {
+                    return Err(StoreError::corrupt(
+                        "unattributed field-store survey row has owner columns",
+                    ));
+                }
+                None
+            }
+            Some("workspace") => Some(workspace_class(
+                declaration_id,
+                fq_name,
+                rel_path,
+                symbol_id,
+            )?),
+            Some("external") => Some(external_class(
+                declaration_id,
+                fq_name,
+                rel_path,
+                symbol_id,
+            )?),
+            Some(_) => {
+                return Err(StoreError::corrupt(
+                    "class-set field-store survey owner kind is corrupt",
+                ));
+            }
+        };
+        stores.push(ClassSetFieldStoreRow {
+            owner,
+            member: row.get(7)?,
+        });
+    }
+    if stores.len() != store_count {
+        return Err(StoreError::corrupt(
+            "class-set field-store survey count is corrupt",
+        ));
+    }
+    Ok(stores)
 }
 
 fn load_artifacts(
@@ -1043,9 +1247,10 @@ fn insert_index(
     conn.execute(
         "INSERT INTO class_set_field_slot_indexes(
            lang,workspace_content_digest,provider_behavior_digest,active_pack_digest,
-           adapter_semantics_digest,representation_version,content_digest,slot_count,atom_count,
-           artifact_count,payload_text_bytes,completion,published_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'complete',unixepoch())",
+         adapter_semantics_digest,representation_version,content_digest,slot_count,atom_count,
+           artifact_count,payload_text_bytes,store_survey_count,store_survey_unknown_members,
+           completion,published_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'complete',unixepoch())",
         params![
             row.key.language.config_label(),
             row.key.workspace_content_digest.as_slice(),
@@ -1057,10 +1262,34 @@ fn insert_index(
             row.slots.len(),
             atom_count,
             row.artifacts.len(),
-            payload_text_bytes_cancellable(&row.slots, &row.artifacts, Some(cancellation),)?,
+            payload_text_bytes_cancellable(
+                &row.store_survey,
+                &row.slots,
+                &row.artifacts,
+                Some(cancellation),
+            )?,
+            row.store_survey.stores.len(),
+            i64::from(row.store_survey.unknown_members),
         ],
     )?;
     let index_id = conn.last_insert_rowid();
+    for (store_ordinal, store) in row.store_survey.stores.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        let owner = store.owner.as_ref().map(class_columns);
+        conn.execute(
+            "INSERT INTO class_set_field_slot_stores VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                index_id,
+                store_ordinal,
+                owner.as_ref().map(|columns| columns.kind),
+                owner.as_ref().and_then(|columns| columns.declaration_id),
+                owner.as_ref().map(|columns| columns.fq_name),
+                owner.as_ref().and_then(|columns| columns.rel_path),
+                owner.as_ref().and_then(|columns| columns.symbol_id),
+                &store.member,
+            ],
+        )?;
+    }
     for (artifact_ordinal, artifact) in row.artifacts.iter().enumerate() {
         ensure_not_cancelled(cancellation)?;
         let artifact_work = semantic_work_values(artifact.work);
@@ -1241,6 +1470,16 @@ fn bounded_count(value: i64, max: usize, name: &str) -> Result<usize> {
     Ok(value)
 }
 
+fn bool_value(value: i64, name: &str) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StoreError::corrupt(format!(
+            "class-set field-slot {name} is invalid"
+        ))),
+    }
+}
+
 fn admit_text_bytes(total: &mut usize, row_bytes: i64) -> Result<()> {
     let row_bytes = bounded_count(
         row_bytes,
@@ -1388,6 +1627,7 @@ mod tests {
                     ..SemanticWork::default()
                 },
             }],
+            ClassSetFieldStoreSurveyRow::default(),
         )
         .unwrap()
     }
@@ -1400,7 +1640,7 @@ mod tests {
     }
 
     fn reconstruct(row: ClassSetFieldSlotIndexRow) -> Result<ClassSetFieldSlotIndexRow> {
-        ClassSetFieldSlotIndexRow::try_new(row.key, row.slots, row.artifacts)
+        ClassSetFieldSlotIndexRow::try_new(row.key, row.slots, row.artifacts, row.store_survey)
     }
 
     fn row_for(language: Language, seed: u8) -> ClassSetFieldSlotIndexRow {
@@ -1410,13 +1650,14 @@ mod tests {
         reconstruct(value).unwrap()
     }
 
-    fn table_counts(store: &AnalyzerStore) -> [i64; 4] {
+    fn table_counts(store: &AnalyzerStore) -> [i64; 5] {
         let conn = store.read_conn().unwrap();
         [
             "class_set_field_slot_indexes",
             "class_set_field_slot_artifacts",
             "class_set_field_slots",
             "class_set_field_slot_atoms",
+            "class_set_field_slot_stores",
         ]
         .map(|table| {
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1586,7 +1827,7 @@ mod tests {
             "an extra child is removed through the parent cascade"
         );
         assert_eq!(load(&store, &expected.key).unwrap(), Some(expected));
-        assert_eq!(table_counts(&store), [1, 1, 1, 3]);
+        assert_eq!(table_counts(&store), [1, 1, 1, 3, 0]);
     }
 
     #[test]
@@ -1652,7 +1893,7 @@ mod tests {
         assert!(cancellation.is_cancelled());
         assert_eq!(
             table_counts(&store),
-            [0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
             "the immediate transaction exposes none of its partial children"
         );
     }
@@ -1723,7 +1964,7 @@ mod tests {
         drop(conn);
         assert_eq!(
             table_counts(&store),
-            [16, 16, 16, 48],
+            [16, 16, 16, 48, 0],
             "pruned parents remove every normalized child row"
         );
         for language in [Language::Python, Language::Ruby] {
@@ -1762,7 +2003,7 @@ mod tests {
 
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         assert_eq!(load(&store, &key()).unwrap(), Some(row()));
-        assert_eq!(table_counts(&store), [1, 1, 1, 3]);
+        assert_eq!(table_counts(&store), [1, 1, 1, 3, 0]);
     }
 
     #[test]
@@ -1806,7 +2047,7 @@ mod tests {
             assert!(message.contains(difference), "{message}");
         }
         assert_eq!(load(&store, &existing.key).unwrap(), Some(existing));
-        assert_eq!(table_counts(&store), [1, 1, 1, 3]);
+        assert_eq!(table_counts(&store), [1, 1, 1, 3, 0]);
     }
 
     #[test]
@@ -1832,6 +2073,7 @@ mod tests {
             replacement_key.clone(),
             row().slots,
             row().artifacts,
+            ClassSetFieldStoreSurveyRow::default(),
         )
         .unwrap();
         assert!(
@@ -1843,9 +2085,13 @@ mod tests {
         for seed in 10..18 {
             let mut next_key = key();
             next_key.workspace_content_digest = [seed; 32];
-            let next =
-                ClassSetFieldSlotIndexRow::try_new(next_key.clone(), row().slots, row().artifacts)
-                    .unwrap();
+            let next = ClassSetFieldSlotIndexRow::try_new(
+                next_key.clone(),
+                row().slots,
+                row().artifacts,
+                ClassSetFieldStoreSurveyRow::default(),
+            )
+            .unwrap();
             store
                 .publish_class_set_field_slot_index(next.clone(), &CancellationToken::new())
                 .unwrap();
@@ -1863,6 +2109,119 @@ mod tests {
             .unwrap(),
             8
         );
+    }
+
+    #[test]
+    fn field_store_survey_round_trips_owned_and_unattributed_writes() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let expected = ClassSetFieldSlotIndexRow::try_new(
+            key(),
+            Vec::new(),
+            Vec::new(),
+            ClassSetFieldStoreSurveyRow {
+                stores: vec![
+                    ClassSetFieldStoreRow {
+                        owner: None,
+                        member: "value".to_string(),
+                    },
+                    ClassSetFieldStoreRow {
+                        owner: Some(ClassSetFieldSlotClassRow::Workspace {
+                            declaration_id: "decl:v1:owner".to_string(),
+                            fq_name: "sample.Owner".to_string(),
+                            rel_path: "sample.py".to_string(),
+                        }),
+                        member: "value".to_string(),
+                    },
+                ],
+                unknown_members: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            store
+                .publish_class_set_field_slot_index(expected.clone(), &CancellationToken::new())
+                .unwrap()
+        );
+        assert_eq!(load(&store, &key()).unwrap(), Some(expected));
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT store_survey_count, store_survey_unknown_members
+                 FROM class_set_field_slot_indexes",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (2, 1)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_field_slot_stores WHERE owner_kind IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn field_store_survey_corrupt_count_and_payload_are_repaired() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let expected = ClassSetFieldSlotIndexRow::try_new(
+            key(),
+            Vec::new(),
+            Vec::new(),
+            ClassSetFieldStoreSurveyRow {
+                stores: vec![ClassSetFieldStoreRow {
+                    owner: None,
+                    member: "value".to_string(),
+                }],
+                unknown_members: true,
+            },
+        )
+        .unwrap();
+        store
+            .publish_class_set_field_slot_index(expected.clone(), &CancellationToken::new())
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE class_set_field_slot_indexes SET store_survey_count=?1",
+                params![i64::try_from(MAX_FIELD_SLOT_STORES).unwrap() + 1],
+            )
+            .unwrap();
+        assert_eq!(
+            load(&store, &key()).unwrap_err().kind(),
+            StoreErrorKind::ResourceBound
+        );
+        assert!(
+            store
+                .publish_class_set_field_slot_index(expected.clone(), &CancellationToken::new())
+                .unwrap()
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE class_set_field_slot_indexes SET payload_text_bytes=payload_text_bytes+1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            load(&store, &key()).unwrap_err().kind(),
+            StoreErrorKind::Corrupt
+        );
+        assert!(
+            store
+                .publish_class_set_field_slot_index(expected.clone(), &CancellationToken::new())
+                .unwrap()
+        );
+        assert_eq!(load(&store, &key()).unwrap(), Some(expected));
     }
 
     #[test]
@@ -1913,6 +2272,10 @@ mod tests {
                 (
                     "class_set_field_slots",
                     "sqlite_autoindex_class_set_field_slots_1",
+                ),
+                (
+                    "class_set_field_slot_stores",
+                    "sqlite_autoindex_class_set_field_slot_stores_1",
                 ),
                 (
                     "class_set_field_slot_atoms",

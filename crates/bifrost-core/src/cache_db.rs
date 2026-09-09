@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 57;
+const CURRENT_MIGRATION_VERSION: i64 = 59;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -111,6 +111,10 @@ const CLASS_SET_SCALAR_RECEIVER_SQL: &str =
     include_str!("../migrations/cache/0056-class-set-scalar-receiver.sql");
 const STRUCTURAL_FACT_EXTERNAL_NAMES_SQL: &str =
     include_str!("../migrations/cache/0057-structural-fact-external-names.sql");
+const RUST_MACRO_USE_IMPORTS_SQL: &str =
+    include_str!("../migrations/cache/0058-rust-macro-use-imports.sql");
+const CLASS_SET_FIELD_STORE_SURVEYS_SQL: &str =
+    include_str!("../migrations/cache/0059-field-store-surveys.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -131,7 +135,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 39] = [
+const CACHE_MIGRATIONS: [CacheMigration; 41] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -287,6 +291,14 @@ const CACHE_MIGRATIONS: [CacheMigration; 39] = [
     CacheMigration {
         version: 57,
         sql: STRUCTURAL_FACT_EXTERNAL_NAMES_SQL,
+    },
+    CacheMigration {
+        version: 58,
+        sql: RUST_MACRO_USE_IMPORTS_SQL,
+    },
+    CacheMigration {
+        version: 59,
+        sql: CLASS_SET_FIELD_STORE_SURVEYS_SQL,
     },
 ];
 
@@ -6242,8 +6254,11 @@ mod tests {
         )
         .unwrap();
 
-        migrate_with_sql(&mut conn, &migrations_through(57)).unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 57);
+        migrate_with_sql(&mut conn, &migrations_through(CURRENT_MIGRATION_VERSION)).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM structural_fact_nodes WHERE blob_id = ?1",
@@ -6319,7 +6334,7 @@ mod tests {
         assert_eq!(
             schema_object_definitions(&conn).unwrap(),
             *CURRENT_SCHEMA_OBJECTS,
-            "the migrated schema matches a fresh version-57 cache"
+            "the migrated schema matches a fresh current cache"
         );
         validate_foreign_keys(&conn).unwrap();
         conn.execute("DELETE FROM blobs WHERE id = ?1", [blob])
@@ -6345,6 +6360,162 @@ mod tests {
             (0, 0, 0, 0),
             "deleting the blob cascades through every external-name structural table"
         );
+    }
+
+    /// Migration 0058 preserves old Rust import facts as ordinary imports and
+    /// adds the source-derived bit needed for `#[macro_use] extern crate`.
+    #[test]
+    fn v57_rust_import_rows_upgrade_with_macro_use_default() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(57)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'rust', 0)",
+            [],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO rust_import_targets(
+                 blob_id, lang, ordinal, module_path, bound_name, imported_name,
+                 is_glob, visibility, owner_module, owner_start, owner_end,
+                 cfg_condition, is_extern_crate
+             ) VALUES(?1, 'rust', 0, 'rocket', 'rocket', NULL, 0, 'private',
+                      '', 0, 42, 'always', 1)",
+            [blob],
+        )
+        .unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(58)).unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(59)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 59);
+        assert_eq!(
+            conn.query_row(
+                "SELECT is_extern_crate, is_macro_use
+                 FROM rust_import_targets WHERE blob_id = ?1",
+                [blob],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (1, 0),
+            "an old extern-crate row is preserved without inventing a macro-use attribute"
+        );
+        conn.execute(
+            "UPDATE rust_import_targets SET is_macro_use = 1 WHERE blob_id = ?1",
+            [blob],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE rust_import_targets SET is_macro_use = 2 WHERE blob_id = ?1",
+                [blob],
+            )
+            .is_err(),
+            "the migrated column accepts only Boolean encodings"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "the migrated schema matches a fresh version-59 cache"
+        );
+    }
+
+    #[test]
+    fn v58_field_store_survey_migration_adds_bounded_cascade_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(58)).unwrap();
+        conn.execute(
+            "INSERT INTO class_set_field_slot_indexes(
+               lang,workspace_content_digest,provider_behavior_digest,active_pack_digest,
+               adapter_semantics_digest,representation_version,content_digest,
+               slot_count,atom_count,artifact_count,payload_text_bytes,completion,published_at
+             ) VALUES('python',zeroblob(32),randomblob(32),randomblob(32),randomblob(32),
+                      1,randomblob(32),0,0,0,0,'complete',17)",
+            [],
+        )
+        .unwrap();
+        let index_id = conn.last_insert_rowid();
+
+        migrate_with_sql(&mut conn, &migrations_through(59)).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 59);
+        assert_eq!(
+            conn.query_row(
+                "SELECT store_survey_count, store_survey_unknown_members
+                 FROM class_set_field_slot_indexes WHERE index_id=?1",
+                [index_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (0, 0),
+            "representation-1 rows retain their data with an empty survey"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT strict FROM pragma_table_list
+                 WHERE schema='main' AND name='class_set_field_slot_stores'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_field_slot_stores(
+                   index_id,store_ordinal,owner_kind,owner_declaration_id,owner_fq_name,
+                   owner_rel_path,owner_symbol_id,member)
+                 VALUES(?1,0,NULL,NULL,NULL,NULL,NULL,'value')",
+                [index_id],
+            )
+            .is_ok()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_field_slot_stores(
+                   index_id,store_ordinal,owner_kind,owner_declaration_id,owner_fq_name,
+                   owner_rel_path,owner_symbol_id,member)
+                 VALUES(?1,1,'external',NULL,'library.Owner',NULL,'symbol-1','value')",
+                [index_id],
+            )
+            .is_ok()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_field_slot_stores(
+                   index_id,store_ordinal,owner_kind,owner_declaration_id,owner_fq_name,
+                   owner_rel_path,owner_symbol_id,member)
+                 VALUES(?1,2,NULL,NULL,'malformed',NULL,NULL,'value')",
+                [index_id],
+            )
+            .is_err(),
+            "an unattributed survey row cannot carry partial owner identity"
+        );
+        conn.execute(
+            "DELETE FROM class_set_field_slot_indexes WHERE index_id=?1",
+            [index_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_field_slot_stores",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "survey rows follow index eviction"
+        );
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     /// Version 28 removes the opaque identity copy without forcing a warm

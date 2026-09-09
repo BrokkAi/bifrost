@@ -13,20 +13,17 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_cpp::hierarchy::{build_cpp_visible_type_units, cpp_resolve_direct_ancestors};
 
-/// The predicate an uncancellable caller passes down. Named rather than spelled
-/// inline at each site so the `expect`s below can point at one reason: with
-/// this predicate a walk cannot stop, so `None` cannot happen.
+/// The predicate an uncancellable caller passes down. Dependency reads can
+/// still be incomplete even though this predicate never stops the walk.
 const ALWAYS: &dyn Fn() -> bool = &|| true;
 
 impl CppAnalyzer {
     pub(super) fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
-        self.visible_type_units_by_file.get_with_by_ref(file, || {
+        self.cached_complete_read(&self.visible_type_units_by_file, file, || {
             #[cfg(any(test, feature = "test-support"))]
             self.record_visible_type_units_build_for_test();
-            Arc::new(
-                build_cpp_visible_type_units(self, file, ALWAYS)
-                    .expect("an include-closure walk that cannot stop always completes"),
-            )
+            build_cpp_visible_type_units(self, file, ALWAYS)
+                .expect("an include-closure walk that cannot stop always completes")
         })
     }
 
@@ -42,8 +39,8 @@ impl CppAnalyzer {
     /// waiter, so one request whose budget had expired would report a stopped
     /// walk to an unrelated request that still had time. A race costs one
     /// duplicate include-closure walk; the misreport would cost a correct
-    /// answer. `None` therefore means exactly one thing: *this* caller's
-    /// `keep_going` said stop.
+    /// answer. `None` means this walk stopped, either at `keep_going` or at an
+    /// incomplete dependency read retained by the request's completion ledger.
     pub(super) fn visible_type_units_while(
         &self,
         file: &ProjectFile,
@@ -54,7 +51,11 @@ impl CppAnalyzer {
         }
         #[cfg(any(test, feature = "test-support"))]
         self.record_visible_type_units_build_for_test();
+        let scope = AnalyzerQueryScope::new(self);
         let built = Arc::new(build_cpp_visible_type_units(self, file, keep_going)?);
+        if scope.read_completion().is_err() {
+            return None;
+        }
         self.visible_type_units_by_file
             .insert(file.clone(), Arc::clone(&built));
         Some(built)
@@ -71,7 +72,11 @@ impl CppAnalyzer {
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return Some((*cached).clone());
         }
+        let scope = AnalyzerQueryScope::new(self);
         let resolved = cpp_resolve_direct_ancestors(self, code_unit, keep_going)?;
+        if scope.read_completion().is_err() {
+            return None;
+        }
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(resolved.clone()));
         Some(resolved)
@@ -80,15 +85,20 @@ impl CppAnalyzer {
 
 impl TypeHierarchyProvider for CppAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_ancestors
-            .get_with_by_ref(code_unit, || {
-                Arc::new(
-                    cpp_resolve_direct_ancestors(self, code_unit, ALWAYS)
-                        .expect("an ancestor resolution that cannot stop always completes"),
-                )
+        self.cached_complete_read(&self.direct_ancestors, code_unit, || {
+            let scope = AnalyzerQueryScope::new(self);
+            cpp_resolve_direct_ancestors(self, code_unit, ALWAYS).unwrap_or_else(|| {
+                assert!(
+                    scope.read_completion().is_err(),
+                    "an unstopped ancestor walk must report an incomplete dependency"
+                );
+                // cached_complete_read propagates the recorded reason and
+                // refuses to publish this compatibility value.
+                Vec::new()
             })
-            .as_ref()
-            .clone()
+        })
+        .as_ref()
+        .clone()
     }
 
     fn get_direct_ancestors_within(

@@ -250,12 +250,21 @@ To cut a release:
      --cache-dir "$plugin_smoke_root/cache" \
      --binary-path "$(pwd)/target/release/bifrost"
    rm -rf "$plugin_smoke_root"
-   target/release/bifrost \
+   policy_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-policy-pretag.XXXXXX")"
+   trap 'rm -rf -- "$policy_smoke_root"' EXIT
+   bash scripts/public/build-pinned-python-semantic-packs.sh \
+     "$policy_smoke_root/bundle" \
+     "$policy_smoke_root/work" \
+     "$policy_smoke_root/cache"
+   BIFROST_SEMANTIC_PACK_CACHE_ROOT="$policy_smoke_root/cache" \
+     target/release/bifrost \
      --root . \
      --format sarif \
      --output target/release-rc-policy.sarif \
      --fail-on never \
      --policy-pack bifrost.code-smells
+   rm -rf -- "$policy_smoke_root"
+   trap - EXIT
    ```
 
    The staged-agent command reproduces the prepublication plugin boundary: it
@@ -267,9 +276,12 @@ To cut a release:
 
    The policy command is a release-artifact smoke test. Existing findings do
    not fail it. An unreliable scan still exits with status 2 and blocks the
-   release. Do not tag the RC commit only because its ordinary branch CI is
-   green. Confirm that each release-only promotion gate has an equivalent
-   pre-tag check, and run it on the frozen RC commit.
+   release. Its pinned Python semantic-pack setup matches policy CI and Release
+   Readiness, so the absent-member policy has the declaration surface it needs
+   to distinguish a clean result from incomplete capability coverage. Do not
+   tag the RC commit only because its ordinary branch CI is green. Confirm that
+   each release-only promotion gate has an equivalent pre-tag check, and run it
+   on the frozen RC commit.
 7. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and

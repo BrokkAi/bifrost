@@ -30,7 +30,7 @@ use crate::cargo_routes::{RustCargoRouteKind, RustCargoTargetRelation};
 use crate::declarations::rust_package_name;
 use crate::imports::{
     RustVisibility, resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package,
+    rust_crate_root_package, rust_item_has_attribute,
 };
 use crate::lexical_scope::{
     RustCfgCondition, lexical_package_at, local_type_item_name_shadowed_in_tree,
@@ -548,23 +548,7 @@ pub struct RustResolvedModuleRoute {
 }
 
 pub fn rust_mod_item_has_macro_use(module: Node<'_>, source: &str) -> bool {
-    let mut sibling = module.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
-        let Some(attribute) = attribute_item.named_child(0) else {
-            break;
-        };
-        let Some(path) = attribute.named_child(0) else {
-            break;
-        };
-        if source.get(path.start_byte()..path.end_byte()) == Some("macro_use") {
-            return true;
-        }
-        sibling = attribute_item.prev_named_sibling();
-    }
-    false
+    rust_item_has_attribute(module, source, "macro_use")
 }
 
 impl From<RustCargoRouteKind> for RustRouteProvenance {

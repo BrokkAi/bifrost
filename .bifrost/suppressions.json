@@ -399,11 +399,11 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "bf8e46b8486e0584adcd60e005ddf0727e04b1cb3261cc48040003bb3c52a416",
+      "finding_id": "47a5cfadd8bd3a515e0ca77d2cf74cc9d7d0961013fb08b163493482c1354089",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",
-      "reason": "Deliberate retry/backoff between store write attempts for one prepared blob (PREPARED_WRITE_IMMEDIATE_RETRIES); the sleep is the mechanism, not a defect. Re-keyed after the #2632 reader-pool change moved the code above it, and after unrelated 2026-09 edits above the loop shifted the finding's ordinal identity.",
+      "reason": "Deliberate retry/backoff between store write attempts for one prepared blob (PREPARED_WRITE_IMMEDIATE_RETRIES); the sleep is the mechanism, not a defect. Re-keyed after the #2632 reader-pool change moved the code above it, and after unrelated 2026-09 edits above the loop shifted the finding's ordinal identity, most recently before the v0.11.1 RC.",
       "policy_hash_at_acceptance": "16b1be4131f57ee9dff8c34d8a083241bbfbd0992cc0a6e215e9b142d7e551ab",
       "accepted_by": "jbellis",
       "accepted_at": "2026-09-02",

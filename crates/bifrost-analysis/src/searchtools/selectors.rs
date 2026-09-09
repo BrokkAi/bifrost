@@ -24,7 +24,11 @@ pub(super) type DefinitionCandidateKey = (
     Option<String>,
 );
 
-pub(super) type DefinitionOutcomeKey = (String, Vec<DefinitionCandidateKey>);
+pub(super) type DefinitionOutcomeKey = (
+    String,
+    Vec<DefinitionCandidateKey>,
+    Option<DefinitionLookupIncompleteReason>,
+);
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DefinitionCandidate {
@@ -55,6 +59,97 @@ pub struct DefinitionCandidate {
 pub struct DefinitionDiagnostic {
     pub kind: String,
     pub message: String,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionLookupIncompleteReason {
+    Cancelled,
+    TimeBudget,
+    ResolutionBudget,
+    AnalysisFailure,
+    StructureUnavailable,
+    NavigationTargets,
+}
+
+/// Map the stable diagnostic kinds emitted by definition resolution to the
+/// small public vocabulary used by both definition result surfaces.
+pub(super) fn definition_lookup_incomplete_reason_for_kind(
+    kind: &str,
+) -> Option<DefinitionLookupIncompleteReason> {
+    Some(match kind {
+        "cancelled" | "java_resolution_cancelled" => DefinitionLookupIncompleteReason::Cancelled,
+        "definition_time_budget_exceeded" | "time_budget" => {
+            DefinitionLookupIncompleteReason::TimeBudget
+        }
+        "resolution_budget_exceeded"
+        | "cpp_receiver_budget_exhausted"
+        | "import_bindings_truncated"
+        | "scala_receiver_budget_exhausted"
+        | "scala_resolution_budget_exceeded"
+        | "ruby_resolution_budget_exhausted"
+        | "csharp_resolution_stopped" => DefinitionLookupIncompleteReason::ResolutionBudget,
+        "definition_candidate_lookup_failed"
+        | "definition_candidate_lookup_incomplete"
+        | "analysis_incomplete"
+        | "partial_import_boundary"
+        | "partial_import_unresolved"
+        | "cpp_analyzer_unavailable"
+        | "csharp_analyzer_unavailable"
+        | "go_analyzer_unavailable"
+        | "java_analyzer_unavailable"
+        | "jsts_analyzer_unavailable"
+        | "kotlin_analyzer_unavailable"
+        | "php_analyzer_unavailable"
+        | "python_analyzer_unavailable"
+        | "ruby_analyzer_unavailable"
+        | "rust_analyzer_unavailable"
+        | "scala_analyzer_unavailable"
+        | "cpp_parse_failed"
+        | "csharp_parse_failed"
+        | "java_parse_failed"
+        | "jsts_parse_failed"
+        | "kotlin_parse_failed"
+        | "php_parse_failed"
+        | "python_parse_failed"
+        | "ruby_parse_failed"
+        | "scala_parse_failed"
+        | "read_failed"
+        | "file_read_failed" => DefinitionLookupIncompleteReason::AnalysisFailure,
+        "cpp_navigation_structure_unavailable" | "source_unavailable" => {
+            DefinitionLookupIncompleteReason::StructureUnavailable
+        }
+        "navigation_targets_truncated" => DefinitionLookupIncompleteReason::NavigationTargets,
+        _ => return None,
+    })
+}
+
+pub(super) fn definition_lookup_incomplete_reason(
+    diagnostics: &[DefinitionDiagnostic],
+) -> Option<DefinitionLookupIncompleteReason> {
+    diagnostics
+        .iter()
+        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind))
+}
+
+pub(super) const fn definition_lookup_complete_default() -> bool {
+    true
+}
+
+pub(super) fn definition_lookup_complete(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,7 +472,12 @@ impl DefinitionCandidateRenderCache {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Option<(Range, Option<(usize, usize)>)> {
-        if unit.is_module() {
+        if unit.is_module()
+            && crate::analyzer::languages::language_support(language_for_target(unit))
+                .and_then(|support| support.path_synthetic_module_unit(unit.source()))
+                .as_ref()
+                == Some(unit)
+        {
             return Some((
                 Range {
                     start_byte: 0,
@@ -1970,6 +2070,46 @@ mod tests {
     };
     use crate::test_support::AnalyzerFixture;
     use std::sync::Arc;
+
+    #[test]
+    fn definition_outcome_key_keeps_complete_and_incomplete_misses_distinct() {
+        use crate::analyzer::usages::get_definition::{
+            DefinitionLookupDiagnostic, DefinitionLookupOutcome, DefinitionLookupStatus,
+        };
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Cpp)
+            .file("widget.cpp", "struct Widget {};\n")
+            .build();
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let complete = DefinitionLookupOutcome {
+            status: DefinitionLookupStatus::NoDefinition,
+            reference: None,
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        };
+        let mut cancelled = complete.clone();
+        cancelled.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cancelled".to_string(),
+            message: "cancelled fixture lookup".to_string(),
+        });
+        let result = crate::searchtools::definitions::collapse_context_outcomes(
+            &analyzer,
+            scope.token(),
+            DefinitionContextReferenceQuery {
+                symbol: "Widget".to_string(),
+                context: "Missing Missing".to_string(),
+                target: "Missing".to_string(),
+            },
+            vec![complete, cancelled],
+        );
+        assert_eq!(result.status, "ambiguous", "{result:?}");
+        assert!(!result.complete, "{result:?}");
+        assert_eq!(
+            result.incomplete_reason,
+            Some(DefinitionLookupIncompleteReason::Cancelled)
+        );
+    }
 
     /// Prove, for one language, that persisted selector projections carry the
     /// same grouping as a freshly built workspace and that rendering the

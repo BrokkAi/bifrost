@@ -13,6 +13,7 @@ use brokk_bifrost_core::analyzer::{
     fq_name::{FqName, SegmentKind, segment_interner},
     symbol_path::parse_symbol_path_fq,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type MemberLookupKey = (Language, String, String, String);
@@ -116,6 +117,9 @@ pub struct DefinitionLookupMemo {
 pub struct AnalyzerDefinitionLookup<'a> {
     analyzer: &'a dyn IAnalyzer,
     language: Mutex<Language>,
+    // A failed relational read must not publish compatibility empty values,
+    // even when this lookup is used without an outer query scope.
+    incomplete: AtomicBool,
     /// Resolved per lookup rather than in the shared memo: the languages a
     /// multi-analyzer reports are not the languages one of its delegates
     /// reports, and both kinds of analyzer can hand out the same memo.
@@ -128,6 +132,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         Self {
             analyzer,
             language: Mutex::new(language),
+            incomplete: AtomicBool::new(false),
             workspace_languages: OnceLock::new(),
             memo: analyzer.definition_lookup_memo().unwrap_or_default(),
         }
@@ -210,7 +215,8 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                 query,
             })
             .collect::<Vec<_>>();
-        match self
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer);
+        let values = match self
             .analyzer
             .relational_definition_batch_for_active_query(&requests)
         {
@@ -219,13 +225,25 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
                 assert_eq!(results.len(), requests.len());
                 results.into_iter().map(|result| result.value).collect()
             }
-            RelationalBatchOutcome::Cancelled => Vec::new(),
+            RelationalBatchOutcome::Cancelled => {
+                self.incomplete.store(true, Ordering::Release);
+                Vec::new()
+            }
             RelationalBatchOutcome::Failed(error) => {
+                self.incomplete.store(true, Ordering::Release);
                 self.analyzer
                     .record_query_failure(StoreError::new(error.message()));
                 Vec::new()
             }
+        };
+        if scope.read_completion().is_err() {
+            self.incomplete.store(true, Ordering::Release);
         }
+        values
+    }
+
+    fn can_publish(&self) -> bool {
+        !self.incomplete.load(Ordering::Acquire)
     }
 
     fn identifier_name(identifier: &str) -> Option<RelationalName> {
@@ -281,11 +299,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         let mut matches = self.identifier_candidates_for_language(language, identifier, None);
         sort_units(&mut matches);
         matches.dedup();
-        self.memo
-            .identifier_cache
-            .lock()
-            .expect("definition identifier cache poisoned")
-            .insert(key, matches.clone());
+        if self.can_publish() {
+            self.memo
+                .identifier_cache
+                .lock()
+                .expect("definition identifier cache poisoned")
+                .insert(key, matches.clone());
+        }
         matches
     }
 
@@ -436,11 +456,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             return cached.clone();
         }
         let matches = self.exact_for_language(fqn, language);
-        self.memo
-            .fqn_cache
-            .lock()
-            .expect("definition fqn cache poisoned")
-            .insert(key, matches.clone());
+        if self.can_publish() {
+            self.memo
+                .fqn_cache
+                .lock()
+                .expect("definition fqn cache poisoned")
+                .insert(key, matches.clone());
+        }
         matches
     }
 
@@ -540,7 +562,9 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             for (fqn, mut units) in missing.into_iter().zip(units_by_name) {
                 sort_units(&mut units);
                 units.dedup();
-                cache.insert((language, fqn), units);
+                if self.can_publish() {
+                    cache.insert((language, fqn), units);
+                }
             }
         }
     }
@@ -593,11 +617,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             } else {
                 sort_units(&mut units);
                 units.dedup();
-                self.memo
-                    .fqn_cache
-                    .lock()
-                    .expect("definition fqn cache poisoned")
-                    .insert((language, fqn), units);
+                if self.can_publish() {
+                    self.memo
+                        .fqn_cache
+                        .lock()
+                        .expect("definition fqn cache poisoned")
+                        .insert((language, fqn), units);
+                }
             }
         }
         if misses.is_empty() {
@@ -667,11 +693,13 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             });
             sort_units(&mut units);
             units.dedup();
-            self.memo
-                .fqn_cache
-                .lock()
-                .expect("definition fqn cache poisoned")
-                .insert((language, fqn), units);
+            if self.can_publish() {
+                self.memo
+                    .fqn_cache
+                    .lock()
+                    .expect("definition fqn cache poisoned")
+                    .insert((language, fqn), units);
+            }
         }
     }
 }
@@ -726,11 +754,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             let mut matches = self.normalized_for_language(normalized, language);
             sort_units(&mut matches);
             matches.dedup();
-            self.memo
-                .normalized_fqn_cache
-                .lock()
-                .expect("normalized definition cache poisoned")
-                .insert(key, matches.clone());
+            if self.can_publish() {
+                self.memo
+                    .normalized_fqn_cache
+                    .lock()
+                    .expect("normalized definition cache poisoned")
+                    .insert(key, matches.clone());
+            }
             units.extend(matches);
         }
         sort_units(&mut units);
@@ -789,11 +819,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         }
         let matches =
             self.identifier_candidates_for_language(language_for_file(file), ident, Some(file));
-        self.memo
-            .file_identifier_cache
-            .lock()
-            .expect("file identifier cache poisoned")
-            .insert(key, matches.clone());
+        if self.can_publish() {
+            self.memo
+                .file_identifier_cache
+                .lock()
+                .expect("file identifier cache poisoned")
+                .insert(key, matches.clone());
+        }
         matches
     }
 
@@ -874,11 +906,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 .collect::<Vec<_>>();
             sort_units(&mut children);
             children.dedup();
-            self.memo
-                .children_cache
-                .lock()
-                .expect("definition children cache poisoned")
-                .insert(key, children.clone());
+            if self.can_publish() {
+                self.memo
+                    .children_cache
+                    .lock()
+                    .expect("definition children cache poisoned")
+                    .insert(key, children.clone());
+            }
             all_children.extend(children);
         }
         sort_units(&mut all_children);
@@ -946,11 +980,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
                 .collect::<Vec<_>>();
             sort_units(&mut members);
             members.dedup();
-            self.memo
-                .members_cache
-                .lock()
-                .expect("definition members cache poisoned")
-                .insert(key, members.clone());
+            if self.can_publish() {
+                self.memo
+                    .members_cache
+                    .lock()
+                    .expect("definition members cache poisoned")
+                    .insert(key, members.clone());
+            }
             all_members.extend(members);
         }
         sort_units(&mut all_members);
@@ -989,11 +1025,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             .collect::<Vec<_>>();
         sort_units(&mut members);
         members.dedup();
-        self.memo
-            .structured_members_cache
-            .lock()
-            .expect("structured definition members cache poisoned")
-            .insert(key, members.clone());
+        if self.can_publish() {
+            self.memo
+                .structured_members_cache
+                .lock()
+                .expect("structured definition members cache poisoned")
+                .insert(key, members.clone());
+        }
         members
     }
 
@@ -1014,35 +1052,26 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         {
             return *cached;
         }
-        let request = RelationalDefinitionRequest {
-            ordinal: 0,
-            language_scope: DefinitionLanguageScope::Language(language),
-            name: RelationalName::stable(package_fq_name(language, package)),
-            query: RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
-        };
-        let exists = match self
-            .analyzer
-            .relational_definition_batch_for_active_query(&[request])
-        {
-            RelationalBatchOutcome::Complete(mut results) => {
-                assert_eq!(results.len(), 1, "package point query returns one result");
-                matches!(
-                    results.remove(0).value,
-                    RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(true))
-                )
-            }
-            RelationalBatchOutcome::Cancelled => false,
-            RelationalBatchOutcome::Failed(error) => {
-                self.analyzer
-                    .record_query_failure(StoreError::new(error.message()));
-                false
-            }
-        };
-        self.memo
-            .package_cache
-            .lock()
-            .expect("package cache poisoned")
-            .insert(key, exists);
+        let mut values = self.query_values(
+            language,
+            vec![(
+                RelationalName::stable(package_fq_name(language, package)),
+                RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
+            )],
+        );
+        let exists = matches!(
+            values.pop(),
+            Some(RelationalDefinitionValue::PackageRelation(
+                PackageRelationValue::Exists(true)
+            ))
+        );
+        if self.can_publish() {
+            self.memo
+                .package_cache
+                .lock()
+                .expect("package cache poisoned")
+                .insert(key, exists);
+        }
         exists
     }
 
@@ -1084,11 +1113,13 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             let exists = package_exists
                 || has_descendants
                 || !self.fqn_for_language(prefix, language).is_empty();
-            self.memo
-                .prefix_cache
-                .lock()
-                .expect("fqn prefix cache poisoned")
-                .insert(key, exists);
+            if self.can_publish() {
+                self.memo
+                    .prefix_cache
+                    .lock()
+                    .expect("fqn prefix cache poisoned")
+                    .insert(key, exists);
+            }
             if exists {
                 return true;
             }
@@ -1102,6 +1133,70 @@ mod definition_lookup_tests {
     use super::*;
     use crate::analyzer::{RubyAnalyzer, TestProject};
     use std::path::PathBuf;
+
+    #[test]
+    fn cancelled_relational_lookup_does_not_memoize_an_empty_answer() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
+            .file("widget.rb", "class Widget\nend\n")
+            .build();
+        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Ruby);
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+        {
+            let _scope =
+                crate::analyzer::AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
+            assert!(lookup.fqn("Widget").is_empty());
+            assert!(
+                lookup
+                    .file_identifier(&fixture.file("widget.rb"), "Widget")
+                    .is_empty()
+            );
+        }
+
+        let recovered = lookup.fqn("Widget");
+        assert!(
+            recovered.iter().any(|unit| unit.fq_name() == "Widget"),
+            "{recovered:?}"
+        );
+        assert_eq!(
+            lookup.file_identifier(&fixture.file("widget.rb"), "Widget"),
+            recovered,
+            "a cancelled file-identifier read must be retried too"
+        );
+        assert!(lookup.memo.fqn_cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_relational_lookup_does_not_publish_later_memo_entries() {
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Ruby)
+            .file("widget.rb", "class Widget\nend\n")
+            .build();
+        let analyzer = RubyAnalyzer::from_project(fixture.project().clone());
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Ruby);
+        // The store rejects an exact-name question with no name. This takes
+        // the real Failed batch path without relying on an I/O race.
+        assert!(
+            lookup
+                .query_values(
+                    Language::Ruby,
+                    vec![(
+                        RelationalName::stable(FqName::new()),
+                        RelationalDefinitionQuery::ExactName
+                    )]
+                )
+                .is_empty()
+        );
+        let recovered = lookup.fqn("Widget");
+        assert!(
+            recovered.iter().any(|unit| unit.fq_name() == "Widget"),
+            "{recovered:?}"
+        );
+        assert!(
+            lookup.memo.fqn_cache.lock().unwrap().is_empty(),
+            "a lookup that observed a failed batch must not publish memo entries"
+        );
+    }
 
     /// Four Ruby files declaring one bare top-level method: two inside the
     /// file set a test passes, one outside it, and one file that declares an

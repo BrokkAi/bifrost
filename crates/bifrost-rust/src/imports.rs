@@ -74,6 +74,11 @@ pub struct RustImportInfo {
     /// An `extern crate` declaration binds the crate namespace only. It must
     /// not produce the zero-prefix named edge that a normal `use item` emits.
     pub is_extern_crate: bool,
+    /// Whether an `extern crate` declaration carries `#[macro_use]` and imports
+    /// the dependency's exported macros into the macro-use prelude.
+    /// Selective `#[macro_use(a, b)]` imports are intentionally unrepresented
+    /// and fall back to the gated boundary because this bit cannot carry names.
+    pub is_macro_use: bool,
 }
 
 impl RustImportInfo {
@@ -174,12 +179,51 @@ fn rust_external_crate_import(
         visibility: rust_item_visibility(node, source),
         path: vec![name.to_string()],
         is_extern_crate: true,
+        is_macro_use: rust_item_attribute(node, source, "macro_use")
+            .is_some_and(|attribute| attribute.child_by_field_name("arguments").is_none()),
     };
     Some(RustProjectedImport {
         import,
         owner: rust_import_owner(node, source, base_module),
         cfg_condition: rust_cfg_condition(node, source),
     })
+}
+
+/// Whether an item carries a preceding outer attribute with the exact path.
+///
+/// Tree-sitter-rust represents outer attributes as preceding siblings rather
+/// than children of the item. Walking the contiguous attribute run preserves
+/// that structure without interpreting the item's rendered source text.
+pub(crate) fn rust_item_has_attribute(node: Node<'_>, source: &str, expected: &str) -> bool {
+    rust_item_attribute(node, source, expected).is_some()
+}
+
+fn rust_item_attribute<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    expected: &str,
+) -> Option<Node<'tree>> {
+    let mut sibling = node.prev_named_sibling();
+    while let Some(attribute_item) = sibling {
+        if matches!(attribute_item.kind(), "line_comment" | "block_comment") {
+            sibling = attribute_item.prev_named_sibling();
+            continue;
+        }
+        if attribute_item.kind() != "attribute_item" {
+            break;
+        }
+        let Some(attribute) = attribute_item.named_child(0) else {
+            break;
+        };
+        let Some(path) = attribute.named_child(0) else {
+            break;
+        };
+        if source.get(path.start_byte()..path.end_byte()) == Some(expected) {
+            return Some(attribute);
+        }
+        sibling = attribute_item.prev_named_sibling();
+    }
+    None
 }
 
 pub fn rust_module_extents(
@@ -645,6 +689,7 @@ impl RustUseDeclaration {
             visibility: self.visibility.clone(),
             path,
             is_extern_crate: false,
+            is_macro_use: false,
         }
     }
 
@@ -681,6 +726,30 @@ fn rust_use_leaf_binder_node(node: Node<'_>, prefix_was_empty: bool) -> Option<N
 mod tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn selective_macro_use_is_not_a_blanket_macro_import() {
+        let source = "#[macro_use]\n// Preserve the attribute across comments.\nextern crate all;\n#[macro_use(a, b)]\nextern crate selected;\nextern crate ordinary;\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let imports = rust_import_projection(tree.root_node(), source, "");
+        let flags: Vec<_> = imports
+            .iter()
+            .map(|binding| {
+                (
+                    binding.import.info.identifier.as_deref().unwrap(),
+                    binding.import.is_macro_use,
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![("all", true), ("selected", false), ("ordinary", false)]
+        );
+    }
 
     #[test]
     fn import_binding_name_distinguishes_unnamed_named_and_glob() {

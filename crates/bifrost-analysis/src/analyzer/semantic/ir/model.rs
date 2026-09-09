@@ -175,6 +175,26 @@ impl ProcedureKind {
     }
 }
 
+/// Whether a procedure's authored body and signature describe the callable
+/// boundary that a call observes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureCallBoundary {
+    /// Calls can be bound to this procedure's receiver, formals, and returns.
+    #[default]
+    Direct,
+    /// A callable transformation may replace the authored boundary.
+    Unknown,
+}
+
+impl ProcedureCallBoundary {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Whether invoking a callable begins executing its body immediately.
 ///
 /// Some languages publish callable bodies whose invocation only creates a
@@ -326,6 +346,7 @@ pub struct ProcedureProperties {
     pub is_synthetic: bool,
     pub invocation: ProcedureInvocationKind,
     pub dispatch_extensibility: DispatchExtensibility,
+    pub call_boundary: ProcedureCallBoundary,
 }
 
 /// The positional or keyword domain accepted or produced at a call boundary.

@@ -53,12 +53,12 @@ use crate::analyzer::tier_demand::TierDemand;
 use crate::analyzer::{
     AnalyzerBuildTierAccess, AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType,
     CppTemplateMetadata, DeclarationInfo, DefinitionLanguageScope, FqName, IAnalyzer, ImportInfo,
-    InformationTier, Language, LanguageDialect, PackageAnchor, Project, ProjectFile, QueryScope,
-    QueryToken, Range, RelationalBatchError, RelationalBatchOutcome, RelationalCallableFact,
-    RelationalDefinitionLookup, RelationalDefinitionQuery, RelationalDefinitionRequest,
-    RelationalDefinitionResult, RelationalDefinitionValue, RubyMethodDispatchMode,
-    SearchSymbolCandidate, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
-    SummaryFileProjection,
+    InformationTier, Language, LanguageDialect, PackageAnchor, Project, ProjectFile,
+    QueryReadIncomplete, QueryScope, QueryToken, Range, RelationalBatchError,
+    RelationalBatchOutcome, RelationalCallableFact, RelationalDefinitionLookup,
+    RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionResult,
+    RelationalDefinitionValue, RubyMethodDispatchMode, SearchSymbolCandidate,
+    SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -2649,6 +2649,14 @@ impl QueryReadCache {
             .any(|active| Arc::ptr_eq(active, context))
         {
             return false;
+        }
+        // New nested scopes reuse these request memos. They must inherit the
+        // provenance of any earlier incomplete read, even after its original
+        // cancellation scope has closed.
+        for active in &self.contexts {
+            if let Err(reason) = active.read_completion() {
+                context.record_read_incomplete(reason);
+            }
         }
         self.contexts.push(Arc::clone(context));
         true
@@ -9764,6 +9772,9 @@ where
             let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
             Ok::<Option<Vec<CodeUnit>>, StoreError>(keep_going().then_some(definitions))
         })?;
+        if cancellation.is_cancelled() {
+            self.record_query_incomplete(QueryReadIncomplete::Cancelled);
+        }
         Ok(definitions
             .map(|definitions| (*definitions).clone())
             .unwrap_or_default())
@@ -9791,6 +9802,7 @@ where
             .active_query_cancellation()
             .is_some_and(|cancellation| cancellation.is_cancelled())
         {
+            self.record_query_incomplete(QueryReadIncomplete::Cancelled);
             return Ok(Vec::new());
         }
         let normalized = self.adapter.normalize_full_name(fq_name);
@@ -9827,7 +9839,10 @@ where
             })?;
         let mut rows = match outcome {
             RenderedDefinitionCandidateOutcome::Complete(rows) => rows,
-            RenderedDefinitionCandidateOutcome::Cancelled => return Ok(Vec::new()),
+            RenderedDefinitionCandidateOutcome::Cancelled => {
+                self.record_query_incomplete(QueryReadIncomplete::Cancelled);
+                return Ok(Vec::new());
+            }
         };
         let path_units = {
             let _path_scope = crate::profiling::scope(format!(
@@ -9977,6 +9992,7 @@ where
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
+            self.record_query_incomplete(QueryReadIncomplete::Cancelled);
             return;
         }
         let _scope = crate::profiling::scope("TreeSitterAnalyzer::prefetch_definitions");
@@ -10019,7 +10035,10 @@ where
                 cancellation.as_ref(),
             ) {
             Ok(RenderedDefinitionCandidateOutcome::Complete(rows)) => rows,
-            Ok(RenderedDefinitionCandidateOutcome::Cancelled) => return,
+            Ok(RenderedDefinitionCandidateOutcome::Cancelled) => {
+                self.record_query_incomplete(QueryReadIncomplete::Cancelled);
+                return;
+            }
             Err(error) => {
                 self.record_store_error(
                     error.context("prefetching definition candidates by short name"),
@@ -10265,6 +10284,9 @@ where
                     add(unit);
                 }
             }
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            self.record_query_incomplete(QueryReadIncomplete::Cancelled);
         }
         grouped
     }
@@ -12442,6 +12464,13 @@ where
         }
     }
 
+    pub(crate) fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
+        let contexts = self.query_read_cache_lock().contexts.clone();
+        for context in contexts {
+            context.record_read_incomplete(reason.clone());
+        }
+    }
+
     /// Route one analyzer-side store read through the request boundary: name
     /// the inputs it reads on every open read ledger, then record any failure.
     ///
@@ -13602,6 +13631,10 @@ where
 
     fn record_query_failure(&self, error: StoreError) {
         TreeSitterAnalyzer::record_store_error(self, error);
+    }
+
+    fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
+        TreeSitterAnalyzer::record_query_incomplete(self, reason);
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {

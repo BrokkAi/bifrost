@@ -86,6 +86,28 @@ Rendered qualified names serve people and protocols. Resolvers use the
 underlying package, type, member, local, and other segments. Reconstructing those
 segments from display text discards structure that the front end already knows.
 
+### Module and package source anchors
+
+A source-declared module uses its declaration item as its primary range.
+Rust's `pub mod m;` anchors in the declaring file, whether its contents live in
+`m.rs` or `m/mod.rs`; its signature is the declaration's source text. Inline
+Rust modules keep the range of their `mod m { ... }` item. Java packages likewise
+retain their `package` declaration ranges. Navigation selects the name token
+inside that item, as it does for other source declarations.
+
+A file-backed module with no declaration token, such as a Python package's
+`__init__.py`, navigates to the start of its backing file. A same-named class or
+reference inside that file is not a declaration of the module. Go records
+package membership and package-owned declarations rather than manufacturing a
+single package declaration spanning all its files.
+
+Rust crate roots reached through Cargo have a file-scope unit covering the root
+source file, starting at byte zero (line 1, column 1 for clients). In the absence
+of a `mod` item, Bifrost does not invent a module declaration or a `mod` signature
+for that directory. A namespace-only lookup can therefore report no single
+indexed declaration. The file-scope anchor remains available without choosing
+an unrelated declaration as the crate's definition.
+
 ## Identity vocabulary
 
 Different representations have different identity lifetimes. Treating all of
@@ -128,6 +150,36 @@ module-relative, nested-owner, exported, or otherwise visible. The shared
 layer carries the paths and candidate identities; the language front end owns
 the interpretation. Parsing import text with delimiters would lose exactly the
 grammar distinctions the resolver needs.
+
+### Python import roots
+
+Python module identities start at a supported packaging import root when one
+contains the source file. Bifrost searches ancestor directories, preferring the
+nearest project and the deepest containing root. It reads
+`tool.setuptools.packages.find.where` from `pyproject.toml` (#1971).
+
+Legacy `setup.py` files can also establish a root (#3075). Bifrost parses the
+Python syntax without executing the script and recognizes a direct call to an
+imported setuptools or distutils `setup` function with a `packages` argument:
+a literal `package_dir` mapping (`{}` or `{"": "source"}`) establishes the root
+regardless of the packages expression and takes precedence over discovery.
+Without `package_dir`, a nonempty literal package collection uses the script
+directory, while calls to imported setuptools `find_packages` or
+`find_namespace_packages` (including aliases) use their literal `where` argument
+or the script directory when omitted; dynamic roots and argument expansions do
+not establish a root. The selected directory is the import root even if it
+contains `__init__.py`. For example, Wirecloud's
+`src/setup.py` declares `packages=('wirecloud',)`, so
+`src/wirecloud/commons/utils/testcases.py` has module identity
+`wirecloud.commons.utils.testcases`.
+
+A filename such as `src`, an empty `__init__.py`, or the presence of `manage.py`
+alone does not establish a root. Unsupported dynamic packaging arguments do not
+supply a default root. Without supported packaging evidence, the existing
+outermost `__init__.py` package convention remains in effect; namespace paths
+without such a package retain their workspace-relative components. Import
+resolution and workspace-boundary checks use these same indexed identities.
+They do not search for matching suffixes or add alternate module names.
 
 ### Hierarchy and members
 

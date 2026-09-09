@@ -539,7 +539,12 @@ fn visit_rust_module(
     if in_test_region {
         parsed.mark_test_region(&code_unit);
     }
-    parsed.add_signature(code_unit.clone(), format!("mod {name} {{"));
+    let signature = if node.child_by_field_name("body").is_some() {
+        format!("mod {name} {{")
+    } else {
+        rust_bounded_declaration_label(node, source)
+    };
+    parsed.add_signature(code_unit.clone(), signature);
 
     if let Some(body) = node.child_by_field_name("body") {
         let mut impl_import_binder = ImportBinder::empty();
@@ -677,6 +682,23 @@ fn visit_rust_function(
     }
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    // `proc_macro_derive(Name)` exports its argument, not the function's name.
+    // Keep it a function: declaration-node lookup requires the exported name
+    // and the declaration identifier to agree.
+    if crate::imports::rust_item_has_attribute(node, source, "proc_macro")
+        || crate::imports::rust_item_has_attribute(node, source, "proc_macro_attribute")
+    {
+        return register_rust_macro(
+            file,
+            name,
+            package_name,
+            parent,
+            rust_range_from_node(node),
+            rust_function_signature(node, source),
+            in_test_region,
+            parsed,
+        );
+    }
     let signature = rust_impl_member_identity_signature(node, source).or_else(|| {
         node.child_by_field_name("parameters")
             .map(|parameters| rust_node_text(parameters, source).trim().to_string())
@@ -2283,6 +2305,42 @@ fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility
 #[cfg(test)]
 mod structured_package_tests {
     use super::*;
+
+    #[test]
+    fn procedural_macro_kinds_preserve_declaration_identifiers() {
+        let source = r#"
+#[proc_macro]
+// A comment does not detach the outer attribute from its item.
+pub fn bang(input: TokenStream) -> TokenStream { input }
+#[proc_macro_attribute]
+// Attribute macros also export the function identifier.
+pub fn decorate(args: TokenStream, input: TokenStream) -> TokenStream { input }
+#[proc_macro_derive(Derived)]
+pub fn derive_impl(input: TokenStream) -> TokenStream { input }
+pub fn plain() {}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "lib.rs");
+        let parsed = parse_rust_file(&file, source, &tree);
+        for (name, kind) in [
+            ("bang", CodeUnitType::Macro),
+            ("decorate", CodeUnitType::Macro),
+            ("derive_impl", CodeUnitType::Function),
+            ("plain", CodeUnitType::Function),
+        ] {
+            let unit = parsed
+                .top_level_declarations
+                .iter()
+                .find(|unit| unit.identifier() == name)
+                .expect("declaration");
+            assert_eq!(unit.kind(), kind, "{unit:?}");
+        }
+    }
 
     #[test]
     fn hidden_directory_is_one_structured_rust_package_segment() {

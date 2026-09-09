@@ -1,6 +1,6 @@
 use super::selectors::*;
 use super::*;
-use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryReadIncomplete, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,40 +30,129 @@ pub struct GetDefinitionByReferenceResult {
 pub struct DefinitionByReferenceLookupResult {
     pub query: DefinitionContextReferenceQuery,
     pub status: String,
+    #[serde(
+        default = "definition_lookup_complete_default",
+        skip_serializing_if = "definition_lookup_complete"
+    )]
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub definitions: Vec<DefinitionCandidate>,
     #[serde(default)]
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
 
+pub(super) fn definition_result_completion(
+    diagnostics: &[DefinitionDiagnostic],
+) -> (bool, Option<DefinitionLookupIncompleteReason>) {
+    let incomplete_reason = definition_lookup_incomplete_reason(diagnostics);
+    (incomplete_reason.is_none(), incomplete_reason)
+}
+
+fn definition_lookup_diagnostics_completion(
+    diagnostics: &[crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic],
+) -> (bool, Option<DefinitionLookupIncompleteReason>) {
+    let incomplete_reason = diagnostics
+        .iter()
+        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind));
+    (incomplete_reason.is_none(), incomplete_reason)
+}
+
 pub fn get_definitions_by_reference(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionByReferenceParams,
 ) -> GetDefinitionByReferenceResult {
-    let scope = AnalyzerQueryScope::new(analyzer);
+    get_definitions_by_reference_with_cancellation(analyzer, params, None)
+}
+
+pub fn get_definitions_by_reference_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionByReferenceParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> GetDefinitionByReferenceResult {
+    let scope = cancellation.map_or_else(
+        || AnalyzerQueryScope::new(analyzer),
+        |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+    );
     let token = scope.token();
     let _scope = profiling::scope("searchtools::get_definitions_by_reference");
 
     let mut results = Vec::with_capacity(params.references.len());
 
     for query in params.references {
-        results.push(resolve_definition_context_query(analyzer, token, query));
+        let mut result = resolve_definition_context_query(analyzer, token, query, cancellation);
+        if let Err(reason) = scope.read_completion() {
+            record_query_read_incomplete(&mut result, reason, cancellation);
+        }
+        results.push(result);
     }
 
     GetDefinitionByReferenceResult { results }
+}
+
+fn record_query_read_incomplete(
+    result: &mut DefinitionByReferenceLookupResult,
+    reason: QueryReadIncomplete,
+    cancellation: Option<&crate::CancellationToken>,
+) {
+    let (kind, incomplete_reason, message) = match reason {
+        QueryReadIncomplete::Cancelled
+            if cancellation.is_some_and(crate::CancellationToken::is_timed_out) =>
+        {
+            (
+                "definition_time_budget_exceeded",
+                DefinitionLookupIncompleteReason::TimeBudget,
+                "definition lookup exceeded its time budget; results are incomplete".to_string(),
+            )
+        }
+        QueryReadIncomplete::Cancelled => (
+            "cancelled",
+            DefinitionLookupIncompleteReason::Cancelled,
+            "definition lookup was cancelled; results are incomplete".to_string(),
+        ),
+        QueryReadIncomplete::StructureUnavailable(file) => (
+            "cpp_navigation_structure_unavailable",
+            DefinitionLookupIncompleteReason::StructureUnavailable,
+            format!(
+                "indexed syntax was unavailable for {file:?}; definition results are incomplete"
+            ),
+        ),
+        QueryReadIncomplete::StoreFailure(error) => (
+            "analysis_incomplete",
+            DefinitionLookupIncompleteReason::AnalysisFailure,
+            format!("indexed definition reads failed: {error}"),
+        ),
+    };
+    result.complete = false;
+    result.incomplete_reason = Some(incomplete_reason);
+    if !result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == kind)
+    {
+        result.diagnostics.push(DefinitionDiagnostic {
+            kind: kind.to_string(),
+            message,
+        });
+    }
 }
 
 pub(super) fn resolve_definition_context_query(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     query: DefinitionContextReferenceQuery,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> DefinitionByReferenceLookupResult {
     let units = match resolve_definition_context_symbol(analyzer, token, &query.symbol) {
         Ok(units) => units,
         Err(diagnostics) => {
+            let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
             return DefinitionByReferenceLookupResult {
                 query,
                 status: "not_found".to_string(),
+                complete,
+                incomplete_reason,
                 definitions: Vec::new(),
                 diagnostics,
             };
@@ -94,6 +183,8 @@ pub(super) fn resolve_definition_context_query(
                 return DefinitionByReferenceLookupResult {
                     query,
                     status: "not_found".to_string(),
+                    complete: false,
+                    incomplete_reason: Some(DefinitionLookupIncompleteReason::AnalysisFailure),
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
                         kind: "read_failed".to_string(),
@@ -143,7 +234,11 @@ pub(super) fn resolve_definition_context_query(
         .into_iter()
         .flat_map(|(file, source, requests)| {
             crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_exact_token_focus(
-                analyzer, requests, file, source,
+                analyzer,
+                requests,
+                file,
+                source,
+                cancellation,
             )
         })
         .collect();
@@ -276,9 +371,15 @@ pub(super) fn invalid_context_lookup(
     kind: &str,
     message: &str,
 ) -> DefinitionByReferenceLookupResult {
+    let (complete, incomplete_reason) = definition_result_completion(&[DefinitionDiagnostic {
+        kind: kind.to_string(),
+        message: message.to_string(),
+    }]);
     DefinitionByReferenceLookupResult {
         query,
         status: "invalid_location".to_string(),
+        complete,
+        incomplete_reason,
         definitions: Vec::new(),
         diagnostics: vec![DefinitionDiagnostic {
             kind: kind.to_string(),
@@ -296,29 +397,69 @@ pub(super) fn collapse_context_outcomes(
     let Some(first) = outcomes.first() else {
         return invalid_context_lookup(query, "target_not_found", "no target candidates found");
     };
+    let incomplete_reason = outcomes
+        .iter()
+        .find_map(|outcome| definition_lookup_diagnostics_completion(&outcome.diagnostics).1);
     let mut render_cache = DefinitionCandidateRenderCache::default();
     let first_key = semantic_outcome_key(analyzer, token, first, &mut render_cache);
     if outcomes.iter().skip(1).all(|outcome| {
         semantic_outcome_key(analyzer, token, outcome, &mut render_cache) == first_key
     }) {
-        return render_definition_reference_lookup(
+        let mut result = render_definition_reference_lookup(
             analyzer,
             token,
             query,
             first.clone(),
             &mut render_cache,
         );
+        if result.incomplete_reason.is_none() {
+            result.incomplete_reason = incomplete_reason;
+        }
+        for outcome in outcomes.iter().skip(1) {
+            for diagnostic in &outcome.diagnostics {
+                if definition_lookup_incomplete_reason_for_kind(&diagnostic.kind).is_some()
+                    && !result
+                        .diagnostics
+                        .iter()
+                        .any(|existing| existing.kind == diagnostic.kind)
+                {
+                    result.diagnostics.push(definition_by_reference_diagnostic(
+                        &result.query,
+                        diagnostic.clone(),
+                    ));
+                }
+            }
+        }
+        result.complete = result.incomplete_reason.is_none();
+        return result;
     }
 
+    let mut diagnostics = vec![DefinitionDiagnostic {
+        kind: "ambiguous_reference_target".to_string(),
+        message:
+            "target appears multiple times in context and resolves to different semantic outcomes"
+                .to_string(),
+    }];
+    for outcome in &outcomes {
+        for diagnostic in &outcome.diagnostics {
+            if definition_lookup_incomplete_reason_for_kind(&diagnostic.kind).is_some() {
+                let rendered = definition_by_reference_diagnostic(&query, diagnostic.clone());
+                if !diagnostics
+                    .iter()
+                    .any(|existing| existing.kind == rendered.kind)
+                {
+                    diagnostics.push(rendered);
+                }
+            }
+        }
+    }
     DefinitionByReferenceLookupResult {
         query,
         status: "ambiguous".to_string(),
+        complete: incomplete_reason.is_none(),
+        incomplete_reason,
         definitions: Vec::new(),
-        diagnostics: vec![DefinitionDiagnostic {
-            kind: "ambiguous_reference_target".to_string(),
-            message: "target appears multiple times in context and resolves to different semantic outcomes"
-                .to_string(),
-        }],
+        diagnostics,
     }
 }
 
@@ -329,10 +470,13 @@ pub(super) fn render_definition_reference_lookup(
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionByReferenceLookupResult {
+    let incomplete_reason = definition_lookup_diagnostics_completion(&outcome.diagnostics).1;
     if outcome.lexical_definition.is_some() {
         return DefinitionByReferenceLookupResult {
             query,
             status: "no_definition".to_string(),
+            complete: incomplete_reason.is_none(),
+            incomplete_reason,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
                 kind: "local_binding_requires_location".to_string(),
@@ -341,20 +485,30 @@ pub(super) fn render_definition_reference_lookup(
             }],
         };
     }
-    let diagnostics = outcome
+    let mut diagnostics: Vec<_> = outcome
         .diagnostics
         .into_iter()
         .map(|diagnostic| definition_by_reference_diagnostic(&query, diagnostic))
         .collect();
+    let candidate_count = outcome.definitions.len();
+    let definitions =
+        definition_candidates_with_cache(analyzer, token, &outcome.definitions, render_cache);
+    if definitions.len() < candidate_count {
+        diagnostics.push(DefinitionDiagnostic {
+            kind: "source_unavailable".to_string(),
+            message: format!(
+                "not all indexed definition candidates could be rendered: {:?}",
+                outcome.definitions
+            ),
+        });
+    }
+    let (complete, incomplete_reason) = definition_result_completion(&diagnostics);
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),
-        definitions: definition_candidates_with_cache(
-            analyzer,
-            token,
-            &outcome.definitions,
-            render_cache,
-        ),
+        complete,
+        incomplete_reason,
+        definitions,
         diagnostics,
     }
 }
@@ -407,5 +561,13 @@ pub(super) fn semantic_outcome_key(
         .filter_map(|unit| definition_candidate_with_cache(analyzer, token, unit, render_cache))
         .map(|candidate| definition_candidate_key(&candidate))
         .collect();
-    (outcome.status.as_str().to_string(), definition)
+    let incomplete_reason = outcome
+        .diagnostics
+        .iter()
+        .find_map(|diagnostic| definition_lookup_incomplete_reason_for_kind(&diagnostic.kind));
+    (
+        outcome.status.as_str().to_string(),
+        definition,
+        incomplete_reason,
+    )
 }

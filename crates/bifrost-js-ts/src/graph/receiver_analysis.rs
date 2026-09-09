@@ -5,15 +5,19 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
+use crate::access_chain::{JsTsImportedMemberChainResolution, resolve_import_member_chain};
 use crate::imports::{js_ts_module_identity, require_call_module_specifier};
 use crate::imports::{
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
-    resolve_js_ts_module_specifier,
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_imported_member_chain,
+    resolve_js_ts_module_binding_candidates, resolve_js_ts_module_specifier,
 };
 use crate::providers::{JsTsSource, compute_direct_ancestors};
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::parse_js_ts_tree;
-use crate::syntax::{JsTsImportBinder, inline_object_type, slice, static_member_property};
+use crate::syntax::{
+    JsTsImportBinder, JsTsImportBindingResolution, inline_object_type, slice,
+    static_member_property,
+};
 use crate::ts_owners::{
     jsts_identifier_candidates, jsts_indexed_callable_node,
     ts_resolve_type_node_to_property_owner_outcome, ts_resolve_type_text_to_property_owners,
@@ -1457,7 +1461,12 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let module_specifier =
             require_call_module_specifier(object, self.source).or_else(|| {
                 let binding_name = simple_identifier_text(object, self.source)?;
-                let binding = self.imports.binding(binding_name)?;
+                let JsTsImportBindingResolution::Exact(binding) =
+                    self.imports.binding_at(binding_name, object.start_byte())
+                else {
+                    return None;
+                };
+                let binding = &binding.binding;
                 matches!(
                     binding.kind,
                     ImportKind::Namespace | ImportKind::CommonJsRequire
@@ -1488,6 +1497,15 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        if let Some(outcome) = self.summarize_imported_member_chain(
+            member_expression,
+            call_byte,
+            depth,
+            budget,
+            tracker,
+        ) {
+            return outcome;
+        }
         let Some(object) = member_expression.child_by_field_name("object") else {
             return ReceiverAnalysisOutcome::Unknown;
         };
@@ -1529,6 +1547,67 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             })
             .collect();
         ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
+    }
+
+    fn summarize_imported_member_chain(
+        &self,
+        member_expression: Node<'tree>,
+        call_byte: usize,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        let JsTsImportedMemberChainResolution::Exact(chain) =
+            resolve_import_member_chain(member_expression, self.source)
+        else {
+            return None;
+        };
+        let JsTsImportBindingResolution::Exact(binding) = self
+            .imports
+            .binding_at(chain.root_name(self.source), call_byte)
+        else {
+            return None;
+        };
+        let resolved = resolve_js_ts_imported_member_chain(
+            self.host,
+            self.support,
+            self.language,
+            self.file,
+            &binding.binding,
+            &chain,
+            Some(&self.aliases),
+            true,
+            budget,
+        );
+        match resolved {
+            ReceiverAnalysisOutcome::Precise(endpoints) => {
+                let functions = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.declaration)
+                    .filter(|unit| unit.is_function())
+                    .collect::<Vec<_>>();
+                (!functions.is_empty())
+                    .then(|| {
+                        self.summarize_external_functions(functions, depth + 1, budget, tracker)
+                    })
+                    .flatten()
+            }
+            ReceiverAnalysisOutcome::Ambiguous(endpoints) => {
+                Some(ReceiverAnalysisOutcome::Ambiguous(
+                    endpoints
+                        .into_iter()
+                        .map(|endpoint| ReceiverValue::ClassOrStaticObject(endpoint.declaration))
+                        .collect(),
+                ))
+            }
+            ReceiverAnalysisOutcome::Unknown => Some(ReceiverAnalysisOutcome::Unknown),
+            ReceiverAnalysisOutcome::Unsupported { reason } => {
+                Some(ReceiverAnalysisOutcome::Unsupported { reason })
+            }
+            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+                Some(ReceiverAnalysisOutcome::ExceededBudget { limit })
+            }
+        }
     }
 
     /// What a call of `callee` produces, read from `function`'s body.

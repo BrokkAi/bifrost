@@ -690,6 +690,9 @@ fn workspace_member_lookup(
         };
         match external_member_lookup(overlay, &symbol_id, kind, member) {
             present @ MemberLookup::Present(_) => return present,
+            MemberLookup::DeclarationAbsent => {
+                unreachable!("external model lookup is declaration-complete or unknown")
+            }
             MemberLookup::Absent => {}
             MemberLookup::Unknown(reason) => return MemberLookup::Unknown(reason),
         }

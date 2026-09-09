@@ -40,7 +40,7 @@ use crate::value_flow::{
 };
 
 use super::FieldSlotIndex;
-use super::field_slots::class_order;
+use super::field_slots::{MemberStoreEvidence, class_order};
 use super::plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason};
 use super::summary::{
     ClassSetAcquisitionCuts, PreparedClassSetSummaries, TypeFlowSummaryProfile,
@@ -515,7 +515,8 @@ pub fn solve_type_flow_for_root(
                     *request.budget = trial_request.budget.clone();
                 }
                 let metrics = trial_result.result().metrics();
-                let trial_interpreted = interpret(workspace, adapter, root, &plan, &trial_result);
+                let trial_interpreted =
+                    interpret(workspace, adapter, field_slots, root, &plan, &trial_result);
                 if metrics.reusable_summary_hits > 0 && trial_interpreted.findings.is_empty() {
                     iteration_budget = trial_semantic_budget;
                     interpreted = trial_interpreted;
@@ -561,7 +562,7 @@ pub fn solve_type_flow_for_root(
                         );
                         result?
                     };
-                    interpreted = interpret(workspace, adapter, root, &plan, &result);
+                    interpreted = interpret(workspace, adapter, field_slots, root, &plan, &result);
                     interpreted.reusable_summary_hits = metrics.reusable_summary_hits;
                     interpreted.reusable_summary_misses = metrics.reusable_summary_misses;
                     interpreted.reusable_root_summary_hits = metrics.reusable_root_summary_hits;
@@ -598,7 +599,7 @@ pub fn solve_type_flow_for_root(
                     );
                     result?
                 };
-                interpreted = interpret(workspace, adapter, root, &plan, &result);
+                interpreted = interpret(workspace, adapter, field_slots, root, &plan, &result);
                 interpreted.published_summaries = summaries.publish_complete(&result, request);
             }
             let maintenance = summaries.maintenance_metrics();
@@ -734,6 +735,7 @@ fn dispatch_hint_flags(
 fn interpret(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
     root: &ProcedureHandle,
     plan: &TypeFlowPlan,
     result: &ValueFlowSummaryResult,
@@ -754,6 +756,7 @@ fn interpret(
             ValueFlowSinkOutcome::Reached(meetings) => reached_class_set(
                 workspace,
                 adapter,
+                field_slots,
                 site,
                 plan,
                 result,
@@ -861,6 +864,7 @@ fn unreached_reason(
 fn reached_class_set(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
     site: MemberAccessSite,
     plan: &TypeFlowPlan,
     result: &ValueFlowSummaryResult,
@@ -940,6 +944,21 @@ fn reached_class_set(
                 MemberLookup::Present(hit) => {
                     member_declarations.push((identity.clone(), hit));
                 }
+                MemberLookup::DeclarationAbsent => match field_slots.member_store_evidence(
+                    workspace,
+                    adapter,
+                    identity,
+                    &site.member,
+                ) {
+                    MemberStoreEvidence::NoStore if complete_receiver_set => absent.push(index),
+                    MemberStoreEvidence::NoStore => {}
+                    MemberStoreEvidence::Stored if site.kind == MemberAccessKind::Load => {}
+                    // A stored value is not a callable declaration. Keep the
+                    // dispatch remainder open instead of inventing a target.
+                    MemberStoreEvidence::Stored | MemberStoreEvidence::Unknown => {
+                        push_reason(&mut unknown, UnknownReason::FieldSlotIncomplete)
+                    }
+                },
                 MemberLookup::Absent if complete_receiver_set => absent.push(index),
                 MemberLookup::Absent => {}
                 MemberLookup::Unknown(reason) => push_reason(&mut unknown, reason),

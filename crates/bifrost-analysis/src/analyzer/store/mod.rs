@@ -2424,8 +2424,14 @@ impl AnalyzerStore {
         #[cfg(test)]
         let conn = {
             let mut conn = conn;
-            let snapshots = current_test_workspace_snapshots(&conn)?;
-            self.select_workspace_snapshots(&mut conn, &snapshots)?;
+            // Streaming readers are query-only, so they cannot accept the
+            // temp workspace-selection writes below. Streaming store reads
+            // use the persisted blob tables directly and do not need those
+            // revisioned views.
+            if !self.streaming_read_active() {
+                let snapshots = current_test_workspace_snapshots(&conn)?;
+                self.select_workspace_snapshots(&mut conn, &snapshots)?;
+            }
             conn
         };
         Ok(conn)
@@ -7015,7 +7021,7 @@ struct RustModuleRow {
 }
 
 /// One `rust_import_targets` row. Named fields rather than positional columns
-/// because there are twelve of them at the binding site.
+/// because there are fourteen of them at the binding site.
 #[derive(Debug)]
 struct RustImportTargetRow {
     ordinal: i64,
@@ -7024,6 +7030,7 @@ struct RustImportTargetRow {
     imported_name: Option<String>,
     is_glob: i64,
     is_extern_crate: i64,
+    is_macro_use: i64,
     visibility: String,
     cfg_condition: String,
     owner_module: String,
@@ -7065,6 +7072,7 @@ impl RustFactRows {
                     imported_name: target.imported_name.clone(),
                     is_glob: bool_to_i64(target.is_glob),
                     is_extern_crate: bool_to_i64(target.is_extern_crate),
+                    is_macro_use: bool_to_i64(target.is_macro_use),
                     visibility: encode_rust_visibility(&target.visibility),
                     cfg_condition: encode_rust_cfg_condition(&target.cfg_condition),
                     owner_module: target.owner_module.clone(),
@@ -7321,9 +7329,9 @@ fn insert_rust_fact_rows(
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_import_targets(
                blob_id, lang, ordinal, module_path, bound_name, imported_name, is_glob,
-               is_extern_crate, visibility, cfg_condition, owner_module, owner_start,
-               owner_end, local_start, local_end
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+               is_extern_crate, is_macro_use, visibility, cfg_condition, owner_module,
+               owner_start, owner_end, local_start, local_end
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
         for row in &rows.import_targets {
             stmt.execute(params![
@@ -7335,6 +7343,7 @@ fn insert_rust_fact_rows(
                 row.imported_name,
                 row.is_glob,
                 row.is_extern_crate,
+                row.is_macro_use,
                 row.visibility,
                 row.cfg_condition,
                 row.owner_module,
@@ -7525,7 +7534,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
         let mut stmt = conn.prepare_cached(
             "SELECT module_path, bound_name, imported_name, is_glob, visibility,
                     owner_module, owner_start, owner_end, local_start, local_end,
-                    cfg_condition, is_extern_crate
+                    cfg_condition, is_extern_crate, is_macro_use
              FROM rust_import_targets
              WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
@@ -7537,6 +7546,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
                     imported_name: row.get(2)?,
                     is_glob: row.get::<_, i64>(3)? != 0,
                     is_extern_crate: row.get::<_, i64>(11)? != 0,
+                    is_macro_use: row.get::<_, i64>(12)? != 0,
                     visibility: RustVisibility::Private,
                     cfg_condition: RustCfgCondition::Always,
                     owner_module: row.get(5)?,
@@ -25424,6 +25434,8 @@ mod tests {
                     target.module_path.as_str(),
                     target.bound_name.as_deref(),
                     target.is_glob,
+                    target.is_extern_crate,
+                    target.is_macro_use,
                     target.owner_module.as_str(),
                     target.local_extent.is_some(),
                 )
@@ -25432,18 +25444,27 @@ mod tests {
         assert_eq!(
             imports,
             vec![
-                ("alpha", Some("Exported"), false, "", false),
-                ("beta", Some("Alias"), false, "", false),
-                ("gamma", None, true, "", false),
-                ("delta", Some("Private"), false, "", false),
-                ("crate", Some("Scoped"), false, "inline", false),
-                ("crate", Some("Local"), false, "inline", true),
+                ("", Some("facade"), false, true, true, "", false),
+                ("alpha", Some("Exported"), false, false, false, "", false),
+                ("beta", Some("Alias"), false, false, false, "", false),
+                ("gamma", None, true, false, false, "", false),
+                ("delta", Some("Private"), false, false, false, "", false),
+                (
+                    "crate",
+                    Some("Scoped"),
+                    false,
+                    false,
+                    false,
+                    "inline",
+                    false,
+                ),
+                ("crate", Some("Local"), false, false, false, "inline", true,),
             ],
             "import rows were {:?}",
             facts.import_targets
         );
-        assert_eq!(facts.import_targets[0].visibility, RustVisibility::Public);
-        assert_eq!(facts.import_targets[3].visibility, RustVisibility::Private);
+        assert_eq!(facts.import_targets[1].visibility, RustVisibility::Public);
+        assert_eq!(facts.import_targets[4].visibility, RustVisibility::Private);
 
         let modules: Vec<_> = facts
             .modules
@@ -25526,6 +25547,12 @@ mod tests {
                     "delta",
                     Some("Private"),
                     brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
+                ),
+                (
+                    "facade",
+                    "facade",
+                    None,
+                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Namespace
                 ),
             ],
             "only the root-scope bindings reach a root-scope include: {:?}",
@@ -25890,6 +25917,8 @@ mod tests {
     /// inline and a file module, and mentions identifiers in code, a comment,
     /// and a string.
     const RUST_USAGE_FACT_FIXTURE: &str = "\
+#[macro_use]
+extern crate facade;
 pub use alpha::Exported;
 pub use beta::Renamed as Alias;
 pub use gamma::*;

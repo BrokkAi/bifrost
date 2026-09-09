@@ -33,6 +33,19 @@ pub fn is_rust_declaration_name(node: Node<'_>) -> bool {
     ) && parent.child_by_field_name("name") == Some(node)
 }
 
+/// Whether this syntax node is Rust's standalone underscore placeholder.
+///
+/// Tree-sitter represents `_` as its anonymous `_` token in patterns, as an
+/// `identifier` in bindings such as `use Trait as _`, and as a
+/// `type_identifier` in inferred type positions. None introduces or names a
+/// reference. Identifiers that merely begin with an underscore remain ordinary
+/// referenceable names.
+pub fn is_rust_non_reference_underscore(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "_"
+        || (matches!(node.kind(), "identifier" | "type_identifier")
+            && simple_node_text(node, source).as_deref() == Some("_"))
+}
+
 pub fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {

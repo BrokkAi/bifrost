@@ -38,6 +38,15 @@ limits before publishing the artifact as immutable. A partially understood
 construct retains its facts and records a scoped gap; missing edges remain
 explicit.
 
+A declaration's body does not always describe the callable exposed to its
+callers. Python decorators can replace that callable, changing its arguments
+and results. Decorated bodies remain available for analysis, but their call
+boundaries stay open: the oracle withholds argument and return bindings until
+the callable's behavior is established. Decorator names and copied metadata
+alone do not establish that behavior.
+The modeled built-in `staticmethod` and `classmethod` descriptors retain their
+supported bindings when their identities and class namespace are proven.
+
 Artifact keys are durable validity identities. Handles used inside one
 materialization also retain artifact-instance identity. This prevents a dense
 value or program-point ID from being paired with rows from another partial
@@ -152,6 +161,16 @@ sanitizer behavior, while fact topology tracks carriers and sink meetings.
 | Taint | Set-oriented sources and sinks over the IDE-style class-set domain; compatible policies can share one solve | A finding requires a propagated source-to-sink meeting; selector co-presence alone is insufficient |
 | Typestate | Finite protocol states and uncertainty over bound subjects; forward and backward execution share semantic edges | Findings retain protocol state, certainty, analysis completion, and witnesses |
 | Class-set type flow | Seeds class atoms and explicit unknown atoms, then reuses the value-flow solver for receiver propagation | Unknown or incomplete class sets remain typed unknown or incomplete results |
+
+Python member absence needs more than a declaration lookup: another procedure
+can install an instance attribute. The class-set engine consults the cached
+workspace store survey before accepting declaration-only absence. Attributed
+writes are keyed by class and member; writes with an unknown receiver keep the
+named member open. An unknown attribute name or an incomplete survey keeps the
+relevant surface open. Member guards such as `hasattr` consult that same survey
+before excluding a receiver class. A possible store does not invent a callable declaration
+or an exhaustive dispatch target. The survey shares the field-slot index's
+validity, bounded persistence, and replay accounting.
 
 Each client keeps separate plans and result types. A taint class, protocol
 state, and inferred class identity retain distinct types. Language-specific
