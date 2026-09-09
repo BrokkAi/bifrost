@@ -956,7 +956,40 @@ pub(super) fn call_binding_expansions(
     if formal_layout_id.is_none() {
         formal_layout_id = signature_id.clone();
     }
-    let report = Arc::new(call_binding_report(&file, &shape.report, target));
+    let mut report = call_binding_report(&file, &shape.report, target);
+    // The initial producer consumes exact source signatures. Model signature
+    // substitution must not lend a different signature's proof to these rows.
+    let conversion_signature = if model_callable_id.is_none() {
+        signature_id.as_deref()
+    } else {
+        None
+    };
+    bindings.populate_conversions(analyzer, &mut report, conversion_signature);
+    let unknown_conversions: Vec<_> = report
+        .conversion_facts
+        .iter()
+        // Receiver/default/terminal rows have no source actual to convert.
+        // Their completeness is owned by the binder below.
+        .filter(|fact| fact.argument_id.is_some())
+        .filter_map(|fact| {
+            fact.result
+                .as_ref()
+                .err()
+                .map(|reason| (&fact.argument_id, reason))
+        })
+        .collect();
+    if !unknown_conversions.is_empty() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: crate::analyzer::common::language_for_file(&file).config_label(),
+            message: format!(
+                "call_bindings conversion typing is incomplete: {unknown_conversions:?}"
+            ),
+        });
+    }
+    let report = Arc::new(report);
     // The owner identity is meaningful only when this call's shared binder
     // emitted an exact receiver/implicit row. In particular, do not attach a
     // model member's owner to static, unestablished, or terminal rows.

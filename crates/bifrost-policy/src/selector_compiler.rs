@@ -844,7 +844,7 @@ impl<'a> PolicySelectorSession<'a> {
             check_exhaustive_selector_rows(&rows)?;
             products.push(rows);
         }
-        let merged = merge_unit_rows(products);
+        let merged = merge_unit_rows(query, products);
         // Every cumulative cap the whole execution enforces, summed over the
         // units. Reaching one means the whole execution might have truncated
         // somewhere in its own order, so the merged rows are not its rows.
@@ -2466,7 +2466,12 @@ impl<'a> SelectorUnits<'a> {
         query: &CodeQuery,
         selector_path: &str,
     ) -> Result<Vec<ProjectFile>, PolicySelectorSessionError> {
-        if !PlanPartitioning::classify(&query.plan).is_by_seed() {
+        // Selector products contain live selected-site lists, already deduplicated
+        // within each file. Unlike row products, they cannot retain branch
+        // contributions until a global branch-major merge.
+        if matches!(query.plan.source, CodeQueryPlanSource::Set { .. })
+            || !PlanPartitioning::classify(&query.plan).is_by_seed()
+        {
             return Err(PolicySelectorSessionError::Widen(
                 WidenReason::PlanCrossesSeeds,
             ));

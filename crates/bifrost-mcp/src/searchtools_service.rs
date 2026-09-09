@@ -2360,21 +2360,32 @@ impl SearchToolsService {
     /// constructor opens, so an ephemeral cache is always an explicit choice.
     /// See [`WorkspaceAnalyzer::build_ephemeral_footgun`] for the full rule.
     ///
-    /// Two callers legitimately want it. One-shot audit drivers (the MCP
+    /// One-shot audit drivers (the MCP
     /// property fuzzer) get two things at once: absent an explicit catalog or
     /// cache override, nothing is written into the target checkout, which
     /// matters when the operator does not own it, and
     /// because every file is parsed fresh, session-only evidence such as
     /// tree-sitter ERROR nodes (`IAnalyzer::parse_errors`) is available for the
     /// whole workspace rather than only for the blobs that missed the cache.
-    /// Scoped sessions ([`crate::scoped_project`]) want it because their partial
-    /// file set must not become the workspace's persisted picture of itself.
+    /// Scoped sessions use [`Self::new_manual_scoped_persisted_for_project`]
+    /// to reuse persistent facts through an isolated session projection.
     pub fn new_manual_ephemeral_footgun_for_project(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
         let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config)
             .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
+        Self::new_manual_from_workspace(project, workspace)
+    }
+
+    /// Construct a manual scoped service that shares the root's persistent
+    /// blob facts while owning an isolated, session-lived file projection.
+    pub fn new_manual_scoped_persisted_for_project(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, String> {
+        let workspace = WorkspaceAnalyzer::build_scoped_persisted(Arc::clone(&project), config)
+            .map_err(|error| format!("Failed to build scoped persisted workspace: {error}"))?;
         Self::new_manual_from_workspace(project, workspace)
     }
 

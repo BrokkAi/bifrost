@@ -7,6 +7,11 @@
 use tree_sitter::Node;
 
 use brokk_bifrost_rust::declarations::{rust_node_text, rust_nominal_type_path};
+use brokk_bifrost_rust::ownership::{
+    RustOwnershipClass, RustOwnershipIncomplete, RustOwnershipIndex, RustReferenceCoercion,
+    rust_dereference_operand, rust_node_is_in_unsafe_context, rust_reference_expression_value,
+    rust_reference_is_mutable, rust_reference_type_referent,
+};
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
@@ -22,7 +27,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v9";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v10";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
@@ -52,7 +57,7 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, initial_work) =
+        let (inventory, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -74,6 +79,8 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
                 }
             };
 
+        let RustProcedureInventory { specs, ownership } = inventory;
+
         // One file prescan, shared by every procedure: what this file states
         // about its own functions' return types, its struct declarations, and
         // which of those structs run no destructor.
@@ -85,7 +92,14 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, &facts, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    &facts,
+                    &ownership,
+                    spec,
+                    staged_budget,
+                    cancellation,
+                )
             },
         )
     }
@@ -155,7 +169,12 @@ struct ProcedureSpec<'tree> {
     callable: Node<'tree>,
 }
 
-type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+struct RustProcedureInventory<'tree> {
+    specs: Vec<ProcedureSpec<'tree>>,
+    ownership: RustOwnershipIndex<'tree, 'tree>,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<RustProcedureInventory<'tree>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -172,6 +191,21 @@ fn enumerate_procedures<'tree>(
     let root = prepared.tree().root_node();
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "rust-source", budget)?;
+    let ownership = match RustOwnershipIndex::build(root, prepared.source(), |entries| {
+        if cancellation.is_cancelled() {
+            return Err(None);
+        }
+        inventory
+            .observe_additional_work(SemanticWork {
+                nested_entries: entries,
+                ..SemanticWork::default()
+            })
+            .map_err(Some)
+    }) {
+        Ok(ownership) => ownership,
+        Err(Some(stop)) => return Ok(stop.into_outcome()),
+        Err(None) => return Ok(inventory.cancelled()),
+    };
     let mut specs = Vec::new();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -249,7 +283,7 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(inventory.complete(specs))
+    Ok(inventory.complete(RustProcedureInventory { specs, ownership }))
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -444,6 +478,7 @@ fn callable_shape<'tree>(
             },
             dispatch_extensibility: rust_callable_dispatch_extensibility(node),
             call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
         },
     ))
 }
@@ -537,9 +572,13 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// Exact declared or structurally inferred type evidence for bindings.
+    value_types: HashMap<ValueId, RustValueType<'tree>>,
+    return_type: Option<Node<'tree>>,
     definitely_non_dropping: HashSet<ValueId>,
     /// What this file states about its own functions, structs, and destructors.
-    facts: &'targets RustFileFacts,
+    facts: &'targets RustFileFacts<'tree>,
+    ownership: &'targets RustOwnershipIndex<'tree, 'tree>,
     /// The struct or array shape each value provably holds, which is what lets
     /// a field or index place name a memory location this procedure owns.
     value_shapes: HashMap<ValueId, RustValueShape>,
@@ -569,6 +608,21 @@ enum RustValueShape {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum RustValueType<'tree> {
+    Declared(Node<'tree>),
+    Borrowed {
+        mutable: bool,
+        referent: Node<'tree>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RustTypeOperation {
+    Dereference,
+    Borrow { mutable: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
 struct LocalBinding {
     declaration_start: usize,
     visible_from: usize,
@@ -579,7 +633,8 @@ struct LocalBinding {
 
 fn lower_procedure<'tree>(
     prepared: &'tree PreparedSyntaxTree,
-    facts: &RustFileFacts,
+    facts: &RustFileFacts<'tree>,
+    ownership: &RustOwnershipIndex<'tree, 'tree>,
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
@@ -607,8 +662,11 @@ fn lower_procedure<'tree>(
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        value_types: HashMap::default(),
+        return_type: spec.callable.child_by_field_name("return_type"),
         definitely_non_dropping: HashSet::default(),
         facts,
+        ownership,
         value_shapes: HashMap::default(),
         field_locators: HashMap::default(),
         constant_index_values: HashMap::default(),
@@ -677,14 +735,24 @@ fn lower_procedure<'tree>(
             return_source,
             expression_value_kind(return_source),
         )?;
+        let transferred =
+            context.value(&mut builder, implicit_return, SemanticValueKind::Temporary)?;
         let return_value =
             context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_ownership_transfer(
+            &mut builder,
+            implicit_return,
+            return_source,
+            source,
+            transferred,
+            context.return_type.map(RustValueType::Declared),
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
             SemanticEffect::ValueFlow {
                 kind: ValueFlowKind::Return,
-                source,
+                source: transferred,
                 target: return_value,
             },
         )?;
@@ -797,13 +865,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // The declared parameter type states the shape directly. A
             // receiver declares none, so it takes the shape of the type its
             // enclosing `impl` block names.
-            let declared_shape = if slot.receiver {
+            let declared_type = if slot.receiver {
                 rust_impl_self_type(callable)
-                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
             } else {
                 node.child_by_field_name("type")
-                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
             };
+            if let Some(declared_type) = declared_type {
+                let value_type = if slot.receiver && direct_child_kind(node, "&") {
+                    RustValueType::Borrowed {
+                        mutable: direct_named_child_kind(node, "mutable_specifier").is_some(),
+                        referent: declared_type,
+                    }
+                } else {
+                    RustValueType::Declared(declared_type)
+                };
+                self.value_types.insert(value, value_type);
+            }
+            let declared_shape =
+                declared_type.and_then(|ty| rust_declared_type_shape(self.source, ty));
             if let Some(shape) = declared_shape {
                 self.value_shapes.insert(value, shape);
             }
@@ -858,6 +937,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // local this initializer names was already classified, which
                 // is what lets `let alias = &original;` take `original`'s own
                 // struct shape.
+                let declared_type = node
+                    .child_by_field_name("type")
+                    .map(RustValueType::Declared)
+                    .or_else(|| {
+                        node.child_by_field_name("value")
+                            .and_then(|initializer| self.expression_type(initializer))
+                    });
+                if let Some(declared_type) = declared_type {
+                    self.value_types.insert(value, declared_type);
+                }
                 if let Some(shape) = node
                     .child_by_field_name("type")
                     .and_then(|ty| rust_declared_type_shape(self.source, ty))
@@ -955,6 +1044,398 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|binding| binding.value)
     }
 
+    fn binding_value(&self, node: Node<'_>) -> Option<ValueId> {
+        let name = node_text(self.source, node)?;
+        match node.kind() {
+            "self" => self.receiver,
+            "identifier" => self
+                .local_at(name, node.start_byte())
+                .or_else(|| self.parameters.get(name).copied()),
+            _ => None,
+        }
+    }
+
+    /// The exact type syntax a bounded expression path inherits.
+    ///
+    /// This deliberately handles only binding paths, parentheses, builtin
+    /// reference construction/dereference, struct construction, casts, and a
+    /// uniquely named same-file function's declared result. User `Deref`,
+    /// indirect/ambiguous calls, projections, and inferred literal defaults
+    /// need resolver/type-checker facts this intrafile producer does not own.
+    fn expression_type(&self, node: Node<'tree>) -> Option<RustValueType<'tree>> {
+        let mut current = node;
+        let mut operations = Vec::new();
+        let mut ty = loop {
+            match current.kind() {
+                "parenthesized_expression" => current = first_named_child(current)?,
+                "identifier" | "self" => {
+                    break self
+                        .binding_value(current)
+                        .and_then(|value| self.value_types.get(&value).copied())?;
+                }
+                "unary_expression" => {
+                    operations.push(RustTypeOperation::Dereference);
+                    current = rust_dereference_operand(current)?;
+                }
+                "reference_expression" => {
+                    operations.push(RustTypeOperation::Borrow {
+                        mutable: rust_reference_is_mutable(current),
+                    });
+                    current = rust_reference_expression_value(current)?;
+                }
+                "struct_expression" => {
+                    break current
+                        .child_by_field_name("name")
+                        .map(RustValueType::Declared)?;
+                }
+                "type_cast_expression" => {
+                    break current
+                        .child_by_field_name("type")
+                        .map(RustValueType::Declared)?;
+                }
+                "call_expression" => {
+                    let function = current.child_by_field_name("function")?;
+                    let function = unwrap_generic_function(function);
+                    if function.kind() != "identifier" || self.binding_value(function).is_some() {
+                        return None;
+                    }
+                    let name = node_text(self.source, function)?;
+                    break self
+                        .facts
+                        .function_return_types
+                        .get(name)
+                        .copied()
+                        .flatten()
+                        .map(RustValueType::Declared)?;
+                }
+                _ => return None,
+            }
+        };
+        for operation in operations.into_iter().rev() {
+            ty = match operation {
+                RustTypeOperation::Dereference => self.dereferenced_type(ty)?,
+                RustTypeOperation::Borrow { mutable } => {
+                    let RustValueType::Declared(referent) = ty else {
+                        return None;
+                    };
+                    RustValueType::Borrowed { mutable, referent }
+                }
+            };
+        }
+        Some(ty)
+    }
+
+    fn dereferenced_type(&self, ty: RustValueType<'tree>) -> Option<RustValueType<'tree>> {
+        match ty {
+            RustValueType::Declared(reference) => {
+                rust_reference_type_referent(reference).map(RustValueType::Declared)
+            }
+            RustValueType::Borrowed { referent, .. } => Some(RustValueType::Declared(referent)),
+        }
+    }
+
+    fn expression_ownership(&self, node: Node<'tree>) -> RustOwnershipClass {
+        if let Some(ty) = self.expression_type(node) {
+            return match ty {
+                RustValueType::Declared(ty) => self.ownership.classify_type(ty),
+                RustValueType::Borrowed { mutable: true, .. } => {
+                    RustOwnershipClass::MutableReference
+                }
+                RustValueType::Borrowed { mutable: false, .. } => {
+                    RustOwnershipClass::SharedReference
+                }
+            };
+        }
+        if matches!(
+            node.kind(),
+            "integer_literal"
+                | "float_literal"
+                | "char_literal"
+                | "boolean_literal"
+                | "true"
+                | "false"
+        ) {
+            RustOwnershipClass::ScalarCopy
+        } else if node.kind() == "unit_expression" {
+            RustOwnershipClass::AggregateCopy
+        } else {
+            RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MissingType)
+        }
+    }
+
+    fn exact_reference_alias(
+        &self,
+        source: RustValueType<'tree>,
+        target: RustValueType<'tree>,
+    ) -> Result<(), RustOwnershipIncomplete> {
+        match (source, target) {
+            (RustValueType::Declared(source), RustValueType::Declared(target)) => {
+                match self.ownership.classify_reference_coercion(source, target) {
+                    RustReferenceCoercion::SharedAlias
+                    | RustReferenceCoercion::MutableAlias
+                    | RustReferenceCoercion::MutableToSharedReborrow
+                    | RustReferenceCoercion::ArrayReferenceToSlice => Ok(()),
+                    RustReferenceCoercion::Incomplete(reason) => Err(reason),
+                }
+            }
+            (RustValueType::Borrowed { mutable, referent }, RustValueType::Declared(target)) => {
+                let target_referent = rust_reference_type_referent(target)
+                    .ok_or(RustOwnershipIncomplete::UnsupportedType)?;
+                self.exact_reference_parts(
+                    mutable,
+                    referent,
+                    rust_reference_is_mutable(target),
+                    target_referent,
+                )
+            }
+            (
+                RustValueType::Declared(source),
+                RustValueType::Borrowed {
+                    mutable: target_mutable,
+                    referent: target_referent,
+                },
+            ) => {
+                let source_referent = rust_reference_type_referent(source)
+                    .ok_or(RustOwnershipIncomplete::UnsupportedType)?;
+                self.exact_reference_parts(
+                    rust_reference_is_mutable(source),
+                    source_referent,
+                    target_mutable,
+                    target_referent,
+                )
+            }
+            (
+                RustValueType::Borrowed { mutable, referent },
+                RustValueType::Borrowed {
+                    mutable: target_mutable,
+                    referent: target_referent,
+                },
+            ) => self.exact_reference_parts(mutable, referent, target_mutable, target_referent),
+        }
+    }
+
+    fn exact_reference_parts(
+        &self,
+        mutable: bool,
+        referent: Node<'tree>,
+        target_mutable: bool,
+        target_referent: Node<'tree>,
+    ) -> Result<(), RustOwnershipIncomplete> {
+        if target_mutable && !mutable {
+            return Err(RustOwnershipIncomplete::UnsupportedType);
+        }
+        if self
+            .ownership
+            .exact_type_equivalence(referent, target_referent)?
+        {
+            return Ok(());
+        }
+        if referent.kind() == "array_type"
+            && referent.child_by_field_name("length").is_some()
+            && (target_referent.kind() == "slice_type"
+                || (target_referent.kind() == "array_type"
+                    && target_referent.child_by_field_name("length").is_none()))
+        {
+            let source_element = referent
+                .child_by_field_name("element")
+                .ok_or(RustOwnershipIncomplete::MissingType)?;
+            let target_element = target_referent
+                .child_by_field_name("element")
+                .or_else(|| first_named_child(target_referent))
+                .ok_or(RustOwnershipIncomplete::MissingType)?;
+            if self
+                .ownership
+                .exact_type_equivalence(source_element, target_element)?
+            {
+                return Ok(());
+            }
+        }
+        Err(RustOwnershipIncomplete::UnsupportedType)
+    }
+
+    fn compatible_transfer_ownership(
+        &self,
+        source: Node<'tree>,
+        target_type: Option<RustValueType<'tree>>,
+    ) -> RustOwnershipClass {
+        if rust_node_is_in_unsafe_context(source) {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType);
+        }
+        let ownership = self.expression_ownership(source);
+        if ownership == RustOwnershipClass::Move {
+            let mut current = source;
+            while current.kind() == "parenthesized_expression" {
+                let Some(inner) = first_named_child(current) else {
+                    return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MissingType);
+                };
+                current = inner;
+            }
+            if rust_dereference_operand(current).is_some() {
+                return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType);
+            }
+        }
+        let Some(target_type) = target_type else {
+            return ownership;
+        };
+        let Some(source_type) = self.expression_type(source) else {
+            return match target_type {
+                RustValueType::Declared(target_type) => self
+                    .ownership
+                    .classify_literal_for_type(source, target_type),
+                RustValueType::Borrowed { .. } => {
+                    RustOwnershipClass::Incomplete(RustOwnershipIncomplete::MissingType)
+                }
+            };
+        };
+        match ownership {
+            RustOwnershipClass::SharedReference | RustOwnershipClass::MutableReference => self
+                .exact_reference_alias(source_type, target_type)
+                .map_or_else(RustOwnershipClass::Incomplete, |_| ownership),
+            RustOwnershipClass::ScalarCopy
+            | RustOwnershipClass::AggregateCopy
+            | RustOwnershipClass::Move => {
+                let RustValueType::Declared(source_type) = source_type else {
+                    return RustOwnershipClass::Incomplete(
+                        RustOwnershipIncomplete::UnsupportedType,
+                    );
+                };
+                match self.ownership.exact_type_equivalence(
+                    source_type,
+                    match target_type {
+                        RustValueType::Declared(target_type) => target_type,
+                        RustValueType::Borrowed { .. } => {
+                            return RustOwnershipClass::Incomplete(
+                                RustOwnershipIncomplete::UnsupportedType,
+                            );
+                        }
+                    },
+                ) {
+                    Ok(true) => ownership,
+                    Ok(false) => {
+                        RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType)
+                    }
+                    Err(reason) => RustOwnershipClass::Incomplete(reason),
+                }
+            }
+            RustOwnershipClass::Incomplete(_) => ownership,
+        }
+    }
+
+    fn transfer_source_value(&self, node: Node<'tree>) -> Option<ValueId> {
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "parenthesized_expression" => current = first_named_child(current)?,
+                "identifier" | "self" => return self.binding_value(current),
+                _ => return None,
+            }
+        }
+    }
+
+    fn append_ownership_transfer(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        expression_source: ValueId,
+        target: ValueId,
+        target_type: Option<RustValueType<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let classification = self.compatible_transfer_ownership(source_node, target_type);
+        // Only an exact move consumes the binding itself. Copy and alias
+        // relations keep the expression occurrence as their source, matching
+        // the adapter's existing evaluation flow while giving a move kill the
+        // binding identity that later-use reasoning observes.
+        let source = if classification == RustOwnershipClass::Move {
+            self.transfer_source_value(source_node)
+                .filter(|source| *source != target)
+                .unwrap_or(expression_source)
+        } else {
+            expression_source
+        };
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        let kind = match classification {
+            RustOwnershipClass::ScalarCopy => Some(TransferKind::Copy),
+            RustOwnershipClass::AggregateCopy => Some(TransferKind::AggregateCopy),
+            RustOwnershipClass::Move => Some(TransferKind::Move {
+                invalidation: MoveInvalidation::Invalidated,
+            }),
+            RustOwnershipClass::SharedReference | RustOwnershipClass::MutableReference => None,
+            RustOwnershipClass::Incomplete(reason) => {
+                let mut ownership_source = source_node;
+                while ownership_source.kind() == "parenthesized_expression" {
+                    let Some(inner) = first_named_child(ownership_source) else {
+                        break;
+                    };
+                    ownership_source = inner;
+                }
+                // Copy versus move changes the meaning only when a transfer
+                // reads reusable source storage. A fresh rvalue has no source
+                // binding to preserve or invalidate, so its constructor,
+                // call, or operator lowering owns any remaining gap. Exact
+                // reference coercions and dereferences still need an ownership
+                // decision because they select aliasing or place semantics.
+                let needs_exact_ownership = self.transfer_source_value(source_node).is_some()
+                    || matches!(
+                        ownership_source.kind(),
+                        "reference_expression" | "unary_expression"
+                    );
+                if !needs_exact_ownership || self.expression_type(source_node).is_none() {
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        },
+                    )?;
+                    return Ok(());
+                }
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source,
+                        target,
+                    },
+                )?;
+                self.add_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    ownership_gap_detail(reason),
+                )?;
+                return Ok(());
+            }
+        };
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: kind.map_or(ValueFlowKind::Local, |kind| {
+                    ValueFlowKind::Transfer(ValueTransfer {
+                        kind,
+                        operation: TransferOperation::None,
+                    })
+                }),
+                source,
+                target,
+            },
+        )?;
+        Ok(())
+    }
+
     /// The shape this expression's value provably holds.
     ///
     /// A reference is transparent on purpose: Rust auto-dereferences a
@@ -976,9 +1457,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         .or_else(|| self.parameters.get(name).copied())?;
                     break self.value_shapes.get(&value).cloned()?;
                 }
-                "parenthesized_expression" | "reference_expression" => {
-                    current = first_named_child(current)?;
-                }
+                "parenthesized_expression" => current = first_named_child(current)?,
+                "reference_expression" => current = current.child_by_field_name("value")?,
                 "field_expression" => {
                     selectors.push(node_text(
                         self.source,
@@ -1299,6 +1779,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     };
                     current = inner;
                 }
+                "unary_expression" => {
+                    let Some(operand) = rust_dereference_operand(current) else {
+                        return false;
+                    };
+                    return self
+                        .expression_type(operand)
+                        .and_then(|ty| self.dereferenced_type(ty))
+                        .is_some();
+                }
                 _ => return false,
             }
         }
@@ -1341,7 +1830,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // enclosing block, so `&Guard::new()` does run a `Drop` there
                 // and keeps the gaps.
                 "reference_expression" => {
-                    if !first_named_child(node).is_some_and(|operand| self.is_place(operand)) {
+                    if !node
+                        .child_by_field_name("value")
+                        .is_some_and(|operand| self.is_place(operand))
+                    {
                         return false;
                     }
                 }
@@ -1946,22 +2438,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         )
                     })?;
                 let source = self.expression_value(builder, value, expression_value_kind(value))?;
-                self.append_effect(
+                self.append_ownership_transfer(
                     builder,
                     binding,
-                    SemanticEffect::Assignment {
-                        target,
-                        value: source,
-                    },
-                )?;
-                self.append_effect(
-                    builder,
-                    binding,
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
-                        source,
-                        target,
-                    },
+                    value,
+                    source,
+                    target,
+                    node.child_by_field_name("type")
+                        .map(RustValueType::Declared),
                 )?;
             } else {
                 self.add_gap(
@@ -2043,8 +2527,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
-            "parenthesized_expression" | "reference_expression" => {
+            "parenthesized_expression" => {
                 let value = first_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                self.transparent_expression(builder, node, value, entry, next, scope, stack)
+            }
+            "reference_expression" => {
+                let value = required_field(node, "value")?;
                 self.transparent_expression(builder, node, value, entry, next, scope, stack)
             }
             "type_cast_expression" => {
@@ -2118,6 +2606,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 Ok(())
+            }
+            "unary_expression"
+                if rust_dereference_operand(node)
+                    .and_then(|operand| self.expression_type(operand))
+                    .and_then(|ty| self.dereferenced_type(ty))
+                    .is_some() =>
+            {
+                let operand = rust_dereference_operand(node)
+                    .expect("a structurally proven dereference retains its operand");
+                self.transparent_expression(builder, node, operand, entry, next, scope, stack)
             }
             "binary_expression" | "unary_expression" => {
                 self.operator_expression(builder, node, entry, next, scope, stack)
@@ -2335,23 +2833,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .or_else(|| self.parameters.get(name).copied());
             if let Some(target) = target {
                 let value = self.expression_value(builder, right, expression_value_kind(right))?;
-                self.append_effect(
+                let target_type = self.value_types.get(&target).copied();
+                self.append_ownership_transfer(
                     builder,
                     terminal,
-                    SemanticEffect::Assignment { target, value },
-                )?;
-                self.append_effect(
-                    builder,
-                    terminal,
-                    SemanticEffect::ValueFlow {
-                        kind: if self.local_at(name, left.start_byte()).is_some() {
-                            ValueFlowKind::Local
-                        } else {
-                            ValueFlowKind::Parameter
-                        },
-                        source: value,
-                        target,
-                    },
+                    right,
+                    value,
+                    target,
+                    target_type,
                 )?;
             } else {
                 self.add_gap(
@@ -3343,12 +3832,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let (Some(value_node), Some(value)) = (value_node, value) {
             let source =
                 self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            let transferred = self.value(builder, terminal, SemanticValueKind::Temporary)?;
+            self.append_ownership_transfer(
+                builder,
+                terminal,
+                value_node,
+                source,
+                transferred,
+                self.return_type.map(RustValueType::Declared),
+            )?;
             self.append_effect(
                 builder,
                 terminal,
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Return,
-                    source,
+                    source: transferred,
                     target: value,
                 },
             )?;
@@ -4325,6 +4823,38 @@ fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
     ) || is_runtime_leaf(node.kind())
 }
 
+fn ownership_gap_detail(reason: RustOwnershipIncomplete) -> &'static str {
+    match reason {
+        RustOwnershipIncomplete::GenericObligation => {
+            "Rust ownership transfer depends on an unresolved generic trait obligation"
+        }
+        RustOwnershipIncomplete::AmbiguousIdentity => {
+            "Rust ownership transfer has more than one structured nominal type candidate"
+        }
+        RustOwnershipIncomplete::UnresolvedPath => {
+            "Rust ownership transfer refers to a nominal type whose declaration identity is unresolved"
+        }
+        RustOwnershipIncomplete::RawPointer => {
+            "Rust ownership transfer crosses a raw-pointer type outside the safe reference proof"
+        }
+        RustOwnershipIncomplete::MacroExpansion => {
+            "Rust ownership transfer depends on macro-expanded type or trait facts that are unavailable"
+        }
+        RustOwnershipIncomplete::WrongTraitIdentity => {
+            "Rust ownership transfer names Copy, Clone, or Drop without proving the builtin trait identity"
+        }
+        RustOwnershipIncomplete::CyclicNominal => {
+            "Rust ownership transfer belongs to a cyclic nominal proof that did not reach a fixed point"
+        }
+        RustOwnershipIncomplete::MissingType => {
+            "Rust ownership transfer has no exact source and destination type evidence"
+        }
+        RustOwnershipIncomplete::UnsupportedType => {
+            "Rust ownership transfer uses a type shape whose Copy or move semantics are not proven"
+        }
+    }
+}
+
 /// A declared type that proves the value it describes owns no `Drop`.
 ///
 /// A reference never runs a destructor when it goes out of scope, and a
@@ -4422,7 +4952,10 @@ struct RustFieldDeclaration {
 /// file at a time and never consults another. That is the same posture the
 /// Python adapter's `instance_field_proofs` takes, and it is stated here so a
 /// reader does not mistake any of these for a whole-crate proof.
-struct RustFileFacts {
+struct RustFileFacts<'tree> {
+    /// One unambiguous same-file bare function name and its declared return
+    /// type. Duplicate names retain `None` rather than selecting by spelling.
+    function_return_types: HashMap<Box<str>, Option<Node<'tree>>>,
     /// Same-file `fn` names whose declared return type owns no `Drop`.
     non_dropping_return_functions: HashMap<Box<str>, bool>,
     /// Every `(struct, field)` this file declares. `None` marks a pair the
@@ -4434,8 +4967,9 @@ struct RustFileFacts {
     plain_structs: HashSet<Box<str>>,
 }
 
-fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
+fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<'tree> {
     let source = prepared.source();
+    let mut function_return_types: HashMap<Box<str>, Option<Node<'tree>>> = HashMap::default();
     let mut non_dropping_return_functions: HashMap<Box<str>, bool> = HashMap::default();
     let mut struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>> =
         HashMap::default();
@@ -4453,6 +4987,16 @@ fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
                     .child_by_field_name("name")
                     .and_then(|name| node_text(source, name))
                 {
+                    if node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "source_file")
+                    {
+                        let return_type = node.child_by_field_name("return_type");
+                        function_return_types
+                            .entry(name.into())
+                            .and_modify(|unique| *unique = None)
+                            .or_insert(return_type);
+                    }
                     let non_dropping = node
                         .child_by_field_name("return_type")
                         .is_some_and(rust_type_is_definitely_non_dropping);
@@ -4570,6 +5114,7 @@ fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
     }
 
     RustFileFacts {
+        function_return_types,
         non_dropping_return_functions,
         struct_fields,
         plain_structs,

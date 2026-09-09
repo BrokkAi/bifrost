@@ -289,3 +289,14 @@ exported macros into a distinct macro-use prelude, so it cannot be inferred
 from the existing namespace-binding columns. Existing rows default to false;
 the Rust language epoch rotates so live Rust blobs are re-extracted under the
 new producer semantics.
+
+Migration `0060-policy-declaration-fact-reads.sql` adopts replayable
+declaration-fact, signature-metadata, and descendant-answer reads for policy
+units. Upgrading discards every persisted policy unit, every persisted policy
+evaluation, and every interned policy read key, across all languages and policy
+families. This cache-wide reset ensures all units are republished with the new
+ledger semantics: declaration readers record the exact facts consumed instead
+of the declaring file's blob, and scoped assertions avoid a language-wide
+dependency. Complete name-lookup answers also record their language scope, with
+composite lookups replayed across the current workspace's languages. Source
+analysis facts remain available for rebuilding the cache.

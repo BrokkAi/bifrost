@@ -306,6 +306,53 @@ impl<T> PoolSafeMemo<T> {
         built
     }
 
+    /// Build the value once on [`dedicated_build_pool`] while work remains permitted.
+    ///
+    /// Like [`Self::get_or_build_on_dedicated_pool`], the pool-independent builder lets
+    /// every caller wait for one build without risking global-rayon starvation. Unlike
+    /// that method, both waiting and building can stop cooperatively; a stopped build
+    /// publishes nothing, so a later caller can retry with a live request.
+    pub fn get_or_build_on_dedicated_pool_while(
+        &self,
+        keep_going: &impl Fn() -> bool,
+        build: impl FnOnce() -> Option<T> + Send,
+    ) -> Option<Arc<T>>
+    where
+        T: Send,
+    {
+        if let Some(value) =
+            self.wait_or_claim_build_while(BuildClaim::PoolIndependent, keep_going)?
+        {
+            return Some(value);
+        }
+        let _guard = BuildingGuard {
+            memo: self,
+            pool_independent: true,
+        };
+
+        let on_dedicated_pool = ON_DEDICATED_BUILD_POOL.with(Cell::get);
+        let built = if on_dedicated_pool {
+            build()
+        } else if rayon::current_thread_index().is_some() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| dedicated_build_pool().install(build))
+                    .join()
+                    .expect("dedicated index build thread panicked")
+            })
+        } else {
+            dedicated_build_pool().install(build)
+        }?;
+        let built = Arc::new(built);
+
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
+            return Some(Arc::clone(existing));
+        }
+        state.value = Some(Arc::clone(&built));
+        Some(built)
+    }
+
     /// Build the value with the parallel builder even when called from a rayon
     /// worker. Use only from orchestration code that prewarms a cache before
     /// starting its own nested parallel scan.
@@ -716,6 +763,36 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "cancelled");
         assert!(memo.get().is_none());
+    }
+
+    #[test]
+    fn stopped_cancellable_dedicated_build_is_not_published() {
+        let memo = PoolSafeMemo::new();
+        let calls = AtomicUsize::new(0);
+
+        assert!(
+            memo.get_or_build_on_dedicated_pool_while(&|| true, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                None::<usize>
+            })
+            .is_none()
+        );
+        assert!(memo.get().is_none());
+
+        let first = memo
+            .get_or_build_on_dedicated_pool_while(&|| true, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(7)
+            })
+            .expect("live build completes");
+        let repeated = memo
+            .get_or_build_on_dedicated_pool_while(&|| true, || {
+                panic!("completed dedicated build must be memoized")
+            })
+            .expect("memoized build remains available");
+
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

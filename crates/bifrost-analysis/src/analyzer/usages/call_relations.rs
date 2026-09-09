@@ -326,6 +326,7 @@ pub(crate) fn call_relation_answer_digest(
 
 #[derive(Default)]
 pub struct CallBindingCache {
+    conversions: super::call_conversion::CallConversionCache,
     formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
     /// One batch-resolved outcome per call site's callee range, keyed by
@@ -343,6 +344,17 @@ pub struct CallBindingCache {
 }
 
 impl CallBindingCache {
+    /// Populate the adjacent shared conversion relation using this query's
+    /// source cache and the already-selected signature.
+    pub fn populate_conversions(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        report: &mut super::call_binding::CallBindingReport,
+        signature: Option<&str>,
+    ) {
+        self.conversions.populate(analyzer, report, signature);
+    }
+
     /// The callable's syntax-derived formal parameter layout, read once per
     /// declaration. Shared with the `call_binding` row producer so both read
     /// one cache entry rather than re-parsing the declaring file twice.

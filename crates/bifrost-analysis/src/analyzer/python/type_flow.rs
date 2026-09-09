@@ -16,6 +16,7 @@ use brokk_bifrost_python::bindings::{
     python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
     python_unambiguous_module_class_binding_bounded,
 };
+use brokk_bifrost_python::declarations::{python_base_origin_node, python_first_parameter_name};
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
 use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
@@ -41,8 +42,8 @@ use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbolKind, semantic_model_callable_family_id,
 };
 use crate::analyzer::usages::get_definition::{
-    PythonDefinitionProvider, ResolutionSession, python_external_imported_symbol_bounded,
-    python_namespace_imported_class_name_bounded,
+    PythonDefinitionProvider, ResolutionSession, python_attribute_callee_reads_a_field_bounded,
+    python_external_imported_symbol_bounded, python_namespace_imported_class_name_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupStatus, resolve_type_at_reference_site_with_budget,
@@ -61,7 +62,7 @@ use crate::path_utils::rel_path_string;
 pub struct PythonTypeFlowAdapter;
 
 /// One name-resolution cache, local to a single adapter call.
-fn python_analyzer(workspace: &WorkspaceAnalyzer) -> &PythonAnalyzer {
+pub(super) fn python_analyzer(workspace: &WorkspaceAnalyzer) -> &PythonAnalyzer {
     resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
         .expect("PythonTypeFlowAdapter serves only workspaces that analyze Python")
 }
@@ -73,7 +74,7 @@ fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>
         .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
 }
 
-fn prepared_for_procedure(
+pub(super) fn prepared_for_procedure(
     workspace: &WorkspaceAnalyzer,
     procedure: &ProcedureHandle,
     file: &ProjectFile,
@@ -87,7 +88,7 @@ fn prepared_for_procedure(
     validate_prepared_syntax_for_procedure(workspace, procedure, file, prepared)
 }
 
-fn current_indexed_prepared(
+pub(super) fn current_indexed_prepared(
     python: &PythonAnalyzer,
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
@@ -98,7 +99,7 @@ fn current_indexed_prepared(
     .then_some(prepared)
 }
 
-fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
+pub(super) fn node_at_span(prepared: &PreparedSyntaxTree, span: SourceSpan) -> Option<Node<'_>> {
     prepared
         .tree()
         .root_node()
@@ -186,7 +187,153 @@ fn assignment_name<'source>(node: Node<'_>, source: &'source str) -> Option<&'so
         .flatten()
 }
 
-fn setattr_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
+/// Whether a class installs members on its own instances at run time.
+///
+/// `setattr(self, name, value)` with a name the syntax does not spell, and
+/// `self.__dict__[name] = value`, both add members no declaration shows.
+/// mutagen's `StrictFileObject.__init__` installs `tell`, `seek` and five more
+/// this way, so its declared surface bounds nothing.
+fn class_installs_dynamic_members(python: &PythonAnalyzer, unit: &CodeUnit) -> bool {
+    let Some(prepared) = current_indexed_prepared(python, unit.source()) else {
+        return true;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, unit) else {
+        return true;
+    };
+    let Some(body) = class.child_by_field_name("body") else {
+        return false;
+    };
+    let source = prepared.source();
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        let function = match member.kind() {
+            "function_definition" => member,
+            "decorated_definition" => {
+                let mut inner = member.walk();
+                match member
+                    .named_children(&mut inner)
+                    .find(|child| child.kind() == "function_definition")
+                {
+                    Some(function) => function,
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+        let Some(receiver) = python_first_parameter_name(function, source) else {
+            continue;
+        };
+        if method_installs_dynamic_members(function, source, &receiver) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether one method body installs a member on `receiver` under a name the
+/// syntax does not spell.
+fn method_installs_dynamic_members(function: Node<'_>, source: &str, receiver: &str) -> bool {
+    let root_id = function.id();
+    let mut stack = vec![function];
+    while let Some(node) = stack.pop() {
+        if node.id() != root_id
+            && matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            )
+        {
+            continue;
+        }
+        let installs = match node.kind() {
+            "call" => {
+                (setattr_write(node, source)
+                    .is_some_and(|name| matches!(name, DynamicMemberName::Any))
+                    && call_receiver_argument_is(node, source, receiver))
+                    || instance_dict_mutation(node, source, receiver)
+            }
+            "assignment" | "augmented_assignment" => {
+                dictionary_write(node, source).is_some()
+                    && dictionary_write_receiver_is(node, source, receiver)
+            }
+            _ => false,
+        };
+        if installs {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+/// Whether a call mutates `receiver.__dict__`, which installs members under
+/// names the syntax does not spell.
+///
+/// celery's `Context.update` is `self.__dict__.update(*args, **kwargs)`, so
+/// every attribute a caller supplies becomes a member of that instance.
+fn instance_dict_mutation(call: Node<'_>, source: &str, receiver: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "attribute" {
+        return false;
+    }
+    let mutates = function
+        .child_by_field_name("attribute")
+        .and_then(|member| member.utf8_text(source.as_bytes()).ok())
+        .is_some_and(|member| {
+            matches!(
+                member,
+                "update" | "setdefault" | "pop" | "popitem" | "clear"
+            )
+        });
+    if !mutates {
+        return false;
+    }
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+    object.kind() == "attribute"
+        && object
+            .child_by_field_name("attribute")
+            .and_then(|member| member.utf8_text(source.as_bytes()).ok())
+            == Some("__dict__")
+        && object.child_by_field_name("object").is_some_and(|base| {
+            base.kind() == "identifier" && base.utf8_text(source.as_bytes()) == Ok(receiver)
+        })
+}
+
+/// Whether a call's first positional argument names `receiver`.
+fn call_receiver_argument_is(call: Node<'_>, source: &str, receiver: &str) -> bool {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .next()
+        .is_some_and(|first| {
+            first.kind() == "identifier" && first.utf8_text(source.as_bytes()) == Ok(receiver)
+        })
+}
+
+/// Whether a `receiver.__dict__[...] = ...` assignment targets `receiver`.
+fn dictionary_write_receiver_is(node: Node<'_>, source: &str, receiver: &str) -> bool {
+    node.child_by_field_name("left")
+        .and_then(|left| left.child_by_field_name("value"))
+        .and_then(|value| value.child_by_field_name("object"))
+        .is_some_and(|object| {
+            object.kind() == "identifier" && object.utf8_text(source.as_bytes()) == Ok(receiver)
+        })
+}
+
+#[derive(Clone)]
+enum DynamicMemberName {
+    Member(Box<str>),
+    Any,
+}
+
+fn setattr_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName> {
     let function = node.child_by_field_name("function")?;
     if function.kind() != "identifier" || function.utf8_text(source.as_bytes()).ok()? != "setattr" {
         return None;
@@ -195,16 +342,16 @@ fn setattr_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
     let mut cursor = arguments.walk();
     let actuals = arguments.named_children(&mut cursor).collect::<Vec<_>>();
     let Some(name) = actuals.get(1) else {
-        return Some(DynamicFieldWrite::Any);
+        return Some(DynamicMemberName::Any);
     };
     Some(
         python_plain_string_literal(*name, source)
-            .map(|name| DynamicFieldWrite::Member(name.into()))
-            .unwrap_or(DynamicFieldWrite::Any),
+            .map(|name| DynamicMemberName::Member(name.into()))
+            .unwrap_or(DynamicMemberName::Any),
     )
 }
 
-fn dictionary_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
+fn dictionary_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName> {
     let left = node.child_by_field_name("left")?;
     if left.kind() != "subscript" {
         return None;
@@ -220,8 +367,8 @@ fn dictionary_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
     let subscript = left.child_by_field_name("subscript")?;
     Some(
         python_plain_string_literal(subscript, source)
-            .map(|name| DynamicFieldWrite::Member(name.into()))
-            .unwrap_or(DynamicFieldWrite::Any),
+            .map(|name| DynamicMemberName::Member(name.into()))
+            .unwrap_or(DynamicMemberName::Any),
     )
 }
 
@@ -254,21 +401,21 @@ fn writes_member_name(node: Node<'_>, source: &str, member: &str) -> bool {
             }
             if let Some(write) = dictionary_write(node, source) {
                 return match write {
-                    DynamicFieldWrite::Any => true,
-                    DynamicFieldWrite::Member(name) => name.as_ref() == member,
+                    DynamicMemberName::Any => true,
+                    DynamicMemberName::Member(name) => name.as_ref() == member,
                 };
             }
         }
     }
     match dynamic_call_write(node, source) {
-        Some(DynamicFieldWrite::Any) => true,
-        Some(DynamicFieldWrite::Member(name)) => name.as_ref() == member,
+        Some(DynamicMemberName::Any) => true,
+        Some(DynamicMemberName::Member(name)) => name.as_ref() == member,
         None => false,
     }
 }
 
 /// Shared structured interpretation for member shadowing and the store survey.
-fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite> {
+fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicMemberName> {
     if node.kind() != "call" {
         return None;
     }
@@ -285,7 +432,7 @@ fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite>
         .ok()?;
     if attribute == "__setattr__" {
         let Some(arguments) = node.child_by_field_name("arguments") else {
-            return Some(DynamicFieldWrite::Any);
+            return Some(DynamicMemberName::Any);
         };
         let mut cursor = arguments.walk();
         let name = arguments
@@ -293,8 +440,8 @@ fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite>
             .next()
             .and_then(|name| python_plain_string_literal(name, source));
         return Some(
-            name.map(|name| DynamicFieldWrite::Member(name.into()))
-                .unwrap_or(DynamicFieldWrite::Any),
+            name.map(|name| DynamicMemberName::Member(name.into()))
+                .unwrap_or(DynamicMemberName::Any),
         );
     }
     // Calls through an instance dictionary can install unspelled members
@@ -304,7 +451,94 @@ fn dynamic_call_write(node: Node<'_>, source: &str) -> Option<DynamicFieldWrite>
         .and_then(|object| object.child_by_field_name("attribute"))
         .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
         == Some("__dict__"))
-    .then_some(DynamicFieldWrite::Any)
+    .then_some(DynamicMemberName::Any)
+}
+
+/// Keep the same AST interpretation for member shadowing and receiver scoping.
+fn scoped_dynamic_write(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    node: Node<'_>,
+    name: DynamicMemberName,
+    source: &str,
+) -> DynamicFieldWrite {
+    if let DynamicMemberName::Member(member) = name {
+        return DynamicFieldWrite::Member(member);
+    }
+    let span = span_for_node(node);
+    let semantics = procedure.semantics();
+    let dictionary_owner = |dictionary: Node<'_>| {
+        let attribute = dictionary.child_by_field_name("attribute")?;
+        let member_span = span_for_node(attribute);
+        semantics.memory_locations().iter().find_map(|location| {
+            let MemoryLocationKind::Field { base, member } = &location.kind else {
+                return None;
+            };
+            (member.anchor().span() == member_span).then_some(*base)
+        })
+    };
+    let receiver = if node.kind() == "call" {
+        semantics
+            .call_sites()
+            .iter()
+            .find(|call| {
+                semantics
+                    .source_mapping(call.source)
+                    .is_some_and(|mapping| {
+                        mapping.kind == SourceMappingKind::Exact
+                            && mapping.locator.anchor().span() == span
+                    })
+            })
+            .and_then(|call| {
+                let function = node.child_by_field_name("function")?;
+                if function.kind() == "identifier" {
+                    call.arguments
+                        .first()
+                        .filter(|argument| !argument.expansion.is_spread())
+                        .map(|argument| argument.value)
+                } else {
+                    let object = function.child_by_field_name("object")?;
+                    if object
+                        .child_by_field_name("attribute")
+                        .and_then(|attribute| attribute.utf8_text(source.as_bytes()).ok())
+                        == Some("__dict__")
+                    {
+                        dictionary_owner(object)
+                    } else {
+                        match semantics.proven_caller_receiver_binding(call.id) {
+                            Some(
+                                crate::analyzer::semantic::CallerReceiverBinding::TypeQualified(_),
+                            ) => call
+                                .arguments
+                                .first()
+                                .filter(|argument| !argument.expansion.is_spread())
+                                .map(|argument| argument.value),
+                            _ if matches!(
+                                builtin_class_reference(
+                                    overlay_of(workspace).as_deref(),
+                                    object,
+                                    source,
+                                    &mut ExternalClassCache::default()
+                                ),
+                                Some(ClassSeed::Class(_))
+                            ) =>
+                            {
+                                call.arguments
+                                    .first()
+                                    .filter(|argument| !argument.expansion.is_spread())
+                                    .map(|argument| argument.value)
+                            }
+                            _ => call.receiver,
+                        }
+                    }
+                }
+            })
+    } else {
+        node.child_by_field_name("left")
+            .and_then(|left| left.child_by_field_name("value"))
+            .and_then(dictionary_owner)
+    };
+    DynamicFieldWrite::Any { receiver, span }
 }
 
 /// Whether a workspace class can shadow an inherited modeled member through
@@ -602,6 +836,57 @@ fn external_seed(
     }
 }
 
+/// Whether a base spelling names a typing marker rather than a class that
+/// contributes members.
+///
+/// `Generic` and `Protocol` exist to carry type parameters. Typeshed spells
+/// `Generic` as a variable annotated `type[_Generic]` and `Protocol` as a
+/// `_SpecialForm`, so neither resolves as a class at all, and a class that
+/// names one would otherwise have a base nothing can resolve. The stub
+/// producer already drops both when it records a hierarchy; this is the same
+/// rule on the workspace side.
+fn python_typing_marker_base(python: &PythonAnalyzer, owner: &CodeUnit, raw: &str) -> bool {
+    let raw = raw.trim();
+    let Some(prepared) = current_indexed_prepared(python, owner.source()) else {
+        return false;
+    };
+    let Some(class) = class_node_for_unit(python, &prepared, owner) else {
+        return false;
+    };
+    let Some(bases) = class.child_by_field_name("superclasses") else {
+        return false;
+    };
+    let mut cursor = bases.walk();
+    let Some(base) = bases
+        .named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .map(python_base_origin_node)
+        .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(raw))
+    else {
+        return false;
+    };
+    let scope = AnalyzerQueryScope::new(python);
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let support = PythonDefinitionProvider::new(python, &session);
+    let Some((module, member)) = python_external_imported_symbol_bounded(
+        &support,
+        scope.token(),
+        owner.source(),
+        prepared.source(),
+        prepared.tree().root_node(),
+        base,
+    ) else {
+        return false;
+    };
+    matches!(
+        format!("{module}.{member}").as_str(),
+        "typing.Protocol"
+            | "typing.Generic"
+            | "typing_extensions.Protocol"
+            | "typing_extensions.Generic"
+    )
+}
+
 /// Raw supertypes retain source spelling, not a resolved import identity. A
 /// terminal-name overlay match such as `ABC` -> `abc.ABC` is therefore not a
 /// proof of the base. A builtin spelling is accepted only after proving that
@@ -618,8 +903,12 @@ fn exact_external_base(
     let class = class_node_for_unit(python, &prepared, owner)?;
     let bases = class.child_by_field_name("superclasses")?;
     let mut cursor = bases.walk();
+    // A raw spelling is the base's origin, so match against the same
+    // reduction: `Mapping[str, int]` records and resolves as `Mapping`.
     let base = bases
         .named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .map(python_base_origin_node)
         .find(|base| base.utf8_text(prepared.source().as_bytes()) == Ok(raw))?;
     let identity = if base.kind() == "attribute" {
         let scope = AnalyzerQueryScope::new(python);
@@ -654,17 +943,11 @@ fn exact_external_base(
         }
         identity
     } else {
-        if base.kind() != "identifier" {
+        let ClassSeed::Class(identity) =
+            builtin_class_reference(overlay, base, prepared.source(), cache)?
+        else {
             return None;
-        }
-        let identity = external_class_identity(overlay, Language::Python, raw, None, cache)?;
-        let builtin_name = format!("builtins.{raw}");
-        if identity.qualified_name() != builtin_name || !is_python_builtin_or_constant(raw) {
-            return None;
-        }
-        if !builtin_base_is_unshadowed(base, prepared.source())? {
-            return None;
-        }
+        };
         identity
     };
     python
@@ -672,7 +955,70 @@ fn exact_external_base(
         .then_some(identity)
 }
 
-fn builtin_base_is_unshadowed(reference: Node<'_>, source: &str) -> Option<bool> {
+/// Flatten the classes a guard names into one node per class.
+///
+/// `isinstance` accepts a tuple of classes and, since Python 3.10, a `|` union
+/// of them. Both spell the same set. Returns false for a shape that is neither
+/// a class reference nor a way of combining them, which leaves the guard
+/// unresolved rather than half-read.
+fn collect_guard_class_nodes<'tree>(node: Node<'tree>, nodes: &mut Vec<Node<'tree>>) -> bool {
+    match node.kind() {
+        "tuple" => {
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            children
+                .into_iter()
+                .all(|child| collect_guard_class_nodes(child, nodes))
+        }
+        "binary_operator" => {
+            let Some(operator) = node.child_by_field_name("operator") else {
+                return false;
+            };
+            if operator.kind() != "|" {
+                return false;
+            }
+            let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else {
+                return false;
+            };
+            collect_guard_class_nodes(left, nodes) && collect_guard_class_nodes(right, nodes)
+        }
+        _ => {
+            nodes.push(node);
+            true
+        }
+    }
+}
+
+/// The builtin class a bare unshadowed builtin name denotes.
+///
+/// A builtin has no workspace declaration, so a type lookup answers nothing
+/// for `dict` in `isinstance(value, dict)`. The name is only that class when
+/// no lexical or module binding competes with it, which is the same proof a
+/// builtin base spelling needs.
+fn exact_builtin_class(
+    reference: Node<'_>,
+    prepared: &PreparedSyntaxTree,
+    overlay: Option<&SemanticModelOverlay>,
+    cache: &mut ExternalClassCache,
+) -> Option<ClassIdentity> {
+    if reference.kind() != "identifier" {
+        return None;
+    }
+    let name = reference.utf8_text(prepared.source().as_bytes()).ok()?;
+    if !is_python_builtin_or_constant(name) {
+        return None;
+    }
+    let identity = external_class_identity(overlay, Language::Python, name, None, cache)?;
+    if identity.qualified_name() != format!("builtins.{name}") {
+        return None;
+    }
+    builtin_base_is_unshadowed(reference, prepared.source())?.then_some(identity)
+}
+
+pub(super) fn builtin_base_is_unshadowed(reference: Node<'_>, source: &str) -> Option<bool> {
     let name = reference.utf8_text(source.as_bytes()).ok()?;
     if python_comprehension_binds_name_at(name, reference, source)
         || python_type_parameter_binds_name_at(name, reference, source)
@@ -711,6 +1057,213 @@ fn builtin_base_is_unshadowed(reference: Node<'_>, source: &str) -> Option<bool>
     Some(true)
 }
 
+/// Whether an external class is `builtins.type` or derives from it.
+///
+/// Its instances are class objects, so their member surface is whatever class
+/// each one is, not what this class declares.
+fn external_class_derives_from_type(
+    overlay: Option<&SemanticModelOverlay>,
+    class: &ClassIdentity,
+) -> bool {
+    if class.qualified_name() == "builtins.type" {
+        return true;
+    }
+    let ClassIdentity::External { symbol_id, .. } = class else {
+        return false;
+    };
+    external_class_hierarchy(overlay, symbol_id)
+        .ancestors
+        .iter()
+        .any(|ancestor| ancestor.qualified_name() == "builtins.type")
+}
+
+/// The modeled ancestry of an external class.
+///
+/// Without this every external class answered `unresolved_base`, so an
+/// `isinstance(value, dict)` guard could never drop `builtins.list` and the
+/// excluded classes survived into the narrowed arm. The active model publishes
+/// the ancestry and says when it is incomplete, which is exactly the proof
+/// `instance_relation` needs.
+///
+/// The descendant inventory stays unavailable and dynamic attributes stay
+/// possible: a dependency's subclasses are not enumerable from a pack, and a
+/// modeled surface is not evidence about attribute hooks. Consumers that prove
+/// a closed member surface require both, so they are unaffected.
+fn external_class_hierarchy(
+    overlay: Option<&SemanticModelOverlay>,
+    symbol_id: &str,
+) -> ClassHierarchy {
+    let Some(overlay) = overlay else {
+        return ClassHierarchy::unknown();
+    };
+    let matched = overlay.symbols_with_id(symbol_id);
+    let [symbol] = matched.records.as_slice() else {
+        return ClassHierarchy::unknown();
+    };
+    let surface = overlay.owner_surface(symbol);
+    let mut ancestors = surface
+        .closure
+        .iter()
+        .filter(|record| record.id != symbol.id)
+        .map(|record| ClassIdentity::External {
+            qualified_name: record.qualified_name.clone().into_boxed_str(),
+            symbol_id: record.id.clone().into_boxed_str(),
+        })
+        .collect::<Vec<_>>();
+    ancestors.sort_by(|left, right| left.qualified_name().cmp(right.qualified_name()));
+    ancestors.dedup();
+    ClassHierarchy {
+        ancestors,
+        descendants: None,
+        unresolved_base: !surface.proves_absence(),
+        dynamic_attributes: true,
+    }
+}
+
+/// Whether a call's callee reads a value rather than naming a class.
+///
+/// Calling a class constructs an instance of it; calling anything else runs
+/// that value's `__call__` and produces a value this adapter cannot name. A
+/// type lookup reports the same class for both shapes, so seeding a
+/// constructed class needs the distinction made here. Only a proven value
+/// rejects the seed: a callee neither proof decides keeps the lookup's answer.
+fn callee_reads_a_value(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    span: SourceSpan,
+) -> bool {
+    let Some(callee) = node_at_span(prepared, span) else {
+        return false;
+    };
+    match callee.kind() {
+        "identifier" => identifier_reads_an_enclosing_local(callee, prepared.source()),
+        "attribute" => {
+            let python = python_analyzer(workspace);
+            let scope = AnalyzerQueryScope::new(python);
+            let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+            let support = PythonDefinitionProvider::new(python, &session);
+            python_attribute_callee_reads_a_field_bounded(
+                &support,
+                scope.token(),
+                file,
+                prepared.source(),
+                prepared.tree().root_node(),
+                callee,
+            ) == Some(true)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `reference` reads a name an enclosing callable binds locally.
+///
+/// A local or a parameter holds a value. A `global` or `nonlocal` declaration
+/// names an outer binding, which a class declaration can still own, so neither
+/// proves the callee is a value.
+fn identifier_reads_an_enclosing_local(reference: Node<'_>, source: &str) -> bool {
+    let Ok(name) = reference.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let mut current = reference;
+    while let Some(scope) = current.parent() {
+        if !session.scope_step() {
+            return false;
+        }
+        let encloses = scope.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= reference.start_byte() && reference.end_byte() <= body.end_byte()
+        });
+        if encloses && matches!(scope.kind(), "function_definition" | "lambda") {
+            let Some(inventory) =
+                python_lexical_scope_inventory_bounded(scope, source, || session.scope_step())
+            else {
+                return false;
+            };
+            if inventory.name_resolution_at(name, reference) == PythonLexicalNameResolution::Local {
+                return true;
+            }
+        }
+        current = scope;
+    }
+    false
+}
+
+/// The builtin class a Python string literal produces.
+///
+/// The grammar gives `"text"` and `b"text"` the same `string` kind and carries
+/// the prefix on the literal's `string_start` token, so the opening token is
+/// the only structure that separates `bytes` from `str`. A concatenation takes
+/// its class from its first literal, which the grammar requires every part to
+/// agree with.
+fn python_string_literal_class(node: Node<'_>, prepared: &PreparedSyntaxTree) -> &'static str {
+    let literal = if node.kind() == "concatenated_string" {
+        let mut cursor = node.walk();
+        match node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "string")
+        {
+            Some(first) => first,
+            None => return "builtins.str",
+        }
+    } else {
+        node
+    };
+    let mut cursor = literal.walk();
+    let Some(start) = literal
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "string_start")
+    else {
+        return "builtins.str";
+    };
+    let Ok(prefix) = start.utf8_text(prepared.source().as_bytes()) else {
+        return "builtins.str";
+    };
+    if prefix.contains('b') || prefix.contains('B') {
+        "builtins.bytes"
+    } else {
+        "builtins.str"
+    }
+}
+
+/// Python's implicit builtin namespace is a lexical binding source, even
+/// when no workspace declaration exists for the referenced class.
+fn builtin_class_reference(
+    overlay: Option<&SemanticModelOverlay>,
+    reference: Node<'_>,
+    source: &str,
+    cache: &mut ExternalClassCache,
+) -> Option<ClassSeed> {
+    if reference.kind() != "identifier" {
+        return None;
+    }
+    let name = reference.utf8_text(source.as_bytes()).ok()?;
+    if !is_python_builtin_or_constant(name) {
+        return None;
+    }
+    match builtin_base_is_unshadowed(reference, source) {
+        Some(false) => None,
+        None => Some(ClassSeed::Unknown(UnknownReason::SemanticBudget)),
+        Some(true) => {
+            let qualified_name = format!("builtins.{name}");
+            Some(
+                match external_class_identity(
+                    overlay,
+                    Language::Python,
+                    &qualified_name,
+                    None,
+                    cache,
+                ) {
+                    Some(identity) if identity.qualified_name() == qualified_name => {
+                        ClassSeed::Class(identity)
+                    }
+                    Some(_) | None => ClassSeed::Unknown(UnknownReason::ExternalNotModeled),
+                },
+            )
+        }
+    }
+}
+
 /// Resolve the expression at `span` in `file` and interpret it as a class seed.
 fn resolve_class_at_span(
     workspace: &WorkspaceAnalyzer,
@@ -724,6 +1277,16 @@ fn resolve_class_at_span(
         .indexed_source_matches(&file, indexed_source)
     {
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
+    if let Some(reference) = node_at_span(prepared, span)
+        && let Some(seed) = builtin_class_reference(
+            overlay_of(workspace).as_deref(),
+            reference,
+            indexed_source,
+            &mut ExternalClassCache::default(),
+        )
+    {
+        return seed;
     }
     let range = analyzer_range_for_span(span);
     let Some(text) = indexed_source.get(range.start_byte..range.end_byte) else {
@@ -792,36 +1355,61 @@ impl PythonTypeFlowAdapter {
         workspace: &WorkspaceAnalyzer,
         procedure: &ProcedureHandle,
         value: ValueId,
-    ) -> Option<Vec<ClassIdentity>> {
-        let semantic_value = procedure.semantics().value(value)?;
+    ) -> Result<Vec<ClassIdentity>, UnknownReason> {
+        let semantic_value = procedure
+            .semantics()
+            .value(value)
+            .expect("a guard class value is retained");
         let mapping = procedure
             .semantics()
-            .source_mapping(semantic_value.source)?;
+            .source_mapping(semantic_value.source)
+            .expect("a guard class value has a source mapping");
         if mapping.kind != SourceMappingKind::Exact {
-            return None;
+            return Err(UnknownReason::UncertainFlow);
         }
-        let file = file_for_locator(workspace, &mapping.locator)?;
-        let prepared = prepared_for_procedure(workspace, procedure, &file).ok()?;
-        let node = self.guard_value_node(procedure, value, &prepared)?;
-        let nodes = if node.kind() == "tuple" {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).collect::<Vec<_>>()
-        } else {
-            vec![node]
+        let file =
+            file_for_locator(workspace, &mapping.locator).ok_or(UnknownReason::UncertainFlow)?;
+        let prepared = prepared_for_procedure(workspace, procedure, &file)?;
+        let node = self
+            .guard_value_node(procedure, value, &prepared)
+            .ok_or(UnknownReason::UncertainFlow)?;
+        let unmodeled = |class: Node<'_>| UnknownReason::UnmodeledGuard {
+            class: class
+                .utf8_text(prepared.source().as_bytes())
+                .expect("a class expression is within its prepared source")
+                .into(),
         };
-        if nodes.is_empty() {
-            return None;
+        // A tuple and a PEP 604 `|` union spell the same set. A shape that is
+        // neither is a guard this adapter does not model, which is what
+        // `unmodeled` names.
+        let mut nodes = Vec::new();
+        if !collect_guard_class_nodes(node, &mut nodes) {
+            return Err(unmodeled(node));
         }
+        if nodes.is_empty() {
+            return Err(unmodeled(node));
+        }
+        let overlay = overlay_of(workspace);
+        let mut cache = ExternalClassCache::default();
         nodes
             .into_iter()
             .map(|class| {
                 let span = span_for_node(class);
                 match resolve_class_at_span(workspace, file.clone(), span, &prepared) {
-                    ClassSeed::Class(class) => Some(class),
+                    ClassSeed::Class(class) => Ok(class),
+                    ClassSeed::Unknown(UnknownReason::SemanticBudget) => {
+                        Err(UnknownReason::SemanticBudget)
+                    }
+                    // A builtin name has no workspace declaration for the type
+                    // lookup to return, so `isinstance(value, dict)` resolves
+                    // to nothing through that route and is modeled here.
+                    ClassSeed::NotApplicable => {
+                        exact_builtin_class(class, &prepared, overlay.as_deref(), &mut cache)
+                            .ok_or_else(|| unmodeled(class))
+                    }
                     ClassSeed::ClassWithOpenBound(_)
                     | ClassSeed::ClassesWithOpenBound(_)
-                    | ClassSeed::Unknown(_)
-                    | ClassSeed::NotApplicable => None,
+                    | ClassSeed::Unknown(_) => Err(unmodeled(class)),
                 }
             })
             .collect()
@@ -888,6 +1476,26 @@ impl PythonTypeFlowAdapter {
         (!hierarchy.unresolved_base).then_some(false)
     }
 
+    /// Whether a declared class states the runtime class of every value that
+    /// satisfies it.
+    ///
+    /// Only a workspace class with an enumerated and empty descendant
+    /// inventory does. An external class has no descendant inventory here, so
+    /// a workspace subclass of it is not excluded.
+    fn declared_class_is_closed(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+    ) -> bool {
+        if !matches!(class, ClassIdentity::Workspace(_)) {
+            return false;
+        }
+        let hierarchy = self.class_hierarchy(workspace, class);
+        hierarchy.descendants.as_deref() == Some(&[])
+            && !hierarchy.unresolved_base
+            && !hierarchy.dynamic_attributes
+    }
+
     fn workspace_member_lookup(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -897,13 +1505,17 @@ impl PythonTypeFlowAdapter {
     ) -> MemberLookup {
         let ancestors = python.get_ancestors(unit);
         // A dynamic-attribute hook anywhere on the hierarchy means no static
-        // member list is complete.
+        // member list is complete. A declared `__new__` says the same about
+        // instance creation: it chooses what to return and may install
+        // attributes on it, as caikit's `ApiFieldNames` singleton does with
+        // `cls._instance.service_pb2_modules = []`.
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
-            if python
-                .direct_children(owner)
-                .iter()
-                .any(|child| matches!(child.terminal_name(), "__getattr__" | "__getattribute__"))
-            {
+            if python.direct_children(owner).iter().any(|child| {
+                matches!(
+                    child.terminal_name(),
+                    "__getattr__" | "__getattribute__" | "__new__"
+                )
+            }) {
                 return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
             }
         }
@@ -911,18 +1523,24 @@ impl PythonTypeFlowAdapter {
         // the pack overlay or the member list is not known to be complete.
         let overlay = overlay_of(workspace);
         let mut cache = ExternalClassCache::default();
-        let direct = python.get_direct_ancestors(unit);
         let mut external_bases = Vec::new();
-        for raw in python.inner.raw_supertypes_of(unit) {
-            let resolved = direct
-                .iter()
-                .any(|ancestor| ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw);
-            if resolved {
-                continue;
-            }
-            match exact_external_base(python, unit, overlay.as_deref(), &raw, &mut cache) {
-                Some(identity) => external_bases.push(identity),
-                None => return MemberLookup::Unknown(UnknownReason::UnresolvedBase),
+        for owner in std::iter::once(unit).chain(ancestors.iter()) {
+            let direct = python.get_direct_ancestors(owner);
+            for raw in python.inner.raw_supertypes_of(owner) {
+                let resolved = direct.iter().any(|ancestor| {
+                    ancestor.terminal_name() == raw || ancestor.fq_name_str() == raw
+                });
+                if resolved {
+                    continue;
+                }
+                match exact_external_base(python, owner, overlay.as_deref(), &raw, &mut cache) {
+                    Some(identity) if !external_bases.contains(&identity) => {
+                        external_bases.push(identity);
+                    }
+                    Some(_) => {}
+                    None if python_typing_marker_base(python, owner, &raw) => {}
+                    None => return MemberLookup::Unknown(UnknownReason::UnresolvedBase),
+                }
             }
         }
         for owner in std::iter::once(unit).chain(ancestors.iter()) {
@@ -953,8 +1571,100 @@ impl PythonTypeFlowAdapter {
                 }
             }
         }
+        // Every Python class inherits `object` whether or not it names a base,
+        // so `__class__`, `__dict__`, `__hash__` and the rest of that surface
+        // are declared by no workspace or named base and are still present.
+        // `object` declares only dunders, which is a fact about the language
+        // rather than about any model, so a plain name needs no lookup.
+        if is_python_dunder(member) {
+            let Some(overlay) = overlay.as_deref() else {
+                return MemberLookup::Unknown(UnknownReason::ExternalNotModeled);
+            };
+            match object_member_lookup(overlay, &mut cache, member) {
+                present @ MemberLookup::Present(_) => return present,
+                MemberLookup::Unknown(reason) => return MemberLookup::Unknown(reason),
+                MemberLookup::Absent | MemberLookup::DeclarationAbsent => {}
+            }
+        }
+        // A class that installs members on its own instances at run time has no
+        // bounded member list. `dynamic_field_writes` reports the same writes
+        // per procedure for field slots; a member proof needs them per class.
+        for owner in std::iter::once(unit).chain(ancestors.iter()) {
+            if class_installs_dynamic_members(python, owner) {
+                return MemberLookup::Unknown(UnknownReason::DynamicAttributes);
+            }
+        }
+        // A class deriving from `type` has class objects for instances, and a
+        // class object's members are the attributes of whatever class it is.
+        // The metaclass declaration bounds only what the metaclass itself
+        // adds, so `cls.protocol` inside a metaclass method is not absent.
+        if external_bases
+            .iter()
+            .any(|base| external_class_derives_from_type(overlay.as_deref(), base))
+        {
+            return MemberLookup::Unknown(UnknownReason::ClassCreation);
+        }
+        // Class creation can install members the declaration does not show: a
+        // metaclass writes them in its own `__init__`, another class-header
+        // keyword configures the same machinery, and a class decorator can
+        // return a different class outright. A class this proof does not cover
+        // is not bounded by its declared body and its ancestors.
+        for owner in std::iter::once(unit).chain(ancestors.iter()) {
+            if !workspace_class_uses_ordinary_metaclass(
+                workspace,
+                python,
+                owner,
+                overlay.as_deref(),
+            ) {
+                return MemberLookup::Unknown(UnknownReason::ClassCreation);
+            }
+        }
         MemberLookup::DeclarationAbsent
     }
+}
+
+/// Whether a member name is one Python reserves for the language.
+///
+/// `object` declares only these, so a name outside the form cannot come from
+/// the inherited object surface no matter what any model says.
+fn is_python_dunder(member: &str) -> bool {
+    member.len() > 4 && member.starts_with("__") && member.ends_with("__")
+}
+
+/// The `builtins.object` member surface, which every Python class inherits.
+fn object_member_lookup(
+    overlay: &SemanticModelOverlay,
+    cache: &mut ExternalClassCache,
+    member: &str,
+) -> MemberLookup {
+    let Some(ClassIdentity::External { symbol_id, .. }) = external_class_identity(
+        Some(overlay),
+        Language::Python,
+        "builtins.object",
+        None,
+        cache,
+    ) else {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    };
+    external_member_lookup(overlay, &symbol_id, member)
+}
+
+fn is_builtin_value_class(class: &ClassIdentity) -> bool {
+    matches!(
+        class.qualified_name(),
+        "types.NoneType"
+            | "builtins.bool"
+            | "builtins.int"
+            | "builtins.float"
+            | "builtins.str"
+            | "builtins.bytes"
+            | "builtins.list"
+            | "builtins.tuple"
+            | "builtins.dict"
+            | "builtins.set"
+            | "builtins.frozenset"
+            | "builtins.object"
+    )
 }
 
 impl TypeFlowAdapter for PythonTypeFlowAdapter {
@@ -963,9 +1673,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
+        // v17 combines #3124 program-point refinement, #3131 named unmodeled-
+        // guard remainders and #3129 scoped dynamic writes, retaining workspace
+        // guard summaries and exact builtin identities after AST shadow checks.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-exact-prepared-syntax-v12",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-exact-class-polarity-v30",
         )
         .expect("adapter name is non-empty")
     }
@@ -1009,7 +1722,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 }
             }
             "not_operator" => "builtins.bool",
-            "string" | "concatenated_string" => "builtins.str",
+            "string" | "concatenated_string" => python_string_literal_class(node, &prepared),
             "boolean_operator" | "binary_operator" | "unary_operator" => {
                 return ClassSeed::Unknown(UnknownReason::UncertainFlow);
             }
@@ -1179,7 +1892,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             Ok(prepared) => prepared,
             Err(reason) => return ClassSeed::Unknown(reason),
         };
-        resolve_class_at_span(workspace, file, mapping.locator.anchor().span(), &prepared)
+        let span = mapping.locator.anchor().span();
+        let seed = resolve_class_at_span(workspace, file.clone(), span, &prepared);
+        if matches!(seed, ClassSeed::Class(_))
+            && callee_reads_a_value(workspace, &file, &prepared, span)
+        {
+            return ClassSeed::NotApplicable;
+        }
+        seed
     }
 
     fn constant_class(
@@ -1208,7 +1928,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         let name = match node.kind() {
             "integer" => "builtins.int",
             "float" => "builtins.float",
-            "string" | "concatenated_string" => "builtins.str",
+            "string" | "concatenated_string" => python_string_literal_class(node, &prepared),
             "true" | "false" => "builtins.bool",
             "none" => "types.NoneType",
             _ => return ClassSeed::NotApplicable,
@@ -1321,7 +2041,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         if !matches!(annotation.kind(), "identifier" | "attribute") {
             return ClassSeed::NotApplicable;
         }
-        resolve_class_at_span(
+        let seed = resolve_class_at_span(
             workspace,
             file,
             SourceSpan::new(
@@ -1338,7 +2058,32 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             )
             .expect("a tree-sitter node range is a valid source span"),
             &prepared,
-        )
+        );
+        // An annotation is an upper bound, not an identity: a caller may pass
+        // any subclass, and a subclass declares members the annotated class
+        // does not. Only a class nothing can extend states the runtime class.
+        //
+        // A builtin value class is the exception the model already makes
+        // elsewhere: `str`, `int` and their siblings are subclassable in
+        // principle, and treating an annotation naming one as exact is the
+        // contract `builtin_class_reference` was added to serve. Widening them
+        // here would make that resolution unusable.
+        //
+        // `object` is not one of them. Every class is an `object`, so the
+        // annotation constrains nothing, and reading it as the exact class
+        // would prove every member absent on any value a signature declares
+        // that way -- which `__eq__(self, other: object)` does everywhere.
+        let ClassSeed::Class(class) = seed else {
+            return seed;
+        };
+        if class.qualified_name() == "builtins.object" {
+            return ClassSeed::ClassWithOpenBound(class);
+        }
+        if is_builtin_value_class(&class) || self.declared_class_is_closed(workspace, &class) {
+            ClassSeed::Class(class)
+        } else {
+            ClassSeed::ClassWithOpenBound(class)
+        }
     }
 
     fn accessed_member(
@@ -1413,8 +2158,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         workspace: &WorkspaceAnalyzer,
         class: &ClassIdentity,
     ) -> ClassHierarchy {
-        let ClassIdentity::Workspace(unit) = class else {
-            return ClassHierarchy::unknown();
+        let unit = match class {
+            ClassIdentity::Workspace(unit) => unit,
+            ClassIdentity::External { symbol_id, .. } => {
+                return external_class_hierarchy(overlay_of(workspace).as_deref(), symbol_id);
+            }
         };
         let python = python_analyzer(workspace);
         let workspace_ancestors = python.get_ancestors(unit);
@@ -1443,6 +2191,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 ) {
                     Some(identity) if !ancestors.contains(&identity) => ancestors.push(identity),
                     Some(_) => {}
+                    None if python_typing_marker_base(python, owner, &raw) => {}
                     None => unresolved_base = true,
                 }
             }
@@ -1523,6 +2272,57 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         true
     }
 
+    fn truthiness_is_pure(&self, workspace: &WorkspaceAnalyzer, class: &ClassIdentity) -> bool {
+        if is_builtin_value_class(class) {
+            return true;
+        }
+        let hierarchy = self.class_hierarchy(workspace, class);
+        !hierarchy.unresolved_base
+            && !hierarchy.dynamic_attributes
+            && ["__bool__", "__len__"].iter().all(|member| {
+                matches!(
+                    self.member_lookup(workspace, MemberAccessKind::Load, class, member),
+                    MemberLookup::Absent | MemberLookup::DeclarationAbsent
+                )
+            })
+    }
+
+    fn member_access_is_pure(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> bool {
+        is_builtin_value_class(class) || self.field_access_is_plain(workspace, class, member)
+    }
+
+    fn field_access_is_plain(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+        member: &str,
+    ) -> bool {
+        let hierarchy = self.class_hierarchy(workspace, class);
+        if hierarchy.unresolved_base || hierarchy.dynamic_attributes {
+            return false;
+        }
+        let Some(descendants) = hierarchy.descendants.as_ref() else {
+            return false;
+        };
+        std::iter::once(class)
+            .chain(&hierarchy.ancestors)
+            .chain(descendants)
+            .all(|owner| {
+                if owner.qualified_name() == "builtins.object" {
+                    return true;
+                }
+                let owner_hierarchy = self.class_hierarchy(workspace, owner);
+                !owner_hierarchy.unresolved_base
+                    && !owner_hierarchy.dynamic_attributes
+                    && self.field_slot_is_complete(workspace, owner, member)
+            })
+    }
+
     fn dynamic_field_writes(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -1530,14 +2330,25 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     ) -> Vec<DynamicFieldWrite> {
         let semantics = procedure.semantics();
         let Some(file) = file_for_locator(workspace, semantics.locator()) else {
-            return vec![DynamicFieldWrite::Any];
+            return vec![DynamicFieldWrite::Any {
+                receiver: None,
+                span: semantics.locator().anchor().span(),
+            }];
         };
         let prepared = match prepared_for_procedure(workspace, procedure, &file) {
             Ok(prepared) => prepared,
-            Err(_) => return vec![DynamicFieldWrite::Any],
+            Err(_) => {
+                return vec![DynamicFieldWrite::Any {
+                    receiver: None,
+                    span: semantics.locator().anchor().span(),
+                }];
+            }
         };
         let Some(callable) = node_at_span(&prepared, semantics.locator().anchor().span()) else {
-            return vec![DynamicFieldWrite::Any];
+            return vec![DynamicFieldWrite::Any {
+                receiver: None,
+                span: semantics.locator().anchor().span(),
+            }];
         };
         let root_id = callable.id();
         let mut writes = Vec::new();
@@ -1552,13 +2363,25 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 continue;
             }
             if let Some(write) = dynamic_call_write(node, prepared.source()) {
-                writes.push(write);
+                writes.push(scoped_dynamic_write(
+                    workspace,
+                    procedure,
+                    node,
+                    write,
+                    prepared.source(),
+                ));
             }
             if matches!(node.kind(), "assignment" | "augmented_assignment")
                 && let Some(write) = dictionary_write(node, prepared.source())
             {
                 writes.push(DynamicFieldWrite::Member("__dict__".into()));
-                writes.push(write);
+                writes.push(scoped_dynamic_write(
+                    workspace,
+                    procedure,
+                    node,
+                    write,
+                    prepared.source(),
+                ));
             }
             let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
@@ -1582,20 +2405,90 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         match guard.predicate {
             GuardPredicate::InstanceOf { classes, .. } => {
-                let Some(classes) = self.guard_classes(workspace, procedure, classes) else {
-                    return unknown();
+                let classes = match self.guard_classes(workspace, procedure, classes) {
+                    Ok(classes) => classes,
+                    Err(reason) => return vec![NarrowingVerdict::Incomplete(reason); atoms.len()],
                 };
                 let overlay = overlay_of(workspace);
-                if !self.guard_classes_have_supported_instance_checks(
-                    workspace,
-                    &classes,
-                    overlay.as_deref(),
-                ) {
-                    return unknown();
+                for class in &classes {
+                    if !self.guard_classes_have_supported_instance_checks(
+                        workspace,
+                        std::slice::from_ref(class),
+                        overlay.as_deref(),
+                    ) {
+                        return vec![
+                            NarrowingVerdict::Incomplete(UnknownReason::UnmodeledGuard {
+                                class: class.qualified_name().into(),
+                            });
+                            atoms.len()
+                        ];
+                    }
                 }
                 atoms
                     .iter()
-                    .map(|atom| verdict(self.instance_relation(workspace, atom, &classes)))
+                    .map(
+                        |atom| match self.instance_relation(workspace, atom, &classes) {
+                            Some(holds) => verdict(Some(holds)),
+                            None => NarrowingVerdict::Incomplete(UnknownReason::UnmodeledGuard {
+                                class: classes
+                                    .iter()
+                                    .map(ClassIdentity::qualified_name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                                    .into(),
+                            }),
+                        },
+                    )
+                    .collect()
+            }
+            // `None` is falsy, and nothing can make it truthy: `NoneType`
+            // declares no `__bool__` and no `__len__`, and neither can be
+            // added to it. A value a truth test proved truthy is therefore
+            // not `None`. Nothing else follows, and the false arm -- which
+            // the engine derives by reversing this one -- proves nothing at
+            // all, because `0`, `""` and an empty container are falsy too.
+            GuardPredicate::Truthy { .. } => atoms
+                .iter()
+                .map(|atom| {
+                    if atom.qualified_name() == "types.NoneType" {
+                        NarrowingVerdict::Drop
+                    } else {
+                        NarrowingVerdict::Unknown
+                    }
+                })
+                .collect(),
+            GuardPredicate::ExactClass {
+                classes,
+                exact_on_true,
+                ..
+            } => {
+                let classes = match self.guard_classes(workspace, procedure, classes) {
+                    Ok(classes) => classes,
+                    Err(reason) => return vec![NarrowingVerdict::Incomplete(reason); atoms.len()],
+                };
+                // `type(value) is C` names the runtime class outright, so a
+                // candidate needs no hierarchy: it either is one of the named
+                // classes or it is not. The named classes must still be the
+                // classes the source spells, which is the same proof
+                // `isinstance` needs of them.
+                let overlay = overlay_of(workspace);
+                for class in &classes {
+                    if !self.guard_classes_have_supported_instance_checks(
+                        workspace,
+                        std::slice::from_ref(class),
+                        overlay.as_deref(),
+                    ) {
+                        return vec![
+                            NarrowingVerdict::Incomplete(UnknownReason::UnmodeledGuard {
+                                class: class.qualified_name().into(),
+                            });
+                            atoms.len()
+                        ];
+                    }
+                }
+                atoms
+                    .iter()
+                    .map(|atom| verdict(Some(classes.contains(atom) == exact_on_true)))
                     .collect()
             }
             GuardPredicate::HasMember { member, .. } => {
@@ -1640,6 +2533,23 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::ConstantEquality { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
         }
+    }
+
+    fn call_guard_narrowing(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        guard: &GuardFact,
+        atoms: &[&ClassIdentity],
+        member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
+    ) -> Option<(ValueId, Vec<NarrowingVerdict>)> {
+        super::guard_summary::call_guard_narrowing(
+            workspace,
+            procedure,
+            guard,
+            atoms,
+            member_lookup,
+        )
     }
 
     fn normal_return_type_constraints(
@@ -1903,7 +2813,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             {
                 return Vec::new();
             }
-            let Some(classes) =
+            let Ok(classes) =
                 self.guard_classes(workspace, procedure, call.arguments[class_parameter].value)
             else {
                 return Vec::new();

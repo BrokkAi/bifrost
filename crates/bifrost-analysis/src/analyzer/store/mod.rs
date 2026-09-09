@@ -197,6 +197,17 @@ impl WorkspaceId {
         Self(brokk_bifrost_core::gitblob::workspace_cache_identity(root))
     }
 
+    /// A partial listing must never reconcile under a live root's identity,
+    /// or under another session's identity even when their roots coincide.
+    pub(crate) fn for_session() -> Self {
+        use brokk_bifrost_core::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
+
+        Self(lower_hex_string(&hash_domain_bytes(
+            b"bifrost-cache-workspace-session-v1",
+            uuid::Uuid::new_v4().as_bytes(),
+        )))
+    }
+
     fn as_str(&self) -> &str {
         &self.0
     }

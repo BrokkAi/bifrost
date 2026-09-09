@@ -64,6 +64,14 @@ This projection is the main isolation boundary:
 - replacing a path-to-content mapping does not require rewriting global facts
   for content that is still reusable elsewhere.
 
+Scoped sessions share the repository's content facts but select their files
+through a unique session projection. They never reconcile their partial file
+listing under the live workspace's identity. The projection remains available
+while any analyzer context uses it and is deleted when the last owner drops;
+the content facts remain reusable by later scoped or whole-workspace builds.
+Scoped builds use the same cache-location resolution and build lock as normal
+persisted builds, including both cache-directory overrides.
+
 Unsaved buffers participate as snapshot-specific content. Their bytes enter the
 request's content identity and remain separate from the committed disk version
 at the same path.
@@ -128,7 +136,10 @@ write jobs; SQLite supplies the corresponding cross-process arbitration.
 The complete workspace build adds a per-cache build lock. Linked worktrees often
 discover the same missing blobs at the same time; independent parsing and
 publication of that identical set would waste CPU and increase writer
-contention.
+contention. Garbage collection takes the same lock because a build publishes
+content facts before the workspace projection that retains them. A collector
+must observe either side of that complete reconciliation, never the interval
+between them.
 One elected build reconciles the shared store while the others wait and then
 observe its committed work. The elected build may still parallelize parsing
 internally before serialized publication.

@@ -39,6 +39,14 @@ use std::sync::Arc;
 /// accessor.
 pub(crate) trait JsTsMemoSource: JsTsSource {
     fn memo_caches(&self) -> &JsTsMemoCaches;
+
+    /// Return the analyzer that owns this memo bucket's request-scoped reads.
+    ///
+    /// The JS/TS source trait lives in the language provider crate and cannot
+    /// itself expose the tree-sitter analyzer's read-ledger state. Keeping the
+    /// accessor here lets all memo crossings publish the same workspace export
+    /// index dependency, including cache hits, without enumerating files again.
+    fn analyzer(&self) -> &dyn IAnalyzer;
 }
 
 /// The one downcast from the framework's `&dyn IAnalyzer` to the JS/TS source
@@ -258,15 +266,24 @@ pub(crate) fn get_direct_descendants_within(
 
 // --- Usage index -----------------------------------------------------------
 
+fn record_usage_index_scope(host: &dyn JsTsMemoSource) {
+    let analyzer = host.analyzer();
+    if analyzer.read_ledger_attached() {
+        analyzer.record_read(analyzer.workspace_scope_read_key(&[host.language()]));
+    }
+}
+
 /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for the host's
 /// language. Built once per cache bucket and reused until `update`/`update_all`
 /// installs a fresh bucket.
 pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
     let language = host.language();
-    host.memo_caches().jsts_usage_index.get_or_build(
+    let index = host.memo_caches().jsts_usage_index.get_or_build(
         || build_jsts_usage_index(host, host.alias_resolver(), language, true),
         || build_jsts_usage_index(host, host.alias_resolver(), language, false),
-    )
+    );
+    record_usage_index_scope(host);
+    index
 }
 
 /// Prepare the usage index before a caller starts its own parallel file scan.
@@ -279,10 +296,12 @@ pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex>
 /// able to re-enter the in-flight cell.
 pub(crate) fn jsts_usage_index_for_parallel_scan(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
     let language = host.language();
-    host.memo_caches().jsts_usage_index.get_or_build_parallel(
+    let index = host.memo_caches().jsts_usage_index.get_or_build_parallel(
         || build_jsts_usage_index(host, host.alias_resolver(), language, true),
         || build_jsts_usage_index(host, host.alias_resolver(), language, false),
-    )
+    );
+    record_usage_index_scope(host);
+    index
 }
 
 pub(crate) fn jsts_usage_index_with_cancellation(
@@ -290,7 +309,8 @@ pub(crate) fn jsts_usage_index_with_cancellation(
     cancellation: &CancellationToken,
 ) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.language();
-    host.memo_caches()
+    let index = host
+        .memo_caches()
         .jsts_usage_index
         .get_or_try_build(
             || {
@@ -314,5 +334,9 @@ pub(crate) fn jsts_usage_index_with_cancellation(
                 .ok_or(())
             },
         )
-        .ok()
+        .ok();
+    if index.is_some() {
+        record_usage_index_scope(host);
+    }
+    index
 }

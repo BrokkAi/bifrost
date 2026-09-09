@@ -2303,6 +2303,9 @@ struct QueryExecutionState<'a> {
     /// Which files the seed scanners enumerate. Narrowed only by a unit
     /// execution; every derived-value expansion still sees the workspace.
     scope: CodeQueryExecutionScope<'a>,
+    /// Physical node at which an opt-in expansion execution retains its exact
+    /// source rows. `None` preserves all existing execution behavior.
+    source_row_boundary: Option<PhysicalQueryNodeId>,
     /// Rows each plan operator emitted, indexed by its physical plan node.
     /// `max_step_outputs` is enforced per step and has no other counter.
     step_outputs: Vec<u64>,
@@ -2839,6 +2842,27 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session(
     cancellation: Option<&CancellationToken>,
     row_family_session: &mut CodeQueryRowFamilySession,
 ) -> DetailedCodeQueryResult {
+    execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
+        analyzer,
+        query,
+        limits,
+        cancellation,
+        row_family_session,
+        CodeQueryExecutionScope::whole_workspace(),
+    )
+}
+
+/// Eager structural execution with shared row-family products over an exact
+/// seed-file scope.
+#[doc(hidden)]
+pub fn execute_code_query_detailed_eager_index_with_row_family_session_in_scope(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    row_family_session: &mut CodeQueryRowFamilySession,
+    execution_scope: CodeQueryExecutionScope<'_>,
+) -> DetailedCodeQueryResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
@@ -2865,7 +2889,7 @@ pub fn execute_code_query_detailed_eager_index_with_row_family_session(
         Some(stores),
         None,
         None,
-        CodeQueryExecutionScope::whole_workspace(),
+        execution_scope,
         None,
     )
 }
@@ -2925,6 +2949,27 @@ pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_s
     cancellation: Option<&CancellationToken>,
     row_family_session: &mut CodeQueryRowFamilySession,
 ) -> DetailedCodeQueryResult {
+    execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope(
+        analyzer,
+        query,
+        limits,
+        cancellation,
+        row_family_session,
+        CodeQueryExecutionScope::whole_workspace(),
+    )
+}
+
+/// Identity-only eager structural execution with shared row-family products
+/// over an exact seed-file scope.
+#[doc(hidden)]
+pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    row_family_session: &mut CodeQueryRowFamilySession,
+    execution_scope: CodeQueryExecutionScope<'_>,
+) -> DetailedCodeQueryResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
@@ -2951,7 +2996,7 @@ pub fn execute_code_query_detailed_eager_index_without_targets_with_row_family_s
         Some(stores),
         None,
         None,
-        CodeQueryExecutionScope::whole_workspace(),
+        execution_scope,
         None,
     )
 }
@@ -2994,6 +3039,59 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         None,
         None,
         CodeQueryExecutionScope::whole_workspace(),
+        None,
+    )
+}
+
+/// Execute a full source query plus an appended expansion suffix against an
+/// exact set of source rows produced by the source query.
+///
+/// This is a query-specific policy seam. The source rows are matched at the
+/// physical source-prefix boundary using structured detailed evidence, then
+/// the suffix continues through the ordinary eager executor. Existing callers
+/// leave this selection unset and retain their whole-workspace behavior.
+#[doc(hidden)]
+pub fn execute_code_query_expansion(
+    analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    source_steps: usize,
+    source_rows: &[DetailedCodeQueryEvidence],
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DetailedCodeQueryResult {
+    assert!(
+        source_steps <= query.plan.steps.len(),
+        "source step count must be a prefix of the full query plan"
+    );
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        token,
+        workspace,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+        None,
+        CodeQueryExecutionScope::for_source_rows(
+            query.plan.steps.len() - source_steps,
+            source_rows,
+        ),
         None,
     )
 }
@@ -3404,6 +3502,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             );
         }
     };
+    let source_row_boundary = source_row_boundary(&physical_plan, scope);
     let requires_semantic = query_plan_requires_semantic(&query.plan);
     if requires_semantic && semantic_continuation.is_none() && !limits.semantic.all_positive() {
         return detailed_result_without_evidence(
@@ -3471,6 +3570,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         workspace,
         cancellation,
         scope,
+        source_row_boundary,
         step_outputs: vec![0; physical_plan.node_count()],
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
@@ -3611,16 +3711,30 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     let rendering_started = capture_profile.then(Instant::now);
     let mut cancelled = execution.cancelled;
     let mut truncated = execution.truncated;
-    // Preserve the pre-composition response shape for a plain structural
-    // query. Set plans retain their seed-only traces because the branch path
-    // is meaningful provenance even when no semantic step follows the set.
-    if query.seed().is_some() && query.plan.steps.is_empty() {
+    // A narrowed union leaf keeps the executor's actual traces and carries
+    // the authored path through every projection. The ordinary root query
+    // retains its historical plain-structural response shape, which omits
+    // seed-only traces.
+    if !scope.branch_path().is_empty() {
+        let branch_path = scope.branch_path();
+        for row in &mut execution.rows {
+            for trace in &mut row.traces {
+                assert!(
+                    trace.branch.is_empty(),
+                    "a union leaf trace must not already carry a set branch"
+                );
+                trace.branch.extend_from_slice(branch_path);
+            }
+        }
+    } else if query.seed().is_some() && query.plan.steps.is_empty() {
         for row in &mut execution.rows {
             row.traces.clear();
             row.provenance_truncated = false;
         }
     }
-    if let Some(seed) = query.seed() {
+    if scope.branch_path().is_empty()
+        && let Some(seed) = query.seed()
+    {
         let plan = QueryPlan::for_query(seed);
         if should_report_broad_query(&plan, seed, &state.budget, truncated) {
             push_broad_query_diagnostic(&mut diagnostics, &state.budget);
@@ -3693,6 +3807,19 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
     }
     if !cancelled && !structural_index_stale {
         state.structural_index_session.publish_auto_observations();
+    }
+    if !scope.branch_path().is_empty() {
+        let branch_path = scope.branch_path();
+        for diagnostic in &mut diagnostics {
+            if diagnostic.branch.is_empty() {
+                diagnostic.branch.extend_from_slice(branch_path);
+            } else {
+                assert!(
+                    diagnostic.branch.starts_with(branch_path),
+                    "a union leaf diagnostic must carry its full branch path"
+                );
+            }
+        }
     }
     let total_work = execution_work_snapshot(state.budget, semantic_work);
     let work = public_execution_work(total_work);
@@ -3784,6 +3911,39 @@ fn select_physical_plan(
         logical_plan,
         parallel_union,
     ))
+}
+
+/// Locate the source prefix in the validated plan. The logical builder adds
+/// one unary node per authored suffix step and one root limit; physical
+/// lowering preserves those dependencies. Walking only the outer suffix also
+/// keeps selection above any set branches in the source query.
+fn source_row_boundary(
+    plan: &PhysicalQueryPlan,
+    scope: CodeQueryExecutionScope<'_>,
+) -> Option<PhysicalQueryNodeId> {
+    let selection = scope.source_selection()?;
+    let root = plan.root();
+    let root_node = plan.node(root);
+    assert!(matches!(
+        plan.logical_node(root).operator(),
+        LogicalQueryOperator::Limit { .. }
+    ));
+    assert_eq!(root_node.dependencies().len(), 1, "the root limit is unary");
+    let mut node = root_node.dependencies()[0];
+    for _ in 0..selection.suffix_steps() {
+        let physical_node = plan.node(node);
+        assert!(matches!(
+            plan.logical_node(node).operator(),
+            LogicalQueryOperator::Step { .. }
+        ));
+        assert_eq!(
+            physical_node.dependencies().len(),
+            1,
+            "an authored suffix step is unary"
+        );
+        node = physical_node.dependencies()[0];
+    }
+    Some(node)
 }
 
 fn select_parallel_union(

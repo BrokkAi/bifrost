@@ -665,6 +665,19 @@ pub(super) fn continuous_optional_chain(mut node: Node<'_>) -> bool {
     }
 }
 
+/// Whether an expression is the direct callee of a call or constructor.
+/// Call-callee position determines the value's semantic kind, so capture
+/// diagnostics can use the same value row that call lowering requests without
+/// preloading it as a local. Transparent wrappers have their own expression
+/// value and are therefore deliberately not climbed here.
+pub(super) fn is_call_callee(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        (parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node))
+            || (parent.kind() == "new_expression"
+                && parent.child_by_field_name("constructor") == Some(node))
+    })
+}
+
 pub(super) fn logical_assignment_operator(node: Node<'_>) -> Option<&'static str> {
     let operator = node.child_by_field_name("operator")?;
     match operator.kind() {

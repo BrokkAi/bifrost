@@ -1940,6 +1940,11 @@ fn value_transfer_detail(
                 span,
             }
         }
+        TransferOperation::CallArgumentConversion(conversion) => {
+            ValueTransferOperation::CallArgumentConversion {
+                id: StableDigest::parse(conversion.to_string()).expect("SHA-256 is canonical"),
+            }
+        }
         TransferOperation::Unknown => ValueTransferOperation::Unknown,
     };
     Ok(ValueTransfer { kind, operation })

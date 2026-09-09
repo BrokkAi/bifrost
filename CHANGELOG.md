@@ -35,6 +35,13 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Ruby value-flow snapshots now support assignments, deciding the largest
+  Ruby DataFlowBench inconclusive cluster.
+- Go analyzer worker startup now caps glibc arenas, bounding memory growth in
+  many-threaded workspace builds.
+- The Kotlin grammar is upgraded to 0.4.6.
+- `score_diff` now classifies hot-symbol references from pre-render usage
+  sites.
 - Type-flow class-set summaries and their field-slot indexes are now
   persisted, validated, and replayed across runs, with persisted cuts
   selected before discovery and fail-closed behavior on unproven surfaces.

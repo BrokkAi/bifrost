@@ -42,7 +42,16 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// and source/JMOD production retains both formal names and that proof (#3006).
 /// 11: Python source-set rejects retain their exact source-entry identity for
 /// release extraction accounting (#3027).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 13;
+/// 14: the Python stub producer no longer records `@name.setter` and
+/// `@name.deleter` as members of their own. A property with a write half
+/// published two competing records for one name, and competing records cannot
+/// prove the member present on its owner.
+/// 15: the Python stub producer records the implicit `builtins.object` base a
+/// stub omits when a class names no other. Without it 196 of the stdlib pack's
+/// 560 classes, `int`, `float` and `types.NoneType` among them, had no
+/// ancestry, so no consumer could resolve their surface or exclude them from
+/// an `isinstance` guard.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 15;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

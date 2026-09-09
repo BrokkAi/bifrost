@@ -208,6 +208,104 @@ fn callback_with_unsupported_parameter_capture_keeps_invocation_unknown() {
 }
 
 #[test]
+fn unsupported_parameter_capture_in_call_position_remains_callable() {
+    let source = r#"
+        function outer(callback) {
+            const write = () => {
+                callback();
+            };
+            write();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let callback = parts
+        .iter()
+        .find(|procedure| procedure.kind == ProcedureKind::Lambda)
+        .expect("callback procedure");
+
+    assert_eq!(
+        callback.call_sites.len(),
+        1,
+        "call sites={:#?}",
+        callback.call_sites
+    );
+    let callee = callback.call_sites[0].callee;
+    assert_eq!(
+        callback.values[callee.index()].kind,
+        SemanticValueKind::Callable,
+        "captured call must retain a callable callee row"
+    );
+    assert!(callback.gaps.iter().any(|gap| {
+        gap.subject == SemanticGapSubject::Value(callee)
+            && gap.capability == SemanticCapability::Captures
+            && gap.kind == SemanticGapKind::Unsupported
+    }));
+}
+
+#[test]
+fn unsupported_parameter_capture_in_constructor_position_remains_callable() {
+    let source = r#"
+        function outer(callback) {
+            const make = () => {
+                new callback();
+            };
+            make();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let callback = parts
+        .iter()
+        .find(|procedure| procedure.kind == ProcedureKind::Lambda)
+        .expect("callback procedure");
+
+    assert_eq!(
+        callback.call_sites.len(),
+        1,
+        "call sites={:#?}",
+        callback.call_sites
+    );
+    let callee = callback.call_sites[0].callee;
+    assert_eq!(
+        callback.values[callee.index()].kind,
+        SemanticValueKind::Callable
+    );
+    assert!(callback.gaps.iter().any(|gap| {
+        gap.subject == SemanticGapSubject::Value(callee)
+            && gap.capability == SemanticCapability::Captures
+            && gap.kind == SemanticGapKind::Unsupported
+    }));
+}
+
+#[test]
+fn unsupported_parameter_capture_as_call_argument_remains_local() {
+    let source = r#"
+        function outer(callback) {
+            const use = () => {
+                sink(callback);
+            };
+            use();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let callback = parts
+        .iter()
+        .find(|procedure| procedure.kind == ProcedureKind::Lambda)
+        .expect("callback procedure");
+
+    assert_eq!(
+        callback.call_sites.len(),
+        1,
+        "call sites={:#?}",
+        callback.call_sites
+    );
+    let argument = callback.call_sites[0].arguments[0].value;
+    assert_eq!(
+        callback.values[argument.index()].kind,
+        SemanticValueKind::Local
+    );
+}
+
+#[test]
 fn sibling_callback_chain_keeps_each_capture_target_distinct() {
     let source = r#"
         function capture(input) {

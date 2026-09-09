@@ -189,7 +189,10 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
-/// Revision 23 adds saved definition-time default argument values, selected
+/// Revision 25 adds program-point assignment events for every structured
+/// Python assignment target and content-addressed provenance for
+/// resolver-proven per-actual call argument conversions. Revision 23 adds
+/// saved definition-time default argument values, selected
 /// by conditional call bindings rather than executed in the callee body.
 /// Revision 20 replaces the fieldless aggregate-copy value-flow marker with
 /// the identity-separating transfer vocabulary (copy, aggregate copy, move
@@ -205,7 +208,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 23;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 25;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1338,10 +1341,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "d7be6c0f078ca1a6637aac177bd346e8b7d4da03b1a420b905f38cdc863de59d"
+            "d8b7799e984f2f3ebc58fe05368d6f241164fe3a317e8ba4b8aa9954e621e61f"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 23);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 25);
     }
 
     fn digest(label: &str) -> StableDigest {

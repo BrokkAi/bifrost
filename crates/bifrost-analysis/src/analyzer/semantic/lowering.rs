@@ -1313,6 +1313,44 @@ impl<'a> ProcedureLoweringSession<'a> {
         )
     }
 
+    /// Add a gap whose downstream impact set is already complete.
+    ///
+    /// Most adapter gaps use the conservative capability-derived impacts plus
+    /// additions. A partitioned gap uses this entry point only when the
+    /// adapter has already lowered every other effect of the operation and the
+    /// retained gap deliberately describes the one remaining partition.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_partitioned_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        subject: SemanticGapSubject,
+        capability: SemanticCapability,
+        impacts: SemanticGapImpacts,
+        kind: SemanticGapKind,
+        detail: impl Into<Box<str>>,
+    ) -> Result<SemanticGapId, ProcedureLoweringError> {
+        let metadata = self.metadata(point)?;
+        let id = SemanticGapId::try_from_index(self.next_gap)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many semantic gaps".into()))?;
+        builder.add_gap(SemanticGap {
+            id,
+            point,
+            subject,
+            capability,
+            impacts,
+            kind,
+            budget: None,
+            discharge: SemanticGapDischarge::ModeledEffectPartition,
+            detail: detail.into(),
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_gap += 1;
+        self.append_effect(builder, point, SemanticEffect::Gap { gap: id })?;
+        Ok(id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_gap_with_impacts_and_discharge(
         &mut self,

@@ -1,11 +1,10 @@
 //! Scoped MCP sessions: a service over an explicitly named subset of a
 //! workspace's files, optionally read at a git revision.
 //!
-//! Every service built here takes the ephemeral analyzer deliberately, which is
-//! why the footgun name appears four times below. A scoped session sees a
-//! partial file set, and a partial view must not become the workspace's
-//! persisted picture of itself: the files it never listed would read as absent
-//! to the next consumer of that cache.
+//! Scoped services reuse the root's persistent blob facts through an isolated
+//! session projection. Their partial file sets never reconcile under the live
+//! workspace's identity. The last analyzer context drops the session's path
+//! rows while keeping the content-addressed facts for later consumers.
 //!
 //! Callers see the partial view for what it is because the `FileSetProject`
 //! every branch below builds answers `Project::coverage()` with its own file
@@ -39,8 +38,8 @@ pub fn create_scoped_service(
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        // Ephemeral on purpose: partial file set, see the module doc.
-        return SearchToolsService::new_manual_ephemeral_footgun_for_project(
+        // Isolate the partial file set while sharing persistent blob facts.
+        return SearchToolsService::new_manual_scoped_persisted_for_project(
             project,
             AnalyzerConfig::default(),
         );
@@ -96,8 +95,8 @@ pub fn create_scoped_service(
         }
     }
     let project: Arc<dyn Project> = overlay_project;
-    // Ephemeral on purpose: partial file set, see the module doc.
-    SearchToolsService::new_manual_ephemeral_footgun_for_project(project, AnalyzerConfig::default())
+    // Isolate the partial file set while sharing persistent blob facts.
+    SearchToolsService::new_manual_scoped_persisted_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn create_cli_tool_service(
@@ -131,8 +130,8 @@ pub fn create_cli_tool_service(
     if overlays.is_empty() {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        // Ephemeral on purpose: partial file set, see the module doc.
-        return SearchToolsService::new_manual_ephemeral_footgun_for_project(
+        // Isolate the partial file set while sharing persistent blob facts.
+        return SearchToolsService::new_manual_scoped_persisted_for_project(
             project,
             AnalyzerConfig::default(),
         );
@@ -159,8 +158,8 @@ pub fn create_cli_tool_service(
     let overlay_project = Arc::new(OverlayProject::new(project));
     install_git_history_overlays(&root, &overlay_project, overlays)?;
     let project: Arc<dyn Project> = overlay_project;
-    // Ephemeral on purpose: partial file set, see the module doc.
-    SearchToolsService::new_manual_ephemeral_footgun_for_project(project, AnalyzerConfig::default())
+    // Isolate the partial file set while sharing persistent blob facts.
+    SearchToolsService::new_manual_scoped_persisted_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {

@@ -849,8 +849,31 @@ pub fn static_member_property<'tree>(
         "subscript_expression" => (member_expression.child_by_field_name("index")?, true),
         _ => return None,
     };
+    if computed
+        && matches!(
+            property.kind(),
+            "property_identifier" | "identifier" | "private_property_identifier"
+        )
+    {
+        return None;
+    }
+    static_property_name(property, source)
+}
+
+/// Resolve a property/member-name node whose name is statically determined by
+/// the syntax tree.
+///
+/// Bare identifiers and private property identifiers are already name-bearing
+/// nodes. A string literal is accepted only when it has exactly one
+/// `string_fragment` child, and a computed property name is accepted only when
+/// it has exactly one string-literal child. This deliberately rejects escaped
+/// and dynamic forms instead of interpreting source text.
+pub fn static_property_name<'tree>(
+    property: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
     match property.kind() {
-        "property_identifier" | "identifier" | "private_property_identifier" if !computed => {
+        "property_identifier" | "identifier" | "private_property_identifier" => {
             let name = slice(property, source);
             (!name.is_empty()).then(|| (property, name.to_string()))
         }
@@ -1649,7 +1672,16 @@ pub fn declarator_module_value_specifier(
 }
 
 pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
-    let root = tree.root_node();
+    compute_import_binder_for_root(source, tree.root_node())
+}
+
+/// Reuse the indexed tree's root when a query already owns exact AST nodes.
+pub fn compute_import_binder_for_root(source: &str, root: Node<'_>) -> JsTsImportBinder {
+    assert_eq!(
+        root.kind(),
+        "program",
+        "import binding requires the file root"
+    );
     // Keep the lexical index with the binder so a position query can reject
     // parameter/local shadowing and assignments without rebuilding a second,
     // consumer-specific binding walk.
@@ -2190,25 +2222,99 @@ relay();
     }
 
     #[test]
-    fn duplicate_static_imports_are_deduplicated_and_bounded() {
+    fn duplicate_static_imports_are_projected_once_but_remain_ambiguous() {
+        let source = r#"
+import { relay } from "./same";
+import { relay } from "./same";
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+        let use_byte = source.rfind("relay();").expect("relay use");
+
+        assert_eq!(imports.bindings_for("relay").count(), 1);
+        assert_eq!(imports.binding_records_for("relay").len(), 2);
+        assert!(!imports.has_competing_static_imports("relay"));
+        assert!(!imports.was_truncated("relay"));
+        assert_eq!(
+            imports.binding_at("relay", use_byte),
+            JsTsImportBindingResolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn distinct_static_imports_fill_then_exceed_the_candidate_capacity() {
         let mut source = String::new();
-        source.push_str("import { relay } from \"./same\";\n");
-        source.push_str("import { relay } from \"./same\";\n");
         for index in 0..MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
             source.push_str(&format!("import {{ relay }} from \"./module-{index}\";\n"));
         }
+        source.push_str("relay();\n");
         let tree = parse_javascript(&source);
         let imports = compute_import_binder(&source, &tree);
+        let use_byte = source.rfind("relay();").expect("relay use");
 
+        assert_eq!(
+            imports.bindings_for("relay").count(),
+            MAX_STATIC_IMPORT_BINDINGS_PER_NAME
+        );
         assert_eq!(
             imports.binding_records_for("relay").len(),
             MAX_IMPORT_BINDING_RECORDS_PER_NAME
         );
+        assert!(!imports.was_truncated("relay"));
         assert_eq!(
-            imports.bindings_for("relay").count(),
-            MAX_STATIC_IMPORT_BINDINGS_PER_NAME - 1
+            imports.binding_at("relay", use_byte),
+            JsTsImportBindingResolution::Ambiguous
+        );
+
+        let mut overflow_source = String::new();
+        for index in 0..=MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
+            overflow_source.push_str(&format!(
+                "import {{ relay }} from \"./overflow-module-{index}\";\n"
+            ));
+        }
+        overflow_source.push_str("relay();\n");
+        let overflow_tree = parse_javascript(&overflow_source);
+        let overflow_imports = compute_import_binder(&overflow_source, &overflow_tree);
+        let overflow_use_byte = overflow_source.rfind("relay();").expect("relay use");
+
+        assert_eq!(
+            overflow_imports.bindings_for("relay").count(),
+            MAX_STATIC_IMPORT_BINDINGS_PER_NAME
+        );
+        assert_eq!(
+            overflow_imports.binding_records_for("relay").len(),
+            MAX_IMPORT_BINDING_RECORDS_PER_NAME
+        );
+        assert!(overflow_imports.was_truncated("relay"));
+        assert_eq!(
+            overflow_imports.binding_at("relay", overflow_use_byte),
+            JsTsImportBindingResolution::Truncated
+        );
+    }
+
+    #[test]
+    fn duplicate_static_import_records_exhaust_the_raw_budget() {
+        let mut source = String::new();
+        for _ in 0..MAX_IMPORT_BINDING_RECORDS_PER_NAME {
+            source.push_str("import { relay } from \"./same\";\n");
+        }
+        source.push_str("import { relay } from \"./overflow\";\n");
+        source.push_str("relay();\n");
+        let tree = parse_javascript(&source);
+        let imports = compute_import_binder(&source, &tree);
+        let use_byte = source.rfind("relay();").expect("relay use");
+
+        assert_eq!(imports.bindings_for("relay").count(), 1);
+        assert_eq!(
+            imports.binding_records_for("relay").len(),
+            MAX_IMPORT_BINDING_RECORDS_PER_NAME
         );
         assert!(imports.was_truncated("relay"));
+        assert_eq!(
+            imports.binding_at("relay", use_byte),
+            JsTsImportBindingResolution::Truncated
+        );
     }
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
@@ -2279,6 +2385,57 @@ relay();
             slice(name_node, source),
             "the `#` belongs to the name the class indexed it under"
         );
+    }
+
+    #[test]
+    fn static_property_name_resolves_structural_name_nodes() {
+        let source = r#"class Box { #private; ["computed"]() {} }
+task.finish(); task["literal"]();"#;
+        let tree = parse_javascript(source);
+
+        let private_field = find_node(tree.root_node(), source, "#private");
+        let private_name = private_field.named_child(0).expect("private field name");
+        let (private_node, private_value) =
+            static_property_name(private_name, source).expect("private name");
+        assert_eq!(private_node.id(), private_name.id());
+        assert_eq!(private_value, "#private");
+
+        let ordinary_name = find_node(tree.root_node(), source, "finish");
+        let (ordinary_node, ordinary_value) =
+            static_property_name(ordinary_name, source).expect("ordinary name");
+        assert_eq!(ordinary_node.id(), ordinary_name.id());
+        assert_eq!(ordinary_value, "finish");
+
+        let computed_name = find_node(tree.root_node(), source, "[\"computed\"]");
+        let (computed_node, computed_value) =
+            static_property_name(computed_name, source).expect("computed name");
+        assert_eq!(slice(computed_node, source), "computed");
+        assert_eq!(computed_value, "computed");
+
+        let literal_name = find_node(tree.root_node(), source, "\"literal\"");
+        let (literal_node, literal_value) =
+            static_property_name(literal_name, source).expect("literal name");
+        assert_eq!(slice(literal_node, source), "literal");
+        assert_eq!(literal_value, "literal");
+    }
+
+    #[test]
+    fn static_property_name_rejects_dynamic_and_ambiguous_nodes() {
+        let source = r#"class Box { [dynamic]() {} ["left" + "right"]() {} ["one", "two"]() {} }
+task[dynamic](); task["fi\nish"]();"#;
+        let tree = parse_javascript(source);
+
+        let dynamic = find_node(tree.root_node(), source, "[dynamic]");
+        assert!(static_property_name(dynamic, source).is_none());
+
+        let expression = find_node(tree.root_node(), source, "[\"left\" + \"right\"]");
+        assert!(static_property_name(expression, source).is_none());
+
+        let multiple = find_node(tree.root_node(), source, "[\"one\", \"two\"]");
+        assert!(static_property_name(multiple, source).is_none());
+
+        let escaped = find_node(tree.root_node(), source, "\"fi\\nish\"");
+        assert!(static_property_name(escaped, source).is_none());
     }
 
     #[test]

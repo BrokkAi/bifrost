@@ -672,7 +672,7 @@ fn fragmented_export_function_body_region(
             },
         });
     }
-    let siblings = cpp_following_named_siblings(node, source);
+    let siblings = cpp_following_named_siblings(node, source, &ParentIndex::unindexed());
     let boundary = fragmented_export_sibling_class_boundary(node, source);
     let boundary_index = boundary.and_then(|boundary| {
         siblings
@@ -767,7 +767,7 @@ fn fragmented_export_sibling_class_boundary<'tree>(
     source: &str,
 ) -> Option<Node<'tree>> {
     let node_parent = node.parent()?;
-    cpp_following_named_siblings(node, source)
+    cpp_following_named_siblings(node, source, &ParentIndex::unindexed())
         .into_iter()
         .find(|candidate| {
             recover_exported_class_function_definition(*candidate, source).is_some()
@@ -814,10 +814,23 @@ fn cpp_nested_stray_close_brace<'tree>(node: Node<'tree>, source: &str) -> Optio
 /// attached to an enclosing container after malformed recovery split the local
 /// declaration list. Stop at the first structurally visible class close so a
 /// later namespace or exported class cannot supply the recovery boundary.
-fn cpp_following_named_siblings<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+///
+/// The climb takes a [`ParentIndex`] because it runs once per visited node and
+/// walks every level to the root: with `Node::parent`, which re-descends from
+/// the root on each call, a translation unit holding thousands of siblings --
+/// generated instruction tables, for instance -- made this the whole cost of
+/// indexing the file. Callers inside the declaration walk pass the walk's
+/// index; the four that ask from outside a traversal pass
+/// [`ParentIndex::unindexed`], which is `Node::parent` itself, so their
+/// behaviour is unchanged.
+fn cpp_following_named_siblings<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Vec<Node<'tree>> {
     let mut siblings = Vec::new();
     let mut anchor = node;
-    while let Some(parent) = anchor.parent() {
+    while let Some(parent) = ancestry.parent(anchor) {
         let at_translation_unit = parent.kind() == "translation_unit";
         let mut sibling = anchor.next_named_sibling();
         while let Some(current) = sibling {
@@ -1153,7 +1166,7 @@ fn fragmented_plain_class_declaration_body<'tree>(
     let open = body
         .children(&mut body.walk())
         .find(|child| child.kind() == "{")?;
-    let siblings = cpp_following_named_siblings(node, source);
+    let siblings = cpp_following_named_siblings(node, source, &ParentIndex::unindexed());
     let ordinary_boundary =
         siblings
             .iter()
@@ -1246,7 +1259,7 @@ fn displaced_export_function_namespace_shape<'tree>(
     // the later real namespace close remains the structural boundary; a
     // direct next-sibling walk stops at the first collapsed namespace and
     // incorrectly makes its intervening items members of this class.
-    let siblings = cpp_following_named_siblings(namespace, source);
+    let siblings = cpp_following_named_siblings(namespace, source, &ParentIndex::unindexed());
     let trailing_index = siblings
         .iter()
         .position(|candidate| same_node(*candidate, trailing_semicolon))?;
@@ -1595,22 +1608,25 @@ struct MacroWrappedDeclaration<'tree> {
 /// a child of it (#3094). Without this the macro recoveries below read nothing
 /// in such a file, because none of their envelopes is in a declaration scope
 /// the parser managed to build.
-fn is_declaration_scope_position(node: Node<'_>) -> bool {
-    declaration_scope_container(node).is_some()
+fn is_declaration_scope_position<'tree>(node: Node<'tree>, ancestry: &ParentIndex<'tree>) -> bool {
+    declaration_scope_container(node, ancestry).is_some()
 }
 
 /// The container `node` declares in, for [`is_declaration_scope_position`]. Its
 /// end is where a parse failure that starts at `node` can still be doing
 /// damage: a declaration scope has no synchronization point of its own, so the
 /// parser carries such a failure to the scope's close.
-fn declaration_scope_container(node: Node<'_>) -> Option<Node<'_>> {
-    let mut parent = node.parent()?;
+fn declaration_scope_container<'tree>(
+    node: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let mut parent = ancestry.parent(node)?;
     loop {
         match parent.kind() {
             "translation_unit" => return Some(parent),
             "declaration_list" => {
-                return parent
-                    .parent()
+                return ancestry
+                    .parent(parent)
                     .is_some_and(|grandparent| {
                         matches!(
                             grandparent.kind(),
@@ -1619,7 +1635,7 @@ fn declaration_scope_container(node: Node<'_>) -> Option<Node<'_>> {
                     })
                     .then_some(parent);
             }
-            "ERROR" => match parent.parent() {
+            "ERROR" => match ancestry.parent(parent) {
                 Some(grandparent) => parent = grandparent,
                 // A root `ERROR` is the translation unit the parser could not
                 // build, so its children stand at file scope.
@@ -1631,8 +1647,8 @@ fn declaration_scope_container(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 /// Whether `node` is an `ERROR` the parser produced where declarations live.
-fn is_declaration_scope_error(node: Node<'_>) -> bool {
-    node.kind() == "ERROR" && is_declaration_scope_position(node)
+fn is_declaration_scope_error<'tree>(node: Node<'tree>, ancestry: &ParentIndex<'tree>) -> bool {
+    node.kind() == "ERROR" && is_declaration_scope_position(node, ancestry)
 }
 
 /// Whether `node` can only be part of what precedes a declarator -- a type, a
@@ -1786,9 +1802,10 @@ fn stranded_declaration_run<'tree>(node: Node<'tree>, source: &str) -> StrandedR
 fn macro_wrapped_declarations<'tree>(
     envelope: Node<'tree>,
     source: &str,
+    ancestry: &ParentIndex<'tree>,
 ) -> Vec<MacroWrappedDeclaration<'tree>> {
     let mut declarations = Vec::new();
-    if !is_declaration_scope_error(envelope) {
+    if !is_declaration_scope_error(envelope, ancestry) {
         return declarations;
     }
     let mut cursor = envelope.walk();
@@ -1848,14 +1865,23 @@ struct CollapsedMacroDeclarationRun {
 /// spells the invocation, which is what this reads.
 struct MacroInvocationTokens<'tree> {
     stack: Vec<Node<'tree>>,
-    next_sibling: Option<Node<'tree>>,
+    /// The last sibling handed to `stack`, and the point the next one is asked
+    /// for. Held as the node rather than as its already-computed successor so
+    /// the successor is asked for only when the walk actually runs off the end
+    /// of what it has: `Node::next_sibling` recovers the parent first, which
+    /// re-descends from the root, so it costs the node's position in the tree.
+    /// Nearly every node this iterator is built for is rejected on its first
+    /// token, before any sibling is needed, and computing one eagerly made that
+    /// rejection cost a walk of the whole container (capstone's generated
+    /// instruction tables, t19).
+    frontier: Option<Node<'tree>>,
 }
 
 impl<'tree> MacroInvocationTokens<'tree> {
     fn new(node: Node<'tree>) -> Self {
         Self {
             stack: vec![node],
-            next_sibling: node.next_sibling(),
+            frontier: Some(node),
         }
     }
 }
@@ -1866,8 +1892,8 @@ impl<'tree> Iterator for MacroInvocationTokens<'tree> {
     fn next(&mut self) -> Option<Node<'tree>> {
         loop {
             let Some(node) = self.stack.pop() else {
-                let sibling = self.next_sibling?;
-                self.next_sibling = sibling.next_sibling();
+                let sibling = self.frontier?.next_sibling()?;
+                self.frontier = Some(sibling);
                 self.stack.push(sibling);
                 continue;
             };
@@ -1930,11 +1956,12 @@ impl<'tree> Iterator for MacroInvocationTokens<'tree> {
 /// invocation the ordinary [`macro_wrapped_declarations`] reader already has --
 /// one the parser left whole in a declaration-scope `ERROR` and that swallowed
 /// nothing past it -- is left to that reader.
-fn collapsed_macro_declaration_run(
-    node: Node<'_>,
+fn collapsed_macro_declaration_run<'tree>(
+    node: Node<'tree>,
     source: &str,
+    ancestry: &ParentIndex<'tree>,
 ) -> Option<CollapsedMacroDeclarationRun> {
-    let container_end = declaration_scope_container(node)?.end_byte();
+    let container_end = declaration_scope_container(node, ancestry)?.end_byte();
     let mut tokens = MacroInvocationTokens::new(node);
     let name = tokens.next()?;
     if !matches!(name.kind(), "identifier" | "type_identifier")
@@ -2201,8 +2228,9 @@ pub fn recovered_callable_body_at(source: &str, range: &Range) -> Option<bool> {
 /// (the same role `is_recovered_exported_class_container` plays for a recovered
 /// class).
 pub fn is_macro_wrapped_declaration_envelope(node: Node<'_>, source: &str) -> bool {
-    !macro_wrapped_declarations(node, source).is_empty()
-        || collapsed_macro_declaration_run(node, source).is_some()
+    let ancestry = ParentIndex::unindexed();
+    !macro_wrapped_declarations(node, source, &ancestry).is_empty()
+        || collapsed_macro_declaration_run(node, source, &ancestry).is_some()
 }
 
 fn recover_exported_class_function_definition<'tree>(
@@ -4538,7 +4566,7 @@ impl<'a> CppVisitor<'a> {
                 // `fragmented_class_body`.
                 // Template wrappers put the escaped members beside the
                 // template rather than beside its malformed declaration.
-                for candidate in cpp_following_named_siblings(node, self.source) {
+                for candidate in cpp_following_named_siblings(node, self.source, ancestry) {
                     if candidate.start_byte() >= fragmented.reparse_end {
                         break;
                     }
@@ -4719,7 +4747,7 @@ impl<'a> CppVisitor<'a> {
                 self.visit_object_macro_error_classes(node, scope);
                 if !self.visit_function_like_export_class_pair(node, scope, stack, ancestry) {
                     self.visit_embedded_function_like_export_classes(node, scope, stack, ancestry);
-                    if self.visit_collapsed_macro_declaration_run(node, scope) {
+                    if self.visit_collapsed_macro_declaration_run(node, scope, ancestry) {
                         return;
                     }
                     if self.visit_sentinel_macro_region(node, scope, stack, ancestry) {
@@ -4875,7 +4903,7 @@ impl<'a> CppVisitor<'a> {
             // flattened run leaves a bare `identifier`/`type_identifier`, and a
             // swallowed tail can land in a `parameter_declaration` (#3094).
             _ => {
-                self.visit_collapsed_macro_declaration_run(node, scope);
+                self.visit_collapsed_macro_declaration_run(node, scope, ancestry);
             }
         }
     }
@@ -4915,7 +4943,7 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         ancestry: &ParentIndex<'tree>,
     ) {
-        let recovered = macro_wrapped_declarations(envelope, self.source);
+        let recovered = macro_wrapped_declarations(envelope, self.source, ancestry);
         if recovered.is_empty() {
             return;
         }
@@ -4953,12 +4981,13 @@ impl<'a> CppVisitor<'a> {
     /// again. Recording it after the scan, not before, keeps the scan's own
     /// reparsed nodes -- which carry their original byte offsets -- visible to
     /// the walk it drives.
-    fn visit_collapsed_macro_declaration_run(
+    fn visit_collapsed_macro_declaration_run<'tree>(
         &mut self,
-        envelope: Node<'_>,
+        envelope: Node<'tree>,
         scope: &ScopeInfo,
+        ancestry: &ParentIndex<'tree>,
     ) -> bool {
-        let Some(run) = collapsed_macro_declaration_run(envelope, self.source) else {
+        let Some(run) = collapsed_macro_declaration_run(envelope, self.source, ancestry) else {
             return false;
         };
         let start = envelope.start_byte();
@@ -4979,7 +5008,7 @@ impl<'a> CppVisitor<'a> {
                     root.named_children(&mut cursor)
                         .enumerate()
                         .find_map(|(index, item)| {
-                            collapsed_macro_declaration_run(item, visitor.source)
+                            collapsed_macro_declaration_run(item, visitor.source, &ancestry)
                                 .map(|run| (index, item, run))
                         });
                 // Walk only the items before the collapsed one. It swallowed
@@ -5835,7 +5864,7 @@ impl<'a> CppVisitor<'a> {
         // ahead of `visit_macro_swallowed_function_declarations` below, which
         // admits the same envelope by its head macro token and reads single
         // declarators out of nodes this recovery reparses properly.
-        if self.visit_collapsed_macro_declaration_run(node, scope) {
+        if self.visit_collapsed_macro_declaration_run(node, scope, ancestry) {
             return;
         }
         // A file-scope object-like macro sentinel the parser cannot see (issue
@@ -5965,7 +5994,7 @@ impl<'a> CppVisitor<'a> {
                     .filter(|boundary| boundary.start_byte() == fragmented.reparse_end)
                 {
                     let mut boundary_scope = scope.clone();
-                    for sibling in cpp_following_named_siblings(node, self.source) {
+                    for sibling in cpp_following_named_siblings(node, self.source, ancestry) {
                         if sibling.start_byte() >= boundary.start_byte() {
                             break;
                         }
@@ -6041,7 +6070,7 @@ impl<'a> CppVisitor<'a> {
                         recovered_specialization_member_scope: false,
                         visible_using_namespaces: scope.visible_using_namespaces.clone(),
                     };
-                    for candidate in cpp_following_named_siblings(node, self.source) {
+                    for candidate in cpp_following_named_siblings(node, self.source, ancestry) {
                         if candidate.start_byte() >= fragmented.reparse_end {
                             break;
                         }
@@ -10534,9 +10563,9 @@ fn class_has_displaced_preprocessor_terminator(class_node: Node<'_>) -> bool {
 /// A preprocessor directive inside a malformed array bound can cause later
 /// declarations to remain children of the conditional. The non-missing token
 /// still gives the exact structured boundary. Ignore nested conditionals and
-/// select the last error-owned token. Tree-sitter can pair a later outer
-/// `#endif` with this conditional, so the direct terminator is not necessarily
-/// missing.
+/// select the last unpaired error-owned token. Tree-sitter can pair a later
+/// outer `#endif` with this conditional, so the direct terminator is not
+/// necessarily missing.
 pub fn cpp_displaced_preprocessor_terminator<'tree>(
     conditional: Node<'tree>,
 ) -> Option<Node<'tree>> {
@@ -10554,19 +10583,19 @@ pub fn cpp_displaced_preprocessor_terminator<'tree>(
         // to a damaged nested conditional, not to this one.
         return None;
     }
+    // Pair concrete directive tokens while walking the recovered subtree. An
+    // inner conditional may be represented only by its `#ifndef`/`#endif`
+    // tokens under an `ERROR`, so skipping nested preprocessor nodes is not
+    // sufficient: an inner `#endif` can otherwise be mistaken for this
+    // conditional's displaced terminator.
     let mut displaced = None;
-    let mut stack = (0..conditional.child_count())
-        .filter_map(|index| conditional.child(index))
+    let mut conditional_depth = 0usize;
+    let mut stack = children_iter(conditional)
         .map(|child| (child, false))
         .collect::<Vec<_>>();
+    stack.reverse();
     while let Some((node, inside_error)) = stack.pop() {
         if !inside_error && node.kind() != "ERROR" && !node.has_error() {
-            continue;
-        }
-        if node.kind() == "#endif" && !node.is_missing() && inside_error {
-            if displaced.is_none_or(|current: Node<'_>| node.end_byte() > current.end_byte()) {
-                displaced = Some(node);
-            }
             continue;
         }
         if node != conditional
@@ -10578,9 +10607,25 @@ pub fn cpp_displaced_preprocessor_terminator<'tree>(
             continue;
         }
         let inside_error = inside_error || node.kind() == "ERROR";
-        for child in children_iter(node) {
-            stack.push((child, inside_error));
+        match node.kind() {
+            "#if" | "#ifdef" | "#ifndef" if node.start_byte() != conditional.start_byte() => {
+                conditional_depth += 1;
+            }
+            "#endif" if !node.is_missing() => {
+                if conditional_depth == 0
+                    && inside_error
+                    && displaced
+                        .is_none_or(|current: Node<'_>| node.end_byte() > current.end_byte())
+                {
+                    displaced = Some(node);
+                }
+                conditional_depth = conditional_depth.saturating_sub(1);
+            }
+            _ => {}
         }
+        let first_pushed = stack.len();
+        stack.extend(children_iter(node).map(|child| (child, inside_error)));
+        stack[first_pushed..].reverse();
     }
     displaced
 }
@@ -16940,6 +16985,35 @@ mod tests {
     }
 
     #[test]
+    fn displaced_terminator_ignores_nested_initializer_endif() {
+        let source = "#ifdef ENABLE_ITEMS\n\
+struct Item { int reg; };\n\
+static const struct Item items[] = {{1}};\n\
+static const struct Item extras[] = {\n\
+  {0},\n\
+#ifndef REDUCED\n\
+  {1},\n\
+#endif\n\
+};\n\
+int read_item(int i) { return items[i].reg; }\n\
+#endif\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("outer conditional");
+
+        assert!(conditional.has_error());
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+        assert!(cpp_displaced_preprocessor_boundary(conditional).is_none());
+    }
+
+    #[test]
     fn pyobject_head_field_recovery_publishes_only_the_real_member() {
         let source = "struct Image { PyObject_HEAD Imaging image; };";
         let parsed = parse_cpp_declarations(source, "image.h");
@@ -17600,8 +17674,9 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
         );
 
         // Both are admitted, and each names the byte just past its own `;`.
-        let first_run =
-            collapsed_macro_declaration_run(*first, source).expect("the first invocation");
+        let ancestry = ParentIndex::new(root);
+        let first_run = collapsed_macro_declaration_run(*first, source, &ancestry)
+            .expect("the first invocation");
         assert_eq!(
             &source[..first_run.invocation_end],
             &source[..source.find("instead\"\n    );").expect("first hint")
@@ -17611,8 +17686,8 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
             first_run.region_end, first_run.invocation_end,
             "the first invocation swallowed nothing, so the recovery owns only its own bytes"
         );
-        let swallowing_run =
-            collapsed_macro_declaration_run(*swallowing, source).expect("the second invocation");
+        let swallowing_run = collapsed_macro_declaration_run(*swallowing, source, &ancestry)
+            .expect("the second invocation");
         assert!(
             swallowing_run.invocation_end < swallowing.end_byte(),
             "the second invocation swallowed the third"
@@ -17663,15 +17738,28 @@ struct llama_vocab; struct llama_model; struct llama_context; struct llama_conte
         let tree = parser.parse(source, None).expect("C++ tree");
         let root = tree.root_node();
         let head = root.named_child(0).expect("the invocation");
+        let ancestry = ParentIndex::new(root);
         assert!(
-            collapsed_macro_declaration_run(head, source).is_none(),
+            collapsed_macro_declaration_run(head, source, &ancestry).is_none(),
             "{}",
             root.to_sexp()
         );
         assert!(
-            !macro_wrapped_declarations(head, source).is_empty(),
+            !macro_wrapped_declarations(head, source, &ancestry).is_empty(),
             "the ordinary reader must be the one that has it: {}",
             root.to_sexp()
+        );
+        // The index is a speed substitution, never a semantic one: the
+        // unindexed path is `Node::parent` itself and must agree.
+        let unindexed = ParentIndex::unindexed();
+        assert!(
+            collapsed_macro_declaration_run(head, source, &unindexed).is_none(),
+            "indexed and unindexed climbs must agree"
+        );
+        assert_eq!(
+            macro_wrapped_declarations(head, source, &ancestry).len(),
+            macro_wrapped_declarations(head, source, &unindexed).len(),
+            "indexed and unindexed climbs must agree"
         );
     }
 

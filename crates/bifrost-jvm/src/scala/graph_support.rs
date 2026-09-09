@@ -17,13 +17,15 @@
 //! they make is Scala's, but one of the facts it reads is not reachable from
 //! this crate.
 //!
-//! The three types beneath the trait are the same story told about query-shaped
+//! The types beneath the trait are the same story told about query-shaped
 //! data rather than about the analyzer. [`ScalaDefinitionIndex`] and
 //! [`ScalaCallableFactsIndex`] expose only the request-local relational answers
 //! the graph reads. [`ScalaFileFacts`] is the same cut through the analyzer's
 //! per-file `FileState`: thirteen fields of the twenty-five it
 //! carries, decoded shim-side and handed across, the way Ruby's owner-relation
-//! facts cross.
+//! facts cross. [`ScalaFileFactsRef`] and [`ScalaFileFactsProvider`] are how a
+//! targeted query reads those facts one file at a time instead of holding the
+//! whole-workspace map (#3142).
 
 use std::sync::Arc;
 
@@ -223,4 +225,44 @@ pub struct ScalaFileFacts {
     pub children: HashMap<CodeUnit, Vec<CodeUnit>>,
     pub scala_traits: HashSet<CodeUnit>,
     pub type_aliases: HashSet<CodeUnit>,
+}
+
+/// One file's [`ScalaFileFacts`], either borrowed from a whole-workspace read
+/// or rehydrated on demand. The borrowed arm keeps the eager whole-workspace
+/// consumer (the inverted edge build) allocation-free; the owned arm is what a
+/// targeted query pays per file it actually touches (#3142).
+pub enum ScalaFileFactsRef<'a> {
+    Borrowed(&'a ScalaFileFacts),
+    Owned(Arc<ScalaFileFacts>),
+}
+
+impl std::ops::Deref for ScalaFileFactsRef<'_> {
+    type Target = ScalaFileFacts;
+
+    fn deref(&self) -> &ScalaFileFacts {
+        match self {
+            Self::Borrowed(facts) => facts,
+            Self::Owned(facts) => facts,
+        }
+    }
+}
+
+/// The per-file facts source behind a targeted usage query's
+/// [`crate::scala::graph::inverted::ProjectTypes`].
+///
+/// The query's workspace-wide sweep derives the type-namespace structures it
+/// needs and drops the rest, so the facts a later lookup reads are rehydrated
+/// one file at a time through the analyzer's ordinary store path. The
+/// implementation owns the caching policy; a file's facts are immutable for
+/// the query's generation, so one hydration per file per query is the
+/// contract, exactly as the eager read hydrated once.
+pub trait ScalaFileFactsProvider: Send + Sync {
+    /// The persisted facts for `file`, or `None` when the analyzer holds no
+    /// state for it -- the same answer the eager whole-workspace map gives by
+    /// omission, so callers must not fall back to another source on `None`.
+    fn file_facts(&self, file: &ProjectFile) -> Option<Arc<ScalaFileFacts>>;
+
+    /// Warm the cells for `files` ahead of the parallel scan, batching what
+    /// would otherwise be one hydration per file per first touch.
+    fn prefetch_file_facts(&self, files: &[ProjectFile]);
 }

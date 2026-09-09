@@ -28,6 +28,7 @@ pub(crate) trait ForwardQueryProvider {
     fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit>;
     fn forward_relational_name(&self, unit: &CodeUnit) -> RelationalName;
     fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String>;
+    fn forward_definition_sources_may_exist(&self) -> bool;
     fn forward_package_exists(&self, package: &str) -> bool;
     fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool;
 }
@@ -67,6 +68,10 @@ macro_rules! impl_forward_query_provider {
 
             fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String> {
                 self.inner.definition_candidate_short_names(rendered)
+            }
+
+            fn forward_definition_sources_may_exist(&self) -> bool {
+                self.inner.definition_sources_may_exist()
             }
 
             fn forward_package_exists(&self, package: &str) -> bool {
@@ -124,6 +129,7 @@ pub struct AnalyzerDefinitionLookup<'a> {
     /// multi-analyzer reports are not the languages one of its delegates
     /// reports, and both kinds of analyzer can hand out the same memo.
     workspace_languages: OnceLock<Vec<Language>>,
+    nonempty_workspace_languages: OnceLock<Vec<Language>>,
     memo: Arc<DefinitionLookupMemo>,
 }
 
@@ -134,6 +140,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             language: Mutex::new(language),
             incomplete: AtomicBool::new(false),
             workspace_languages: OnceLock::new(),
+            nonempty_workspace_languages: OnceLock::new(),
             memo: analyzer.definition_lookup_memo().unwrap_or_default(),
         }
     }
@@ -190,11 +197,28 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         candidates
     }
 
-    /// The languages this workspace actually indexes, in a stable order.
-    /// Resolved once per batch: `CodeUnitIndex::languages` rebuilds a set per call.
+    /// Configured languages that may contribute definitions, in stable order.
+    /// Empty delegates cannot own a cross-language target (#1174), so skip
+    /// their candidate rendering and store batches (#3140). Unknown providers
+    /// remain eligible. Ledger reads retain negative questions for every
+    /// language so adding its first source still invalidates the answer.
     fn workspace_languages(&self) -> &[Language] {
-        self.workspace_languages
-            .get_or_init(|| self.analyzer.languages().into_iter().collect())
+        let languages = self
+            .workspace_languages
+            .get_or_init(|| self.analyzer.languages().into_iter().collect());
+        if self.analyzer.read_ledger_attached() {
+            return languages;
+        }
+        self.nonempty_workspace_languages.get_or_init(|| {
+            languages
+                .iter()
+                .copied()
+                .filter(|language| {
+                    self.language_analyzer(*language)
+                        .is_none_or(|provider| provider.forward_definition_sources_may_exist())
+                })
+                .collect()
+        })
     }
 
     fn query_values(
@@ -242,7 +266,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         values
     }
 
-    fn can_publish(&self) -> bool {
+    pub(crate) fn can_publish(&self) -> bool {
         !self.incomplete.load(Ordering::Acquire)
     }
 
@@ -445,6 +469,38 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 
     fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        let read = || self.fqn_for_language_unrecorded(fqn, language);
+        if !self.analyzer.read_ledger_attached() {
+            return read();
+        }
+        let (matches, reads) =
+            crate::analyzer::i_analyzer::capture_nested_reads(self.analyzer, read);
+        if self.can_publish() {
+            self.record_resolved_name(fqn, Some(language), &matches);
+        } else {
+            for read in reads {
+                self.analyzer.record_read(read);
+            }
+        }
+        matches
+    }
+
+    fn record_resolved_name(&self, name: &str, language: Option<Language>, matches: &[CodeUnit]) {
+        if !self.analyzer.read_ledger_attached() || !self.can_publish() {
+            return;
+        }
+        self.analyzer
+            .record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::ResolvedName,
+                crate::analyzer::read_ledger::LookupQuestion::Name {
+                    language,
+                    name: name.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(matches),
+            ));
+    }
+
+    fn fqn_for_language_unrecorded(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         let key = (language, fqn.to_string());
         if let Some(cached) = self
             .memo
@@ -720,6 +776,15 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             .collect::<Vec<_>>();
         sort_units(&mut units);
         units.dedup();
+        if self.analyzer.read_ledger_attached()
+            && *self
+                .language
+                .lock()
+                .expect("definition language mutex poisoned")
+                == Language::None
+        {
+            self.record_resolved_name(fqn, None, &units);
+        }
         units
     }
 
@@ -734,6 +799,7 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
         }
         sort_units(&mut units);
         units.dedup();
+        self.record_resolved_name(fqn, None, &units);
         units
     }
 
@@ -1133,6 +1199,77 @@ mod definition_lookup_tests {
     use super::*;
     use crate::analyzer::{RubyAnalyzer, TestProject};
     use std::path::PathBuf;
+
+    #[test]
+    fn workspace_lookup_skips_empty_delegates_and_observes_their_first_source() {
+        use crate::analyzer::{AnalyzerDelegate, CppAnalyzer, MultiAnalyzer, ScalaAnalyzer};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let fixture = crate::inline_project::InlineTestProject::new()
+            .file("widget.cpp", "class Widget {};\n")
+            .build();
+        let analyzer = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Cpp,
+                AnalyzerDelegate::Cpp(CppAnalyzer::from_project(fixture.project().clone())),
+            ),
+            (
+                Language::Scala,
+                AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(fixture.project().clone())),
+            ),
+        ]));
+        let scala_batches = |analyzer: &MultiAnalyzer| {
+            analyzer.delegates()[&Language::Scala]
+                .analyzer()
+                .test_hooks()
+                .relational_definition_batch_call_count_for_test()
+        };
+        let before = scala_batches(&analyzer);
+        {
+            let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::None);
+            assert_eq!(lookup.fqn("Widget").len(), 1);
+            assert!(lookup.fqn("Absent").is_empty());
+            assert_eq!(lookup.identifier("Widget").len(), 1);
+            assert_eq!(lookup.by_normalized_fqn("Widget").len(), 1);
+            assert!(!lookup.package_exists_in_any_language("absent"));
+            lookup.prefetch_fqns(&["AlsoAbsent".to_string()]);
+            assert!(lookup.fqn("AlsoAbsent").is_empty());
+        }
+        assert_eq!(
+            scala_batches(&analyzer) - before,
+            0,
+            "empty Scala must do no relational work for C++ workspace lookups"
+        );
+        // Reusing a lookup under a newly attached ledger must restore negative
+        // reads for empty languages, even after its pruned list was cached.
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::None);
+        assert!(lookup.identifier("Missing").is_empty());
+        {
+            let ledger = Arc::new(crate::analyzer::ReadLedger::new());
+            let _scope = crate::analyzer::AnalyzerQueryScope::with_read_ledger(
+                &analyzer,
+                Arc::clone(&ledger),
+            );
+            assert!(lookup.identifier("LedgerMissing").is_empty());
+            assert!(scala_batches(&analyzer) > before);
+            assert!(!ledger.keys().is_empty());
+        }
+        drop(lookup);
+
+        // A scoped resolver must still see an exact target in another language.
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Scala);
+        assert_eq!(lookup.fqn_in_any_language("Widget").len(), 1);
+        assert!(lookup.fqn("Widget").is_empty());
+        drop(lookup);
+
+        let file = ProjectFile::new(fixture.root().to_path_buf(), "Added.scala");
+        file.write("package added\nclass Added\n").unwrap();
+        let updated = analyzer.update(&BTreeSet::from([file]));
+        let lookup = AnalyzerDefinitionLookup::new(&updated, Language::Cpp);
+        assert_eq!(lookup.fqn_in_any_language("added.Added").len(), 1);
+        assert!(lookup.package_exists_in_any_language("added"));
+        assert!(lookup.fqn("added.Added").is_empty());
+    }
 
     #[test]
     fn cancelled_relational_lookup_does_not_memoize_an_empty_answer() {

@@ -22,9 +22,9 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v7";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v9";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -95,6 +95,60 @@ fn branch_statements(node: Node<'_>) -> Vec<Node<'_>> {
 
 fn statement_definitely_abrupt(node: Node<'_>) -> bool {
     matches!(node.kind(), "return" | "break" | "next" | "redo" | "retry")
+}
+
+/// The bounded Ruby rescue form whose payload can be carried without making
+/// ordinary `raise` calls intrinsic: one receiverless `raise local` call is
+/// matched by one clause for a class declared exactly once in this file.
+#[derive(Debug, Clone, Copy)]
+struct RubyPreciseRaise {
+    source: ValueId,
+    binder: ValueId,
+}
+
+fn direct_raise_identifier<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    if node.kind() != "call"
+        || node.child_by_field_name("receiver").is_some()
+        || node.child_by_field_name("block").is_some()
+        || node
+            .child_by_field_name("method")
+            .and_then(|method| node_text(source, method))
+            != Some("raise")
+    {
+        return None;
+    }
+    let arguments = call_arguments(node);
+    let [argument] = arguments.as_slice() else {
+        return None;
+    };
+    (argument.kind() == "identifier").then_some(*argument)
+}
+
+fn precise_rescue_type<'tree, 'source>(
+    rescue: Node<'tree>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let exceptions = rescue.child_by_field_name("exceptions")?;
+    let exception_nodes = named_children(exceptions);
+    let [exception] = exception_nodes.as_slice() else {
+        return None;
+    };
+    (exception.kind() == "constant")
+        .then(|| node_text(source, *exception))
+        .flatten()
+}
+
+fn precise_rescue_binder<'tree>(rescue: Node<'tree>) -> Option<Node<'tree>> {
+    let variable = rescue.child_by_field_name("variable")?;
+    let candidates = if variable.kind() == "exception_variable" {
+        named_children(variable)
+    } else {
+        vec![variable]
+    };
+    let [binder] = candidates.as_slice() else {
+        return None;
+    };
+    (binder.kind() == "identifier").then_some(*binder)
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -256,12 +310,26 @@ struct LocalBindingCollection {
 #[derive(Default)]
 struct RubyPropertyInventory {
     declarations: HashMap<(Box<str>, Box<str>), RubyPropertyDeclaration>,
+    /// Classes whose same-file construction surface has no observed
+    /// singleton override or dynamic class-body mutation. The value is the
+    /// exact `initialize` procedure when one was collected; `None` means the
+    /// class uses Ruby's inherited constructor.
+    constructors: HashMap<Box<str>, Option<ProcedureId>>,
+    exception_classes: HashSet<Box<str>>,
+    raise_unproven: bool,
+    /// A same-file Array/Hash reopen or singleton mutation can replace the
+    /// built-in []/[]= implementation. Keep literal index proofs closed only
+    /// when this file has not declared such a mutation.
+    builtin_index_unproven: bool,
 }
 
 #[derive(Default)]
 struct RubyPropertyDeclaration {
     reader: Option<SourceAnchor>,
     writer: Option<SourceAnchor>,
+    /// Class supplied by one linear `initialize` write, usable only while
+    /// both the owning and returned class retain their construction proof.
+    result_class: Option<Box<str>>,
 }
 
 struct RubyPropertyCollection {
@@ -271,27 +339,189 @@ struct RubyPropertyCollection {
 
 impl RubyPropertyInventory {
     fn complete_accessor(&self, class: &str, property: &str) -> Option<SourceAnchor> {
+        self.constructors.get(class)?;
         let declaration = self.declarations.get(&(class.into(), property.into()))?;
         let reader = declaration.reader?;
         declaration.writer.map(|_| reader)
     }
+
+    fn accessor_result_class(&self, class: &str, property: &str) -> Option<&str> {
+        self.constructors.get(class)?;
+        let declaration = self.declarations.get(&(class.into(), property.into()))?;
+        declaration.reader?;
+        declaration.writer?;
+        declaration
+            .result_class
+            .as_deref()
+            .filter(|class| self.constructor_is_proven(class))
+    }
+
+    fn constructor_is_proven(&self, class: &str) -> bool {
+        self.constructors.contains_key(class)
+    }
+
+    fn constructor_target(&self, class: &str) -> Option<ProcedureId> {
+        self.constructors.get(class).copied().flatten()
+    }
+
+    fn builtin_index_is_proven(&self) -> bool {
+        !self.builtin_index_unproven
+    }
 }
 
-fn collect_property_inventory(
-    root: Node<'_>,
+fn direct_initializer_result_class(
+    initializer: Node<'_>,
+    property: &str,
     source: &str,
+    adapter: &mut SemanticTraversalBudget<'_>,
+) -> Result<Option<Box<str>>, RubyLoweringError> {
+    let body = initializer
+        .child_by_field_name("body")
+        .unwrap_or(initializer);
+    let statements = if body.kind() == "body_statement" {
+        ordinary_body_statements(body)
+    } else {
+        runtime_statement_children(body)
+    };
+    let direct_assignments = statements
+        .iter()
+        .filter(|statement| statement.kind() == "assignment")
+        .map(|statement| statement.id())
+        .collect::<Vec<_>>();
+    let instance_variable = format!("@{property}");
+    let mut candidate: Option<Box<str>> = None;
+    let mut has_direct_assignment = false;
+    let mut invalid = false;
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        adapter.enter_node()?;
+        if node.id() != body.id()
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "lambda" | "class" | "module" | "singleton_class"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "assignment"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.kind() == "instance_variable"
+            && node_text(source, left) == Some(instance_variable.as_str())
+        {
+            // A branch- or block-local write needs path-sensitive storage
+            // state. Seeing one invalidates the linear positive candidate.
+            if !direct_assignments.contains(&node.id()) {
+                invalid = true;
+            } else {
+                has_direct_assignment = true;
+                let Some(class) = ruby_constructor_class(right, source) else {
+                    invalid = true;
+                    stack.extend(named_children(node).into_iter().rev());
+                    continue;
+                };
+                adapter.before_insert()?;
+                adapter.charge_name(class)?;
+                if candidate
+                    .as_deref()
+                    .is_some_and(|candidate| candidate != class)
+                {
+                    invalid = true;
+                } else {
+                    candidate = Some(class.into());
+                }
+            }
+        }
+        stack.extend(named_children(node).into_iter().rev());
+    }
+    Ok((has_direct_assignment && !invalid)
+        .then_some(candidate)
+        .flatten())
+}
+
+fn ruby_constructor_class<'tree, 'source>(
+    call: Node<'tree>,
+    source: &'source str,
+) -> Option<&'source str> {
+    ruby_constructor_call(call, source)
+        .then(|| call.child_by_field_name("receiver"))
+        .flatten()
+        .filter(|receiver| receiver.kind() == "constant")
+        .and_then(|receiver| node_text(source, receiver))
+}
+
+fn ruby_property_call<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "call"
+        || node.child_by_field_name("arguments").is_some()
+        || node.child_by_field_name("block").is_some()
+        || node
+            .child_by_field_name("operator")
+            .and_then(|operator| node_text(source, operator))
+            == Some("&.")
+    {
+        return None;
+    }
+    Some((
+        node.child_by_field_name("receiver")?,
+        node.child_by_field_name("method")?,
+    ))
+}
+
+fn ruby_supported_superclass(class: Node<'_>, source: &str) -> Option<bool> {
+    let superclass = class.child_by_field_name("superclass")?;
+    let Some(superclass) = first_runtime_named_child(superclass) else {
+        return Some(false);
+    };
+    Some(superclass.kind() == "constant" && node_text(source, superclass) == Some("StandardError"))
+}
+
+fn collect_property_inventory<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    specs: &[ProcedureSpec<'tree>],
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<RubyPropertyCollection, RubyLoweringError> {
     let mut inventory = RubyPropertyInventory::default();
+    let mut duplicate_classes = HashSet::default();
+    let mut seen_classes = HashSet::default();
+    let mut standard_error_derived_classes = HashSet::default();
+    let mut inert_file = true;
     let mut adapter = SemanticTraversalBudget {
         work: SemanticWork::default(),
         budget,
         cancellation,
     };
+    let mut constructor_procedures = HashMap::default();
+    for spec in specs {
+        adapter.enter_node()?;
+        if spec.kind == ProcedureKind::Constructor {
+            constructor_procedures.insert(spec.callable.id(), spec.id);
+        }
+        if matches!(spec.callable.kind(), "method" | "singleton_method") {
+            match spec
+                .callable
+                .child_by_field_name("name")
+                .and_then(|name| node_text(source, name))
+            {
+                Some("raise") => inventory.raise_unproven = true,
+                Some("attr_accessor" | "attr_reader" | "attr_writer") => inert_file = false,
+                _ => {}
+            }
+        }
+    }
     for class in named_children(root) {
         adapter.enter_node()?;
         if class.kind() != "class" {
+            // Executable file-level forms can change constants or method
+            // tables. Do not replace that missing model with a blacklist of
+            // metaprogramming method names.
+            inert_file &= matches!(class.kind(), "method" | "comment" | "empty_statement");
             continue;
         }
         let Some(name) = class
@@ -299,12 +529,31 @@ fn collect_property_inventory(
             .filter(|name| name.kind() == "constant")
             .and_then(|name| node_text(source, name))
         else {
+            inert_file = false;
             continue;
         };
+        adapter.charge_name(name)?;
+        let name_box: Box<str> = name.into();
+        if matches!(name, "Array" | "Hash") {
+            inventory.builtin_index_unproven = true;
+        }
+        if matches!(name, "Object" | "Module" | "Class" | "Kernel") {
+            inert_file = false;
+        }
+        if !seen_classes.insert(name_box.clone()) {
+            duplicate_classes.insert(name_box.clone());
+        }
+        let superclass_is_supported = ruby_supported_superclass(class, source);
+        if superclass_is_supported == Some(true) {
+            standard_error_derived_classes.insert(name_box.clone());
+        }
         let Some(body) = class.child_by_field_name("body") else {
             continue;
         };
         let mut methods = Vec::new();
+        let mut initializer = None;
+        let mut constructor_surface_safe =
+            superclass_is_supported.is_none() || superclass_is_supported == Some(true);
         for call in runtime_statement_children(body) {
             adapter.enter_node()?;
             if call.kind() == "method" {
@@ -315,10 +564,38 @@ fn collect_property_inventory(
                     adapter.before_insert()?;
                     adapter.charge_name(method)?;
                     methods.push(method.to_owned());
+                    if method == "initialize" {
+                        initializer = Some(call);
+                    }
+                    // Match Python's bounded heap-class proof: arbitrary
+                    // instance methods (including exception/dispatch hooks)
+                    // need their own model before this class is proof-safe.
+                    if method != "initialize" {
+                        constructor_surface_safe = false;
+                    }
                 }
                 continue;
             }
+            if matches!(call.kind(), "singleton_method" | "singleton_class") {
+                // A singleton `new`, `allocate`, or class hook can replace
+                // the constructor target even when the source spelling is
+                // `Type.new`. Keep the whole class unproven rather than
+                // manufacturing a same-file binding.
+                constructor_surface_safe = false;
+                continue;
+            }
             if call.kind() != "call" {
+                // Class-body assignments, nested declarations, and other
+                // executable forms can mutate the class method table.
+                constructor_surface_safe = false;
+                continue;
+            }
+            if call.child_by_field_name("receiver").is_some()
+                || call.child_by_field_name("block").is_some()
+            {
+                // `Other.attr_accessor` or a block passed to an accessor hook
+                // mutates a different or runtime-selected method table.
+                constructor_surface_safe = false;
                 continue;
             }
             let accessor = call
@@ -328,11 +605,13 @@ fn collect_property_inventory(
                 accessor,
                 Some("attr_accessor" | "attr_reader" | "attr_writer")
             ) {
+                constructor_surface_safe = false;
                 continue;
             }
             for argument in call_arguments(call) {
                 adapter.enter_node()?;
                 let Some(property) = ruby_symbol_name(argument, source) else {
+                    constructor_surface_safe = false;
                     continue;
                 };
                 adapter.before_insert()?;
@@ -354,8 +633,14 @@ fn collect_property_inventory(
                 }
             }
         }
+        if constructor_surface_safe {
+            let target = initializer
+                .and_then(|initializer| constructor_procedures.get(&initializer.id()).copied());
+            adapter.charge_name(name)?;
+            inventory.constructors.insert(name_box.clone(), target);
+        }
         for ((owner, property), declaration) in &mut inventory.declarations {
-            if owner.as_ref() != name {
+            if owner.as_ref() != name_box.as_ref() {
                 continue;
             }
             let writer = format!("{property}=");
@@ -365,9 +650,42 @@ fn collect_property_inventory(
             {
                 declaration.reader = None;
                 declaration.writer = None;
+                declaration.result_class = None;
+            } else if declaration.reader.is_some() && declaration.writer.is_some() {
+                declaration.result_class = initializer
+                    .map(|initializer| {
+                        direct_initializer_result_class(initializer, property, source, &mut adapter)
+                    })
+                    .transpose()?
+                    .flatten();
             }
         }
     }
+    if !duplicate_classes.is_empty() {
+        inventory
+            .declarations
+            .retain(|(owner, _), _| !duplicate_classes.contains(owner));
+        inventory
+            .constructors
+            .retain(|owner, _| !duplicate_classes.contains(owner));
+    }
+    // A same-file declaration of StandardError rebinds the superclass name;
+    // a previously seen subclass can no longer use the built-in exception
+    // proof. Keep this bounded and fail closed for that class family.
+    if seen_classes.contains("StandardError") {
+        inventory
+            .constructors
+            .retain(|owner, _| !standard_error_derived_classes.contains(owner));
+    }
+    if !inert_file {
+        inventory.constructors.clear();
+        inventory.builtin_index_unproven = true;
+        inventory.raise_unproven = true;
+    }
+    inventory.exception_classes = standard_error_derived_classes
+        .into_iter()
+        .filter(|class| inventory.constructor_is_proven(class))
+        .collect();
     Ok(RubyPropertyCollection {
         inventory,
         work: adapter.work,
@@ -557,6 +875,7 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
         let properties = match collect_property_inventory(
             prepared.tree().root_node(),
             prepared.source(),
+            &specs,
             &staged_budget,
             cancellation,
         ) {
@@ -1031,6 +1350,7 @@ fn callable_shape<'tree>(
             is_synthetic: synthetic,
             invocation: immediate,
             call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
             // A lambda or block body is not a named member of anything, so no
             // later declaration can redefine or override the callable this
             // literal names: its dispatch is closed. Every other Ruby callable
@@ -1165,6 +1485,7 @@ struct LoweringContext<'tree, 'targets> {
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
     local_storage: HashMap<ValueId, RubyLocalStorage>,
+    precise_raise_binders: HashMap<usize, RubyPreciseRaise>,
     constant_index_values: HashMap<u64, ValueId>,
     instance_field_locators: HashMap<Box<str>, SemanticLocator>,
     receiver: Option<ValueId>,
@@ -1226,6 +1547,7 @@ fn lower_procedure<'tree, 'request>(
         parameters: HashMap::default(),
         locals: HashMap::default(),
         local_storage: HashMap::default(),
+        precise_raise_binders: HashMap::default(),
         constant_index_values: HashMap::default(),
         instance_field_locators: HashMap::default(),
         receiver: None,
@@ -1565,12 +1887,110 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if parent.id() == self.procedure_runtime_body_node_id {
                 return true;
             }
-            if !matches!(parent.kind(), "body_statement" | "block_body" | "program") {
-                return false;
+            match parent.kind() {
+                "body_statement" | "block_body" | "program" => current = parent,
+                "begin" => current = parent,
+                _ => return false,
             }
-            current = parent;
         }
         false
+    }
+
+    /// Pre-compute the one rescue binding that this procedure can lower
+    /// precisely. `try_body` is visited before its protected assignments are
+    /// scheduled, so this proof deliberately reads the protected syntax
+    /// rather than consulting `local_storage`.
+    fn prepare_precise_rescue(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        protected: &[Node<'tree>],
+        rescues: &[Node<'tree>],
+    ) -> Result<Option<()>, RubyLoweringError> {
+        if self.properties.raise_unproven || rescues.len() != 1 {
+            return Ok(None);
+        }
+        let rescue = rescues[0];
+        let shape = (|| {
+            let rescue_type = precise_rescue_type(rescue, self.source)?;
+            let binder = precise_rescue_binder(rescue)?;
+            let (raise_node, preceding) = protected.split_last()?;
+            let raised_node = direct_raise_identifier(*raise_node, self.source)?;
+            Some((rescue_type, binder, *raise_node, raised_node, preceding))
+        })();
+        let Some((class, binder_node, raise_node, raised_node, preceding)) = shape else {
+            return Ok(None);
+        };
+        if !self.properties.exception_classes.contains(class) {
+            return Ok(None);
+        }
+        let raised_name = node_text(self.source, raised_node).expect("identifier spans source");
+        let binder_name = node_text(self.source, binder_node).expect("identifier spans source");
+        let mut constructed = false;
+        for statement in preceding {
+            let mut pending = vec![*statement];
+            while let Some(node) = pending.pop() {
+                if self.session.cancellation().is_cancelled() {
+                    return Err(RubyLoweringError::Cancelled(Box::new(
+                        builder.prospective_work(),
+                    )));
+                }
+                builder.descend_nested_entry().map_err(|error| {
+                    RubyLoweringError::Budget(error, Box::new(builder.prospective_work()))
+                })?;
+                if node.id() == statement.id()
+                    && node.kind() == "assignment"
+                    && node.child_by_field_name("left").is_some_and(|left| {
+                        left.kind() == "identifier"
+                            && node_text(self.source, left) == Some(raised_name)
+                    })
+                {
+                    let right = required_field(node, "right")?;
+                    if constructed
+                        || ruby_constructor_class(right, self.source) != Some(class)
+                        || !call_arguments(right).is_empty()
+                        || right.child_by_field_name("block").is_some()
+                    {
+                        return Ok(None);
+                    }
+                    constructed = true;
+                    continue;
+                }
+                if node.kind() == "identifier" && node_text(self.source, node) == Some(raised_name)
+                {
+                    // Only modeled accessor bases can use the object before
+                    // raise. Rebinding, aliasing, capture, and whole-object
+                    // escape require a richer exception payload proof.
+                    let accessor = node
+                        .parent()
+                        .and_then(|parent| ruby_property_call(parent, self.source));
+                    let proven = constructed
+                        && accessor.is_some_and(|(receiver, member)| {
+                            receiver.id() == node.id()
+                                && node_text(self.source, member).is_some_and(|member| {
+                                    self.properties.complete_accessor(class, member).is_some()
+                                })
+                        });
+                    if !proven {
+                        return Ok(None);
+                    }
+                }
+                pending.extend(named_children(node));
+            }
+        }
+        if !constructed {
+            return Ok(None);
+        }
+        let (source, _) = self
+            .binding_value(raised_name)
+            .expect("assigned Ruby local has a binding");
+        let (binder, _) = self
+            .binding_value(binder_name)
+            .expect("rescue variable has a binding");
+        self.local_storage
+            .insert(binder, RubyLocalStorage::Class(class.into()));
+        self.precise_raise_binders
+            .insert(raise_node.id(), RubyPreciseRaise { source, binder });
+        Ok(Some(()))
     }
 
     fn update_local_storage(
@@ -1580,7 +2000,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         right: Node<'tree>,
     ) {
         if left.kind() == "element_reference" {
-            let replacement_class = self.constructor_class(right);
+            let replacement_class = (assignment.kind() == "assignment")
+                .then(|| self.constructor_class(right))
+                .flatten();
             let Some((object, _)) = self.element_parts(left) else {
                 return;
             };
@@ -1609,31 +2031,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some((target, _)) = self.binding_value(name) else {
             return;
         };
-        let storage = self
-            .assignment_is_direct_in_body(assignment)
-            .then(|| match right.kind() {
-                "array" => Some(RubyLocalStorage::Indexable {
+        let storage = (assignment.kind() == "assignment"
+            && self.assignment_is_direct_in_body(assignment))
+        .then(|| match right.kind() {
+            "array" if self.properties.builtin_index_is_proven() => {
+                Some(RubyLocalStorage::Indexable {
                     element_class: self.homogeneous_array_element_class(right),
-                }),
-                "hash" => Some(RubyLocalStorage::Indexable {
+                })
+            }
+            "hash" if self.properties.builtin_index_is_proven() => {
+                Some(RubyLocalStorage::Indexable {
                     element_class: None,
-                }),
-                "identifier" => node_text(self.source, right)
-                    .and_then(|source| self.binding_value(source))
-                    .and_then(|(source, _)| self.local_storage.get(&source).cloned()),
-                "call" if ruby_constructor_call(right, self.source) => right
-                    .child_by_field_name("receiver")
-                    .filter(|receiver| receiver.kind() == "constant")
-                    .and_then(|receiver| node_text(self.source, receiver))
-                    .map(|class| RubyLocalStorage::Class(class.into())),
-                _ => None,
-            })
-            .flatten();
+                })
+            }
+            "identifier" => node_text(self.source, right)
+                .and_then(|source| self.binding_value(source))
+                .and_then(|(source, _)| self.local_storage.get(&source).cloned()),
+            "call" if ruby_constructor_call(right, self.source) => {
+                ruby_constructor_class(right, self.source)
+                    .filter(|class| self.properties.constructor_is_proven(class))
+                    .map(|class| RubyLocalStorage::Class(class.into()))
+            }
+            _ => None,
+        })
+        .flatten();
         if let Some(storage) = storage {
             self.local_storage.insert(target, storage);
         } else {
             self.local_storage.remove(&target);
         }
+    }
+
+    fn invalidate_parallel_assignment_storage(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        left: Node<'tree>,
+    ) -> Result<(), RubyLoweringError> {
+        let mut pending = vec![left];
+        while let Some(node) = pending.pop() {
+            if self.session.cancellation().is_cancelled() {
+                return Err(RubyLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            builder.descend_nested_entry().map_err(|error| {
+                RubyLoweringError::Budget(error, Box::new(builder.prospective_work()))
+            })?;
+            if node.kind() == "identifier" {
+                if let Some(name) = node_text(self.source, node)
+                    && let Some((value, _)) = self.binding_value(name)
+                {
+                    self.local_storage.remove(&value);
+                }
+                continue;
+            }
+            pending.extend(named_children(node));
+        }
+        Ok(())
     }
 
     fn homogeneous_array_element_class(&self, array: Node<'tree>) -> Option<Box<str>> {
@@ -1646,38 +2100,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn constructor_class(&self, call: Node<'tree>) -> Option<Box<str>> {
-        ruby_constructor_call(call, self.source)
-            .then(|| call.child_by_field_name("receiver"))
-            .flatten()
-            .filter(|receiver| receiver.kind() == "constant")
-            .and_then(|receiver| node_text(self.source, receiver))
+        ruby_constructor_class(call, self.source)
+            .filter(|class| self.properties.constructor_is_proven(class))
             .map(Into::into)
     }
 
     fn receiver_class(&self, receiver: Node<'tree>) -> Option<&str> {
-        match receiver.kind() {
-            "identifier" => {
-                let name = node_text(self.source, receiver)?;
-                let (receiver, _) = self.binding_value(name)?;
-                let RubyLocalStorage::Class(class) = self.local_storage.get(&receiver)? else {
-                    return None;
-                };
-                Some(class)
+        let mut current = receiver;
+        let mut accessors = Vec::new();
+        // Peel first and replay from the rooted local so deeply nested Ruby
+        // access paths do not consume the Rust call stack.
+        let base_class = loop {
+            match current.kind() {
+                "call" => {
+                    let (receiver, property) = ruby_property_call(current, self.source)?;
+                    accessors.push(property);
+                    current = receiver;
+                }
+                "identifier" => {
+                    let name = node_text(self.source, current)?;
+                    let (value, _) = self.binding_value(name)?;
+                    let RubyLocalStorage::Class(class) = self.local_storage.get(&value)? else {
+                        break None;
+                    };
+                    break Some(class.as_ref());
+                }
+                "element_reference" => {
+                    let (object, _) = self.element_parts(current)?;
+                    let name = node_text(self.source, object)?;
+                    let (value, _) = self.binding_value(name)?;
+                    let RubyLocalStorage::Indexable {
+                        element_class: Some(class),
+                    } = self.local_storage.get(&value)?
+                    else {
+                        break None;
+                    };
+                    break Some(class.as_ref());
+                }
+                _ => break None,
             }
-            "element_reference" => {
-                let (object, _) = self.element_parts(receiver)?;
-                let name = node_text(self.source, object)?;
-                let (object, _) = self.binding_value(name)?;
-                let RubyLocalStorage::Indexable {
-                    element_class: Some(class),
-                } = self.local_storage.get(&object)?
-                else {
-                    return None;
-                };
-                Some(class)
-            }
-            _ => None,
+        }?;
+        let mut class = base_class;
+        for property in accessors.into_iter().rev() {
+            let property = node_text(self.source, property)?;
+            class = self.properties.accessor_result_class(class, property)?;
         }
+        Some(class)
     }
 
     fn property_member_locator(
@@ -1729,11 +2197,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn property_parts(&self, node: Node<'tree>) -> Option<(Node<'tree>, SemanticLocator)> {
-        if node.kind() != "call" || node.child_by_field_name("arguments").is_some() {
-            return None;
-        }
-        let receiver = node.child_by_field_name("receiver")?;
-        let property = node.child_by_field_name("method")?;
+        let (receiver, property) = ruby_property_call(node, self.source)?;
         self.property_member_locator(receiver, property)
             .map(|member| (receiver, member))
     }
@@ -1956,13 +2420,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         match node.kind() {
-            "program"
-            | "block_body"
-            | "do"
-            | "then"
-            | "else"
-            | "ensure"
-            | "parenthesized_statements" => {
+            "program" | "block_body" | "do" | "then" | "else" | "ensure" => {
                 let children = runtime_statement_children(node);
                 if self.reuse_first_statement_entry
                     && node.id() == self.procedure_runtime_body_node_id
@@ -1973,6 +2431,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     self.schedule_statements(builder, entry, &children, next, scope, stack)
                 }
+            }
+            "parenthesized_statements" => {
+                let children = runtime_statement_children(node);
+                let terminal = self.point(builder, node, Vec::new())?;
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let source = if let Some(last) = children.last() {
+                    self.expression_value(builder, *last, expression_value_kind(*last))?
+                } else {
+                    self.value(builder, terminal, SemanticValueKind::Null)?
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target: result,
+                    },
+                )?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_statements(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             "body_statement" if body_has_rescue_or_ensure(node) => {
                 self.try_body(builder, node, entry, next, scope, stack)
@@ -2855,18 +3341,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             next
         };
 
+        let precise_rescue =
+            self.prepare_precise_rescue(builder, &parts.protected, &parts.rescues)?;
         let protected_scope = if parts.rescues.is_empty() {
             cleanup_scope
         } else {
             let dispatcher = self.point(builder, node, Vec::new())?;
-            self.add_gap(
-                builder,
-                dispatcher,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "Ruby rescue exception-list evaluation, class matching, and binding require runtime refinement",
-            )?;
+            if precise_rescue.is_none() {
+                self.add_gap(
+                    builder,
+                    dispatcher,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unknown,
+                    "Ruby rescue exception-list evaluation, class matching, and binding require runtime refinement",
+                )?;
+            }
             for rescue in &parts.rescues {
                 let rescue_entry = self.point(builder, *rescue, Vec::new())?;
                 self.edge(
@@ -2899,7 +3389,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         callable_exit: false,
                     },
                 );
-                if rescue.child_by_field_name("exceptions").is_some() {
+                if precise_rescue.is_none() && rescue.child_by_field_name("exceptions").is_some() {
                     self.add_gap(
                         builder,
                         rescue_entry,
@@ -2909,7 +3399,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "rescue exception class expressions and splats may execute calls on the exceptional path",
                     )?;
                 }
-                if rescue.child_by_field_name("variable").is_some() {
+                if precise_rescue.is_none() && rescue.child_by_field_name("variable").is_some() {
                     self.add_gap(
                         builder,
                         rescue_entry,
@@ -3284,6 +3774,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
+        if self.precise_raise_binders.contains_key(&node.id()) {
+            return self.precise_raise(builder, node, entry, scope, stack);
+        }
         if node
             .child_by_field_name("method")
             .is_some_and(|method| method.kind() == "super")
@@ -3315,8 +3808,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::Function
         };
+        let constructor_target = constructor
+            .then(|| ruby_constructor_class(node, self.source))
+            .flatten()
+            .and_then(|class| self.properties.constructor_target(class));
         let resolution = if matches!(method, Some("send" | "public_send")) {
             CallableTargetResolution::Unsupported
+        } else if let Some(target) = constructor_target {
+            CallableTargetResolution::Proven(CallableTarget::Local(target))
         } else if let Some(&target) = self
             .function_value_targets
             .invocations
@@ -3458,6 +3957,58 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
             stack,
         )
+    }
+
+    fn precise_raise(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let RubyPreciseRaise { source, binder } = self
+            .precise_raise_binders
+            .get(&node.id())
+            .copied()
+            .expect("precise raise was checked before lowering");
+        let terminal = self.point(builder, node, Vec::new())?;
+        let thrown = self.value(builder, terminal, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source,
+                target: thrown,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source: thrown,
+                target: binder,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Throw {
+                value: Some(thrown),
+            },
+        )?;
+        self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)?;
+        let argument = direct_raise_identifier(node, self.source)
+            .expect("precise raise retains its direct local argument");
+        stack.push(Work::Expression {
+            node: argument,
+            entry,
+            next: EdgeTarget::normal(terminal),
+            scope,
+        });
+        Ok(())
     }
 
     fn property_access(
@@ -3909,6 +4460,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RubyLoweringError> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
+        if node.kind() == "assignment"
+            && matches!(
+                left.kind(),
+                "left_assignment_list" | "destructured_left_assignment" | "rest_assignment"
+            )
+        {
+            if let Some((targets, values)) = (left.kind() == "left_assignment_list")
+                .then(|| self.parallel_assignment_parts(left, right))
+                .flatten()
+            {
+                self.invalidate_parallel_assignment_storage(builder, left)?;
+                return self.parallel_assignment(
+                    builder, node, entry, next, scope, stack, targets, values,
+                );
+            }
+            self.invalidate_parallel_assignment_storage(builder, left)?;
+        }
         let operator = node
             .child_by_field_name("operator")
             .and_then(|operator| node_text(self.source, operator));
@@ -3937,7 +4505,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let instance_field_place = (node.kind() == "assignment")
             .then(|| self.instance_field_member_locator(left))
             .flatten();
+        // A complete generated accessor or a constant built-in container slot
+        // is the operation itself, not an unresolved synthetic method call.
+        // Keep dispatch gaps only when this structured memory model is absent.
+        let mut modeled_store = false;
+        let mut assigned_value = None;
         if let Some(member) = instance_field_place {
+            modeled_store = true;
             let value = self.expression_value(builder, right, expression_value_kind(right))?;
             let base = self
                 .receiver
@@ -3956,8 +4530,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
-            self.expression_values.insert(node.id(), value);
+            assigned_value = Some(value);
         } else if let Some((receiver, member)) = property_place {
+            modeled_store = true;
             let value = self.expression_value(builder, right, expression_value_kind(right))?;
             let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
             let location = self.session.add_memory_location(
@@ -3974,11 +4549,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
-            self.expression_values.insert(node.id(), value);
+            assigned_value = Some(value);
         } else if let Some((object, index_node)) = element_place {
             let value = self.expression_value(builder, right, expression_value_kind(right))?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
             let index = self.constant_index_value(builder, index_node)?;
+            modeled_store = index.is_some();
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -4001,7 +4577,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     value,
                 },
             )?;
-            self.expression_values.insert(node.id(), value);
+            assigned_value = Some(value);
         } else if identity_assignment {
             let name = node_text(self.source, left).unwrap_or_default();
             if let Some((target, flow_kind)) = self.binding_value(name) {
@@ -4020,9 +4596,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                     },
                 )?;
-                if !short_circuit {
-                    self.expression_values.insert(node.id(), value);
-                }
+                assigned_value = Some(value);
             } else {
                 self.add_gap(
                     builder,
@@ -4055,6 +4629,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
         }
+        // Consumers reserve an assignment expression's ValueId before this
+        // lowering runs (for example the implicit return). Preserve that
+        // identity and publish the selected value into it.
+        let assignment_result = assigned_value
+            .map(|value| {
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: value,
+                        target: result,
+                    },
+                )?;
+                Ok::<_, RubyLoweringError>(result)
+            })
+            .transpose()?;
         if node.kind() == "operator_assignment" && !short_circuit {
             self.add_gap(
                 builder,
@@ -4087,6 +4679,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let right_entry = self.point(builder, right, Vec::new())?;
             let operator_decision = if short_circuit {
                 let decision = self.point(builder, left, Vec::new())?;
+                let bypass = if let Some(result) = assignment_result {
+                    let source =
+                        self.expression_value(builder, left, SemanticValueKind::Temporary)?;
+                    assert!(
+                        self.emit_lexical_input_flow(builder, left, decision, source)?,
+                        "a supported short-circuit assignment has a binding"
+                    );
+                    let bypass = self.point(builder, left, Vec::new())?;
+                    self.append_effect(
+                        builder,
+                        bypass,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target: result,
+                        },
+                    )?;
+                    self.edge(
+                        builder,
+                        bypass,
+                        EdgeTarget::normal(merge.expect("short-circuit assignment has a merge")),
+                    )?;
+                    bypass
+                } else {
+                    merge.expect("short-circuit assignment has a merge")
+                };
                 let (right_kind, bypass_kind) = if operator == Some("&&=") {
                     (
                         ControlEdgeKind::ConditionalTrue,
@@ -4110,7 +4728,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     builder,
                     decision,
                     EdgeTarget {
-                        point: merge.expect("short-circuit assignment has a merge"),
+                        point: bypass,
                         kind: bypass_kind,
                     },
                 )?;
@@ -4164,7 +4782,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack,
             )
         } else {
-            if dispatching_target && node.kind() != "operator_assignment" {
+            if dispatching_target && !modeled_store && node.kind() != "operator_assignment" {
                 self.assignment_dispatch_gaps(builder, terminal, false)?;
             }
             let mut evaluations = target_evaluations;
@@ -4178,6 +4796,93 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack,
             )
         }
+    }
+
+    fn parallel_assignment_parts(
+        &self,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> Option<(Vec<Node<'tree>>, Vec<Node<'tree>>)> {
+        debug_assert_eq!(left.kind(), "left_assignment_list");
+        let targets = runtime_statement_children(left);
+        if targets.is_empty() || targets.iter().any(|target| target.kind() != "identifier") {
+            return None;
+        }
+        let values = match right.kind() {
+            "right_assignment_list" | "array" => runtime_statement_children(right),
+            _ => return None,
+        };
+        (values.len() == targets.len()
+            && values.iter().all(|value| value.kind() != "splat_argument"))
+        .then_some((targets, values))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        targets: Vec<Node<'tree>>,
+        values: Vec<Node<'tree>>,
+    ) -> Result<(), RubyLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let value_ids = values
+            .iter()
+            .map(|value| self.expression_value(builder, *value, expression_value_kind(*value)))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (target_node, value) in targets.iter().zip(value_ids.iter().copied()) {
+            let name = node_text(self.source, *target_node)
+                .expect("a parallel assignment identifier has a valid source range");
+            let (target, flow_kind) = self
+                .binding_value(name)
+                .expect("a parallel assignment identifier is in the binding timeline");
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::Assignment { target, value },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: flow_kind,
+                    source: value,
+                    target,
+                },
+            )?;
+        }
+
+        // A direct non-final statement discards the aggregate result. Any
+        // enclosing expression, or the implicit method return, consumes one
+        // packed value that this lowering intentionally does not represent.
+        if !self.assignment_is_direct_in_body(node)
+            || self.expression_values.contains_key(&node.id())
+        {
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Ruby parallel-assignment expression result packing is not represented as one aggregate value",
+            )?;
+        }
+
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &values,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
     }
 
     fn assignment_dispatch_gaps(
@@ -4240,10 +4945,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
         let terminal = self.point(builder, node, Vec::new())?;
+        let mut modeled_load = false;
         if let Some((object, index_node)) = self.element_parts(node) {
             let result = self.expression_value(builder, node, expression_value_kind(node))?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
             let index = self.constant_index_value(builder, index_node)?;
+            modeled_load = index.is_some();
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -4267,22 +4974,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
         }
-        self.add_gap(
+        if !modeled_load {
+            self.add_gap(
             builder,
             terminal,
             SemanticGapSubject::Point,
             SemanticCapability::Calls,
             SemanticGapKind::Unsupported,
             "Ruby element lookup dispatches through [] and is not emitted as a synthetic call site",
-        )?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unknown,
-            "element lookup and index coercion may raise",
-        )?;
+            )?;
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+                "element lookup and index coercion may raise",
+            )?;
+        }
         self.edge(builder, terminal, next)?;
         let object = required_field(node, "object")?;
         let mut evaluations = vec![object];
@@ -5390,6 +6099,7 @@ mod tests {
         match collect_property_inventory(
             tree.root_node(),
             source,
+            &[],
             &SemanticBudget::default(),
             &cancellation,
         ) {
@@ -5411,6 +6121,7 @@ mod tests {
         match collect_property_inventory(
             tree.root_node(),
             source,
+            &[],
             &budget,
             &CancellationToken::default(),
         ) {

@@ -294,7 +294,13 @@ impl DispatchBoundary {
                         .procedure()
                         .semantics()
                         .call_site(call.id())
-                        .is_some_and(|row| row.receiver.is_some() == target.has_receiver())
+                        .is_some_and(|row| {
+                            call_receiver_admits_target(
+                                row.receiver.is_some(),
+                                target.has_receiver(),
+                                target.procedure().language(),
+                            )
+                        })
             }
             // #1978: a fully-qualified unmaterialized external callee names its
             // synthetic locator through `External(Some(_))` and carries its
@@ -313,12 +319,16 @@ impl DispatchBoundary {
                             // receiver written at the call. Ordinary synthetic
                             // targets still have to match the lowered shape.
                             target.has_resolver_owned_call_shape()
-                                || normalized_external_has_receiver(
-                                    row.receiver.is_some(),
+                                || call_receiver_admits_target(
+                                    normalized_external_has_receiver(
+                                        row.receiver.is_some(),
+                                        target.language(),
+                                        target.owner_fqn(),
+                                        target.normalized_static_owner(),
+                                    ),
+                                    target.has_receiver(),
                                     target.language(),
-                                    target.owner_fqn(),
-                                    target.normalized_static_owner(),
-                                ) == target.has_receiver()
+                                )
                         })
             }
             (_, None, None) => true,
@@ -691,6 +701,31 @@ impl UnmaterializedExternalTarget {
 /// exact resolver may prove its canonical owner here. The equality guard keeps
 /// that proof target-specific; every other language and every Java value
 /// receiver preserves the raw IR shape.
+/// Whether a call's receiver shape admits a target's.
+///
+/// A target that declares a receiver needs one at the call site. A target
+/// without one ordinarily forbids one, because a receiver the lowering
+/// recorded is evidence the callee was reached through a value, and binding
+/// that to a receiver-less target is a mis-resolution worth failing on. Go
+/// relies on exactly that: `db.Open()` records `db` as a receiver, and only a
+/// resolver-owned package proof may bind it to a package function.
+///
+/// Python is the exception. Its attribute syntax is uniform, so a recorded
+/// receiver distinguishes nothing: `text.maketrans(...)` reaches a static
+/// member through an instance and `os.path.join(...)` reaches a module
+/// function through its qualifier, and the lowering records a receiver for
+/// both.
+pub(crate) fn call_receiver_admits_target(
+    call_has_receiver: bool,
+    target_has_receiver: bool,
+    language: SemanticLanguage,
+) -> bool {
+    if target_has_receiver {
+        return call_has_receiver;
+    }
+    !call_has_receiver || language.language() == Language::Python
+}
+
 pub(crate) fn normalized_external_has_receiver(
     raw_has_receiver: bool,
     language: SemanticLanguage,

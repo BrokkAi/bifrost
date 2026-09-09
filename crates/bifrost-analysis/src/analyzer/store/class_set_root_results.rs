@@ -11,7 +11,7 @@ use super::class_set_summaries::ClassSetSummaryAttachment;
 use super::{AnalyzerStore, PARSED_BLOB_COMPLETE_CONDITION, Result, StoreError};
 use crate::CancellationToken;
 use crate::analyzer::Language;
-use crate::analyzer::semantic::{SourcePosition, SourceSpan, WorkspaceRelativePath};
+use crate::analyzer::semantic::{SourcePosition, SourceSpan, UnknownReason, WorkspaceRelativePath};
 
 macro_rules! generation_params {
     ($key:expr) => {
@@ -90,88 +90,11 @@ impl PersistedClassSetStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PersistedClassSetUnknownReason {
-    RootParameter,
-    SelfReceiver,
-    VariadicParameter,
-    UnresolvedCall,
-    Truncated,
-    UnmodeledLoad,
-    Await,
-    Capture,
-    AmbiguousCallee,
-    ExternalNotModeled,
-    UnresolvedBase,
-    DynamicAttributes,
-    PackIncomplete,
-    UncertainFlow,
-    FieldSlotIncomplete,
-    SolverBudget,
-    SemanticBudget,
-    IncompleteRoot,
-    OpenTypeBound,
-    ScalarReceiver,
-}
-
-impl PersistedClassSetUnknownReason {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::RootParameter => "root_parameter",
-            Self::SelfReceiver => "self_receiver",
-            Self::VariadicParameter => "variadic_parameter",
-            Self::UnresolvedCall => "unresolved_call",
-            Self::Truncated => "truncated",
-            Self::UnmodeledLoad => "unmodeled_load",
-            Self::Await => "await",
-            Self::Capture => "capture",
-            Self::AmbiguousCallee => "ambiguous_callee",
-            Self::ExternalNotModeled => "external_not_modeled",
-            Self::UnresolvedBase => "unresolved_base",
-            Self::DynamicAttributes => "dynamic_attributes",
-            Self::PackIncomplete => "pack_incomplete",
-            Self::UncertainFlow => "uncertain_flow",
-            Self::FieldSlotIncomplete => "field_slot_incomplete",
-            Self::SolverBudget => "solver_budget",
-            Self::SemanticBudget => "semantic_budget",
-            Self::IncompleteRoot => "incomplete_root",
-            Self::OpenTypeBound => "open_type_bound",
-            Self::ScalarReceiver => "scalar_receiver",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "root_parameter" => Some(Self::RootParameter),
-            "self_receiver" => Some(Self::SelfReceiver),
-            "variadic_parameter" => Some(Self::VariadicParameter),
-            "unresolved_call" => Some(Self::UnresolvedCall),
-            "truncated" => Some(Self::Truncated),
-            "unmodeled_load" => Some(Self::UnmodeledLoad),
-            "await" => Some(Self::Await),
-            "capture" => Some(Self::Capture),
-            "ambiguous_callee" => Some(Self::AmbiguousCallee),
-            "external_not_modeled" => Some(Self::ExternalNotModeled),
-            "unresolved_base" => Some(Self::UnresolvedBase),
-            "dynamic_attributes" => Some(Self::DynamicAttributes),
-            "pack_incomplete" => Some(Self::PackIncomplete),
-            "uncertain_flow" => Some(Self::UncertainFlow),
-            "field_slot_incomplete" => Some(Self::FieldSlotIncomplete),
-            "solver_budget" => Some(Self::SolverBudget),
-            "semantic_budget" => Some(Self::SemanticBudget),
-            "incomplete_root" => Some(Self::IncompleteRoot),
-            "open_type_bound" => Some(Self::OpenTypeBound),
-            "scalar_receiver" => Some(Self::ScalarReceiver),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PersistedClassSetAtom {
     WorkspaceClass(Box<str>),
     ExternalClass(Box<str>),
-    Unknown(PersistedClassSetUnknownReason),
+    Unknown(UnknownReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,7 +245,7 @@ impl FindingFreeClassSetRootResult {
                 }
                 PersistedClassSetAtom::Unknown(reason) => {
                     hash.tag(2);
-                    hash.text(reason.label());
+                    hash.text(&reason.to_string());
                 }
             }
             hash.text(row.status.label());
@@ -401,10 +324,11 @@ pub(crate) const CLASS_SET_ROOT_RESULT_ROWS_SQL: &str =
               + length(CAST(atom_kind AS BLOB))
               + length(CAST(COALESCE(class_name,'') AS BLOB))
               + length(CAST(COALESCE(unknown_reason,'') AS BLOB))
+              + length(CAST(COALESCE(guard_class,'') AS BLOB))
               + length(CAST(class_set_status AS BLOB)),
             row_ordinal,rel_path,start_byte,start_line,start_byte_column,
             end_byte,end_line,end_byte_column,member,atom_kind,class_name,
-            unknown_reason,class_set_status
+            unknown_reason,class_set_status,guard_class
      FROM class_set_finding_free_root_rows
      WHERE result_id=?1 ORDER BY row_ordinal LIMIT ?2";
 
@@ -899,7 +823,8 @@ fn load_rows(
         let atom_kind = row.get::<_, String>(10)?;
         let class_name = row.get::<_, Option<String>>(11)?;
         let unknown_reason = row.get::<_, Option<String>>(12)?;
-        let atom = decode_atom(&atom_kind, class_name, unknown_reason)?;
+        let guard_class = row.get::<_, Option<String>>(14)?;
+        let atom = decode_atom(&atom_kind, class_name, unknown_reason, guard_class)?;
         let status_label = row.get::<_, String>(13)?;
         let status = PersistedClassSetStatus::from_label(&status_label).ok_or_else(|| {
             StoreError::corrupt(format!(
@@ -933,15 +858,32 @@ fn decode_atom(
     atom_kind: &str,
     class_name: Option<String>,
     unknown_reason: Option<String>,
+    guard_class: Option<String>,
 ) -> Result<PersistedClassSetAtom> {
-    match (atom_kind, class_name, unknown_reason) {
-        ("workspace", Some(class), None) if !class.is_empty() => Ok(
+    match (
+        atom_kind,
+        class_name,
+        unknown_reason.as_deref(),
+        guard_class,
+    ) {
+        ("workspace", Some(class), None, None) if !class.is_empty() => Ok(
             PersistedClassSetAtom::WorkspaceClass(class.into_boxed_str()),
         ),
-        ("external", Some(class), None) if !class.is_empty() => {
+        ("external", Some(class), None, None) if !class.is_empty() => {
             Ok(PersistedClassSetAtom::ExternalClass(class.into_boxed_str()))
         }
-        ("unknown", None, Some(reason)) => PersistedClassSetUnknownReason::from_label(&reason)
+        ("unknown", None, Some("unmodeled_guard"), Some(class)) if !class.is_empty() => Ok(
+            PersistedClassSetAtom::Unknown(UnknownReason::UnmodeledGuard {
+                class: class.into_boxed_str(),
+            }),
+        ),
+        ("unknown", None, Some(reason), None) => UnknownReason::from_label(reason)
+            .filter(|reason| {
+                !matches!(
+                    reason,
+                    UnknownReason::UnmodeledGuard { .. } | UnknownReason::DynamicFieldWrite
+                )
+            })
             .map(PersistedClassSetAtom::Unknown)
             .ok_or_else(|| {
                 StoreError::corrupt(format!(
@@ -980,16 +922,24 @@ fn insert_result(
     let result_id = conn.last_insert_rowid();
     for row in &result.rows {
         ensure_not_cancelled(cancellation)?;
-        let (atom_kind, class_name, unknown_reason) = match &row.atom {
+        let (atom_kind, class_name, unknown_reason, guard_class) = match &row.atom {
             PersistedClassSetAtom::WorkspaceClass(class) => {
-                ("workspace", Some(class.as_ref()), None)
+                ("workspace", Some(class.as_ref()), None, None)
             }
-            PersistedClassSetAtom::ExternalClass(class) => ("external", Some(class.as_ref()), None),
-            PersistedClassSetAtom::Unknown(reason) => ("unknown", None, Some(reason.label())),
+            PersistedClassSetAtom::ExternalClass(class) => {
+                ("external", Some(class.as_ref()), None, None)
+            }
+            PersistedClassSetAtom::Unknown(reason @ UnknownReason::UnmodeledGuard { class }) => {
+                ("unknown", None, Some(reason.label()), Some(class.as_ref()))
+            }
+            PersistedClassSetAtom::Unknown(reason) => ("unknown", None, Some(reason.label()), None),
         };
         conn.execute(
-            "INSERT INTO class_set_finding_free_root_rows VALUES(
-               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO class_set_finding_free_root_rows(
+               result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
+               end_byte,end_line,end_byte_column,member,atom_kind,class_name,
+               unknown_reason,class_set_status,guard_class)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 result_id,
                 row.ordinal,
@@ -1005,6 +955,7 @@ fn insert_result(
                 class_name,
                 unknown_reason,
                 row.status.label(),
+                guard_class,
             ],
         )?;
     }
@@ -1118,8 +1069,12 @@ fn validate_row(row: &PersistedClassSetRootRow) -> Result<()> {
         return Err(StoreError::new("class-set root-result row is invalid"));
     }
     match &row.atom {
+        PersistedClassSetAtom::Unknown(UnknownReason::DynamicFieldWrite) => Err(StoreError::new(
+            "dynamic field write evidence is request-local",
+        )),
         PersistedClassSetAtom::WorkspaceClass(class)
         | PersistedClassSetAtom::ExternalClass(class)
+        | PersistedClassSetAtom::Unknown(UnknownReason::UnmodeledGuard { class })
             if class.is_empty() =>
         {
             Err(StoreError::new("class-set root-result class name is empty"))
@@ -1179,7 +1134,13 @@ fn payload_text_bytes(
         let atom_bytes = match &row.atom {
             PersistedClassSetAtom::WorkspaceClass(class)
             | PersistedClassSetAtom::ExternalClass(class) => class.len(),
-            PersistedClassSetAtom::Unknown(reason) => reason.label().len(),
+            PersistedClassSetAtom::Unknown(reason) => {
+                reason.label().len()
+                    + match reason {
+                        UnknownReason::UnmodeledGuard { class } => class.len(),
+                        _ => 0,
+                    }
+            }
         };
         [
             path_text(&row.relative_path)?.len(),
@@ -1437,9 +1398,7 @@ mod tests {
                     relative_path: PathBuf::from("src/app.py"),
                     span: source_span(40, 46),
                     member: "scalar".into(),
-                    atom: PersistedClassSetAtom::Unknown(
-                        PersistedClassSetUnknownReason::ScalarReceiver,
-                    ),
+                    atom: PersistedClassSetAtom::Unknown(UnknownReason::ScalarReceiver),
                     status: PersistedClassSetStatus::Partial,
                 },
                 PersistedClassSetRootRow {
@@ -1447,9 +1406,7 @@ mod tests {
                     relative_path: PathBuf::from("src/app.py"),
                     span: source_span(30, 36),
                     member: "maybe".into(),
-                    atom: PersistedClassSetAtom::Unknown(
-                        PersistedClassSetUnknownReason::OpenTypeBound,
-                    ),
+                    atom: PersistedClassSetAtom::Unknown(UnknownReason::OpenTypeBound),
                     status: PersistedClassSetStatus::Partial,
                 },
                 PersistedClassSetRootRow {
@@ -1472,9 +1429,7 @@ mod tests {
                 relative_path: PathBuf::from("src/app.py"),
                 span: source_span(ordinal.saturating_mul(2), ordinal.saturating_mul(2) + 1),
                 member: format!("value_{ordinal}").into_boxed_str(),
-                atom: PersistedClassSetAtom::Unknown(
-                    PersistedClassSetUnknownReason::UnresolvedCall,
-                ),
+                atom: PersistedClassSetAtom::Unknown(UnknownReason::UnresolvedCall),
                 status: PersistedClassSetStatus::Partial,
             })
             .collect();
@@ -1509,6 +1464,56 @@ mod tests {
             MAX_CLASS_SET_ROOT_RETAINED_BYTES,
             &CancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn named_guard_reasons_round_trip_with_separate_class_identity() {
+        let store = store_with_blob();
+        let base = result(1);
+        let mut rows = base.rows.clone();
+        rows[1].atom = PersistedClassSetAtom::Unknown(UnknownReason::UnmodeledGuard {
+            class: "unknown_module.Thing".into(),
+        });
+        let expected =
+            FindingFreeClassSetRootResult::try_new(base.key, base.attachment, rows).unwrap();
+        assert!(
+            store
+                .publish_finding_free_class_set_root_result(
+                    expected.clone(),
+                    &CancellationToken::new()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            load(&store, &expected.key).unwrap(),
+            ClassSetRootResultLookup::Hit(Box::new(expected.clone()))
+        );
+        let stored: (String, String) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT unknown_reason,guard_class FROM class_set_finding_free_root_rows
+             WHERE unknown_reason='unmodeled_guard'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("unmodeled_guard".into(), "unknown_module.Thing".into())
+        );
+        assert_eq!(
+            store
+                .finding_free_class_set_root_result(
+                    &expected.key,
+                    MAX_CLASS_SET_ROOT_ROWS,
+                    expected.retained_bytes() - 1,
+                    &CancellationToken::new()
+                )
+                .unwrap(),
+            ClassSetRootResultLookup::Rejected(ClassSetRootResultRejection::ResourceBound)
+        );
     }
 
     #[test]
@@ -1636,6 +1641,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn dynamic_write_rows_are_rejected_before_publication() {
+        let mut candidate = result(1);
+        candidate.rows[0].atom = PersistedClassSetAtom::Unknown(UnknownReason::DynamicFieldWrite);
+        let error = FindingFreeClassSetRootResult::try_new(
+            candidate.key,
+            candidate.attachment,
+            candidate.rows,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("request-local"), "{error}");
+        assert!(decode_atom("unknown", None, Some("dynamic_field_write".into()), None).is_err());
     }
 
     #[test]

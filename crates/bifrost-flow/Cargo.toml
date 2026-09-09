@@ -34,6 +34,7 @@ test-support = [
 ]
 
 [dev-dependencies]
+proptest = "1.11"
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.11.1", features = ["test-support"] }
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.11.1", features = ["test-support"] }
 tempfile = "3.23.0"

@@ -749,6 +749,16 @@ pub struct DependencyPackPreparationOutcome {
 pub struct DependencyDiscoveryProfile {
     pub metadata_inputs_considered: usize,
     pub dependencies_resolved: usize,
+    /// Bounded, non-gating observations about the discovery inputs. These do
+    /// not imply a discovery failure and must not affect completeness.
+    pub informational_evidence: Vec<DependencyDiscoveryInformationalEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyDiscoveryInformationalEvidence {
+    /// Compile-database source entries structurally inside the workspace but
+    /// absent from the analyzer's C/C++ workspace listing.
+    CppMissingWorkspaceSources { count: usize, sample: Vec<PathBuf> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,6 +777,7 @@ impl DependencyDiscoveryOutcome {
             profile: DependencyDiscoveryProfile {
                 metadata_inputs_considered: 0,
                 dependencies_resolved: dependencies.len(),
+                informational_evidence: Vec::new(),
             },
             dependencies,
             diagnostics: Vec::new(),
@@ -812,6 +823,7 @@ impl std::ops::Deref for DependencyDiscoveryOutcome {
 pub struct DependencyDiscoveryEvidence {
     declared_modules: crate::hash::HashSet<String>,
     truncated: bool,
+    informational_evidence: Vec<DependencyDiscoveryInformationalEvidence>,
 }
 
 impl DependencyDiscoveryEvidence {
@@ -833,6 +845,7 @@ impl DependencyDiscoveryEvidence {
         Self {
             declared_modules,
             truncated: !outcome.complete,
+            informational_evidence: outcome.profile.informational_evidence.clone(),
         }
     }
 
@@ -840,6 +853,12 @@ impl DependencyDiscoveryEvidence {
     /// miss against [`Self::declares_module_path`] is not proof of absence.
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Non-gating observations retained from discovery. Their presence does
+    /// not make the dependency set incomplete.
+    pub fn informational_evidence(&self) -> &[DependencyDiscoveryInformationalEvidence] {
+        &self.informational_evidence
     }
 
     /// Whether the build declares `path` or a module containing it: an exact

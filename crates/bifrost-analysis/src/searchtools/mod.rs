@@ -173,6 +173,7 @@ pub use scan_usages::classify_test_files;
 /// Shared with `diff_scoring`, whose verification group must classify a
 /// reference site's file exactly the way a usage scan does.
 pub(crate) use scan_usages::is_test_like_file;
+pub(crate) use scan_usages::scan_usage_reference_sites_by_location;
 pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
 pub use scan_usages::usage_graph;

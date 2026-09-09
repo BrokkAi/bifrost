@@ -1,21 +1,21 @@
 use std::sync::Arc;
 
 use super::super::ir::{
-    CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryLocationKind, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
-    ValueTransfer,
+    BackingStoreOffset, CaptureSource, EvidenceCompleteness, ExecutionTiming, MemoryLocationKind,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, SemanticValueKind,
+    ValueFlowKind, ValueHandle, ValueTransfer,
 };
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
 use super::model::{
-    AbstractLocation, AbstractObjectIdentity, AccessSelector, ExecutionTimingClaim,
+    AbstractLocation, AbstractObjectIdentity, AccessPathRoot, AccessSelector, ExecutionTimingClaim,
     OracleCallContext, ProcedurePortHandle, ProcedurePortKind,
 };
 use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
     validate_retained_relation_arenas,
 };
-use crate::analyzer::semantic::{SemanticGapId, ValueId};
+use crate::analyzer::semantic::{ProgramPointId, SemanticGapId, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowRelationKind {
@@ -95,6 +95,32 @@ pub enum ValueFlowEndpoint {
 }
 
 impl ValueFlowEndpoint {
+    /// The runtime carrier for a value, including a formal binding's port.
+    ///
+    /// Formal bindings are read through procedure ports. Their assignments
+    /// must overwrite those same ports, rather than a disconnected value
+    /// carrier that leaves the incoming parameter or receiver alive (#3124).
+    /// Locals and expression results are represented directly by values.
+    pub fn for_value(value: ValueHandle) -> Self {
+        let procedure = value.procedure();
+        match procedure
+            .semantics()
+            .value(value.id())
+            .expect("a retained value handle names a live value")
+            .kind
+        {
+            SemanticValueKind::Parameter { ordinal, .. } => Self::Port(
+                ProcedurePortHandle::parameter(procedure.clone(), ordinal)
+                    .expect("a parameter value has a live parameter port"),
+            ),
+            SemanticValueKind::Receiver { .. } => Self::Port(
+                ProcedurePortHandle::receiver(procedure.clone())
+                    .expect("a receiver value has a live receiver port"),
+            ),
+            _ => Self::Value(value),
+        }
+    }
+
     fn validate_at(&self, procedure: &ProcedureHandle) -> Result<(), OracleContractError> {
         match self {
             Self::Value(value) => require_same_procedure(value.procedure(), procedure),
@@ -109,6 +135,19 @@ impl ValueFlowEndpoint {
 
 fn value_endpoint(endpoint: &ValueFlowEndpoint, expected: ValueId) -> bool {
     matches!(endpoint, ValueFlowEndpoint::Value(value) if value.id() == expected)
+}
+
+fn runtime_value_endpoint(
+    procedure: &ProcedureHandle,
+    endpoint: &ValueFlowEndpoint,
+    expected: ValueId,
+) -> bool {
+    *endpoint
+        == ValueFlowEndpoint::for_value(
+            procedure
+                .value_handle(expected)
+                .expect("a validated effect value is live"),
+        )
 }
 
 fn port_endpoint(endpoint: &ValueFlowEndpoint, expected: ProcedurePortKind) -> bool {
@@ -152,6 +191,11 @@ impl MemoryAccessChains {
                         target,
                         source: value,
                     } => (target, ValueOrigin::Copy(value)),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative { .. },
+                        target,
+                        ..
+                    } => (target, ValueOrigin::Ambiguous),
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Transfer(_),
                         target,
@@ -274,6 +318,107 @@ fn direct_capture_port_matches(
         && port_endpoint(endpoint, ProcedurePortKind::Capture { slot: location })
 }
 
+/// Validate one of the two bounded candidates projected from a backing-store
+/// alternative. The candidate either names the fresh allocation directly or
+/// names the complete source backing store. The alternative offset is applied
+/// only when a later access path composes with the value, not on this event's
+/// own whole-backing relation.
+fn matches_backing_store_alternative(
+    procedure: &ProcedureHandle,
+    source: ValueId,
+    _offset: BackingStoreOffset,
+    allocation: crate::analyzer::semantic::AllocationId,
+    endpoint: &ValueFlowEndpoint,
+) -> bool {
+    let ValueFlowEndpoint::Location(location) = endpoint else {
+        return matches!(_offset, BackingStoreOffset::Zero)
+            && matches!(endpoint, ValueFlowEndpoint::Value(value) if value.id() == source);
+    };
+    if matches!(
+        location.path().root(),
+        AccessPathRoot::Allocation(actual) if actual.id() == allocation
+    ) {
+        return location.path().selectors().is_empty();
+    }
+    structured_value_origin_matches_root(procedure, source, location.path().root())
+}
+
+/// Whether an access-path root is one of the structured identity origins of a
+/// value. Alternative backing rows may materialize their existing-backing arm
+/// at an allocation or formal root reached through earlier local/backing rows,
+/// so checking only the immediate source value would reject a valid snapshot.
+fn structured_value_origin_matches_root(
+    procedure: &ProcedureHandle,
+    source: ValueId,
+    expected: &AccessPathRoot,
+) -> bool {
+    let mut pending = vec![source];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let current_matches = match expected {
+            AccessPathRoot::Value(value) => value.id() == current,
+            AccessPathRoot::Allocation(allocation) => procedure
+                .semantics()
+                .allocation(allocation.id())
+                .is_some_and(|row| row.result == current),
+            AccessPathRoot::ProcedurePort(port) => procedure
+                .semantics()
+                .value(current)
+                .is_some_and(|value| match port.kind() {
+                    ProcedurePortKind::Receiver => {
+                        matches!(value.kind, SemanticValueKind::Receiver { .. })
+                    }
+                    ProcedurePortKind::Parameter { ordinal } => {
+                        matches!(value.kind, SemanticValueKind::Parameter { ordinal: actual, .. } if actual == ordinal)
+                    }
+                    ProcedurePortKind::NormalReturn
+                    | ProcedurePortKind::IndexedNormalReturn { .. }
+                    | ProcedurePortKind::ExceptionalReturn
+                    | ProcedurePortKind::Capture { .. } => false,
+                }),
+            AccessPathRoot::Static(_)
+            | AccessPathRoot::TypeSummary(_)
+            | AccessPathRoot::ModuleObject(_)
+            | AccessPathRoot::External(_)
+            | AccessPathRoot::CallResult(_)
+            | AccessPathRoot::LexicalCell(_)
+            | AccessPathRoot::CaptureSlot(_) => false,
+        };
+        if current_matches {
+            return true;
+        }
+        for point in procedure.semantics().points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value } if target == current => {
+                        pending.push(value);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+                        source,
+                        target,
+                    } if target == current => pending.push(source),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative { allocation, .. },
+                        source,
+                        target,
+                    } if target == current => {
+                        pending.push(source);
+                        if let Some(allocation) = procedure.semantics().allocation(allocation) {
+                            pending.push(allocation.result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 /// `chains` is derived on the first access shape that needs it and reused for
 /// every later relation. Deriving it walks the whole procedure, which most
 /// snapshots never need: only a memory access whose relation endpoint is not a
@@ -288,8 +433,8 @@ fn relation_matches_event(
         SemanticEffect::Assignment { target, value } => {
             (relation.kind == ValueFlowRelationKind::Assignment
                 && relation.transfer.is_none()
-                && value_endpoint(&relation.source, *value)
-                && value_endpoint(&relation.target, *target))
+                && runtime_value_endpoint(procedure, &relation.source, *value)
+                && runtime_value_endpoint(procedure, &relation.target, *target))
                 || is_container_collapse(relation, *target)
         }
         SemanticEffect::ValueFlow {
@@ -299,9 +444,25 @@ fn relation_matches_event(
         } => {
             (relation.kind == ValueFlowRelationKind::Assignment
                 && relation.transfer.is_none()
-                && value_endpoint(&relation.source, *source)
-                && value_endpoint(&relation.target, *target))
+                && runtime_value_endpoint(procedure, &relation.source, *source)
+                && runtime_value_endpoint(procedure, &relation.target, *target))
                 || is_container_collapse(relation, *target)
+        }
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::BackingStoreAlternative { offset, allocation },
+            source,
+            target,
+        } => {
+            relation.kind == ValueFlowRelationKind::Assignment
+                && relation.transfer.is_none()
+                && value_endpoint(&relation.target, *target)
+                && matches_backing_store_alternative(
+                    procedure,
+                    *source,
+                    *offset,
+                    *allocation,
+                    &relation.source,
+                )
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Transfer(transfer),
@@ -310,44 +471,26 @@ fn relation_matches_event(
         } => {
             relation.kind == ValueFlowRelationKind::Assignment
                 && relation.transfer == Some(*transfer)
-                && value_endpoint(&relation.source, *source)
-                && value_endpoint(&relation.target, *target)
+                && runtime_value_endpoint(procedure, &relation.source, *source)
+                && runtime_value_endpoint(procedure, &relation.target, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Parameter,
             source,
             target,
         } => {
-            if relation.kind != ValueFlowRelationKind::Parameter {
-                return false;
-            }
-            let source_kind = procedure.semantics().value(*source).map(|row| &row.kind);
-            let target_kind = procedure.semantics().value(*target).map(|row| &row.kind);
-            match (source_kind, target_kind) {
-                (Some(SemanticValueKind::Parameter { ordinal, .. }), _) => {
-                    port_endpoint(
-                        &relation.source,
-                        ProcedurePortKind::Parameter { ordinal: *ordinal },
-                    ) && value_endpoint(&relation.target, *target)
-                }
-                (_, Some(SemanticValueKind::Parameter { ordinal, .. })) => {
-                    value_endpoint(&relation.source, *source)
-                        && port_endpoint(
-                            &relation.target,
-                            ProcedurePortKind::Parameter { ordinal: *ordinal },
-                        )
-                }
-                _ => false,
-            }
+            relation.kind == ValueFlowRelationKind::Parameter
+                && runtime_value_endpoint(procedure, &relation.source, *source)
+                && runtime_value_endpoint(procedure, &relation.target, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Receiver,
+            source,
             target,
-            ..
         } => {
             relation.kind == ValueFlowRelationKind::Receiver
-                && port_endpoint(&relation.source, ProcedurePortKind::Receiver)
-                && value_endpoint(&relation.target, *target)
+                && runtime_value_endpoint(procedure, &relation.source, *source)
+                && runtime_value_endpoint(procedure, &relation.target, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Return,
@@ -778,6 +921,36 @@ impl ValueFlowSnapshot {
         let mut relations = self.relations.into_vec();
         let mut chains = None;
         relations.retain(|relation| relation.preserves_runtime_class(&mut chains));
+        self.relations = relations.into_boxed_slice();
+        self
+    }
+
+    /// Remove incoming memory flow for loads whose result a client supplies
+    /// independently. Replacing only the result's seeds would leave ordinary
+    /// heap flow able to reintroduce values excluded by the client's model.
+    /// Load identities are local to this snapshot's procedure. Other loads,
+    /// stores, evidence identities, and coverage remain unchanged.
+    pub fn without_memory_loads_into(
+        mut self,
+        loads: impl IntoIterator<Item = (ProgramPointId, ValueId)>,
+    ) -> Self {
+        let loads = loads.into_iter().collect::<std::collections::HashSet<_>>();
+        for &(point, result) in &loads {
+            assert!(
+                self.procedure.semantics().point(point).is_some_and(|point| {
+                    point.events.iter().any(|event| {
+                        matches!(event.effect, SemanticEffect::MemoryLoad { result: actual, .. } if actual == result)
+                    })
+                }),
+                "a replaced load must belong to the snapshot procedure"
+            );
+        }
+        let mut relations = self.relations.into_vec();
+        relations.retain(|relation| {
+            !(relation.kind == ValueFlowRelationKind::MemoryLoad
+                && matches!(&relation.target, ValueFlowEndpoint::Value(value)
+                    if loads.contains(&(relation.point.id(), value.id()))))
+        });
         self.relations = relations.into_boxed_slice();
         self
     }

@@ -968,6 +968,9 @@ impl ProcedureSemantics {
             {
                 Some(CallerReceiverBinding::Bound(receiver))
             }
+            (None, CallableReferenceKind::TypeQualifiedMethod { qualifier }, None) => {
+                Some(CallerReceiverBinding::TypeQualified(qualifier))
+            }
             (None, CallableReferenceKind::Function | CallableReferenceKind::StaticMethod, None) => {
                 Some(CallerReceiverBinding::Absent)
             }

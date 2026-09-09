@@ -453,6 +453,7 @@ fn build_curated_pack_evidence_outcome(
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 2,
             dependencies_resolved: dependencies.len(),
+            informational_evidence: Vec::new(),
         },
         dependencies,
         complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
@@ -885,6 +886,7 @@ fn build_outcome(
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 2,
             dependencies_resolved: dependencies.len(),
+            informational_evidence: Vec::new(),
         },
         dependencies,
         complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,

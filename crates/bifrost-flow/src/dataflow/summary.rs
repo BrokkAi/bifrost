@@ -181,6 +181,19 @@ pub trait ReusableSummaryProvider<Fact> {
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<Fact>>, ReusableSummaryError>;
 
+    /// Probe the solve root's Zero-entry relation. Providers that stage
+    /// publications transactionally can override this method to distinguish
+    /// the solver's one speculative root lookup from an ordinary recursive
+    /// call back into the root procedure.
+    fn root_summary_for(
+        &mut self,
+        root: &ProcedureHandle,
+        entry_fact: Fact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, ReusableSummaryError> {
+        self.summary_for(root, root, entry_fact, request)
+    }
+
     /// Commit provider-owned cache publications staged while answering an
     /// accepted root lookup. Root lookup is speculative until the solver has
     /// validated the returned relation and reserved all replay work, so a
@@ -2187,7 +2200,7 @@ where
         let mut probe_budget = request.budget.clone();
         let mut probe_request = DataflowRequest::new(&mut probe_budget, request.cancellation)
             .with_query_plan_config(request.query_plan_config());
-        let summary = match reusable.summary_for(&root, &root, self.zero_fact, &mut probe_request) {
+        let summary = match reusable.root_summary_for(&root, self.zero_fact, &mut probe_request) {
             Ok(Some(summary)) => summary,
             Ok(None) => {
                 reusable.discard_root_summary(&root);

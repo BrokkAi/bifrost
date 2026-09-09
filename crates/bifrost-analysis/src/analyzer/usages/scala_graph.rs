@@ -565,6 +565,78 @@ object Use {
         );
     }
 
+    /// #3142: a targeted find-references query sweeps the workspace once for
+    /// the seed's derived structures but materializes full per-file facts only
+    /// for the files the query actually scans or resolves through. Here the
+    /// workspace spreads one package per file, the scan set is one file, and
+    /// the target's package closure is one more: the touched set is a
+    /// handful, not the workspace.
+    #[test]
+    fn scala_targeted_query_materializes_facts_only_for_touched_files() {
+        const FILE_COUNT: usize = 132;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..FILE_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("C{index}.scala"));
+            let source = if index == 0 {
+                "package p0\n\nclass Leaf\n".to_string()
+            } else if index == 5 {
+                "package p5\n\nimport p0.Leaf\n\nclass UsesLeaf {\n  def make: Leaf = new Leaf\n}\n"
+                    .to_string()
+            } else {
+                format!("package p{index}\n\nclass C{index}\n")
+            };
+            file.write(source).unwrap();
+        }
+        let project = TestProject::new(root.clone(), Language::Scala);
+        let analyzer = ScalaAnalyzer::new(Arc::new(project));
+        let target = analyzer
+            .all_declarations()
+            .find(|unit| unit.fq_name() == "p0.Leaf")
+            .expect("the corpus declares p0.Leaf");
+        let scanned = ProjectFile::new(root, "C5.scala");
+        let candidates = HashSet::from_iter([scanned.clone()]);
+
+        use crate::analyzer::AnalyzerTestHooks;
+        use crate::analyzer::usages::traits::UsageAnalyzer;
+        analyzer.reset_full_hydration_count_for_test();
+        analyzer.reset_scala_query_file_facts_touched_for_test();
+        let bulk_before = analyzer.bulk_hydration_count_for_test();
+
+        let result = ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected a successful usage query, got {result:?}");
+        };
+        let hits = hits_by_overload
+            .get(&target)
+            .expect("the query target keys the hits");
+        assert!(
+            hits.iter().any(|hit| hit.file == scanned),
+            "expected the C5 `new Leaf` site among {hits:?}",
+        );
+
+        // The sweep hydrates every workspace file once; the provider hydrates
+        // each touched file once. Nothing hydrates twice.
+        let touched = analyzer.scala_query_file_facts_touched_for_test();
+        assert_eq!(
+            analyzer.bulk_hydration_count_for_test() - bulk_before,
+            FILE_COUNT + touched,
+            "sweep hydrates each file once, provider hydrates each touched file once",
+        );
+        assert_eq!(
+            touched, 2,
+            "only the target's file and the scanned file materialize full per-file facts",
+        );
+    }
+
     #[test]
     fn complete_inbound_graph_is_reused_by_the_dead_code_cache() {
         let temp = tempfile::tempdir().unwrap();

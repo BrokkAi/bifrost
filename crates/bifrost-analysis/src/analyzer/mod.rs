@@ -260,6 +260,7 @@ pub(crate) use tree_sitter_analyzer::{
     AnalyzerStoreContext, BuildAbort, BulkFileStateSource, RevisionBlobIdentities,
     ephemeral_store_context, persistent_store_context,
     persistent_store_context_without_automatic_gc, revision_image_store_context,
+    scoped_store_context,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
@@ -273,7 +274,7 @@ pub use workspace::{
     DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
     PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
 };
-pub(crate) use workspace::{RevisionWorkspaceProjection, SharedAnalyzerCache};
+pub(crate) use workspace::{SharedAnalyzerCache, WorkspaceProjectionLease};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParserFlavor {

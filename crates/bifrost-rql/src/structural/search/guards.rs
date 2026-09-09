@@ -151,13 +151,24 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             None,
         ),
-        GuardPredicate::InstanceOf { value, classes } => (
+        GuardPredicate::InstanceOf { value, classes }
+        | GuardPredicate::ExactClass { value, classes, .. } => (
             None,
             None,
             None,
             None,
             Some(u64::from(value.get())),
             Some(u64::from(classes.get())),
+            None,
+            None,
+        ),
+        GuardPredicate::Truthy { value } => (
+            None,
+            None,
+            None,
+            None,
+            Some(u64::from(value.get())),
+            None,
             None,
             None,
         ),
@@ -270,9 +281,17 @@ mod tests {
                 value: crate::analyzer::semantic::ValueId::new(0),
                 classes: crate::analyzer::semantic::ValueId::new(1),
             },
+            GuardPredicate::ExactClass {
+                value: crate::analyzer::semantic::ValueId::new(0),
+                classes: crate::analyzer::semantic::ValueId::new(1),
+                exact_on_true: true,
+            },
             GuardPredicate::HasMember {
                 value: crate::analyzer::semantic::ValueId::new(0),
                 member: crate::analyzer::semantic::ValueId::new(1),
+            },
+            GuardPredicate::Truthy {
+                value: crate::analyzer::semantic::ValueId::new(0),
             },
             GuardPredicate::Opaque {
                 digest: crate::analyzer::semantic::GuardConditionDigest::from_syntax_kind(
@@ -285,7 +304,7 @@ mod tests {
                 "{predicate:?}"
             );
         }
-        assert_eq!(GuardPredicate::LABELS.len(), 6);
+        assert_eq!(GuardPredicate::LABELS.len(), 8);
     }
 
     /// A constant condition proves one arm cannot execute, and which arm that

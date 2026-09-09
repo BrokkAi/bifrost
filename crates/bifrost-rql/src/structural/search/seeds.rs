@@ -293,13 +293,14 @@ pub(super) fn prepare_seed_access(
                         access.retained_bytes.saturating_add(index.retained_bytes());
                 }
             }
-            if state.analyzer.read_ledger_attached() {
-                // Recorded here and nowhere earlier: this is the one point at
-                // which the answer is drawn from the posting index, which is
-                // derived from this language's whole analyzed file set. A seed
-                // scan reads only the files it opens and records a `File` key
-                // for each, so charging it the language scope would make every
-                // edit anywhere invalidate every unit.
+            if state.analyzer.read_ledger_attached() && state.scope.seed_files().is_none() {
+                // Recorded here and nowhere earlier for a whole-workspace
+                // execution: this is the one point at which the answer is
+                // drawn from the language's complete posting index. A
+                // narrowed execution asks the same index only about its exact
+                // seed files, whose hydration records `File` keys; charging
+                // that unit the language scope would make unrelated edits
+                // invalidate it.
                 //
                 // The identity is the analyzer's own scope fold rather than
                 // the index's raw key, because that is the value verification

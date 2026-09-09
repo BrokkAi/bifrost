@@ -32,7 +32,7 @@ use crate::path_utils::rel_path_string;
 use brokk_bifrost_analysis::analyzer::store::class_set_root_results::{
     ClassSetRootResultGenerationKey, ClassSetRootResultLookup, FindingFreeClassSetRootKey,
     FindingFreeClassSetRootResult, PersistedClassSetAtom, PersistedClassSetRootRow,
-    PersistedClassSetStatus, PersistedClassSetUnknownReason,
+    PersistedClassSetStatus,
 };
 use brokk_bifrost_flow::dataflow::{
     DataflowDirectionRequest, DataflowQueryPlanConfig, DataflowRequest, SolverBudget,
@@ -146,6 +146,7 @@ struct MergedClassSet {
     member: String,
     classes: Vec<ClassIdentity>,
     unknown: Vec<UnknownReason>,
+    dynamic_origins: Vec<String>,
     status: ClassSetStatus,
 }
 
@@ -1031,7 +1032,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v5";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v6";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1065,6 +1066,7 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
                     member: set.site.member.to_string(),
                     classes: Vec::new(),
                     unknown: Vec::new(),
+                    dynamic_origins: Vec::new(),
                     status: set.status,
                 });
                 merged.last_mut().expect("the set was just pushed")
@@ -1077,7 +1079,13 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
         }
         for reason in &set.unknown {
             if !entry.unknown.contains(reason) {
-                entry.unknown.push(*reason);
+                entry.unknown.push(reason.clone());
+            }
+        }
+        for evidence in &set.dynamic_writes {
+            let origin = evidence.origin();
+            if !entry.dynamic_origins.contains(&origin) {
+                entry.dynamic_origins.push(origin);
             }
         }
         entry.status = entry.status.weakest(set.status);
@@ -1112,8 +1120,13 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
                 status: set.status.label(),
             });
         }
-        for reason in &set.unknown {
-            let origin = format!("unknown:{}", reason.label());
+        for origin in set
+            .unknown
+            .iter()
+            .filter(|reason| **reason != UnknownReason::DynamicFieldWrite)
+            .map(|reason| format!("unknown:{reason}"))
+            .chain(set.dynamic_origins.iter().cloned())
+        {
             rows.push(ClassSetRowValue {
                 id: class_set_row_id(
                     &root_procedure_id,
@@ -1167,24 +1180,28 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
     rows
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ClassSetRowAtomOrder<'a> {
     Workspace(&'a str),
     External(&'a str),
-    Unknown(PersistedClassSetUnknownReason),
+    Unknown(UnknownReason),
+    DynamicWrite(&'a str),
 }
 
 fn class_set_row_atom_order(row: &ClassSetRowValue) -> ClassSetRowAtomOrder<'_> {
     match (row.origin.as_str(), row.class.as_deref()) {
         ("workspace", Some(class)) => ClassSetRowAtomOrder::Workspace(class),
         ("external", Some(class)) => ClassSetRowAtomOrder::External(class),
+        (origin, None) if origin.starts_with("unknown:dynamic_field_write:") => {
+            ClassSetRowAtomOrder::DynamicWrite(origin)
+        }
         (origin, None) => ClassSetRowAtomOrder::Unknown(
-            PersistedClassSetUnknownReason::from_label(
+            UnknownReason::from_label(
                 origin
                     .strip_prefix("unknown:")
                     .expect("Unknown origins carry their typed reason label"),
             )
-            .expect("the live and durable Unknown vocabularies stay aligned"),
+            .expect("Unknown origins carry a live typed reason label"),
         ),
         _ => unreachable!("live class-set projection preserves atom pairing"),
     }
@@ -1194,6 +1211,13 @@ fn persisted_class_set_row(
     ordinal: usize,
     row: &ClassSetRowValue,
 ) -> Option<PersistedClassSetRootRow> {
+    // Site-bearing dynamic survey evidence is request-local until its solver
+    // work and source dependencies have a durable replay contract.
+    if row.origin == "unknown:dynamic_field_write"
+        || row.origin.starts_with("unknown:dynamic_field_write:")
+    {
+        return None;
+    }
     let atom = persisted_class_set_atom(row);
     Some(PersistedClassSetRootRow {
         ordinal: u32::try_from(ordinal).ok()?,
@@ -1214,12 +1238,12 @@ fn persisted_class_set_atom(row: &ClassSetRowValue) -> PersistedClassSetAtom {
             PersistedClassSetAtom::ExternalClass(class.to_owned().into_boxed_str())
         }
         (origin, None) => PersistedClassSetAtom::Unknown(
-            PersistedClassSetUnknownReason::from_label(
+            UnknownReason::from_label(
                 origin
                     .strip_prefix("unknown:")
                     .expect("Unknown origins carry their typed reason label"),
             )
-            .expect("the live and durable Unknown vocabularies stay aligned"),
+            .expect("Unknown origins carry a live typed reason label"),
         ),
         _ => unreachable!("live class-set projection preserves atom pairing"),
     }
@@ -1244,9 +1268,7 @@ fn persisted_class_set_rows(
                 PersistedClassSetAtom::ExternalClass(class) => {
                     (Some(String::from(class)), "external".to_string())
                 }
-                PersistedClassSetAtom::Unknown(reason) => {
-                    (None, format!("unknown:{}", reason.label()))
-                }
+                PersistedClassSetAtom::Unknown(reason) => (None, format!("unknown:{reason}")),
             };
             ClassSetRowValue {
                 id: class_set_row_id(
@@ -1562,7 +1584,7 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v5",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v6",
             "class-preserving transfers must not reuse operand-dependency root results"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");

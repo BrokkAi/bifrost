@@ -23,6 +23,7 @@ mod eval;
 mod introspect;
 mod ir;
 mod lower;
+mod occurrence;
 mod validate;
 
 pub use coverage::{
@@ -46,6 +47,7 @@ pub use ir::{
     MAX_IR_SET_MEMBERS, RelationalPlanIr, RowScalar, domain_schema, expansion_result_domain,
 };
 pub use lower::{LoweredRowSelector, lower_relational_assertion_plan, lower_row_selector_plan};
+pub(crate) use occurrence::lower_occurrence_assert;
 pub use validate::{RelationalAssertionPlanError, validate_limits, validate_plan_ir};
 
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;

@@ -61,8 +61,8 @@ use super::syntax::{
 };
 use crate::scala::declarations::scala_class_parameter_field_keyword;
 use crate::scala::graph_support::{
-    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaSource,
-    ScalaWorkspaceSource,
+    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaFileFactsProvider,
+    ScalaFileFactsRef, ScalaSource, ScalaWorkspaceSource,
 };
 use crate::scala::imports::scala_import_infos_from_node;
 use crate::scala::supertypes::{
@@ -352,13 +352,98 @@ pub struct ProjectTypes {
     nested_objects_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     wildcard_members_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
-    bulk_file_states: Option<Arc<HashMap<ProjectFile, ScalaFileFacts>>>,
+    file_facts: ScalaFileFactsSource,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     effective_callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     extension_methods_by_owner_member:
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
     override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
     exported_member_bindings_by_owner: Mutex<HashMap<String, Vec<(String, String)>>>,
+}
+
+/// How a [`ProjectTypes`] answers per-file fact lookups.
+///
+/// The eager arm is the whole-workspace read the inverted edge build and the
+/// analyzer-cached project types hold. The lazy arm is the targeted usage
+/// query's: per-file facts rehydrate one file at a time as resolution touches
+/// them, so one symbol's question never retains the whole repository's
+/// thirteen-field per-file records (#3142).
+enum ScalaFileFactsSource {
+    Eager(Arc<HashMap<ProjectFile, ScalaFileFacts>>),
+    Lazy(Arc<dyn ScalaFileFactsProvider>),
+}
+
+/// The per-file facts the seed's hierarchy resolution reads.
+///
+/// Four of [`ScalaFileFacts`]' thirteen fields; the rest are either derived
+/// into the seed's workspace-wide structures during the sweep or rehydrated
+/// lazily when the query touches the file.
+pub struct ScalaHierarchyFileFacts {
+    pub package_name: String,
+    pub imports: Vec<ImportInfo>,
+    pub supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
+    pub children: HashMap<CodeUnit, Vec<CodeUnit>>,
+}
+
+/// The borrowed view [`ProjectTypes::resolve_direct_ancestors`] reads per
+/// file, so the whole-workspace eager map and the targeted query's lean
+/// records share one resolution body.
+trait ScalaHierarchyInput {
+    fn package_name(&self) -> &str;
+    fn imports(&self) -> &[ImportInfo];
+    fn supertype_lookup_paths(&self) -> &HashMap<CodeUnit, Vec<String>>;
+    fn children(&self) -> &HashMap<CodeUnit, Vec<CodeUnit>>;
+}
+
+impl ScalaHierarchyInput for ScalaFileFacts {
+    fn package_name(&self) -> &str {
+        &self.package_name
+    }
+
+    fn imports(&self) -> &[ImportInfo] {
+        &self.imports
+    }
+
+    fn supertype_lookup_paths(&self) -> &HashMap<CodeUnit, Vec<String>> {
+        &self.supertype_lookup_paths
+    }
+
+    fn children(&self) -> &HashMap<CodeUnit, Vec<CodeUnit>> {
+        &self.children
+    }
+}
+
+impl ScalaHierarchyInput for ScalaHierarchyFileFacts {
+    fn package_name(&self) -> &str {
+        &self.package_name
+    }
+
+    fn imports(&self) -> &[ImportInfo] {
+        &self.imports
+    }
+
+    fn supertype_lookup_paths(&self) -> &HashMap<CodeUnit, Vec<String>> {
+        &self.supertype_lookup_paths
+    }
+
+    fn children(&self) -> &HashMap<CodeUnit, Vec<CodeUnit>> {
+        &self.children
+    }
+}
+
+/// What a [`ScalaProjectTypesSeed`] carries per file beyond the derived
+/// workspace-wide structures.
+#[derive(Clone)]
+enum ScalaSeedFileFacts {
+    /// The whole-workspace eager read: hierarchy input and query-time lookups.
+    Eager(Arc<HashMap<ProjectFile, ScalaFileFacts>>),
+    /// The targeted query: the lean hierarchy inputs the unresolved seed
+    /// needs once, then the lazily rehydrated per-file facts the catalog and
+    /// scan phases read. [`ProjectTypes::resolved_seed`] drops the inputs.
+    Targeted {
+        hierarchy_inputs: Option<Arc<HashMap<ProjectFile, ScalaHierarchyFileFacts>>>,
+        facts: Arc<dyn ScalaFileFactsProvider>,
+    },
 }
 
 /// Immutable Scala file facts plus the hierarchy layer resolved from them.
@@ -376,7 +461,90 @@ pub struct ScalaProjectTypesSeed {
     ambiguous_direct_ancestor_owners: Option<Arc<HashSet<CodeUnit>>>,
     structural_parent_by_unit: Arc<HashMap<CodeUnit, CodeUnit>>,
     scala_trait_fqns: Arc<HashSet<String>>,
-    bulk_file_states: Arc<HashMap<ProjectFile, ScalaFileFacts>>,
+    facts: ScalaSeedFileFacts,
+}
+
+/// The workspace-wide type-namespace structures a [`ScalaProjectTypesSeed`]
+/// derives from the per-file facts. Everything the seed must answer about
+/// files the query never touches lands here; nothing per-file does.
+#[derive(Default)]
+struct ScalaSeedDerived {
+    type_aliases: HashSet<CodeUnit>,
+    structural_parent_by_unit: HashMap<CodeUnit, CodeUnit>,
+    scala_trait_fqns: HashSet<String>,
+}
+
+impl ScalaSeedDerived {
+    fn fold_file_facts(&mut self, facts: &ScalaFileFacts) {
+        self.type_aliases.extend(facts.type_aliases.iter().cloned());
+        for (parent, children) in &facts.children {
+            for child in children {
+                self.structural_parent_by_unit
+                    .insert(child.clone(), parent.clone());
+            }
+        }
+        self.scala_trait_fqns
+            .extend(facts.scala_traits.iter().map(CodeUnit::fq_name));
+    }
+}
+
+/// The targeted usage query's whole-workspace sweep accumulator (#3142).
+///
+/// The analysis side feeds one chunk of hydrated file facts at a time and
+/// drops each chunk here: the derived type-namespace structures accumulate,
+/// and the lean hierarchy inputs stay only for files the hierarchy resolution
+/// can read (those that spell a supertype). Every other field of the fat
+/// per-file record dies with the chunk, and [`Self::into_seed`] hands the
+/// query a lazily rehydrated per-file facts source for the files resolution
+/// later touches.
+#[derive(Default)]
+pub struct ScalaProjectTypesSweep {
+    derived: ScalaSeedDerived,
+    hierarchy_inputs: HashMap<ProjectFile, ScalaHierarchyFileFacts>,
+}
+
+impl ScalaProjectTypesSweep {
+    pub fn fold_file(&mut self, file: ProjectFile, facts: ScalaFileFacts) {
+        self.derived.fold_file_facts(&facts);
+        if !facts.supertype_lookup_paths.is_empty() {
+            self.hierarchy_inputs.insert(
+                file,
+                ScalaHierarchyFileFacts {
+                    package_name: facts.package_name,
+                    imports: facts.imports,
+                    supertype_lookup_paths: facts.supertype_lookup_paths,
+                    children: facts.children,
+                },
+            );
+        }
+    }
+
+    pub fn into_seed(self, facts: Arc<dyn ScalaFileFactsProvider>) -> ScalaProjectTypesSeed {
+        ScalaProjectTypesSeed {
+            type_aliases: Arc::new(self.derived.type_aliases),
+            direct_ancestors_by_owner: None,
+            direct_ancestors_by_unit: None,
+            ambiguous_direct_ancestor_owners: None,
+            structural_parent_by_unit: Arc::new(self.derived.structural_parent_by_unit),
+            scala_trait_fqns: Arc::new(self.derived.scala_trait_fqns),
+            facts: ScalaSeedFileFacts::Targeted {
+                hierarchy_inputs: Some(Arc::new(self.hierarchy_inputs)),
+                facts,
+            },
+        }
+    }
+}
+
+impl ScalaProjectTypesSeed {
+    /// Warm the per-file facts cells for the files the query is about to
+    /// scan. The eager seed already holds every file; the targeted seed
+    /// batches the scan set's hydration ahead of the parallel walk so each
+    /// file's first touch is a memory hit, not a store read.
+    pub fn prefetch_file_facts(&self, files: &[ProjectFile]) {
+        if let ScalaSeedFileFacts::Targeted { facts, .. } = &self.facts {
+            facts.prefetch_file_facts(files);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -490,37 +658,18 @@ impl ProjectTypes {
     }
 
     pub fn seed(file_states: Arc<HashMap<ProjectFile, ScalaFileFacts>>) -> ScalaProjectTypesSeed {
-        let type_aliases = Arc::new(
-            file_states
-                .values()
-                .flat_map(|state| state.type_aliases.iter().cloned())
-                .collect(),
-        );
-        let structural_parent_by_unit = file_states
-            .values()
-            .flat_map(|state| {
-                state.children.iter().flat_map(|(parent, children)| {
-                    children
-                        .iter()
-                        .cloned()
-                        .map(|child| (child, parent.clone()))
-                })
-            })
-            .collect();
-        let scala_trait_fqns = Arc::new(
-            file_states
-                .values()
-                .flat_map(|state| state.scala_traits.iter().map(CodeUnit::fq_name))
-                .collect(),
-        );
+        let mut derived = ScalaSeedDerived::default();
+        for state in file_states.values() {
+            derived.fold_file_facts(state);
+        }
         ScalaProjectTypesSeed {
-            type_aliases,
+            type_aliases: Arc::new(derived.type_aliases),
             direct_ancestors_by_owner: None,
             direct_ancestors_by_unit: None,
             ambiguous_direct_ancestor_owners: None,
-            structural_parent_by_unit: Arc::new(structural_parent_by_unit),
-            scala_trait_fqns,
-            bulk_file_states: file_states,
+            structural_parent_by_unit: Arc::new(derived.structural_parent_by_unit),
+            scala_trait_fqns: Arc::new(derived.scala_trait_fqns),
+            facts: ScalaSeedFileFacts::Eager(file_states),
         }
     }
 
@@ -529,6 +678,12 @@ impl ProjectTypes {
         facts: Arc<dyn ScalaCallableFactsIndex>,
         seed: ScalaProjectTypesSeed,
     ) -> Self {
+        let file_facts = match &seed.facts {
+            ScalaSeedFileFacts::Eager(states) => ScalaFileFactsSource::Eager(Arc::clone(states)),
+            ScalaSeedFileFacts::Targeted { facts, .. } => {
+                ScalaFileFactsSource::Lazy(Arc::clone(facts))
+            }
+        };
         let mut types = Self {
             index,
             type_aliases: Arc::clone(&seed.type_aliases),
@@ -544,7 +699,7 @@ impl ProjectTypes {
             nested_objects_by_owner: Mutex::new(HashMap::default()),
             wildcard_members_by_owner: Mutex::new(HashMap::default()),
             source_facts_by_file: Mutex::new(HashMap::default()),
-            bulk_file_states: Some(Arc::clone(&seed.bulk_file_states)),
+            file_facts,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
@@ -556,13 +711,19 @@ impl ProjectTypes {
             debug_assert!(types.ambiguous_direct_ancestor_owners.is_some());
             return types;
         }
-        let (direct_ancestors_by_unit, ambiguous_direct_ancestor_owners) = types
-            .resolve_direct_ancestors_from_file_states(
-                types
-                    .bulk_file_states
+        let (direct_ancestors_by_unit, ambiguous_direct_ancestor_owners) = match &seed.facts {
+            ScalaSeedFileFacts::Eager(states) => {
+                types.resolve_direct_ancestors(states, &seed.structural_parent_by_unit)
+            }
+            ScalaSeedFileFacts::Targeted {
+                hierarchy_inputs, ..
+            } => types.resolve_direct_ancestors(
+                hierarchy_inputs
                     .as_ref()
-                    .expect("bulk Scala file states were just installed"),
-            );
+                    .expect("an unresolved Scala targeted seed carries its hierarchy inputs"),
+                &seed.structural_parent_by_unit,
+            ),
+        };
         let direct_ancestors_by_owner = direct_ancestors_by_unit
             .iter()
             .map(|(owner, ancestors)| (owner.fq_name(), ancestors.clone()))
@@ -601,11 +762,15 @@ impl ProjectTypes {
                     .as_ref()
                     .expect("Scala trait facts are initialized"),
             ),
-            bulk_file_states: Arc::clone(
-                self.bulk_file_states
-                    .as_ref()
-                    .expect("Scala bulk file facts are initialized"),
-            ),
+            facts: match &self.file_facts {
+                ScalaFileFactsSource::Eager(states) => {
+                    ScalaSeedFileFacts::Eager(Arc::clone(states))
+                }
+                ScalaFileFactsSource::Lazy(facts) => ScalaSeedFileFacts::Targeted {
+                    hierarchy_inputs: None,
+                    facts: Arc::clone(facts),
+                },
+            },
         }
     }
 
@@ -690,8 +855,15 @@ impl ProjectTypes {
         descendants
     }
 
-    pub fn bulk_file_state(&self, file: &ProjectFile) -> Option<&ScalaFileFacts> {
-        self.bulk_file_states.as_ref()?.get(file)
+    pub fn bulk_file_state(&self, file: &ProjectFile) -> Option<ScalaFileFactsRef<'_>> {
+        match &self.file_facts {
+            ScalaFileFactsSource::Eager(states) => {
+                states.get(file).map(ScalaFileFactsRef::Borrowed)
+            }
+            ScalaFileFactsSource::Lazy(facts) => {
+                facts.file_facts(file).map(ScalaFileFactsRef::Owned)
+            }
+        }
     }
 
     fn callable_facts(
@@ -862,34 +1034,16 @@ impl ProjectTypes {
         }
     }
 
-    fn export_infos_for_owner(
-        &self,
-        scala: &dyn ScalaSource,
-        owner: &CodeUnit,
-    ) -> Vec<ScalaExportInfo> {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(owner.source())
-                .and_then(|state| state.scala_exports.get(owner))
-                .cloned()
-                .unwrap_or_default(),
-            None => scala.export_infos_for_owner(owner),
-        }
+    fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
+        self.bulk_file_state(owner.source())
+            .and_then(|state| state.scala_exports.get(owner).cloned())
+            .unwrap_or_default()
     }
 
-    fn imports_for_export_owner(
-        &self,
-        scala: &dyn ScalaSource,
-        token: QueryToken<'_>,
-        owner: &CodeUnit,
-    ) -> Vec<ImportInfo> {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(owner.source())
-                .map(|state| state.imports.clone())
-                .unwrap_or_default(),
-            None => scala.import_info_of(token, owner.source()),
-        }
+    fn imports_for_export_owner(&self, owner: &CodeUnit) -> Vec<ImportInfo> {
+        self.bulk_file_state(owner.source())
+            .map(|state| state.imports.clone())
+            .unwrap_or_default()
     }
 
     fn physical_callable_targets(
@@ -983,8 +1137,8 @@ impl ProjectTypes {
                 continue;
             }
             owners.insert(current_fqn.clone(), current.clone());
-            let imports = self.imports_for_export_owner(scala, token, &current);
-            for export in self.export_infos_for_owner(scala, &current) {
+            let imports = self.imports_for_export_owner(&current);
+            for export in self.export_infos_for_owner(&current) {
                 if export.owner_path.is_empty() {
                     continue;
                 }
@@ -1125,29 +1279,23 @@ impl ProjectTypes {
         result
     }
 
-    pub fn resolve_direct_ancestors_from_file_states(
+    /// Resolve every owner's direct supertypes from the per-file hierarchy
+    /// inputs. `projected_parent_by_unit` is the seed's workspace-wide
+    /// child->parent map: the eager path derives it from the same facts this
+    /// reads, so both seed shapes resolve against identical parents.
+    fn resolve_direct_ancestors<F: ScalaHierarchyInput>(
         &self,
-        file_states: &HashMap<ProjectFile, ScalaFileFacts>,
+        file_inputs: &HashMap<ProjectFile, F>,
+        projected_parent_by_unit: &HashMap<CodeUnit, CodeUnit>,
     ) -> (HashMap<CodeUnit, Vec<CodeUnit>>, HashSet<CodeUnit>) {
         let mut ancestors_by_owner = HashMap::default();
         let mut ambiguous_owners = HashSet::default();
-        let projected_parent_by_unit = file_states
-            .values()
-            .flat_map(|state| {
-                state.children.iter().flat_map(|(parent, children)| {
-                    children
-                        .iter()
-                        .cloned()
-                        .map(|child| (child, parent.clone()))
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        for (file, state) in file_states {
-            if state.supertype_lookup_paths.is_empty() {
+        for (file, state) in file_inputs {
+            if state.supertype_lookup_paths().is_empty() {
                 continue;
             }
             let lookup_paths_by_owner = state
-                .supertype_lookup_paths
+                .supertype_lookup_paths()
                 .iter()
                 .filter_map(|(owner, encoded)| {
                     let paths = encoded
@@ -1174,7 +1322,7 @@ impl ProjectTypes {
                     let resolver = NameResolver::for_type_hierarchy_file(
                         Some(file),
                         Some(&package),
-                        &state.imports,
+                        state.imports(),
                         self,
                         &required_names,
                     );
@@ -1182,7 +1330,7 @@ impl ProjectTypes {
                 })
                 .collect::<HashMap<_, _>>();
             let parent_by_child = state
-                .children
+                .children()
                 .iter()
                 .flat_map(|(parent, children)| children.iter().map(move |child| (child, parent)))
                 .collect::<HashMap<_, _>>();
@@ -1202,7 +1350,7 @@ impl ProjectTypes {
                         &owner,
                         state,
                         &parent_by_child,
-                        &projected_parent_by_unit,
+                        projected_parent_by_unit,
                     ) else {
                         if self.type_lookup_path_is_ambiguous(resolver, path.segments()) {
                             ambiguous_owners.insert(owner.clone());
@@ -1590,7 +1738,7 @@ impl ProjectTypes {
         let source_facts = self.source_facts_for_file(scala, declaration.source());
         let resolver = NameResolver::for_file_types(scala, token, declaration, self);
         let mut resolved = HashSet::default();
-        for range in self.declaration_ranges_for(scala, declaration) {
+        for range in self.declaration_ranges_for(declaration) {
             if let Some(path) = source_facts
                 .field_type_paths_by_range
                 .get(&(range.start_byte, range.end_byte))
@@ -1655,7 +1803,7 @@ impl ProjectTypes {
         let source_facts = self.source_facts_for_file(scala, alias.source());
         let resolver = NameResolver::for_file_types(scala, token, alias, self);
         let resolved = self
-            .declaration_ranges_for(scala, alias)
+            .declaration_ranges_for(alias)
             .into_iter()
             .filter_map(|range| {
                 source_facts
@@ -2152,7 +2300,7 @@ impl ProjectTypes {
     }
 
     pub fn is_abstract_scala_method(&self, scala: &dyn ScalaSource, method: &CodeUnit) -> bool {
-        let ranges = self.declaration_ranges_for(scala, method);
+        let ranges = self.declaration_ranges_for(method);
         !ranges.is_empty()
             && ranges.iter().all(|range| {
                 self.source_facts_for_file(scala, method.source())
@@ -2517,7 +2665,7 @@ impl ProjectTypes {
     ) -> Option<ScalaGenericOwnerSourceFacts> {
         let source_facts = self.source_facts_for_file(scala, owner.source());
         let mut matches = self
-            .declaration_ranges_for(scala, owner)
+            .declaration_ranges_for(owner)
             .into_iter()
             .filter_map(|range| {
                 source_facts
@@ -2684,7 +2832,7 @@ impl ProjectTypes {
             .filter(|member| member.is_function())
         {
             let source_facts = self.source_facts_for_file(scala, method.source());
-            for range in self.declaration_ranges_for(scala, method) {
+            for range in self.declaration_ranges_for(method) {
                 if let Some(alternative) = source_facts
                     .callable_alternatives_by_range
                     .get(&(range.start_byte, range.end_byte))
@@ -3960,12 +4108,12 @@ impl ProjectTypes {
         self.resolve_type_in_declaration_context(scala, resolver, segments)
     }
 
-    fn resolve_type_in_owner_context(
+    fn resolve_type_in_owner_context<F: ScalaHierarchyInput>(
         &self,
         resolver: &NameResolver,
         segments: &[String],
         owner: &CodeUnit,
-        state: &ScalaFileFacts,
+        state: &F,
         parent_by_child: &HashMap<&CodeUnit, &CodeUnit>,
         projected_parent_by_unit: &HashMap<CodeUnit, CodeUnit>,
     ) -> Option<String> {
@@ -3973,7 +4121,7 @@ impl ProjectTypes {
         let mut scope = parent_by_child.get(owner).copied();
         while let Some(parent) = scope {
             let lexical = state
-                .children
+                .children()
                 .get(parent)
                 .into_iter()
                 .flatten()
@@ -4004,7 +4152,7 @@ impl ProjectTypes {
                 projected_parent_by_unit,
             );
         }
-        if let Some(relative) = self.resolve_package_relative_type(&state.package_name, segments) {
+        if let Some(relative) = self.resolve_package_relative_type(state.package_name(), segments) {
             return Some(relative);
         }
         self.resolve_type_in_projected_declaration_context(
@@ -4488,7 +4636,7 @@ impl ProjectTypes {
         cell.get_or_init(|| {
             let source_facts = self.source_facts_for_file(scala, target.source());
             let declaration_resolver = NameResolver::for_file_types(scala, token, target, self);
-            let ranges = self.declaration_ranges_for(scala, target);
+            let ranges = self.declaration_ranges_for(target);
             let mut exact = ranges
                 .iter()
                 .filter_map(|range| {
@@ -4618,7 +4766,7 @@ impl ProjectTypes {
                 return Arc::new(exact);
             }
             let mut fallback = self
-                .signature_metadata_for(scala, target)
+                .signature_metadata_for(target)
                 .into_iter()
                 .filter_map(|metadata| {
                     metadata.callable_arity().map(|arity| CallableAlternative {
@@ -4984,13 +5132,11 @@ impl ProjectTypes {
             return true;
         }
         let source_facts = self.source_facts_for_file(scala, target.source());
-        self.declaration_ranges_for(scala, target)
-            .iter()
-            .any(|range| {
-                source_facts
-                    .case_class_ranges
-                    .contains(&(range.start_byte, range.end_byte))
-            })
+        self.declaration_ranges_for(target).iter().any(|range| {
+            source_facts
+                .case_class_ranges
+                .contains(&(range.start_byte, range.end_byte))
+        })
     }
 
     pub fn type_is_stable_owner(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
@@ -4998,13 +5144,11 @@ impl ProjectTypes {
             return true;
         }
         let source_facts = self.source_facts_for_file(scala, target.source());
-        self.declaration_ranges_for(scala, target)
-            .iter()
-            .any(|range| {
-                source_facts
-                    .stable_owner_ranges
-                    .contains(&(range.start_byte, range.end_byte))
-            })
+        self.declaration_ranges_for(target).iter().any(|range| {
+            source_facts
+                .stable_owner_ranges
+                .contains(&(range.start_byte, range.end_byte))
+        })
     }
 
     pub fn stable_roots_for_resolved_type_name(
@@ -5684,50 +5828,32 @@ impl ProjectTypes {
 
     pub fn is_case_class(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         let source_facts = self.source_facts_for_file(scala, target.source());
-        self.declaration_ranges_for(scala, target)
-            .iter()
-            .any(|range| {
-                source_facts
-                    .case_class_ranges
-                    .contains(&(range.start_byte, range.end_byte))
-            })
+        self.declaration_ranges_for(target).iter().any(|range| {
+            source_facts
+                .case_class_ranges
+                .contains(&(range.start_byte, range.end_byte))
+        })
     }
 
     pub fn is_enum(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         let source_facts = self.source_facts_for_file(scala, target.source());
-        self.declaration_ranges_for(scala, target)
-            .iter()
-            .any(|range| {
-                source_facts
-                    .enum_ranges
-                    .contains(&(range.start_byte, range.end_byte))
-            })
+        self.declaration_ranges_for(target).iter().any(|range| {
+            source_facts
+                .enum_ranges
+                .contains(&(range.start_byte, range.end_byte))
+        })
     }
 
-    fn declaration_ranges_for(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> Vec<Range> {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(target.source())
-                .and_then(|state| state.ranges.get(target))
-                .cloned()
-                .unwrap_or_default(),
-            None => scala.ranges(target),
-        }
+    fn declaration_ranges_for(&self, target: &CodeUnit) -> Vec<Range> {
+        self.bulk_file_state(target.source())
+            .and_then(|state| state.ranges.get(target).cloned())
+            .unwrap_or_default()
     }
 
-    fn signature_metadata_for(
-        &self,
-        scala: &dyn ScalaSource,
-        target: &CodeUnit,
-    ) -> Vec<SignatureMetadata> {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(target.source())
-                .and_then(|state| state.signature_metadata.get(target))
-                .cloned()
-                .unwrap_or_default(),
-            None => scala.signature_metadata(target),
-        }
+    fn signature_metadata_for(&self, target: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.bulk_file_state(target.source())
+            .and_then(|state| state.signature_metadata.get(target).cloned())
+            .unwrap_or_default()
     }
 
     fn source_facts_for_file(
@@ -5753,14 +5879,9 @@ impl ProjectTypes {
     }
 
     pub fn source_for_file(&self, scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(file)
-                .map(|state| state.source.as_str())
-                .filter(|source| !source.is_empty())
-                .map(str::to_owned)
-                .or_else(|| scala.indexed_source(file)),
-            None => scala.indexed_source(file),
+        match self.bulk_file_state(file) {
+            Some(state) if !state.source.is_empty() => Some(state.source.clone()),
+            _ => scala.indexed_source(file),
         }
     }
 
@@ -6726,59 +6847,37 @@ impl NameResolver {
         types: &ProjectTypes,
     ) -> Self {
         let file = target.source();
-        match &types.bulk_file_states {
-            Some(states) => match states.get(file) {
-                Some(state) => {
-                    let reference_byte = state
-                        .ranges
-                        .get(target)
-                        .into_iter()
-                        .flatten()
-                        .map(|range| range.start_byte)
-                        .min();
-                    let imports = visible_imports_at_byte(&state.imports, reference_byte);
-                    Self::for_file_with_facts_impl(
-                        scala,
-                        token,
-                        Some(file),
-                        &[target.package_name().to_string()],
-                        &imports,
-                        types,
-                        false,
-                        &HashMap::default(),
-                    )
-                }
-                None => Self::for_file_with_facts_impl(
-                    scala,
-                    token,
-                    Some(file),
-                    &[target.package_name().to_string()],
-                    &[],
-                    types,
-                    false,
-                    &HashMap::default(),
-                ),
-            },
-            None => {
-                let imports = scala.import_info_of(token, file);
-                let reference_byte = scala
-                    .ranges(target)
-                    .into_iter()
-                    .map(|range| range.start_byte)
-                    .min();
-                let imports = visible_imports_at_byte(&imports, reference_byte);
-                Self::for_file_with_facts_impl(
-                    scala,
-                    token,
-                    Some(file),
-                    &[target.package_name().to_string()],
-                    &imports,
-                    types,
-                    false,
-                    &HashMap::default(),
-                )
-            }
-        }
+        let package_prefixes = [target.package_name().to_string()];
+        let Some(state) = types.bulk_file_state(file) else {
+            return Self::for_file_with_facts_impl(
+                scala,
+                token,
+                Some(file),
+                &package_prefixes,
+                &[],
+                types,
+                false,
+                &HashMap::default(),
+            );
+        };
+        let reference_byte = state
+            .ranges
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|range| range.start_byte)
+            .min();
+        let imports = visible_imports_at_byte(&state.imports, reference_byte);
+        Self::for_file_with_facts_impl(
+            scala,
+            token,
+            Some(file),
+            &package_prefixes,
+            &imports,
+            types,
+            false,
+            &HashMap::default(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11408,7 +11507,7 @@ fn named_argument_callable_targets(
         .iter()
         .filter(|callable| {
             ctx.types
-                .signature_metadata_for(ctx.scala, callable)
+                .signature_metadata_for(callable)
                 .iter()
                 .flat_map(|metadata| metadata.parameters())
                 .any(|parameter| parameter.label() == label)
@@ -14350,5 +14449,403 @@ mod tests {
         assert!(!single_replica_family(
             [&first, &second, &third].into_iter()
         ));
+    }
+
+    /// The #3142 targeted-query seed shape: the sweep folds each file's facts
+    /// into the seed's derived structures, keeps hierarchy inputs only for
+    /// files that spell a supertype, and serves every later per-file lookup
+    /// through the provider.
+    mod query_seed {
+        use super::*;
+
+        fn empty_facts(package_name: &str) -> ScalaFileFacts {
+            ScalaFileFacts {
+                source: String::new(),
+                package_name: package_name.to_string(),
+                declarations: HashSet::default(),
+                definition_lookup_units: HashSet::default(),
+                imports: Vec::new(),
+                scala_exports: HashMap::default(),
+                supertype_lookup_paths: HashMap::default(),
+                signatures: HashMap::default(),
+                signature_metadata: HashMap::default(),
+                ranges: HashMap::default(),
+                children: HashMap::default(),
+                scala_traits: HashSet::default(),
+                type_aliases: HashSet::default(),
+            }
+        }
+
+        struct StubFactsProvider {
+            facts: HashMap<ProjectFile, Arc<ScalaFileFacts>>,
+            prefetched: Mutex<Vec<ProjectFile>>,
+        }
+
+        impl ScalaFileFactsProvider for StubFactsProvider {
+            fn file_facts(&self, file: &ProjectFile) -> Option<Arc<ScalaFileFacts>> {
+                self.facts.get(file).cloned()
+            }
+
+            fn prefetch_file_facts(&self, files: &[ProjectFile]) {
+                self.prefetched
+                    .lock()
+                    .expect("stub prefetch log poisoned")
+                    .extend(files.iter().cloned());
+            }
+        }
+
+        struct StubDefinitionIndex {
+            units: Vec<CodeUnit>,
+        }
+
+        impl ScalaDefinitionIndex for StubDefinitionIndex {
+            fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+                self.units
+                    .iter()
+                    .filter(|unit| unit.fq_name() == fqn)
+                    .cloned()
+                    .collect()
+            }
+
+            fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+                self.units
+                    .iter()
+                    .filter(|unit| scala_normalized_fq_name(&unit.fq_name()) == normalized)
+                    .cloned()
+                    .collect()
+            }
+
+            fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+                self.units
+                    .iter()
+                    .filter(|unit| {
+                        unit.package_name() == package && scala_simple_type_name(unit) == simple
+                    })
+                    .cloned()
+                    .collect()
+            }
+
+            fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+                self.units
+                    .iter()
+                    .filter(|unit| unit.identifier() == ident)
+                    .cloned()
+                    .collect()
+            }
+
+            fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
+                Vec::new()
+            }
+
+            fn fqn_exists(&self, fqn: &str) -> bool {
+                self.units.iter().any(|unit| unit.fq_name() == fqn)
+            }
+
+            fn package_exists(&self, package: &str) -> bool {
+                self.units.iter().any(|unit| unit.package_name() == package)
+            }
+
+            fn package_container_exists(&self, package: &str) -> bool {
+                self.package_exists(package)
+            }
+
+            fn child_packages(&self, _package: &str) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn members_for_structured_owner(
+                &self,
+                _owner: &brokk_bifrost_core::analyzer::fq_name::FqName,
+                _name: &str,
+            ) -> Vec<CodeUnit> {
+                Vec::new()
+            }
+
+            fn members_for_owner_name(
+                &self,
+                _owner_fqn: &str,
+                _normalized_owner_fqn: &str,
+                _name: &str,
+            ) -> Vec<CodeUnit> {
+                Vec::new()
+            }
+
+            fn package_types_in(&self, package: &str) -> Vec<(String, Vec<CodeUnit>)> {
+                let mut grouped: Vec<(String, Vec<CodeUnit>)> = Vec::new();
+                for unit in self
+                    .units
+                    .iter()
+                    .filter(|unit| unit.package_name() == package)
+                {
+                    let simple = scala_simple_type_name(unit);
+                    match grouped.iter_mut().find(|(name, _)| *name == simple) {
+                        Some((_, units)) => units.push(unit.clone()),
+                        None => grouped.push((simple, vec![unit.clone()])),
+                    }
+                }
+                grouped
+            }
+        }
+
+        struct StubCallableFacts;
+
+        impl ScalaCallableFactsIndex for StubCallableFacts {
+            fn facts_for_declaration(
+                &self,
+                _declaration: &CodeUnit,
+            ) -> Vec<brokk_bifrost_core::analyzer::RelationalCallableFact> {
+                Vec::new()
+            }
+        }
+
+        struct Scenario {
+            file_a: ProjectFile,
+            file_b: ProjectFile,
+            facts: HashMap<ProjectFile, ScalaFileFacts>,
+            base: CodeUnit,
+            child: CodeUnit,
+            alias: CodeUnit,
+            parent: CodeUnit,
+            inner: CodeUnit,
+        }
+
+        /// `bulk/A.scala` holds `trait Base` and `class Child extends Base`
+        /// (a hierarchy input); `bulk/B.scala` holds an alias and a nested
+        /// class but no supertype clause (no hierarchy input).
+        fn scenario() -> Scenario {
+            let file_a = ProjectFile::new(std::env::temp_dir(), "src/main/scala/bulk/A.scala");
+            let file_b = ProjectFile::new(std::env::temp_dir(), "src/main/scala/bulk/B.scala");
+            let base = unit(
+                file_a.clone(),
+                CodeUnitType::Class,
+                "bulk",
+                "Base",
+                None,
+                false,
+            );
+            let child = unit(
+                file_a.clone(),
+                CodeUnitType::Class,
+                "bulk",
+                "Child",
+                None,
+                false,
+            );
+            let parent = unit(
+                file_b.clone(),
+                CodeUnitType::Class,
+                "bulk",
+                "Parent",
+                None,
+                false,
+            );
+            let inner = unit(
+                file_b.clone(),
+                CodeUnitType::Class,
+                "bulk",
+                "Parent.Inner",
+                None,
+                false,
+            );
+            let alias = unit(
+                file_b.clone(),
+                CodeUnitType::Class,
+                "bulk",
+                "Money",
+                None,
+                false,
+            );
+            let mut facts_a = empty_facts("bulk");
+            facts_a.scala_traits.insert(base.clone());
+            facts_a
+                .supertype_lookup_paths
+                .insert(child.clone(), vec![r#"{"segments":["Base"]}"#.to_string()]);
+            facts_a.declarations.insert(base.clone());
+            facts_a.declarations.insert(child.clone());
+            let mut facts_b = empty_facts("bulk");
+            facts_b.children.insert(parent.clone(), vec![inner.clone()]);
+            facts_b.type_aliases.insert(alias.clone());
+            facts_b.ranges.insert(
+                inner.clone(),
+                vec![Range {
+                    start_byte: 7,
+                    end_byte: 12,
+                    start_line: 2,
+                    end_line: 2,
+                }],
+            );
+            let facts = HashMap::from_iter([(file_a.clone(), facts_a), (file_b.clone(), facts_b)]);
+            Scenario {
+                file_a,
+                file_b,
+                facts,
+                base,
+                child,
+                alias,
+                parent,
+                inner,
+            }
+        }
+
+        fn stub_index(scenario: &Scenario) -> Arc<dyn ScalaDefinitionIndex> {
+            Arc::new(StubDefinitionIndex {
+                units: vec![
+                    scenario.base.clone(),
+                    scenario.child.clone(),
+                    scenario.alias.clone(),
+                    scenario.parent.clone(),
+                    scenario.inner.clone(),
+                ],
+            })
+        }
+
+        /// The sweep seed and the eager seed derive identical type-namespace
+        /// structures from the same facts, and the targeted seed keeps
+        /// hierarchy inputs only for the file that spells a supertype.
+        #[test]
+        fn targeted_sweep_derives_the_eager_seed_structures() {
+            let scenario = scenario();
+            let eager = ProjectTypes::seed(Arc::new(scenario.facts.clone()));
+            let mut sweep = ScalaProjectTypesSweep::default();
+            for (file, facts) in scenario.facts.clone() {
+                sweep.fold_file(file, facts);
+            }
+            let provider = Arc::new(StubFactsProvider {
+                facts: HashMap::default(),
+                prefetched: Mutex::new(Vec::new()),
+            });
+            let targeted = sweep.into_seed(provider);
+
+            assert_eq!(eager.type_aliases, targeted.type_aliases);
+            assert_eq!(
+                eager.structural_parent_by_unit,
+                targeted.structural_parent_by_unit,
+            );
+            assert_eq!(eager.scala_trait_fqns, targeted.scala_trait_fqns);
+            assert!(targeted.type_aliases.contains(&scenario.alias));
+            assert_eq!(
+                targeted.structural_parent_by_unit.get(&scenario.inner),
+                Some(&scenario.parent),
+            );
+            assert!(targeted.scala_trait_fqns.contains("bulk.Base"));
+            match &targeted.facts {
+                ScalaSeedFileFacts::Targeted {
+                    hierarchy_inputs, ..
+                } => {
+                    let inputs = hierarchy_inputs
+                        .as_ref()
+                        .expect("an unresolved targeted seed carries hierarchy inputs");
+                    assert!(inputs.contains_key(&scenario.file_a));
+                    assert!(!inputs.contains_key(&scenario.file_b));
+                }
+                ScalaSeedFileFacts::Eager(_) => panic!("the sweep builds a targeted seed"),
+            }
+        }
+
+        /// Both seed shapes resolve the same direct hierarchy through the
+        /// same index, and the resolved targeted seed drops the hierarchy
+        /// inputs while keeping the lazy per-file facts source.
+        #[test]
+        fn targeted_and_eager_seeds_resolve_the_same_hierarchy() {
+            let scenario = scenario();
+            let index = stub_index(&scenario);
+            let facts: Arc<dyn ScalaCallableFactsIndex> = Arc::new(StubCallableFacts);
+
+            let eager_types = ProjectTypes::from_seed(
+                index.clone(),
+                facts.clone(),
+                ProjectTypes::seed(Arc::new(scenario.facts.clone())),
+            );
+            let mut sweep = ScalaProjectTypesSweep::default();
+            for (file, file_facts) in scenario.facts.clone() {
+                sweep.fold_file(file, file_facts);
+            }
+            let provider = Arc::new(StubFactsProvider {
+                facts: HashMap::from_iter([(
+                    scenario.file_b.clone(),
+                    Arc::new(scenario.facts[&scenario.file_b].clone()),
+                )]),
+                prefetched: Mutex::new(Vec::new()),
+            });
+            let targeted_types = ProjectTypes::from_seed(index, facts, sweep.into_seed(provider));
+
+            assert_eq!(
+                eager_types.exact_direct_ancestors(&scenario.child),
+                vec![scenario.base.clone()],
+            );
+            assert_eq!(
+                targeted_types.exact_direct_ancestors(&scenario.child),
+                vec![scenario.base.clone()],
+            );
+            assert_eq!(
+                eager_types.exact_direct_ancestors_snapshot(),
+                targeted_types.exact_direct_ancestors_snapshot(),
+            );
+
+            // The resolved seed drops the hierarchy inputs and keeps the lazy
+            // facts source: file_b's ranges come from the provider, and a file
+            // the provider does not serve answers None, exactly like an absent
+            // key in the eager map.
+            let resolved = targeted_types.resolved_seed();
+            match &resolved.facts {
+                ScalaSeedFileFacts::Targeted {
+                    hierarchy_inputs, ..
+                } => assert!(hierarchy_inputs.is_none()),
+                ScalaSeedFileFacts::Eager(_) => panic!("the targeted seed stays targeted"),
+            }
+            let rebuilt = ProjectTypes::from_seed(
+                stub_index(&scenario),
+                Arc::new(StubCallableFacts),
+                resolved,
+            );
+            let served = rebuilt
+                .bulk_file_state(&scenario.file_b)
+                .expect("the provider serves file_b");
+            assert_eq!(
+                served.ranges[&scenario.inner]
+                    .iter()
+                    .map(|range| range.start_byte)
+                    .collect::<Vec<_>>(),
+                vec![7],
+            );
+            assert!(rebuilt.bulk_file_state(&scenario.file_a).is_none());
+        }
+
+        /// Prefetch reaches the lazy provider on a targeted seed and is a
+        /// no-op on an eager seed, which already holds every file.
+        #[test]
+        fn prefetch_file_facts_warms_only_the_targeted_provider() {
+            let scenario = scenario();
+            let provider = Arc::new(StubFactsProvider {
+                facts: HashMap::default(),
+                prefetched: Mutex::new(Vec::new()),
+            });
+            let mut sweep = ScalaProjectTypesSweep::default();
+            for (file, file_facts) in scenario.facts.clone() {
+                sweep.fold_file(file, file_facts);
+            }
+            let targeted = sweep.into_seed(provider.clone());
+            targeted.prefetch_file_facts(std::slice::from_ref(&scenario.file_b));
+            assert_eq!(
+                provider
+                    .prefetched
+                    .lock()
+                    .expect("stub prefetch log poisoned")
+                    .as_slice(),
+                std::slice::from_ref(&scenario.file_b),
+            );
+
+            let eager = ProjectTypes::seed(Arc::new(scenario.facts));
+            eager.prefetch_file_facts(std::slice::from_ref(&scenario.file_a));
+            assert_eq!(
+                provider
+                    .prefetched
+                    .lock()
+                    .expect("stub prefetch log poisoned")
+                    .len(),
+                1,
+                "an eager seed must not touch the provider",
+            );
+        }
     }
 }

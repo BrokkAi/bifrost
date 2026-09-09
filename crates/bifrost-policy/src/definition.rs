@@ -889,6 +889,10 @@ impl DeclarationStateAssert {
 /// join is an equality on the captured facts-arena node's content-scoped AST
 /// id, so a capture placed on the enclosing declaration addresses a different
 /// node and correctly joins nothing.
+///
+/// Execution lowers this authoring record to a relational join and count within
+/// its existing subject-file partition. The authored record remains the source
+/// of policy hashes and occurrence finding presentation.
 #[derive(Debug, Clone)]
 pub struct OccurrenceAssert {
     pub id: PolicyAssertId,

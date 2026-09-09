@@ -33,10 +33,12 @@ pub use backward_client::{
     BackwardValueFlowResult, BackwardValueFlowSinkOutcome, BackwardValueFlowSolveError,
     solve_value_flow_backward_with_snapshot,
 };
-pub(crate) use client::kills_target as rule_kills_target;
 pub use client::{
     ValueFlowFact, ValueFlowProblem, ValueFlowSolveError, ValueFlowUncertainty,
     solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
+};
+pub(crate) use client::{
+    invalidates_source as rule_invalidates_source, kills_target as rule_kills_target,
 };
 pub(crate) use client::{
     solve_value_flow_entry_with_reusable_summaries, solve_value_flow_with_reusable_summaries,
@@ -55,7 +57,7 @@ pub use model::{
 };
 pub use plan::{
     AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowEdgeKillSpec, ValueFlowIncompleteCause,
-    ValueFlowInput, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
+    ValueFlowInput, ValueFlowLocalRuleSpec, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits,
     ValueFlowSummaryLocationBinding,
 };
 pub(crate) use plan::{ValueFlowCarrierSummaryIdentity, ValueFlowSourceBehaviorIdentity};

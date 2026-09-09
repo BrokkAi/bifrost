@@ -23,6 +23,7 @@ use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -220,7 +221,17 @@ static GO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
 /// check on the field relationship means a declaration, keyed literal, label,
 /// or ordinary identifier with the same spelling cannot be mistaken for a
 /// member occurrence.
-fn go_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+/// Classify one identifier's occurrence role.
+///
+/// Takes the walk's parent index rather than calling `Node::parent`: this runs
+/// for every identifier fact in the file, and tree-sitter recovers a parent by
+/// re-descending from the root, so asking directly is quadratic in file size.
+/// On goqu's vendored 248k-line `sqlite3-binding.c` that was 97% of process CPU
+/// and timed out 100 probes at the 600s budget.
+fn go_occurrence_role<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Option<OccurrenceRole> {
     if !matches!(
         node.kind(),
         "identifier" | "field_identifier" | "package_identifier" | "type_identifier"
@@ -228,7 +239,7 @@ fn go_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         return None;
     }
 
-    let parent = node.parent()?;
+    let parent = parents.parent(node)?;
     (parent.kind() == "selector_expression" && field_name_in_parent(parent, node) == Some("field"))
         .then_some(OccurrenceRole::MemberPosition)
 }
@@ -280,7 +291,7 @@ impl StructuralSpec for GoStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
-        if let Some(role) = go_occurrence_role(node) {
+        if let Some(role) = go_occurrence_role(node, sink.parents()) {
             sink.occurrence_role(node, role);
         }
         match kind {
@@ -400,6 +411,10 @@ mod structural_spec_tests {
             }
         }
 
+        // Same index the extraction driver builds; the classifier must answer
+        // exactly what `Node::parent` answered before it was threaded through.
+        let parents = ParentIndex::new(tree.root_node());
+
         assert_eq!(selectors.len(), 1, "fixture should contain one selector");
         let selector = selectors[0];
         let member = selector
@@ -409,10 +424,10 @@ mod structural_spec_tests {
             .child_by_field_name("operand")
             .expect("selector receiver");
         assert_eq!(
-            go_occurrence_role(member),
+            go_occurrence_role(member, &parents),
             Some(OccurrenceRole::MemberPosition)
         );
-        assert_eq!(go_occurrence_role(receiver), None);
+        assert_eq!(go_occurrence_role(receiver, &parents), None);
 
         let keyed_member = identifiers
             .iter()
@@ -426,7 +441,7 @@ mod structural_spec_tests {
                 })
             })
             .expect("keyed literal member name");
-        assert_eq!(go_occurrence_role(keyed_member), None);
+        assert_eq!(go_occurrence_role(keyed_member, &parents), None);
 
         for identifier in identifiers {
             let parent = identifier.parent();
@@ -436,7 +451,7 @@ mod structural_spec_tests {
             });
             if !is_selector_member {
                 assert_eq!(
-                    go_occurrence_role(identifier),
+                    go_occurrence_role(identifier, &parents),
                     None,
                     "non-selector identifier at {} must not be classified",
                     identifier.start_byte()

@@ -11,6 +11,7 @@
 //! they supply seeds and member lookup only, never a solver.
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -61,7 +62,7 @@ impl ClassIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnknownReason {
     RootParameter,
     SelfReceiver,
@@ -81,6 +82,7 @@ pub enum UnknownReason {
     /// summary could not classify, or a write/hierarchy boundary prevents the
     /// summary from proving it observed the whole slot.
     FieldSlotIncomplete,
+    DynamicFieldWrite,
     /// The dataflow solver stopped before a fixed point
     /// (`SolverTermination::ExceededBudget`): any unreached sink may have
     /// been reached with more solver work.
@@ -100,10 +102,25 @@ pub enum UnknownReason {
     /// The receiver is a real scalar value, but the class-set domain does not
     /// model a nominal member-bearing class for it.
     ScalarReceiver,
+    /// Class creation can install members the declaration does not show: a
+    /// metaclass writes them, a class-header keyword configures the same
+    /// machinery, or a decorator returns a different class. The declared
+    /// hierarchy therefore does not bound the class's members. A receiver that
+    /// is itself a class object carries the same remainder: its members are
+    /// the attributes of whatever class it is.
+    ClassCreation,
+    /// A language guard was recognized structurally, but its class predicate
+    /// is not modeled by the adapter. The class name identifies the predicate
+    /// that remained unresolved.
+    UnmodeledGuard {
+        class: Box<str>,
+    },
 }
 
 impl UnknownReason {
-    pub const fn label(self) -> &'static str {
+    /// Stable reason family label. Named reasons intentionally keep the same
+    /// family label; use [`Display`](fmt::Display) when the payload is needed.
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::RootParameter => "root_parameter",
             Self::SelfReceiver => "self_receiver",
@@ -120,11 +137,61 @@ impl UnknownReason {
             Self::PackIncomplete => "pack_incomplete",
             Self::UncertainFlow => "uncertain_flow",
             Self::FieldSlotIncomplete => "field_slot_incomplete",
+            Self::DynamicFieldWrite => "dynamic_field_write",
             Self::SolverBudget => "solver_budget",
             Self::SemanticBudget => "semantic_budget",
             Self::IncompleteRoot => "incomplete_root",
             Self::OpenTypeBound => "open_type_bound",
             Self::ScalarReceiver => "scalar_receiver",
+            Self::ClassCreation => "class_creation",
+            Self::UnmodeledGuard { .. } => "unmodeled_guard",
+        }
+    }
+
+    /// Parse a persisted or diagnostic reason label, including the payload of
+    /// a named unmodeled guard. This accepts only the structured reason
+    /// format; it does not interpret source text.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "root_parameter" => Self::RootParameter,
+            "self_receiver" => Self::SelfReceiver,
+            "variadic_parameter" => Self::VariadicParameter,
+            "unresolved_call" => Self::UnresolvedCall,
+            "truncated" => Self::Truncated,
+            "unmodeled_load" => Self::UnmodeledLoad,
+            "await" => Self::Await,
+            "capture" => Self::Capture,
+            "ambiguous_callee" => Self::AmbiguousCallee,
+            "external_not_modeled" => Self::ExternalNotModeled,
+            "unresolved_base" => Self::UnresolvedBase,
+            "dynamic_attributes" => Self::DynamicAttributes,
+            "pack_incomplete" => Self::PackIncomplete,
+            "uncertain_flow" => Self::UncertainFlow,
+            "field_slot_incomplete" => Self::FieldSlotIncomplete,
+            "dynamic_field_write" => Self::DynamicFieldWrite,
+            "solver_budget" => Self::SolverBudget,
+            "semantic_budget" => Self::SemanticBudget,
+            "incomplete_root" => Self::IncompleteRoot,
+            "open_type_bound" => Self::OpenTypeBound,
+            "scalar_receiver" => Self::ScalarReceiver,
+            "class_creation" => Self::ClassCreation,
+            label => Self::UnmodeledGuard {
+                class: label
+                    .strip_prefix("unmodeled_guard:")
+                    .filter(|class| !class.is_empty())?
+                    .into(),
+            },
+        })
+    }
+}
+
+impl fmt::Display for UnknownReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnmodeledGuard { class } => {
+                write!(formatter, "{}:{class}", self.label())
+            }
+            _ => formatter.write_str(self.label()),
         }
     }
 }
@@ -389,14 +456,14 @@ pub fn validate_prepared_syntax_for_procedure(
 
 /// Where one class-carrying source was seeded, retained for findings,
 /// witnesses, and receiver-driven dispatch hints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSite {
     pub file: ProjectFile,
     pub span: SourceSpan,
     pub kind: SourceSiteKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceSiteKind {
     ConstructorCall,
     Literal,
@@ -787,10 +854,16 @@ fn push_member_declaration(digest: &mut LengthDelimitedDigest, declaration: &Mem
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NarrowingVerdict {
     Keep,
     Drop,
+    /// The predicate result is unknown for this candidate. The candidate is
+    /// retained on both edges and the caller may attach the reason only to
+    /// the true edge's result.
+    Incomplete(UnknownReason),
+    /// A neutral, unmodeled predicate result. Keep the candidate on both
+    /// edges without adding an incompleteness reason.
     Unknown,
 }
 
@@ -829,12 +902,15 @@ impl ClassHierarchy {
 }
 
 /// A structured field mutation that does not appear as a direct Field store
-/// in semantic IR. `Member` poisons only that spelling; `Any` poisons every
-/// class-keyed slot.
+/// in semantic IR. Named writes keep that spelling open. An arbitrary name
+/// retains its receiver and write site for the flow engine to scope its effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicFieldWrite {
     Member(Box<str>),
-    Any,
+    Any {
+        receiver: Option<ValueId>,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,7 +1018,35 @@ pub trait TypeFlowAdapter: Send + Sync {
         ClassHierarchy::unknown()
     }
 
+    /// Whether truth testing an instance can execute user-defined effects.
+    /// A true answer permits a field guard to constrain a subsequent reread.
+    fn truthiness_is_pure(&self, _workspace: &WorkspaceAnalyzer, _class: &ClassIdentity) -> bool {
+        false
+    }
+
+    /// Whether loading this member can execute user-defined effects.
+    fn member_access_is_pure(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _class: &ClassIdentity,
+        _member: &str,
+    ) -> bool {
+        false
+    }
+
     fn field_slot_is_complete(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _class: &ClassIdentity,
+        _member: &str,
+    ) -> bool {
+        false
+    }
+
+    /// Whether repeated accesses to this instance field use ordinary storage,
+    /// rather than a descriptor or dynamic lookup. This proves access-path
+    /// stability between effects, not global heap singleton ownership.
+    fn field_access_is_plain(
         &self,
         _workspace: &WorkspaceAnalyzer,
         _class: &ClassIdentity,
@@ -961,7 +1065,9 @@ pub trait TypeFlowAdapter: Send + Sync {
 
     /// Classify each candidate on the guard's true arm, in input order.
     /// Resolve guard operands once for the batch. The false arm reverses
-    /// Keep and Drop; Unknown must remain on both arms. Member lookup is
+    /// Keep and Drop; Unknown remains on both arms without a reason, while
+    /// Incomplete remains on both arms and contributes its reason on the true
+    /// edge. Member lookup is
     /// supplied by the flow engine so declaration-only absence can consult
     /// the same workspace store survey as final member interpretation.
     fn narrowing_verdicts(
@@ -973,6 +1079,23 @@ pub trait TypeFlowAdapter: Send + Sync {
         _member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
     ) -> Vec<NarrowingVerdict> {
         vec![NarrowingVerdict::Unknown; atoms.len()]
+    }
+
+    /// Derive a guard from an exactly resolved workspace predicate call.
+    /// Return the constrained actual argument and one verdict per candidate,
+    /// with the same true/false-arm contract as `narrowing_verdicts`.
+    /// Implementations must validate the current body and callable binding;
+    /// an opaque or effectful body supplies no constraint. These query-local
+    /// facts become ordinary edge kills, whose behavior is summary-keyed.
+    fn call_guard_narrowing(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _guard: &GuardFact,
+        _atoms: &[&ClassIdentity],
+        _member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
+    ) -> Option<(ValueId, Vec<NarrowingVerdict>)> {
+        None
     }
 
     /// Return only contracts whose target, actual/formal binding, and class
@@ -1007,6 +1130,34 @@ pub fn type_flow_adapter(language: Language) -> Option<&'static dyn TypeFlowAdap
 #[cfg(test)]
 mod tests {
     use super::{ClassAtom, ClassIdentity, ClassSeed, ExternalMemberDeclaration, UnknownReason};
+
+    #[test]
+    fn unknown_reason_labels_and_display_round_trip_named_guards() {
+        let first = UnknownReason::UnmodeledGuard {
+            class: "pkg.First".into(),
+        };
+        let second = UnknownReason::UnmodeledGuard {
+            class: "pkg.Second".into(),
+        };
+
+        assert_eq!(
+            UnknownReason::from_label(&UnknownReason::DynamicFieldWrite.to_string()),
+            Some(UnknownReason::DynamicFieldWrite)
+        );
+        assert_eq!(first.label(), "unmodeled_guard");
+        assert_eq!(first.to_string(), "unmodeled_guard:pkg.First");
+        assert_eq!(
+            UnknownReason::from_label(&first.to_string()),
+            Some(first.clone())
+        );
+        assert_eq!(UnknownReason::from_label(&second.to_string()), Some(second));
+        assert_ne!(
+            first,
+            UnknownReason::UnmodeledGuard {
+                class: "pkg.Second".into(),
+            }
+        );
+    }
 
     #[test]
     fn open_class_seed_expands_to_class_then_typed_unknown() {

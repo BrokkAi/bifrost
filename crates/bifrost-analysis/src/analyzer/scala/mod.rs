@@ -71,7 +71,7 @@ use brokk_bifrost_core::analyzer::{
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
@@ -80,10 +80,10 @@ pub(crate) use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmProofGap, model_disposition_over_tiers,
     prove_against_active_model,
 };
-use brokk_bifrost_jvm::scala::graph::inverted::ScalaProjectTypesSeed;
+use brokk_bifrost_jvm::scala::graph::inverted::{ScalaProjectTypesSeed, ScalaProjectTypesSweep};
 pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
-    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaForwardOwnerFacts,
-    ScalaNameProof, ScalaSource,
+    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaFileFactsProvider,
+    ScalaForwardOwnerFacts, ScalaNameProof, ScalaSource,
 };
 pub(crate) use brokk_bifrost_jvm::scala::imports::{
     scala_enclosing_template_owner_fq_names, scala_lexical_scope_path_at,
@@ -565,12 +565,118 @@ pub(crate) fn build_scala_project_types(
     ScalaProjectTypes::from_parts(index, facts, file_states)
 }
 
-fn scala_project_types_seed(file_states: HashMap<ProjectFile, FileState>) -> ScalaProjectTypesSeed {
-    let file_states = file_states
-        .into_iter()
-        .map(|(file, state)| (file, scala_file_facts(state)))
-        .collect();
-    ScalaProjectTypes::seed(Arc::new(file_states))
+/// One file's lazily hydrated facts cell in [`ScalaQueryFileFactsProvider`].
+type ScalaQueryFileFactsCell = Arc<OnceLock<Option<Arc<ScalaFileFacts>>>>;
+
+/// The per-file facts source a targeted Scala usage query resolves through
+/// (#3142).
+///
+/// One `OnceLock` cell per touched file pins a single hydration, exactly as
+/// the eager whole-workspace read hydrated each file once; the cells outlive
+/// the frontier's provisional rebuilds because a file's persisted facts are
+/// not a provisional relational answer. A file the store cannot hydrate
+/// caches `None`, the same answer its absence from the eager map gave.
+struct ScalaQueryFileFactsProvider {
+    inner: TreeSitterAnalyzer<ScalaAdapter>,
+    cells: Mutex<HashMap<ProjectFile, ScalaQueryFileFactsCell>>,
+    touched: Arc<AtomicUsize>,
+}
+
+impl ScalaQueryFileFactsProvider {
+    /// The file's cell, creating it empty on first touch. Cell creation is
+    /// the query's touched-file count: every created cell hydrates once and
+    /// stays for the rest of the query.
+    fn cell_for(
+        &self,
+        cells: &mut HashMap<ProjectFile, ScalaQueryFileFactsCell>,
+        file: &ProjectFile,
+    ) -> ScalaQueryFileFactsCell {
+        match cells.entry(file.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.touched.fetch_add(1, Ordering::Relaxed);
+                entry.insert(Arc::new(OnceLock::new())).clone()
+            }
+        }
+    }
+}
+
+impl ScalaFileFactsProvider for ScalaQueryFileFactsProvider {
+    fn file_facts(&self, file: &ProjectFile) -> Option<Arc<ScalaFileFacts>> {
+        let cell = {
+            let mut guard = self
+                .cells
+                .lock()
+                .expect("Scala query file-facts cache poisoned");
+            self.cell_for(&mut guard, file)
+        };
+        cell.get_or_init(|| {
+            self.inner
+                .bulk_file_states([file.clone()], BulkFileStateSource::Omit)
+                .remove(file)
+                .map(|state| Arc::new(scala_file_facts(state)))
+        })
+        .clone()
+    }
+
+    fn prefetch_file_facts(&self, files: &[ProjectFile]) {
+        let pending: Vec<(ProjectFile, ScalaQueryFileFactsCell)> = {
+            let mut guard = self
+                .cells
+                .lock()
+                .expect("Scala query file-facts cache poisoned");
+            files
+                .iter()
+                .map(|file| (file.clone(), self.cell_for(&mut guard, file)))
+                .filter(|(_, cell)| cell.get().is_none())
+                .collect()
+        };
+        for chunk in pending.chunks(SCALA_QUERY_SWEEP_CHUNK_FILES) {
+            let mut states = self.inner.bulk_file_states(
+                chunk.iter().map(|(file, _)| file.clone()),
+                BulkFileStateSource::Omit,
+            );
+            for (file, cell) in chunk {
+                cell.get_or_init(|| {
+                    states
+                        .remove(file)
+                        .map(|state| Arc::new(scala_file_facts(state)))
+                });
+            }
+        }
+    }
+}
+
+/// The files one sweep batch hydrates at a time.
+///
+/// The sweep keeps only the seed's derived structures and the lean hierarchy
+/// inputs, so this bounds the live fat per-file records during the
+/// whole-workspace pass to one chunk instead of the workspace (#3142).
+const SCALA_QUERY_SWEEP_CHUNK_FILES: usize = 64;
+
+/// The targeted usage query's seed: the workspace-wide type-namespace
+/// structures derived in a chunked sweep, plus a lazily rehydrated per-file
+/// facts source for the files resolution actually touches. Unlike
+/// [`build_scala_project_types`], no whole-workspace map of thirteen-field
+/// per-file records is materialized or retained.
+fn scala_project_types_query_seed(
+    inner: &TreeSitterAnalyzer<ScalaAdapter>,
+    touched: Arc<AtomicUsize>,
+    files: &[ProjectFile],
+) -> ScalaProjectTypesSeed {
+    let provider = Arc::new(ScalaQueryFileFactsProvider {
+        inner: inner.clone(),
+        cells: Mutex::new(HashMap::default()),
+        touched,
+    });
+    let mut sweep = ScalaProjectTypesSweep::default();
+    for chunk in files.chunks(SCALA_QUERY_SWEEP_CHUNK_FILES) {
+        let states = inner.bulk_file_states(chunk.iter().cloned(), BulkFileStateSource::Omit);
+        for (file, state) in states {
+            sweep.fold_file(file, scala_file_facts(state));
+        }
+    }
+    sweep.into_seed(provider)
 }
 
 fn build_scala_project_types_from_frontier(
@@ -607,6 +713,9 @@ pub struct ScalaAnalyzer {
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
     pub(crate) dead_code_usage_edges: UsageEdgesCache,
     project_types_build_count: Arc<AtomicUsize>,
+    /// Files whose full per-file facts the current analyzer generation's
+    /// targeted usage queries materialized through the lazy provider (#3142).
+    scala_query_file_facts_touched: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     scala_query_parse_count: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -842,6 +951,7 @@ impl ScalaAnalyzer {
         clone.dead_code_usage_edges =
             build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
+        clone.scala_query_file_facts_touched = Arc::new(AtomicUsize::new(0));
         #[cfg(any(test, feature = "test-support"))]
         {
             clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
@@ -889,6 +999,7 @@ impl ScalaAnalyzer {
             project_types: Arc::new(OnceLock::new()),
             dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
+            scala_query_file_facts_touched: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -1121,11 +1232,12 @@ impl ScalaAnalyzer {
         build_scala_project_types(self.inner.clone(), file_states)
     }
 
-    pub(crate) fn project_types_seed_from_file_states(
-        &self,
-        file_states: HashMap<ProjectFile, FileState>,
-    ) -> ScalaProjectTypesSeed {
-        scala_project_types_seed(file_states)
+    pub(crate) fn project_types_query_seed(&self, files: &[ProjectFile]) -> ScalaProjectTypesSeed {
+        scala_project_types_query_seed(
+            &self.inner,
+            Arc::clone(&self.scala_query_file_facts_touched),
+            files,
+        )
     }
 
     pub(crate) fn build_project_types_from_frontier(
@@ -1980,6 +2092,15 @@ impl crate::analyzer::AnalyzerTestHooks for ScalaAnalyzer {
 
     fn scala_query_walk_count_for_test(&self) -> usize {
         self.scala_query_walk_count.load(Ordering::Relaxed)
+    }
+
+    fn reset_scala_query_file_facts_touched_for_test(&self) {
+        self.scala_query_file_facts_touched
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn scala_query_file_facts_touched_for_test(&self) -> usize {
+        self.scala_query_file_facts_touched.load(Ordering::Relaxed)
     }
 }
 

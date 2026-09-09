@@ -284,6 +284,10 @@ impl JsTsMemoSource for TypescriptAnalyzer {
     fn memo_caches(&self) -> &JsTsMemoCaches {
         &self.memo_caches
     }
+
+    fn analyzer(&self) -> &dyn crate::analyzer::IAnalyzer {
+        &self.inner
+    }
 }
 
 crate::analyzer::impl_forward_query_provider!(TypescriptAnalyzer);

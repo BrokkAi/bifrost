@@ -690,6 +690,7 @@ fn callable_shape<'tree>(
             },
             dispatch_extensibility,
             call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
         },
     ))
 }

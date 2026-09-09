@@ -267,6 +267,7 @@ fn raw_taint_projection(
         analysis_finding_id: AnalysisFindingId::try_new("test", sink_key).unwrap(),
         anchor,
         sink: AnalysisEventRef::try_new("test", sink_key).unwrap(),
+        reached_labels: facts.reached_source_labels.clone(),
         origins,
         origins_truncated,
         witness_refs: Vec::new(),

@@ -757,11 +757,23 @@ pub(super) fn typescript_epoch_before_callable_modifier_metadata() -> String {
 // now retain every physical navigation range so class-body lookup can select
 // the binding active at the reference site.
 // Salt bumped (#3075): static setup.py packaging evidence establishes import roots.
+// Salt bumped again: a subscripted base (`Base[T]`) now records its generic
+// origin and an unnameable base (a call, an unpacked list) records its source
+// spelling. Persisted rows written before this omitted both, so a cached class
+// looks like it has fewer bases than it declares.
+// Salt bumped again: an instance attribute assigned through a bracketed
+// unpacking target (`(self.a, self.b) = ...`) is now collected. Cached rows
+// omitted every such attribute, so a class looks like it declares fewer.
+// Salt bumped again: a chained assignment (`encrypt = decrypt = process`) now
+// declares every target it binds. Cached rows carry only the outermost one.
+// Salt bumped (#3123): class-qualified semantic calls retain descriptor receiver contracts.
+// Salt bumped (#3124): type-flow class identity resolves proven builtin names.
+// Salt bumped (#3131): unmodeled instance guards retain named incomplete evidence.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08;python-setuptools-import-roots-2026-08;python-class-rebinding-navigation-ranges-2026-08;python-setup-py-import-roots-2026-09;python-subscripted-and-unnameable-bases-2026-09;python-bracketed-unpacking-self-attributes-2026-09;python-chained-assignment-targets-2026-09;python-class-qualified-call-binding-2026-09;python-type-flow-builtin-class-identities-2026-09;python-type-flow-unmodeled-guards-2026-09;python-scoped-dynamic-writes-3129"
 );
 // Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
 // this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the

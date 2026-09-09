@@ -255,17 +255,22 @@ impl<'a> UnitReuse<'a> {
         }
     }
 
-    /// Publish one recomputed unit under the reads that produced it.
+    /// Stage one recomputed unit under the reads that produced it.
+    ///
+    /// The incremental context commits staged products only when the caller
+    /// records the complete unit-key set for a successful sliced policy. A
+    /// later widening therefore drops this product instead of exposing a
+    /// partial unit set through the shared store.
     pub(crate) fn publish(
         &self,
         key: PolicyUnitKey,
         product: PolicyUnitProduct,
         reads: Vec<ReadKey>,
     ) {
-        self.incremental
-            .store()
-            .borrow_mut()
-            .publish(PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive));
+        self.incremental.stage_unit(
+            self.policy_id.clone(),
+            PolicyUnit::new(key, product, reads, BudgetMode::Exhaustive),
+        );
     }
 }
 
@@ -462,7 +467,7 @@ pub(crate) fn sliced_query_units(
         products.push(rows);
     }
 
-    let merged = merge_unit_rows(products);
+    let merged = merge_unit_rows(query, products);
     if merged
         .reached_limit(&execution.limits, query.limit)
         .is_some()

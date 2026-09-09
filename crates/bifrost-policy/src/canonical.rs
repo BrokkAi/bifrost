@@ -806,6 +806,17 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                     flow_kill_to_json,
                 ),
             );
+            if !spec.transforms.entries.is_empty() {
+                insert(
+                    &mut object,
+                    "transforms",
+                    sorted_typed_values(
+                        spec.transforms.entries.iter(),
+                        |left, right| left.id.cmp(&right.id),
+                        flow_transform_to_json,
+                    ),
+                );
+            }
             Value::Object(object)
         }
         PolicyAnalysis::Typestate { spec } => {
@@ -1841,6 +1852,15 @@ fn flow_kill_to_json(kill: &TaintSanitizerSpec) -> Value {
         "selector": selector_to_json(&kill.selector),
         "input": policy_port_to_json(&kill.input),
         "output": policy_port_to_json(&kill.output),
+    })
+}
+
+fn flow_transform_to_json(transform: &TaintTransformSpec) -> Value {
+    json!({
+        "id": transform.id.as_str(),
+        "selector": selector_to_json(&transform.selector),
+        "input": policy_port_to_json(&transform.input),
+        "output": policy_port_to_json(&transform.output),
     })
 }
 

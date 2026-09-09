@@ -9,9 +9,17 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 const COMPILATION_DATABASE_PATH: &str = "compile_commands.json";
+
+/// The maximum number of workspace-relative source paths retained in the
+/// compile-database coverage report. The count remains exact; the sample is
+/// intentionally bounded so a generated database cannot make discovery
+/// evidence unbounded.
+const MAX_MISSING_WORKSPACE_SOURCE_SAMPLE: usize = 32;
 
 /// Whether `file` is the workspace compilation database consumed by
 /// [`CppCompileContexts::load`].
@@ -82,14 +90,49 @@ pub enum CppExternalIncludeResolution {
     Declared { root: PathBuf, header: PathBuf },
 }
 
+/// Informational coverage from one compile database against the analyzer's
+/// C++ workspace listing.
+///
+/// A missing source is not a discovery failure. Build systems routinely leave
+/// generated translation units in `compile_commands.json` after a clean or
+/// partial checkout. This report is therefore kept separate from compile
+/// contexts and dependency-discovery completeness. The count is exact over
+/// distinct canonical workspace-relative paths; the sample is deterministic
+/// and bounded by [`MAX_MISSING_WORKSPACE_SOURCE_SAMPLE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CppCompileDatabaseCoverage {
+    missing_workspace_source_count: usize,
+    missing_workspace_source_sample: Vec<PathBuf>,
+}
+
+impl CppCompileDatabaseCoverage {
+    /// The exact number of distinct in-workspace compile-database source paths
+    /// absent from the supplied analyzer listing.
+    pub fn missing_workspace_source_count(&self) -> usize {
+        self.missing_workspace_source_count
+    }
+
+    /// A sorted, workspace-relative sample of missing source paths.
+    pub fn missing_workspace_source_sample(&self) -> &[PathBuf] {
+        &self.missing_workspace_source_sample
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CppCompileContexts {
     by_source: HashMap<PathBuf, Vec<CppCompileContext>>,
+    /// Every distinct source path named by an in-workspace compile-database
+    /// entry, including entries whose compiler arguments are malformed. The
+    /// source identity is retained independently of whether a context can be
+    /// used for include resolution so coverage can report stale generated
+    /// entries without turning them into diagnostics.
+    database_sources: HashSet<PathBuf>,
 }
 
 impl CppCompileContexts {
     pub fn load(project: &dyn Project) -> Self {
-        let database_path = project.root().join(COMPILATION_DATABASE_PATH);
+        let workspace_root = canonical_or_normalized_path(project.root());
+        let database_path = workspace_root.join(COMPILATION_DATABASE_PATH);
         let Ok(database) = std::fs::read_to_string(database_path) else {
             return Self::default();
         };
@@ -98,14 +141,17 @@ impl CppCompileContexts {
         };
 
         let mut by_source: HashMap<PathBuf, Vec<CppCompileContext>> = HashMap::default();
+        let mut database_sources = HashSet::default();
         for entry in entries {
-            let Some(source) = entry.source_path(project.root()) else {
+            let Some(source) = entry.source_path(&workspace_root) else {
                 continue;
             };
-            if !source.starts_with(project.root()) {
+            let source_identity = canonical_or_normalized_path(&source);
+            if source_identity.strip_prefix(&workspace_root).is_err() {
                 continue;
             }
-            let Some(context) = entry.compile_context(project.root()) else {
+            database_sources.insert(source_identity.clone());
+            let Some(context) = entry.compile_context(&workspace_root) else {
                 continue;
             };
             // A build that compiles one file in several configurations records
@@ -113,12 +159,56 @@ impl CppCompileContexts {
             // caller decide per name whether the configurations agree; dropping
             // them would make "compiled two ways" look like "never compiled".
             // Entries that parse to the same context are one configuration.
-            let candidates = by_source.entry(source).or_default();
+            let candidates = by_source.entry(source_identity).or_default();
             if !candidates.contains(&context) {
                 candidates.push(context);
             }
         }
-        Self { by_source }
+        Self {
+            by_source,
+            database_sources,
+        }
+    }
+
+    /// Compare compile-database source identities with the analyzer's exact
+    /// C++ workspace listing.
+    ///
+    /// The listing is supplied by the caller so discovery can preserve its
+    /// listing-driven scan and avoid a second workspace walk. Both sides are
+    /// compared as canonical [`PathBuf`] identities under `workspace_root`;
+    /// no source text, display path, or string-prefix identity participates.
+    /// Entries outside `workspace_root` are ordinary build inputs and are
+    /// silently excluded.
+    pub fn missing_workspace_sources<'a>(
+        &self,
+        workspace_root: &Path,
+        workspace_files: impl IntoIterator<Item = &'a ProjectFile>,
+    ) -> CppCompileDatabaseCoverage {
+        let workspace_root = canonical_or_normalized_path(workspace_root);
+        let listed_sources = workspace_files
+            .into_iter()
+            .map(|file| canonical_or_normalized_path(&file.abs_path()))
+            .collect::<HashSet<_>>();
+        let mut missing_count = 0usize;
+        let mut sample = BTreeSet::new();
+        for source in &self.database_sources {
+            let Some(relative) = (|| {
+                let relative = source.strip_prefix(&workspace_root).ok()?;
+                (!relative.as_os_str().is_empty() && !listed_sources.contains(source))
+                    .then(|| relative.to_path_buf().normalize())
+            })() else {
+                continue;
+            };
+            missing_count = missing_count.saturating_add(1);
+            sample.insert(relative);
+            if sample.len() > MAX_MISSING_WORKSPACE_SOURCE_SAMPLE {
+                sample.pop_last();
+            }
+        }
+        CppCompileDatabaseCoverage {
+            missing_workspace_source_count: missing_count,
+            missing_workspace_source_sample: sample.into_iter().collect(),
+        }
     }
 
     /// Every distinct compile configuration the database records for `file`,
@@ -129,7 +219,7 @@ impl CppCompileContexts {
     /// candidate agrees that it is.
     pub fn contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
         self.by_source
-            .get(&file.abs_path().normalize())
+            .get(&canonical_or_normalized_path(&file.abs_path()))
             .map_or(&[], Vec::as_slice)
     }
 
@@ -472,6 +562,34 @@ fn absolute_path(directory: &Path, path: &Path) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// Canonicalize an existing path, or canonicalize its nearest existing
+/// ancestor and append the missing tail. The latter is required for stale
+/// generated entries, whose source path is precisely the path that does not
+/// exist. Keeping the operation component-based also preserves platform
+/// prefixes and avoids string path identity.
+fn canonical_or_normalized_path(path: &Path) -> PathBuf {
+    let path = path.to_path_buf().normalize();
+    let mut missing_tail: Vec<OsString> = Vec::new();
+    let mut current = path.as_path();
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            let mut result = canonical.normalize();
+            for component in missing_tail.iter().rev() {
+                result.push(component);
+            }
+            return result.normalize();
+        }
+        let Some(name) = current.file_name() else {
+            return path;
+        };
+        missing_tail.push(name.to_owned());
+        let Some(parent) = current.parent() else {
+            return path;
+        };
+        current = parent;
+    }
+}
+
 fn macro_name(definition: &str) -> Option<String> {
     let end = definition.find('=').unwrap_or(definition.len());
     let name = &definition[..end];
@@ -481,9 +599,9 @@ fn macro_name(definition: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{CompiledLanguage, CppCompileContexts, CppExternalIncludeResolution};
-    use brokk_bifrost_core::analyzer::project::TestProject;
+    use brokk_bifrost_core::analyzer::project::{FilesystemProject, Project, TestProject};
     use brokk_bifrost_core::analyzer::{Language, ProjectFile};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Parses one argument vector into a compile context the same way
     /// [`super::CompilationDatabaseEntry::compile_context`] does, without a
@@ -626,6 +744,150 @@ mod tests {
         // Two entries that parse to the same flags are not a disagreement, so
         // the selection stays unambiguous.
         assert_eq!(1, contexts.contexts_for(&file).len());
+    }
+
+    #[test]
+    fn missing_workspace_sources_are_canonical_bounded_and_deterministic() {
+        let (_temp, project) = project_with_database(None);
+        let root = project.root_path().to_path_buf();
+        ProjectFile::new(root.clone(), "src/present.cpp")
+            .write("int present() { return 0; }")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "src/present.c")
+            .write("int present_c(void) { return 0; }")
+            .expect("present C source");
+        ProjectFile::new(root.clone(), "include/present.hin")
+            .write("int generated_declaration(void);")
+            .expect("present C header template");
+
+        let mut entries = vec![serde_json::json!({
+            "directory": ".",
+            "file": "src/./present.cpp",
+            "arguments": ["clang++", "-c", "src/present.cpp"]
+        })];
+        entries.push(serde_json::json!({
+            "directory": ".",
+            "file": "src/present.c",
+            "arguments": ["clang", "-c", "src/present.c"]
+        }));
+        entries.push(serde_json::json!({
+            "directory": ".",
+            "file": "include/present.hin",
+            "arguments": ["clang", "-x", "c-header", "include/present.hin"]
+        }));
+        entries.extend(
+            (0..(super::MAX_MISSING_WORKSPACE_SOURCE_SAMPLE + 3)).map(|index| {
+                serde_json::json!({
+                    "directory": ".",
+                    "file": format!("generated/./unit-{index:02}.cpp"),
+                    "arguments": ["clang++", "-c", format!("generated/unit-{index:02}.cpp")]
+                })
+            }),
+        );
+        // This duplicate resolves to the same canonical path and must not
+        // inflate the exact count or change the sample.
+        entries.push(serde_json::json!({
+            "directory": "generated",
+            "file": "../generated/unit-00.cpp",
+            "arguments": ["clang++", "-c", "../generated/unit-00.cpp"]
+        }));
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(serde_json::to_string(&entries).expect("database JSON"))
+            .expect("database");
+
+        let contexts = CppCompileContexts::load(&project);
+        let listed = project
+            .analyzable_files(Language::Cpp)
+            .expect("C++ listing");
+        let coverage = contexts.missing_workspace_sources(&root, &listed);
+
+        assert_eq!(
+            super::MAX_MISSING_WORKSPACE_SOURCE_SAMPLE + 3,
+            coverage.missing_workspace_source_count()
+        );
+        assert_eq!(
+            (0..super::MAX_MISSING_WORKSPACE_SOURCE_SAMPLE)
+                .map(|index| Path::new("generated").join(format!("unit-{index:02}.cpp")))
+                .collect::<Vec<_>>(),
+            coverage.missing_workspace_source_sample()
+        );
+        assert!(
+            !coverage
+                .missing_workspace_source_sample()
+                .contains(&PathBuf::from("src/present.cpp"))
+        );
+
+        let reversed = entries.into_iter().rev().collect::<Vec<_>>();
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(serde_json::to_string(&reversed).expect("reversed database JSON"))
+            .expect("reversed database");
+        let reversed_coverage =
+            CppCompileContexts::load(&project).missing_workspace_sources(&root, &listed);
+        assert_eq!(coverage, reversed_coverage);
+    }
+
+    #[test]
+    fn missing_workspace_sources_excludes_outside_root_and_ignored_files() {
+        let temp = tempfile::tempdir().expect("workspace root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let outside_source = outside
+            .path()
+            .canonicalize()
+            .expect("canonical outside root")
+            .join("outside.cpp")
+            .to_string_lossy()
+            .into_owned();
+        ProjectFile::new(root.clone(), "src/present.cpp")
+            .write("int present() { return 0; }")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "ignored.cpp")
+            .write("int ignored() { return 0; }")
+            .expect("ignored source");
+        ProjectFile::new(root.clone(), ".bifrostignore")
+            .write("ignored.cpp\n")
+            .expect("ignore file");
+        let database = serde_json::json!([
+            {
+                "directory": ".",
+                "file": "src/../src/present.cpp",
+                "arguments": ["clang++", "-c", "src/present.cpp"]
+            },
+            {
+                "directory": ".",
+                "file": "ignored.cpp",
+                "arguments": ["clang++", "-c", "ignored.cpp"]
+            },
+            {
+                "directory": ".",
+                "file": outside_source.clone(),
+                "arguments": ["clang++", "-c", outside_source]
+            }
+        ]);
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(database.to_string())
+            .expect("database");
+        let project = FilesystemProject::new(root.clone()).expect("filesystem project");
+        let listed = project
+            .analyzable_files(Language::Cpp)
+            .expect("C++ listing");
+        assert!(
+            listed
+                .iter()
+                .any(|file| file.rel_path() == Path::new("src/present.cpp"))
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|file| file.rel_path() == Path::new("ignored.cpp"))
+        );
+
+        let coverage = CppCompileContexts::load(&project).missing_workspace_sources(&root, &listed);
+        assert_eq!(1, coverage.missing_workspace_source_count());
+        assert_eq!(
+            &[PathBuf::from("ignored.cpp")],
+            coverage.missing_workspace_source_sample()
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::analyzer::semantic::SemanticBudgetDimension;
+use crate::query::PlanPartitioning;
 use std::path::Path;
 
 /// Which files a query's seed enumeration runs over.
@@ -29,6 +30,26 @@ use std::path::Path;
 pub struct CodeQueryExecutionScope<'a> {
     seed_files: Option<&'a [ProjectFile]>,
     workspace_files: Option<&'a [ProjectFile]>,
+    branch_path: &'a [usize],
+    /// Optional policy expansion selection. This is query-specific: existing
+    /// whole-workspace and per-seed execution scopes leave it unset.
+    source_selection: Option<CodeQuerySourceSelection<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CodeQuerySourceSelection<'a> {
+    suffix_steps: usize,
+    source_rows: &'a [DetailedCodeQueryEvidence],
+}
+
+impl<'a> CodeQuerySourceSelection<'a> {
+    pub(super) const fn suffix_steps(self) -> usize {
+        self.suffix_steps
+    }
+
+    pub(super) const fn source_rows(self) -> &'a [DetailedCodeQueryEvidence] {
+        self.source_rows
+    }
 }
 
 impl<'a> CodeQueryExecutionScope<'a> {
@@ -37,6 +58,8 @@ impl<'a> CodeQueryExecutionScope<'a> {
         Self {
             seed_files: None,
             workspace_files: None,
+            branch_path: &[],
+            source_selection: None,
         }
     }
 
@@ -49,6 +72,40 @@ impl<'a> CodeQueryExecutionScope<'a> {
         Self {
             seed_files: Some(seed_files),
             workspace_files: Some(workspace_files),
+            branch_path: &[],
+            source_selection: None,
+        }
+    }
+
+    /// Enumerate one seed file while retaining the authored union branch path.
+    pub(super) const fn for_seed_files_with_branch_path(
+        seed_files: &'a [ProjectFile],
+        workspace_files: &'a [ProjectFile],
+        branch_path: &'a [usize],
+    ) -> Self {
+        Self {
+            seed_files: Some(seed_files),
+            workspace_files: Some(workspace_files),
+            branch_path,
+            source_selection: None,
+        }
+    }
+
+    /// Select the exact rows produced by the source prefix before running the
+    /// appended expansion suffix. The caller must have already validated that
+    /// `suffix_steps` is the number of steps appended to that source prefix.
+    pub(super) const fn for_source_rows(
+        suffix_steps: usize,
+        source_rows: &'a [DetailedCodeQueryEvidence],
+    ) -> Self {
+        Self {
+            seed_files: None,
+            workspace_files: None,
+            branch_path: &[],
+            source_selection: Some(CodeQuerySourceSelection {
+                suffix_steps,
+                source_rows,
+            }),
         }
     }
 
@@ -60,6 +117,15 @@ impl<'a> CodeQueryExecutionScope<'a> {
     /// The whole-workspace enumeration, if the caller already computed it.
     pub(super) const fn workspace_files(self) -> Option<&'a [ProjectFile]> {
         self.workspace_files
+    }
+
+    /// The authored branch path for a narrowed union leaf.
+    pub(super) const fn branch_path(self) -> &'a [usize] {
+        self.branch_path
+    }
+
+    pub(super) const fn source_selection(self) -> Option<CodeQuerySourceSelection<'a>> {
+        self.source_selection
     }
 }
 
@@ -86,6 +152,16 @@ pub fn execute_code_query_unit(
     cancellation: Option<&CancellationToken>,
     scope: CodeQueryExecutionScope<'_>,
 ) -> UnitExecutionResult {
+    if PlanPartitioning::classify(&query.plan).is_seed_union()
+        && let Some(seed_files) = scope.seed_files()
+    {
+        assert_eq!(
+            seed_files.len(),
+            1,
+            "a seed-union unit must narrow exactly one seed file"
+        );
+        return execute_seed_union_unit(analyzer, workspace, query, limits, cancellation, scope);
+    }
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_unit(
         analyzer,
@@ -97,6 +173,83 @@ pub fn execute_code_query_unit(
         &mut row_keys,
     );
     project_unit_result(&detailed, row_keys)
+}
+
+/// Execute one eligible union unit leaf by leaf, preserving branch rows until
+/// the global unit merge. A leaf receives no result limit of its own: the
+/// query's limit is a cap on the union after all branches have been composed.
+fn execute_seed_union_unit(
+    analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    scope: CodeQueryExecutionScope<'_>,
+) -> UnitExecutionResult {
+    let leaves = PlanPartitioning::union_leaf_plans(&query.plan)
+        .expect("seed-union execution requires an eligible union plan");
+    let mut rows = Vec::new();
+    let mut work = CodeQueryExecutionWork::default();
+    let mut budgeted_work = CodeQueryBudgetedWork::default();
+    let mut diagnostics = Vec::new();
+    let mut truncated = false;
+
+    for (leaf, branch_path) in leaves {
+        let leaf_query = CodeQuery {
+            schema_version: query.schema_version,
+            plan: leaf.clone(),
+            // A branch cannot apply the union's global result cap. The
+            // physical pipeline cap still bounds intermediate output.
+            limit: usize::MAX,
+            result_detail: query.result_detail,
+            execution_mode: query.execution_mode,
+        };
+        let mut row_keys = Vec::new();
+        let leaf_scope = CodeQueryExecutionScope::for_seed_files_with_branch_path(
+            scope
+                .seed_files()
+                .expect("a seed-union unit requires narrowed seed files"),
+            scope
+                .workspace_files()
+                .expect("a seed-union unit requires whole-workspace files"),
+            &branch_path,
+        );
+        let detailed = execute_detailed_unit(
+            analyzer,
+            workspace,
+            &leaf_query,
+            limits,
+            cancellation,
+            leaf_scope,
+            &mut row_keys,
+        );
+        let mut leaf_result = project_unit_result(&detailed, row_keys);
+        work = work.saturating_add(leaf_result.work);
+        budgeted_work.provenance_steps = budgeted_work
+            .provenance_steps
+            .saturating_add(leaf_result.budgeted_work.provenance_steps);
+        budgeted_work.import_files_resolved = budgeted_work
+            .import_files_resolved
+            .saturating_add(leaf_result.budgeted_work.import_files_resolved);
+        budgeted_work.import_edges_resolved = budgeted_work
+            .import_edges_resolved
+            .saturating_add(leaf_result.budgeted_work.import_edges_resolved);
+        budgeted_work
+            .step_outputs
+            .extend(leaf_result.budgeted_work.step_outputs);
+        diagnostics.append(&mut leaf_result.diagnostics);
+        truncated |= leaf_result.truncated;
+        rows.append(&mut leaf_result.rows);
+    }
+
+    UnitExecutionResult {
+        rows,
+        work,
+        budgeted_work,
+        completion: code_query_completion(truncated, &diagnostics),
+        diagnostics,
+        truncated,
+    }
 }
 
 /// One selector unit's execution, both ways.
@@ -1587,6 +1740,7 @@ pub struct MergedUnitRows {
     pub budgeted_work: CodeQueryBudgetedWork,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub truncated: bool,
+    fair_share_divisor: usize,
 }
 
 impl MergedUnitRows {
@@ -1611,16 +1765,19 @@ impl MergedUnitRows {
 ///
 /// `units` must arrive in seed order -- the order the family's own comparator
 /// puts their seed files in, which [`seed_file_order`] and
-/// [`structural_seed_file_order`] expose. The whole execution's row vector is
-/// the concatenation of its per-seed-file row vectors in exactly that order,
-/// deduplicated first-writer-wins, so this reproduces it: a repeated key keeps
-/// the first row and merges the later row's provenance traces into it under the
-/// same `MAX_PROVENANCE_TRACES` bound the pipeline applies.
+/// [`structural_seed_file_order`] expose. A non-union whole execution's row
+/// vector is the concatenation of its per-seed-file row vectors in exactly
+/// that order. An eligible union unit contains leaf rows in seed-major order,
+/// so this function stably sorts those raw rows by their full branch path
+/// before applying the same first-writer deduplication as the executor.
 ///
 /// Every counter lane is summed and diagnostics are concatenated in order. The
 /// equality this reproduces is claimed only while no cumulative cap was
 /// reached, which is what the summed lanes let a caller check.
-pub fn merge_unit_rows(units: impl IntoIterator<Item = UnitExecutionResult>) -> MergedUnitRows {
+pub fn merge_unit_rows(
+    query: &CodeQuery,
+    units: impl IntoIterator<Item = UnitExecutionResult>,
+) -> MergedUnitRows {
     let mut items: Vec<UnitRowItem> = Vec::new();
     let mut evidence: Vec<UnitRowEvidence> = Vec::new();
     let mut indexes: HashMap<UnitRowKey, usize> = HashMap::default();
@@ -1628,6 +1785,14 @@ pub fn merge_unit_rows(units: impl IntoIterator<Item = UnitExecutionResult>) -> 
     let mut budgeted_work: Option<CodeQueryBudgetedWork> = None;
     let mut diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut truncated = false;
+    let union = PlanPartitioning::classify(&query.plan).is_seed_union();
+    let fair_share_divisor = if union {
+        PlanPartitioning::classify_union(&query.plan)
+            .expect("seed-union merge requires an eligible union plan")
+    } else {
+        1
+    };
+    let mut raw_rows = Vec::new();
 
     for unit in units {
         work = work.saturating_add(unit.work);
@@ -1637,14 +1802,26 @@ pub fn merge_unit_rows(units: impl IntoIterator<Item = UnitExecutionResult>) -> 
         });
         diagnostics.extend(unit.diagnostics);
         truncated |= unit.truncated;
-        for row in unit.rows {
-            match indexes.get(&row.key) {
-                Some(&index) => merge_duplicate_row(&mut items[index], &mut evidence[index], row),
-                None => {
-                    indexes.insert(row.key, items.len());
-                    items.push(row.item);
-                    evidence.push(row.evidence);
-                }
+        raw_rows.extend(unit.rows);
+    }
+
+    if union {
+        for row in &raw_rows {
+            row_branch(row);
+        }
+        raw_rows.sort_by(|left, right| {
+            left.item.provenance[0]
+                .branch
+                .cmp(&right.item.provenance[0].branch)
+        });
+    }
+    for row in raw_rows {
+        match indexes.get(&row.key) {
+            Some(&index) => merge_duplicate_row(&mut items[index], &mut evidence[index], row),
+            None => {
+                indexes.insert(row.key, items.len());
+                items.push(row.item);
+                evidence.push(row.evidence);
             }
         }
     }
@@ -1656,7 +1833,35 @@ pub fn merge_unit_rows(units: impl IntoIterator<Item = UnitExecutionResult>) -> 
         budgeted_work: budgeted_work.unwrap_or_default(),
         diagnostics,
         truncated,
+        fair_share_divisor,
     }
+}
+
+/// The branch path on a raw union row, after validating that both projected
+/// provenance surfaces agree and that every trace came from one leaf.
+fn row_branch(row: &UnitRow) -> &[usize] {
+    assert!(
+        !row.item.provenance.is_empty(),
+        "union rows require provenance"
+    );
+    assert_eq!(
+        row.item.provenance.len(),
+        row.evidence.provenance.len(),
+        "item and evidence provenance remain aligned"
+    );
+    let branch = &row.item.provenance[0].branch;
+    assert!(!branch.is_empty(), "union rows require a full branch path");
+    for (item_trace, evidence_trace) in row.item.provenance.iter().zip(&row.evidence.provenance) {
+        assert_eq!(
+            item_trace.branch, evidence_trace.branch,
+            "item and evidence traces must carry the same branch"
+        );
+        assert_eq!(
+            &item_trace.branch, branch,
+            "all traces for one raw row must carry one leaf branch"
+        );
+    }
+    branch
 }
 
 /// Fold a repeated row into the row that first claimed its key.
@@ -1672,6 +1877,11 @@ fn merge_duplicate_row(item: &mut UnitRowItem, evidence: &mut UnitRowEvidence, r
         item.provenance.len(),
         evidence.provenance.len(),
         "a rendered row's provenance and its evidence provenance are one list"
+    );
+    assert_eq!(
+        row.item.provenance.len(),
+        row.evidence.provenance.len(),
+        "a duplicate row's item and evidence provenance remain aligned"
     );
     let remaining = MAX_PROVENANCE_TRACES.saturating_sub(item.provenance.len());
     if row.item.provenance.len() > remaining {
@@ -1720,23 +1930,47 @@ pub fn structural_seed_file_order(left: &ProjectFile, right: &ProjectFile) -> st
 /// scanner applies them itself on every unit, and a unit that yields no row
 /// still records the reads that prove it yields none.
 ///
-/// A `Set` source has no seed enumeration of its own; it is [`Whole`] by
-/// classification and never reaches this function.
+/// An eligible union enumerates the union of its leaf language filters and
+/// uses their common comparator. Other `Set` sources are [`Whole`] by
+/// classification and never reach this function.
 ///
 /// [`Whole`]: crate::query::PlanPartitioning::Whole
 pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<ProjectFile> {
-    let (languages, structural) = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => (seed.languages.as_slice(), true),
-        CodeQueryPlanSource::Occurrences(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::Scopes(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::Bindings(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::Paths(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::GenerationSites(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::Exports(seed) => (seed.languages.as_slice(), false),
-        CodeQueryPlanSource::Set { .. } => {
-            unreachable!("a set-sourced plan is classified Whole and has no seed enumeration")
+    if PlanPartitioning::classify(plan).is_seed_union() {
+        let leaves = PlanPartitioning::union_leaf_plans(plan)
+            .expect("seed-union enumeration requires an eligible union plan");
+        let mut languages = Vec::new();
+        let mut accepts_all_languages = false;
+        let mut structural = None;
+        for (leaf, _) in leaves {
+            let (leaf_languages, leaf_structural) = seed_languages(leaf);
+            structural.get_or_insert(leaf_structural);
+            if leaf_languages.is_empty() {
+                accepts_all_languages = true;
+            } else {
+                for language in leaf_languages {
+                    if !languages.contains(language) {
+                        languages.push(*language);
+                    }
+                }
+            }
         }
-    };
+        let mut selected = files
+            .iter()
+            .filter(|file| {
+                accepts_all_languages
+                    || languages.contains(&crate::analyzer::common::language_for_file(file))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if structural.expect("an eligible union has at least one leaf") {
+            selected.sort_by(structural_seed_file_order);
+        } else {
+            selected.sort_by(seed_file_order);
+        }
+        return selected;
+    }
+    let (languages, structural) = seed_languages(plan);
     let mut selected = files
         .iter()
         .filter(|file| {
@@ -1751,6 +1985,22 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
         selected.sort_by(seed_file_order);
     }
     selected
+}
+
+/// Return a seed's language filter and its seed-file comparator family.
+fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
+    match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => (&seed.languages, true),
+        CodeQueryPlanSource::Occurrences(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::Scopes(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::Bindings(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::Paths(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::Exports(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::Set { .. } => {
+            unreachable!("a union leaf has no set source")
+        }
+    }
 }
 
 /// The cumulative cap a merged product reached, if it reached one.
@@ -1809,7 +2059,9 @@ impl MergedUnitRows {
     /// happened to execute under. The comparisons are `>=` rather than `>` at
     /// every lane the executor tests with `>`, because a sum that exactly
     /// reaches a cap is already a sum that cannot prove the whole run had
-    /// headroom.
+    /// headroom. An eligible union's leaves bypass fair branch shares, so
+    /// physical lanes are compared with the original cap divided by the
+    /// maximum nested fair-share divisor. Semantic lanes remain unchanged.
     ///
     /// The lanes are paired the way the executor charges them:
     /// `import_files_resolved` shares `max_scanned_files` with the seed scan,
@@ -1822,6 +2074,7 @@ impl MergedUnitRows {
         result_limit: usize,
     ) -> Option<MergedLimit> {
         let reached = |lane: u64, cap: usize| lane >= cap as u64;
+        let physical_cap = |cap: usize| cap / self.fair_share_divisor;
         if self.truncated {
             return Some(MergedLimit::UnitTruncated);
         }
@@ -1832,13 +2085,13 @@ impl MergedUnitRows {
             self.work
                 .scanned_files
                 .saturating_add(self.budgeted_work.import_files_resolved),
-            limits.max_scanned_files,
+            physical_cap(limits.max_scanned_files),
         ) {
             return Some(MergedLimit::ScannedFiles);
         }
         if reached(
             self.work.scanned_source_bytes,
-            limits.max_scanned_source_bytes,
+            physical_cap(limits.max_scanned_source_bytes),
         ) {
             return Some(MergedLimit::ScannedSourceBytes);
         }
@@ -1846,7 +2099,7 @@ impl MergedUnitRows {
             self.work
                 .fact_nodes
                 .saturating_add(self.work.examined_references),
-            limits.max_fact_nodes,
+            physical_cap(limits.max_fact_nodes),
         ) {
             return Some(MergedLimit::FactNodes);
         }
@@ -1855,7 +2108,7 @@ impl MergedUnitRows {
                 .pipeline_rows
                 .saturating_add(self.budgeted_work.provenance_steps)
                 .saturating_add(self.budgeted_work.import_edges_resolved),
-            limits.max_pipeline_rows,
+            physical_cap(limits.max_pipeline_rows),
         ) {
             return Some(MergedLimit::PipelineRows);
         }
@@ -1864,7 +2117,11 @@ impl MergedUnitRows {
         // could have cut a step's output.
         if reached(
             self.budgeted_work.max_step_outputs(),
-            result_limit.min(limits.max_pipeline_rows),
+            if self.fair_share_divisor == 1 {
+                result_limit.min(limits.max_pipeline_rows)
+            } else {
+                physical_cap(limits.max_pipeline_rows)
+            },
         ) {
             return Some(MergedLimit::StepOutputs);
         }

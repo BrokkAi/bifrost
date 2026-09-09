@@ -278,6 +278,10 @@ impl ForwardQueryProvider for CppAnalyzer {
         self.inner.definition_candidate_short_names(rendered)
     }
 
+    fn forward_definition_sources_may_exist(&self) -> bool {
+        self.inner.definition_sources_may_exist()
+    }
+
     fn forward_package_exists(&self, package: &str) -> bool {
         self.inner.forward_package_exists(package)
     }

@@ -1866,6 +1866,7 @@ impl FlowStateDerivation {
                     // indexed properties into flow state, so the raw gap
                     // remains blocking here.
                     SemanticGapDischarge::CanonicalIndexIdentity => true,
+                    SemanticGapDischarge::ModeledEffectPartition => true,
                     SemanticGapDischarge::None | SemanticGapDischarge::CallResolution => true,
                 }
         })

@@ -205,6 +205,7 @@ pub fn resolve_rust_semantic_pack_dependencies(
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: dependencies.len(),
+            informational_evidence: Vec::new(),
         },
         complete: diagnostics.is_empty() && !cancelled,
         dependencies,

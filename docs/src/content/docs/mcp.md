@@ -220,7 +220,11 @@ not coverage, so a symbol that a test reaches only through an intermediate is
 still listed. `baseline` reports cognitive complexity before and after the
 edited symbol pairs. `excluded` names the binary and unparseable changed files
 no feature could measure, and `verification.unresolved_symbols` names symbols
-whose reference scan did not complete, so nothing is dropped silently. Test
+whose reference scan did not complete, so nothing is dropped silently. Verification
+uses source reference lines before interactive usage summaries, including for hot
+symbols. Inline test membership comes from declaration ranges; merely sharing a
+file with tests does not count. Caller time limits and analysis limits still
+leave symbols unresolved. Test
 symbols and edges are always in scope because verification needs them. The tool
 builds an analyzer over the whole target revision rather than the changed files
 alone, because the diff's own files cannot answer who calls a changed symbol;

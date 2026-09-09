@@ -30,7 +30,10 @@ use std::path::Path;
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::invalidation::{DerivedArtifactId, DerivedArtifactKind, InvalidationReason};
-use crate::analyzer::read_ledger::{IndexFamily, LookupKind, LookupQuestion, ReadKey};
+use crate::analyzer::read_ledger::{
+    IndexFamily, LookupKind, LookupQuestion, ReadKey, absent_declaration_facts_digest,
+    absent_signature_metadata_digest,
+};
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::semantic::{
     CallSiteHandle, DispatchOracle, ProcedureHandle, SemanticBudget, SemanticBudgetExceeded,
@@ -60,6 +63,22 @@ use crate::hash::{HashMap, HashSet};
 pub trait WorkspaceFactIndex: Send + Sync {
     /// The language whose analyzed content this index describes.
     fn fact_index_language(&self) -> Language;
+
+    /// Replay the shared declaration and structural-parent facts, before any
+    /// language adapter adds its own parent interpretation.
+    fn declaration_facts_digest(&self, declaration: &CodeUnit) -> StableDigest;
+
+    /// Replay the shared signature projection before adapter-specific fallbacks.
+    fn signature_metadata_digest(&self, declaration: &CodeUnit) -> StableDigest;
+
+    /// Replay one complete name lookup, including an empty answer.
+    fn definition_answer_digest(&self, name: &str) -> StableDigest;
+
+    /// Replay declarations addressed by a source identifier.
+    fn identifier_candidate_answer_digest(&self, name: &str) -> StableDigest;
+
+    /// Replay the complete short-name candidate set.
+    fn short_name_candidate_answer_digest(&self, name: &str) -> StableDigest;
 
     /// Every analyzed path of this language with the blob it resolves to.
     fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)>;
@@ -536,6 +555,79 @@ pub fn replay_lookup(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     match kind {
+        LookupKind::ResolvedName => {
+            use crate::analyzer::BoundedDefinitionLookup;
+            let LookupQuestion::Name { language, name } = question else {
+                unreachable!("a resolved-name lookup records a name question")
+            };
+            let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
+            let definitions = match language {
+                Some(language) => lookup.fqn_in_language(name, *language),
+                None => lookup.fqn_in_any_language(name),
+            };
+            lookup
+                .can_publish()
+                .then(|| crate::analyzer::read_ledger::declaration_set_digest(&definitions))
+        }
+        LookupKind::Definitions
+        | LookupKind::IdentifierCandidates
+        | LookupKind::ShortNameCandidates => {
+            let LookupQuestion::Name { language, name } = question else {
+                unreachable!("a definitions lookup records a name question")
+            };
+            Some(match language {
+                Some(language) => {
+                    let indexes = analyzer.workspace_fact_indexes();
+                    let index = indexes
+                        .into_iter()
+                        .find(|index| index.fact_index_language() == *language)?;
+                    match kind {
+                        LookupKind::Definitions => index.definition_answer_digest(name),
+                        LookupKind::IdentifierCandidates => {
+                            index.identifier_candidate_answer_digest(name)
+                        }
+                        LookupKind::ShortNameCandidates => {
+                            index.short_name_candidate_answer_digest(name)
+                        }
+                        _ => unreachable!("the match admits only name lookup kinds"),
+                    }
+                }
+                None => match kind {
+                    LookupKind::Definitions => {
+                        crate::analyzer::read_ledger::declaration_set_digest(
+                            &analyzer.get_definitions(name),
+                        )
+                    }
+                    LookupKind::IdentifierCandidates => {
+                        crate::analyzer::read_ledger::declaration_set_digest(
+                            &analyzer.lookup_candidates_by_identifier(name),
+                        )
+                    }
+                    LookupKind::ShortNameCandidates => {
+                        crate::analyzer::read_ledger::declaration_set_digest(
+                            &analyzer.lookup_candidates_by_short_name(name),
+                        )
+                    }
+                    _ => unreachable!("the match admits only name lookup kinds"),
+                },
+            })
+        }
+        LookupKind::DeclarationFacts => Some(match replayed_declaration(analyzer, question) {
+            Some(declaration) => analyzer
+                .workspace_fact_indexes()
+                .into_iter()
+                .find(|index| index.fact_index_language() == declaration.source().language())?
+                .declaration_facts_digest(&declaration),
+            None => absent_declaration_facts_digest(),
+        }),
+        LookupKind::SignatureMetadata => Some(match replayed_declaration(analyzer, question) {
+            Some(declaration) => analyzer
+                .workspace_fact_indexes()
+                .into_iter()
+                .find(|index| index.fact_index_language() == declaration.source().language())?
+                .signature_metadata_digest(&declaration),
+            None => absent_signature_metadata_digest(),
+        }),
         LookupKind::Callers => {
             let unit = replayed_declaration(analyzer, question)?;
             let result = CallRelationService::incoming_bounded(

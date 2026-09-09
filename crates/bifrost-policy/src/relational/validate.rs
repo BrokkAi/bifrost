@@ -409,6 +409,10 @@ pub fn validate_limits(limits: &IrLimits) -> Result<(), RelationalAssertionPlanE
         ("max_joined_rows", limits.max_joined_rows),
         ("max_groups", limits.max_groups),
         ("max_values_per_group", limits.max_values_per_group),
+        (
+            "max_representative_tuples",
+            limits.max_representative_tuples,
+        ),
     ] {
         if value == 0 {
             return Err(RelationalAssertionPlanError::ZeroLimit { name });

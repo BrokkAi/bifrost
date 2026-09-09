@@ -13,18 +13,19 @@ use super::WorkspaceSemanticOracle;
 use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::semantic::{
     AbstractObjectIdentity, CallSiteHandle, CallableTarget, CallableTargetResolution,
-    CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
-    DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
-    DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    ExactExternalFormalContract, ExactExternalProcedureTarget, HeapOracle, MemberDeclaration,
-    MemoryLocationKind, ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits,
-    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
-    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork,
-    SourceAnchor, SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget,
-    ValueAtPoint, WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
+    CallerReceiverBinding, CancellationToken, CandidateCoverage, ContentIdentity,
+    DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DispatchBoundary,
+    DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility, DispatchOracle, DispatchResult,
+    EvidenceCompleteness, EvidenceHandle, ExactExternalFormalContract,
+    ExactExternalProcedureTarget, HeapOracle, MemberDeclaration, MemoryLocationKind,
+    ObjectCardinality, ObservationPhase, OracleCallContext, OracleLimits, OracleRelationArena,
+    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
+    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
+    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
+    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, ValueAtPoint,
+    WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
     unmaterialized_external_mount, unmaterialized_external_path,
 };
 use crate::analyzer::semantic_model::{
@@ -566,6 +567,12 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             .call_site(call.id())
             .ok_or_else(|| SemanticProviderError::internal("semantic call-site handle is stale"))?;
         let call_language = call.procedure().artifact().key().language();
+        let type_selected_method = matches!(
+            call.procedure()
+                .semantics()
+                .proven_caller_receiver_binding(call.id()),
+            Some(CallerReceiverBinding::TypeQualified(_))
+        );
         let call_dispatch_gap =
             scoped_call_dispatch_gap(call.procedure().semantics(), semantic_call);
         let procedure_call_gap = scoped_procedure_dispatch_gap(call.procedure());
@@ -1018,7 +1025,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 // body-less arm), which already asks unconditionally. Only
                 // *acting* on a non-empty answer by widening the candidate
                 // set stays behind the flag.
-                if complete_materialization && !group.receiver_hint {
+                if complete_materialization && !group.receiver_hint && !type_selected_method {
                     if staged_request.charge_execution_traversal(1) {
                         matched_concrete_groups = true;
                         match virtual_dispatch_implementor_targets(
@@ -1109,7 +1116,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 // pushed just above stays with them, so the answer says "the
                 // named callee has no body, and these are the members that
                 // could run" rather than claiming a resolved edge.
-                if complete_materialization && !group.receiver_hint {
+                if complete_materialization && !group.receiver_hint && !type_selected_method {
                     if staged_request.charge_execution_traversal(1) {
                         if let Some(implementors) = virtual_dispatch_implementor_targets(
                             self.workspace.analyzer(),
@@ -1978,13 +1985,20 @@ fn proven_static_target_discharges_gap(
     ) && candidates
         .iter()
         .all(|candidate| candidate.target().semantics().kind() == ProcedureKind::Method);
+    // Selecting a function through a type does not dispatch on the explicit
+    // receiver actual's dynamic class. The resolver already chose the body.
+    let type_selected_method = matches!(gap.subject, SemanticGapSubject::CallSite(id)
+        if matches!(caller.semantics().proven_caller_receiver_binding(id),
+            Some(CallerReceiverBinding::TypeQualified(_))));
     (receiverless || go_concrete_method)
         && lookup_resolved
         && boundaries.is_empty()
         && materialization_quality == DispatchQuality::Complete
         && candidates.iter().all(|candidate| {
             proven_complete(candidate)
-                && (go_concrete_method || candidate_has_free_target(candidate))
+                && (go_concrete_method
+                    || type_selected_method
+                    || candidate_has_free_target(candidate))
         })
 }
 

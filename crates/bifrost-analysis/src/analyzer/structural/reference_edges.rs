@@ -1134,13 +1134,15 @@ pub fn inverse_edges_for_declaration(
     if let Some(cancellation) = cancellation {
         finder = finder.with_cancellation(cancellation.clone());
     }
-    let run = finder.references_to_edges(
-        analyzer,
-        std::slice::from_ref(declaration),
-        MAX_INVERSE_EDGE_FILES,
-        MAX_INVERSE_EDGE_HITS,
-        None,
-    );
+    let run = crate::analyzer::i_analyzer::capture_usage_lookup_reads(analyzer, || {
+        finder.references_to_edges(
+            analyzer,
+            std::slice::from_ref(declaration),
+            MAX_INVERSE_EDGE_FILES,
+            MAX_INVERSE_EDGE_HITS,
+            None,
+        )
+    });
     let mut reasons = match run.completeness {
         EdgeCompleteness::Complete => Vec::new(),
         EdgeCompleteness::Incomplete { reasons } => reasons,

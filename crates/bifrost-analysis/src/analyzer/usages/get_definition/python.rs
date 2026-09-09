@@ -440,6 +440,42 @@ fn python_namespace_imported_class_candidate_bounded(
     )
 }
 
+/// Whether an attribute callee reads a stored value rather than naming a
+/// class or a callable declaration.
+///
+/// A type lookup answers the same way for three different shapes.
+/// `Parameter` in `Holder.Parameter()` names a class, so the lookup's class is
+/// what the call constructs. `make` in `Holder().make()` names a method, so
+/// the lookup's class is that method's return type. `_regex` in
+/// `self._regex()` names a field, so the lookup's class is the class of the
+/// stored value; calling it runs that value's `__call__` and produces
+/// something else. Only the third shape invalidates the lookup's answer.
+/// `None` means the receiver or the member did not resolve and the question
+/// has no bounded answer.
+pub(crate) fn python_attribute_callee_reads_a_field_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    callee: Node<'_>,
+) -> Option<bool> {
+    if python_namespace_imported_class_candidate_bounded(support, token, file, source, root, callee)
+        .is_some()
+    {
+        return Some(false);
+    }
+    let object = callee.child_by_field_name("object")?;
+    let member = python_slice(callee.child_by_field_name("attribute")?, source);
+    if member.is_empty() {
+        return None;
+    }
+    let receiver =
+        python_type_for_expression_bounded(support, token, file, source, root, object, 1)?;
+    let declaration = unique_python_candidate(support.members_for_owner(&receiver, member))?;
+    Some(!declaration.is_class() && !declaration.is_function())
+}
+
 pub(crate) fn python_namespace_imported_class_name_bounded(
     support: &PythonDefinitionProvider<'_>,
     token: QueryToken<'_>,
@@ -1606,6 +1642,17 @@ fn python_callable_return_type_in_tree(
     )
 }
 
+/// Whether a function definition is a coroutine function.
+///
+/// The grammar marks it with an `async` token before `def` rather than with a
+/// distinct node kind or a field.
+fn python_function_is_async(function: Node<'_>) -> bool {
+    let mut cursor = function.walk();
+    function
+        .children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind() == "async")
+}
+
 fn python_function_return_type_from_node_bounded(
     support: &PythonDefinitionProvider<'_>,
     token: QueryToken<'_>,
@@ -1615,6 +1662,12 @@ fn python_function_return_type_from_node_bounded(
     function: Node<'_>,
     depth: usize,
 ) -> Option<CodeUnit> {
+    // Calling an `async def` produces a coroutine. Its annotation describes
+    // what awaiting that coroutine yields, so it is not the call's own type,
+    // and the body's `return` values are not either.
+    if python_function_is_async(function) {
+        return None;
+    }
     if let Some(annotation) = function.child_by_field_name("return_type") {
         return python_type_from_annotation_bounded(
             support,

@@ -10,7 +10,7 @@ and completeness semantics around native [Rune Query Language
 reporting form, but it is not an alternate RQLP authoring syntax.
 
 > **Current execution boundary:** Bifrost executes match-, taint-, typestate-,
-> and assertion-analysis policies. Taint resolves typed source and sink
+> assertion-, and flow-analysis policies. Taint and flow resolve typed endpoint
 > bindings, compiles compatible demand, runs bounded set-oriented propagation,
 > and renders retained findings. Unsupported or incomplete semantic boundaries
 > remain non-clean completion states rather than empty successful results.
@@ -275,11 +275,13 @@ named `eval`:
             (call :callee (name "eval"))))))
 ```
 
-`match` is currently the only analysis type that executes end to end. Its RQL
-result is evidence for the surrounding policy, so the policy—not the selector—
-owns the finding message, severity, identity, and completion state. A callee
-name match is still a structural fact; it does not by itself prove runtime
-dispatch.
+Every analysis type has its own typed execution contract. For `match`, an RQL
+result is evidence for the surrounding policy, so the policy—not the
+selector—owns the finding message, severity, identity, and completion state. A
+callee name match is still a structural fact; it does not by itself prove
+runtime dispatch. Flow policies likewise report typed incompleteness when the
+declared value-flow ports cannot be established, rather than treating an empty
+result as proof of safety or correctness.
 
 The documentation test runs that exact policy against this source through the
 current `bifrost` binary:
@@ -422,6 +424,7 @@ source/sink leaves should normally use endpoint documents.
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
 | `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-value-origin`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
+| `flow` | Neutral origins, observations, kills, and policy-local transforms over typed value-flow ports. | Executes bounded value-flow propagation. Uncertain or unbindable typed ports remain incomplete rather than producing a clean verdict. |
 
 ### Taint: broad libraries, specific findings
 
@@ -521,6 +524,52 @@ removal. If the selected sanitizer is unresolved or ambiguous, the policy
 run must remain non-conclusive (or retain the finding); an empty finding set
 alone is never evidence that an uncertain sanitizer made the value safe.
 
+### Policy-local transforms: carry a value across an exact seam
+
+A taint policy can declare a policy-local transform under `:transforms`. It
+selects one exact call or value site and binds the input and output ports. The
+transform is a pass-through from input to output, with the labels changed as
+the declared set operation `(input - removes) union adds`. At least one
+`:removes` or `:adds` label is required, so an empty taint transform is a
+load-time authoring error.
+
+```lisp
+:transforms
+  (endpoint-set :entries [
+    (transform :id normalize-user
+      :selector (rql (language java
+        (call :callee (name "normalizeUser"))))
+      :input (argument :index 0)
+      :output return-value
+      :removes [user-controlled]
+      :adds [normalized])])
+```
+
+Taint transform sets may compose catalog entries, but not match-endpoint sets.
+Their selector and ports are typed evidence: a transform does not apply to a
+lookalike call or an unbound operand. A structurally bound but uncertain port
+still contributes a possible flow and keeps the result inconclusive. Finding
+provenance retains the source's original labels, while
+`reached_source_labels` reports the labels carried at the sink after every
+transform on the witness.
+
+A flow analysis may use the same `:transforms` field with the neutral form:
+
+```lisp
+:transforms
+  (endpoint-set :entries [
+    (transform :id normalize-user
+      :selector (rql (language java
+        (call :callee (name "normalizeUser"))))
+      :input (argument :index 0)
+      :output return-value)])
+```
+
+Flow transforms carry the tracked value from `:input` to `:output` without
+label fields and compose only local entries. If either typed port is uncertain
+or cannot be bound, the flow result remains typed-incomplete; it is not
+converted into a clean verdict.
+
 ### External models: declare a procedure's transfer semantics
 
 A taint policy can declare, under `:external-models`, that the calls its
@@ -583,8 +632,9 @@ observable location for that field of the written object exists in the
 solve; a field nothing can read makes the write a complete no-op, and an
 ambiguous destination leaves the run non-conclusive instead of writing a
 guessed location. Shipped semantic-pack summaries still take precedence at
-a call they cover, and `:transforms` (label-rewriting propagators) remain a
-typed compile refusal.
+a call they cover. External-model transform effects (`:effect (transform ...)`)
+remain a typed compile refusal; policy-local transforms are the supported
+transform surface.
 
 ### Framework entry points: synthesize a root for an uncalled handler
 

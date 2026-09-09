@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v49";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v50";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -3440,7 +3440,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             {
                 Some(GoStorageKind::Map)
             }
-            "call_expression" if self.exact_append_backing(node).is_some() => {
+            "call_expression" if self.builtin_append_source(node).is_some() => {
                 Some(GoStorageKind::Slice)
             }
             _ => None,
@@ -3496,7 +3496,16 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     .map(|end| go_integer_literal_value(self.prepared.source(), end))
                     .unwrap_or(Some(source_shape.length))?;
                 let length = end.checked_sub(start)?;
-                let capacity = source_shape.capacity.checked_sub(start)?;
+                let capacity = match node.child_by_field_name("capacity") {
+                    Some(max) => {
+                        let max = go_integer_literal_value(self.prepared.source(), max)?;
+                        if end > max || max > source_shape.capacity {
+                            return None;
+                        }
+                        max.checked_sub(start)?
+                    }
+                    None => source_shape.capacity.checked_sub(start)?,
+                };
                 (end <= source_shape.capacity).then_some(ExactSliceShape { length, capacity })
             }
             "call_expression" => match self.exact_append_backing(node)? {
@@ -4076,11 +4085,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return None;
         }
         let arguments = all_call_arguments(node);
-        (arguments.len() >= 2
-            && arguments[1..]
-                .iter()
-                .all(|argument| argument.kind() != "variadic_argument"))
-        .then_some(arguments[0])
+        (arguments.len() >= 2).then_some(arguments[0])
     }
 
     fn is_import_qualifier(&self, node: Node<'tree>) -> bool {
@@ -7208,14 +7213,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             result,
                             AllocationKind::Slice,
                         )?;
-                        self.session.add_gap_with_impacts(
+                        self.session.add_partitioned_gap(
                             builder,
                             boundary,
                             SemanticGapSubject::Value(result),
                             SemanticCapability::IndexMemory,
-                            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
-                                .with(SemanticGapImpact::HeapWrite)
-                                .with(SemanticGapImpact::Aliasing),
+                            SemanticGapImpacts::single(SemanticGapImpact::HeapRead),
                             SemanticGapKind::Unsupported,
                             "Go append proves a replacement allocation, but copying prior elements into the new backing store is not yet lowered",
                         )?;
@@ -7242,8 +7245,78 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     )?;
                     let value = self.expression_value(
                         builder,
-                        *argument,
-                        self.expression_value_kind(*argument),
+                        go_call_argument_value_node(*argument),
+                        self.expression_value_kind(go_call_argument_value_node(*argument)),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                }
+                self.edge(builder, boundary, next)?;
+                let evaluations = all_call_arguments(node);
+                self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &evaluations,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
+            "call_expression" if self.builtin_append_source(node).is_some() => {
+                let boundary = self.point(builder, node, Vec::new())?;
+                let source_node = self
+                    .builtin_append_source(node)
+                    .expect("guard proves a builtin append source");
+                let source = self.expression_value(
+                    builder,
+                    source_node,
+                    self.expression_value_kind(source_node),
+                )?;
+                let fresh = self.value(
+                    builder,
+                    boundary,
+                    SemanticValueKind::LanguageDefined("go.append.fresh_backing".into()),
+                )?;
+                self.value_storage_kinds.insert(fresh, GoStorageKind::Slice);
+                let allocation =
+                    self.session
+                        .add_allocation(builder, boundary, fresh, AllocationKind::Slice)?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative {
+                            offset: BackingStoreOffset::Zero,
+                            allocation,
+                        },
+                        source,
+                        target: result,
+                    },
+                )?;
+                for argument in all_call_arguments(node)[1..].iter().copied() {
+                    let argument = go_call_argument_value_node(argument);
+                    let location = self.session.add_memory_location(
+                        builder,
+                        boundary,
+                        MemoryLocationKind::Index {
+                            base: result,
+                            index: None,
+                            constant_index: None,
+                            identity: IndexedLocationIdentity::Element,
+                        },
+                    )?;
+                    let value = self.expression_value(
+                        builder,
+                        argument,
+                        self.expression_value_kind(argument),
                     )?;
                     self.append_effect(
                         builder,
@@ -13476,6 +13549,101 @@ func shadowed(make func([]int, int) []int) {
         assert!(
             shadowed.allocations.is_empty(),
             "a rebound make identifier must remain an ordinary call: {shadowed:#?}"
+        );
+    }
+
+    #[test]
+    fn full_slice_capacity_controls_exact_append_replacement() {
+        const SOURCE: &str = r#"package main
+
+func fullSlice() {
+    source := make([]int, 4, 8)
+    window := source[1:3:3]
+    result := append(window, 7)
+    _ = result
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "fullSlice");
+        assert_eq!(
+            procedure
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.kind == AllocationKind::Slice)
+                .count(),
+            2,
+            "the full slice has capacity max-low=2, so append must replace its backing store: {procedure:#?}"
+        );
+        assert!(
+            procedure.call_sites.is_empty(),
+            "builtin append is lowered as storage semantics: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn unknown_builtin_append_publishes_finite_backing_alternatives() {
+        const SOURCE: &str = r#"package main
+
+func unknownAppend(source []int, extra []int) []int {
+    result := append(source, extra...)
+    return result
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let procedure = named_procedure(&procedures, "unknownAppend");
+        let alternatives = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::BackingStoreAlternative { offset, allocation },
+                    source,
+                    target,
+                } => Some((offset, allocation, source, target)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(offset, allocation, source, target)] = alternatives.as_slice() else {
+            panic!("unknown append must publish one finite alternative: {procedure:#?}");
+        };
+        assert_eq!(*offset, BackingStoreOffset::Zero);
+        assert_ne!(*source, *target);
+        let fresh = &procedure.allocations[allocation.index()];
+        assert_eq!(fresh.kind, AllocationKind::Slice);
+        assert_eq!(
+            procedure.values[fresh.result.index()].kind,
+            SemanticValueKind::LanguageDefined("go.append.fresh_backing".into())
+        );
+        assert!(
+            procedure.call_sites.is_empty(),
+            "unknown builtin append must not become an ordinary call: {procedure:#?}"
+        );
+        assert!(
+            procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| {
+                    let SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        ..
+                    } = event.effect
+                    else {
+                        return false;
+                    };
+                    matches!(
+                        procedure.memory_locations[location.index()].kind,
+                        MemoryLocationKind::Index {
+                            base,
+                            index: None,
+                            constant_index: None,
+                            identity: IndexedLocationIdentity::Element,
+                        } if base == *target
+                    )
+                }),
+            "appended values retain a structured wildcard index at the result backing: {procedure:#?}"
         );
     }
 

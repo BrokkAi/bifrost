@@ -79,11 +79,16 @@ impl ReadKeyColumns {
             } => {
                 assert!(
                     lookup_question_matches_kind(*kind, question),
-                    "a dispatch lookup kind and call-site question use the same address domain"
+                    "a lookup kind must use its supported question shape"
                 );
                 columns.family = Some(kind.stable_label());
                 columns.digest = Some(digest.as_bytes().to_vec());
                 match question {
+                    LookupQuestion::Name { language, name } => {
+                        columns.languages =
+                            language.map(|language| language.config_label().to_string());
+                        columns.name = Some(name.to_string());
+                    }
                     LookupQuestion::Declaration { rel_path, fq_name } => {
                         columns.rel_path = Some(rel_path.to_string());
                         columns.name = Some(fq_name.to_string());
@@ -181,6 +186,10 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
         "lookup" => {
             let lookup_kind = lookup_kind_of(family.as_deref().ok_or_else(|| missing("kind"))?)?;
             let question = match (rel_path, name, subject, start_byte, end_byte) {
+                (None, Some(name), None, None, None) => LookupQuestion::Name {
+                    language: languages.as_deref().map(decode_language).transpose()?,
+                    name: Box::from(name.as_str()),
+                },
                 (Some(rel_path), Some(fq_name), None, None, None) => LookupQuestion::Declaration {
                     rel_path: Box::from(rel_path.as_str()),
                     fq_name: Box::from(fq_name.as_str()),
@@ -299,16 +308,31 @@ pub(super) fn decode_read_key(row: &rusqlite::Row<'_>) -> Result<ReadKey> {
 fn lookup_question_matches_kind(kind: LookupKind, question: &LookupQuestion) -> bool {
     matches!(
         (kind, question),
-        (LookupKind::Dispatch, LookupQuestion::CallSite { .. })
+        (
+            LookupKind::ResolvedName
+                | LookupKind::Definitions
+                | LookupKind::IdentifierCandidates
+                | LookupKind::ShortNameCandidates,
+            LookupQuestion::Name { .. },
+        ) | (LookupKind::Dispatch, LookupQuestion::CallSite { .. })
             | (
                 LookupKind::ProcedureDispatch,
                 LookupQuestion::ProcedureCallSite { .. }
             )
-    ) || (!matches!(kind, LookupKind::Dispatch | LookupKind::ProcedureDispatch)
-        && !matches!(
-            question,
-            LookupQuestion::CallSite { .. } | LookupQuestion::ProcedureCallSite { .. }
-        ))
+    ) || (!matches!(
+        kind,
+        LookupKind::ResolvedName
+            | LookupKind::Definitions
+            | LookupKind::IdentifierCandidates
+            | LookupKind::ShortNameCandidates
+            | LookupKind::Dispatch
+            | LookupKind::ProcedureDispatch
+    ) && !matches!(
+        question,
+        LookupQuestion::Name { .. }
+            | LookupQuestion::CallSite { .. }
+            | LookupQuestion::ProcedureCallSite { .. }
+    ))
 }
 
 /// The sorted language labels of one scope, as the one text column a scope
@@ -359,7 +383,13 @@ const ALL_INDEX_FAMILIES: [IndexFamily; 9] = [
 ];
 
 /// Every derived-value lookup kind.
-const ALL_LOOKUP_KINDS: [LookupKind; 9] = [
+const ALL_LOOKUP_KINDS: [LookupKind; 15] = [
+    LookupKind::ResolvedName,
+    LookupKind::Definitions,
+    LookupKind::IdentifierCandidates,
+    LookupKind::ShortNameCandidates,
+    LookupKind::DeclarationFacts,
+    LookupKind::SignatureMetadata,
     LookupKind::Callers,
     LookupKind::Callees,
     LookupKind::Usages,
@@ -454,6 +484,86 @@ mod tests {
             ),
             ReadKey::path_absent(Language::Java, "src/Missing.java"),
             ReadKey::index(IndexFamily::DefinitionExact, b"com.example.Main"),
+            ReadKey::lookup(
+                LookupKind::ResolvedName,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::ResolvedName,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::Definitions,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::Definitions,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::IdentifierCandidates,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::IdentifierCandidates,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::ShortNameCandidates,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::ShortNameCandidates,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::DeclarationFacts,
+                LookupQuestion::Declaration {
+                    rel_path: Box::from("src/Main.java"),
+                    fq_name: Box::from("com.example.Main#run"),
+                },
+                answer,
+            ),
+            ReadKey::lookup(
+                LookupKind::SignatureMetadata,
+                LookupQuestion::Declaration {
+                    rel_path: Box::from("src/Main.java"),
+                    fq_name: Box::from("com.example.Main#run"),
+                },
+                answer,
+            ),
             ReadKey::lookup(
                 LookupKind::Callers,
                 LookupQuestion::Declaration {

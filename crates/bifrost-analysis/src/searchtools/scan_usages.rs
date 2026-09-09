@@ -954,6 +954,26 @@ pub(super) enum ScanUsagesWorkEntry {
     },
 }
 
+/// Raw reference sites collected before the interactive response renderer.
+///
+/// This is crate-private because the public scan result remains bounded for
+/// interactive callers. Consumers that need source-backed evidence can use
+/// this result without inheriting the presentation renderer's file and byte
+/// limits.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesReferenceSites {
+    pub(crate) input: ScanUsagesTarget,
+    pub(crate) files: Vec<ScanUsagesReferenceFile>,
+    pub(crate) incomplete_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesReferenceFile {
+    pub(crate) path: String,
+    pub(crate) hits: usize,
+    pub(crate) lines: Vec<usize>,
+}
+
 fn macro_lexical_usage_rows(
     analyzer: &dyn IAnalyzer,
     target_file: &ProjectFile,
@@ -2345,17 +2365,17 @@ pub(super) fn scan_usages_backend(
     context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
     HEAVY_SCAN_POOL.install(|| {
-        scan_usages_backend_on_pool(
+        let (entries, scope) = scan_usages_backend_on_pool(
             analyzer,
             token,
-            surface,
             include_tests,
             paths,
             symbols,
             targets,
             include_same_owner,
             context,
-        )
+        );
+        render_scan_usages_with_budget(entries, scope, surface)
     })
 }
 
@@ -2363,14 +2383,13 @@ pub(super) fn scan_usages_backend(
 fn scan_usages_backend_on_pool(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    surface: ScanUsagesSurface,
     include_tests: bool,
     paths: Option<&[String]>,
     symbols: Vec<ScanUsageRequest>,
     targets: Vec<ScanUsageRequest>,
     include_same_owner: bool,
     context: &ScanUsagesExecutionContext,
-) -> ScanUsagesResult {
+) -> (Vec<ScanUsagesWorkEntry>, ScanUsagesScope) {
     let _scope = profiling::scope("searchtools::scan_usages_on_pool");
     // A batch is one read-only analyzer request. Keep the read cache alive across
     // target resolution and every per-target UsageFinder query so later targets
@@ -2383,7 +2402,7 @@ fn scan_usages_backend_on_pool(
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+        return (entries, query_scope.result_scope());
     }
 
     // When the caller scopes the query to `paths`, the answer can only live in those files, so
@@ -2409,21 +2428,21 @@ fn scan_usages_backend_on_pool(
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+        return (entries, query_scope.result_scope());
     }
 
     let test_files = test_file_exclusion(analyzer, include_tests);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+        return (entries, query_scope.result_scope());
     }
     let reference_only_sibling_extensions =
         present_reference_only_sibling_extensions_by_language(analyzer);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+        return (entries, query_scope.result_scope());
     }
 
     let mut work_entries = Vec::new();
@@ -3049,7 +3068,208 @@ fn scan_usages_backend_on_pool(
     }
 
     work_entries.sort_by_key(ScanUsagesWorkEntry::index);
-    render_scan_usages_with_budget(work_entries, query_scope.result_scope(), surface)
+    (work_entries, query_scope.result_scope())
+}
+
+/// Collect source-backed reference sites for location-selected targets before
+/// interactive rendering applies its response budget.
+pub(crate) fn scan_usage_reference_sites_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+    cancellation: CancellationToken,
+) -> Vec<ScanUsagesReferenceSites> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let targets = params
+        .targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| ScanUsageRequest::target(index, target))
+        .collect();
+    let context = ScanUsagesExecutionContext::with_cancellation(cancellation);
+    let (entries, scope) = HEAVY_SCAN_POOL.install(|| {
+        scan_usages_backend_on_pool(
+            analyzer,
+            token,
+            params.include_tests,
+            params.paths.as_deref(),
+            Vec::new(),
+            targets,
+            params.include_same_owner,
+            &context,
+        )
+    });
+    collect_scan_usages_reference_sites(analyzer, entries, scope, &context)
+}
+
+fn collect_scan_usages_reference_sites(
+    analyzer: &dyn IAnalyzer,
+    entries: Vec<ScanUsagesWorkEntry>,
+    scope: ScanUsagesScope,
+    context: &ScanUsagesExecutionContext,
+) -> Vec<ScanUsagesReferenceSites> {
+    let mut classified: Vec<_> = entries
+        .iter()
+        .map(classify_scan_usages_reference_entry)
+        .collect();
+    // Models can contribute authored reference sites (for example generated
+    // accessors). Keep that evidence without fitting it to an interactive reply.
+    if !context.cancellation.is_cancelled()
+        && let Some(overlay) = analyzer.semantic_model_overlay()
+    {
+        attach_model_relations_to_entries(analyzer, &overlay, &scope, &mut classified);
+    }
+    entries
+        .into_iter()
+        .zip(classified)
+        .map(|(entry, mut classified)| {
+            if !scope.unmatched_paths.is_empty() {
+                downgrade_for_unmatched_paths(&mut classified, ScanUsagesSurface::Location);
+            }
+            if context.cancellation.is_cancelled() {
+                mark_incomplete(
+                    &mut classified,
+                    context.interruption_reason(),
+                    ScanUsagesSurface::Location,
+                );
+            }
+            let incomplete_reason = raw_reference_incomplete_reason(&classified);
+            let files = raw_reference_files(&entry, &classified.files);
+            let input = match classified.input {
+                ScanUsagesInput::Target(target) => target,
+                ScanUsagesInput::Symbol(symbol) => {
+                    unreachable!("location reference scan produced a symbol input: {symbol}")
+                }
+            };
+            ScanUsagesReferenceSites {
+                input,
+                files,
+                incomplete_reason,
+            }
+        })
+        .collect()
+}
+
+fn classify_scan_usages_reference_entry(entry: &ScanUsagesWorkEntry) -> ScanUsagesEntry {
+    match entry {
+        ScanUsagesWorkEntry::Usage {
+            request,
+            state,
+            candidate_files_sample,
+            target_is_method,
+            incomplete_reason,
+        } => classify_usage_entry(
+            request,
+            raw_symbol_usages(state),
+            candidate_files_sample.clone(),
+            false,
+            None,
+            *target_is_method,
+            *incomplete_reason,
+        ),
+        ScanUsagesWorkEntry::TooManyCallsites {
+            request,
+            state,
+            short_name,
+            total_callsites,
+            limit,
+            target_is_method,
+        } => classify_usage_entry(
+            request,
+            raw_symbol_usages(state),
+            None,
+            true,
+            Some((short_name.clone(), *total_callsites, *limit)),
+            *target_is_method,
+            Some(ScanUsagesIncompleteReason::Callsites),
+        ),
+        _ => classify_scan_usages_entry(entry),
+    }
+}
+
+fn raw_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
+    SymbolUsages {
+        symbol: state.symbol.clone(),
+        fq_name: state.fq_name.clone(),
+        definition_path: state.definition_path.clone(),
+        definition_line: state.definition_line,
+        total_hits: state.total_hits,
+        unproven_hits: state.unproven_hits,
+        same_owner_sites: some_if_nonzero(state.same_owner_sites),
+        rendering: UsageRendering::Full,
+        candidate_files_truncated: state.candidate_files_truncated,
+        reference_only_siblings: state.reference_only_absence_note.is_some(),
+        definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
+        files_truncated: None,
+        note: state.base_note.clone(),
+        top_enclosing: Vec::new(),
+        files: Vec::new(),
+        same_owner_files: Vec::new(),
+        unproven_files: raw_summary_file_groups(&state.unproven_rows),
+        model_relations: Vec::new(),
+    }
+}
+
+fn raw_summary_file_groups(rows: &[UsageHitRow]) -> Vec<UsageFileGroup> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for row in rows {
+        *counts.entry(row.path.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(path, hit_count)| UsageFileGroup {
+            path,
+            hits: Vec::new(),
+            hit_count: Some(hit_count),
+        })
+        .collect()
+}
+
+fn raw_reference_files(
+    entry: &ScanUsagesWorkEntry,
+    modeled_files: &[UsageFileGroup],
+) -> Vec<ScanUsagesReferenceFile> {
+    let mut grouped: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    if let Some(state) = entry_render_state(entry) {
+        for hit in &state.hits {
+            grouped.entry(&hit.path).or_default().push(hit.line);
+        }
+    }
+    for file in modeled_files {
+        assert!(
+            file.hit_count.is_none(),
+            "model source sites must retain lines"
+        );
+        grouped
+            .entry(&file.path)
+            .or_default()
+            .extend(file.hits.iter().map(|hit| hit.line));
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut lines)| {
+            lines.sort_unstable();
+            ScanUsagesReferenceFile {
+                hits: lines.len(),
+                path: path.to_owned(),
+                lines,
+            }
+        })
+        .collect()
+}
+
+fn raw_reference_incomplete_reason(entry: &ScanUsagesEntry) -> Option<String> {
+    match entry.status {
+        ScanUsagesStatus::Found
+        | ScanUsagesStatus::VerifiedAbsent
+        | ScanUsagesStatus::NoExternalUsages => {
+            entry.incomplete_reason.map(|reason| format!("{reason:?}"))
+        }
+        status => Some(match entry.message.as_deref() {
+            Some(message) => format!("scan status {status:?}: {message}"),
+            None => format!("scan status {status:?}"),
+        }),
+    }
 }
 
 /// A definition node in the workspace usage graph.
@@ -5392,13 +5612,24 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
 }
 
 fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResult) {
-    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
-
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return;
     };
-    let whole_workspace = result.scope.whole_workspace;
-    for entry in &mut result.results {
+    attach_model_relations_to_entries(analyzer, &overlay, &result.scope, &mut result.results);
+    fit_model_relations_to_response_budget(result);
+    result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn attach_model_relations_to_entries(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    scope: &ScanUsagesScope,
+    entries: &mut [ScanUsagesEntry],
+) {
+    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
+
+    let whole_workspace = scope.whole_workspace;
+    for entry in entries {
         let input = match &entry.input {
             ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
             ScanUsagesInput::Target(_) => entry
@@ -5462,7 +5693,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
                     {
                         continue;
                     }
-                    for file in authored_model_references(analyzer, &overlay, source.records[0]) {
+                    for file in authored_model_references(analyzer, overlay, source.records[0]) {
                         modeled_references
                             .entry(file.path)
                             .or_default()
@@ -5543,7 +5774,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
         }
         let model_symbol = symbol.records[0];
         if whole_workspace {
-            let authored_references = authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_references = authored_model_references(analyzer, overlay, model_symbol);
             let authored_hits = authored_references
                 .iter()
                 .map(|file| file.hits.len())
@@ -5621,8 +5852,6 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             );
         }
     }
-    fit_model_relations_to_response_budget(result);
-    result.summary = build_scan_usages_summary(&result.results);
 }
 
 fn authored_model_references(
@@ -6302,6 +6531,56 @@ mod tests {
     use super::*;
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn batch_reference_sites_preserve_files_beyond_interactive_limit() {
+        let mut sources = vec![(
+            "app.py".to_string(),
+            "def target():\n    pass\n".to_string(),
+        )];
+        for index in 0..25 {
+            sources.push((
+                format!("caller_{index:02}.py"),
+                "from app import target\n\ndef call():\n".to_string() + &"    target()\n".repeat(5),
+            ));
+        }
+        let files: Vec<_> = sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let fixture = AnalyzerFixture::new_for_language(Language::Python, &files);
+        let analyzer = fixture.analyzer.analyzer();
+        let params = ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "app.py".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+        };
+        let interactive = scan_usages_by_location(analyzer, params.clone());
+        assert_eq!(
+            interactive.results[0].rendering,
+            Some(UsageRendering::Summary)
+        );
+        assert!(
+            interactive.results[0].files_truncated.is_some(),
+            "{interactive:?}"
+        );
+        let raw =
+            scan_usage_reference_sites_by_location(analyzer, params, CancellationToken::default());
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].incomplete_reason.is_none(), "{raw:?}");
+        assert_eq!(raw[0].files.len(), 25, "{raw:?}");
+        for (index, file) in raw[0].files.iter().enumerate() {
+            assert_eq!(file.path, format!("caller_{index:02}.py"));
+            assert_eq!(file.hits, file.lines.len());
+            assert!((4..=8).all(|line| file.lines.contains(&line)), "{file:?}");
+        }
+    }
 
     #[test]
     fn rooted_usage_graph_never_scans_the_workspace_declaration_inventory() {

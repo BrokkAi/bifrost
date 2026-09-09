@@ -28,3 +28,4 @@ bifrost_searchtools/*.so
 # decisions live in .bifrost/suppressions.json (published) and
 # .bifrost/suppressions.private.json (not published).
 /.bifrost/suppressions.local.json
+/.brokk.local-hold/

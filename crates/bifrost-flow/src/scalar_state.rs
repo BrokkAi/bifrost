@@ -561,7 +561,7 @@ fn transfer_point(
                 }
             }
             SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::LanguageDefined,
+                kind: ValueFlowKind::LanguageDefined | ValueFlowKind::BackingStoreAlternative { .. },
                 target,
                 ..
             }
@@ -743,7 +743,9 @@ fn apply_guard_refinement(
         }
         GuardPredicate::ConstantBoolean { .. }
         | GuardPredicate::InstanceOf { .. }
+        | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
+        | GuardPredicate::Truthy { .. }
         | GuardPredicate::Opaque { .. } => return,
     };
     state[subject.index()] = refined;

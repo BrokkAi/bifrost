@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 59;
+const CURRENT_MIGRATION_VERSION: i64 = 62;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -115,6 +115,12 @@ const RUST_MACRO_USE_IMPORTS_SQL: &str =
     include_str!("../migrations/cache/0058-rust-macro-use-imports.sql");
 const CLASS_SET_FIELD_STORE_SURVEYS_SQL: &str =
     include_str!("../migrations/cache/0059-field-store-surveys.sql");
+const POLICY_DECLARATION_FACT_READS_SQL: &str =
+    include_str!("../migrations/cache/0060-policy-declaration-fact-reads.sql");
+const CLASS_SET_UNMODELED_GUARDS_SQL: &str =
+    include_str!("../migrations/cache/0061-class-set-unmodeled-guards.sql");
+const CLASS_SET_CLASS_CREATION_REMAINDER_SQL: &str =
+    include_str!("../migrations/cache/0062-class-set-class-creation-remainder.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -135,7 +141,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 41] = [
+const CACHE_MIGRATIONS: [CacheMigration; 44] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -299,6 +305,18 @@ const CACHE_MIGRATIONS: [CacheMigration; 41] = [
     CacheMigration {
         version: 59,
         sql: CLASS_SET_FIELD_STORE_SURVEYS_SQL,
+    },
+    CacheMigration {
+        version: 60,
+        sql: POLICY_DECLARATION_FACT_READS_SQL,
+    },
+    CacheMigration {
+        version: 61,
+        sql: CLASS_SET_UNMODELED_GUARDS_SQL,
+    },
+    CacheMigration {
+        version: 62,
+        sql: CLASS_SET_CLASS_CREATION_REMAINDER_SQL,
     },
 ];
 
@@ -5671,12 +5689,78 @@ mod tests {
             [result_id],
         )
         .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,4,'src/app.py',36,2,6,37,2,7,'created','unknown',NULL,
+                   'class_creation','partial')",
+                [result_id],
+            )
+            .is_err(),
+            "schema 56 must reject the reason added by schema 62"
+        );
 
         migrate(&mut conn).unwrap();
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_rows",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            4,
+            "the current schema must preserve every earlier row"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_finding_free_root_rows",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            4
+        );
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,4,'src/app.py',40,3,0,41,3,1,'missing','unknown',NULL,
+               'unmodeled_guard','partial','unknown_module.Thing')",
+            [result_id],
+        )
+        .unwrap();
+        for invalid in ["NULL", "''"] {
+            assert!(
+                conn.execute(
+                    &format!(
+                        "UPDATE class_set_finding_free_root_rows SET guard_class={invalid}
+                 WHERE row_ordinal=4"
+                    ),
+                    []
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            conn.execute(
+                "UPDATE class_set_finding_free_root_rows SET guard_class='Other'
+             WHERE row_ordinal=3",
+                []
+            )
+            .is_err()
+        );
+
+        // The class-creation remainder schema 62 admits. `guard_class` belongs
+        // to the unmodeled-guard reason alone, so this row leaves it null.
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,5,'src/app.py',36,2,6,37,2,7,'created','unknown',NULL,
+               'class_creation','partial',NULL)",
+            [result_id],
+        )
+        .unwrap();
 
         conn.execute("DELETE FROM blobs WHERE lang='python'", [])
             .unwrap();
@@ -6331,6 +6415,7 @@ mod tests {
             ),
             "migration 0057 preserves role and occurrence-role identity"
         );
+        migrate(&mut conn).unwrap();
         assert_eq!(
             schema_object_definitions(&conn).unwrap(),
             *CURRENT_SCHEMA_OBJECTS,
@@ -6389,9 +6474,9 @@ mod tests {
 
         migrate_with_sql(&mut conn, &migrations_through(58)).unwrap();
 
-        migrate_with_sql(&mut conn, &migrations_through(59)).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(60)).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 59);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 60);
         assert_eq!(
             conn.query_row(
                 "SELECT is_extern_crate, is_macro_use
@@ -6416,10 +6501,11 @@ mod tests {
             .is_err(),
             "the migrated column accepts only Boolean encodings"
         );
+        migrate(&mut conn).unwrap();
         assert_eq!(
             schema_object_definitions(&conn).unwrap(),
             *CURRENT_SCHEMA_OBJECTS,
-            "the migrated schema matches a fresh version-59 cache"
+            "a store carried to the current version matches a fresh one"
         );
     }
 
@@ -6516,6 +6602,111 @@ mod tests {
         );
         validate_foreign_keys(&conn).unwrap();
         assert!(quick_check_is_ok(&conn).unwrap());
+    }
+
+    /// Migration 0060 rejects policy units whose persisted read vocabulary was
+    /// recorded before declaration-fact and descendant lookups became precise.
+    #[test]
+    fn v59_policy_units_are_discarded_with_their_obsolete_read_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(59)).unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('1111111111111111111111111111111111111111', 'java', 0)",
+            [],
+        )
+        .unwrap();
+        let blob = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO policy_evaluations(
+                 base_tree_oid, policy_set_digest, options_digest,
+                 configuration_fingerprint, active_model_set_hash, engine_epoch,
+                 resolved_commit, published_at
+             ) VALUES(
+                 '2222222222222222222222222222222222222222',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                 '3333333333333333333333333333333333333333', 0)",
+            [],
+        )
+        .unwrap();
+        let evaluation = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO policy_units(
+                 policy_semantic_hash, family, partition_kind, seed_rel_path,
+                 seed_blob_oid, partition_digest, seed_blob_id, lang,
+                 configuration_fingerprint, active_model_set_hash, engine_epoch,
+                 completion, budget_mode, product_kind, product,
+                 read_set_digest, published_at
+             ) VALUES(
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'assertion', 'assert_file', 'src/Startup.java',
+                 '1111111111111111111111111111111111111111',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 ?1, 'java',
+                 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                 'complete', 'exhaustive', 'assert_file', '{}', zeroblob(32), 0)",
+            [blob],
+        )
+        .unwrap();
+        let unit = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO policy_read_keys(key_digest, kind, digest)
+             VALUES(zeroblob(32), 'configuration', zeroblob(32))",
+            [],
+        )
+        .unwrap();
+        let read = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO policy_unit_reads(unit_id, read_id) VALUES(?1, ?2)",
+            rusqlite::params![unit, read],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO policy_evaluation_units(evaluation_id, policy_id, unit_id)
+             VALUES(?1, 'test.policy', ?2)",
+            rusqlite::params![evaluation, unit],
+        )
+        .unwrap();
+
+        migrate_with_sql(&mut conn, &migrations_through(60)).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 60);
+        assert_eq!(
+            conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM policy_units),
+                    (SELECT COUNT(*) FROM policy_read_keys),
+                    (SELECT COUNT(*) FROM policy_evaluation_units),
+                    (SELECT COUNT(*) FROM policy_evaluations)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (0, 0, 0, 0),
+            "the derived evaluations, units, memberships, and reads are gone"
+        );
+        // The schema comparison is against a fresh store at the current
+        // version, so carry this one the rest of the way first.
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "a store carried to the current version matches a fresh one"
+        );
     }
 
     /// Version 28 removes the opaque identity copy without forcing a warm

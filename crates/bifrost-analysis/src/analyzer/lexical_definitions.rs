@@ -321,7 +321,7 @@ fn python_method_binding_with_step(
     Some(PythonMethodBinding::Instance)
 }
 
-fn parameter_owner_for_range<'tree>(
+pub(crate) fn parameter_owner_for_range<'tree>(
     language: Language,
     root: Node<'tree>,
     declaration_range: &Range,
@@ -851,6 +851,7 @@ fn parameter_roots_with_step<'tree>(
 
 fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<FormalVariadicKind> {
     use FormalVariadicKind::{Both, Keyword, Positional};
+    use brokk_bifrost_python::declarations::PythonParameterSplat;
     let kind = parameter.kind();
     match language {
         Language::Java => (kind == "spread_parameter").then_some(Positional),
@@ -860,11 +861,13 @@ fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<Form
                 .child_by_field_name("pattern")
                 .is_some_and(|pattern| pattern.kind() == "rest_pattern"))
         .then_some(Positional),
-        Language::Python => match kind {
-            "list_splat_pattern" => Some(Positional),
-            "dictionary_splat_pattern" => Some(Keyword),
-            _ => None,
-        },
+        Language::Python => {
+            match brokk_bifrost_python::declarations::python_parameter_splat(parameter) {
+                Some(PythonParameterSplat::Positional) => Some(Positional),
+                Some(PythonParameterSplat::Keyword) => Some(Keyword),
+                None => None,
+            }
+        }
         Language::Rust => (kind == "variadic_parameter").then_some(Positional),
         Language::Php => (kind == "variadic_parameter").then_some(Both),
         Language::Ruby => match kind {
@@ -1856,6 +1859,70 @@ mod tests {
             .expect("load Kotlin grammar");
         let tree = parser.parse(source, None).expect("parse Kotlin source");
         (parser, tree)
+    }
+
+    #[test]
+    fn an_annotated_python_splat_parameter_is_still_variadic() {
+        let source = concat!(
+            "def run(*cmd: str, check: bool = True, **kwargs: object):\n",
+            "    return cmd, check, kwargs\n",
+            "\n",
+            "def bare(*cmd, check=True, **kwargs):\n",
+            "    return cmd, check, kwargs\n",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("load Python grammar");
+        let tree = parser.parse(source, None).expect("parse Python source");
+        let mut definitions = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_definition" {
+                definitions.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(definitions.len(), 2);
+
+        // The annotation wraps the splat in a `typed_parameter`, which is the
+        // only difference between these two signatures.
+        for definition in definitions {
+            let layout = formal_parameter_slots_for_owner(Language::Python, definition, source)
+                .expect("python function declares formals");
+            let shape = layout
+                .slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.unique_name().map(String::from),
+                        slot.variadic,
+                        slot.passing_mode,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shape,
+                vec![
+                    (
+                        Some("cmd".to_owned()),
+                        Some(FormalVariadicKind::Positional),
+                        FormalParameterPassingMode::PositionalOnly
+                    ),
+                    (
+                        Some("check".to_owned()),
+                        None,
+                        FormalParameterPassingMode::NamedOnly
+                    ),
+                    (
+                        Some("kwargs".to_owned()),
+                        Some(FormalVariadicKind::Keyword),
+                        FormalParameterPassingMode::NamedOnly
+                    ),
+                ]
+            );
+        }
     }
 
     #[test]

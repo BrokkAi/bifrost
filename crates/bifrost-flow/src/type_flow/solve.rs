@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use brokk_bifrost_core::profiling;
 
-use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
     CandidateCoverage, ClassAtom, ClassIdentity, DispatchHint, DispatchHintCallSiteKey,
     DispatchHintSet, DispatchHints, IcfgProvider, MemberAccessKind, MemberLookup, MemberLookupHit,
@@ -27,6 +26,7 @@ use crate::analyzer::semantic::{
     WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
+use crate::analyzer::{AnalyzerQueryScope, WorkspaceAnalyzer};
 use crate::dataflow::{
     DataflowRequest, PathQuality, SolverTermination, SummaryWitness, SummaryWitnessError,
     WitnessReconstructionLimits, WitnessRetentionLimits,
@@ -36,12 +36,13 @@ use crate::value_flow::{
     ClosureLimits, DurableProcedureKey, ValueFlowCache, ValueFlowCarrier, ValueFlowMeeting,
     ValueFlowSinkId, ValueFlowSinkOutcome, ValueFlowSolveError, ValueFlowSummaryResult,
     WorkspaceValueFlowProvider, solve_value_flow_with_reusable_summaries,
-    solve_value_flow_with_witnesses,
+    solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
 };
 
 use super::FieldSlotIndex;
 use super::field_slots::{MemberStoreEvidence, class_order};
 use super::plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason};
+use super::refinement_sources::DefinitionSources;
 use super::summary::{
     ClassSetAcquisitionCuts, PreparedClassSetSummaries, TypeFlowSummaryProfile,
     TypeFlowSummaryState,
@@ -100,6 +101,7 @@ pub struct ReceiverClassSet {
     /// the Known set instead of repeating a language query.
     pub member_declarations: Vec<(ClassIdentity, MemberLookupHit)>,
     pub unknown: Vec<UnknownReason>,
+    pub dynamic_writes: Vec<super::dynamic_stores::DynamicWriteEvidence>,
     pub status: ClassSetStatus,
 }
 
@@ -318,6 +320,12 @@ pub fn solve_type_flow_for_root(
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TypeFlowRootResult, TypeFlowError> {
+    let _semantic_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        workspace.analyzer(),
+        active_semantic_model_snapshot.clone(),
+    );
+    let _cancellation_scope =
+        AnalyzerQueryScope::with_cancellation(workspace.analyzer(), request.cancellation);
     let mut dispatch_hints = DispatchHints::empty();
     let mut previous: Option<TypeFlowRootResult> = None;
     let mut summary_profile = TypeFlowSummaryProfile::default();
@@ -382,7 +390,7 @@ pub fn solve_type_flow_for_root(
                 )
             };
             let plan_cache_writes = discovery_provider.take_retained_writes();
-            let plan = match plan_result {
+            let mut plan = match plan_result {
                 Ok(plan) => plan,
                 Err(error) => {
                     if plan_cache_writes {
@@ -391,10 +399,93 @@ pub fn solve_type_flow_for_root(
                     return Err(error.into());
                 }
             };
-            persistence.observe_provider_failure(plan.provider_failure_observed());
             if plan_cache_writes {
                 *semantic_budget = iteration_budget.clone();
             }
+            if plan.needs_source_refinement() && !plan.refinement_budget_exhausted() {
+                if plan.has_summary_cuts() {
+                    *semantic_budget = iteration_budget;
+                    require_full_plan = true;
+                    continue 'plan_attempt;
+                }
+                loop {
+                    // Collect complete may-source evidence before deriving any
+                    // exclusions. This trial never publishes reusable summaries.
+                    let preliminary = solve_value_flow_with_summaries(
+                        root,
+                        &provider,
+                        plan.value_flow(),
+                        &mut iteration_budget,
+                        request,
+                    )?;
+                    let preliminary_status =
+                        interpret(workspace, adapter, field_slots, root, &plan, &preliminary);
+                    if !preliminary_status.complete || preliminary_status.semantic_budget_exhausted
+                    {
+                        if preliminary_status.semantic_budget_exhausted {
+                            plan.mark_refinement_budget_exhausted();
+                        }
+                        let interpreted =
+                            interpret(workspace, adapter, field_slots, root, &plan, &preliminary);
+                        break 'plan_attempt (
+                            plan,
+                            interpreted,
+                            iteration_budget,
+                            Default::default(),
+                            false,
+                        );
+                    }
+                    let refinement = DefinitionSources::new(
+                        &preliminary,
+                        &mut iteration_budget,
+                        request.cancellation,
+                    )
+                    .map_err(TypeFlowPlanError::from)
+                    .and_then(|evidence| {
+                        plan.refine_sources(
+                            workspace,
+                            adapter,
+                            field_slots,
+                            &evidence,
+                            &mut iteration_budget,
+                            request.cancellation,
+                        )
+                    });
+                    match refinement {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(TypeFlowPlanError::RefinementBudget(_)) => {
+                            plan.mark_refinement_budget_exhausted();
+                            break;
+                        }
+                        Err(error) => {
+                            *semantic_budget = iteration_budget;
+                            return Err(error.into());
+                        }
+                    }
+                    if request.cancellation.is_cancelled() {
+                        return Err(TypeFlowPlanError::Cancelled.into());
+                    }
+                }
+            }
+            if plan.refinement_budget_exhausted() || plan.store_survey_boundary().is_some() {
+                let result = solve_value_flow_with_summaries(
+                    root,
+                    &provider,
+                    plan.value_flow(),
+                    &mut iteration_budget,
+                    request,
+                )?;
+                let interpreted = interpret(workspace, adapter, field_slots, root, &plan, &result);
+                break 'plan_attempt (
+                    plan,
+                    interpreted,
+                    iteration_budget,
+                    Default::default(),
+                    false,
+                );
+            }
+            persistence.observe_provider_failure(plan.provider_failure_observed());
             let cut_manifest = if require_full_plan {
                 Default::default()
             } else {
@@ -741,7 +832,9 @@ fn interpret(
     result: &ValueFlowSummaryResult,
 ) -> TypeFlowRootResult {
     let termination = result.result().termination();
-    let complete = termination.is_fixed_point();
+    let complete = termination.is_fixed_point()
+        && !plan.refinement_budget_exhausted()
+        && plan.store_survey_boundary().is_none();
     let semantic_budget_exhausted = plan.field_slot_semantic_budget_exhausted()
         || plan
             .value_flow()
@@ -752,7 +845,7 @@ fn interpret(
     let mut findings = Vec::new();
     for (sink_id, _) in plan.value_flow().sinks() {
         let site = plan.sink(sink_id).clone();
-        let set = match result.sink_outcome(sink_id) {
+        let mut set = match result.sink_outcome(sink_id) {
             ValueFlowSinkOutcome::Reached(meetings) => reached_class_set(
                 workspace,
                 adapter,
@@ -769,6 +862,7 @@ fn interpret(
                 classes: Vec::new(),
                 member_declarations: Vec::new(),
                 unknown: Vec::new(),
+                dynamic_writes: Vec::new(),
                 status: ClassSetStatus::NoInformation,
             },
             // An unreached sink under an incomplete root must name why; an
@@ -781,6 +875,7 @@ fn interpret(
                     site,
                     classes: Vec::new(),
                     member_declarations: Vec::new(),
+                    dynamic_writes: Vec::new(),
                     unknown: vec![unreached_reason(
                         plan,
                         sink_id,
@@ -791,7 +886,18 @@ fn interpret(
                 }
             }
         };
+        if let Some(reason) = plan.store_survey_boundary() {
+            push_reason(&mut set.unknown, reason);
+            set.status = ClassSetStatus::Inconclusive;
+        }
+        if plan.refinement_budget_exhausted() {
+            push_reason(&mut set.unknown, UnknownReason::SemanticBudget);
+            set.status = ClassSetStatus::Inconclusive;
+        }
         class_sets.push(set);
+    }
+    if plan.refinement_budget_exhausted() || plan.store_survey_boundary().is_some() {
+        findings.clear();
     }
     let mut distinct_findings: Vec<AbsentMemberFinding> = Vec::new();
     for finding in findings {
@@ -877,6 +983,7 @@ fn reached_class_set(
     let mut class_meetings: Vec<&ValueFlowMeeting> = Vec::new();
     let mut member_declarations = Vec::new();
     let mut unknown: Vec<UnknownReason> = Vec::new();
+    let mut dynamic_writes = Vec::new();
     for meeting in meetings {
         if meeting.is_uncertain() {
             push_reason(&mut unknown, UnknownReason::UncertainFlow);
@@ -918,14 +1025,18 @@ fn reached_class_set(
                     class_meetings.push(meeting);
                 }
             }
-            ClassAtom::Unknown(reason) => push_reason(&mut unknown, *reason),
+            ClassAtom::Unknown(reason) => push_reason(&mut unknown, reason.clone()),
         }
     }
     let mut ordered_classes = classes.into_iter().zip(class_meetings).collect::<Vec<_>>();
     ordered_classes.sort_unstable_by(|((left, _), _), ((right, _), _)| class_order(left, right));
     let (classes, class_meetings): (Vec<(ClassIdentity, SourceSite)>, Vec<&ValueFlowMeeting>) =
         ordered_classes.into_iter().unzip();
-    unknown.sort_unstable_by_key(|reason| reason.label());
+    unknown.sort_unstable_by(|left, right| {
+        left.label()
+            .cmp(right.label())
+            .then_with(|| left.cmp(right))
+    });
     let mut status = if !unknown.is_empty() {
         ClassSetStatus::Partial
     } else if classes.is_empty() {
@@ -940,7 +1051,21 @@ fn reached_class_set(
         let complete_receiver_set = status == ClassSetStatus::Known;
         let mut absent: Vec<usize> = Vec::new();
         for (index, (identity, _)) in classes.iter().enumerate() {
-            match adapter.member_lookup(workspace, site.kind, identity, &site.member) {
+            let lookup = adapter.member_lookup(workspace, site.kind, identity, &site.member);
+            if matches!(
+                lookup,
+                MemberLookup::Absent | MemberLookup::DeclarationAbsent
+            ) {
+                for evidence in field_slots.dynamic_write_evidence(identity) {
+                    if !dynamic_writes.contains(evidence) {
+                        dynamic_writes.push(evidence.clone());
+                    }
+                }
+                if !dynamic_writes.is_empty() {
+                    push_reason(&mut unknown, UnknownReason::DynamicFieldWrite);
+                }
+            }
+            match lookup {
                 MemberLookup::Present(hit) => {
                     member_declarations.push((identity.clone(), hit));
                 }
@@ -984,6 +1109,7 @@ fn reached_class_set(
         classes,
         member_declarations,
         unknown,
+        dynamic_writes,
         status,
     }
 }

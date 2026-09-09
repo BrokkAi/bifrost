@@ -5,7 +5,7 @@ use crate::analyzer::{
     ProjectFile,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::analyzer::{RevisionBlobIdentities, RevisionWorkspaceProjection, SharedAnalyzerCache};
+use crate::analyzer::{RevisionBlobIdentities, SharedAnalyzerCache, WorkspaceProjectionLease};
 use crate::gitblob::resolve_default_branch_ref;
 use crate::profiling;
 use crate::searchtools::{
@@ -1835,7 +1835,7 @@ impl RevisionExport {
 /// naming a temp-directory root are gone before the request returns.
 pub struct RevisionWorkspace {
     workspace: WorkspaceAnalyzer,
-    _projection: RevisionWorkspaceProjection,
+    _projection: WorkspaceProjectionLease,
 }
 
 impl RevisionWorkspace {
@@ -3688,7 +3688,7 @@ pub(crate) fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<Workspace
 /// naming a temp-directory root are gone before the request returns.
 pub(crate) struct RevisionAnalyzer {
     workspace: WorkspaceAnalyzer,
-    _projection: Option<RevisionWorkspaceProjection>,
+    _projection: Option<WorkspaceProjectionLease>,
 }
 
 impl RevisionAnalyzer {

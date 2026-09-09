@@ -2,7 +2,7 @@ use super::inline_project::BuiltInlineTestProject;
 use super::*;
 use crate::structural::search::units::{
     CodeQueryExecutionScope, MergedUnitRows, UnitExecutionResult, execute_code_query_unit,
-    merge_unit_rows, seed_file_order,
+    merge_unit_rows, plan_seed_files, seed_file_order,
 };
 
 /// Eight files so the whole execution clears the auto structural-index
@@ -53,6 +53,37 @@ fn callers_query() -> CodeQuery {
     .expect("callers query")
 }
 
+fn overlapping_union_query() -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "union": [
+            { "match": { "kind": "function", "name": { "regex": "^target" } } },
+            { "match": { "kind": "function" } }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("overlapping union query")
+}
+
+fn nested_union_query() -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
+        "union": [
+            {
+                "union": [
+                    { "match": { "kind": "function", "name": { "regex": "^target" } } },
+                    { "match": { "kind": "function" } }
+                ]
+            },
+            { "match": { "kind": "function", "name": "caller0" } }
+        ],
+        "limit": 500,
+        "result_detail": "full"
+    }))
+    .expect("nested union query")
+}
+
 /// The whole execution's rows in the projection a unit product carries.
 ///
 /// A unit merges projected rows, not rendered ones, so the partition property
@@ -96,7 +127,7 @@ fn merged(
     query: &CodeQuery,
     seed_files: &[ProjectFile],
 ) -> MergedUnitRows {
-    merge_unit_rows(units(workspace, query, seed_files))
+    merge_unit_rows(query, units(workspace, query, seed_files))
 }
 
 fn seed_files_of(workspace: &WorkspaceAnalyzer) -> Vec<ProjectFile> {
@@ -123,6 +154,59 @@ fn merged_structural_units_reproduce_the_whole_execution() {
         "the evidence projection rebuilds the executor's own evidence"
     );
     assert_eq!(merged.completion(), whole.result.completion());
+}
+
+#[test]
+fn merged_overlapping_union_units_reproduce_branch_order_and_evidence() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let files = plan_seed_files(
+        &overlapping_union_query().plan,
+        &workspace.analyzer().analyzed_files(),
+    );
+    let query = overlapping_union_query();
+    let whole = whole_execution(&workspace, &query);
+    let merged = merged(&workspace, &query, &files);
+
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+    assert_eq!(merged.completion(), whole.result.completion());
+}
+
+#[test]
+fn merged_nested_union_units_reproduce_full_branch_paths() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = nested_union_query();
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let whole = whole_execution(&workspace, &query);
+    let merged = merged(&workspace, &query, &files);
+
+    assert_eq!(merged.items, projected(&whole.result.results));
+    assert_eq!(merged.detailed_evidence(project.root()), whole.evidence);
+}
+
+#[test]
+fn union_merge_widens_when_the_conservative_fair_cap_is_reached() {
+    let project = eight_file_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = overlapping_union_query();
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let merged = merged(&workspace, &query, &files);
+    let limits = CodeQueryExecutionLimits {
+        max_scanned_files: usize::try_from(
+            merged.work.scanned_files + merged.budgeted_work.import_files_resolved,
+        )
+        .expect("fixture scan count fits usize")
+            + 1,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    assert_eq!(
+        merged.reached_limit(&limits, query.limit),
+        Some(crate::structural::search::units::MergedLimit::ScannedFiles),
+        "a root union's physical budget is divided by its branch count"
+    );
 }
 
 #[test]
@@ -454,7 +538,7 @@ fn a_broad_query_advises_on_the_execution_that_paid_for_it() {
         "no single-file unit scans enough to raise the advisory"
     );
 
-    let merged = merge_unit_rows(units);
+    let merged = merge_unit_rows(&query, units);
     assert_eq!(
         merged.items,
         projected(&whole.result.results),

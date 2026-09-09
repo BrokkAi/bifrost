@@ -15,14 +15,17 @@ use std::path::Path;
 use brokk_bifrost_core::profiling;
 
 use crate::analyzer::read_ledger::ReadKey;
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, postdominators,
+};
 use crate::analyzer::semantic::{
     CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
     DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, MemberAccessKind,
     MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict, ProcedureHandle,
     ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
     SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind,
-    SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
-    ValueFlowSnapshot,
+    SemanticWork, SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter,
+    UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -41,9 +44,12 @@ use crate::value_flow::{
 };
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
+use super::binding_refinement::{self, GuardBindings};
+use super::correlations::{CorrelationAnalysis, CorrelationError, analyze_correlations};
+use super::field_refinement::{self, FieldLoadRefinement, FieldVersion};
 use super::field_slots::{FieldSlotIndex, MemberStoreEvidence, receiver_values};
+use super::refinement_sources::DefinitionSources;
 use super::summary::class_set_local_structure_digest;
-use crate::scalar_state::BindingOriginIndex;
 
 /// Restrict the dependency relation to transfers that preserve runtime class.
 /// Computation result seeds are added separately by `seed_procedure`.
@@ -93,13 +99,19 @@ pub struct TypeFlowPlan {
     value_flow: ValueFlowPlan,
     atoms: Vec<ClassAtom>,
     source_sites: Vec<SourceSite>,
+    member_surface_sources: HashSet<ValueFlowEventKey>,
     sinks: Vec<MemberAccessSite>,
     coverage: HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
     dispatch_reads: HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
     local_structure_digests: HashMap<DurableProcedureKey, StableDigest>,
     summary_cuts: HashSet<DurableProcedureKey>,
     field_slot_semantic_budget_exhausted: bool,
+    store_survey_boundary: Option<UnknownReason>,
     provider_failure_observed: bool,
+    field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
+    refinement_budget_exhausted: bool,
+    correlations: Vec<(ProcedureHandle, CorrelationAnalysis)>,
+    guard_bindings: HashMap<DurableProcedureKey, GuardBindings>,
 }
 
 fn closure_has_provider_failure(closure: &DiscoveredClosure) -> bool {
@@ -198,7 +210,9 @@ pub enum TypeFlowPlanError {
     RootRelationsUnavailable,
     WorkspaceEnumeration(std::io::Error),
     Cancelled,
+    RefinementBudget(crate::analyzer::semantic::SemanticBudgetExceeded),
     Flow(ValueFlowPlanError),
+    GuardControl(CfgAlgorithmError<ProgramPointId>),
     ExternalSummary(ProcedureSummaryBindingError),
 }
 
@@ -212,8 +226,17 @@ impl fmt::Display for TypeFlowPlanError {
             Self::WorkspaceEnumeration(error) => {
                 write!(formatter, "type-flow workspace enumeration failed: {error}")
             }
-            Self::Cancelled => formatter.write_str("type-flow field-slot scan was cancelled"),
+            Self::Cancelled => formatter.write_str("type-flow refinement was cancelled"),
+            Self::RefinementBudget(error) => {
+                write!(formatter, "type-flow refinement budget exhausted: {error}")
+            }
             Self::Flow(error) => write!(formatter, "type-flow value-flow plan failed: {error}"),
+            Self::GuardControl(error) => {
+                write!(
+                    formatter,
+                    "type-flow guard control analysis failed: {error:?}"
+                )
+            }
             Self::ExternalSummary(error) => {
                 write!(
                     formatter,
@@ -226,6 +249,15 @@ impl fmt::Display for TypeFlowPlanError {
 
 impl Error for TypeFlowPlanError {}
 
+impl From<CorrelationError> for TypeFlowPlanError {
+    fn from(error: CorrelationError) -> Self {
+        match error {
+            CorrelationError::Budget(error) => Self::RefinementBudget(error),
+            CorrelationError::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+}
+
 impl From<ValueFlowPlanError> for TypeFlowPlanError {
     fn from(error: ValueFlowPlanError) -> Self {
         Self::Flow(error)
@@ -236,9 +268,10 @@ impl From<ValueFlowPlanError> for TypeFlowPlanError {
 struct SeedTables {
     sources: Vec<(ValueFlowSourceSpec, ClassAtom, SourceSite)>,
     sinks: Vec<(ValueFlowSinkSpec, MemberAccessSite)>,
-    /// Distinct ordinals for several specs at one program point, reset per
-    /// procedure because `ProgramPointId` is procedure-local.
-    ordinals: HashMap<(ProgramPointId, ValueFlowEventKind), u32>,
+    member_surface_sources: HashSet<ValueFlowEventKey>,
+    /// Distinct ordinals at each stable source location. Several program
+    /// points can share a source mapping.
+    ordinals: HashMap<(SemanticLocator, ValueFlowEventKind), u32>,
 }
 
 impl SeedTables {
@@ -247,6 +280,7 @@ impl SeedTables {
             sources: Vec::new(),
             sinks: Vec::new(),
             ordinals: HashMap::default(),
+            member_surface_sources: HashSet::default(),
         }
     }
 
@@ -271,6 +305,31 @@ impl SeedTables {
             atom,
             site,
         ));
+    }
+
+    fn push_member_surface_source(
+        &mut self,
+        point: &ProgramPointHandle,
+        carrier: ValueFlowCarrier,
+        atom: ClassAtom,
+        site: SourceSite,
+    ) {
+        assert!(matches!(atom, ClassAtom::Unknown(_)));
+        self.push_source(
+            point,
+            ValueFlowObservationPhase::BeforeEffects,
+            carrier,
+            atom,
+            site,
+        );
+        self.member_surface_sources.insert(
+            self.sources
+                .last()
+                .expect("the source was just inserted")
+                .0
+                .key()
+                .clone(),
+        );
     }
 
     fn push_sink(
@@ -298,7 +357,12 @@ impl SeedTables {
         point: &ProgramPointHandle,
         kind: ValueFlowEventKind,
     ) -> ValueFlowEventKey {
-        let ordinal = self.ordinals.entry((point.id(), kind)).or_insert(0);
+        let base = ValueFlowEventKey::at_point(point, 0, kind)
+            .expect("a live point retains its source mapping");
+        let ordinal = self
+            .ordinals
+            .entry((base.site().clone(), kind))
+            .or_insert(0);
         let key = ValueFlowEventKey::at_point(point, *ordinal, kind)
             .expect("a live point with a retained source mapping yields an event key");
         *ordinal += 1;
@@ -348,20 +412,76 @@ fn call_result_anchor(
     Some((point, carrier))
 }
 
-fn guard_edge_kills(
+fn narrowing_member_lookup(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
+    class: &ClassIdentity,
+    member: &str,
+) -> MemberLookup {
+    match adapter.member_lookup(workspace, MemberAccessKind::Load, class, member) {
+        MemberLookup::Absent | MemberLookup::DeclarationAbsent
+            if field_slots.dynamic_write_evidence(class).next().is_some() =>
+        {
+            MemberLookup::Unknown(UnknownReason::DynamicFieldWrite)
+        }
+        MemberLookup::DeclarationAbsent => {
+            match field_slots.member_store_evidence(workspace, adapter, class, member) {
+                MemberStoreEvidence::NoStore => MemberLookup::Absent,
+                MemberStoreEvidence::Stored | MemberStoreEvidence::Unknown => {
+                    MemberLookup::Unknown(UnknownReason::FieldSlotIncomplete)
+                }
+            }
+        }
+        result => result,
+    }
+}
+
+fn field_atom_survives(
+    workspace: &WorkspaceAnalyzer,
+    adapter: &dyn TypeFlowAdapter,
+    field_slots: &FieldSlotIndex,
+    procedure: &ProcedureHandle,
+    refinement: &FieldLoadRefinement,
+    atom: &ClassAtom,
+) -> bool {
+    let ClassAtom::Class(class) = atom else {
+        return true;
+    };
+    let member_lookup = |class: &ClassIdentity, member: &str| {
+        narrowing_member_lookup(workspace, adapter, field_slots, class, member)
+    };
+    refinement.alternatives.iter().any(|alternative| {
+        alternative.guards.iter().all(|&(index, truth)| {
+            let verdicts = adapter.narrowing_verdicts(
+                workspace,
+                procedure,
+                &procedure.semantics().guard_facts()[index],
+                &[class],
+                &member_lookup,
+            );
+            assert_eq!(verdicts.len(), 1, "one verdict for the field candidate");
+            !matches!(
+                (&verdicts[0], truth),
+                (NarrowingVerdict::Drop, true) | (NarrowingVerdict::Keep, false)
+            )
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guard_transfers(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
     field_slots: &FieldSlotIndex,
     procedures: &[ProcedureHandle],
-    sources: &[ValueFlowSourceSpec],
-    atoms_by_key: &HashMap<ValueFlowEventKey, (ClassAtom, SourceSite)>,
-) -> Vec<ValueFlowEdgeKillSpec> {
+    tables: &mut SeedTables,
+    guard_bindings: &HashMap<DurableProcedureKey, GuardBindings>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<ValueFlowEdgeKillSpec>, TypeFlowPlanError> {
     let mut sources_by_class = HashMap::<ClassIdentity, Vec<ValueFlowEventKey>>::default();
-    for source in sources {
-        let (ClassAtom::Class(atom), _) = atoms_by_key
-            .get(source.key())
-            .expect("every source spec retains its class atom")
-        else {
+    for (source, atom, _) in &tables.sources {
+        let ClassAtom::Class(atom) = atom else {
             continue;
         };
         sources_by_class
@@ -375,47 +495,148 @@ fn guard_edge_kills(
         .iter()
         .map(|(class, _)| *class)
         .collect::<Vec<_>>();
+    let member_lookup = |class: &ClassIdentity, member: &str| {
+        narrowing_member_lookup(workspace, adapter, field_slots, class, member)
+    };
+    let mut cfg_budget = CfgAlgorithmBudget::default();
     for procedure in procedures {
-        let origins = BindingOriginIndex::new(procedure);
-        for guard in procedure.semantics().guard_facts() {
-            let constrained = match guard.predicate {
-                GuardPredicate::InstanceOf { value, .. }
-                | GuardPredicate::HasMember { value, .. } => Some(value),
-                GuardPredicate::NullComparison { .. } => guard.subject,
-                GuardPredicate::ConstantBoolean { .. }
-                | GuardPredicate::ConstantEquality { .. }
-                | GuardPredicate::Opaque { .. } => None,
-            };
-            let Some(binding) = constrained.and_then(|value| origins.unique_binding_origin(value))
-            else {
-                continue;
-            };
-            let carrier = binding_carrier(procedure, binding);
+        let Some(bindings) = guard_bindings.get(&procedure.durable_key()) else {
+            continue;
+        };
+        let mut joins = None;
+        for (guard_index, guard) in procedure.semantics().guard_facts().iter().enumerate() {
             if classes.is_empty() || (guard.true_edge.is_none() && guard.false_edge.is_none()) {
                 continue;
             }
-            let member_lookup = |class: &ClassIdentity, member: &str| {
-                match adapter.member_lookup(workspace, MemberAccessKind::Load, class, member) {
-                    MemberLookup::DeclarationAbsent => {
-                        match field_slots.member_store_evidence(workspace, adapter, class, member) {
-                            MemberStoreEvidence::NoStore => MemberLookup::Absent,
-                            // A store can be conditional. It defeats absence
-                            // but does not prove that a guard is always true.
-                            MemberStoreEvidence::Stored | MemberStoreEvidence::Unknown => {
-                                MemberLookup::Unknown(UnknownReason::FieldSlotIncomplete)
-                            }
-                        }
-                    }
-                    result => result,
+            let (binding, call_verdicts) = match guard.predicate {
+                GuardPredicate::InstanceOf { .. }
+                | GuardPredicate::ExactClass { .. }
+                | GuardPredicate::HasMember { .. }
+                | GuardPredicate::Truthy { .. }
+                | GuardPredicate::NullComparison { .. } => {
+                    (bindings.binding_for_guard(guard_index), None)
                 }
+                GuardPredicate::Opaque { .. } => {
+                    let Some((value, verdicts)) = adapter.call_guard_narrowing(
+                        workspace,
+                        procedure,
+                        guard,
+                        &classes,
+                        &member_lookup,
+                    ) else {
+                        continue;
+                    };
+                    (
+                        bindings.binding_at_point(guard.point, value),
+                        Some(verdicts),
+                    )
+                }
+                GuardPredicate::ConstantBoolean { .. }
+                | GuardPredicate::ConstantEquality { .. } => continue,
             };
-            let verdicts =
-                adapter.narrowing_verdicts(workspace, procedure, guard, &classes, &member_lookup);
+            let Some(binding) = binding else {
+                continue;
+            };
+            let carrier = binding_carrier(procedure, binding);
+            let verdicts = call_verdicts.unwrap_or_else(|| {
+                adapter.narrowing_verdicts(workspace, procedure, guard, &classes, &member_lookup)
+            });
             assert_eq!(
                 verdicts.len(),
                 classes.len(),
                 "one guard verdict per candidate class"
             );
+            let mut remainders = HashMap::<UnknownReason, Vec<ValueFlowEventKey>>::default();
+            for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
+                if let NarrowingVerdict::Incomplete(reason) = verdict {
+                    remainders
+                        .entry(reason.clone())
+                        .or_default()
+                        .extend(atom_sources.iter().cloned());
+                }
+            }
+            if guard.true_edge.is_some() && !remainders.is_empty() {
+                let semantics = procedure.semantics();
+                if joins.is_none() {
+                    joins = Some(
+                        postdominators(
+                            semantics,
+                            semantics.entry_point(),
+                            semantics.normal_exit_point(),
+                            semantics.exceptional_exit_point(),
+                            &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
+                        )
+                        .map_err(TypeFlowPlanError::GuardControl)?,
+                    );
+                }
+                let join = joins
+                    .as_ref()
+                    .expect("guard postdominators were computed")
+                    .immediate_postdominator(semantics, guard.point);
+                let point = procedure
+                    .point_handle(guard.point)
+                    .expect("a retained guard point is live");
+                let mut remainders = remainders.into_iter().collect::<Vec<_>>();
+                remainders.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                for (reason, inputs) in remainders {
+                    let site = source_site(
+                        workspace,
+                        procedure,
+                        mapping_span(procedure, guard.source),
+                        SourceSiteKind::Unknown,
+                    )
+                    .expect("a workspace guard retains its source file");
+                    let key = tables.event_key(&point, ValueFlowEventKind::Source);
+                    tables.sources.push((
+                        ValueFlowSourceSpec::new(
+                            key.clone(),
+                            point.clone(),
+                            ValueFlowObservationPhase::AfterEffects,
+                            carrier.clone(),
+                            ProofStatus::Proven,
+                            EvidenceCompleteness::Complete,
+                        )
+                        .when_sources_reach(inputs),
+                        ClassAtom::Unknown(reason),
+                        site,
+                    ));
+                    // The source requires an undecidable candidate on the
+                    // guarded binding. Zero can reach an infeasible arm, but
+                    // must not manufacture a remainder there.
+                    for (edge_id, edge) in semantics.successor_edges(guard.point) {
+                        if Some(edge_id) != guard.true_edge {
+                            kills.push(ValueFlowEdgeKillSpec {
+                                point: point.clone(),
+                                target: edge.target_point,
+                                kind: edge.kind,
+                                carrier: carrier.clone(),
+                                sources: vec![key.clone()],
+                            });
+                        }
+                    }
+                    // The guard conditions this binding only until its false
+                    // arm or reconvergence. A later conjunct can also reach
+                    // the false arm. Copies made inside the protected arm keep
+                    // their remainder on their own carriers.
+                    let false_target = guard
+                        .false_edge
+                        .and_then(|edge| semantics.control_edge(edge))
+                        .map(|edge| edge.target_point);
+                    for target in [false_target, join].into_iter().flatten() {
+                        for (_, edge) in semantics.predecessor_edges(target) {
+                            kills.push(ValueFlowEdgeKillSpec {
+                                point: procedure
+                                    .point_handle(edge.source_point)
+                                    .expect("a retained predecessor point is live"),
+                                target,
+                                kind: edge.kind,
+                                carrier: carrier.clone(),
+                                sources: vec![key.clone()],
+                            });
+                        }
+                    }
+                }
+            }
             for (dropped_verdict, edge_id) in [
                 (NarrowingVerdict::Drop, guard.true_edge),
                 (NarrowingVerdict::Keep, guard.false_edge),
@@ -470,7 +691,7 @@ fn guard_edge_kills(
                 {
                     continue;
                 }
-                let Some(binding) = origins.unique_binding_origin(constraint.subject) else {
+                let Some(binding) = bindings.binding_at_point(normal, constraint.subject) else {
                     continue;
                 };
                 let mut dropped = Vec::new();
@@ -502,34 +723,18 @@ fn guard_edge_kills(
             }
         }
     }
-    kills
+    Ok(kills)
 }
 
 fn binding_carrier(
     procedure: &ProcedureHandle,
     binding: crate::analyzer::semantic::ValueId,
 ) -> ValueFlowCarrier {
-    match &procedure
-        .semantics()
-        .value(binding)
-        .expect("a binding origin is live in its procedure")
-        .kind
-    {
-        SemanticValueKind::Parameter { ordinal, .. } => ValueFlowCarrier::Port(
-            ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
-                .expect("the ordinal comes from a retained parameter value"),
-        ),
-        SemanticValueKind::Receiver { .. } => ValueFlowCarrier::Port(
-            ProcedurePortHandle::receiver(procedure.clone())
-                .expect("the procedure retains its receiver value"),
-        ),
-        SemanticValueKind::Local => ValueFlowCarrier::Value(
-            procedure
-                .value_handle(binding)
-                .expect("a local binding origin is live"),
-        ),
-        kind => unreachable!("binding origin has unsupported kind: {kind:?}"),
-    }
+    ValueFlowCarrier::from(ValueFlowEndpoint::for_value(
+        procedure
+            .value_handle(binding)
+            .expect("a binding origin is live in its procedure"),
+    ))
 }
 
 impl TypeFlowPlan {
@@ -631,8 +836,64 @@ impl TypeFlowPlan {
         unmaterialized_external_targets.sort_unstable();
         unmaterialized_external_targets.dedup();
         let mut tables = SeedTables::new();
+        let mut field_refinements = Vec::new();
+        let mut refinement_budget_exhausted = false;
+        let mut correlations = Vec::new();
+        let mut guard_bindings = HashMap::default();
         for procedure in &closure.procedures {
-            tables.ordinals.clear();
+            match binding_refinement::derive(procedure, semantic_budget, cancellation) {
+                Ok(bindings) => {
+                    guard_bindings.insert(procedure.durable_key(), bindings);
+                }
+                Err(CorrelationError::Budget(_)) => refinement_budget_exhausted = true,
+                Err(CorrelationError::Cancelled { .. }) => {
+                    return Err(TypeFlowPlanError::Cancelled);
+                }
+            }
+            match analyze_correlations(procedure, semantic_budget, Some(cancellation)) {
+                Ok(mut analysis) => {
+                    analysis
+                        .guard_edge_exclusions
+                        .retain(|candidate| !candidate.incompatible_data_defs.is_empty());
+                    if !analysis.guard_edge_exclusions.is_empty() {
+                        correlations.push((procedure.clone(), analysis));
+                    }
+                }
+                Err(CorrelationError::Budget(_)) => refinement_budget_exhausted = true,
+                Err(CorrelationError::Cancelled { .. }) => {
+                    return Err(TypeFlowPlanError::Cancelled);
+                }
+            }
+            let fields = if let Some(class) = adapter.enclosing_class(workspace, procedure) {
+                match field_refinement::derive(
+                    workspace,
+                    adapter,
+                    procedure,
+                    closure
+                        .snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.value().procedure() == procedure)
+                        .map(|snapshot| snapshot.value()),
+                    &class,
+                    field_slots,
+                    semantic_budget,
+                    cancellation,
+                ) {
+                    Ok(fields) => fields,
+                    Err(CorrelationError::Budget(_)) => {
+                        refinement_budget_exhausted = true;
+                        Vec::new()
+                    }
+                    Err(CorrelationError::Cancelled { .. }) => {
+                        return Err(TypeFlowPlanError::Cancelled);
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            if cancellation.is_cancelled() {
+                return Err(TypeFlowPlanError::Cancelled);
+            }
             seed_procedure(
                 workspace,
                 adapter,
@@ -641,9 +902,25 @@ impl TypeFlowPlan {
                 root_key.clone(),
                 procedure,
                 &mut tables,
+                &fields,
             );
+            field_refinements.extend(fields.into_iter().map(|field| (procedure.clone(), field)));
         }
-        let SeedTables { sources, sinks, .. } = tables;
+        let edge_kills = guard_transfers(
+            workspace,
+            adapter,
+            field_slots,
+            &closure.procedures,
+            &mut tables,
+            &guard_bindings,
+            cancellation,
+        )?;
+        let SeedTables {
+            sources,
+            sinks,
+            member_surface_sources,
+            ..
+        } = tables;
         // The ValueFlowPlan sorts specs by event key and rejects duplicates,
         // so the atom and site of every spec stay recoverable by key.
         let mut source_specs = Vec::with_capacity(sources.len());
@@ -652,14 +929,6 @@ impl TypeFlowPlan {
             atoms_by_key.insert(spec.key().clone(), (atom, site));
             source_specs.push(spec);
         }
-        let edge_kills = guard_edge_kills(
-            workspace,
-            adapter,
-            field_slots,
-            &closure.procedures,
-            &source_specs,
-            &atoms_by_key,
-        );
         let mut sink_specs = Vec::with_capacity(sinks.len());
         let mut sites_by_key = HashMap::default();
         for (spec, site) in sinks {
@@ -672,7 +941,21 @@ impl TypeFlowPlan {
             closure
                 .snapshots
                 .into_iter()
-                .map(class_set_snapshot)
+                .map(|input| {
+                    let (snapshot, status) = input.into_parts();
+                    let procedure = snapshot.procedure().clone();
+                    // Field versions supply these load results, including
+                    // explicit open alternatives. Ordinary heap loads would
+                    // bypass that replacement and resurrect overwritten values
+                    // whenever repeated accesses share a canonical location.
+                    let snapshot = snapshot.without_memory_loads_into(
+                        field_refinements
+                            .iter()
+                            .filter(|(owner, _)| owner == &procedure)
+                            .map(|(_, field)| (field.point, field.result)),
+                    );
+                    class_set_snapshot(ValueFlowInput::new(snapshot, status))
+                })
                 .collect(),
             closure.bindings,
             source_specs,
@@ -740,18 +1023,416 @@ impl TypeFlowPlan {
             value_flow,
             atoms,
             source_sites,
+            member_surface_sources,
             sinks: member_sites,
             coverage: closure.coverage,
             dispatch_reads,
             local_structure_digests,
             summary_cuts,
-            field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted(),
+            store_survey_boundary: field_slots.dynamic_survey_boundary(),
+            field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted()
+                || refinement_budget_exhausted,
             provider_failure_observed,
+            field_refinements,
+            refinement_budget_exhausted,
+            correlations,
+            guard_bindings,
         })
+    }
+
+    pub(super) fn discovery_boundary(&self) -> Option<UnknownReason> {
+        if self.field_slot_semantic_budget_exhausted || self.refinement_budget_exhausted {
+            Some(UnknownReason::SemanticBudget)
+        } else if self.provider_failure_observed {
+            Some(UnknownReason::IncompleteRoot)
+        } else if self.coverage.values().any(|coverage| coverage.truncated) {
+            Some(UnknownReason::Truncated)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn store_survey_boundary(&self) -> Option<UnknownReason> {
+        self.store_survey_boundary.clone()
     }
 
     pub fn value_flow(&self) -> &ValueFlowPlan {
         &self.value_flow
+    }
+
+    pub(crate) fn needs_source_refinement(&self) -> bool {
+        !self.correlations.is_empty()
+            || self.field_refinements.iter().any(|(_, field)| {
+                field
+                    .alternatives
+                    .iter()
+                    .any(|alternative| matches!(alternative.version, FieldVersion::Store { .. }))
+            })
+    }
+
+    pub(crate) fn mark_refinement_budget_exhausted(&mut self) {
+        self.field_slot_semantic_budget_exhausted = true;
+        self.refinement_budget_exhausted = true;
+    }
+
+    /// These sources and exclusions depend on a preliminary solve of this
+    /// request's closure. A reusable body cut cannot reconstruct that evidence.
+    pub(super) fn procedure_requires_source_refinement(&self, procedure: &ProcedureHandle) -> bool {
+        self.correlations
+            .iter()
+            .any(|(owner, _)| owner == procedure)
+            || self.field_refinements.iter().any(|(owner, field)| {
+                owner == procedure
+                    && field.alternatives.iter().any(|alternative| {
+                        matches!(alternative.version, FieldVersion::Store { .. })
+                    })
+            })
+    }
+
+    pub(crate) fn refinement_budget_exhausted(&self) -> bool {
+        self.refinement_budget_exhausted
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn refine_sources(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        field_slots: &FieldSlotIndex,
+        evidence: &DefinitionSources,
+        budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, TypeFlowPlanError> {
+        budget
+            .charge(SemanticWork {
+                nested_entries: self.value_flow.sources().len(),
+                ..SemanticWork::default()
+            })
+            .map_err(TypeFlowPlanError::RefinementBudget)?;
+        let mut correlated_kills = Vec::new();
+        for (procedure, analysis) in &self.correlations {
+            if cancellation.is_cancelled() {
+                return Err(TypeFlowPlanError::Cancelled);
+            }
+            for candidate in &analysis.guard_edge_exclusions {
+                let mut sources = HashMap::<ValueFlowEventKey, bool>::default();
+                let mut complete = true;
+                for definition in &candidate.all_reaching_data_defs {
+                    let point = procedure
+                        .point_handle(definition.point)
+                        .expect("a definition point is live");
+                    let (event, carrier) = if let Some(value) = definition.rhs {
+                        (
+                            definition.event_index,
+                            ValueFlowCarrier::Value(
+                                procedure
+                                    .value_handle(value)
+                                    .expect("a definition source is live"),
+                            ),
+                        )
+                    } else if definition.is_entry() {
+                        (0, binding_carrier(procedure, definition.binding))
+                    } else {
+                        complete = false;
+                        break;
+                    };
+                    let Some(reaching) = evidence.before(
+                        &self.value_flow,
+                        &point,
+                        event,
+                        &carrier,
+                        budget,
+                        cancellation,
+                    )?
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    let incompatible = candidate.incompatible_data_defs.contains(definition);
+                    for (source, uncertain) in reaching {
+                        if uncertain {
+                            complete = false;
+                            break;
+                        }
+                        let key = self
+                            .value_flow
+                            .source(source)
+                            .expect("a reaching source is retained")
+                            .key()
+                            .clone();
+                        let removable =
+                            incompatible && matches!(self.atom(source), ClassAtom::Class(_));
+                        sources
+                            .entry(key)
+                            .and_modify(|old| *old &= removable)
+                            .or_insert(removable);
+                    }
+                    if !complete {
+                        break;
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+                let sources = sources
+                    .into_iter()
+                    .filter_map(|(key, remove)| remove.then_some(key))
+                    .collect::<Vec<_>>();
+                if sources.is_empty() {
+                    continue;
+                }
+                let edge = procedure
+                    .semantics()
+                    .control_edge(candidate.edge)
+                    .expect("a candidate edge is live");
+                correlated_kills.push(ValueFlowEdgeKillSpec {
+                    point: procedure
+                        .point_handle(edge.source_point)
+                        .expect("a guard point is live"),
+                    target: edge.target_point,
+                    kind: edge.kind,
+                    carrier: binding_carrier(procedure, candidate.data_binding),
+                    sources,
+                });
+            }
+        }
+        let mut tables = SeedTables::new();
+        for (id, spec) in self.value_flow.sources() {
+            let replaced = self.field_refinements.iter().any(|(procedure, field)| {
+                spec.point().procedure() == procedure && spec.point().id() == field.point
+                    && matches!(spec.carrier(), ValueFlowCarrier::Value(value) if value.id() == field.result)
+            });
+            if !replaced && spec.activation_triggers().is_none() {
+                tables.sources.push((
+                    spec.clone(),
+                    self.atom(id).clone(),
+                    self.source_site(id).clone(),
+                ));
+            }
+        }
+        let mut seen_procedures = HashSet::default();
+        let procedures = self
+            .value_flow
+            .summary_procedures()
+            .filter(|procedure| seen_procedures.insert(procedure.durable_key()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for procedure in &procedures {
+            if cancellation.is_cancelled() {
+                return Err(TypeFlowPlanError::Cancelled);
+            }
+            for (_, spec) in self
+                .value_flow
+                .sources()
+                .filter(|(_, spec)| spec.point().procedure() == procedure)
+            {
+                tables
+                    .ordinals
+                    .entry((spec.key().site().clone(), ValueFlowEventKind::Source))
+                    .and_modify(|ordinal| *ordinal = (*ordinal).max(spec.key().ordinal() + 1))
+                    .or_insert(spec.key().ordinal() + 1);
+            }
+            for (_, field) in self
+                .field_refinements
+                .iter()
+                .filter(|(owner, _)| owner == procedure)
+            {
+                let point = procedure
+                    .point_handle(field.point)
+                    .expect("a refined load is live");
+                let span = mapping_span(
+                    procedure,
+                    procedure
+                        .semantics()
+                        .point(field.point)
+                        .expect("a load point is live")
+                        .source,
+                );
+                let unknown_site =
+                    || source_site(workspace, procedure, span, SourceSiteKind::Unknown);
+                let mut candidates = Vec::new();
+                for alternative in &field.alternatives {
+                    if cancellation.is_cancelled() {
+                        return Err(TypeFlowPlanError::Cancelled);
+                    }
+                    let mut values = Vec::new();
+                    match alternative.version {
+                        FieldVersion::Entry | FieldVersion::Open { .. } => {
+                            if let Some(class) = adapter.enclosing_class(workspace, procedure)
+                                && let Some(slot) = field_slots.slot(&class, &field.member)
+                            {
+                                budget
+                                    .charge(SemanticWork {
+                                        nested_entries: slot.atoms.len(),
+                                        ..SemanticWork::default()
+                                    })
+                                    .map_err(TypeFlowPlanError::RefinementBudget)?;
+                                values.extend(slot.atoms.iter().cloned());
+                            } else if let Some(site) = unknown_site() {
+                                values
+                                    .push((ClassAtom::Unknown(UnknownReason::UnmodeledLoad), site));
+                            }
+                            if matches!(alternative.version, FieldVersion::Open { .. })
+                                && let Some(site) = unknown_site()
+                            {
+                                values.push((
+                                    ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete),
+                                    site,
+                                ));
+                            }
+                        }
+                        FieldVersion::Store {
+                            point: store,
+                            event,
+                            value,
+                        } => {
+                            let store = procedure
+                                .point_handle(store)
+                                .expect("a field store point is live");
+                            let carrier = ValueFlowCarrier::Value(
+                                procedure
+                                    .value_handle(value)
+                                    .expect("a store value is live"),
+                            );
+                            if let Some(sources) = evidence.before(
+                                &self.value_flow,
+                                &store,
+                                event,
+                                &carrier,
+                                budget,
+                                cancellation,
+                            )? {
+                                for (source, uncertain) in sources {
+                                    values.push((
+                                        self.atom(source).clone(),
+                                        self.source_site(source).clone(),
+                                    ));
+                                    if uncertain && let Some(site) = unknown_site() {
+                                        values.push((
+                                            ClassAtom::Unknown(UnknownReason::UncertainFlow),
+                                            site,
+                                        ));
+                                    }
+                                }
+                            } else if let Some(site) = unknown_site() {
+                                values
+                                    .push((ClassAtom::Unknown(UnknownReason::UncertainFlow), site));
+                            }
+                        }
+                    }
+                    let restriction = FieldLoadRefinement {
+                        point: field.point,
+                        result: field.result,
+                        member: field.member.clone(),
+                        alternatives: vec![alternative.clone()],
+                    };
+                    for (atom, site) in values {
+                        if field_atom_survives(
+                            workspace,
+                            adapter,
+                            field_slots,
+                            procedure,
+                            &restriction,
+                            &atom,
+                        ) && !candidates.contains(&(atom.clone(), site.clone()))
+                        {
+                            candidates.push((atom, site));
+                        }
+                    }
+                }
+                for (atom, site) in candidates {
+                    tables.push_source(
+                        &point,
+                        ValueFlowObservationPhase::AfterEffects,
+                        ValueFlowCarrier::Value(
+                            procedure
+                                .value_handle(field.result)
+                                .expect("a load result is live"),
+                        ),
+                        atom,
+                        site,
+                    );
+                }
+            }
+        }
+        // Field refinement replaces source keys. Rebuild conditional guard
+        // sources from the new candidates instead of retaining stale triggers.
+        let mut kills = guard_transfers(
+            workspace,
+            adapter,
+            field_slots,
+            &procedures,
+            &mut tables,
+            &self.guard_bindings,
+            cancellation,
+        )?;
+        let mut atoms_by_key = HashMap::default();
+        let mut sources = Vec::new();
+        budget
+            .charge(SemanticWork {
+                nested_entries: tables.sources.len(),
+                ..SemanticWork::default()
+            })
+            .map_err(TypeFlowPlanError::RefinementBudget)?;
+        // Compare semantic source observations, excluding their temporary
+        // ordinal identities. Dependent field stores may need another solve
+        // after an upstream load's candidate set changes.
+        let previous = self
+            .value_flow
+            .sources()
+            .map(|(id, spec)| {
+                (
+                    spec.point(),
+                    spec.phase(),
+                    spec.carrier(),
+                    self.atom(id),
+                    self.source_site(id),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let replacement = tables
+            .sources
+            .iter()
+            .map(|(spec, atom, site)| (spec.point(), spec.phase(), spec.carrier(), atom, site))
+            .collect::<HashSet<_>>();
+        let sources_changed = previous != replacement;
+        for (spec, atom, site) in tables.sources {
+            atoms_by_key.insert(spec.key().clone(), (atom, site));
+            sources.push(spec);
+        }
+        for mut kill in correlated_kills {
+            kill.sources.retain(|key| atoms_by_key.contains_key(key));
+            if !kill.sources.is_empty() {
+                kills.push(kill);
+            }
+        }
+        let value_flow = self
+            .value_flow
+            .with_replaced_sources_and_edge_kills(sources, kills)?;
+        let mut atoms = Vec::new();
+        let mut sites = Vec::new();
+        for (_, spec) in value_flow.sources() {
+            let (atom, site) = atoms_by_key
+                .remove(spec.key())
+                .expect("a rebuilt source retains its atom");
+            atoms.push(atom);
+            sites.push(site);
+        }
+        self.value_flow = value_flow;
+        self.atoms = atoms;
+        self.source_sites = sites;
+        Ok(sources_changed)
+    }
+
+    /// Unknown member-surface annotations on a base do not describe its
+    /// runtime class. A load-result unknown remains a class source.
+    pub(super) fn is_member_surface_source(&self, source: ValueFlowSourceId) -> bool {
+        self.member_surface_sources.contains(
+            self.value_flow
+                .source(source)
+                .expect("a retained source belongs to the plan")
+                .key(),
+        )
     }
 
     pub fn atom(&self, source: ValueFlowSourceId) -> &ClassAtom {
@@ -893,6 +1574,7 @@ fn dispatch_status(dispatch: &DispatchStatus) -> SemanticInputStatus {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_procedure(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
@@ -901,6 +1583,7 @@ fn seed_procedure(
     root_key: DurableProcedureKey,
     procedure: &ProcedureHandle,
     tables: &mut SeedTables,
+    field_refinements: &[FieldLoadRefinement],
 ) {
     let semantics = procedure.semantics();
     let is_root = procedure.durable_key() == root_key;
@@ -920,7 +1603,7 @@ fn seed_procedure(
     }
     for value in semantics.values() {
         match &value.kind {
-            SemanticValueKind::Constant => {
+            SemanticValueKind::Constant | SemanticValueKind::Boolean(_) => {
                 let span = mapping_span(procedure, value.source);
                 for atom in adapter
                     .constant_class(workspace, procedure, value)
@@ -1092,7 +1775,6 @@ fn seed_procedure(
             | SemanticValueKind::Temporary
             | SemanticValueKind::Address
             | SemanticValueKind::Null
-            | SemanticValueKind::Boolean(_)
             | SemanticValueKind::UnsignedInteger(_)
             | SemanticValueKind::Exception
             | SemanticValueKind::Callable => {
@@ -1204,8 +1886,14 @@ fn seed_procedure(
                         procedure,
                         MemberAccessQuery::Load(location_row),
                     );
-                    let modeled_slot = if let MemoryLocationKind::Field { base, .. } =
-                        &location_row.kind
+                    let refinement = field_refinements
+                        .iter()
+                        .find(|field| field.point == point.id && field.result == *result);
+                    let modeled_slot = if let Some(field) = refinement
+                        && let Some(class) = enclosing_class.as_ref()
+                    {
+                        field_slots.slot(class, &field.member)
+                    } else if let MemoryLocationKind::Field { base, .. } = &location_row.kind
                         && receiver_values.contains(base)
                         && let Some(class) = enclosing_class.as_ref()
                         && let Some(member) = member.as_deref()
@@ -1221,12 +1909,39 @@ fn seed_procedure(
                     );
                     if let Some(slot) = modeled_slot {
                         for (atom, site) in &slot.atoms {
+                            if let Some(refinement) = refinement
+                                && !field_atom_survives(
+                                    workspace,
+                                    adapter,
+                                    field_slots,
+                                    procedure,
+                                    refinement,
+                                    atom,
+                                )
+                            {
+                                continue;
+                            }
                             tables.push_source(
                                 &point_handle,
                                 ValueFlowObservationPhase::AfterEffects,
                                 carrier.clone(),
                                 atom.clone(),
                                 site.clone(),
+                            );
+                        }
+                        if refinement.is_some_and(|field| {
+                            field.alternatives.iter().any(|alternative| {
+                                matches!(alternative.version, FieldVersion::Open { .. })
+                            })
+                        }) && let Some(site) =
+                            source_site(workspace, procedure, span, SourceSiteKind::Unknown)
+                        {
+                            tables.push_source(
+                                &point_handle,
+                                ValueFlowObservationPhase::AfterEffects,
+                                carrier.clone(),
+                                ClassAtom::Unknown(UnknownReason::FieldSlotIncomplete),
+                                site,
                             );
                         }
                         if let MemoryLocationKind::Field { base, .. } = &location_row.kind {
@@ -1237,9 +1952,8 @@ fn seed_procedure(
                             );
                             for (atom, site) in &slot.atoms {
                                 if matches!(atom, ClassAtom::Unknown(_)) {
-                                    tables.push_source(
+                                    tables.push_member_surface_source(
                                         &point_handle,
-                                        ValueFlowObservationPhase::BeforeEffects,
                                         base_carrier.clone(),
                                         atom.clone(),
                                         site.clone(),

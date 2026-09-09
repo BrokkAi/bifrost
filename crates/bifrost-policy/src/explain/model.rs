@@ -102,6 +102,8 @@ pub enum ExplanationNodeKind {
     /// of the query that produced the relation, which is why it is not a
     /// `selector_stage`.
     FilterPredicate,
+    /// One authored row expansion that removed the candidate's source rows.
+    ExpansionStep,
     /// One retained derivation the solver proved: a whole witness path, or one
     /// step of that path in path order. A derivation is not a selector stage --
     /// nothing about it was re-executed, and its order is the path's, not the
@@ -123,6 +125,7 @@ impl ExplanationNodeKind {
             Self::SelectorStage => "selector_stage",
             Self::RelationBinding => "relation_binding",
             Self::FilterPredicate => "filter_predicate",
+            Self::ExpansionStep => "expansion_step",
             Self::Derivation => "derivation",
             Self::Assertion => "assertion",
             Self::CoverageObligation => "coverage_obligation",

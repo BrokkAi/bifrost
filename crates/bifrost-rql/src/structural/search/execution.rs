@@ -32,7 +32,7 @@ pub(super) fn execute_plan(
     let mut cache_started = state.cache_profile;
     let mut own_diagnostic_start = diagnostics.len();
 
-    let execution = match (physical_operator, logical_operator) {
+    let mut execution = match (physical_operator, logical_operator) {
         (PhysicalQueryOperator::OccurrenceScan, LogicalQueryOperator::OccurrenceSeed(seed)) => {
             if state
                 .cancellation
@@ -627,13 +627,15 @@ pub(super) fn execute_plan(
         (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
             let dependency = physical_node.dependencies()[0];
             let dependency_started = profiling.then(Instant::now);
+            let child_terminal_cap =
+                (state.source_row_boundary != Some(dependency)).then_some(count.saturating_add(1));
             let mut child = execute_plan(
                 plan,
                 token,
                 dependency,
                 state,
                 limits,
-                Some(count.saturating_add(1)),
+                child_terminal_cap,
                 diagnostics,
                 profile_branch,
             );
@@ -681,6 +683,24 @@ pub(super) fn execute_plan(
         }
         _ => unreachable!("physical operator must implement its logical query node"),
     };
+
+    if state.source_row_boundary == Some(node_id) {
+        let source_rows = state
+            .scope
+            .source_selection()
+            .expect("a source-row boundary requires source-row selection")
+            .source_rows();
+        execution.rows.retain(|row| {
+            let evidence = detailed_evidence_for_pipeline_value(0, &row.value, None);
+            source_rows.iter().any(|source| {
+                source.domain == evidence.domain
+                    && source.key == evidence.key
+                    && source.file == evidence.file
+                    && source.byte_span == evidence.byte_span
+                    && source.identities == evidence.identities
+            })
+        });
+    }
 
     if profiling {
         append_diagnostic_terminations(
@@ -811,6 +831,7 @@ pub(super) fn execute_parallel_seed_union(
     let analyzer = state.analyzer;
     let cancellation = state.cancellation;
     let scope = state.scope;
+    let source_row_boundary = state.source_row_boundary;
     let receiver_budget_override = state.receiver_budget_override;
     let access_mode = state.access_mode;
     let retained_value_census = state.retained_value_census.clone();
@@ -833,6 +854,7 @@ pub(super) fn execute_parallel_seed_union(
                     workspace: None,
                     cancellation,
                     scope,
+                    source_row_boundary,
                     step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
                     budget: base_budget,

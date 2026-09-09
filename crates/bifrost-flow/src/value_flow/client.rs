@@ -199,20 +199,8 @@ impl<'plan> ValueFlowProblem<'plan> {
         fact: ValueFlowFact,
     ) -> Vec<ActiveFlow> {
         let mut active = Vec::new();
-        if matches!(fact.0, ValueFlowFactKind::Zero) {
-            for source in self
-                .plan
-                .sources_at(point, super::ValueFlowObservationPhase::BeforeEffects)
-            {
-                let uncertainty =
-                    quality_uncertainty(source.spec.proof(), source.spec.completeness());
-                active.push(ActiveFlow {
-                    source: source.id,
-                    carrier: source.carrier,
-                    uncertainty,
-                });
-            }
-        } else if let ValueFlowFactKind::Carrier {
+        let is_zero = matches!(fact.0, ValueFlowFactKind::Zero);
+        if let ValueFlowFactKind::Carrier {
             source,
             carrier,
             uncertainty,
@@ -224,6 +212,36 @@ impl<'plan> ValueFlowProblem<'plan> {
                 uncertainty,
             });
         }
+        let mut generated = Vec::new();
+        for source in self
+            .plan
+            .sources_at(point, super::ValueFlowObservationPhase::BeforeEffects)
+        {
+            match source.activation_triggers.as_deref() {
+                None if is_zero => {
+                    generated.push(ActiveFlow {
+                        source: source.id,
+                        carrier: source.carrier,
+                        uncertainty: quality_uncertainty(
+                            source.spec.proof(),
+                            source.spec.completeness(),
+                        ),
+                    });
+                }
+                Some(triggers) if !is_zero => {
+                    generated.extend(conditional_source_flows(
+                        source.id,
+                        source.carrier,
+                        triggers,
+                        active.iter().copied(),
+                        source.spec.proof(),
+                        source.spec.completeness(),
+                    ));
+                }
+                None | Some(_) => {}
+            }
+        }
+        active.extend(generated);
         active.sort_unstable();
         active.dedup();
         active
@@ -247,36 +265,41 @@ impl<'plan> ValueFlowProblem<'plan> {
         );
         let mut active = active.into_iter().collect::<HashSet<_>>();
         for rule in self.plan.local_rule_views(point) {
-            let (source, target, complete) = (rule.source, rule.target, rule.complete);
-            if kills_target(&rule) {
-                active.retain(|flow| flow.carrier != target);
-            }
-            let generated = active
-                .iter()
-                .copied()
-                .filter(|flow| flow.carrier == source)
-                .map(|flow| ActiveFlow {
-                    carrier: target,
-                    ..flow.with_transfer_completeness(complete)
-                })
-                .collect::<Vec<_>>();
-            active.extend(generated);
+            apply_local_rule(&mut active, rule);
         }
-        if matches!(fact.0, ValueFlowFactKind::Zero) {
-            for source in self
-                .plan
-                .sources_at(point, super::ValueFlowObservationPhase::AfterEffects)
-            {
-                active.insert(ActiveFlow {
-                    source: source.id,
-                    carrier: source.carrier,
-                    uncertainty: quality_uncertainty(
+        let mut generated = Vec::new();
+        for source in self
+            .plan
+            .sources_at(point, super::ValueFlowObservationPhase::AfterEffects)
+        {
+            match source.activation_triggers.as_deref() {
+                None if matches!(fact.0, ValueFlowFactKind::Zero) => {
+                    generated.push(ActiveFlow {
+                        source: source.id,
+                        carrier: source.carrier,
+                        uncertainty: quality_uncertainty(
+                            source.spec.proof(),
+                            source.spec.completeness(),
+                        ),
+                    });
+                }
+                Some(triggers) if !matches!(fact.0, ValueFlowFactKind::Zero) => {
+                    generated.extend(conditional_source_flows(
+                        source.id,
+                        source.carrier,
+                        triggers,
+                        active.iter().copied(),
                         source.spec.proof(),
                         source.spec.completeness(),
-                    ),
-                });
+                    ));
+                }
+                None | Some(_) => {}
             }
         }
+        // Evaluate every conditional source against the incoming active set.
+        // Extending only after this loop prevents a source generated here from
+        // recursively activating another source at the same point.
+        active.extend(generated);
         let mut active = active.into_iter().collect::<Vec<_>>();
         active.sort_unstable();
         self.append_meetings(
@@ -388,11 +411,9 @@ impl<'plan> ValueFlowProblem<'plan> {
                     super::ValueFlowObservationPhase::BeforeEffects,
                     super::ValueFlowObservationPhase::AfterEffects,
                 ] {
-                    for source in self
-                        .plan
-                        .sources_at(edge.target(), phase)
-                        .filter(|source| source.carrier == rule.source)
-                    {
+                    for source in self.plan.sources_at(edge.target(), phase).filter(|source| {
+                        source.carrier == rule.source && source.activation_triggers.is_none()
+                    }) {
                         let uncertainty =
                             quality_uncertainty(source.spec.proof(), source.spec.completeness());
                         mapped.push(
@@ -503,6 +524,44 @@ impl<'plan> ValueFlowProblem<'plan> {
     }
 }
 
+fn conditional_source_flows(
+    source: ValueFlowSourceId,
+    carrier: ValueFlowCarrierId,
+    triggers: &[ValueFlowSourceId],
+    active: impl IntoIterator<Item = ActiveFlow>,
+    proof: &ProofStatus,
+    completeness: &EvidenceCompleteness,
+) -> Vec<ActiveFlow> {
+    active
+        .into_iter()
+        .filter(|flow| flow.carrier == carrier && triggers.binary_search(&flow.source).is_ok())
+        .map(|flow| ActiveFlow {
+            source,
+            carrier,
+            uncertainty: flow.uncertainty.with_quality(proof, completeness),
+        })
+        .collect()
+}
+
+fn apply_local_rule(active: &mut HashSet<ActiveFlow>, rule: super::plan::LocalRuleView) {
+    if kills_target(&rule) {
+        active.retain(|flow| flow.carrier != rule.target);
+    }
+    let generated = active
+        .iter()
+        .copied()
+        .filter(|flow| flow.carrier == rule.source)
+        .map(|flow| ActiveFlow {
+            carrier: rule.target,
+            ..flow.with_transfer_completeness(rule.complete)
+        })
+        .collect::<Vec<_>>();
+    if invalidates_source(&rule) {
+        active.retain(|flow| flow.carrier != rule.source);
+    }
+    active.extend(generated);
+}
+
 impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
     type Fact = ValueFlowFact;
 
@@ -573,7 +632,17 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
         let mut meetings = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut meetings);
+        let mut active = self.apply_point(edge.source(), fact, &mut meetings);
+        if let crate::analyzer::semantic::IcfgEdgeKind::Intraprocedural(kind) = edge.kind() {
+            let kills = self
+                .plan
+                .edge_kills(edge.source(), edge.target().id(), kind);
+            active.retain(|flow| {
+                !kills.iter().any(|kill| {
+                    kill.carrier == flow.carrier && kill.sources.binary_search(&flow.source).is_ok()
+                })
+            });
+        }
         self.emit_all(active, meetings, out);
     }
 }
@@ -756,11 +825,31 @@ impl From<SummaryDataflowError> for ValueFlowSolveError {
 /// kill is correct for it too; a name the resolver could not prove leaves more
 /// than one candidate object, which is a weak update and no kill at all.
 pub(crate) fn kills_target(rule: &super::plan::LocalRuleView) -> bool {
+    // Parameter and receiver relations are copies between a boundary port and
+    // a value carrier, so a distinct endpoint replaces the target carrier.
     match rule.kind {
-        ValueFlowRelationKind::Assignment => rule.source != rule.target,
+        ValueFlowRelationKind::Assignment
+        | ValueFlowRelationKind::Parameter
+        | ValueFlowRelationKind::Receiver => rule.source != rule.target,
         ValueFlowRelationKind::MemoryStore => rule.strong_update,
         _ => false,
     }
+}
+
+/// Whether a by-value relation consumes the value held by its source.
+///
+/// Generate the destination fact before applying this kill: the target keeps
+/// the moved value while later observations of the source binding do not.
+pub(crate) fn invalidates_source(rule: &super::plan::LocalRuleView) -> bool {
+    matches!(
+        rule.transfer,
+        Some(crate::analyzer::semantic::ValueTransfer {
+            kind: crate::analyzer::semantic::TransferKind::Move {
+                invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+            },
+            ..
+        })
+    )
 }
 
 fn quality_uncertainty(
@@ -773,5 +862,329 @@ fn quality_uncertainty(
         ValueFlowUncertainty(0)
     } else {
         ValueFlowUncertainty(0).with_semantic()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::{
+        CancellationToken, EvidenceCompleteness, MoveInvalidation, SemanticRequest,
+        SemanticValueKind, TransferKind, TransferOperation, ValueTransfer,
+    };
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+    use crate::value_flow::{
+        ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowObservationPhase,
+        ValueFlowSourceSpec,
+    };
+
+    fn carrier(index: usize) -> ValueFlowCarrierId {
+        ValueFlowCarrierId::try_from_index(index).expect("carrier id")
+    }
+
+    fn active_at(index: usize) -> ActiveFlow {
+        ActiveFlow {
+            source: ValueFlowSourceId::try_from_index(0).expect("source id"),
+            carrier: carrier(index),
+            uncertainty: ValueFlowUncertainty::empty(),
+        }
+    }
+
+    fn transfer_rule(kind: TransferKind) -> super::super::plan::LocalRuleView {
+        super::super::plan::LocalRuleView {
+            event_index: 0,
+            source: carrier(0),
+            target: carrier(1),
+            kind: ValueFlowRelationKind::Assignment,
+            transfer: Some(ValueTransfer {
+                kind,
+                operation: TransferOperation::None,
+            }),
+            complete: true,
+            policy_local: false,
+            strong_update: false,
+        }
+    }
+
+    #[test]
+    fn copy_preserves_source_while_move_invalidates_it_after_generation() {
+        let mut copied = HashSet::from([active_at(0)]);
+        apply_local_rule(&mut copied, transfer_rule(TransferKind::Copy));
+        assert_eq!(
+            copied
+                .iter()
+                .map(|flow| flow.carrier.get())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1])
+        );
+
+        let mut moved = HashSet::from([active_at(0)]);
+        apply_local_rule(
+            &mut moved,
+            transfer_rule(TransferKind::Move {
+                invalidation: MoveInvalidation::Invalidated,
+            }),
+        );
+        assert_eq!(
+            moved
+                .iter()
+                .map(|flow| flow.carrier.get())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1])
+        );
+
+        let mut later_use = transfer_rule(TransferKind::Copy);
+        later_use.target = carrier(2);
+        apply_local_rule(&mut moved, later_use);
+        assert_eq!(
+            moved
+                .iter()
+                .map(|flow| flow.carrier.get())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1]),
+            "a later read of the invalidated source must not regenerate flow"
+        );
+
+        let mut unknown_move = HashSet::from([active_at(0)]);
+        apply_local_rule(
+            &mut unknown_move,
+            transfer_rule(TransferKind::Move {
+                invalidation: MoveInvalidation::Unknown,
+            }),
+        );
+        assert_eq!(
+            unknown_move
+                .iter()
+                .map(|flow| flow.carrier.get())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1]),
+            "an unknown invalidation cannot prove the source value was killed"
+        );
+    }
+
+    #[test]
+    fn conditional_source_requires_matching_source_on_same_carrier() {
+        let matching = ActiveFlow {
+            source: ValueFlowSourceId::try_from_index(1).expect("source id"),
+            carrier: carrier(0),
+            uncertainty: ValueFlowUncertainty::empty().with_semantic(),
+        };
+        let unrelated_source = ActiveFlow {
+            source: ValueFlowSourceId::try_from_index(2).expect("source id"),
+            ..matching
+        };
+        let unrelated_carrier = ActiveFlow {
+            carrier: carrier(3),
+            ..matching
+        };
+        let active = [matching, unrelated_source, unrelated_carrier];
+        let generated = conditional_source_flows(
+            ValueFlowSourceId::try_from_index(4).expect("source id"),
+            carrier(0),
+            &[ValueFlowSourceId::try_from_index(1).expect("source id")],
+            active,
+            &ProofStatus::Proven,
+            &EvidenceCompleteness::Complete,
+        );
+        assert_eq!(generated.len(), 1);
+        assert_eq!(generated[0].source.get(), 4);
+        assert_eq!(generated[0].carrier.get(), 0);
+        assert_eq!(generated[0].uncertainty, matching.uncertainty);
+    }
+
+    #[test]
+    fn conditional_sources_are_forward_only_and_never_zero_seeded() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "flow.go",
+                "package fixture\nfunc run(value string) string { return value }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("fixture declares run");
+        let parameter = root
+            .semantics()
+            .values()
+            .iter()
+            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
+            .expect("fixture has one parameter")
+            .id;
+        let value_carrier = ValueFlowCarrier::Value(
+            root.value_handle(parameter)
+                .expect("parameter value remains live"),
+        );
+        let other_carrier = ValueFlowCarrier::Port(
+            crate::analyzer::semantic::ProcedurePortHandle::parameter(root.clone(), 0)
+                .expect("parameter port remains live"),
+        );
+        let entry = root
+            .point_handle(root.semantics().entry_point())
+            .expect("entry point remains live");
+        let exit = root
+            .point_handle(root.semantics().normal_exit_point())
+            .expect("normal exit remains live");
+        let trigger_key = ValueFlowEventKey::at_point(&entry, 0, ValueFlowEventKind::Source)
+            .expect("trigger key");
+        let unrelated_key = ValueFlowEventKey::at_point(&entry, 1, ValueFlowEventKind::Source)
+            .expect("unrelated key");
+        let before_key = ValueFlowEventKey::at_point(&exit, 2, ValueFlowEventKind::Source)
+            .expect("before-effects key");
+        let after_key = ValueFlowEventKey::at_point(&exit, 3, ValueFlowEventKind::Source)
+            .expect("after-effects key");
+        let trigger = ValueFlowSourceSpec::new(
+            trigger_key.clone(),
+            entry.clone(),
+            ValueFlowObservationPhase::BeforeEffects,
+            value_carrier.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        );
+        let unrelated = ValueFlowSourceSpec::new(
+            unrelated_key.clone(),
+            entry,
+            ValueFlowObservationPhase::BeforeEffects,
+            other_carrier,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        );
+        let before = ValueFlowSourceSpec::new(
+            before_key,
+            exit.clone(),
+            ValueFlowObservationPhase::BeforeEffects,
+            value_carrier.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        )
+        .when_sources_reach(vec![trigger_key.clone()]);
+        let after = ValueFlowSourceSpec::new(
+            after_key,
+            exit.clone(),
+            ValueFlowObservationPhase::AfterEffects,
+            value_carrier,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        )
+        .when_sources_reach(vec![trigger_key.clone()]);
+        let plan = ValueFlowPlan::try_new(
+            root,
+            Vec::new(),
+            Vec::new(),
+            vec![trigger, unrelated, before, after],
+            Vec::new(),
+        )
+        .expect("conditional source plan");
+        let problem = ValueFlowProblem::new(&plan);
+        let before_id = plan
+            .sources()
+            .find(|(_, spec)| {
+                spec.phase() == ValueFlowObservationPhase::BeforeEffects
+                    && spec.activation_triggers().is_some()
+            })
+            .map(|(id, _)| id)
+            .expect("before conditional source");
+        let after_id = plan
+            .sources()
+            .find(|(_, spec)| {
+                spec.phase() == ValueFlowObservationPhase::AfterEffects
+                    && spec.activation_triggers().is_some()
+            })
+            .map(|(id, _)| id)
+            .expect("after conditional source");
+        let trigger_id = plan
+            .source_id_for_key(&trigger_key)
+            .expect("trigger source");
+        let unrelated_id = plan
+            .source_id_for_key(&unrelated_key)
+            .expect("unrelated source");
+        let value_carrier_id = plan
+            .carrier_id_for_key(
+                &ValueFlowCarrier::Value(
+                    plan.root()
+                        .value_handle(parameter)
+                        .expect("parameter value remains live"),
+                )
+                .stable_key()
+                .expect("value carrier key"),
+            )
+            .expect("value carrier id");
+        let unrelated_carrier_id = plan
+            .carrier_id_for_key(
+                &ValueFlowCarrier::Port(
+                    crate::analyzer::semantic::ProcedurePortHandle::parameter(
+                        plan.root().clone(),
+                        0,
+                    )
+                    .expect("parameter port remains live"),
+                )
+                .stable_key()
+                .expect("port carrier key"),
+            )
+            .expect("port carrier id");
+        assert!(
+            plan.has_edge_kills(),
+            "conditional plans require forward solving"
+        );
+        let zero = problem.apply_point(&exit, ValueFlowFact::ZERO, &mut Vec::new());
+        assert!(
+            zero.iter()
+                .all(|flow| flow.source != before_id && flow.source != after_id)
+        );
+        let unmatched = problem.apply_point(
+            &plan
+                .root()
+                .point_handle(plan.root().semantics().normal_exit_point())
+                .expect("normal exit remains live"),
+            ValueFlowFact::carrier_fact(
+                unrelated_id,
+                unrelated_carrier_id,
+                ValueFlowUncertainty::empty(),
+            ),
+            &mut Vec::new(),
+        );
+        assert!(
+            unmatched
+                .iter()
+                .all(|flow| flow.source != before_id && flow.source != after_id)
+        );
+        let mut meetings = Vec::new();
+        let matched = problem.apply_point(
+            &plan
+                .root()
+                .point_handle(plan.root().semantics().normal_exit_point())
+                .expect("normal exit remains live"),
+            ValueFlowFact::carrier_fact(
+                trigger_id,
+                value_carrier_id,
+                ValueFlowUncertainty::empty(),
+            ),
+            &mut meetings,
+        );
+        assert!(matched.iter().any(|flow| flow.source == before_id));
+        assert!(matched.iter().any(|flow| flow.source == after_id));
     }
 }

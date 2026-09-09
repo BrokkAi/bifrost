@@ -15,7 +15,7 @@ use crate::analyzer::semantic::{
     UnknownReason, WorkspaceIcfgProvider, type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::{AnalyzerQueryScope, Language, ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::{DataflowRequest, SolverBudget};
 use crate::hash::HashMap;
 use crate::value_flow::{ClosureLimits, ValueFlowCache};
@@ -102,12 +102,12 @@ impl TypeFlowReport {
                         .iter()
                         .filter(|reason| !reasons_before.contains(reason))
                     {
-                        *self.unknown_reasons.entry(*reason).or_insert(0) += 1;
+                        *self.unknown_reasons.entry(reason.clone()).or_insert(0) += 1;
                     }
                 }
                 None => {
                     for reason in &set.unknown {
-                        *self.unknown_reasons.entry(*reason).or_insert(0) += 1;
+                        *self.unknown_reasons.entry(reason.clone()).or_insert(0) += 1;
                     }
                     self.site_index.insert(key, self.class_sets.len());
                     self.class_sets.push(set);
@@ -150,6 +150,11 @@ fn merge_class_set(existing: &mut ReceiverClassSet, incoming: ReceiverClassSet) 
         &mut existing.member_declarations,
         incoming.member_declarations,
     );
+    for evidence in incoming.dynamic_writes {
+        if !existing.dynamic_writes.contains(&evidence) {
+            existing.dynamic_writes.push(evidence);
+        }
+    }
     for reason in incoming.unknown {
         if !existing.unknown.contains(&reason) {
             existing.unknown.push(reason);
@@ -225,6 +230,12 @@ pub fn solve_type_flow_workspace(
     cancellation: &CancellationToken,
 ) -> Result<TypeFlowReport, TypeFlowError> {
     let active_semantic_model_snapshot = workspace.analyzer().active_semantic_model_snapshot();
+    let _semantic_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        workspace.analyzer(),
+        active_semantic_model_snapshot.clone(),
+    );
+    let _cancellation_scope =
+        AnalyzerQueryScope::with_cancellation(workspace.analyzer(), cancellation);
     let value_flow_cache = ValueFlowCache::default();
     let summary_state = TypeFlowSummaryState::default();
     let mut report = TypeFlowReport::default();

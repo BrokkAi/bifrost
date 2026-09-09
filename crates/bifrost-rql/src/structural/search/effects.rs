@@ -5884,7 +5884,9 @@ fn normalized_success_guard_edges(
                     GuardPredicate::ConstantBoolean { .. }
                     | GuardPredicate::ConstantEquality { .. }
                     | GuardPredicate::InstanceOf { .. }
+                    | GuardPredicate::ExactClass { .. }
                     | GuardPredicate::HasMember { .. }
+                    | GuardPredicate::Truthy { .. }
                     | GuardPredicate::NullComparison { .. }
                     | GuardPredicate::Opaque { .. },
                 ) => return None,

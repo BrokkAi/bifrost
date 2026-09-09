@@ -142,6 +142,10 @@ const RELATIONAL_FIXTURE: &str =
 /// truncates the binding and leaves the run inconclusive with a finding.
 const RELATIONAL_TWO_READS: &str = "export function render(): number {\n  return 1;\n}\n\nexport const alias = render;\nexport const second = render;\n";
 
+/// Two declaration-name rows, so a one-row pipeline budget makes the source
+/// binding non-exhaustive while retaining the candidate in its first row.
+const RELATIONAL_TWO_DECLARATIONS: &str = "export function render(): number {\n  return 1;\n}\n\nexport function second(): number {\n  return 2;\n}\n";
+
 /// Two reference sites with the same semantic target. Their detailed semantic
 /// key is shared, so exact why-not lineage must also retain source identity.
 const TWO_RENDER_REFERENCES: &str = "export function render(): number {\n  return 1;\n}\n\nexport const first = render;\nexport const second = render;\n";
@@ -199,8 +203,8 @@ const SCOPED_FILTER_RELATIONAL: &str = r#"(policy
       (aggregate :name reads :op count))
     (assert :group by-read :value reads :cardinality (exactly 0))))"#;
 
-/// The same invariant over two bindings, the second of which is a row
-/// expansion this slice does not replay.
+/// The same invariant over two bindings, with the second projecting the
+/// first binding's sites through receiver analysis into outcome rows.
 const TWO_BINDING_RELATIONAL: &str = r#"(policy
   :id "test.explain.relational.two"
   :name "Member sites have receiver outcomes"
@@ -211,6 +215,23 @@ const TWO_BINDING_RELATIONAL: &str = r#"(policy
     (bind :name site :query (rql (occurrences :role [member_position])))
     (bind :name receiver :from site :step receiver-outcome)
     (join :left site :right receiver :kind anti :on ((ast_id site_ast_id)))
+    (group :name orphaned :by (site.ast_id)
+      (aggregate :name sites :op count))
+    (assert :group orphaned :value sites :cardinality (exactly 0))))"#;
+
+/// A declaration occurrence expanded to hierarchy-hop rows. The candidate-hop
+/// row schema correlates its occurrence through `ast_id`; declaration names
+/// have no hierarchy route in the TypeScript fixture below.
+const CANDIDATE_HIERARCHY_RELATIONAL: &str = r#"(policy
+  :id "test.explain.relational.candidate-hierarchy"
+  :name "Declaration sites have candidate hierarchy hops"
+  :message "every declaration occurrence must produce a candidate hierarchy row"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [declaration_name])))
+    (bind :name hop :from site :step candidate-hierarchy)
+    (join :left site :right hop :kind anti :on ((ast_id ast_id)))
     (group :name orphaned :by (site.ast_id)
       (aggregate :name sites :op count))
     (assert :group orphaned :value sites :cardinality (exactly 0))))"#;
@@ -1725,40 +1746,236 @@ fn why_not_reports_a_filter_drop_over_a_non_exhaustive_binding_as_unknown() {
 }
 
 #[test]
-fn why_not_reports_unknown_for_a_row_expansion_binding_it_cannot_replay() {
+fn why_not_replays_receiver_outcome_expansion_but_defers_the_join() {
     let fixture = Fixture::with_source(MEMBER_FIXTURE);
     let explanation = relational_why_not(
         &fixture,
         TWO_BINDING_RELATIONAL,
         &candidate_in(MEMBER_FIXTURE, "run();"),
+        &ExplanationLimits::default().with_max_prefix_executions(3),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![
+            (String::from("site"), ExplanationOutcome::Satisfied),
+            (String::from("receiver"), ExplanationOutcome::Satisfied),
+        ]
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    let gap = join_replay_gap(&explanation).expect("the join remains outside this adapter");
+    assert_eq!(gap.kind(), ExplanationNodeKind::CoverageObligation);
+    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
+    assert_eq!(
+        gap.reasons(),
+        [PolicyIncompleteReason::CapabilityIncomplete]
+    );
+}
+
+#[test]
+fn why_not_reports_a_candidate_absent_from_the_expansion_source_before_expanding() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        CANDIDATE_HIERARCHY_RELATIONAL,
+        &relational_candidate("return 1"),
         &ExplanationLimits::default(),
     );
 
-    let bindings = binding_labels(&explanation);
-    assert_eq!(bindings.len(), 2, "{bindings:?}");
-    assert_eq!(bindings[0].0, "site");
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Failed);
     assert_eq!(
-        bindings[1],
-        (String::from("receiver"), ExplanationOutcome::Unknown)
+        binding_labels(&explanation),
+        vec![(String::from("site"), ExplanationOutcome::Failed)]
+    );
+    let site = &explanation.root().children()[0];
+    assert_eq!(
+        child_labels(site, ExplanationNodeKind::SelectorStage),
+        vec![(String::from("occurrences"), ExplanationOutcome::Failed)]
+    );
+    assert_eq!(
+        explanation
+            .root()
+            .children()
+            .iter()
+            .filter(|node| node.kind() == ExplanationNodeKind::RelationBinding)
+            .count(),
+        1,
+        "the expansion is not reached after the source binding drops the candidate"
+    );
+}
+
+#[test]
+fn why_not_reports_a_candidate_dropped_by_the_hierarchy_expansion() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        CANDIDATE_HIERARCHY_RELATIONAL,
+        &relational_candidate("render"),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![
+            (String::from("site"), ExplanationOutcome::Satisfied),
+            (String::from("hop"), ExplanationOutcome::Failed),
+        ]
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Failed);
+    let expansion = &explanation.root().children()[1];
+    assert_eq!(expansion.outcome(), ExplanationOutcome::Failed);
+    let child = expansion
+        .children()
+        .iter()
+        .find(|node| node.kind().label() == "expansion_step")
+        .expect("the dropped expansion is named after its source prefixes");
+    assert_eq!(child.kind().label(), "expansion_step");
+    assert_eq!(child.label(), "candidate-hierarchy");
+    let expected = child.expected().expect("expansion expectation");
+    assert!(expected.contains("candidate-hierarchy"), "{expected}");
+    assert!(expected.contains("site"), "{expected}");
+    assert!(expected.contains("Occurrence"), "{expected}");
+    let actual = child.actual().expect("expansion actual");
+    assert!(actual.contains("render"), "{actual}");
+}
+
+#[test]
+fn why_not_keeps_a_dropped_expansion_unknown_when_its_source_is_truncated() {
+    let budget = PolicyBudget::builder()
+        .with_query_limits(CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        })
+        .expect("query limits")
+        .build()
+        .expect("budget");
+    let fixture = Fixture::with_source(RELATIONAL_TWO_DECLARATIONS);
+    let explanation = relational_why_not_with_budget(
+        &fixture,
+        CANDIDATE_HIERARCHY_RELATIONAL,
+        &candidate_in(RELATIONAL_TWO_DECLARATIONS, "render"),
+        &ExplanationLimits::default(),
+        &budget,
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![
+            (String::from("site"), ExplanationOutcome::Satisfied),
+            (String::from("hop"), ExplanationOutcome::Unknown),
+        ]
     );
     assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
     let expansion = &explanation.root().children()[1];
     assert_eq!(
         expansion.reasons(),
-        [PolicyIncompleteReason::CapabilityIncomplete]
+        [PolicyIncompleteReason::PipelineRowBudget]
     );
-    assert!(
-        expansion
-            .actual()
-            .expect("expansion prose")
-            .contains("not replayed"),
-        "{:?}",
-        expansion.actual()
+    let step = expansion
+        .children()
+        .iter()
+        .find(|node| node.kind().label() == "expansion_step")
+        .expect("the expansion step is retained");
+    assert_eq!(step.outcome(), ExplanationOutcome::Unknown);
+    assert_eq!(step.reasons(), [PolicyIncompleteReason::PipelineRowBudget]);
+}
+
+#[test]
+fn why_not_reports_prefix_budget_between_expansion_source_replay_and_step() {
+    let fixture = relational_fixture();
+    let limits = ExplanationLimits::default().with_max_prefix_executions(2);
+    let explanation = relational_why_not(
+        &fixture,
+        CANDIDATE_HIERARCHY_RELATIONAL,
+        &relational_candidate("render"),
+        &limits,
     );
-    assert!(
-        expansion.children().is_empty(),
-        "an unreplayed binding executed no prefix"
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![
+            (String::from("site"), ExplanationOutcome::Satisfied),
+            (String::from("hop"), ExplanationOutcome::Unknown),
+        ]
     );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    let expansion = &explanation.root().children()[1];
+    assert_eq!(
+        expansion.reasons(),
+        [PolicyIncompleteReason::ReportRetentionBudget]
+    );
+    assert_eq!(expansion.children().len(), 1);
+    assert!(expansion.children_truncated());
+    assert_eq!(
+        expansion.children()[0].kind(),
+        ExplanationNodeKind::SelectorStage
+    );
+    assert_eq!(
+        expansion.children()[0].outcome(),
+        ExplanationOutcome::Satisfied
+    );
+    assert_eq!(expansion.omitted_children_lower_bound(), 1);
+}
+
+/// An unrelated occurrence with the same member name expands successfully.
+/// It must not make the candidate survive either expansion or its filter.
+#[test]
+fn why_not_filters_only_the_candidates_expansion_rows() {
+    let fixture = Fixture::with_source(MEMBER_FIXTURE);
+    for (source_query, outcome) in [
+        (
+            "(occurrences :role [declaration_name member_position])",
+            ExplanationOutcome::Failed,
+        ),
+        // Lexical occurrences-in reports incomplete coverage. Replay still
+        // locates and filters the exact candidate row, but cannot prove absence.
+        (
+            "(occurrences-in (file-of (class :name \"Service\")))",
+            ExplanationOutcome::Unknown,
+        ),
+    ] {
+        let policy = format!(
+            r#"(policy
+          :id "test.explain.expansion-filter"
+          :name "Only member positions"
+          :message "only expanded member positions are reported"
+          :severity warning
+          :analysis (analysis :type assertion
+            (bind :name site :query (rql {source_query}))
+            (bind :name selection :from site :step member-selection)
+            (filter :over selection :where ((selection.role eq member_position)))
+            (join :left site :right selection :on ((ast_id site_ast_id)))
+            (group :name by-site :by (site.ast_id) (aggregate :name sites :op count))
+            (assert :group by-site :value sites :cardinality (exactly 0))))"#
+        );
+        let dropped = relational_why_not(
+            &fixture,
+            &policy,
+            &candidate_in(MEMBER_FIXTURE, "run():"),
+            &ExplanationLimits::default(),
+        );
+        assert_eq!(dropped.outcome(), outcome, "{source_query}: {dropped:#?}");
+        let binding = &dropped.root().children()[1];
+        assert_eq!(binding.label(), "selection");
+        assert_eq!(
+            filter_nodes(binding),
+            vec![(
+                String::from("(selection.role eq member_position)"),
+                String::from("`selection.role` is declaration_name"),
+                outcome,
+            )]
+        );
+        let survived = relational_why_not(
+            &fixture,
+            &policy,
+            &candidate_in(MEMBER_FIXTURE, "run();"),
+            &ExplanationLimits::default(),
+        );
+        assert!(
+            join_replay_gap(&survived).is_some(),
+            "{source_query}: {survived:#?}"
+        );
+    }
 }
 
 #[test]
@@ -2373,6 +2590,7 @@ fn fake_projection(
         );
     }
 
+    let reached_labels = facts.reached_source_labels.clone();
     crate::projection::TaintProjectedFinding {
         facts,
         pairs: vec![crate::projection::TaintPairProjection {
@@ -2381,6 +2599,7 @@ fn fake_projection(
                 .expect("an analysis finding id"),
             anchor,
             sink: AnalysisEventRef::try_new("test", "observation-0").expect("an event ref"),
+            reached_labels,
             origins: vec![crate::projection::TaintOriginProjection {
                 source_endpoint: source.identity.clone(),
                 source_label: label,

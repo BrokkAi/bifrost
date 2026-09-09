@@ -545,6 +545,10 @@ pub enum ValueTransferOperation {
         id: StableDigest,
         span: SourceSpan,
     },
+    /// Resolver-proven conversion provenance for one actual/formal argument
+    /// pair. This digest identifies the complete conversion witness and does
+    /// not identify a callee invocation.
+    CallArgumentConversion { id: StableDigest },
     /// An operation runs but was not selected exactly. The edge's own proof
     /// and completeness must not claim proven, complete knowledge.
     Unknown,

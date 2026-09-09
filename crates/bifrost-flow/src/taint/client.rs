@@ -610,15 +610,29 @@ impl<'plan> TaintFlowProblem<'plan> {
             if crate::value_flow::rule_kills_target(&rule) {
                 active.retain(|flow| flow.carrier != rule.target);
             }
+            let local_transform = rule.policy_local.then(|| {
+                self.plan
+                    .local_transform_function(point, rule.source, rule.target)
+                    .unwrap_or_else(|| self.plan.identity())
+            });
             let generated = active
                 .iter()
                 .filter(|flow| flow.carrier == rule.source)
                 .cloned()
-                .map(|flow| ActiveTaint {
-                    carrier: rule.target,
-                    ..flow.through_semantics(rule.complete)
+                .map(|flow| {
+                    let mut flow = flow.through_semantics(rule.complete);
+                    if let Some(function) = local_transform {
+                        flow.function = flow.function.compose(function);
+                    }
+                    ActiveTaint {
+                        carrier: rule.target,
+                        ..flow
+                    }
                 })
                 .collect::<Vec<_>>();
+            if crate::value_flow::rule_invalidates_source(&rule) {
+                active.retain(|flow| flow.carrier != rule.source);
+            }
             active.extend(generated);
         }
     }
@@ -786,17 +800,40 @@ impl<'plan> TaintFlowProblem<'plan> {
                 if crate::value_flow::rule_kills_target(&rule) {
                     active.retain(|flow| flow.carrier != rule.target);
                 }
-                let remaining = max_candidates.saturating_sub(active.len());
+                let invalidated = if crate::value_flow::rule_invalidates_source(&rule) {
+                    active
+                        .iter()
+                        .filter(|flow| flow.carrier == rule.source)
+                        .count()
+                } else {
+                    0
+                };
+                let remaining =
+                    max_candidates.saturating_sub(active.len().saturating_sub(invalidated));
+                let local_transform = rule.policy_local.then(|| {
+                    self.plan
+                        .local_transform_function(point, rule.source, rule.target)
+                        .unwrap_or_else(|| self.plan.identity())
+                });
                 let generated = active
                     .iter()
                     .filter(|flow| flow.carrier == rule.source)
                     .take(remaining.saturating_add(1))
                     .cloned()
-                    .map(|flow| ActiveTaint {
-                        carrier: rule.target,
-                        ..flow.through_semantics(rule.complete)
+                    .map(|flow| {
+                        let mut flow = flow.through_semantics(rule.complete);
+                        if let Some(function) = local_transform {
+                            flow.function = flow.function.compose(function);
+                        }
+                        ActiveTaint {
+                            carrier: rule.target,
+                            ..flow
+                        }
                     })
                     .collect::<Vec<_>>();
+                if crate::value_flow::rule_invalidates_source(&rule) {
+                    active.retain(|flow| flow.carrier != rule.source);
+                }
                 if generated.len() > remaining {
                     return Ok(None);
                 }
@@ -887,45 +924,99 @@ impl<'plan> TaintFlowProblem<'plan> {
                 || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
             function: TaintEdgeFunction::generate(binding.classes()),
         };
-        let mut output = Vec::new();
-        let mut active = if spec.phase() == ValueFlowObservationPhase::BeforeEffects {
+        let before = if spec.phase() == ValueFlowObservationPhase::BeforeEffects {
             vec![make_source()]
         } else {
             Vec::new()
         };
+        let after = if spec.phase() == ValueFlowObservationPhase::AfterEffects {
+            vec![make_source()]
+        } else {
+            Vec::new()
+        };
+        self.replay_witness_step(output_fact, step, before, after)
+            .into_iter()
+            .fold(self.plan.universe().empty_set(), |mut classes, function| {
+                classes.union_with(&function.apply(&self.plan.universe().empty_set()));
+                classes
+            })
+    }
+
+    /// Map demanded output classes back through one exact retained witness
+    /// step. Origin reconstruction uses this instead of assuming that class
+    /// names are unchanged between a source and a sink.
+    pub(crate) fn witness_step_preimages(
+        &self,
+        input_fact: TaintFact,
+        output_fact: TaintFact,
+        step: &SummaryWitnessStep,
+        demanded: &[(TaintClassId, TaintClassSet)],
+    ) -> Vec<TaintClassSet> {
+        let active = match input_fact.0 {
+            TaintFactKind::Carrier { carrier, uncertain } => vec![ActiveTaint {
+                carrier,
+                uncertain,
+                function: self.plan.identity().clone(),
+            }],
+            TaintFactKind::Zero | TaintFactKind::Meeting { .. } => Vec::new(),
+        };
+        let functions = self.replay_witness_step(output_fact, step, active, Vec::new());
+        demanded
+            .iter()
+            .map(|(_, classes)| {
+                let mut preimage = self.plan.universe().empty_set();
+                for function in &functions {
+                    for class in classes.iter_dense() {
+                        preimage.union_with(&function.preimage_class(class));
+                    }
+                }
+                preimage
+            })
+            .collect()
+    }
+
+    /// Replay one retained summary witness step from an explicitly selected
+    /// set of active inputs. `after` supports a source whose authored phase is
+    /// after effects without admitting every other source at the point.
+    fn replay_witness_step(
+        &self,
+        output_fact: TaintFact,
+        step: &SummaryWitnessStep,
+        mut active: Vec<ActiveTaint>,
+        after: Vec<ActiveTaint>,
+    ) -> Vec<TaintEdgeFunction> {
+        let mut output = Vec::new();
         self.apply_phase(
-            spec.point(),
+            step.source(),
             ValueFlowObservationPhase::BeforeEffects,
             &mut active,
         );
         self.append_meetings(
-            spec.point(),
+            step.source(),
             ValueFlowObservationPhase::BeforeEffects,
             &active,
             output_fact.meeting_entry_fact(),
             &mut output,
         );
-        self.apply_local_rules(spec.point(), &mut active);
-        if spec.phase() == ValueFlowObservationPhase::AfterEffects {
-            active.push(make_source());
-        }
+        self.apply_local_rules(step.source(), &mut active);
+        active.extend(after);
         self.apply_phase(
-            spec.point(),
+            step.source(),
             ValueFlowObservationPhase::AfterEffects,
             &mut active,
         );
         self.append_meetings(
-            spec.point(),
+            step.source(),
             ValueFlowObservationPhase::AfterEffects,
             &active,
             output_fact.meeting_entry_fact(),
             &mut output,
         );
 
-        let active = match step.kind() {
+        active = match step.kind() {
             SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call) => {
                 let (Some(call), Some(target)) = (step.origin(), step.target()) else {
-                    return self.plan.universe().empty_set();
+                    return Vec::new();
                 };
                 let callee = target.procedure();
                 active
@@ -960,7 +1051,7 @@ impl<'plan> TaintFlowProblem<'plan> {
             SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
             | SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn) => {
                 let Some(call) = step.origin() else {
-                    return self.plan.universe().empty_set();
+                    return Vec::new();
                 };
                 active
                     .into_iter()
@@ -997,7 +1088,7 @@ impl<'plan> TaintFlowProblem<'plan> {
             SummaryWitnessStepKind::Edge(IcfgEdgeKind::CallToNormalContinuation)
             | SummaryWitnessStepKind::Edge(IcfgEdgeKind::CallToExceptionalContinuation) => {
                 let Some(call) = step.origin() else {
-                    return self.plan.universe().empty_set();
+                    return Vec::new();
                 };
                 let kind = match step.kind() {
                     SummaryWitnessStepKind::Edge(kind) => kind,
@@ -1042,13 +1133,10 @@ impl<'plan> TaintFlowProblem<'plan> {
             | SummaryWitnessStepKind::EndSummaryGap(_) => active,
         };
         output.extend(active.into_iter().map(|flow| (flow.fact(), flow.function)));
-        let mut contribution = self.plan.universe().empty_set();
-        for (fact, function) in output {
-            if fact == output_fact {
-                contribution.union_with(&function.apply(&self.plan.universe().empty_set()));
-            }
-        }
-        contribution
+        output
+            .into_iter()
+            .filter_map(|(fact, function)| (fact == output_fact).then_some(function))
+            .collect()
     }
 
     fn emit(
@@ -1695,6 +1783,12 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
                     next.push(fact);
                     continue;
                 };
+                if crate::value_flow::rule_invalidates_source(&view)
+                    && carrier == view.source
+                    && carrier != view.target
+                {
+                    continue;
+                }
                 if carrier != view.target {
                     next.push(fact);
                     continue;
@@ -1702,12 +1796,30 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
                 if !crate::value_flow::rule_kills_target(&view) {
                     next.push(fact);
                 }
-                next.push(Self::demand_with(
-                    fact,
-                    view.source,
-                    class_index,
-                    uncertain || !view.complete,
-                ));
+                let predecessors = if view.policy_local {
+                    self.plan
+                        .local_transform_function(point, view.source, view.target)
+                        .unwrap_or_else(|| self.plan.identity())
+                        .preimage_class(
+                            self.class_id(class_index)
+                                .expect("a demand class belongs to the plan universe"),
+                        )
+                } else {
+                    let mut identity = self.plan.universe().empty_set();
+                    identity.insert_dense(
+                        self.class_id(class_index)
+                            .expect("a demand class belongs to the plan universe"),
+                    );
+                    identity
+                };
+                for predecessor in predecessors.iter_dense() {
+                    next.push(Self::demand_with(
+                        fact,
+                        view.source,
+                        u16::try_from(predecessor.index()).expect("taint universe fits in u16"),
+                        uncertain || !view.complete,
+                    ));
+                }
             }
             next.sort_unstable();
             next.dedup();

@@ -1,4 +1,4 @@
-//! Workspace-wide syntactic summaries for class-owned instance fields.
+//! Class-owned field values and receiver-scoped workspace store evidence.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use crate::analyzer::store::class_set_field_slots::{
 use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
+use super::dynamic_stores::{DynamicWriteEvidence, PendingDynamicWrite, ScopedDynamicWrite};
 use super::plan::TypeFlowPlanError;
 use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
 
@@ -133,13 +134,14 @@ enum PersistedHydrationRejection {
     Cancelled,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CollectedSlots {
     stores: HashMap<FieldSlotKey, Vec<FieldSlotAtom>>,
     loads: HashMap<FieldSlotKey, SourceSite>,
     foreign_members: HashSet<Box<str>>,
     dynamic_members: HashSet<Box<str>>,
-    dynamic_any: bool,
+    dynamic_writes: Vec<PendingDynamicWrite>,
+    dynamic_effects: Vec<ScopedDynamicWrite>,
     globally_incomplete: bool,
     transient_resolver_budget: bool,
     semantic_budget_exhaustion: Option<SemanticBudgetExceeded>,
@@ -164,6 +166,7 @@ struct FieldStoreSurvey {
     stores: HashMap<ClassIdentity, HashSet<Box<str>>>,
     unowned_members: HashSet<Box<str>>,
     unknown_members: bool,
+    dynamic_effects: Vec<ScopedDynamicWrite>,
 }
 
 impl FieldStoreSurvey {
@@ -182,7 +185,8 @@ impl FieldStoreSurvey {
                 .union(&collected.dynamic_members)
                 .cloned()
                 .collect(),
-            unknown_members: collected.globally_incomplete || collected.dynamic_any,
+            unknown_members: collected.globally_incomplete,
+            dynamic_effects: collected.dynamic_effects.clone(),
         }
     }
 
@@ -248,12 +252,36 @@ impl FieldStoreSurvey {
                 },
             )
             .saturating_add(member_bytes(&self.unowned_members))
+            .saturating_add(
+                self.dynamic_effects.iter().fold(
+                    self.dynamic_effects
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ScopedDynamicWrite>()),
+                    |bytes, effect| {
+                        bytes
+                            .saturating_add(project_file_path_bytes(&effect.evidence.site.file))
+                            .saturating_add(
+                                effect
+                                    .classes
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<ClassIdentity>()),
+                            )
+                            .saturating_add(
+                                effect
+                                    .classes
+                                    .iter()
+                                    .map(class_identity_heap_bytes)
+                                    .sum::<usize>(),
+                            )
+                    },
+                ),
+            )
     }
 }
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 5;
+    const ALGORITHM_VERSION: u32 = 6;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -523,6 +551,7 @@ impl FieldSlotIndex {
             .analyzable_files(adapter.language())
             .map_err(TypeFlowPlanError::WorkspaceEnumeration)?;
         let mut collected = CollectedSlots::default();
+        let mut procedures = Vec::new();
         for file in files {
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
@@ -564,6 +593,69 @@ impl FieldSlotIndex {
                     .procedure_handle(procedure.id())
                     .expect("a retained artifact owns each procedure");
                 collect_procedure(workspace, adapter, &procedure, &mut collected, cancellation)?;
+                procedures.push(procedure);
+            }
+        }
+        if !collected.dynamic_writes.is_empty() {
+            let mut solver_budget = crate::dataflow::SolverBudget::default();
+            let mut provisional =
+                Self::finish(workspace, adapter, collected.clone(), cancellation)?;
+            loop {
+                // Start with the syntactic slot values, then monotonically
+                // add effects until receiver scopes stop changing. Guards
+                // remain open throughout: absence cannot justify its own
+                // survey. Slot values only open for affected receiver classes.
+                provisional.store_survey.dynamic_effects = collected
+                    .dynamic_writes
+                    .iter()
+                    .map(|write| {
+                        ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad)
+                    })
+                    .collect();
+                let mut effects = super::dynamic_stores::survey(
+                    workspace,
+                    adapter,
+                    &provisional,
+                    &procedures,
+                    &collected.dynamic_writes,
+                    semantic_budget,
+                    &mut solver_budget,
+                    cancellation,
+                )?;
+                for (next, previous) in effects.iter_mut().zip(&collected.dynamic_effects) {
+                    for class in &previous.classes {
+                        if !next.classes.contains(class) {
+                            next.classes.push(class.clone());
+                        }
+                    }
+                    next.classes.sort_by(class_order);
+                    if previous.evidence.reason.is_some() {
+                        next.evidence.reason = previous.evidence.reason.clone();
+                    }
+                }
+                if effects == collected.dynamic_effects {
+                    break;
+                }
+                let exhausted = effects.iter().any(|effect| {
+                    matches!(
+                        effect.evidence.reason,
+                        Some(
+                            UnknownReason::SemanticBudget
+                                | UnknownReason::SolverBudget
+                                | UnknownReason::IncompleteRoot
+                                | UnknownReason::Truncated
+                        )
+                    )
+                });
+                collected.dynamic_effects = effects;
+                if exhausted {
+                    break;
+                }
+                let next = Self::finish(workspace, adapter, collected.clone(), cancellation)?;
+                if next.slots == provisional.slots {
+                    break;
+                }
+                provisional = next;
             }
         }
         Self::finish(workspace, adapter, collected, cancellation)
@@ -589,7 +681,8 @@ impl FieldSlotIndex {
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
         let store_survey = FieldStoreSurvey::from_collected(&collected);
-        let persistable = !collected.globally_incomplete
+        let persistable = collected.dynamic_writes.is_empty()
+            && !collected.globally_incomplete
             && !collected.transient_resolver_budget
             && collected.semantic_budget_exhaustion.is_none();
         let mut artifacts = collected
@@ -635,7 +728,10 @@ impl FieldSlotIndex {
                 || hierarchy.descendants.is_none()
                 || hierarchy.unresolved_base
                 || hierarchy.dynamic_attributes
-                || collected.dynamic_any
+                || collected
+                    .dynamic_effects
+                    .iter()
+                    .any(|write| related.iter().any(|class| write.affects(class)))
                 || collected.foreign_members.contains(member.as_ref())
                 || collected.dynamic_members.contains(member.as_ref());
             for owner in &related {
@@ -726,9 +822,7 @@ impl FieldSlotIndex {
                                         ClassSetFieldSlotAtomValueRow::Class(persist_class(class)?)
                                     }
                                     ClassAtom::Unknown(reason) => {
-                                        ClassSetFieldSlotAtomValueRow::Unknown(
-                                            reason.label().to_string(),
-                                        )
+                                        ClassSetFieldSlotAtomValueRow::Unknown(reason.to_string())
                                     }
                                 },
                                 source: persist_source(source)?,
@@ -852,7 +946,7 @@ impl FieldSlotIndex {
                                         )?)
                                     }
                                     ClassSetFieldSlotAtomValueRow::Unknown(reason) => {
-                                        ClassAtom::Unknown(unknown_reason(&reason)?)
+                                        ClassAtom::Unknown(UnknownReason::from_label(&reason)?)
                                     }
                                 },
                                 rehydrate_source(
@@ -935,7 +1029,12 @@ impl FieldSlotIndex {
         if hierarchy.ancestors.iter().any(has_store) {
             return MemberStoreEvidence::Stored;
         }
-        if self.store_survey.unknown_members
+        if self
+            .store_survey
+            .dynamic_effects
+            .iter()
+            .any(|write| write.affects(class))
+            || self.store_survey.unknown_members
             || self.store_survey.unowned_members.contains(member)
             || hierarchy.unresolved_base
             || hierarchy.dynamic_attributes
@@ -944,6 +1043,17 @@ impl FieldSlotIndex {
         } else {
             MemberStoreEvidence::NoStore
         }
+    }
+
+    pub(super) fn dynamic_write_evidence(
+        &self,
+        class: &ClassIdentity,
+    ) -> impl Iterator<Item = &DynamicWriteEvidence> {
+        self.store_survey
+            .dynamic_effects
+            .iter()
+            .filter(move |write| write.affects(class))
+            .map(|write| &write.evidence)
     }
 
     pub fn slot(&self, class: &ClassIdentity, member: &str) -> Option<&FieldSlot> {
@@ -955,6 +1065,20 @@ impl FieldSlotIndex {
 
     pub const fn digest(&self) -> StableDigest {
         self.digest
+    }
+
+    pub(super) fn dynamic_survey_boundary(&self) -> Option<UnknownReason> {
+        self.store_survey.dynamic_effects.iter().find_map(|write| {
+            write.evidence.reason.clone().filter(|reason| {
+                matches!(
+                    reason,
+                    UnknownReason::SemanticBudget
+                        | UnknownReason::SolverBudget
+                        | UnknownReason::IncompleteRoot
+                        | UnknownReason::Truncated
+                )
+            })
+        })
     }
 
     pub const fn semantic_budget_exhausted(&self) -> bool {
@@ -1009,7 +1133,7 @@ impl FieldSlotIndex {
                         total
                             .saturating_add(match atom {
                                 ClassAtom::Class(class) => class_identity_heap_bytes(class),
-                                ClassAtom::Unknown(_) => 0,
+                                ClassAtom::Unknown(reason) => unknown_reason_heap_bytes(reason),
                             })
                             .saturating_add(project_file_path_bytes(&source.file))
                     }))
@@ -1064,6 +1188,13 @@ fn class_identity_heap_bytes(class: &ClassIdentity) -> usize {
             qualified_name,
             symbol_id,
         } => qualified_name.len().saturating_add(symbol_id.len()),
+    }
+}
+
+fn unknown_reason_heap_bytes(reason: &UnknownReason) -> usize {
+    match reason {
+        UnknownReason::UnmodeledGuard { class } => class.len(),
+        _ => 0,
     }
 }
 
@@ -1323,32 +1454,6 @@ fn portable_path(file: &ProjectFile) -> Option<String> {
         .map(|path| path.as_str().to_string())
 }
 
-fn unknown_reason(label: &str) -> Option<UnknownReason> {
-    Some(match label {
-        "root_parameter" => UnknownReason::RootParameter,
-        "self_receiver" => UnknownReason::SelfReceiver,
-        "variadic_parameter" => UnknownReason::VariadicParameter,
-        "unresolved_call" => UnknownReason::UnresolvedCall,
-        "truncated" => UnknownReason::Truncated,
-        "unmodeled_load" => UnknownReason::UnmodeledLoad,
-        "await" => UnknownReason::Await,
-        "capture" => UnknownReason::Capture,
-        "ambiguous_callee" => UnknownReason::AmbiguousCallee,
-        "external_not_modeled" => UnknownReason::ExternalNotModeled,
-        "unresolved_base" => UnknownReason::UnresolvedBase,
-        "dynamic_attributes" => UnknownReason::DynamicAttributes,
-        "pack_incomplete" => UnknownReason::PackIncomplete,
-        "uncertain_flow" => UnknownReason::UncertainFlow,
-        "field_slot_incomplete" => UnknownReason::FieldSlotIncomplete,
-        "solver_budget" => UnknownReason::SolverBudget,
-        "semantic_budget" => UnknownReason::SemanticBudget,
-        "incomplete_root" => UnknownReason::IncompleteRoot,
-        "open_type_bound" => UnknownReason::OpenTypeBound,
-        "scalar_receiver" => UnknownReason::ScalarReceiver,
-        _ => return None,
-    })
-}
-
 fn source_kind(label: &str) -> Option<SourceSiteKind> {
     Some(match label {
         "constructor_call" => SourceSiteKind::ConstructorCall,
@@ -1376,7 +1481,21 @@ fn collect_procedure(
             DynamicFieldWrite::Member(member) => {
                 collected.dynamic_members.insert(member);
             }
-            DynamicFieldWrite::Any => collected.dynamic_any = true,
+            DynamicFieldWrite::Any { receiver, span } => {
+                if let Some(file) = file_for_procedure(workspace, procedure) {
+                    collected.dynamic_writes.push(PendingDynamicWrite {
+                        procedure: procedure.clone(),
+                        receiver,
+                        site: SourceSite {
+                            file,
+                            span,
+                            kind: SourceSiteKind::Unknown,
+                        },
+                    });
+                } else {
+                    collected.globally_incomplete = true;
+                }
+            }
         }
     }
     let semantics = procedure.semantics();
@@ -1403,7 +1522,19 @@ fn collect_procedure(
                         procedure,
                         MemberAccessQuery::Load(location),
                     ) else {
-                        collected.dynamic_any = true;
+                        if let Some(file) = file_for_procedure(workspace, procedure) {
+                            collected.dynamic_writes.push(PendingDynamicWrite {
+                                procedure: procedure.clone(),
+                                receiver: Some(base),
+                                site: SourceSite {
+                                    file,
+                                    span: mapping_span(procedure, event.source),
+                                    kind: SourceSiteKind::Unknown,
+                                },
+                            });
+                        } else {
+                            collected.globally_incomplete = true;
+                        }
                         continue;
                     };
                     let Some(class) = enclosing_class
@@ -1493,11 +1624,25 @@ pub(super) fn receiver_values(
     procedure: &ProcedureHandle,
 ) -> HashSet<crate::analyzer::semantic::ValueId> {
     let semantics = procedure.semantics();
+    // This inventory helper has no program-point state. A mutable receiver
+    // binding cannot certify that every read still names the entry object.
+    // The local field refinement pass recovers proofs at individual accesses.
+    let rebound = semantics
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| match event.effect {
+            SemanticEffect::Assignment { target, value } if target != value => Some(target),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let mut values = semantics
         .values()
         .iter()
         .filter_map(|value| {
-            matches!(value.kind, SemanticValueKind::Receiver { .. }).then_some(value.id)
+            (matches!(value.kind, SemanticValueKind::Receiver { .. })
+                && !rebound.contains(&value.id))
+            .then_some(value.id)
         })
         .collect::<HashSet<_>>();
     loop {
@@ -1689,7 +1834,7 @@ fn classify_stored_value(
             continue;
         }
         match &row.kind {
-            SemanticValueKind::Constant => {
+            SemanticValueKind::Constant | SemanticValueKind::Boolean(_) => {
                 classified.observe_seed(
                     adapter.constant_class(workspace, procedure, row),
                     &file,
@@ -1721,7 +1866,6 @@ fn classify_stored_value(
             | SemanticValueKind::Temporary
             | SemanticValueKind::Address
             | SemanticValueKind::Null
-            | SemanticValueKind::Boolean(_)
             | SemanticValueKind::UnsignedInteger(_)
             | SemanticValueKind::Exception
             | SemanticValueKind::Callable
@@ -1800,7 +1944,10 @@ fn atom_order(
         (ClassAtom::Class(left), ClassAtom::Class(right)) => class_order(left, right),
         (ClassAtom::Class(_), ClassAtom::Unknown(_)) => std::cmp::Ordering::Less,
         (ClassAtom::Unknown(_), ClassAtom::Class(_)) => std::cmp::Ordering::Greater,
-        (ClassAtom::Unknown(left), ClassAtom::Unknown(right)) => left.label().cmp(right.label()),
+        (ClassAtom::Unknown(left), ClassAtom::Unknown(right)) => left
+            .label()
+            .cmp(right.label())
+            .then_with(|| left.cmp(right)),
     };
     atom_order.then_with(|| source_site_order(left_site, right_site))
 }
@@ -1826,6 +1973,12 @@ fn digest_index(
     let mut digest = LengthDelimitedDigest::new(b"bifrost-type-flow-field-index-v2");
     digest.push(digest_slots(slots, semantics).as_bytes());
     digest.push(&[u8::from(survey.unknown_members)]);
+    for write in &survey.dynamic_effects {
+        digest.push(write.evidence.origin().as_bytes());
+        for class in &write.classes {
+            push_class(&mut digest, class);
+        }
+    }
     for (owner, member) in survey.ordered_stores() {
         match owner {
             Some(owner) => {
@@ -1853,7 +2006,7 @@ fn digest_slots(slots: &[FieldSlot], semantics: StableDigest) -> StableDigest {
                 }
                 ClassAtom::Unknown(reason) => {
                     digest.push(b"unknown");
-                    digest.push(reason.label().as_bytes());
+                    digest.push(reason.to_string().as_bytes());
                 }
             }
             digest.push(site.file.rel_path().to_string_lossy().as_bytes());

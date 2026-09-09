@@ -306,6 +306,9 @@ pub(crate) struct TaintPairProjection {
     /// the anchor path/common stable identity but cannot derive a semantic site
     /// from an opaque ref.
     pub(crate) sink: AnalysisEventRef,
+    /// Labels carried by this source partition at the sink. They can differ
+    /// from the origin labels when an authored transform rewrites them.
+    pub(crate) reached_labels: Vec<super::definition::TaintLabel>,
     pub(crate) origins: Vec<TaintOriginProjection>,
     pub(crate) origins_truncated: bool,
     pub(crate) witness_refs: Vec<WitnessId>,
@@ -1091,16 +1094,31 @@ fn validate_taint_projection(
         };
         let finding_id =
             PolicyFindingId::from_taint_anchor(&authority.seal.policy_id, &pair.anchor);
+        let source = authority
+            .spec
+            .sources
+            .iter()
+            .chain(authority.spec.entry_points.iter())
+            .find(|source| source.identity == source_endpoint)
+            .expect("validated source facts retain a resolved source endpoint");
+        if pair.reached_labels.iter().any(|label| {
+            !authority
+                .spec
+                .authorizes_reached_label(&source.definition, label)
+        }) {
+            omitted_finding_ids.insert(finding_id);
+            rejections.push(ProjectionAuthorityError::EndpointModelMismatch {
+                role: "taint transform",
+            });
+            continue;
+        }
         let source_facts = validated_facts
             .source_facts
             .iter()
             .filter(|fact| fact.source_endpoint == source_endpoint)
             .cloned()
             .collect::<Vec<_>>();
-        let reached_source_labels = source_facts
-            .iter()
-            .map(|fact| fact.source_label.clone())
-            .collect::<Vec<_>>();
+        let reached_source_labels = pair.reached_labels.clone();
         let pair_facts = TaintPolicyProjectionFacts::try_new(
             validated_facts.sink_endpoint.clone(),
             validated_facts.sink_endpoint_semantic_hash,
@@ -1659,12 +1677,6 @@ fn validate_taint_facts(
             invalid_source_endpoints,
         });
     }
-    let mut reached_source_labels = valid_source_facts
-        .iter()
-        .map(|fact| fact.source_label.clone())
-        .collect::<Vec<_>>();
-    reached_source_labels.sort();
-    reached_source_labels.dedup();
     let rebuilt = TaintPolicyProjectionFacts::try_new(
         facts.sink_endpoint,
         facts.sink_endpoint_semantic_hash,
@@ -1673,7 +1685,7 @@ fn validate_taint_facts(
         facts.sink_categories,
         facts.sink_tags,
         facts.sink_impacts,
-        reached_source_labels,
+        facts.reached_source_labels,
         valid_source_facts,
         budget,
     )
@@ -2341,6 +2353,7 @@ mod tests {
             .unwrap(),
             anchor,
             sink: AnalysisEventRef::try_new("test", "sink-event").unwrap(),
+            reached_labels: vec![source_fact.source_label.clone()],
             origins,
             origins_truncated: false,
             witness_refs: Vec::new(),

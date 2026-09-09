@@ -75,8 +75,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.captured_bindings.insert(capture.binding, value);
         }
         for capture in &spec.omitted_captures {
-            let value =
-                self.expression_value(builder, capture.reference, SemanticValueKind::Local)?;
+            // A captured reference can also be a call callee. Classify it by
+            // its structural role before caching it so call lowering reuses a
+            // Callable row rather than a Local row.
+            let value = self.expression_value(
+                builder,
+                capture.reference,
+                if is_call_callee(capture.reference) {
+                    SemanticValueKind::Callable
+                } else {
+                    SemanticValueKind::Local
+                },
+            )?;
             self.add_gap(
                 builder,
                 entry,

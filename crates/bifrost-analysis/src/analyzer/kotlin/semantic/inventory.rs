@@ -506,6 +506,7 @@ fn callable_shape<'tree>(
             invocation: ProcedureInvocationKind::Immediate,
             dispatch_extensibility: dispatch_extensibility(source, node, kind, is_static),
             call_boundary: ProcedureCallBoundary::Direct,
+            receiver_binding: Default::default(),
         },
         is_suspend,
         delegated,

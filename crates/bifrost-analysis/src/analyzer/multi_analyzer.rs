@@ -1462,6 +1462,16 @@ impl CodeUnitIndex for MultiAnalyzer {
                 delegate.analyzer().definitions(fq_name)
             })
             .collect();
+        if IAnalyzer::read_ledger_attached(self) {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::Definitions,
+                crate::analyzer::read_ledger::LookupQuestion::Name {
+                    language: None,
+                    name: fq_name.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&matches),
+            ));
+        }
         Box::new(matches.into_iter())
     }
 
@@ -1558,7 +1568,19 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_short_name(symbol))
+        let matches =
+            self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_short_name(symbol));
+        if IAnalyzer::read_ledger_attached(self) {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::ShortNameCandidates,
+                crate::analyzer::read_ledger::LookupQuestion::Name {
+                    language: None,
+                    name: symbol.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&matches),
+            ));
+        }
+        matches
     }
 
     /// Every delegate must be able to answer from an index before a miss is
@@ -1572,7 +1594,19 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_identifier(identifier))
+        let matches = self
+            .merged_from_delegates(|analyzer| analyzer.lookup_candidates_by_identifier(identifier));
+        if IAnalyzer::read_ledger_attached(self) {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::lookup(
+                crate::analyzer::read_ledger::LookupKind::IdentifierCandidates,
+                crate::analyzer::read_ledger::LookupQuestion::Name {
+                    language: None,
+                    name: identifier.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&matches),
+            ));
+        }
+        matches
     }
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
@@ -1693,10 +1727,10 @@ impl IAnalyzer for MultiAnalyzer {
     /// Record one input read through this facade.
     ///
     /// The delegates keep their own registries and record their own funnels;
-    /// this reaches the ledgers of the contexts opened against the composite
-    /// so a key formed above the delegates is not lost. Forwarding to the
-    /// delegates as well would only re-record the same key on the same
-    /// ledgers, which a set-valued ledger would drop anyway.
+    /// this reaches every unshadowed ledger opened against the composite so a
+    /// key formed above the delegates is not lost. Forwarding to the delegates
+    /// as well would only re-record the same key, which a set-valued ledger
+    /// would drop anyway.
     fn record_read(&self, key: crate::analyzer::read_ledger::ReadKey) {
         if !IAnalyzer::read_ledger_attached(self) {
             return;
@@ -1706,9 +1740,7 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned")
             .clone();
-        for context in contexts {
-            context.record_read(key.clone());
-        }
+        crate::analyzer::i_analyzer::record_read_on_active_ledgers(&contexts, key);
     }
 
     fn record_unattributed_read(&self) {
@@ -1720,13 +1752,20 @@ impl IAnalyzer for MultiAnalyzer {
             .lock()
             .expect("multi-analyzer query context mutex poisoned")
             .clone();
-        for context in contexts {
-            context.record_unattributed_read();
-        }
+        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
     }
 
     fn read_ledger_attached(&self) -> bool {
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
+    }
+
+    fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .iter()
+            .rev()
+            .find_map(|context| context.current_thread_read_ledger().cloned())
     }
 
     fn prefetch_definitions(&self, fq_names: &[String]) {
@@ -2901,6 +2940,27 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .analyzer()
                     .test_hooks()
                     .scala_query_walk_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_scala_query_file_facts_touched_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_scala_query_file_facts_touched_for_test();
+        }
+    }
+
+    fn scala_query_file_facts_touched_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .scala_query_file_facts_touched_for_test()
             })
             .sum()
     }

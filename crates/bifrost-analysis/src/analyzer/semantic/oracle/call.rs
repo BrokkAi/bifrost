@@ -1,7 +1,8 @@
 use super::super::ids::ProgramPointId;
 use super::super::ir::{
-    ArgumentDomain, CallArgumentExpansion, CallSiteHandle, FormalMultiplicity, ProcedureHandle,
-    ProofStatus, SemanticValueKind, ValueHandle,
+    ArgumentDomain, CallArgumentExpansion, CallSiteHandle, CallerReceiverBinding,
+    FormalMultiplicity, ProcedureHandle, ProcedureReceiverBinding, ProofStatus, SemanticValueKind,
+    ValueHandle,
 };
 use super::dispatch::DispatchCandidate;
 use super::error::{OracleContractError, require_same_procedure};
@@ -492,6 +493,7 @@ impl CallBindings {
         let mut formal_bindings = std::collections::HashSet::new();
         let mut formal_mapping_counts = std::collections::HashMap::<u32, usize>::new();
         let mut implicit_formals = std::collections::HashSet::new();
+        let caller_receiver_binding = caller.semantics().proven_caller_receiver_binding(call.id());
         let mut has_receiver = false;
         let mut normal_return_bindings = std::collections::HashSet::new();
         let mut has_exceptional_return = false;
@@ -516,8 +518,9 @@ impl CallBindings {
                     require_same_procedure(actual.procedure(), caller)?;
                     require_same_procedure(formal.procedure(), &callee)?;
                     // A call that spells a receiver operand binds exactly that
-                    // operand. A receiverless call may instead bind one of two
-                    // structurally proven implicit actuals: the caller's own
+                    // operand. An unbound method accounts for its receiver in
+                    // an argument group. Other receiverless calls can bind a
+                    // class qualifier or structurally proven implicit actuals: the caller's own
                     // dispatch receiver (a bare call between members of one
                     // declaring type dispatches on `this`), or -- a
                     // constructor call, `new Type(...)`, which spells no
@@ -526,15 +529,27 @@ impl CallBindings {
                     // `this` can only ever be the object being constructed).
                     let receiver_actual_matches = match call_row.receiver {
                         Some(receiver) => receiver == actual.id(),
+                        None if caller_receiver_binding.is_some_and(|binding| {
+                            binding.passes_receiver_as_argument(callee.semantics())
+                        }) =>
+                        {
+                            false
+                        }
                         None => {
-                            caller.semantics().value(actual.id()).is_some_and(|row| {
-                                row.kind == SemanticValueKind::Receiver { dispatch: true }
-                            }) || (call_row.result == Some(actual.id())
-                                && caller
-                                    .semantics()
-                                    .allocations()
-                                    .iter()
-                                    .any(|allocation| allocation.result == actual.id()))
+                            (matches!(caller_receiver_binding,
+                                Some(CallerReceiverBinding::TypeQualified(qualifier))
+                                    if qualifier == actual.id())
+                                && callee.semantics().properties().receiver_binding
+                                    == ProcedureReceiverBinding::Class)
+                                || caller.semantics().value(actual.id()).is_some_and(|row| {
+                                    row.kind == SemanticValueKind::Receiver { dispatch: true }
+                                })
+                                || (call_row.result == Some(actual.id())
+                                    && caller
+                                        .semantics()
+                                        .allocations()
+                                        .iter()
+                                        .any(|allocation| allocation.result == actual.id()))
                         }
                     };
                     if !receiver_actual_matches || formal.kind() != ProcedurePortKind::Receiver {
@@ -618,11 +633,6 @@ impl CallBindings {
                             &context,
                         )?;
                         require_same_procedure(mapping.formal.procedure(), &callee)?;
-                        let ProcedurePortKind::Parameter { ordinal } = mapping.formal.kind() else {
-                            return Err(OracleContractError::InvalidCallBinding(
-                                "argument mapping does not name a callee parameter port",
-                            ));
-                        };
                         if argument.value != mapping.actual.value().id()
                             || !member_matches_expansion(&argument.expansion, &mapping.member)
                         {
@@ -630,6 +640,45 @@ impl CallBindings {
                                 "argument mapping does not match the call source expansion",
                             ));
                         }
+                        if mapping.formal.kind() == ProcedurePortKind::Receiver {
+                            if has_receiver
+                                || !caller_receiver_binding.is_some_and(|binding| {
+                                    binding.passes_receiver_as_argument(callee.semantics())
+                                })
+                                || !matches!(
+                                    argument.expansion,
+                                    CallArgumentExpansion::Direct(
+                                        ArgumentDomain::Positional
+                                            | ArgumentDomain::PositionalOrKeyword
+                                    )
+                                )
+                                || call_row.arguments[..mapping.source_index as usize]
+                                    .iter()
+                                    .any(|source| {
+                                        matches!(
+                                            source.expansion,
+                                            CallArgumentExpansion::Direct(
+                                                ArgumentDomain::Positional
+                                                    | ArgumentDomain::PositionalOrKeyword
+                                            ) | CallArgumentExpansion::Spread(
+                                                ArgumentDomain::Positional
+                                                    | ArgumentDomain::PositionalOrKeyword
+                                            )
+                                        )
+                                    })
+                            {
+                                return Err(OracleContractError::InvalidCallBinding(
+                                    "receiver argument does not match an unbound method's first positional actual",
+                                ));
+                            }
+                            has_receiver = true;
+                            continue;
+                        }
+                        let ProcedurePortKind::Parameter { ordinal } = mapping.formal.kind() else {
+                            return Err(OracleContractError::InvalidCallBinding(
+                                "argument mapping does not name a callee parameter or receiver port",
+                            ));
+                        };
                         let multiplicity = mapping
                             .formal
                             .formal_multiplicity()

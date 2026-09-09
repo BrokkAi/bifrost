@@ -84,7 +84,10 @@ pub struct TaintOriginStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintOriginFindingEvidence {
     origin: SourceEventKey,
+    /// Source-declared classes that contributed along this witness.
     classes: TaintClassSet,
+    /// Classes observed at the sink after every intervening transform.
+    reached_classes: TaintClassSet,
     witnesses: Box<[Arc<SummaryWitness>]>,
 }
 
@@ -95,6 +98,10 @@ impl TaintOriginFindingEvidence {
 
     pub const fn classes(&self) -> &TaintClassSet {
         &self.classes
+    }
+
+    pub const fn reached_classes(&self) -> &TaintClassSet {
+        &self.reached_classes
     }
 
     pub const fn witnesses(&self) -> &[Arc<SummaryWitness>] {
@@ -313,6 +320,9 @@ impl TaintFindingReport {
                                             .value_flow_key()
                                             .retained_bytes()
                                             .saturating_add(evidence.classes.retained_heap_bytes())
+                                            .saturating_add(
+                                                evidence.reached_classes.retained_heap_bytes(),
+                                            )
                                             .saturating_add(size_of_val(&*evidence.witnesses))
                                             .saturating_add(
                                                 evidence
@@ -603,13 +613,27 @@ fn collect_step_origins(
     steps: &[SummaryWitnessStep],
     witness: &Arc<SummaryWitness>,
     origins: &mut BTreeSet<SourceEventKey>,
-    evidence: &mut Vec<(SourceEventKey, TaintClassSet, Vec<Arc<SummaryWitness>>)>,
+    evidence: &mut Vec<(
+        SourceEventKey,
+        TaintClassSet,
+        TaintClassSet,
+        Vec<Arc<SummaryWitness>>,
+    )>,
     origin_truncated: &mut bool,
 ) -> Result<(), TaintFindingError> {
-    for step in steps {
-        result
+    let mut demanded = classes
+        .iter_dense()
+        .map(|class| {
+            let mut singleton = plan.universe().empty_set();
+            singleton.insert_dense(class);
+            (class, singleton)
+        })
+        .collect::<Vec<_>>();
+    for step in steps.iter().rev() {
+        let input = result
             .fact_result()
             .fact(step.input_fact())
+            .copied()
             .ok_or(TaintFindingError::InvalidResult)?;
         let output = result
             .fact_result()
@@ -621,19 +645,27 @@ fn collect_step_origins(
                 .source(source.source())
                 .is_some_and(|spec| spec.point() == step.source())
         }) {
-            let contribution = problem
-                .source_contribution(source.source(), output, step)
-                .intersection(classes);
+            let immediate = problem.source_contribution(source.source(), output, step);
+            let mut contribution = plan.universe().empty_set();
+            let mut reached_classes = plan.universe().empty_set();
+            for (reached, required_here) in &demanded {
+                let contributing = immediate.intersection(required_here);
+                if !contributing.is_empty() {
+                    contribution.union_with(&contributing);
+                    reached_classes.insert_dense(*reached);
+                }
+            }
             if contribution.is_empty() {
                 continue;
             }
             origins.insert(source.origin().clone());
             match evidence
                 .iter_mut()
-                .find(|(origin, _, _)| origin == source.origin())
+                .find(|(origin, _, _, _)| origin == source.origin())
             {
-                Some((_, retained_classes, retained_witnesses)) => {
+                Some((_, retained_classes, retained_reached, retained_witnesses)) => {
                     *retained_classes = retained_classes.union(&contribution);
+                    *retained_reached = retained_reached.union(&reached_classes);
                     if !retained_witnesses.contains(witness) {
                         retained_witnesses.push(Arc::clone(witness));
                     }
@@ -641,6 +673,7 @@ fn collect_step_origins(
                 None => evidence.push((
                     source.origin().clone(),
                     contribution,
+                    reached_classes,
                     vec![Arc::clone(witness)],
                 )),
             }
@@ -648,9 +681,13 @@ fn collect_step_origins(
                 let removed = origins
                     .pop_last()
                     .expect("an over-limit origin set is nonempty");
-                evidence.retain(|(origin, _, _)| origin != &removed);
+                evidence.retain(|(origin, _, _, _)| origin != &removed);
                 *origin_truncated = true;
             }
+        }
+        let preimages = problem.witness_step_preimages(input, output, step, &demanded);
+        for ((_, classes), preimage) in demanded.iter_mut().zip(preimages) {
+            *classes = preimage;
         }
     }
     Ok(())
@@ -676,7 +713,12 @@ fn reconstruct_origins(
         })
         .ok_or(TaintFindingError::InvalidResult)?;
     let mut origins = BTreeSet::new();
-    let mut evidence = Vec::<(SourceEventKey, TaintClassSet, Vec<Arc<SummaryWitness>>)>::new();
+    let mut evidence = Vec::<(
+        SourceEventKey,
+        TaintClassSet,
+        TaintClassSet,
+        Vec<Arc<SummaryWitness>>,
+    )>::new();
     let mut origin_truncated = false;
     let mut witness_unavailable = false;
     let mut witness_truncated = false;
@@ -924,11 +966,14 @@ fn reconstruct_origins(
         origins: origins.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         evidence: evidence
             .into_iter()
-            .map(|(origin, classes, witnesses)| TaintOriginFindingEvidence {
-                origin,
-                classes,
-                witnesses: witnesses.into_boxed_slice(),
-            })
+            .map(
+                |(origin, classes, reached_classes, witnesses)| TaintOriginFindingEvidence {
+                    origin,
+                    classes,
+                    reached_classes,
+                    witnesses: witnesses.into_boxed_slice(),
+                },
+            )
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         origin_truncated,

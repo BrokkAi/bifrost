@@ -337,6 +337,25 @@ impl ExecutionTiming {
     }
 }
 
+/// Which value supplies a method receiver when selected through a type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureReceiverBinding {
+    /// The caller passes an instance explicitly when the method is unbound.
+    #[default]
+    Instance,
+    /// The descriptor binds the type object used to select the method.
+    Class,
+}
+
+impl ProcedureReceiverBinding {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Instance => "instance",
+            Self::Class => "class",
+        }
+    }
+}
+
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
@@ -347,6 +366,7 @@ pub struct ProcedureProperties {
     pub invocation: ProcedureInvocationKind,
     pub dispatch_extensibility: DispatchExtensibility,
     pub call_boundary: ProcedureCallBoundary,
+    pub receiver_binding: ProcedureReceiverBinding,
 }
 
 /// The positional or keyword domain accepted or produced at a call boundary.
@@ -820,6 +840,12 @@ pub enum CallableReferenceKind {
     Function,
     BoundMethod,
     UnboundMethod,
+    /// A member selected through a proven type object. The resolved method's
+    /// receiver contract decides whether the qualifier or a written actual
+    /// supplies its receiver; the qualifier is not itself a bound receiver.
+    TypeQualifiedMethod {
+        qualifier: ValueId,
+    },
     StaticMethod,
     Constructor,
 }
@@ -831,6 +857,7 @@ impl CallableReferenceKind {
             Self::Function => "function",
             Self::BoundMethod => "bound_method",
             Self::UnboundMethod => "unbound_method",
+            Self::TypeQualifiedMethod { .. } => "type_qualified_method",
             Self::StaticMethod => "static_method",
             Self::Constructor => "constructor",
         }
@@ -854,13 +881,32 @@ pub struct CallableValue {
 /// A caller-side receiver fact established at one call site.
 ///
 /// This describes evaluation of the callable value, not whether a resolved
-/// target declares a receiver-like formal. In particular, an unbound method or
-/// constructor can require target-specific binding even though the caller did
-/// not evaluate a bound receiver.
+/// target declares a receiver-like formal. In particular, a method selected
+/// through a type can require target-specific binding even though the caller
+/// did not evaluate a bound receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallerReceiverBinding {
     Absent,
     Bound(ValueId),
+    TypeQualified(ValueId),
+}
+
+impl CallerReceiverBinding {
+    /// An instance method selected without binding an object receives its
+    /// receiver from the written argument list. Static methods have no receiver
+    /// value, and class-bound descriptors use the qualifier instead.
+    pub fn passes_receiver_as_argument(self, callee: &super::ProcedureSemantics) -> bool {
+        matches!(self, Self::TypeQualified(_))
+            && callee.properties().receiver_binding == ProcedureReceiverBinding::Instance
+            && matches!(
+                callee.kind(),
+                ProcedureKind::Method | ProcedureKind::Constructor
+            )
+            && callee
+                .values()
+                .iter()
+                .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
+    }
 }
 
 /// The intraprocedural destination of one normal, exceptional, or async arm.
@@ -1359,6 +1405,9 @@ pub enum SemanticGapDischarge {
     CanonicalIndexIdentity,
     NonRejoiningExceptionalExit,
     ExitOnlyProcedureCompletion,
+    /// The adapter modeled every operation effect except the exact impact set
+    /// retained by this gap. Consumers may discharge only that partition.
+    ModeledEffectPartition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1530,6 +1579,11 @@ pub enum TransferOperation {
     /// call site's dispatch facts carry the exact callable identity; the
     /// transfer does not duplicate it.
     CallSite(CallSiteId),
+    /// A shared resolver proved the conversion for one actual/formal argument
+    /// pair. The copyable digest is opaque, content-addressed provenance for
+    /// that complete conversion witness; it does not identify a callee
+    /// invocation and carries no local graph identity.
+    CallArgumentConversion(StableDigest),
     /// An operation runs but was not selected exactly. The event's evidence
     /// must not claim proven, complete knowledge.
     Unknown,
@@ -1540,6 +1594,7 @@ impl TransferOperation {
         match self {
             Self::None => "none",
             Self::CallSite(_) => "call_site",
+            Self::CallArgumentConversion(_) => "call_argument_conversion",
             Self::Unknown => "unknown",
         }
     }
@@ -1591,6 +1646,15 @@ pub enum ValueFlowKind {
     BackingStore {
         offset: BackingStoreOffset,
     },
+    /// The target uses either the source backing store at `offset` or the
+    /// named fresh allocation.  The allocation is a bounded alternative, not
+    /// an additional ordinary value-flow edge; consumers must retain both
+    /// candidates and keep their completeness partial until runtime choice is
+    /// known.
+    BackingStoreAlternative {
+        offset: BackingStoreOffset,
+        allocation: AllocationId,
+    },
     Parameter,
     Receiver,
     Return,
@@ -1607,7 +1671,9 @@ impl ValueFlowKind {
     pub const fn preserves_runtime_class(self) -> bool {
         match self {
             Self::Transfer(transfer) => transfer.preserves_runtime_class(),
-            Self::LanguageDefined | Self::BackingStore { .. } => false,
+            Self::LanguageDefined
+            | Self::BackingStore { .. }
+            | Self::BackingStoreAlternative { .. } => false,
             Self::Local
             | Self::Parameter
             | Self::Receiver
@@ -1621,6 +1687,7 @@ impl ValueFlowKind {
             Self::Local => "local",
             Self::Transfer(_) => "transfer",
             Self::BackingStore { .. } => "backing_store",
+            Self::BackingStoreAlternative { .. } => "backing_store_alternative",
             Self::Parameter => "parameter",
             Self::Receiver => "receiver",
             Self::Return => "return",
@@ -1896,7 +1963,9 @@ impl ProgramPoint {
         };
         self.events.get(event_index + 1).is_some_and(|next| {
             matches!(next.effect, SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Transfer(_) | ValueFlowKind::BackingStore { .. },
+                kind: ValueFlowKind::Transfer(_)
+                    | ValueFlowKind::BackingStore { .. }
+                    | ValueFlowKind::BackingStoreAlternative { .. },
                 source,
                 target: transferred,
             } if source == value && transferred == target)
@@ -2005,8 +2074,32 @@ pub enum GuardPredicate {
     /// The condition tests whether `value` is an instance of one or more
     /// classes denoted by `classes`.
     InstanceOf { value: ValueId, classes: ValueId },
+    /// The condition tests whether `value`'s class is exactly one of the
+    /// classes denoted by `classes`.
+    ///
+    /// This is not `InstanceOf` with a narrower reading. A subclass of a named
+    /// class satisfies `InstanceOf` and fails this test, so the two disagree on
+    /// both arms and one cannot stand in for the other.
+    ///
+    /// `exact_on_true` carries the comparison's polarity, the way
+    /// [`Self::NullComparison`] carries `null_on_true`: `type(x) is C` states
+    /// the class on the true arm, and `type(x) is not C` states it on the
+    /// false arm. The grammar spells `is not` as one operator token, so the
+    /// two are one predicate with two polarities rather than a predicate and
+    /// its negation.
+    ExactClass {
+        value: ValueId,
+        classes: ValueId,
+        exact_on_true: bool,
+    },
     /// The condition tests whether `value` has the member named by `member`.
     HasMember { value: ValueId, member: ValueId },
+    /// The condition is `value` itself, read for its truth.
+    ///
+    /// Only the true arm carries information, and only about the language's
+    /// null value: `None` is falsy and nothing can make it truthy. A falsy
+    /// value is not necessarily null, so the false arm proves nothing.
+    Truthy { value: ValueId },
     /// The decision is represented, but its condition was not normalizable.
     Opaque { digest: GuardConditionDigest },
 }
@@ -2019,7 +2112,9 @@ impl GuardPredicate {
         "null_comparison",
         "constant_equality",
         "instance_of",
+        "exact_class",
         "has_member",
+        "truthy",
         "opaque",
     ];
 
@@ -2029,7 +2124,9 @@ impl GuardPredicate {
             Self::NullComparison { .. } => "null_comparison",
             Self::ConstantEquality { .. } => "constant_equality",
             Self::InstanceOf { .. } => "instance_of",
+            Self::ExactClass { .. } => "exact_class",
             Self::HasMember { .. } => "has_member",
+            Self::Truthy { .. } => "truthy",
             Self::Opaque { .. } => "opaque",
         }
     }
@@ -2042,7 +2139,9 @@ impl GuardPredicate {
             Self::NullComparison { .. }
             | Self::ConstantEquality { .. }
             | Self::InstanceOf { .. }
+            | Self::ExactClass { .. }
             | Self::HasMember { .. }
+            | Self::Truthy { .. }
             | Self::Opaque { .. } => None,
         }
     }

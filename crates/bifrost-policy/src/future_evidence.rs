@@ -397,16 +397,6 @@ impl TaintPolicyProjectionFacts {
             });
         }
 
-        let mut actual_labels = self
-            .source_facts
-            .iter()
-            .map(|fact| fact.source_label.clone())
-            .collect::<Vec<_>>();
-        actual_labels.sort();
-        actual_labels.dedup();
-        if self.reached_source_labels != actual_labels {
-            return Err(FutureEvidenceError::ReachedSourceLabelsMismatch);
-        }
         Ok(())
     }
 }
@@ -814,9 +804,6 @@ impl TaintFindingEvidence {
         for origin in &origins {
             if origin.source_endpoint != source_endpoint {
                 return Err(FutureEvidenceError::OriginSourceEndpointMismatch);
-            }
-            if !reached_source_labels.contains(&origin.source_label) {
-                return Err(FutureEvidenceError::OriginSourceLabelMismatch);
             }
             if !source_scenarios_truncated && !source_scenarios.contains(&origin.scenario_id) {
                 return Err(FutureEvidenceError::OriginScenarioMismatch);
@@ -1807,7 +1794,6 @@ pub enum FutureEvidenceError {
         analysis: &'static str,
     },
     EvidenceContentHashMismatch,
-    ReachedSourceLabelsMismatch,
     InvalidStrongIdentityDerivation {
         field: &'static str,
     },
@@ -1824,7 +1810,6 @@ pub enum FutureEvidenceError {
     AnchorViolationSiteMismatch,
     ViolationHashMismatch,
     OriginSourceEndpointMismatch,
-    OriginSourceLabelMismatch,
     OriginScenarioMismatch,
     ObservedStateIsExpected,
     RetainedEvidenceBudget {
@@ -1872,9 +1857,6 @@ impl fmt::Display for FutureEvidenceError {
             Self::EvidenceContentHashMismatch => {
                 formatter.write_str("taint source fact does not match its CVSS evidence hash")
             }
-            Self::ReachedSourceLabelsMismatch => formatter.write_str(
-                "reached_source_labels must exactly equal labels present in source_facts",
-            ),
             Self::InvalidStrongIdentityDerivation { field } => {
                 write!(formatter, "{field} is not a typed stable semantic identity")
             }
@@ -1904,9 +1886,6 @@ impl fmt::Display for FutureEvidenceError {
             }
             Self::OriginSourceEndpointMismatch => {
                 formatter.write_str("taint origin belongs to a different source endpoint")
-            }
-            Self::OriginSourceLabelMismatch => {
-                formatter.write_str("taint origin label was not reached by the finding")
             }
             Self::OriginScenarioMismatch => {
                 formatter.write_str("taint origin scenario is absent from the complete report set")

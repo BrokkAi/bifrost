@@ -231,8 +231,78 @@ fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
     if root.has_error() {
         return None;
     }
-    let mut setup_bindings: HashMap<Vec<String>, String> = HashMap::default();
     let mut import_root = None;
+    for (call, setup_bindings) in setup_py_setup_calls(&source, root) {
+        let candidate = setup_py_import_root_from_call(call, &source, &setup_bindings)?;
+        if import_root
+            .replace(candidate.clone())
+            .is_some_and(|root| root != candidate)
+        {
+            return None;
+        }
+    }
+    import_root
+}
+
+/// Read the `python_requires` specifier a legacy `setup.py` declares.
+///
+/// This is setuptools' spelling of `pyproject.toml`'s `requires-python`, and it
+/// is what selects the standard-library semantic pack for a project that has no
+/// PEP 621 manifest. The script is read, never executed: only a literal string
+/// passed to a top-level call to an imported `setup` binding counts, and two
+/// calls that disagree declare nothing.
+pub fn setuptools_setup_py_python_requires(setup_py: &Path) -> Option<String> {
+    let source = std::fs::read_to_string(setup_py).ok()?;
+    let tree = parse_python_tree(&source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut requirement: Option<String> = None;
+    for (call, _) in setup_py_setup_calls(&source, root) {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            continue;
+        };
+        if arguments.kind() != "argument_list" {
+            continue;
+        }
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            if argument.kind() != "keyword_argument" {
+                continue;
+            }
+            let Some(name) = argument.child_by_field_name("name") else {
+                continue;
+            };
+            if py_node_text(name, &source).trim() != "python_requires" {
+                continue;
+            }
+            let value = argument.child_by_field_name("value")?;
+            let declared = python_plain_string_literal(value, &source)?.to_owned();
+            if requirement
+                .replace(declared.clone())
+                .is_some_and(|previous| previous != declared)
+            {
+                return None;
+            }
+        }
+    }
+    requirement
+}
+
+/// Every top-level call to an imported setuptools `setup` binding, paired with
+/// the import bindings that were live where the call appears.
+///
+/// The walk tracks bindings across the module's top-level statements, so a name
+/// a later statement rebinds stops being read as setuptools' `setup`. It does
+/// not enter function, class, or lambda bodies: a call there is conditional on
+/// something this reader does not evaluate.
+fn setup_py_setup_calls<'tree>(
+    source: &str,
+    root: Node<'tree>,
+) -> Vec<(Node<'tree>, HashMap<Vec<String>, String>)> {
+    let mut setup_bindings: HashMap<Vec<String>, String> = HashMap::default();
+    let mut calls = Vec::new();
     let mut cursor = root.walk();
 
     for statement in root.named_children(&mut cursor) {
@@ -240,10 +310,10 @@ fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
             statement.kind(),
             "import_statement" | "import_from_statement"
         ) {
-            for binding in setup_py_bound_names(statement, &source) {
+            for binding in setup_py_bound_names(statement, source) {
                 setup_bindings.retain(|path, _| path.first() != Some(&binding));
             }
-            for import in python_import_infos_from_node(statement, &source) {
+            for import in python_import_infos_from_node(statement, source) {
                 if import.is_wildcard {
                     setup_bindings.clear();
                     continue;
@@ -291,23 +361,17 @@ fn parse_setuptools_setup_py_import_root(setup_py: &Path) -> Option<PathBuf> {
             && statement.named_child_count() == 1
             && let Some(call) = statement.named_child(0)
             && call.kind() == "call"
-            && setup_py_call_imported_function(call, &source, &setup_bindings)
+            && setup_py_call_imported_function(call, source, &setup_bindings)
                 .is_some_and(|function| function == "setup")
         {
-            let candidate = setup_py_import_root_from_call(call, &source, &setup_bindings)?;
-            if import_root
-                .replace(candidate.clone())
-                .is_some_and(|root| root != candidate)
-            {
-                return None;
-            }
+            calls.push((call, setup_bindings.clone()));
         }
 
-        for binding in setup_py_bound_names(statement, &source) {
+        for binding in setup_py_bound_names(statement, source) {
             setup_bindings.retain(|path, _| path.first() != Some(&binding));
         }
     }
-    import_root
+    calls
 }
 
 /// Return names that a top-level statement binds in the module scope.
@@ -951,11 +1015,17 @@ impl<'a> PythonVisitor<'a> {
         if assignment.kind() != "assignment" {
             return;
         }
-        let Some(left) = assignment.child_by_field_name("left") else {
+        let targets = python_chained_assignment_targets(assignment);
+        if targets.is_empty() {
             return;
-        };
-        self.visit_instance_attribute_assignment(left, scope);
-        let names = collect_assigned_names(left, self.source);
+        }
+        for left in &targets {
+            self.visit_instance_attribute_assignment(*left, scope);
+        }
+        let names = targets
+            .iter()
+            .flat_map(|left| collect_assigned_names(*left, self.source))
+            .collect::<Vec<_>>();
         for name in names {
             let (short_name, fq) = if let Some(parent) = scope.last() {
                 if parent.kind != ScopeKind::Class {
@@ -1201,6 +1271,41 @@ fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
 /// so a caller that reads only the field loses the binding name of every
 /// annotated parameter. Every Python surface that names parameters reads them
 /// through this function.
+/// Which splat a Python formal parameter spells, looking through the
+/// annotation wrapper.
+///
+/// `*args` is a `list_splat_pattern` and `**kwargs` a
+/// `dictionary_splat_pattern`, but the grammar spells `*args: str` as a
+/// `typed_parameter` that holds one, so a test on the parameter's own node kind
+/// misses every annotated variadic. A parameter that misses it binds like an
+/// ordinary formal: one positional actual each, and the rest spill onto the
+/// formals that follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonParameterSplat {
+    /// `*args`: collects every remaining positional actual.
+    Positional,
+    /// `**kwargs`: collects every remaining keyword actual.
+    Keyword,
+}
+
+pub fn python_parameter_splat(parameter: Node<'_>) -> Option<PythonParameterSplat> {
+    let splat = match parameter.kind() {
+        kind @ ("list_splat_pattern" | "dictionary_splat_pattern") => kind,
+        _ => {
+            let mut cursor = parameter.walk();
+            parameter
+                .named_children(&mut cursor)
+                .map(|child| child.kind())
+                .find(|kind| matches!(*kind, "list_splat_pattern" | "dictionary_splat_pattern"))?
+        }
+    };
+    match splat {
+        "list_splat_pattern" => Some(PythonParameterSplat::Positional),
+        "dictionary_splat_pattern" => Some(PythonParameterSplat::Keyword),
+        _ => unreachable!("the splat kind was matched above"),
+    }
+}
+
 pub fn python_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" => Some(node),
@@ -1282,6 +1387,24 @@ fn python_header_with_decorators(node: Node<'_>, source: &str) -> String {
     relevant.join("\n")
 }
 
+/// Every positional base of a class, as the spelling the hierarchy resolver
+/// should look up.
+///
+/// A base this function omits is indistinguishable from a class that has no
+/// such base, so member lookup would treat an incompletely modeled hierarchy
+/// as a complete one and prove a member absent that the base declares. Every
+/// positional base therefore contributes a spelling:
+///
+/// * A dotted name is its own spelling.
+/// * A subscripted base (`Base[T]`, `MutableMapping[str, Any]`) contributes
+///   its generic origin, which is the class the runtime actually inherits.
+/// * Any other positional base -- a call such as `namedtuple(...)`, an
+///   unpacked base list, a conditional expression -- contributes its source
+///   spelling. Resolution fails on it, and the caller reports an unresolved
+///   base instead of a complete member list.
+///
+/// A keyword argument (`metaclass=`, and the arbitrary keywords
+/// `__init_subclass__` accepts) is not a base and contributes nothing here.
 fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let Some(superclasses) = node.child_by_field_name("superclasses") else {
         return Vec::new();
@@ -1289,17 +1412,36 @@ fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut cursor = superclasses.walk();
     for child in superclasses.named_children(&mut cursor) {
-        match child.kind() {
-            "identifier" | "attribute" => {
-                let text = py_node_text(child, source).trim();
-                if !text.is_empty() {
-                    result.push(text.to_string());
-                }
-            }
-            _ => {}
+        if child.kind() == "keyword_argument" {
+            continue;
+        }
+        let named = python_base_origin_node(child);
+        let text = py_node_text(named, source).trim();
+        if !text.is_empty() {
+            result.push(text.to_string());
         }
     }
     result
+}
+
+/// The node whose text names a base class: the value a subscripted base
+/// applies its type arguments to, or the base expression itself.
+///
+/// Base spellings recorded by [`extract_python_supertypes`] are looked up
+/// again against the class's own syntax, so both sides must reduce a base the
+/// same way or a generic base stops matching the spelling it produced.
+pub fn python_base_origin_node<'tree>(base: Node<'tree>) -> Node<'tree> {
+    if base.kind() != "subscript" {
+        return base;
+    }
+    let Some(value) = base.child_by_field_name("value") else {
+        return base;
+    };
+    if matches!(value.kind(), "identifier" | "attribute") {
+        value
+    } else {
+        base
+    }
 }
 
 fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
@@ -1356,7 +1498,16 @@ fn collect_direct_self_assigned_attributes<'tree>(
                 attributes.push((name.to_string(), attribute));
             }
         }
-        "pattern_list" | "tuple" | "list" | "parenthesized_expression" => {
+        // The grammar spells an unpacking target three ways: a bare comma list
+        // is a `pattern_list`, and parentheses or brackets around it make a
+        // `tuple_pattern` or a `list_pattern`. Omitting the bracketed forms
+        // dropped every attribute a multi-line unpacking assigns.
+        "pattern_list"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "tuple"
+        | "list"
+        | "parenthesized_expression" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 collect_direct_self_assigned_attributes(child, source, receiver_name, attributes);
@@ -1391,7 +1542,9 @@ fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &
         .any(|name| py_node_text(name, source).trim() == decorator_name)
 }
 
-fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+/// The name a callable binds its first parameter to, which for a method is
+/// the receiver every `self.x` and `setattr(self, ...)` in its body names.
+pub fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
     let parameters = node.child_by_field_name("parameters")?;
     let mut cursor = parameters.walk();
     parameters
@@ -1436,4 +1589,83 @@ pub fn parse_python_tree(source: &str) -> Option<Tree> {
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .expect("failed to load python parser");
     parser.parse(source, None)
+}
+
+#[cfg(test)]
+mod supertype_tests {
+    use super::extract_python_supertypes;
+    use tree_sitter::{Node, Parser};
+
+    fn class_node<'tree>(tree: &'tree tree_sitter::Tree, source: &str) -> Node<'tree> {
+        let mut cursor = tree.root_node().walk();
+        tree.root_node()
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "class_definition")
+            .unwrap_or_else(|| panic!("source declares a class: {source}"))
+    }
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("the Python grammar loads");
+        parser.parse(source, None).expect("the source parses")
+    }
+
+    #[test]
+    fn every_positional_base_contributes_a_spelling() {
+        for (source, expected) in [
+            ("class A(Base): pass\n", vec!["Base"]),
+            ("class A(pkg.Base): pass\n", vec!["pkg.Base"]),
+            // The generic origin is the class the runtime inherits; dropping
+            // a subscripted base made an incomplete hierarchy look complete.
+            ("class A(Base[int]): pass\n", vec!["Base"]),
+            ("class A(pkg.Base[str, int]): pass\n", vec!["pkg.Base"]),
+            (
+                "class A(Mapping[str, Any], Base): pass\n",
+                vec!["Mapping", "Base"],
+            ),
+            // Not a base: a keyword argument configures class creation.
+            ("class A(Base, metaclass=Meta): pass\n", vec!["Base"]),
+            ("class A(metaclass=Meta): pass\n", Vec::new()),
+            // Unnameable bases still register, so resolution reports an
+            // unresolved base rather than a complete member list.
+            (
+                "class A(namedtuple(\"P\", \"x\")): pass\n",
+                vec!["namedtuple(\"P\", \"x\")"],
+            ),
+            ("class A(*bases): pass\n", vec!["*bases"]),
+            ("class A: pass\n", Vec::new()),
+        ] {
+            let tree = parse(source);
+            let node = class_node(&tree, source);
+            assert_eq!(
+                extract_python_supertypes(node, source),
+                expected,
+                "supertypes of {source}"
+            );
+        }
+    }
+}
+
+/// Every target a possibly chained assignment binds.
+///
+/// Python's `encrypt = decrypt = process` binds both names, but the grammar
+/// spells it as one `assignment` whose `right` is another `assignment`. Reading
+/// only the outermost `left` declares `encrypt` and silently drops `decrypt`,
+/// so the alias reads as an absent member on the class that defines it.
+fn python_chained_assignment_targets<'tree>(assignment: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut targets = Vec::new();
+    let mut node = assignment;
+    loop {
+        let Some(left) = node.child_by_field_name("left") else {
+            break;
+        };
+        targets.push(left);
+        match node.child_by_field_name("right") {
+            Some(right) if right.kind() == "assignment" => node = right,
+            _ => break,
+        }
+    }
+    targets
 }

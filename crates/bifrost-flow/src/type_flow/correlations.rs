@@ -1,0 +1,1738 @@
+//! Sparse, procedure-local correlation of data and boolean definitions.
+//!
+//! A class source can be removed on a guard edge only when the data definition
+//! that carries it is paired with a definition of the tested boolean that
+//! proves the opposite outcome.  Independent reaching-definition sets lose
+//! that relationship at a join.  This module retains the relationship as a
+//! sparse set of `(data definition, boolean definition, fact)` tuples and
+//! exposes the incompatible data definitions to the type-flow planner.
+//!
+//! The analysis consumes only validated semantic IR.  It does not inspect
+//! source text, and it does not use a regular expression or a second parser.
+//! Its worklist is iterative so a long or cyclic procedure cannot consume the
+//! Rust call stack.  A budget or cancellation failure discards the whole
+//! result; callers never receive a silently truncated relation.
+
+use std::collections::VecDeque;
+use std::fmt;
+
+use crate::analyzer::semantic::{
+    CancellationToken, ControlEdgeId, GuardPredicate, ProcedureHandle, ProgramPointId,
+    SemanticBudget, SemanticBudgetExceeded, SemanticEffect, SemanticGapImpact, SemanticValueKind,
+    SemanticWork, ValueId,
+};
+use crate::hash::{HashMap, HashSet};
+
+/// The only boolean facts that can authorize a source exclusion.
+///
+/// `Unknown` is retained explicitly.  A missing or unsupported semantic fact
+/// is never interpreted as either literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BoolFact {
+    True,
+    False,
+    Unknown,
+}
+
+impl BoolFact {
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn from_literal(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
+    }
+}
+
+/// One program-point definition of a tracked data binding.
+///
+/// An entry definition uses [`Self::ENTRY_EVENT_INDEX`] and has no RHS.  An
+/// explicit unknown write also has no RHS, but has the event index at which
+/// the unknown effect occurred.  The distinction is therefore preserved by
+/// the location tuple without manufacturing a source value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DefinitionRecord {
+    pub binding: ValueId,
+    pub point: ProgramPointId,
+    pub event_index: usize,
+    pub rhs: Option<ValueId>,
+}
+
+impl DefinitionRecord {
+    /// Sentinel event position for a binding's procedure-entry definition.
+    pub const ENTRY_EVENT_INDEX: usize = usize::MAX;
+
+    pub const fn is_entry(self) -> bool {
+        self.event_index == Self::ENTRY_EVENT_INDEX
+    }
+}
+
+/// The data definitions observed at one guard edge for one data binding.
+///
+/// The four definition lists are disjoint.  A definition whose paired facts
+/// contain both the expected and opposite literals is placed in
+/// `unknown_data_defs`, because it is not universally compatible with either
+/// outcome.  This is the form the parent type-flow planner needs for its
+/// universal may-source test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelationCandidate {
+    pub edge: ControlEdgeId,
+    pub bool_binding: ValueId,
+    pub expected: BoolFact,
+    pub data_binding: ValueId,
+    pub all_reaching_data_defs: Vec<DefinitionRecord>,
+    pub compatible_data_defs: Vec<DefinitionRecord>,
+    pub incompatible_data_defs: Vec<DefinitionRecord>,
+    pub unknown_data_defs: Vec<DefinitionRecord>,
+}
+
+/// A complete result from one procedure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelationAnalysis {
+    /// Every tracked data definition, including explicit entry and unknown
+    /// definitions.  The vector is in deterministic definition order.
+    pub definitions: Vec<DefinitionRecord>,
+    /// One row per reachable supported guard edge and data binding.
+    pub guard_edge_exclusions: Vec<CorrelationCandidate>,
+}
+
+/// Why a correlation analysis did not produce a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelationError {
+    Budget(SemanticBudgetExceeded),
+    Cancelled { timed_out: bool },
+}
+
+impl fmt::Display for CorrelationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Budget(error) => write!(
+                formatter,
+                "correlation analysis exceeded semantic budget: {error}"
+            ),
+            Self::Cancelled { timed_out: true } => {
+                formatter.write_str("correlation analysis timed out")
+            }
+            Self::Cancelled { timed_out: false } => {
+                formatter.write_str("correlation analysis was cancelled")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CorrelationError {}
+
+impl From<SemanticBudgetExceeded> for CorrelationError {
+    fn from(error: SemanticBudgetExceeded) -> Self {
+        Self::Budget(error)
+    }
+}
+
+/// Analyze one validated procedure's correlated data and boolean definitions.
+///
+/// The caller supplies the same semantic budget used by the surrounding
+/// request.  One `nested_entries` unit is charged for each newly retained
+/// pair and one `control_edges` unit for each CFG edge traversal.  If either
+/// lane is exhausted, or cancellation is observed, the function returns an
+/// error and no partial relation is exposed.
+pub fn analyze_correlations(
+    procedure: &ProcedureHandle,
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<CorrelationAnalysis, CorrelationError> {
+    check_cancelled(cancellation)?;
+    let semantics = procedure.semantics();
+    charge_preprocessing_inputs(semantics, budget)?;
+    check_cancelled(cancellation)?;
+    let data_bindings = tracked_data_bindings(semantics.values());
+    let bool_bindings = tested_boolean_bindings(semantics, budget, cancellation)?;
+    check_cancelled(cancellation)?;
+    if bool_bindings.is_empty() || data_bindings.is_empty() {
+        return Ok(CorrelationAnalysis {
+            definitions: Vec::new(),
+            guard_edge_exclusions: Vec::new(),
+        });
+    }
+    let open_bindings = open_bindings(semantics);
+    check_cancelled(cancellation)?;
+
+    // Index every definition needed by the surviving relational question.
+    let mut definitions = DefinitionTable::new();
+    definitions.index_entry_definitions(
+        semantics.entry_point(),
+        &data_bindings,
+        &bool_bindings,
+        budget,
+        cancellation,
+    )?;
+    definitions.index_event_definitions(
+        semantics,
+        &data_bindings,
+        &bool_bindings,
+        &open_bindings,
+        budget,
+        cancellation,
+    )?;
+
+    let initial = FlowState::entry(&data_bindings, &bool_bindings, &definitions, budget)?;
+    let point_count = semantics.points().len();
+    let mut states = vec![FlowState::default(); point_count];
+    let mut exits = vec![FlowState::default(); point_count];
+    states[semantics.entry_point().index()] = initial;
+    let mut queued = vec![false; point_count];
+    queued[semantics.entry_point().index()] = true;
+    let mut worklist = VecDeque::from([semantics.entry_point()]);
+
+    while let Some(point_id) = worklist.pop_front() {
+        queued[point_id.index()] = false;
+        check_cancelled(cancellation)?;
+        let entry_state = states[point_id.index()].clone();
+        let exit_state = transfer_point(
+            semantics,
+            point_id,
+            entry_state,
+            &definitions,
+            &bool_bindings,
+            &data_bindings,
+            &open_bindings,
+            budget,
+            cancellation,
+        )?;
+        exits[point_id.index()] = exit_state.clone();
+
+        for (_edge_id, edge) in semantics.successor_edges(point_id) {
+            check_cancelled(cancellation)?;
+            charge_edges(budget, 1)?;
+            let target = edge.target_point.index();
+            let changed = states[target].join(&exit_state, budget)?;
+            if changed && !queued[target] {
+                queued[target] = true;
+                worklist.push_back(edge.target_point);
+            }
+        }
+    }
+
+    let mut guard_edge_exclusions = Vec::new();
+    for guard in semantics.guard_facts() {
+        let Some((bool_binding, true_fact)) = guard_binding_and_true_fact(semantics, guard) else {
+            continue;
+        };
+        let state = &exits[guard.point.index()];
+        for (edge, expected) in [
+            (guard.true_edge, true_fact),
+            (guard.false_edge, true_fact.opposite()),
+        ] {
+            let Some(edge) = edge else { continue };
+            for &data_binding in &data_bindings {
+                let Some(pairs) = state.relations.get(&(data_binding, bool_binding)) else {
+                    continue;
+                };
+                let candidate = make_candidate(
+                    edge,
+                    bool_binding,
+                    expected,
+                    data_binding,
+                    pairs,
+                    &definitions,
+                );
+                if !candidate.all_reaching_data_defs.is_empty() {
+                    guard_edge_exclusions.push(candidate);
+                }
+            }
+        }
+    }
+    guard_edge_exclusions.sort_by_key(|candidate| {
+        (
+            candidate.edge,
+            candidate.bool_binding,
+            candidate.data_binding,
+            candidate.expected,
+        )
+    });
+
+    Ok(CorrelationAnalysis {
+        definitions: definitions.data_records,
+        guard_edge_exclusions,
+    })
+}
+
+fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), CorrelationError> {
+    if let Some(token) = cancellation
+        && token.is_cancelled()
+    {
+        return Err(CorrelationError::Cancelled {
+            timed_out: token.is_timed_out(),
+        });
+    }
+    Ok(())
+}
+
+fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
+    if count == 0 {
+        return Ok(());
+    }
+    budget.charge(SemanticWork {
+        control_edges: count,
+        ..SemanticWork::default()
+    })?;
+    Ok(())
+}
+
+fn charge_pairs(budget: &mut SemanticBudget, count: usize) -> Result<(), CorrelationError> {
+    if count == 0 {
+        return Ok(());
+    }
+    budget.charge(SemanticWork {
+        nested_entries: count,
+        ..SemanticWork::default()
+    })?;
+    Ok(())
+}
+
+fn charge_preprocessing_inputs(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    budget: &mut SemanticBudget,
+) -> Result<(), CorrelationError> {
+    let event_count = semantics
+        .points()
+        .iter()
+        .map(|point| point.events.len())
+        .fold(0, usize::saturating_add);
+    budget.charge(SemanticWork {
+        values: semantics.values().len(),
+        memory_locations: semantics.memory_locations().len(),
+        captures: semantics.captures().len(),
+        events: event_count,
+        nested_entries: semantics.guard_facts().len(),
+        ..SemanticWork::default()
+    })?;
+    Ok(())
+}
+
+fn tracked_data_bindings(values: &[crate::analyzer::semantic::SemanticValue]) -> Vec<ValueId> {
+    let mut bindings = values
+        .iter()
+        .filter(|value| is_binding_kind(&value.kind))
+        .map(|value| value.id)
+        .collect::<Vec<_>>();
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
+}
+
+fn is_binding_kind(kind: &SemanticValueKind) -> bool {
+    matches!(
+        kind,
+        SemanticValueKind::Local
+            | SemanticValueKind::Parameter { .. }
+            | SemanticValueKind::Receiver { .. }
+    )
+}
+
+/// Return bindings whose storage can be changed by a call, continuation, or
+/// suspension according to the semantic IR.  A plain local is deliberately
+/// absent: an ordinary call does not rebind its caller-local slot.  Address
+/// values and mutable/shared capture cells are the structured evidence that a
+/// callee can observe or change the binding itself.
+pub(super) fn open_bindings(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> HashSet<ValueId> {
+    let binding_values = semantics
+        .values()
+        .iter()
+        .filter(|value| is_binding_kind(&value.kind))
+        .map(|value| value.id)
+        .collect::<HashSet<_>>();
+    let mut open_values = HashSet::default();
+
+    for location in semantics.memory_locations() {
+        match &location.kind {
+            crate::analyzer::semantic::MemoryLocationKind::LexicalCell { binding }
+            | crate::analyzer::semantic::MemoryLocationKind::Capture {
+                binding: Some(binding),
+                ..
+            } => {
+                open_values.insert(*binding);
+            }
+            _ => {}
+        }
+    }
+    for capture in semantics.captures() {
+        let writable = matches!(
+            &capture.mode,
+            crate::analyzer::semantic::CaptureMode::SharedCell
+                | crate::analyzer::semantic::CaptureMode::MutableCell
+                | crate::analyzer::semantic::CaptureMode::Unknown
+                | crate::analyzer::semantic::CaptureMode::LanguageDefined(_)
+        );
+        if !writable {
+            continue;
+        }
+        match capture.captured {
+            crate::analyzer::semantic::CaptureSource::Value(value) => {
+                open_values.insert(value);
+            }
+            crate::analyzer::semantic::CaptureSource::Location(location) => {
+                if let Some(location) = semantics.memory_location(location)
+                    && let crate::analyzer::semantic::MemoryLocationKind::LexicalCell { binding }
+                    | crate::analyzer::semantic::MemoryLocationKind::Capture {
+                        binding: Some(binding),
+                        ..
+                    } = &location.kind
+                {
+                    open_values.insert(*binding);
+                }
+            }
+        }
+    }
+
+    // An address target publishes the source value in the IR. Propagate this
+    // evidence backwards through validated identity-preserving copies so an
+    // address of a temporary still reopens its local/parameter carrier.
+    let mut reverse_copies = HashMap::<ValueId, Vec<ValueId>>::default();
+    for point in semantics.points() {
+        for event in &point.events {
+            match &event.effect {
+                SemanticEffect::Assignment { target, value }
+                    if semantics
+                        .value(*target)
+                        .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
+                {
+                    open_values.insert(*value);
+                    reverse_copies.entry(*target).or_default().push(*value);
+                }
+                SemanticEffect::Assignment { target, value } => {
+                    reverse_copies.entry(*target).or_default().push(*value);
+                }
+                SemanticEffect::ValueFlow { source, target, .. }
+                    if semantics
+                        .value(*target)
+                        .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
+                {
+                    open_values.insert(*source);
+                    reverse_copies.entry(*target).or_default().push(*source);
+                }
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind,
+                } if kind.preserves_runtime_class() => {
+                    reverse_copies.entry(*target).or_default().push(*source);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut worklist = open_values.iter().copied().collect::<VecDeque<_>>();
+    while let Some(target) = worklist.pop_front() {
+        if let Some(sources) = reverse_copies.get(&target) {
+            for &source in sources {
+                if open_values.insert(source) {
+                    worklist.push_back(source);
+                }
+            }
+        }
+    }
+    open_values
+        .into_iter()
+        .filter(|value| binding_values.contains(value))
+        .collect()
+}
+
+/// Collect guard values and every structured copy source that can feed one.
+///
+/// The closure is deliberately backwards over semantic value-flow rows.  It
+/// resolves a temporary produced by a read/copy without treating all values
+/// in a procedure as interchangeable, and it stays independent of source
+/// spelling and evaluation order.
+fn tested_boolean_bindings(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<ValueId>, CorrelationError> {
+    let mut tested = HashSet::default();
+    for guard in semantics.guard_facts() {
+        check_cancelled(cancellation)?;
+        match guard.predicate {
+            GuardPredicate::Truthy { value } => {
+                tested.insert(value);
+            }
+            GuardPredicate::ConstantEquality { .. } => {
+                if let Some(subject) = guard.subject {
+                    tested.insert(subject);
+                }
+            }
+            GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::NullComparison { .. }
+            | GuardPredicate::InstanceOf { .. }
+            | GuardPredicate::ExactClass { .. }
+            | GuardPredicate::HasMember { .. }
+            | GuardPredicate::Opaque { .. } => {}
+        }
+    }
+
+    // Build both directions of the identity graph once. Correlation can only
+    // authorize a kill when a tested value has a possible literal boolean
+    // definition. Restricting the seeds to the forward literal closure
+    // avoids carrying every unrelated truthiness subject through the product
+    // of data and boolean definitions.  The reverse closure below retains the
+    // intermediate copies that connect that literal to the guard.
+    let mut reverse_copies = HashMap::<ValueId, Vec<ValueId>>::default();
+    let mut forward_copies = HashMap::<ValueId, Vec<ValueId>>::default();
+    for point in semantics.points() {
+        check_cancelled(cancellation)?;
+        for event in &point.events {
+            check_cancelled(cancellation)?;
+            budget.charge(SemanticWork {
+                events: 1,
+                ..SemanticWork::default()
+            })?;
+            let (source, target) = match &event.effect {
+                SemanticEffect::Assignment { target, value } => (*value, *target),
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind,
+                } if kind.preserves_runtime_class() => (*source, *target),
+                _ => continue,
+            };
+            reverse_copies.entry(target).or_default().push(source);
+            forward_copies.entry(source).or_default().push(target);
+        }
+    }
+
+    let literal_values = semantics
+        .values()
+        .iter()
+        .filter_map(|value| intrinsic_boolean(semantics, value.id).map(|_| value.id))
+        .collect::<Vec<_>>();
+    if literal_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut literal_reachable = literal_values.iter().copied().collect::<HashSet<_>>();
+    let mut worklist = literal_values.into_iter().collect::<VecDeque<_>>();
+    while let Some(source) = worklist.pop_front() {
+        let Some(targets) = forward_copies.get(&source) else {
+            continue;
+        };
+        for &target in targets {
+            charge_pairs(budget, 1)?;
+            check_cancelled(cancellation)?;
+            if literal_reachable.insert(target) {
+                worklist.push_back(target);
+            }
+        }
+    }
+
+    tested.retain(|value| literal_reachable.contains(value));
+    let mut bindings = tested.clone();
+    worklist = tested.into_iter().collect::<VecDeque<_>>();
+    while let Some(target) = worklist.pop_front() {
+        let Some(sources) = reverse_copies.get(&target) else {
+            continue;
+        };
+        for &source in sources {
+            budget.charge(SemanticWork {
+                nested_entries: 1,
+                ..SemanticWork::default()
+            })?;
+            check_cancelled(cancellation)?;
+            // Literal values are handled directly by replace_boolean_component;
+            // retaining them as relation keys only adds a Cartesian row. Any
+            // other source must be on both the literal and tested closures so
+            // that an unsupported side path remains unknown rather than being
+            // treated as a boolean fact.
+            if intrinsic_boolean(semantics, source).is_none()
+                && literal_reachable.contains(&source)
+                && bindings.insert(source)
+            {
+                worklist.push_back(source);
+            }
+        }
+    }
+    let mut values = bindings.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    Ok(values)
+}
+
+fn guard_binding_and_true_fact(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    guard: &crate::analyzer::semantic::GuardFact,
+) -> Option<(ValueId, BoolFact)> {
+    match guard.predicate {
+        GuardPredicate::Truthy { value } => Some((value, BoolFact::True)),
+        GuardPredicate::ConstantEquality { negated, constant } => {
+            let SemanticValueKind::Boolean(value) = semantics.value(constant)?.kind else {
+                return None;
+            };
+            let subject = guard.subject?;
+            let fact = BoolFact::from_literal(value);
+            Some((subject, if negated { fact.opposite() } else { fact }))
+        }
+        GuardPredicate::ConstantBoolean { .. }
+        | GuardPredicate::NullComparison { .. }
+        | GuardPredicate::InstanceOf { .. }
+        | GuardPredicate::ExactClass { .. }
+        | GuardPredicate::HasMember { .. }
+        | GuardPredicate::Opaque { .. } => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BooleanDefinition {
+    binding: ValueId,
+    point: ProgramPointId,
+    event_index: usize,
+    rhs: Option<ValueId>,
+}
+
+impl BooleanDefinition {
+    const ENTRY_EVENT_INDEX: usize = DefinitionRecord::ENTRY_EVENT_INDEX;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Pair {
+    data_definition: usize,
+    boolean_definition: BooleanDefinition,
+    fact: BoolFact,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FlowState {
+    relations: HashMap<(ValueId, ValueId), HashSet<Pair>>,
+}
+
+impl FlowState {
+    fn entry(
+        data_bindings: &[ValueId],
+        bool_bindings: &[ValueId],
+        definitions: &DefinitionTable,
+        budget: &mut SemanticBudget,
+    ) -> Result<Self, CorrelationError> {
+        let mut state = Self::default();
+        for &data_binding in data_bindings {
+            let data_definition = *definitions
+                .data_lookup
+                .get(&DefinitionRecord {
+                    binding: data_binding,
+                    point: definitions.entry_point,
+                    event_index: DefinitionRecord::ENTRY_EVENT_INDEX,
+                    rhs: None,
+                })
+                .expect("every tracked data binding has an entry definition");
+            for &boolean_binding in bool_bindings {
+                let boolean_definition = BooleanDefinition {
+                    binding: boolean_binding,
+                    point: definitions.entry_point,
+                    event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
+                    rhs: None,
+                };
+                insert_pair(
+                    &mut state,
+                    (data_binding, boolean_binding),
+                    Pair {
+                        data_definition,
+                        boolean_definition,
+                        fact: BoolFact::Unknown,
+                    },
+                    budget,
+                )?;
+            }
+        }
+        Ok(state)
+    }
+
+    fn join(
+        &mut self,
+        other: &Self,
+        budget: &mut SemanticBudget,
+    ) -> Result<bool, CorrelationError> {
+        let mut changed = false;
+        for (&key, pairs) in &other.relations {
+            let destination = self.relations.entry(key).or_default();
+            for &pair in pairs {
+                if destination.insert(pair) {
+                    charge_pairs(budget, 1)?;
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+}
+
+fn insert_pair(
+    state: &mut FlowState,
+    key: (ValueId, ValueId),
+    pair: Pair,
+    budget: &mut SemanticBudget,
+) -> Result<bool, CorrelationError> {
+    let inserted = state.relations.entry(key).or_default().insert(pair);
+    if inserted {
+        charge_pairs(budget, 1)?;
+    }
+    Ok(inserted)
+}
+
+#[derive(Debug, Default)]
+struct DefinitionTable {
+    entry_point: ProgramPointId,
+    data_records: Vec<DefinitionRecord>,
+    data_lookup: HashMap<DefinitionRecord, usize>,
+    boolean_records: HashMap<BooleanDefinition, BooleanDefinition>,
+}
+
+impl DefinitionTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn index_entry_definitions(
+        &mut self,
+        entry_point: ProgramPointId,
+        data_bindings: &[ValueId],
+        bool_bindings: &[ValueId],
+        budget: &mut SemanticBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), CorrelationError> {
+        self.entry_point = entry_point;
+        for &binding in data_bindings {
+            check_cancelled(cancellation)?;
+            charge_pairs(budget, 1)?;
+            self.intern_data(DefinitionRecord {
+                binding,
+                point: entry_point,
+                event_index: DefinitionRecord::ENTRY_EVENT_INDEX,
+                rhs: None,
+            });
+        }
+        for &binding in bool_bindings {
+            check_cancelled(cancellation)?;
+            charge_pairs(budget, 1)?;
+            self.intern_boolean(BooleanDefinition {
+                binding,
+                point: entry_point,
+                event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
+                rhs: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn index_event_definitions(
+        &mut self,
+        semantics: &crate::analyzer::semantic::ProcedureSemantics,
+        data_bindings: &[ValueId],
+        bool_bindings: &[ValueId],
+        open_bindings: &HashSet<ValueId>,
+        budget: &mut SemanticBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), CorrelationError> {
+        let data_binding_set = data_bindings.iter().copied().collect::<HashSet<_>>();
+        let bool_binding_set = bool_bindings.iter().copied().collect::<HashSet<_>>();
+        for point in semantics.points() {
+            check_cancelled(cancellation)?;
+            for (event_index, event) in point.events.iter().enumerate() {
+                check_cancelled(cancellation)?;
+                budget.charge(SemanticWork {
+                    events: 1,
+                    ..SemanticWork::default()
+                })?;
+                match &event.effect {
+                    SemanticEffect::Assignment { target, value } => {
+                        let (target, value) = (*target, *value);
+                        if data_binding_set.contains(&target) {
+                            self.intern_data(DefinitionRecord {
+                                binding: target,
+                                point: point.id,
+                                event_index,
+                                rhs: Some(value),
+                            });
+                        }
+                        if bool_binding_set.contains(&target) {
+                            self.intern_boolean(BooleanDefinition {
+                                binding: target,
+                                point: point.id,
+                                event_index,
+                                rhs: Some(value),
+                            });
+                        }
+                    }
+                    SemanticEffect::ValueFlow {
+                        source,
+                        target,
+                        kind,
+                    } if bool_binding_set.contains(target)
+                        && kind.preserves_runtime_class()
+                        && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
+                    {
+                        self.intern_boolean(BooleanDefinition {
+                            binding: *target,
+                            point: point.id,
+                            event_index,
+                            rhs: Some(*source),
+                        });
+                    }
+                    effect => {
+                        for binding in unknown_write_bindings(effect, semantics, open_bindings) {
+                            if data_binding_set.contains(&binding) {
+                                self.intern_data(DefinitionRecord {
+                                    binding,
+                                    point: point.id,
+                                    event_index,
+                                    rhs: None,
+                                });
+                            }
+                            if bool_binding_set.contains(&binding) {
+                                self.intern_boolean(BooleanDefinition {
+                                    binding,
+                                    point: point.id,
+                                    event_index,
+                                    rhs: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(result) = produced_value(&event.effect)
+                    && data_binding_set.contains(&result)
+                {
+                    self.intern_data(DefinitionRecord {
+                        binding: result,
+                        point: point.id,
+                        event_index,
+                        rhs: None,
+                    });
+                }
+                if let Some(result) = produced_value(&event.effect)
+                    && bool_binding_set.contains(&result)
+                {
+                    self.intern_boolean(BooleanDefinition {
+                        binding: result,
+                        point: point.id,
+                        event_index,
+                        rhs: None,
+                    });
+                }
+            }
+        }
+        self.data_records.sort_unstable();
+        self.data_lookup.clear();
+        for (index, definition) in self.data_records.iter().copied().enumerate() {
+            self.data_lookup.insert(definition, index);
+        }
+        Ok(())
+    }
+
+    fn intern_data(&mut self, definition: DefinitionRecord) -> usize {
+        if let Some(&index) = self.data_lookup.get(&definition) {
+            return index;
+        }
+        let index = self.data_records.len();
+        self.data_records.push(definition);
+        self.data_lookup.insert(definition, index);
+        index
+    }
+
+    fn intern_boolean(&mut self, definition: BooleanDefinition) -> BooleanDefinition {
+        self.boolean_records.insert(definition, definition);
+        definition
+    }
+
+    fn data_definition(
+        &self,
+        binding: ValueId,
+        point: ProgramPointId,
+        event_index: usize,
+        rhs: Option<ValueId>,
+    ) -> usize {
+        *self
+            .data_lookup
+            .get(&DefinitionRecord {
+                binding,
+                point,
+                event_index,
+                rhs,
+            })
+            .expect("indexed data definition exists")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_point(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    point_id: ProgramPointId,
+    mut state: FlowState,
+    definitions: &DefinitionTable,
+    bool_bindings: &[ValueId],
+    data_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<FlowState, CorrelationError> {
+    let point = semantics.point(point_id).expect("validated point exists");
+    for (event_index, event) in point.events.iter().enumerate() {
+        check_cancelled(cancellation)?;
+        match &event.effect {
+            SemanticEffect::Assignment { target, value } => {
+                let (target, value) = (*target, *value);
+                if data_bindings.binary_search(&target).is_ok() {
+                    let definition =
+                        definitions.data_definition(target, point_id, event_index, Some(value));
+                    replace_data_component(&mut state, target, definition);
+                }
+                if bool_bindings.binary_search(&target).is_ok() {
+                    let definition = BooleanDefinition {
+                        binding: target,
+                        point: point_id,
+                        event_index,
+                        rhs: Some(value),
+                    };
+                    replace_boolean_component(
+                        &mut state,
+                        target,
+                        Some(value),
+                        definition,
+                        semantics,
+                        bool_bindings,
+                        budget,
+                    )?;
+                }
+            }
+            SemanticEffect::ValueFlow {
+                source,
+                target,
+                kind,
+            } if bool_bindings.binary_search(target).is_ok()
+                && kind.preserves_runtime_class()
+                && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
+            {
+                let definition = BooleanDefinition {
+                    binding: *target,
+                    point: point_id,
+                    event_index,
+                    rhs: Some(*source),
+                };
+                replace_boolean_component(
+                    &mut state,
+                    *target,
+                    Some(*source),
+                    definition,
+                    semantics,
+                    bool_bindings,
+                    budget,
+                )?;
+            }
+            effect => {
+                for binding in unknown_write_bindings(effect, semantics, open_bindings) {
+                    if data_bindings.binary_search(&binding).is_ok() {
+                        let definition =
+                            definitions.data_definition(binding, point_id, event_index, None);
+                        replace_data_component(&mut state, binding, definition);
+                    }
+                    if bool_bindings.binary_search(&binding).is_ok() {
+                        let definition = BooleanDefinition {
+                            binding,
+                            point: point_id,
+                            event_index,
+                            rhs: None,
+                        };
+                        replace_boolean_component(
+                            &mut state,
+                            binding,
+                            None,
+                            definition,
+                            semantics,
+                            bool_bindings,
+                            budget,
+                        )?;
+                    }
+                }
+            }
+        }
+        if let Some(result) = produced_value(&event.effect)
+            && data_bindings.binary_search(&result).is_ok()
+            && !matches!(&event.effect, SemanticEffect::Assignment { .. })
+        {
+            let definition = definitions.data_definition(result, point_id, event_index, None);
+            replace_data_component(&mut state, result, definition);
+        }
+        if let Some(result) = produced_value(&event.effect)
+            && bool_bindings.binary_search(&result).is_ok()
+            && !matches!(&event.effect, SemanticEffect::Assignment { .. })
+        {
+            let definition = BooleanDefinition {
+                binding: result,
+                point: point_id,
+                event_index,
+                rhs: None,
+            };
+            replace_boolean_component(
+                &mut state,
+                result,
+                None,
+                definition,
+                semantics,
+                bool_bindings,
+                budget,
+            )?;
+        }
+    }
+    Ok(state)
+}
+
+fn replace_data_component(state: &mut FlowState, binding: ValueId, definition: usize) {
+    for ((data_binding, _), pairs) in &mut state.relations {
+        if *data_binding == binding {
+            let replacement = pairs
+                .drain()
+                .map(|pair| Pair {
+                    data_definition: definition,
+                    ..pair
+                })
+                .collect();
+            *pairs = replacement;
+        }
+    }
+}
+
+fn replace_boolean_component(
+    state: &mut FlowState,
+    target: ValueId,
+    source: Option<ValueId>,
+    definition: BooleanDefinition,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    bool_bindings: &[ValueId],
+    budget: &mut SemanticBudget,
+) -> Result<(), CorrelationError> {
+    // A source relation is the only path that preserves data/boolean
+    // correlation.  Direct intrinsic booleans are independent of the current
+    // data binding and can therefore update every retained data definition.
+    // Other sources become an explicit unknown component.
+    let source_literal = source.and_then(|source| intrinsic_boolean(semantics, source));
+    let source_is_tracked = source_literal.is_none()
+        && source.is_some_and(|source| bool_bindings.binary_search(&source).is_ok());
+    if let Some(value) = source_literal {
+        return replace_boolean_fact_component(
+            state,
+            target,
+            definition,
+            BoolFact::from_literal(value),
+            budget,
+        );
+    }
+    if !source_is_tracked {
+        return replace_boolean_fact_component(
+            state,
+            target,
+            definition,
+            BoolFact::Unknown,
+            budget,
+        );
+    }
+    let relation_keys = state
+        .relations
+        .keys()
+        .copied()
+        .filter(|(_, boolean_binding)| *boolean_binding == target)
+        .collect::<Vec<_>>();
+    let data_bindings = relation_keys
+        .iter()
+        .map(|(data_binding, _)| *data_binding)
+        .collect::<Vec<_>>();
+
+    let source_pairs = state
+        .relations
+        .iter()
+        .filter(|((_, boolean_binding), _)| *boolean_binding == source.expect("tracked source"))
+        .map(|((data_binding, _), pairs)| (*data_binding, pairs.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for data_binding in data_bindings {
+        let target_key = (data_binding, target);
+        let replacement = source_pairs.get(&data_binding).cloned().map(|pairs| {
+            pairs
+                .into_iter()
+                .map(|pair| Pair {
+                    data_definition: pair.data_definition,
+                    boolean_definition: definition,
+                    fact: pair.fact,
+                })
+                .collect::<HashSet<_>>()
+        });
+        state.relations.insert(target_key, HashSet::default());
+        for pair in replacement.unwrap_or_default() {
+            insert_pair(state, target_key, pair, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_boolean_fact_component(
+    state: &mut FlowState,
+    target: ValueId,
+    definition: BooleanDefinition,
+    fact: BoolFact,
+    budget: &mut SemanticBudget,
+) -> Result<(), CorrelationError> {
+    let data_bindings = state
+        .relations
+        .keys()
+        .copied()
+        .filter(|(_, boolean_binding)| *boolean_binding == target)
+        .map(|(data_binding, _)| data_binding)
+        .collect::<Vec<_>>();
+    for data_binding in data_bindings {
+        let target_key = (data_binding, target);
+        let replacement = current_data_definitions(state, data_binding)
+            .into_iter()
+            .map(|data_definition| Pair {
+                data_definition,
+                boolean_definition: definition,
+                fact,
+            })
+            .collect::<HashSet<_>>();
+        state.relations.insert(target_key, HashSet::default());
+        for pair in replacement {
+            insert_pair(state, target_key, pair, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn current_data_definitions(state: &FlowState, data_binding: ValueId) -> Vec<usize> {
+    let mut definitions = HashSet::default();
+    for ((binding, _), pairs) in &state.relations {
+        if *binding == data_binding {
+            definitions.extend(pairs.iter().map(|pair| pair.data_definition));
+        }
+    }
+    definitions.into_iter().collect()
+}
+
+fn intrinsic_boolean(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    value: ValueId,
+) -> Option<bool> {
+    match &semantics.value(value)?.kind {
+        SemanticValueKind::Boolean(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn is_assignment_transfer_marker(
+    point: &crate::analyzer::semantic::ProgramPoint,
+    event_index: usize,
+    source: ValueId,
+    target: ValueId,
+) -> bool {
+    event_index > 0
+        && matches!(
+            &point.events[event_index - 1].effect,
+            SemanticEffect::Assignment {
+                target: previous_target,
+                value: previous_value,
+            } if *previous_target == target && *previous_value == source
+        )
+}
+
+/// Return only bindings whose semantic IR identifies a write target.
+///
+/// A call or an ordinary heap write does not rebind a procedure-local slot:
+/// invalidating every local at every call destroys the very branch correlation
+/// this analysis is meant to preserve. Calls reopen only the IR-proven
+/// address/capture/lexical-cell bindings. Lexical-cell/capture stores and
+/// value-scoped gaps do name a writable binding, so those are explicit
+/// openness points. Produced call/async results are handled separately by
+/// [`produced_value`].
+pub(super) fn unknown_write_bindings(
+    effect: &SemanticEffect,
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    open_bindings: &HashSet<ValueId>,
+) -> Vec<ValueId> {
+    match effect {
+        SemanticEffect::MemoryStore { location, .. } => semantics
+            .memory_location(*location)
+            .and_then(|location| match &location.kind {
+                crate::analyzer::semantic::MemoryLocationKind::LexicalCell { binding }
+                | crate::analyzer::semantic::MemoryLocationKind::Capture {
+                    binding: Some(binding),
+                    ..
+                } => Some(vec![*binding]),
+                crate::analyzer::semantic::MemoryLocationKind::Capture {
+                    binding: None, ..
+                } => Some(sorted_bindings(open_bindings)),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        SemanticEffect::Invoke { .. }
+        | SemanticEffect::CallContinuation { .. }
+        | SemanticEffect::AsyncSuspend { .. }
+        | SemanticEffect::AsyncResume { .. }
+        | SemanticEffect::Synchronization { .. } => sorted_bindings(open_bindings),
+        SemanticEffect::Gap { gap } => semantics
+            .gap(*gap)
+            .filter(|gap| {
+                gap.impacts.contains(SemanticGapImpact::ValueFlow)
+                    || gap.impacts.contains(SemanticGapImpact::Aliasing)
+            })
+            .map(|gap| match gap.subject {
+                crate::analyzer::semantic::SemanticGapSubject::Value(binding) => vec![binding],
+                _ => sorted_bindings(open_bindings),
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn sorted_bindings(bindings: &HashSet<ValueId>) -> Vec<ValueId> {
+    let mut bindings = bindings.iter().copied().collect::<Vec<_>>();
+    bindings.sort_unstable();
+    bindings
+}
+
+pub(super) fn produced_value(effect: &SemanticEffect) -> Option<ValueId> {
+    match effect {
+        SemanticEffect::MemoryLoad { result, .. }
+        | SemanticEffect::CallableCreation { result, .. }
+        | SemanticEffect::CallableReference { result, .. }
+        | SemanticEffect::AsyncResume {
+            result: Some(result),
+            ..
+        } => Some(*result),
+        _ => None,
+    }
+}
+
+fn make_candidate(
+    edge: ControlEdgeId,
+    bool_binding: ValueId,
+    expected: BoolFact,
+    data_binding: ValueId,
+    pairs: &HashSet<Pair>,
+    definitions: &DefinitionTable,
+) -> CorrelationCandidate {
+    let mut by_data = HashMap::<usize, (bool, bool, bool)>::default();
+    for pair in pairs {
+        let entry = by_data.entry(pair.data_definition).or_default();
+        match pair.fact {
+            BoolFact::Unknown => entry.2 = true,
+            fact if fact == expected => entry.0 = true,
+            fact if fact == expected.opposite() => entry.1 = true,
+            _ => entry.2 = true,
+        }
+    }
+    let mut all = Vec::new();
+    let mut compatible = Vec::new();
+    let mut incompatible = Vec::new();
+    let mut unknown = Vec::new();
+    let mut ids = by_data.keys().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    for id in ids {
+        let record = definitions.data_records[id];
+        all.push(record);
+        let (has_compatible, has_incompatible, has_unknown) = by_data[&id];
+        match (has_compatible, has_incompatible, has_unknown) {
+            (true, false, false) => compatible.push(record),
+            (false, true, false) => incompatible.push(record),
+            _ => unknown.push(record),
+        }
+    }
+    CorrelationCandidate {
+        edge,
+        bool_binding,
+        expected,
+        data_binding,
+        all_reaching_data_defs: all,
+        compatible_data_defs: compatible,
+        incompatible_data_defs: incompatible,
+        unknown_data_defs: unknown,
+    }
+}
+
+#[cfg(test)]
+mod correlation_properties {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct ReferencePair {
+        data_definition: usize,
+        boolean_definition: usize,
+        fact: BoolFact,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct ReferenceState {
+        relations: BTreeMap<(ValueId, ValueId), Vec<ReferencePair>>,
+    }
+
+    impl ReferenceState {
+        fn join(&mut self, other: &Self) {
+            for (&key, pairs) in &other.relations {
+                let destination = self.relations.entry(key).or_default();
+                for &pair in pairs {
+                    if !destination.contains(&pair) {
+                        destination.push(pair);
+                    }
+                }
+                destination.sort_unstable_by_key(|pair| {
+                    (pair.data_definition, pair.boolean_definition, pair.fact)
+                });
+            }
+        }
+    }
+
+    fn boolean_definition(index: usize, binding: ValueId) -> BooleanDefinition {
+        BooleanDefinition {
+            binding,
+            point: ProgramPointId::new(index as u32),
+            event_index: index,
+            rhs: None,
+        }
+    }
+
+    fn seed_states(
+        data_bindings: &[ValueId],
+        boolean_bindings: &[ValueId],
+    ) -> (FlowState, ReferenceState) {
+        let mut actual = FlowState::default();
+        let mut reference = ReferenceState::default();
+        for &data_binding in data_bindings {
+            for &boolean_binding in boolean_bindings {
+                let pair = Pair {
+                    data_definition: 0,
+                    boolean_definition: boolean_definition(0, boolean_binding),
+                    fact: BoolFact::Unknown,
+                };
+                actual.relations.insert(
+                    (data_binding, boolean_binding),
+                    [pair].into_iter().collect(),
+                );
+                reference.relations.insert(
+                    (data_binding, boolean_binding),
+                    vec![ReferencePair {
+                        data_definition: 0,
+                        boolean_definition: 0,
+                        fact: BoolFact::Unknown,
+                    }],
+                );
+            }
+        }
+        (actual, reference)
+    }
+
+    fn reference_replace_data(state: &mut ReferenceState, binding: ValueId, definition: usize) {
+        for ((data_binding, _), pairs) in &mut state.relations {
+            if *data_binding == binding {
+                for pair in pairs.iter_mut() {
+                    pair.data_definition = definition;
+                }
+                pairs.sort_unstable_by_key(|pair| {
+                    (pair.data_definition, pair.boolean_definition, pair.fact)
+                });
+                pairs.dedup();
+            }
+        }
+    }
+
+    fn reference_replace_boolean_fact(
+        state: &mut ReferenceState,
+        target: ValueId,
+        definition: usize,
+        fact: BoolFact,
+    ) {
+        let keys = state
+            .relations
+            .keys()
+            .copied()
+            .filter(|(_, boolean_binding)| *boolean_binding == target)
+            .collect::<Vec<_>>();
+        for (data_binding, _) in keys {
+            let mut data_definitions = state
+                .relations
+                .iter()
+                .filter(|((binding, _), _)| *binding == data_binding)
+                .flat_map(|(_, pairs)| pairs.iter().map(|pair| pair.data_definition))
+                .collect::<Vec<_>>();
+            data_definitions.sort_unstable();
+            data_definitions.dedup();
+            state.relations.insert(
+                (data_binding, target),
+                data_definitions
+                    .into_iter()
+                    .map(|data_definition| ReferencePair {
+                        data_definition,
+                        boolean_definition: definition,
+                        fact,
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    fn actual_signature(state: &FlowState) -> Vec<(ValueId, ValueId, usize, usize, BoolFact)> {
+        let mut signature = state
+            .relations
+            .iter()
+            .flat_map(|(&(data_binding, boolean_binding), pairs)| {
+                pairs.iter().map(move |pair| {
+                    (
+                        data_binding,
+                        boolean_binding,
+                        pair.data_definition,
+                        pair.boolean_definition.event_index,
+                        pair.fact,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        signature.sort_unstable();
+        signature
+    }
+
+    fn reference_signature(
+        state: &ReferenceState,
+    ) -> Vec<(ValueId, ValueId, usize, usize, BoolFact)> {
+        let mut signature = state
+            .relations
+            .iter()
+            .flat_map(|(&(data_binding, boolean_binding), pairs)| {
+                pairs.iter().map(move |pair| {
+                    (
+                        data_binding,
+                        boolean_binding,
+                        pair.data_definition,
+                        pair.boolean_definition,
+                        pair.fact,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        signature.sort_unstable();
+        signature
+    }
+
+    fn definition_table(count: usize) -> DefinitionTable {
+        let mut definitions = DefinitionTable::default();
+        for index in 0..count {
+            definitions.intern_data(DefinitionRecord {
+                binding: ValueId::new(index as u32),
+                point: ProgramPointId::new(index as u32),
+                event_index: index,
+                rhs: None,
+            });
+        }
+        definitions
+    }
+
+    fn reference_candidate(
+        expected: BoolFact,
+        pairs: &[ReferencePair],
+    ) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut facts_by_data = BTreeMap::<usize, (bool, bool, bool)>::new();
+        for pair in pairs {
+            let facts = facts_by_data.entry(pair.data_definition).or_default();
+            match pair.fact {
+                BoolFact::Unknown => facts.2 = true,
+                fact if fact == expected => facts.0 = true,
+                fact if fact == expected.opposite() => facts.1 = true,
+                _ => facts.2 = true,
+            }
+        }
+        let mut all = Vec::new();
+        let mut compatible = Vec::new();
+        let mut incompatible = Vec::new();
+        let mut unknown = Vec::new();
+        for (data_definition, (has_compatible, has_incompatible, has_unknown)) in facts_by_data {
+            all.push(data_definition);
+            match (has_compatible, has_incompatible, has_unknown) {
+                (true, false, false) => compatible.push(data_definition),
+                (false, true, false) => incompatible.push(data_definition),
+                _ => unknown.push(data_definition),
+            }
+        }
+        (all, compatible, incompatible, unknown)
+    }
+
+    fn candidate_signature(
+        candidate: &CorrelationCandidate,
+    ) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+        (
+            candidate
+                .all_reaching_data_defs
+                .iter()
+                .map(|definition| definition.event_index)
+                .collect(),
+            candidate
+                .compatible_data_defs
+                .iter()
+                .map(|definition| definition.event_index)
+                .collect(),
+            candidate
+                .incompatible_data_defs
+                .iter()
+                .map(|definition| definition.event_index)
+                .collect(),
+            candidate
+                .unknown_data_defs
+                .iter()
+                .map(|definition| definition.event_index)
+                .collect(),
+        )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TraceOperation {
+        ReplaceData {
+            binding: u8,
+            definition: u16,
+        },
+        ReplaceBoolean {
+            binding: u8,
+            definition: u16,
+            fact: BoolFact,
+        },
+        JoinData {
+            binding: u8,
+            definition: u16,
+        },
+        JoinBoolean {
+            binding: u8,
+            definition: u16,
+            fact: BoolFact,
+        },
+    }
+
+    impl TraceOperation {
+        fn binding(self) -> usize {
+            match self {
+                Self::ReplaceData { binding, .. }
+                | Self::ReplaceBoolean { binding, .. }
+                | Self::JoinData { binding, .. }
+                | Self::JoinBoolean { binding, .. } => binding as usize,
+            }
+        }
+    }
+
+    fn trace_operation_strategy() -> impl Strategy<Value = TraceOperation> {
+        let binding = 0_u8..2;
+        let definition = 1_u16..299;
+        let fact = (0_u8..3).prop_map(|fact| match fact {
+            0 => BoolFact::True,
+            1 => BoolFact::False,
+            _ => BoolFact::Unknown,
+        });
+        prop_oneof![
+            (binding.clone(), definition.clone()).prop_map(|(binding, definition)| {
+                TraceOperation::ReplaceData {
+                    binding,
+                    definition,
+                }
+            }),
+            (binding.clone(), definition.clone(), fact.clone()).prop_map(
+                |(binding, definition, fact)| TraceOperation::ReplaceBoolean {
+                    binding,
+                    definition,
+                    fact,
+                }
+            ),
+            (binding.clone(), definition.clone()).prop_map(|(binding, definition)| {
+                TraceOperation::JoinData {
+                    binding,
+                    definition,
+                }
+            }),
+            (binding, definition, fact).prop_map(|(binding, definition, fact)| {
+                TraceOperation::JoinBoolean {
+                    binding,
+                    definition,
+                    fact,
+                }
+            }),
+        ]
+    }
+
+    // Exercises short generated finite traces. The reference keeps sorted
+    // vectors and independently enumerates the four candidate classes; it
+    // does not call the production replacement or join helpers.
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+        #[test]
+        fn finite_relation_matches_reference(
+            trace in prop::collection::vec(trace_operation_strategy(), 1..=8)
+        ) {
+        let data_bindings = [ValueId::new(1), ValueId::new(2)];
+        let boolean_bindings = [ValueId::new(3), ValueId::new(4)];
+        let definitions = definition_table(300);
+        let (mut actual, mut reference) = seed_states(&data_bindings, &boolean_bindings);
+        let mut budget = SemanticBudget::uniform(100_000).expect("positive test budget");
+        for (step, operation) in trace.iter().copied().enumerate() {
+            let data_binding = data_bindings[operation.binding()];
+            let boolean_binding = boolean_bindings[operation.binding()];
+            match operation {
+                TraceOperation::ReplaceData { definition, .. } => {
+                    replace_data_component(&mut actual, data_binding, definition as usize);
+                    reference_replace_data(&mut reference, data_binding, definition as usize);
+                }
+                TraceOperation::ReplaceBoolean {
+                    definition, fact, ..
+                } => {
+                    replace_boolean_fact_component(
+                        &mut actual,
+                        boolean_binding,
+                        boolean_definition(definition as usize, boolean_binding),
+                        fact,
+                        &mut budget,
+                    )
+                    .expect("finite relation stays within budget");
+                    reference_replace_boolean_fact(
+                        &mut reference,
+                        boolean_binding,
+                        definition as usize,
+                        fact,
+                    );
+                }
+                TraceOperation::JoinData { definition, .. } => {
+                    let mut branch_actual = actual.clone();
+                    let mut branch_reference = reference.clone();
+                    replace_data_component(&mut branch_actual, data_binding, definition as usize);
+                    reference_replace_data(
+                        &mut branch_reference,
+                        data_binding,
+                        definition as usize,
+                    );
+                    actual
+                        .join(&branch_actual, &mut budget)
+                        .expect("finite join stays within budget");
+                    reference.join(&branch_reference);
+                }
+                TraceOperation::JoinBoolean {
+                    definition, fact, ..
+                } => {
+                    let mut branch_actual = actual.clone();
+                    let mut branch_reference = reference.clone();
+                    replace_boolean_fact_component(
+                        &mut branch_actual,
+                        boolean_binding,
+                        boolean_definition(definition as usize, boolean_binding),
+                        fact,
+                        &mut budget,
+                    )
+                    .expect("finite loop state stays within budget");
+                    reference_replace_boolean_fact(
+                        &mut branch_reference,
+                        boolean_binding,
+                        definition as usize,
+                        fact,
+                    );
+                    actual
+                        .join(&branch_actual, &mut budget)
+                        .expect("finite loop join stays within budget");
+                    reference.join(&branch_reference);
+                }
+            }
+                assert_eq!(
+                    actual_signature(&actual),
+                    reference_signature(&reference),
+                    "relation mismatch at step {step}"
+                );
+        }
+
+        // Reapply one fixed loop body until two successive joins are equal.
+        // The finite reference must reach the same fixed point; this catches
+        // accidental pair loss on a backedge.
+        let loop_binding = boolean_bindings[trace.len() % boolean_bindings.len()];
+        let loop_definition = 299;
+        let mut previous_actual = None;
+        let mut previous_reference = None;
+        for _ in 0..3 {
+            let mut body_actual = actual.clone();
+            let mut body_reference = reference.clone();
+            replace_boolean_fact_component(
+                &mut body_actual,
+                loop_binding,
+                boolean_definition(loop_definition, loop_binding),
+                BoolFact::True,
+                &mut budget,
+            )
+            .expect("fixed loop stays within budget");
+            reference_replace_boolean_fact(
+                &mut body_reference,
+                loop_binding,
+                loop_definition,
+                BoolFact::True,
+            );
+            actual
+                .join(&body_actual, &mut budget)
+                .expect("fixed loop join stays within budget");
+            reference.join(&body_reference);
+            let actual_signature_now = actual_signature(&actual);
+            let reference_signature_now = reference_signature(&reference);
+            if let Some(previous) = &previous_actual {
+                assert_eq!(
+                    &actual_signature_now, previous,
+                    "production loop did not stabilize"
+                );
+            }
+            if let Some(previous) = &previous_reference {
+                assert_eq!(
+                    &reference_signature_now, previous,
+                    "reference loop did not stabilize"
+                );
+            }
+            assert_eq!(actual_signature_now, reference_signature_now);
+            previous_actual = Some(actual_signature_now);
+            previous_reference = Some(reference_signature_now);
+        }
+
+        for &data_binding in &data_bindings {
+            for &boolean_binding in &boolean_bindings {
+                let actual_pairs = actual
+                    .relations
+                    .get(&(data_binding, boolean_binding))
+                    .expect("relation key remains present");
+                let reference_pairs = reference
+                    .relations
+                    .get(&(data_binding, boolean_binding))
+                    .expect("reference relation key remains present");
+                for expected in [BoolFact::True, BoolFact::False, BoolFact::Unknown] {
+                    let candidate = make_candidate(
+                        ControlEdgeId::new(0),
+                        boolean_binding,
+                        expected,
+                        data_binding,
+                        actual_pairs,
+                        &definitions,
+                    );
+                    let expected_signature = reference_candidate(expected, reference_pairs);
+                    assert_eq!(
+                        candidate_signature(&candidate),
+                        expected_signature,
+                        "candidate mismatch for data {data_binding:?}, bool {boolean_binding:?}, expected {expected:?}"
+                    );
+                }
+            }
+        }
+        }
+    }
+
+    /// Public contract: `Unknown` is the only self-opposite fact and known
+    /// literals form an involution.  This guards edge polarity independently
+    /// from the finite relation trace above.
+    #[test]
+    pub fn bool_fact_opposite_is_an_involution() {
+        for fact in [BoolFact::True, BoolFact::False, BoolFact::Unknown] {
+            assert_eq!(fact.opposite().opposite(), fact);
+        }
+        assert_eq!(BoolFact::True.opposite(), BoolFact::False);
+        assert_eq!(BoolFact::False.opposite(), BoolFact::True);
+        assert_eq!(BoolFact::Unknown.opposite(), BoolFact::Unknown);
+    }
+}

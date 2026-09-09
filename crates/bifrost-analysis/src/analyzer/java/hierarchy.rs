@@ -6,6 +6,7 @@
 //! walk reads through [`JavaHierarchyFact`], and the query-count test hooks.
 
 use super::*;
+use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey, declaration_set_digest};
 use crate::analyzer::tree_sitter_analyzer::HierarchyDeclarationFacts;
 use crate::analyzer::{
     CodeUnitType, DescendantIndexScope, DirectDescendantIndex, ImportInfo, Range,
@@ -16,6 +17,7 @@ use brokk_bifrost_jvm::java::hierarchy::{
     JavaHierarchyFact, build_java_direct_descendant_index, java_direct_ancestors,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 impl JavaHierarchyFact for HierarchyDeclarationFacts {
     fn declaration(&self) -> &CodeUnit {
@@ -64,12 +66,22 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        descendants_from_variant_index(
+        let descendants = descendants_from_variant_index(
             &self.memo_caches.direct_descendant_index,
             scope,
             code_unit,
             || self.build_direct_descendant_index(scope),
-        )
+        );
+        if !scope.cancellation().is_cancelled()
+            && let Some(descendants) = descendants.as_ref()
+        {
+            self.inner.record_read_key(ReadKey::lookup(
+                LookupKind::Descendants,
+                LookupQuestion::declaration(code_unit),
+                declaration_set_digest(descendants),
+            ));
+        }
+        descendants
     }
 }
 
@@ -81,17 +93,27 @@ impl JavaAnalyzer {
         let _scope = crate::profiling::scope("JavaAnalyzer::build_direct_descendant_index");
         let candidates = self
             .inner
-            .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)
-            .unwrap_or_default();
-        build_java_direct_descendant_index(
+            .hierarchy_declaration_facts_by_kind_for_descendant_lookup(CodeUnitType::Class)?;
+        let hydration_complete = AtomicBool::new(true);
+        let index = build_java_direct_descendant_index(
             candidates,
             |batch| {
-                self.inner
-                    .hydrate_hierarchy_declaration_facts(batch)
-                    .is_some()
+                let complete = self
+                    .inner
+                    .hydrate_hierarchy_declaration_facts_for_descendant_lookup(batch)
+                    .is_some();
+                if !complete {
+                    hydration_complete.store(false, Ordering::Relaxed);
+                }
+                complete
             },
             scope,
-        )
+        );
+        if !hydration_complete.load(Ordering::Relaxed) || scope.cancellation().is_cancelled() {
+            None
+        } else {
+            index
+        }
     }
 
     #[doc(hidden)]

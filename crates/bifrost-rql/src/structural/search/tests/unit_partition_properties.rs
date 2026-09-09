@@ -110,7 +110,7 @@ fn generated_project() -> impl Strategy<Value = GeneratedProject> {
 }
 
 /// The plans the property runs, one of each partitionable shape: a seed-only
-/// structural plan, a row-local step, a derived-value step, and a
+/// structural plan, a row-local step, a derived-value step, a union, and a
 /// non-structural seed family.
 fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
     let query = |label: &'static str, value: serde_json::Value| {
@@ -145,6 +145,18 @@ fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
                 "schema_version": 1,
                 "match": { "kind": "function" },
                 "steps": [{ "op": "enclosing_decl" }, { "op": "callers" }],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
+            "overlapping union",
+            json!({
+                "schema_version": 1,
+                "union": [
+                    { "match": { "kind": "function", "name": { "regex": "^fn[0-9]$" } } },
+                    { "match": { "kind": "function" } }
+                ],
                 "limit": 500,
                 "result_detail": "full"
             }),
@@ -286,7 +298,7 @@ proptest! {
                     )
                 })
                 .collect::<Vec<_>>();
-            let merged = merge_unit_rows(units);
+            let merged = merge_unit_rows(&query, units);
 
             let merged_bytes = comparable_rendering(&merged.items);
             let whole_bytes = comparable_rendering(

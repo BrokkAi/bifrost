@@ -416,6 +416,234 @@ fn a_semi_join_keeps_each_left_row_once() {
     assert_eq!(verdicts(&inner), vec![("site".to_string(), 2)]);
 }
 
+/// A left join retains a left row with a null right side when no key matches.
+/// The null test also proves that the right schema was widened, including for
+/// a field that is required in the source domain.
+#[test]
+fn a_left_join_keeps_an_unmatched_left_row_with_null_right_fields() {
+    let left = source(0, "arg");
+    let right = source(1, "other");
+    let joined = join(
+        2,
+        &left,
+        &right,
+        IrJoinKind::Left,
+        vec![IrEquiKey {
+            left: column("arg", "site_id"),
+            right: column("other", "site_id"),
+        }],
+    );
+    assert!(
+        !right
+            .schema
+            .field(&column("other", "argument_index"))
+            .expect("call-argument schema has argument_index")
+            .nullable
+    );
+    assert!(
+        joined
+            .schema
+            .field(&column("other", "argument_index"))
+            .expect("left join carries the right schema")
+            .nullable
+    );
+    let filtered = filter(
+        3,
+        "unmatched",
+        &joined,
+        vec![IrPredicate::IsNull {
+            column: column("other", "argument_index"),
+            negated: false,
+        }],
+    );
+    let grouped = group(
+        4,
+        "by-site",
+        &filtered,
+        vec![column("arg", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("left-zero", &grouped, "calls", AssertCardinality::AtMost(0));
+    let plan = plan(
+        vec![left, right, joined, filtered, grouped],
+        vec![assertion],
+    );
+    let left_rows = vec![argument("site", "arg-0", 0, None, false)];
+    let right_rows = vec![argument("elsewhere", "other-0", 0, None, false)];
+
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left_rows, RelationCoverage::Exhaustive),
+            ("other", &right_rows, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
+    assert_eq!(
+        evaluation.violations[0].representatives,
+        vec![vec![RelationalViolationRow {
+            binding: binding("arg"),
+            row: 0,
+        }]]
+    );
+}
+
+/// A matched left-join pair has the same rows and cardinality as an inner
+/// join, including both contributors in the retained evidence.
+#[test]
+fn a_left_join_matches_inner_join_for_matching_pairs() {
+    let left = [argument("site", "arg-0", 0, None, false)];
+    let right = [argument("site", "other-0", 0, None, false)];
+    let inputs = [
+        ("arg", &left[..], RelationCoverage::Exhaustive),
+        ("other", &right[..], RelationCoverage::Exhaustive),
+    ];
+    let left_join = evaluate(
+        &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
+        &inputs,
+    );
+    let inner = evaluate(
+        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
+        &inputs,
+    );
+
+    assert_eq!(verdicts(&left_join), verdicts(&inner));
+    assert_eq!(
+        left_join.violations[0].representatives,
+        vec![vec![
+            RelationalViolationRow {
+                binding: binding("arg"),
+                row: 0,
+            },
+            RelationalViolationRow {
+                binding: binding("other"),
+                row: 0,
+            },
+        ]]
+    );
+}
+
+/// A matching left row still expands once per duplicate right row, just like
+/// an inner join, while an unmatched row would expand only once.
+#[test]
+fn a_left_join_retains_each_matching_right_duplicate() {
+    let left = vec![argument("site", "arg-0", 0, None, false)];
+    let right = vec![
+        argument("site", "other-0", 0, None, false),
+        argument("site", "other-1", 1, None, false),
+    ];
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
+    assert_eq!(evaluation.violations[0].representatives.len(), 2);
+}
+
+/// An unmatched left row is only a witness when the right relation was
+/// exhaustively searched, because an unseen right row could have matched it.
+#[test]
+fn an_unmatched_left_join_row_is_witness_unsound_over_a_partial_right_relation() {
+    let left = vec![argument("site", "arg-0", 0, None, false)];
+    let right = vec![argument("elsewhere", "other-0", 0, None, false)];
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Left, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::ProvenSubset),
+        ],
+    );
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert_eq!(
+        evaluation.unmet_obligations[0].reasons,
+        vec![PolicyIncompleteReason::PartialDiscovery]
+    );
+}
+
+/// A matched pair can still carry an unsound right tuple from an earlier
+/// derivation. A left join keeps both that witness reason and its own partial
+/// coverage reason when it blocks the resulting verdict.
+#[test]
+fn a_left_join_retains_right_witness_and_coverage_reasons() {
+    let arg = source(0, "arg");
+    let other = source(1, "other");
+    let blocker = source(2, "blocker");
+    let right = join(
+        3,
+        &other,
+        &blocker,
+        IrJoinKind::Anti,
+        vec![IrEquiKey {
+            left: column("other", "site_id"),
+            right: column("blocker", "site_id"),
+        }],
+    );
+    let joined = join(
+        4,
+        &arg,
+        &right,
+        IrJoinKind::Left,
+        vec![IrEquiKey {
+            left: column("arg", "site_id"),
+            right: column("other", "site_id"),
+        }],
+    );
+    let grouped = group(
+        5,
+        "by-site",
+        &joined,
+        vec![column("arg", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion(
+        "left-reasons",
+        &grouped,
+        "calls",
+        AssertCardinality::AtMost(0),
+    );
+    let plan = plan(
+        vec![arg, other, blocker, right, joined, grouped],
+        vec![assertion],
+    );
+    let arg_rows = vec![argument("site", "arg-0", 0, None, false)];
+    let other_rows = vec![argument("site", "other-0", 0, None, false)];
+    let blocker_rows = vec![argument("elsewhere", "blocker-0", 0, None, false)];
+
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &arg_rows, RelationCoverage::Exhaustive),
+            ("other", &other_rows, RelationCoverage::ProvenSubset),
+            (
+                "blocker",
+                &blocker_rows,
+                RelationCoverage::incomplete(vec![PolicyIncompleteReason::Cancelled]),
+            ),
+        ],
+    );
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert_eq!(
+        evaluation.unmet_obligations[0].reasons,
+        vec![
+            PolicyIncompleteReason::Cancelled,
+            PolicyIncompleteReason::PartialDiscovery,
+        ]
+    );
+}
+
 /// Every right-side duplicate is retained in source order, and each pair is
 /// emitted left-major before the next left tuple is probed.
 #[test]
@@ -813,6 +1041,48 @@ fn a_truncated_group_loses_its_verdict_and_no_other_group_does() {
         evaluation.unmet_obligations[0].key,
         vec![Some(RowScalar::StableId("site-a".to_string()))]
     );
+}
+
+fn ten_matching_join_pairs() -> (Vec<UnitRowItem>, Vec<UnitRowItem>) {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 1, None, false),
+    ];
+    let right = (0..5)
+        .map(|index| argument("site", &format!("other-{index}"), index, None, false))
+        .collect();
+    (left, right)
+}
+
+#[test]
+fn representative_tuple_retention_defaults_to_eight() {
+    assert_eq!(IrLimits::default().max_representative_tuples, 8);
+    let (left, right) = ten_matching_join_pairs();
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
+    assert_eq!(evaluation.violations[0].representatives.len(), 8);
+}
+
+#[test]
+fn representative_tuple_retention_accepts_a_bound_above_eight() {
+    let (left, right) = ten_matching_join_pairs();
+    let mut plan = join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
+    plan.limits.max_representative_tuples = 12;
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 10)]);
+    assert_eq!(evaluation.violations[0].representatives.len(), 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,5 +1627,17 @@ fn a_zero_bound_is_rejected() {
     assert_eq!(
         validate_plan_ir(&plan),
         Err(RelationalAssertionPlanError::ZeroLimit { name: "max_groups" })
+    );
+}
+
+#[test]
+fn a_zero_representative_bound_is_rejected() {
+    let mut plan = counting_plan(AssertCardinality::AtMost(0));
+    plan.limits.max_representative_tuples = 0;
+    assert_eq!(
+        validate_plan_ir(&plan),
+        Err(RelationalAssertionPlanError::ZeroLimit {
+            name: "max_representative_tuples"
+        })
     );
 }

@@ -35,8 +35,9 @@ use super::coverage::{
     RelationalObligationKind,
 };
 use super::ir::{
-    IrAggregate, IrAggregateOp, IrColumn, IrCompareOp, IrJoinKind, IrOperand, IrOrderedSequence,
-    IrPredicate, IrRelationId, IrRelationOp, RelationalPlanIr, RowScalar,
+    DEFAULT_MAX_REPRESENTATIVE_TUPLES, IrAggregate, IrAggregateOp, IrColumn, IrCompareOp,
+    IrJoinKind, IrOperand, IrOrderedSequence, IrPredicate, IrRelationId, IrRelationOp,
+    RelationalPlanIr, RowScalar,
 };
 
 /// One row of one binding that contributed to a violated group, addressed by
@@ -47,10 +48,11 @@ pub struct RelationalViolationRow {
     pub row: usize,
 }
 
-/// The number of contributing tuples a violation retains for diagnostics. The
-/// aggregate value already states the complete count; representatives exist so
-/// a finding can point at exact source ranges, not to enumerate the group.
-pub const MAX_VIOLATION_REPRESENTATIVE_TUPLES: usize = 8;
+/// The default number of contributing tuples a violation retains for
+/// diagnostics. The aggregate value already states the complete count;
+/// representatives exist so a finding can point at exact source ranges, not to
+/// enumerate the group. Each plan may override this in `IrLimits`.
+pub const MAX_VIOLATION_REPRESENTATIVE_TUPLES: usize = DEFAULT_MAX_REPRESENTATIVE_TUPLES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalAssertionViolation {
@@ -855,20 +857,30 @@ fn evaluate_join(
         })
         .collect::<EvalResult<Vec<_>>>()?;
 
-    // An anti join publishes rows because nothing matched them. That is only a
-    // fact about the world when the right relation held every row that exists.
+    // Anti joins and unmatched left-join rows are present because nothing
+    // matched them. That is only a fact about the world when the right relation
+    // held every row that exists.
     let right_is_exhaustive = right.coverage.is_exhaustive();
     let mut witness_reasons = left.witness_reasons.clone();
-    if kind == IrJoinKind::Anti && !right_is_exhaustive {
-        witness_reasons.extend(right.coverage.incomplete_reasons());
-    } else {
-        witness_reasons.extend(right.witness_reasons.iter().copied());
+    match kind {
+        IrJoinKind::Left => {
+            witness_reasons.extend(right.witness_reasons.iter().copied());
+            if !right_is_exhaustive {
+                witness_reasons.extend(right.coverage.incomplete_reasons());
+            }
+        }
+        IrJoinKind::Anti if !right_is_exhaustive => {
+            witness_reasons.extend(right.coverage.incomplete_reasons());
+        }
+        _ => witness_reasons.extend(right.witness_reasons.iter().copied()),
     }
     witness_reasons.sort();
     witness_reasons.dedup();
 
     let mut coverage = match kind {
-        IrJoinKind::Inner | IrJoinKind::Semi => left.coverage.clone().meet(right.coverage.clone()),
+        IrJoinKind::Inner | IrJoinKind::Left | IrJoinKind::Semi => {
+            left.coverage.clone().meet(right.coverage.clone())
+        }
         // Missing right rows cannot remove an anti-join row that exists; they
         // can only add one, which the witness rule handles.
         IrJoinKind::Anti => left.coverage.clone(),
@@ -905,7 +917,7 @@ fn evaluate_join(
         let matches = right_index.get(&key);
         let matched = matches.is_some();
         if let Some(matches) = matches
-            && kind == IrJoinKind::Inner
+            && matches!(kind, IrJoinKind::Inner | IrJoinKind::Left)
         {
             for right_tuple in matches {
                 if joined.len() == state.limits.max_joined_rows {
@@ -931,6 +943,7 @@ fn evaluate_join(
         }
         let retain = match kind {
             IrJoinKind::Inner => false,
+            IrJoinKind::Left => !matched,
             IrJoinKind::Semi => matched,
             IrJoinKind::Anti => !matched,
         };
@@ -939,17 +952,22 @@ fn evaluate_join(
                 coverage = state.truncate(coverage);
                 break;
             }
+            let mut values = tuple.values.clone();
+            if kind == IrJoinKind::Left {
+                values.extend((0..right.layout.len()).map(|_| None));
+            }
             joined.push(EvalTuple {
-                values: tuple.values.clone(),
+                values,
                 contributors: tuple.contributors.clone(),
                 witness_sound: tuple.witness_sound
-                    && (kind != IrJoinKind::Anti || right_is_exhaustive),
+                    && (!matches!(kind, IrJoinKind::Anti | IrJoinKind::Left)
+                        || right_is_exhaustive),
             });
         }
     }
 
     let layout = match kind {
-        IrJoinKind::Inner => {
+        IrJoinKind::Inner | IrJoinKind::Left => {
             let mut layout = left.layout.clone();
             layout.extend(right.layout.iter().cloned());
             layout
@@ -1035,7 +1053,7 @@ fn evaluate_group(
             .tuples
             .iter()
             .flat_map(|tuple| tuple.contributors.iter())
-            .take(MAX_VIOLATION_REPRESENTATIVE_TUPLES)
+            .take(state.limits.max_representative_tuples)
             .map(|contributor| {
                 let mut rows = contributor.clone();
                 rows.sort_by_key(|row| {

@@ -53,6 +53,7 @@
 
 use crate::analyzer::lexical_definitions::{FormalParameterLayout, FormalParameterSlot};
 use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::usages::call_conversion::{CallArgumentConversion, ConversionUnknown};
 use crate::analyzer::usages::call_shape::CallShapeReport;
 use crate::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::structural::callable::{ArgumentListKind, CallShapeCoverage};
@@ -215,15 +216,10 @@ pub struct CallBindingRow {
     /// reaches the formal, when an adapter establishes one (issue #2438's
     /// "conversion/coercion fact when established").
     ///
-    /// No adapter publishes one today, so this is `None` on every row Bifrost
-    /// mints. The column exists so a language that gains the fact adds a value,
-    /// not a column, and its published domain is deliberately open: the
-    /// vocabulary is each language's own -- Java widening and boxing, Rust
-    /// deref and unsizing coercions, TypeScript structural assignability -- and
-    /// enumerating it across languages before any adapter records one would be
-    /// a table nobody produces. A row never carries a conversion derivable from
-    /// [`CallBindingRow::binding_kind`]; "packed into the variadic formal" is
-    /// already what a `variadic` row says.
+    /// Projected only through an exact join to [`CallBindingReport::conversion_facts`].
+    /// Java and TypeScript publish bounded structured proofs; missing types,
+    /// signature applicability or adapter capability leave this value absent.
+    /// Conversion completeness is independent of actual/formal mapping.
     pub conversion: Option<String>,
     /// The actual's own span, or the whole call's span for a terminal row.
     pub range: Range,
@@ -249,6 +245,10 @@ pub struct CallBindingReport {
     pub bound_count: usize,
     /// At least one row, always.
     pub rows: Vec<CallBindingRow>,
+    /// Resolver-proven conversions or typed unknown for each binding row.
+    /// The syntax-only binder initializes unknown; [`super::call_conversion::CallConversionCache`]
+    /// supplies query-local type evidence without changing target selection.
+    pub conversion_facts: Vec<CallArgumentConversion>,
 }
 
 /// What the caller established about the callee before asking for the rows.
@@ -353,16 +353,30 @@ pub fn call_binding_report(
                 coverage: CallBindingCoverage,
                 actual_count: usize,
                 bound_count: usize,
-                rows: Vec<CallBindingRow>| CallBindingReport {
-        file: file.clone(),
-        site_id: site_id.clone(),
-        site_ast_id: outcome.site_ast_id.clone(),
-        range: outcome.range,
-        target,
-        coverage,
-        actual_count,
-        bound_count,
-        rows,
+                rows: Vec<CallBindingRow>| {
+        let conversion_facts = rows
+            .iter()
+            .map(|row| {
+                CallArgumentConversion::unknown(
+                    row,
+                    target.as_ref(),
+                    None,
+                    ConversionUnknown::UnresolvedSignature,
+                )
+            })
+            .collect();
+        CallBindingReport {
+            file: file.clone(),
+            site_id: site_id.clone(),
+            site_ast_id: outcome.site_ast_id.clone(),
+            range: outcome.range,
+            target,
+            coverage,
+            actual_count,
+            bound_count,
+            rows,
+            conversion_facts,
+        }
     };
 
     // An unreadable shape enumerated no argument, so there is nothing to bind

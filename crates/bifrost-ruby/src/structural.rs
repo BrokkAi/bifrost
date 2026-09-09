@@ -1304,4 +1304,87 @@ mod tests {
             vec![EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals]
         );
     }
+
+    /// `field_name_in_parent` answers exactly what indexing the child list
+    /// answers, for every (parent, child) pair in a parsed tree.
+    ///
+    /// The indexed form is the oracle: it is what the helper did before it was
+    /// rewritten to walk with a cursor. That rewrite exists purely to drop the
+    /// quadratic `Node::child(i)` re-descent (it was 98% of the property
+    /// fuzzer's CPU on a wide-node file), so it must not move a single answer.
+    /// Ruby carries the check because Ruby is where the pathology surfaced,
+    /// but the helper is shared by every language adapter.
+    #[test]
+    fn field_name_in_parent_matches_the_indexed_reference() {
+        fn indexed_reference(
+            parent: tree_sitter::Node<'_>,
+            child: tree_sitter::Node<'_>,
+        ) -> Option<&'static str> {
+            (0..parent.child_count()).find_map(|index| {
+                (parent.child(index) == Some(child))
+                    .then(|| parent.field_name_for_child(index as u32))
+                    .flatten()
+            })
+        }
+
+        let source = r#"
+module Codec
+  class Data < Base
+    include Enumerable
+    CONST = [1, 2, 3].map { |value| value * 2 }
+
+    def initialize(capacity: 16, **options)
+      @impl = options.fetch(:impl) { Impl.new(capacity) }
+      super()
+    end
+
+    def each(&block)
+      rewind
+      while (node = self.next)
+        yield node
+      end
+    rescue StopIteration => error
+      raise error unless block
+    end
+
+    def to_h
+      { name: @name, size: @size, nested: { a: 1, b: 2 } }
+    end
+  end
+end
+"#;
+        let tree = parse(source);
+        let mut stack = vec![tree.root_node()];
+        let mut pairs = 0_usize;
+        let mut with_field = 0_usize;
+        while let Some(parent) = stack.pop() {
+            let mut cursor = parent.walk();
+            let children: Vec<_> = parent.children(&mut cursor).collect();
+            for child in children {
+                let actual = field_name_in_parent(parent, child);
+                assert_eq!(
+                    actual,
+                    indexed_reference(parent, child),
+                    "field name disagreed for {:?} inside {:?}",
+                    child.kind(),
+                    parent.kind()
+                );
+                pairs += 1;
+                if actual.is_some() {
+                    with_field += 1;
+                }
+                stack.push(child);
+            }
+        }
+        // Guard the guard: a tree that produced no field-carrying pairs would
+        // let a broken implementation pass by answering `None` everywhere.
+        assert!(
+            pairs > 100,
+            "expected a substantial tree, walked {pairs} pairs"
+        );
+        assert!(
+            with_field > 20,
+            "expected many named fields, found {with_field}"
+        );
+    }
 }

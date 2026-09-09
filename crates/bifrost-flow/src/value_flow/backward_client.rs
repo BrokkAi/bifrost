@@ -254,7 +254,11 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
     ) -> Vec<BackwardValueFlowFact> {
         let mut meetings = Vec::new();
         let phase = phase.into_observation();
-        for source in self.plan.sources_at(point, phase) {
+        for source in self
+            .plan
+            .sources_at(point, phase)
+            .filter(|source| source.activation_triggers.is_none())
+        {
             if source.carrier != demand.carrier {
                 continue;
             }
@@ -310,11 +314,9 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                     super::ValueFlowObservationPhase::BeforeEffects,
                     super::ValueFlowObservationPhase::AfterEffects,
                 ] {
-                    for source in self
-                        .plan
-                        .sources_at(edge.target(), phase)
-                        .filter(|source| source.carrier == rule.source)
-                    {
+                    for source in self.plan.sources_at(edge.target(), phase).filter(|source| {
+                        source.carrier == rule.source && source.activation_triggers.is_none()
+                    }) {
                         let uncertainty = demand
                             .uncertainty
                             .with_quality(&rule.proof, &rule.completeness)
@@ -546,6 +548,12 @@ fn inverse_local_demands(demand: Demand, rules: &[LocalRuleView], out: &mut Vec<
     for rule in rules {
         let mut next = Vec::with_capacity(current.len().saturating_add(1));
         for candidate in current.drain(..) {
+            if super::client::invalidates_source(rule)
+                && candidate.carrier == rule.source
+                && candidate.carrier != rule.target
+            {
+                continue;
+            }
             if candidate.carrier != rule.target {
                 next.push(candidate);
                 continue;
@@ -701,7 +709,9 @@ impl BackwardSnapshotProblem for BackwardValueFlowProblem<'_> {
 
 fn is_weak_update(rule: &LocalRuleView) -> bool {
     match rule.kind {
-        ValueFlowRelationKind::Assignment => rule.source == rule.target,
+        ValueFlowRelationKind::Assignment
+        | ValueFlowRelationKind::Parameter
+        | ValueFlowRelationKind::Receiver => rule.source == rule.target,
         ValueFlowRelationKind::MemoryStore => !rule.strong_update,
         _ => true,
     }
@@ -740,12 +750,26 @@ mod tests {
         strong_update: bool,
     ) -> LocalRuleView {
         LocalRuleView {
+            event_index: 0,
             source: ValueFlowCarrierId::try_from_index(source).expect("source id"),
             target: ValueFlowCarrierId::try_from_index(target).expect("target id"),
             kind,
             transfer: None,
             complete: true,
+            policy_local: false,
             strong_update,
+        }
+    }
+
+    fn invalidating_move_rule(source: usize, target: usize) -> LocalRuleView {
+        LocalRuleView {
+            transfer: Some(crate::analyzer::semantic::ValueTransfer {
+                kind: crate::analyzer::semantic::TransferKind::Move {
+                    invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+                },
+                operation: crate::analyzer::semantic::TransferOperation::None,
+            }),
+            ..rule(source, target, ValueFlowRelationKind::Assignment, false)
         }
     }
 
@@ -781,6 +805,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1]
         );
+    }
+
+    #[test]
+    fn backward_move_maps_target_to_source_but_kills_later_source_demand() {
+        let rules = [invalidating_move_rule(0, 1)];
+        let mut target_preimages = Vec::new();
+        inverse_local_demands(demand(1), &rules, &mut target_preimages);
+        assert_eq!(
+            target_preimages
+                .iter()
+                .map(|demand| demand.carrier.get())
+                .collect::<Vec<_>>(),
+            [0]
+        );
+
+        let mut source_preimages = Vec::new();
+        inverse_local_demands(demand(0), &rules, &mut source_preimages);
+        assert!(source_preimages.is_empty());
     }
 }
 

@@ -33,7 +33,10 @@ use crate::analyzer::common::{
 use crate::analyzer::fq_name::absent_segment_separators;
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, install_on_dedicated_build_pool};
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
-use crate::analyzer::read_ledger::{IndexFamily, ReadKey};
+use crate::analyzer::read_ledger::{
+    IndexFamily, LookupKind, LookupQuestion, ReadKey, declaration_facts_digest,
+    signature_metadata_digest,
+};
 use crate::analyzer::store::liveness::{
     FileStatStamp, LivePathEntry, LivePathMap, LiveSnapshot, Liveness,
 };
@@ -68,6 +71,7 @@ use crate::text_utils::compute_line_starts;
 use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -374,6 +378,9 @@ pub(crate) enum BulkFileStateSource {
 pub(crate) struct AnalyzerStoreContext {
     pub(crate) store: Arc<AnalyzerStore>,
     pub(crate) workspace_id: crate::analyzer::store::WorkspaceId,
+    /// Every clone and lazy delegate retains the session's projection until
+    /// its last reader goes away. Blob facts outlive this lease.
+    pub(crate) _projection_lease: Option<Arc<crate::analyzer::WorkspaceProjectionLease>>,
     pub(crate) gc: Arc<crate::analyzer::store::gc::AnalyzerGcCoordinator>,
     pub(crate) liveness: Option<Arc<Liveness>>,
     /// The immutable listing and live identities captured for one workspace
@@ -665,16 +672,7 @@ fn persistent_store_context_with_automatic_gc(
     automatic_gc: bool,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => {
-            let db_path = crate::analyzer::store::analyzer_db_path(root);
-            AnalyzerStore::open_persistent(&db_path).map_err(|error| {
-                error.context(format!(
-                    "opening the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
-                    db_path.display(),
-                    db_path.display(),
-                ))
-            })?
-        }
+        Some(root) => open_persistent_store(root)?,
         None => {
             return Err(StoreError::new(rootless_persistence_message(
                 project.root(),
@@ -682,6 +680,32 @@ fn persistent_store_context_with_automatic_gc(
         }
     };
     Ok(store_context_from_store(project, store, automatic_gc))
+}
+
+fn open_persistent_store(root: &std::path::Path) -> std::result::Result<AnalyzerStore, StoreError> {
+    let db_path = crate::analyzer::store::analyzer_db_path(root);
+    AnalyzerStore::open_persistent(&db_path).map_err(|error| {
+        error.context(format!(
+            "opening the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
+            db_path.display(),
+            db_path.display(),
+        ))
+    })
+}
+
+pub(crate) fn scoped_store_context(
+    project: &dyn Project,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let store = open_persistent_store(project.root())?;
+    // The root selects reusable content, not the identity of this partial
+    // listing. Do not use the subset to schedule repository-wide collection.
+    let mut context = store_context_from_store(project, store, false);
+    context.workspace_id = crate::analyzer::store::WorkspaceId::for_session();
+    context._projection_lease = Some(Arc::new(crate::analyzer::WorkspaceProjectionLease::new(
+        Arc::clone(&context.store),
+        context.workspace_id.clone(),
+    )));
+    Ok(context)
 }
 
 /// Report a persisted build over a project with no persistence identity, with
@@ -704,11 +728,12 @@ fn rootless_persistence_message(root: &std::path::Path) -> String {
          2. For a whole immutable revision, use the shared revision cache: \
          RevisionExport::build_workspace, or build_revision_analyzer. A fact keyed by blob id \
          describes those bytes for every consumer, so the revision's blobs stay warm.\n\
-         3. If the view really is session-only or partial (a changed-file-scoped set, a checkout \
-         you must leave byte-identical, cold-build measurement), say so with \
-         WorkspaceAnalyzer::build_ephemeral_footgun. A partial file set must not become a \
-         workspace's cached picture of itself.\n\
-         4. For a multi-root host whose root set resolves to no machine cache directory, set \
+         3. For a scoped file set over a rooted workspace, use \
+         WorkspaceAnalyzer::build_scoped_persisted. It shares blob facts through an isolated \
+         session projection without replacing the workspace's cached picture of itself.\n\
+         4. For session-only parse-error evidence, a checkout you must leave byte-identical, \
+         or deliberate cold-build measurement, use WorkspaceAnalyzer::build_ephemeral_footgun.\n\
+         5. For a multi-root host whose root set resolves to no machine cache directory, set \
          BIFROST_CACHE_ROOT=<writable local root>; Bifrost derives one root-set-specific child \
          under it.",
         root.display(),
@@ -755,6 +780,7 @@ fn store_context_from_shared_store(
     AnalyzerStoreContext {
         store,
         workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+        _projection_lease: None,
         gc: Arc::new(gc),
         liveness,
         workspace_snapshot: None,
@@ -2468,13 +2494,31 @@ type PreparedSyntaxRequestCache =
 type SourceSnapshotFileStateIndex = HashMap<FileStateCacheKey, Arc<FileState>>;
 type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
-#[derive(Debug)]
+#[derive(Default)]
+struct QueryRequestMemos(HashMap<TypeId, Arc<dyn Any + Send + Sync>>);
+
+impl QueryRequestMemos {
+    fn get_or_init<T>(&mut self) -> Arc<T>
+    where
+        T: Default + Send + Sync + 'static,
+    {
+        let memo = self
+            .0
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(T::default()));
+        Arc::clone(memo)
+            .downcast::<T>()
+            .unwrap_or_else(|_| panic!("request memo registry key and value type disagree"))
+    }
+}
+
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     /// Each request memo is independently synchronized. The outer cache lock
-    /// only protects this handle set and the active-context list; callers clone
-    /// one handle under that lock and then operate on the selected cache after
-    /// dropping it, so an insertion in one memo cannot block readers of another.
+    /// protects this handle set, typed memo registry, and active-context list;
+    /// callers clone one handle under that lock and then operate on the selected
+    /// cache after dropping it, so an insertion in one memo cannot block readers
+    /// of another.
     analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
     live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
     current_sources: Arc<RwLock<HashMap<ProjectFile, Option<String>>>>,
@@ -2547,6 +2591,11 @@ struct QueryReadCache {
     /// during this request answers from (#2883). See
     /// [`crate::analyzer::DefinitionLookupMemo`].
     definition_lookup: Arc<crate::analyzer::DefinitionLookupMemo>,
+    /// Request-local language memos keyed by their concrete type. Each memo is
+    /// created at most once while this cache is active, and the registry is
+    /// replaced at every outer-scope transition so detached handles cannot
+    /// publish into a later request.
+    request_memos: QueryRequestMemos,
 }
 
 /// One request's materialization of the workspace's path-synthetic module
@@ -2593,8 +2642,9 @@ struct DefinitionSortCandidate {
 /// The recorder a read funnel pushes its [`ReadKey`]s into.
 ///
 /// It holds the request boundaries that were open when the funnel was crossed,
-/// so one push reaches every ledger around it. Constructing one is the only
-/// work a ledger-free run would have to do, which is why
+/// so one push reaches every unrelated ledger while an explicit nested capture
+/// replaces only its own enclosing ledger. Constructing one is the only work a
+/// ledger-free run would have to do, which is why
 /// [`TreeSitterAnalyzer::record_reads`] refuses to build it at all in that
 /// case.
 pub(crate) struct ReadKeySink<'a> {
@@ -2603,11 +2653,7 @@ pub(crate) struct ReadKeySink<'a> {
 
 impl ReadKeySink<'_> {
     pub(crate) fn push(&mut self, key: crate::analyzer::read_ledger::ReadKey) {
-        for context in self.contexts {
-            if let Some(ledger) = context.read_ledger() {
-                ledger.record(key.clone());
-            }
-        }
+        crate::analyzer::i_analyzer::record_read_on_active_ledgers(self.contexts, key);
     }
 }
 
@@ -2630,6 +2676,7 @@ impl QueryReadCache {
             workspace_module_walk: Arc::new(RwLock::new(None)),
             class_ranges: Arc::new(RwLock::new(HashMap::default())),
             definition_lookup: Arc::default(),
+            request_memos: QueryRequestMemos::default(),
         }
     }
 
@@ -2696,6 +2743,7 @@ impl QueryReadCache {
         self.workspace_module_walk = Arc::new(RwLock::new(None));
         self.class_ranges = Arc::new(RwLock::new(HashMap::default()));
         self.definition_lookup = Arc::default();
+        self.request_memos = QueryRequestMemos::default();
     }
 
     fn is_active(&self) -> bool {
@@ -4025,18 +4073,32 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return None;
         }
-        if code_unit.is_module() {
-            return None;
-        }
-
-        self.fetch_file_state(code_unit.source()).and_then(|state| {
-            state.children.iter().find_map(|(parent, children)| {
-                children
-                    .iter()
-                    .any(|child| child == code_unit)
-                    .then(|| parent.clone())
+        let resolve = || {
+            if code_unit.is_module() {
+                return None;
+            }
+            self.fetch_file_state(code_unit.source()).and_then(|state| {
+                state.children.iter().find_map(|(parent, children)| {
+                    children
+                        .iter()
+                        .any(|child| child == code_unit)
+                        .then(|| parent.clone())
+                })
             })
-        })
+        };
+        let parent = if self.read_ledger_attached() {
+            crate::analyzer::i_analyzer::capture_nested_reads(self, resolve).0
+        } else {
+            resolve()
+        };
+        if self.read_ledger_attached() {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::DeclarationFacts,
+                LookupQuestion::declaration(code_unit),
+                declaration_facts_digest(code_unit, parent.as_ref()),
+            ));
+        }
+        parent
     }
 
     pub fn top_level_file_scope_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -6982,8 +7044,8 @@ where
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
     }
 
-    /// Record the inputs `build` names on every read ledger open around this
-    /// analyzer, and nothing at all when none is.
+    /// Record the inputs `build` names on every unshadowed read ledger open
+    /// around this analyzer, and nothing at all when none is.
     ///
     /// The active contexts are cloned out from under the coarse
     /// `query_read_cache` read lock before they are touched, exactly as
@@ -7006,17 +7068,15 @@ where
         self.record_reads(move |sink| sink.push(key));
     }
 
-    /// Record one crossing this analyzer could not name, on every ledger open
-    /// around it. Broadcast exactly as [`Self::record_reads`] is, and just as
-    /// free when no ledger is attached.
+    /// Record one crossing this analyzer could not name on every unshadowed
+    /// ledger open around it. This follows [`Self::record_reads`] and is just
+    /// as free when no ledger is attached.
     pub(crate) fn record_unattributed_read(&self) {
         if !self.read_ledger_attached() {
             return;
         }
         let contexts = self.query_read_cache_lock().contexts.clone();
-        for context in contexts {
-            context.record_unattributed_read();
-        }
+        crate::analyzer::i_analyzer::record_unattributed_on_active_ledgers(&contexts);
     }
 
     /// The [`ReadKey::File`] naming `file`'s blob as this adapter reads it.
@@ -7803,6 +7863,20 @@ where
         } else {
             LivePathEntry::filesystem_hashed(file.clone(), oid)
         }
+    }
+
+    /// A conservative, store-free proof used to prune empty definition delegates.
+    /// Live paths are per-language and include structurally claimed files. Keep
+    /// incomplete inventories and request overlays on the normal query path:
+    /// their absence cannot be established from the indexed snapshot alone.
+    pub(crate) fn definition_sources_may_exist(&self) -> bool {
+        !self.state.workspace_package_inventory_complete
+            || self.indexed_live_snapshot.all_paths().next().is_some()
+            || self.live_snapshot().all_paths().next().is_some()
+            || self
+                .project
+                .overlay_content()
+                .is_some_and(|content| !content.entries().is_empty())
     }
 
     fn live_snapshot(&self) -> Arc<LiveSnapshot> {
@@ -9453,7 +9527,7 @@ where
         Some(units)
     }
 
-    pub(crate) fn hierarchy_declaration_facts_by_kind(
+    fn hierarchy_declaration_facts_by_kind_unrecorded(
         &self,
         kind: CodeUnitType,
     ) -> Option<Vec<HierarchyDeclarationFacts>> {
@@ -9461,7 +9535,7 @@ where
             return Some(Vec::new());
         }
         let rows = self.store_query_or_record(
-            |sink| sink.push(self.scope_read_key()),
+            |_| {},
             self.store_context
                 .store
                 .declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
@@ -9547,7 +9621,7 @@ where
         Some(facts)
     }
 
-    pub(crate) fn hydrate_hierarchy_declaration_facts(
+    fn hydrate_hierarchy_declaration_facts_unrecorded(
         &self,
         facts: &mut [HierarchyDeclarationFacts],
     ) -> Option<()> {
@@ -9559,7 +9633,7 @@ where
             .filter_map(|facts| facts.storage_key.clone())
             .collect::<Vec<_>>();
         let persisted = self.store_query_or_record(
-            |sink| sink.push(self.scope_read_key()),
+            |_| {},
             self.store_context
                 .store
                 .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref()),
@@ -9576,6 +9650,53 @@ where
             facts.raw_supertypes = Arc::clone(&stored.raw_supertypes);
         }
         Some(())
+    }
+
+    /// Query hierarchy declaration candidates and retain the ordinary
+    /// whole-language dependency used by callers whose result is not itself a
+    /// replayable descendant lookup.
+    pub(crate) fn hierarchy_declaration_facts_by_kind(
+        &self,
+        kind: CodeUnitType,
+    ) -> Option<Vec<HierarchyDeclarationFacts>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return self.hierarchy_declaration_facts_by_kind_unrecorded(kind);
+        }
+        self.record_read_key(self.scope_read_key());
+        self.hierarchy_declaration_facts_by_kind_unrecorded(kind)
+    }
+
+    /// Query hierarchy declaration candidates for Java's replayable direct
+    /// descendant lookup. Only Java uses this narrower variant.
+    pub(crate) fn hierarchy_declaration_facts_by_kind_for_descendant_lookup(
+        &self,
+        kind: CodeUnitType,
+    ) -> Option<Vec<HierarchyDeclarationFacts>> {
+        self.hierarchy_declaration_facts_by_kind_unrecorded(kind)
+    }
+
+    /// Hydrate hierarchy facts and retain the ordinary whole-language
+    /// dependency used by callers whose result is not itself a replayable
+    /// descendant lookup.
+    pub(crate) fn hydrate_hierarchy_declaration_facts(
+        &self,
+        facts: &mut [HierarchyDeclarationFacts],
+    ) -> Option<()> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return self.hydrate_hierarchy_declaration_facts_unrecorded(facts);
+        }
+        self.record_read_key(self.scope_read_key());
+        self.hydrate_hierarchy_declaration_facts_unrecorded(facts)
+    }
+
+    /// Hydrate hierarchy facts for Java's replayable direct descendant lookup.
+    /// The precise `Descendants` key is published by the Java provider only
+    /// after its complete answer is available.
+    pub(crate) fn hydrate_hierarchy_declaration_facts_for_descendant_lookup(
+        &self,
+        facts: &mut [HierarchyDeclarationFacts],
+    ) -> Option<()> {
+        self.hydrate_hierarchy_declaration_facts_unrecorded(facts)
     }
 
     /// The spellings one fq name is looked up under in the `(lang, short_name)`
@@ -10136,6 +10257,26 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return BTreeSet::new();
         }
+        let read = || self.lookup_declarations_by_identifier_unrecorded(identifier);
+        let matches = if self.read_ledger_attached() {
+            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+        } else {
+            read()
+        };
+        if self.read_ledger_attached() {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::IdentifierCandidates,
+                LookupQuestion::Name {
+                    language: Some(self.adapter.language()),
+                    name: identifier.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&matches),
+            ));
+        }
+        matches
+    }
+
+    fn lookup_declarations_by_identifier_unrecorded(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         let langs = self.storage_language_keys_for_queries();
         let names = |unit: &CodeUnit| identifier_addresses_target(unit, identifier);
         let mut rows = self
@@ -11958,6 +12099,16 @@ where
         self.query_read_cache_lock().active_cancellation()
     }
 
+    pub(crate) fn active_query_request_memo<T>(&self) -> Option<Arc<T>>
+    where
+        T: Default + Send + Sync + 'static,
+    {
+        let mut cache = self.query_read_cache_write();
+        cache
+            .is_active()
+            .then(|| cache.request_memos.get_or_init::<T>())
+    }
+
     pub(crate) fn active_query_semantic_model_overlay(
         &self,
     ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
@@ -12238,6 +12389,34 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return LimitedQueryRows::complete(Vec::new(), 0);
         }
+        if !self.read_ledger_attached() {
+            return self.signature_metadata_limited_unrecorded(code_unit, limit);
+        }
+        let (metadata, reads) = crate::analyzer::i_analyzer::capture_nested_reads(self, || {
+            self.signature_metadata_limited_unrecorded(code_unit, limit)
+        });
+        if metadata.complete {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::SignatureMetadata,
+                LookupQuestion::declaration(code_unit),
+                signature_metadata_digest(code_unit, &metadata.rows),
+            ));
+        } else {
+            // A truncated projection is not the complete signature answer.
+            // Retain the concrete reads until the caller retries or refuses
+            // the incomplete result under its own budget.
+            for read in reads {
+                self.record_read_key(read);
+            }
+        }
+        metadata
+    }
+
+    fn signature_metadata_limited_unrecorded(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -13234,13 +13413,28 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return Box::new(std::iter::empty());
         }
-        let definitions = match self.sql_definitions_vec(fq_name) {
+        let read = || match self.sql_definitions_vec(fq_name) {
             Ok(definitions) => definitions,
             Err(error) => {
                 self.record_store_error(error);
                 Vec::new()
             }
         };
+        let definitions = if self.read_ledger_attached() {
+            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+        } else {
+            read()
+        };
+        if self.read_ledger_attached() {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::Definitions,
+                LookupQuestion::Name {
+                    language: Some(self.adapter.language()),
+                    name: fq_name.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&definitions),
+            ));
+        }
         Box::new(definitions.into_iter())
     }
 
@@ -13415,8 +13609,26 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return BTreeSet::new();
         }
-        self.sql_lookup_candidates_by_short_name(symbol)
-            .unwrap_or_default()
+        let read = || {
+            self.sql_lookup_candidates_by_short_name(symbol)
+                .unwrap_or_default()
+        };
+        let matches = if self.read_ledger_attached() {
+            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+        } else {
+            read()
+        };
+        if self.read_ledger_attached() {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::ShortNameCandidates,
+                LookupQuestion::Name {
+                    language: Some(self.adapter.language()),
+                    name: symbol.into(),
+                },
+                crate::analyzer::read_ledger::declaration_set_digest(&matches),
+            ));
+        }
+        matches
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -13438,7 +13650,20 @@ where
         if !self.workspace_declaration_identities_authoritative() {
             return Vec::new();
         }
-        self.signature_metadata_vec_of(code_unit)
+        let read = || self.signature_metadata_vec_of(code_unit);
+        let metadata = if self.read_ledger_attached() {
+            crate::analyzer::i_analyzer::capture_nested_reads(self, read).0
+        } else {
+            read()
+        };
+        if self.read_ledger_attached() {
+            self.record_read_key(ReadKey::lookup(
+                LookupKind::SignatureMetadata,
+                LookupQuestion::declaration(code_unit),
+                signature_metadata_digest(code_unit, &metadata),
+            ));
+        }
+        metadata
     }
 }
 
@@ -13591,6 +13816,14 @@ where
 
     fn read_ledger_attached(&self) -> bool {
         TreeSitterAnalyzer::read_ledger_attached(self)
+    }
+
+    fn current_thread_read_ledger(&self) -> Option<Arc<crate::analyzer::read_ledger::ReadLedger>> {
+        self.query_read_cache_lock()
+            .contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.current_thread_read_ledger().cloned())
     }
 
     fn active_query_cancellation(&self) -> Option<CancellationToken> {
@@ -14269,6 +14502,31 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
 {
     fn fact_index_language(&self) -> Language {
         self.adapter.language()
+    }
+
+    fn declaration_facts_digest(&self, declaration: &CodeUnit) -> StableDigest {
+        let parent = self.structural_parent_of(declaration);
+        declaration_facts_digest(declaration, parent.as_ref())
+    }
+
+    fn signature_metadata_digest(&self, declaration: &CodeUnit) -> StableDigest {
+        signature_metadata_digest(declaration, &self.signature_metadata(declaration))
+    }
+
+    fn definition_answer_digest(&self, name: &str) -> StableDigest {
+        crate::analyzer::read_ledger::declaration_set_digest(&self.get_definitions(name))
+    }
+
+    fn identifier_candidate_answer_digest(&self, name: &str) -> StableDigest {
+        crate::analyzer::read_ledger::declaration_set_digest(
+            &self.lookup_candidates_by_identifier(name),
+        )
+    }
+
+    fn short_name_candidate_answer_digest(&self, name: &str) -> StableDigest {
+        crate::analyzer::read_ledger::declaration_set_digest(
+            &self.lookup_candidates_by_short_name(name),
+        )
     }
 
     fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
@@ -15826,6 +16084,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store,
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16331,6 +16590,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16451,6 +16711,7 @@ mod tests {
         let reopened_context = AnalyzerStoreContext {
             store: Arc::clone(&reopened_store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16542,6 +16803,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -17294,6 +17556,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store: Arc::new(AnalyzerStore::open_ephemeral().unwrap()),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -17386,6 +17649,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -18744,6 +19008,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store,
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -19156,6 +19421,7 @@ mod tests {
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
+            _projection_lease: None,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,

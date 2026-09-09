@@ -84,18 +84,18 @@ use brokk_bifrost_flow::dataflow::{
 };
 use brokk_bifrost_flow::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
-    TaintBatchPlanner, TaintClassSet, TaintFindingCollectionLimits, TaintFindingReport,
-    TaintOriginFindingEvidence, TaintPolicyPlan, TaintPropagationSemanticsId,
-    TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintStoreChannel,
-    TaintStoreDimension, TaintStoreReadBinding, TaintStoreWriteBinding, TaintUniverse,
-    collect_taint_findings_with_limits,
+    TaintBatchPlanner, TaintClassSet, TaintEdgeFunction, TaintFindingCollectionLimits,
+    TaintFindingReport, TaintLocalTransformBinding, TaintOriginFindingEvidence, TaintPolicyPlan,
+    TaintPropagationSemanticsId, TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding,
+    TaintStoreChannel, TaintStoreDimension, TaintStoreReadBinding, TaintStoreWriteBinding,
+    TaintUniverse, collect_taint_findings_with_limits,
 };
 use brokk_bifrost_flow::value_flow::{
     ClosureLimits, ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCuratedCallModel,
     ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause, ValueFlowInput,
-    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowProvider, ValueFlowSinkId,
-    ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec, ValueFlowSummaryLocationBinding,
-    discover_closure_with,
+    ValueFlowLocalRuleSpec, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowProvider,
+    ValueFlowSinkId, ValueFlowSinkSpec, ValueFlowSourceId, ValueFlowSourceSpec,
+    ValueFlowSummaryLocationBinding, discover_closure_with,
 };
 use brokk_bifrost_flow::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
@@ -202,7 +202,6 @@ pub(crate) struct TaintPolicyCompileFailure {
 pub(crate) struct CompiledTaintEndpoint {
     pub(crate) endpoint: ResolvedEndpointIdentity,
     pub(crate) event: ValueFlowEventKey,
-    pub(crate) labels: Box<[TaintLabel]>,
 }
 
 pub(crate) struct CompiledTaintPolicyPlan {
@@ -974,6 +973,17 @@ struct BoundSanitizer {
     output: BoundEndpoint,
 }
 
+/// One policy-local transform bound to an exact selected call. The carrier
+/// relation and its evidence live in value flow; the label sets are retained
+/// here until the taint function can be built against the region's universe.
+#[derive(Clone)]
+struct BoundTransform {
+    input: BoundEndpoint,
+    output: BoundEndpoint,
+    removes: Box<[TaintLabel]>,
+    adds: Box<[TaintLabel]>,
+}
+
 /// One persistence-store write or read end bound to a selected call site: the
 /// value carrier that crosses the boundary plus the resolved runtime channel
 /// identity linking the two ends. The `endpoint` labels stay empty; the
@@ -1049,7 +1059,7 @@ struct ResolvedTaintValue {
     completeness: EvidenceCompleteness,
 }
 
-struct ResolvedSanitizerValues {
+struct ResolvedTransferValues {
     input: ResolvedTaintValue,
     output: ResolvedTaintValue,
 }
@@ -1549,11 +1559,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         policy: &LoadedPolicy,
         spec: &ResolvedTaintPolicySpec,
     ) -> Result<Vec<CompiledTaintPolicyPlan>, TaintPolicyCompileError> {
-        if !spec.transforms.is_empty() {
-            return Err(TaintPolicyCompileError::UnsupportedAuxiliarySemantics(
-                "transform",
-            ));
-        }
         validate_external_model_entries(&spec.external_models)?;
 
         let selectors = policy
@@ -1613,7 +1618,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         for sanitizer in &spec.sanitizers {
             let selector = required_selector(&selectors, &sanitizer.selector_path)?;
             for selected in self.select(selector, &sanitizer.definition.output)? {
-                for resolved in self.resolve_selected_sanitizer_values(
+                for resolved in self.resolve_selected_transfer_values(
                     selected,
                     selector,
                     &sanitizer.definition.input,
@@ -1639,6 +1644,41 @@ impl<'a> TaintPolicyCompiler<'a> {
                             completeness: resolved.output.completeness,
                             labels,
                         },
+                    });
+                }
+            }
+        }
+        let mut all_transforms = Vec::new();
+        for transform in &spec.transforms {
+            let selector = required_selector(&selectors, &transform.selector_path)?;
+            for selected in self.select(selector, &transform.definition.output)? {
+                for resolved in self.resolve_selected_transfer_values(
+                    selected,
+                    selector,
+                    &transform.definition.input,
+                    &transform.definition.output,
+                )? {
+                    all_transforms.push(BoundTransform {
+                        input: BoundEndpoint {
+                            endpoint: transform.identity.clone(),
+                            point: resolved.input.point,
+                            phase: resolved.input.phase,
+                            carrier: resolved.input.carrier,
+                            proof: resolved.input.proof,
+                            completeness: resolved.input.completeness,
+                            labels: Box::default(),
+                        },
+                        output: BoundEndpoint {
+                            endpoint: transform.identity.clone(),
+                            point: resolved.output.point,
+                            phase: resolved.output.phase,
+                            carrier: resolved.output.carrier,
+                            proof: resolved.output.proof,
+                            completeness: resolved.output.completeness,
+                            labels: Box::default(),
+                        },
+                        removes: transform.definition.removes.clone().into_boxed_slice(),
+                        adds: transform.definition.adds.clone().into_boxed_slice(),
                     });
                 }
             }
@@ -1822,6 +1862,13 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .iter()
                     .flat_map(|sanitizer| sanitizer.definition.removes.iter()),
             )
+            .chain(spec.transforms.iter().flat_map(|transform| {
+                transform
+                    .definition
+                    .removes
+                    .iter()
+                    .chain(&transform.definition.adds)
+            }))
             // Every label an external model mentions joins the universe, so a
             // declared transfer's moved and removed sets resolve to dense
             // classes even when no source currently mints them.
@@ -1862,6 +1909,12 @@ impl<'a> TaintPolicyCompiler<'a> {
                 [
                     kill.input.point.procedure().clone(),
                     kill.output.point.procedure().clone(),
+                ]
+            }))
+            .chain(all_transforms.iter().flat_map(|transform| {
+                [
+                    transform.input.point.procedure().clone(),
+                    transform.output.point.procedure().clone(),
                 ]
             }))
             .chain(
@@ -1976,6 +2029,10 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|kill| kill.input.point.procedure().durable_key())
             .collect::<Vec<_>>();
+        let transform_procedures = all_transforms
+            .iter()
+            .map(|transform| transform.input.point.procedure().durable_key())
+            .collect::<Vec<_>>();
         let store_write_procedures = all_store_writes
             .iter()
             .map(|end| end.endpoint.point.procedure().durable_key())
@@ -2084,6 +2141,12 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
                 .map(|(kill, _)| kill.clone())
                 .collect::<Vec<_>>();
+            let mut transforms = all_transforms
+                .iter()
+                .zip(&transform_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(transform, _)| transform.clone())
+                .collect::<Vec<_>>();
             let mut store_writes = all_store_writes
                 .iter()
                 .zip(&store_write_procedures)
@@ -2105,6 +2168,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             sort_bound_endpoints(&mut sources);
             sort_bound_endpoints(&mut sinks);
             sort_bound_sanitizers(&mut kills);
+            sort_bound_transforms(&mut transforms);
             sort_bound_store_ends(&mut store_writes);
             sort_bound_store_ends(&mut store_reads);
             // Store ends ride the ordinary source/sink event machinery: a
@@ -2166,6 +2230,24 @@ impl<'a> TaintPolicyCompiler<'a> {
                     )
                     .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?
             };
+            let local_rules = transforms
+                .iter()
+                .map(|transform| {
+                    ValueFlowLocalRuleSpec::new(
+                        transform.output.point.clone(),
+                        transform.input.carrier.clone(),
+                        transform.output.carrier.clone(),
+                        conjoin_proof(&transform.input.proof, &transform.output.proof),
+                        conjoin_completeness(
+                            &transform.input.completeness,
+                            &transform.output.completeness,
+                        ),
+                    )
+                })
+                .collect();
+            let value_flow = value_flow
+                .with_local_rules(local_rules)
+                .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
             let taint_sources = bind_taint_sources(
                 &value_flow,
                 &universe,
@@ -2175,9 +2257,16 @@ impl<'a> TaintPolicyCompiler<'a> {
             let taint_sinks =
                 bind_taint_sinks(&value_flow, &universe, &sinks, &sink_specs[..sinks.len()])?;
             let taint_sanitizers = bind_taint_sanitizers(&value_flow, &universe, &kills)?;
+            let taint_local_transforms =
+                bind_taint_local_transforms(&value_flow, &universe, &transforms)?;
             let store_write_bindings = bind_store_writes(&value_flow, &store_writes, &write_specs)?;
             let store_read_bindings = bind_store_reads(&value_flow, &store_reads, &read_specs)?;
             let sanitizer_hash = sanitizer_compatibility_hash(&value_flow, &taint_sanitizers);
+            let auxiliary_hash = local_transform_compatibility_hash(
+                &value_flow,
+                sanitizer_hash,
+                &taint_local_transforms,
+            );
             let store_hash =
                 store_compatibility_hash(&value_flow, &store_write_bindings, &store_read_bindings);
             let analysis = TaintAnalysisPlan::new(
@@ -2188,6 +2277,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 taint_sanitizers,
                 Vec::new(),
             )
+            .and_then(|analysis| analysis.with_local_transforms(taint_local_transforms))
             .and_then(|analysis| analysis.with_stores(store_write_bindings, store_read_bindings))
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
             let internal_policy_id = format!(
@@ -2206,7 +2296,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     &root.artifact().key().fingerprint(),
                     root.semantics().locator(),
                     value_flow_compatibility_hash(analysis.value_flow()),
-                    sanitizer_hash,
+                    auxiliary_hash,
                     store_hash,
                 ),
                 spec.call_modeling.unmodeled,
@@ -2225,7 +2315,6 @@ impl<'a> TaintPolicyCompiler<'a> {
                     source_metadata.push(CompiledTaintEndpoint {
                         endpoint: source.identity.clone(),
                         event: key.clone(),
-                        labels: source.definition.labels.clone().into_boxed_slice(),
                     });
                 }
             }
@@ -2500,23 +2589,24 @@ impl<'a> TaintPolicyCompiler<'a> {
     /// before pairing; a missing side is a refusal rather than a one-sided
     /// sanitizer effect. Matched-value ports are point observations rather than
     /// call ports and cannot establish this input/output relationship.
-    fn resolve_selected_sanitizer_values(
+    fn resolve_selected_transfer_values(
         &mut self,
         selection: SelectedSite,
         selector: &ResolvedPolicySelector,
         input: &PolicyPort,
         output: &PolicyPort,
-    ) -> Result<Vec<ResolvedSanitizerValues>, TaintPolicyCompileError> {
+    ) -> Result<Vec<ResolvedTransferValues>, TaintPolicyCompileError> {
         if matches!(input, PolicyPort::MatchedValue) || matches!(output, PolicyPort::MatchedValue) {
             return Err(TaintPolicyCompileError::UnsupportedBinding(
-                "sanitizer input and output must be call ports".to_owned(),
+                "transform or sanitizer input and output must be call ports".to_owned(),
             ));
         }
         let inputs = self.resolve_selected_values(selection.clone(), selector, input)?;
         let outputs = self.resolve_selected_values(selection, selector, output)?;
         if inputs.is_empty() || inputs.len() != outputs.len() {
             return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
-                "sanitizer input and output do not resolve to the same call sites".to_owned(),
+                "transform or sanitizer input and output do not resolve to the same call sites"
+                    .to_owned(),
             ));
         }
         let mut resolved = Vec::with_capacity(inputs.len());
@@ -2525,10 +2615,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                 != output.call.as_ref().map(CallSiteHandle::durable_key)
             {
                 return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
-                    "sanitizer input and output resolved different call sites".to_owned(),
+                    "transform or sanitizer input and output resolved different call sites"
+                        .to_owned(),
                 ));
             }
-            resolved.push(ResolvedSanitizerValues { input, output });
+            resolved.push(ResolvedTransferValues { input, output });
         }
         Ok(resolved)
     }
@@ -4939,7 +5030,10 @@ struct ProjectedSourceGroup<'a> {
     source: &'a ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>,
     origins: Vec<&'a TaintOriginFindingEvidence>,
     findings: Vec<&'a brokk_bifrost_flow::taint::TaintFinding>,
+    /// Labels minted by the source and retained as origin evidence.
     labels: Vec<TaintLabel>,
+    /// Labels those source values carry at the sink after transforms.
+    reached_labels: Vec<TaintLabel>,
 }
 
 /// The place one projected taint finding reports: one declared sink endpoint at
@@ -5124,15 +5218,18 @@ fn project_policy_findings(
                         .ok_or_else(|| {
                             "compiled taint source is absent from the loaded policy".to_owned()
                         })?;
-                    let labels = stable_taint_labels(universe, origin)?
+                    let labels = stable_taint_labels(universe, origin.classes())?
+                        .into_iter()
+                        .filter(|label| source.definition.labels.contains(label))
+                        .collect::<Vec<_>>();
+                    let reached_labels = stable_taint_labels(universe, origin.reached_classes())?
                         .into_iter()
                         .filter(|label| {
-                            compiled_source.labels.contains(label)
-                                && source.definition.labels.contains(label)
+                            spec.authorizes_reached_label(&source.definition, label)
                                 && sink.definition.accepts.contains(label)
                         })
                         .collect::<Vec<_>>();
-                    if labels.is_empty() {
+                    if labels.is_empty() || reached_labels.is_empty() {
                         continue;
                     }
                     match groups
@@ -5151,12 +5248,16 @@ fn project_policy_findings(
                             group.labels.extend(labels);
                             group.labels.sort();
                             group.labels.dedup();
+                            group.reached_labels.extend(reached_labels);
+                            group.reached_labels.sort();
+                            group.reached_labels.dedup();
                         }
                         None => groups.push(ProjectedSourceGroup {
                             source,
                             origins: vec![origin],
                             findings: vec![finding],
                             labels,
+                            reached_labels,
                         }),
                     }
                     break;
@@ -5269,6 +5370,7 @@ fn project_policy_findings(
                     .map_err(|error| error.to_string())?,
                 anchor,
                 sink: sink_ref.clone(),
+                reached_labels: group.reached_labels.clone(),
                 origins,
                 origins_truncated,
                 witness_refs,
@@ -5276,9 +5378,9 @@ fn project_policy_findings(
                 report: projected_report,
             });
         }
-        let reached_labels = source_facts
+        let reached_labels = groups
             .iter()
-            .map(|fact| fact.source_label.clone())
+            .flat_map(|group| group.reached_labels.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -5327,10 +5429,10 @@ fn canonical_locator_identity(
 
 fn stable_taint_labels(
     universe: &TaintUniverse,
-    origin: &TaintOriginFindingEvidence,
+    classes: &TaintClassSet,
 ) -> Result<Vec<TaintLabel>, String> {
     universe
-        .stable_classes(origin.classes())
+        .stable_classes(classes)
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|class| TaintLabel::new(class.as_str()).map_err(|error| error.to_string()))
@@ -5382,7 +5484,7 @@ fn project_taint_origins(
     let mut origins = Vec::new();
     for origin in &group.origins {
         let scenario = source_scenario(workspace, origin)?;
-        let labels = stable_taint_labels(universe, origin)?;
+        let labels = stable_taint_labels(universe, origin.classes())?;
         for label in labels
             .into_iter()
             .filter(|label| group.labels.contains(label))
@@ -6078,6 +6180,20 @@ fn sort_bound_sanitizers(sanitizers: &mut [BoundSanitizer]) {
     });
 }
 
+fn sort_bound_transforms(transforms: &mut [BoundTransform]) {
+    transforms.sort_by(|left, right| {
+        left.output
+            .point
+            .procedure()
+            .semantics()
+            .locator()
+            .cmp(right.output.point.procedure().semantics().locator())
+            .then_with(|| left.output.point.id().cmp(&right.output.point.id()))
+            .then_with(|| left.input.endpoint.cmp(&right.input.endpoint))
+            .then_with(|| left.input.point.id().cmp(&right.input.point.id()))
+    });
+}
+
 /// Sort bound external models by call identity, then by declaring entry, so
 /// per-call grouping and every derived hash input is deterministic.
 fn sort_bound_external_models(models: &mut [BoundExternalModel]) {
@@ -6096,8 +6212,9 @@ fn sort_bound_external_models(models: &mut [BoundExternalModel]) {
 /// selector runs, so an unsupported declaration is a loud typed failure and
 /// never a silently inert stanza (#2691).
 ///
-/// Transform effects (label rewriting) are the propagator contract of #2689
-/// and stay refused wholesale alongside `:transforms`.
+/// External-model transform effects (the broader propagator contract of
+/// #2689) stay refused. Policy-local `:transforms` lower separately onto exact
+/// local carrier relations.
 fn validate_external_model_entries(
     models: &[ResolvedTaintAuxiliary<ResolvedTaintExternalModelDefinition>],
 ) -> Result<(), TaintPolicyCompileError> {
@@ -6752,6 +6869,42 @@ fn bind_taint_sanitizers(
         .collect())
 }
 
+fn bind_taint_local_transforms(
+    value_flow: &ValueFlowPlan,
+    universe: &TaintUniverse,
+    transforms: &[BoundTransform],
+) -> Result<Vec<TaintLocalTransformBinding>, TaintPolicyCompileError> {
+    transforms
+        .iter()
+        .map(|transform| {
+            let input = value_flow
+                .carrier_id(&transform.input.carrier)
+                .ok_or_else(|| {
+                    TaintPolicyCompileError::Plan(
+                        "transform input carrier is absent from the value-flow plan".to_owned(),
+                    )
+                })?;
+            let output = value_flow
+                .carrier_id(&transform.output.carrier)
+                .ok_or_else(|| {
+                    TaintPolicyCompileError::Plan(
+                        "transform output carrier is absent from the value-flow plan".to_owned(),
+                    )
+                })?;
+            let removed = class_set(universe, &transform.removes)?;
+            let added = class_set(universe, &transform.adds)?;
+            let function =
+                TaintEdgeFunction::kill(&removed).compose(&TaintEdgeFunction::generate(&added));
+            Ok(TaintLocalTransformBinding::new(
+                transform.output.point.clone(),
+                input,
+                output,
+                function,
+            ))
+        })
+        .collect()
+}
+
 /// Hash the kill semantics one region compiled, keyed on carrier *keys* rather
 /// than dense carrier IDs so two policies over the same region agree exactly
 /// when the batch planner's own sanitizer equality would.
@@ -6778,6 +6931,34 @@ fn sanitizer_compatibility_hash(
     hasher.finish()
 }
 
+/// Add policy-local label rewriting to the existing sanitizer compatibility
+/// component without rotating identities for policies that declare no local
+/// transform.
+fn local_transform_compatibility_hash(
+    value_flow: &ValueFlowPlan,
+    sanitizer_hash: u64,
+    transforms: &[TaintLocalTransformBinding],
+) -> u64 {
+    if transforms.is_empty() {
+        return sanitizer_hash;
+    }
+    let mut hasher = DefaultHasher::new();
+    hasher.write(b"bifrost-policy-local-transform-compatibility-v1");
+    hasher.write_u64(sanitizer_hash);
+    hasher.write_usize(transforms.len());
+    for binding in transforms {
+        std::hash::Hash::hash(binding.point(), &mut hasher);
+        if let Some(key) = value_flow.carrier_key(binding.input()) {
+            std::hash::Hash::hash(key, &mut hasher);
+        }
+        if let Some(key) = value_flow.carrier_key(binding.output()) {
+            std::hash::Hash::hash(key, &mut hasher);
+        }
+        std::hash::Hash::hash(binding.function(), &mut hasher);
+    }
+    hasher.finish()
+}
+
 fn endpoint_metadata<Spec>(
     endpoints: &[BoundEndpoint],
     specs: &[(ValueFlowEventKey, Spec)],
@@ -6793,7 +6974,6 @@ fn endpoint_metadata<Spec>(
         .map(|(endpoint, (key, _))| CompiledTaintEndpoint {
             endpoint: endpoint.endpoint.clone(),
             event: key.clone(),
-            labels: endpoint.labels.clone(),
         })
         .collect()
 }

@@ -245,6 +245,51 @@ impl TaintTransformBinding {
     }
 }
 
+/// Label transfer attached to one policy-local input-to-output flow rule.
+///
+/// Unlike [`TaintTransformBinding`], this is not a point-phase carrier
+/// function. It fires only when the solver traverses the exact local relation,
+/// which makes pass-through conditional on the input carrier being active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintLocalTransformBinding {
+    point: ProgramPointHandle,
+    input: ValueFlowCarrierId,
+    output: ValueFlowCarrierId,
+    function: TaintEdgeFunction,
+}
+
+impl TaintLocalTransformBinding {
+    pub const fn new(
+        point: ProgramPointHandle,
+        input: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        function: TaintEdgeFunction,
+    ) -> Self {
+        Self {
+            point,
+            input,
+            output,
+            function,
+        }
+    }
+
+    pub const fn point(&self) -> &ProgramPointHandle {
+        &self.point
+    }
+
+    pub const fn input(&self) -> ValueFlowCarrierId {
+        self.input
+    }
+
+    pub const fn output(&self) -> ValueFlowCarrierId {
+        self.output
+    }
+
+    pub const fn function(&self) -> &TaintEdgeFunction {
+        &self.function
+    }
+}
+
 /// The resolution of one optional store discrimination dimension (the key a
 /// value is stored under, or the store instance it is stored in).
 ///
@@ -399,6 +444,7 @@ pub struct TaintAnalysisPlan {
     sinks: Box<[TaintSinkBinding]>,
     sanitizers: Box<[TaintSanitizerBinding]>,
     transforms: Box<[TaintTransformBinding]>,
+    local_transforms: Box<[TaintLocalTransformBinding]>,
     store_writes: Box<[TaintStoreWriteBinding]>,
     store_reads: Box<[TaintStoreReadBinding]>,
     identity: TaintEdgeFunction,
@@ -600,6 +646,7 @@ impl TaintAnalysisPlan {
             sinks: sinks.into_boxed_slice(),
             sanitizers: sanitizers.into_boxed_slice(),
             transforms: transforms.into_boxed_slice(),
+            local_transforms: Box::default(),
             store_writes: Box::default(),
             store_reads: Box::default(),
             identity,
@@ -607,6 +654,47 @@ impl TaintAnalysisPlan {
             sanitizers_resolved,
             owner: Arc::new(()),
         })
+    }
+
+    /// Attach label functions to the exact policy-local relations already
+    /// installed in the value-flow plan.
+    pub fn with_local_transforms(
+        mut self,
+        mut transforms: Vec<TaintLocalTransformBinding>,
+    ) -> Result<Self, TaintPlanError> {
+        transforms.sort_by(compare_local_transforms);
+        if transforms.windows(2).any(|pair| {
+            pair[0].point == pair[1].point
+                && pair[0].input == pair[1].input
+                && pair[0].output == pair[1].output
+        }) {
+            return Err(TaintPlanError::DuplicateLocalTransform);
+        }
+        for transform in &transforms {
+            validate_carrier_binding(
+                &self.value_flow,
+                transform.point(),
+                transform.input,
+                transform.function.universe(),
+                self.universe.hash(),
+            )?;
+            validate_carrier_binding(
+                &self.value_flow,
+                transform.point(),
+                transform.output,
+                transform.function.universe(),
+                self.universe.hash(),
+            )?;
+            if !self.value_flow.has_policy_local_rule(
+                transform.point(),
+                transform.input,
+                transform.output,
+            ) {
+                return Err(TaintPlanError::InvalidLocalTransform);
+            }
+        }
+        self.local_transforms = transforms.into_boxed_slice();
+        Ok(self)
     }
 
     /// Attach persistence-boundary bindings to this plan.
@@ -679,7 +767,8 @@ impl TaintAnalysisPlan {
             sinks,
             self.sanitizers.to_vec(),
             self.transforms.to_vec(),
-        )?;
+        )?
+        .with_local_transforms(self.local_transforms.to_vec())?;
         rebuilt.with_stores(self.store_writes.to_vec(), self.store_reads.to_vec())
     }
 
@@ -719,7 +808,8 @@ impl TaintAnalysisPlan {
             self.sinks.to_vec(),
             self.sanitizers.to_vec(),
             self.transforms.to_vec(),
-        )?;
+        )?
+        .with_local_transforms(self.local_transforms.to_vec())?;
         rebuilt.with_stores(self.store_writes.to_vec(), self.store_reads.to_vec())
     }
 
@@ -768,6 +858,10 @@ impl TaintAnalysisPlan {
         &self.transforms
     }
 
+    pub(crate) const fn local_transforms(&self) -> &[TaintLocalTransformBinding] {
+        &self.local_transforms
+    }
+
     pub(crate) fn summary_key_rows(&self) -> usize {
         self.value_flow
             .carrier_summary_identity_total_rows()
@@ -775,6 +869,7 @@ impl TaintAnalysisPlan {
             .saturating_add(self.sinks.len())
             .saturating_add(self.sanitizers.len())
             .saturating_add(self.transforms.len())
+            .saturating_add(self.local_transforms.len())
             .saturating_add(self.store_writes.len())
             .saturating_add(self.store_reads.len())
     }
@@ -820,6 +915,7 @@ impl TaintAnalysisPlan {
             .saturating_add(size_of_val(&*self.sinks))
             .saturating_add(size_of_val(&*self.sanitizers))
             .saturating_add(size_of_val(&*self.transforms))
+            .saturating_add(size_of_val(&*self.local_transforms))
             .saturating_add(size_of_val(&*self.store_writes))
             .saturating_add(size_of_val(&*self.store_reads))
             .saturating_add(size_of_val(&*self.phase_transfers))
@@ -848,6 +944,12 @@ impl TaintAnalysisPlan {
             )
             .saturating_add(
                 self.transforms
+                    .iter()
+                    .map(|transform| transform.function.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.local_transforms
                     .iter()
                     .map(|transform| transform.function.retained_heap_bytes())
                     .fold(0usize, usize::saturating_add),
@@ -895,6 +997,20 @@ impl TaintAnalysisPlan {
             })
     }
 
+    pub(crate) fn local_transform_function(
+        &self,
+        point: &ProgramPointHandle,
+        input: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+    ) -> Option<&TaintEdgeFunction> {
+        self.local_transforms
+            .iter()
+            .find(|binding| {
+                binding.point() == point && binding.input() == input && binding.output() == output
+            })
+            .map(TaintLocalTransformBinding::function)
+    }
+
     /// Conservative directional transfer fan-out inputs for snapshot
     /// planning. Value-flow relations account for local, call, fallback, and
     /// endpoint transfer work; taint's phase-composed sanitizer and transform
@@ -905,7 +1021,8 @@ impl TaintAnalysisPlan {
             .phase_transfers
             .len()
             .saturating_add(self.sanitizers.len())
-            .saturating_add(self.transforms.len());
+            .saturating_add(self.transforms.len())
+            .saturating_add(self.local_transforms.len());
         (
             self.value_flow
                 .forward_transfer_fanout_estimate()
@@ -1005,6 +1122,21 @@ fn compare_transforms(
         .then_with(|| left.phase.cmp(&right.phase))
         .then_with(|| left.event_index.cmp(&right.event_index))
         .then_with(|| left.carrier.cmp(&right.carrier))
+        .then_with(|| left.function.cmp(&right.function))
+}
+
+fn compare_local_transforms(
+    left: &TaintLocalTransformBinding,
+    right: &TaintLocalTransformBinding,
+) -> std::cmp::Ordering {
+    left.point
+        .procedure()
+        .semantics()
+        .locator()
+        .cmp(right.point.procedure().semantics().locator())
+        .then_with(|| left.point.id().cmp(&right.point.id()))
+        .then_with(|| left.input.cmp(&right.input))
+        .then_with(|| left.output.cmp(&right.output))
         .then_with(|| left.function.cmp(&right.function))
 }
 
@@ -1254,6 +1386,7 @@ impl TaintBatchPlanner {
                     remap_sanitizers(&first.analysis, &value_flow)?,
                     remap_transforms(&first.analysis, &value_flow)?,
                 )?
+                .with_local_transforms(remap_local_transforms(&first.analysis, &value_flow)?)?
                 .with_stores(
                     remap_store_writes(&first.analysis, &value_flow)?,
                     remap_store_reads(&first.analysis, &value_flow)?,
@@ -1278,6 +1411,7 @@ fn ensure_same_semantics(
             .has_same_propagation_semantics(&right.value_flow)
         || !same_sanitizers(left, right)
         || !same_transforms(left, right)
+        || !same_local_transforms(left, right)
         || !same_stores(left, right)
     {
         return Err(TaintPlanError::IncompatibleBatchMember);
@@ -1396,6 +1530,24 @@ fn remap_transforms(
                 binding.phase,
                 binding.event_index,
                 remapped_carrier(&analysis.value_flow, value_flow, binding.carrier)?,
+                binding.function.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn remap_local_transforms(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintLocalTransformBinding>, TaintPlanError> {
+    analysis
+        .local_transforms
+        .iter()
+        .map(|binding| {
+            Ok(TaintLocalTransformBinding::new(
+                binding.point.clone(),
+                remapped_carrier(&analysis.value_flow, value_flow, binding.input)?,
+                remapped_carrier(&analysis.value_flow, value_flow, binding.output)?,
                 binding.function.clone(),
             ))
         })
@@ -1523,6 +1675,22 @@ fn same_transforms(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool 
             })
 }
 
+fn same_local_transforms(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
+    left.local_transforms.len() == right.local_transforms.len()
+        && left
+            .local_transforms
+            .iter()
+            .zip(&right.local_transforms)
+            .all(|(left_binding, right_binding)| {
+                left_binding.point == right_binding.point
+                    && left_binding.function == right_binding.function
+                    && left.value_flow.carrier_key(left_binding.input)
+                        == right.value_flow.carrier_key(right_binding.input)
+                    && left.value_flow.carrier_key(left_binding.output)
+                        == right.value_flow.carrier_key(right_binding.output)
+            })
+}
+
 fn merge_sources(
     target: &mut Vec<TaintSourceBinding>,
     incoming: &[TaintSourceBinding],
@@ -1567,6 +1735,8 @@ pub enum TaintPlanError {
     EmptyBatch,
     IncompatibleBatchMember,
     AmbiguousTransferOrder,
+    InvalidLocalTransform,
+    DuplicateLocalTransform,
 }
 
 impl fmt::Display for TaintPlanError {
@@ -1585,6 +1755,11 @@ impl fmt::Display for TaintPlanError {
             Self::AmbiguousTransferOrder => formatter.write_str(
                 "taint transfers sharing one point, phase, carrier, and ordinal are ambiguous",
             ),
+            Self::InvalidLocalTransform => formatter
+                .write_str("taint local transform does not name an injected value-flow relation"),
+            Self::DuplicateLocalTransform => {
+                formatter.write_str("duplicate taint local transform relation")
+            }
         }
     }
 }

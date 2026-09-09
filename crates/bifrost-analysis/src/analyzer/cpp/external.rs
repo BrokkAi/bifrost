@@ -7,15 +7,16 @@ use crate::analyzer::cpp::CppAnalyzer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
     AuthoredShard, BoundedDependencyDiagnostics, BoundedProducerDiagnostics, CatalogCoordinate,
-    Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryOutcome,
-    DependencyDiscoveryProfile, DependencyPackAdapter, DependencyPackDiagnostic,
-    DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
-    ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact, HierarchyKind, ImplicitOperation,
-    Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance,
-    ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact, Safety,
-    SemanticModelActivationEvidence, Signature, StructuredTypeExpression, TypeCopySemantics,
-    TypeFact, TypeIdentity, TypeKind, TypeMoveSemantics, TypeRef, TypeRefReferenceKind,
-    TypeValueSemantics, Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryInformationalEvidence,
+    DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
+    DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
+    DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact,
+    HierarchyKind, ImplicitOperation, Locator, MemberFact, MemberIdentity, MemberKind,
+    NameSelector, Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency,
+    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
+    StructuredTypeExpression, TypeCopySemantics, TypeFact, TypeIdentity, TypeKind,
+    TypeMoveSemantics, TypeRef, TypeRefReferenceKind, TypeValueSemantics, Visibility,
+    WildcardVariance, member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOriginKind, SemanticModelOverlay,
@@ -1127,9 +1128,42 @@ pub fn resolve_cpp_semantic_pack_dependencies(
     let contexts = CppCompileContexts::load(project);
     let mut dependencies = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let files = match project.analyzable_files(Language::Cpp) {
+        Ok(files) => files,
+        Err(error) => {
+            diagnostics.push(header_discovery_failed(
+                None,
+                format!("cannot list C++ source files: {error}"),
+            ));
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return DependencyDiscoveryOutcome {
+                dependencies,
+                diagnostics,
+                suppressed_diagnostics,
+                complete: false,
+                cancelled: false,
+                profile: DependencyDiscoveryProfile {
+                    metadata_inputs_considered: 1,
+                    dependencies_resolved: 0,
+                    informational_evidence: Vec::new(),
+                },
+            };
+        }
+    };
+    let coverage = contexts.missing_workspace_sources(project.root(), &files);
+    let informational_evidence = (coverage.missing_workspace_source_count() > 0)
+        .then(
+            || DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                count: coverage.missing_workspace_source_count(),
+                sample: coverage.missing_workspace_source_sample().to_vec(),
+            },
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
     let header_sets = match discover_reachable_header_sets(
         project,
         &contexts,
+        files,
         limits,
         cancellation,
         &mut diagnostics,
@@ -1143,7 +1177,11 @@ pub fn resolve_cpp_semantic_pack_dependencies(
                 suppressed_diagnostics,
                 complete: false,
                 cancelled: true,
-                profile: DependencyDiscoveryProfile::default(),
+                profile: DependencyDiscoveryProfile {
+                    metadata_inputs_considered: 1,
+                    dependencies_resolved: 0,
+                    informational_evidence,
+                },
             };
         }
         Err(HeaderDiscoveryError::Failed(message)) => {
@@ -1204,6 +1242,7 @@ pub fn resolve_cpp_semantic_pack_dependencies(
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 1,
             dependencies_resolved: dependencies.len(),
+            informational_evidence,
         },
         complete: diagnostics.is_empty() && suppressed_diagnostics.total() == 0,
         dependencies,
@@ -1221,13 +1260,11 @@ fn root_dependency_name(root: &Path) -> String {
 fn discover_reachable_header_sets(
     project: &dyn Project,
     contexts: &CppCompileContexts,
+    files: std::collections::BTreeSet<ProjectFile>,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut BoundedDependencyDiagnostics,
 ) -> Result<Vec<(PathBuf, Vec<PathBuf>)>, HeaderDiscoveryError> {
-    let files = project.analyzable_files(Language::Cpp).map_err(|error| {
-        HeaderDiscoveryError::Failed(format!("cannot list C++ source files: {error}"))
-    })?;
     // An angle include reaches an external root only through the compile
     // contexts of the file that spells it: with no entry naming that file,
     // `resolve_external_angle_include` answers `MissingCompileContext` and the
@@ -1604,6 +1641,7 @@ mod tests {
         SemanticRequest, TransferKind, TransferOperation, ValueFlowKind,
     };
     use crate::analyzer::semantic_model::CompilerOptions;
+    use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
     use crate::analyzer::semantic_model::{
         AuthoredPayload, CatalogOptions, ResolvedDependencyArtifactInput,
         SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
@@ -2304,6 +2342,159 @@ mod tests {
             &["detail/inner.h".to_string(), "widget.h".to_string()],
             paths.as_slice(),
             "only the named source's transitive closure is discovered"
+        );
+    }
+
+    #[test]
+    fn missing_in_workspace_database_source_is_informational_only() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("int main() { return 0; }\n")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-c","src/main.cpp"]},{"directory":".","file":"generated/widget.cpp","arguments":["clang++","-c","generated/widget.cpp"]}]"#,
+            )
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert!(discovery.diagnostics.is_empty(), "{discovery:#?}");
+        assert!(discovery.dependencies.is_empty(), "{discovery:#?}");
+        assert_eq!(
+            &[
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                    count: 1,
+                    sample: vec![PathBuf::from("generated/widget.cpp")],
+                }
+            ],
+            discovery.profile.informational_evidence.as_slice()
+        );
+        let retained = DependencyDiscoveryEvidence::from_outcome(&discovery);
+        assert!(!retained.truncated());
+        assert_eq!(
+            discovery.profile.informational_evidence,
+            retained.informational_evidence()
+        );
+    }
+
+    #[test]
+    fn outside_workspace_database_source_produces_no_information() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let outside_source = outside.path().join("generated.cpp");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("int main() { return 0; }\n")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                serde_json::json!([{
+                    "directory": ".",
+                    "file": outside_source,
+                    "arguments": ["clang++", "-c", "generated.cpp"]
+                }])
+                .to_string(),
+            )
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert!(discovery.diagnostics.is_empty(), "{discovery:#?}");
+        assert!(discovery.profile.informational_evidence.is_empty());
+    }
+
+    #[test]
+    fn cancellation_retains_missing_source_information_without_changing_termination() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget.h>\n")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]},{"directory":".","file":"generated/widget.cpp","arguments":["clang++","-c","generated/widget.cpp"]}]"#,
+            )
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            Some(&cancellation),
+        );
+
+        assert!(discovery.cancelled, "{discovery:#?}");
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert_eq!(
+            &[
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                    count: 1,
+                    sample: vec![PathBuf::from("generated/widget.cpp")],
+                }
+            ],
+            discovery.profile.informational_evidence.as_slice()
+        );
+    }
+
+    #[test]
+    fn discovery_failure_retains_missing_source_information() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <nested/widget.h>\n")
+            .expect("present source");
+        ProjectFile::new(root.clone(), "fake/include/nested/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]},{"directory":".","file":"generated/widget.cpp","arguments":["clang++","-c","generated/widget.cpp"]}]"#,
+            )
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let limits = DependencyPackLimits {
+            max_source_path_depth: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert!(!discovery.cancelled, "{discovery:#?}");
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cpp.header_discovery_failed"),
+            "{discovery:#?}"
+        );
+        assert_eq!(
+            &[
+                DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                    count: 1,
+                    sample: vec![PathBuf::from("generated/widget.cpp")],
+                }
+            ],
+            discovery.profile.informational_evidence.as_slice()
         );
     }
 

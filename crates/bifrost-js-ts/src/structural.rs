@@ -951,12 +951,14 @@ mod tests {
 
         let mut roles = Vec::new();
         let mut occurrence_roles = Vec::new();
+        let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
         let mut sink = RoleSink::new(
             &fact_by_ts_node,
             &mut roles,
             &mut occurrence_roles,
             32,
             None,
+            &parents,
         );
         TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
         let (name, stop) = sink.into_parts();
@@ -1002,12 +1004,14 @@ mod tests {
 
         let mut roles = Vec::new();
         let mut occurrence_roles = Vec::new();
+        let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
         let mut sink = RoleSink::new(
             &fact_by_ts_node,
             &mut roles,
             &mut occurrence_roles,
             32,
             None,
+            &parents,
         );
         TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
         let (name, stop) = sink.into_parts();

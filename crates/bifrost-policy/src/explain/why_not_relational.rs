@@ -10,7 +10,7 @@
 //!
 //! 1. its row is not in some binding's relation at all, either because the
 //!    binding's query never returned it or because a `filter` the plan attaches
-//!    directly to that binding removed it;
+//!    directly to that binding or its expansion removed it;
 //! 2. its row is in every binding but the join or the group key does not put it
 //!    in a violated group;
 //! 3. the aggregate over its group satisfies the authored cardinality.
@@ -18,6 +18,7 @@
 //! This adapter answers level 1 exactly. It re-executes each binding's query
 //! the way the relational driver executes it, reusing the milestone-5 prefix
 //! walk to name the *stage inside that binding* that dropped the candidate,
+//! applies an expansion through the evaluator's shared query lowering,
 //! and then replays every `filter` record whose input chain reaches that
 //! binding without crossing a join or a group, against the rows the binding's
 //! query actually returned for the candidate. Levels 2 and 3 need a join-level
@@ -33,8 +34,8 @@
 //! A non-exhaustive prefix, a prefix omitted by the execution budget, or a row
 //! expansion this adapter does not replay is `unknown`.
 //!
-//! A filter replay obeys the same rule for the same reason. A located row that
-//! fails a predicate is definitely removed, but a non-exhaustive query may have
+//! Expansion and filter replay obey the same rule for the same reason. A row
+//! that fails a predicate or expansion is removed, but an incomplete query may have
 //! left out another row covering the candidate that would have passed, so a
 //! filter drop is `failed` only over an exhaustive, untruncated row set and is
 //! `unknown` otherwise. A predicate that cannot be read against a row is
@@ -42,20 +43,22 @@
 //!
 //! # Bounds
 //!
-//! Every binding's prefix walk and every filter relation it replays draw on one
+//! Every binding's prefix walk, expansion, and filter relation draw on one
 //! shared execution budget (`ExplanationLimits::max_prefix_executions`), one
 //! unit each, and the walk stops at the first binding that does not retain the
 //! candidate. What the budget cut is reported through the root's
 //! `children_truncated` pair.
 
-use brokk_bifrost_rql::structural::CodeQueryResultValue;
+use std::collections::HashMap;
+
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryResultValue};
 
 use crate::budget::PolicyBudget;
 use crate::definition::{
     PolicyAnalysisType, RelationalAssertionPlan, RowBinding, RowBindingName, RowBindingSource,
-    relational_binding_selector_path,
+    RowExpansionStep, relational_binding_selector_path,
 };
-use crate::evaluator::PolicyEvaluationContext;
+use crate::evaluator::{PolicyEvaluationContext, relational_expansion_query};
 use crate::finding::{PolicyIncompleteReason, PolicySourceLocation};
 use crate::relational::{
     IrColumn, IrPredicate, IrRelationOp, RelationalAssertionEvaluationError, RelationalPlanIr,
@@ -132,14 +135,16 @@ struct BindingOutcome {
     outcome: ExplanationOutcome,
     actual: String,
     reasons: Vec<PolicyIncompleteReason>,
-    /// The executed prefix walk, absent for a binding this adapter does not
-    /// replay.
-    walk: Option<StageWalk>,
+    /// The binding's source prefix walk.
+    walk: StageWalk,
     /// One entry per located row a replayed filter removed, present only when
     /// every located row was removed.
     dropped: Vec<DroppedRow>,
     /// Filter relations the shared execution budget did not reach.
     omitted_filters: u64,
+    /// An expansion that retained none of the candidate's source rows.
+    expansion: Option<RawNode>,
+    omitted_expansions: u64,
 }
 
 /// Every binding that was decided, plus what the shared execution budget cut.
@@ -174,6 +179,7 @@ fn walk_bindings(
 ) -> Result<BindingWalk, ExplainError> {
     let mut remaining = limits.max_prefix_executions();
     let mut bindings = Vec::with_capacity(plan.bindings.len());
+    let mut queries: HashMap<&RowBindingName, CodeQuery> = HashMap::new();
     let mut index = 0;
     while index < plan.bindings.len() {
         let binding = &plan.bindings[index];
@@ -183,6 +189,7 @@ fn walk_bindings(
         let outcome = match &binding.source {
             RowBindingSource::Query(_) => {
                 let query = binding_query(policy, binding)?;
+                queries.insert(&binding.name, query.clone());
                 let walk = run_prefixes(
                     query,
                     context,
@@ -202,18 +209,29 @@ fn walk_bindings(
                 };
                 query_binding_outcome(binding, walk, verdict)
             }
-            RowBindingSource::Expansion { from, step } => BindingOutcome {
-                name: binding.name.as_str().to_string(),
-                outcome: ExplanationOutcome::Unknown,
-                actual: format!(
-                    "the row expansion `{}` of binding `{from}` is not replayed by this adapter",
-                    step.label()
-                ),
-                reasons: vec![PolicyIncompleteReason::CapabilityIncomplete],
-                walk: None,
-                dropped: Vec::new(),
-                omitted_filters: 0,
-            },
+            RowBindingSource::Expansion { from, step } => {
+                let source = queries
+                    .get(from)
+                    .expect("a validated expansion follows its source binding");
+                let query = relational_expansion_query(source, *step);
+                let outcome = expansion_binding_outcome(
+                    binding,
+                    from,
+                    *step,
+                    source,
+                    query.as_ref(),
+                    ir,
+                    lineages,
+                    context,
+                    candidate,
+                    budget,
+                    &mut remaining,
+                );
+                if let Some(query) = query {
+                    queries.insert(&binding.name, query);
+                }
+                outcome
+            }
         };
         let decided = outcome.outcome != ExplanationOutcome::Satisfied;
         bindings.push(outcome);
@@ -228,6 +246,110 @@ fn walk_bindings(
         bindings,
         omitted_bindings,
     })
+}
+
+/// Replay the source prefixes before applying the evaluator's expansion query.
+/// `MemberCandidates` is the only expansion kind without an executable
+/// relational domain; the shared evaluator lowering returns None for it.
+/// All other kinds, including receiver projections and their prerequisite
+/// analysis, run through the production CodeQuery executor.
+#[allow(clippy::too_many_arguments)]
+fn expansion_binding_outcome(
+    binding: &RowBinding,
+    from: &RowBindingName,
+    step: RowExpansionStep,
+    source: &CodeQuery,
+    query: Option<&CodeQuery>,
+    ir: &RelationalPlanIr,
+    lineages: &[Option<BindingLineage>],
+    context: &PolicyEvaluationContext<'_>,
+    candidate: &ExplanationCandidate,
+    budget: &PolicyBudget,
+    remaining: &mut usize,
+) -> BindingOutcome {
+    let mut walk = run_prefixes(
+        source,
+        context,
+        candidate,
+        budget,
+        *remaining,
+        PrefixExecution::PreferWorkspace,
+        budget.query_limits().max_pipeline_rows,
+    );
+    *remaining = remaining.saturating_sub(walk.executed());
+    if walk.decided().is_some() || walk.prefixes_truncated() {
+        return query_binding_outcome(binding, walk, FilterVerdict::Retained);
+    }
+    if *remaining == 0 {
+        let mut outcome = query_binding_outcome(binding, walk, FilterVerdict::Retained);
+        outcome.outcome = ExplanationOutcome::Unknown;
+        outcome.actual = format!(
+            "the prefix-execution budget stopped binding `{}` before expansion `{}` was replayed",
+            binding.name,
+            step.label(),
+        );
+        outcome.reasons = vec![PolicyIncompleteReason::ReportRetentionBudget];
+        outcome.omitted_expansions = 1;
+        return outcome;
+    }
+    let Some(query) = query else {
+        let mut outcome = query_binding_outcome(binding, walk, FilterVerdict::Retained);
+        outcome.outcome = ExplanationOutcome::Unknown;
+        outcome.actual = format!(
+            "row expansion `{}` has no executable row domain",
+            step.label()
+        );
+        outcome.reasons = vec![PolicyIncompleteReason::CapabilityIncomplete];
+        return outcome;
+    };
+    *remaining -= 1;
+    let expanded = walk
+        .located()
+        .expand(query, source.plan.steps.len(), context, budget);
+    if expanded.rows().is_empty() {
+        let outcome = if expanded.exhaustive() {
+            ExplanationOutcome::Failed
+        } else {
+            ExplanationOutcome::Unknown
+        };
+        let reasons = expanded.reasons().to_vec();
+        let expansion = RawNode::new(ExplanationNodeKind::ExpansionStep, outcome, step.label())
+            .with_expected(format!(
+                "expansion `{}` of relation `{from}` produces a row for source keys {:?}",
+                step.label(),
+                walk.located().keys(),
+            ))
+            .with_actual(format!(
+                "source values that did not expand: {:?}",
+                walk.located().rows()
+            ))
+            .with_reasons(reasons.clone());
+        let actual = if expanded.exhaustive() {
+            format!(
+                "expansion `{}` of binding `{from}` removed the candidate's source rows",
+                step.label()
+            )
+        } else {
+            format!(
+                "expansion `{}` of binding `{from}` retained no candidate rows, but the replay was not exhaustive",
+                step.label()
+            )
+        };
+        return BindingOutcome {
+            name: binding.name.as_str().to_string(),
+            outcome,
+            actual,
+            reasons,
+            walk,
+            dropped: Vec::new(),
+            omitted_filters: 0,
+            expansion: Some(expansion),
+            omitted_expansions: 0,
+        };
+    }
+    walk.replace_located(expanded);
+    let verdict = replay_filters(ir, lineages, &binding.name, walk.located(), remaining);
+    query_binding_outcome(binding, walk, verdict)
 }
 
 /// The resolved query one authored query binding executes.
@@ -501,9 +623,11 @@ fn query_binding_outcome(
         outcome,
         actual,
         reasons,
-        walk: Some(walk),
+        walk,
         dropped,
         omitted_filters,
+        expansion: None,
+        omitted_expansions: 0,
     }
 }
 
@@ -587,13 +711,16 @@ fn binding_node(binding: BindingOutcome, candidate: &ExplanationCandidate) -> Ra
             candidate.path().clone(),
         )))
         .with_reasons(reasons.clone());
-    if let Some(walk) = binding.walk {
-        let prefixes_truncated = walk.prefixes_truncated();
-        let omitted_prefixes = walk.omitted_prefixes();
-        for stage in walk.into_stages() {
-            node.push_child(stage_node(stage, candidate));
-        }
-        node = node.with_source_truncation(prefixes_truncated, omitted_prefixes);
+    let prefixes_truncated = binding.walk.prefixes_truncated();
+    let omitted_prefixes = binding.walk.omitted_prefixes();
+    for stage in binding.walk.into_stages() {
+        node.push_child(stage_node(stage, candidate));
+    }
+    node = node.with_source_truncation(prefixes_truncated, omitted_prefixes);
+    if let Some(expansion) = binding.expansion {
+        node.push_child(expansion.with_location(Some(PolicySourceLocation::artifact(
+            candidate.path().clone(),
+        ))));
     }
     for dropped in binding.dropped {
         node.push_child(
@@ -613,4 +740,5 @@ fn binding_node(binding: BindingOutcome, candidate: &ExplanationCandidate) -> Ra
         );
     }
     node.with_source_truncation(binding.omitted_filters > 0, binding.omitted_filters)
+        .with_source_truncation(binding.omitted_expansions > 0, binding.omitted_expansions)
 }

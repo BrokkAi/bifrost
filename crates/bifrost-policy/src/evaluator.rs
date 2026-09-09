@@ -10,6 +10,7 @@ mod cvss_evidence;
 mod typestate_compilation;
 
 use assertion::evaluate_assertion_policy;
+pub(crate) use assertion::relational_expansion_query;
 use cvss_evidence::*;
 pub(crate) use typestate_compilation::TypestateCompilationFailure;
 
@@ -23,7 +24,6 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::invalidation::BudgetMode;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
@@ -49,7 +49,7 @@ use brokk_bifrost_rql::structural::rewrite_paths::{
 };
 use brokk_bifrost_rql::structural::search::{
     CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
-    CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
+    CodeQueryOccurrence, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQueryStableOwnerDerivation,
@@ -57,8 +57,8 @@ use brokk_bifrost_rql::structural::search::{
     UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance, UnitRowItemRef,
     UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance, UnitRowProvenanceRef,
     execute_code_query_detailed_eager_index,
-    execute_code_query_detailed_eager_index_with_row_family_session,
-    execute_code_query_detailed_eager_index_without_targets_with_row_family_session,
+    execute_code_query_detailed_eager_index_with_row_family_session_in_scope,
+    execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope,
     execute_code_query_detailed_eager_index_workspace, execute_code_query_unit,
 };
 use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
@@ -132,8 +132,7 @@ use super::unit_execution::{
     SeedPartition, UnitAttempt, UnitQueryExecution, UnitReuse, recompute_unit, sliced_query_units,
 };
 use super::units::{
-    PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitProduct, UnitPartition,
-    WidenReason,
+    PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnitProduct, UnitPartition, WidenReason,
 };
 
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
@@ -2356,7 +2355,7 @@ fn evaluate_match_policy_by_unit(
         match sliced_match_candidates(policy, incremental, context, budget, &mut attempt) {
             Ok(evaluated) => (evaluated, None),
             Err(reason) => (
-                widened_match_candidates(policy, incremental, context, budget),
+                widened_match_candidates(policy, context, budget),
                 Some(reason),
             ),
         };
@@ -2449,17 +2448,16 @@ fn sliced_match_candidates(
     ))
 }
 
-/// Evaluate one match policy in full and publish it as a single whole unit.
+/// Evaluate one match policy in full without recording a unit.
 ///
-/// The execution is the whole-workspace one -- the same entry point a unit
-/// takes, with the seed enumeration not narrowed, which is what every
-/// non-incremental run already does -- held open under a ledger so the
-/// published unit names the inputs it actually read. A run that truncated,
-/// raised a diagnostic, or performed a read the ledger could not name
-/// publishes nothing: there would be no honest read set to verify it by.
+/// The execution is the whole-workspace one -- the same entry point the
+/// sliced path uses, with the seed enumeration not narrowed, which is what
+/// every non-incremental run already does. A widened execution cannot produce a
+/// reusable unit: its read set is workspace-wide and cannot survive an edit,
+/// while the base evaluation's finding identities already serve the warm diff
+/// join.
 fn widened_match_candidates(
     policy: &LoadedPolicy,
-    incremental: &PolicyIncrementalContext<'_>,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> EvaluatedMatchPolicy {
@@ -2471,30 +2469,16 @@ fn widened_match_candidates(
         Ok(executable) => executable,
         Err(refusal) => return refusal.into_run(budget),
     };
-    let (product, reads) = recompute_unit(context.analyzer, || {
-        execute_code_query_unit(
-            context.analyzer,
-            // The whole match execution is analyzer-only, so its unit is too.
-            None,
-            &executable,
-            budget.query_limits(),
-            context.cancellation,
-            CodeQueryExecutionScope::whole_workspace(),
-        )
-    });
-    if let Some(reads) = reads
-        && !product.truncated
-        && product.diagnostics.is_empty()
-    {
-        let key = incremental.inputs().unit_key(policy, UnitPartition::Whole);
-        incremental.store().borrow_mut().publish(PolicyUnit::new(
-            key.clone(),
-            PolicyUnitProduct::Rows(product.clone()),
-            reads,
-            BudgetMode::Exhaustive,
-        ));
-        incremental.record_units(policy.definition().metadata.id.clone(), vec![key]);
-    }
+    let product = execute_code_query_unit(
+        context.analyzer,
+        // The whole match execution is analyzer-only, as in the historical
+        // non-incremental path.
+        None,
+        &executable,
+        budget.query_limits(),
+        context.cancellation,
+        CodeQueryExecutionScope::whole_workspace(),
+    );
     let mut items = Vec::with_capacity(product.rows.len());
     let mut evidence = Vec::with_capacity(product.rows.len());
     for row in product.rows {

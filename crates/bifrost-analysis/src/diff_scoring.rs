@@ -18,9 +18,7 @@
 //! files land in [`ExcludedFiles`], and a symbol whose references could not be
 //! resolved lands in [`VerificationFeatures::unresolved_symbols`].
 
-use crate::analyzer::{
-    DispatchExtensibility, IAnalyzer, PoolSafeMemo, ProjectFile, WorkspaceAnalyzer,
-};
+use crate::analyzer::{DispatchExtensibility, IAnalyzer, PoolSafeMemo, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::diff_analysis::{
     AnalyzedDiff, CommitSymbol, DiffAnalysisOptions, DiffEndpointParams, DiffEndpoints,
@@ -29,8 +27,8 @@ use crate::diff_analysis::{
     path_string, primary_range, resolved_imports_of,
 };
 use crate::searchtools::{
-    ScanUsagesByLocationParams, ScanUsagesEntry, ScanUsagesInput, ScanUsagesStatus,
-    ScanUsagesTarget, is_test_like_file, scan_usages_by_location_with_cancellation,
+    ScanUsagesByLocationParams, ScanUsagesTarget, is_test_like_file,
+    scan_usage_reference_sites_by_location,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -798,9 +796,7 @@ fn dispatch_extensible_edited_symbols(analyzed: &AnalyzedDiff) -> usize {
 struct ReferenceFile {
     path: String,
     hits: usize,
-    /// Reference lines, when the scan rendered them. A scan that summarized a
-    /// very hot symbol reports per-file counts only, which is why this can be
-    /// empty while `hits` is not.
+    /// Every admitted reference site retains its line before interactive rendering.
     lines: Vec<usize>,
 }
 
@@ -818,9 +814,8 @@ struct SymbolReferences {
 type ReferenceSites = HashMap<SymbolKey, SymbolReferences>;
 
 /// The last complete reference query for one immutable analyzer generation.
-/// Rendering budgets apply across the requested batch, so answers from
-/// different target sets cannot be combined without changing score semantics.
-/// Incomplete or cancelled scans must be retried.
+/// Retain one complete target set to bound session retention. Incomplete or
+/// cancelled scans must be retried; interactive rendering limits do not apply.
 #[derive(Default)]
 struct ReferenceCache {
     complete: Mutex<Option<(BTreeMap<SymbolKey, String>, ReferenceSites)>>,
@@ -917,7 +912,7 @@ fn resolve_reference_sites(
             symbol: Some(fqn.clone()),
         })
         .collect();
-    let scanned = scan_usages_by_location_with_cancellation(
+    let scanned = scan_usage_reference_sites_by_location(
         whole_target,
         ScanUsagesByLocationParams {
             targets,
@@ -937,74 +932,38 @@ fn resolve_reference_sites(
     );
 
     let references: ReferenceSites = scanned
-        .results
-        .iter()
-        .map(|entry| (entry_key(entry), symbol_references(entry)))
+        .into_iter()
+        .map(|entry| {
+            let key = (entry.input.path, entry.input.line);
+            let files = entry
+                .files
+                .into_iter()
+                .map(|file| ReferenceFile {
+                    path: file.path,
+                    hits: file.hits,
+                    lines: file.lines,
+                })
+                .collect();
+            (
+                key,
+                SymbolReferences {
+                    files,
+                    incomplete_reason: entry.incomplete_reason,
+                },
+            )
+        })
         .collect();
     if !cancellation.is_cancelled()
         && references.len() == wanted.len()
         && references.keys().all(|key| wanted.contains_key(key))
-        && scanned.results.iter().all(|entry| {
-            entry.complete
-                && entry.incomplete_reason.is_none()
-                && entry.status != ScanUsagesStatus::Failure
-        })
+        && references
+            .values()
+            .all(|sites| sites.incomplete_reason.is_none())
     {
         *cache.complete.lock().expect("reference cache poisoned") =
             Some((wanted, references.clone()));
     }
     references
-}
-
-/// The scanned entry's symbol key.
-///
-/// Every request above is a [`ScanUsagesTarget`], and the scan echoes each
-/// request's own input back on its entry, so a symbol input here would mean the
-/// by-location scan answered a question nobody asked. Skipping such an entry
-/// would silently drop a symbol from verification; there is no recovery, so
-/// this is an assertion rather than an `Option`.
-fn entry_key(entry: &ScanUsagesEntry) -> SymbolKey {
-    match &entry.input {
-        ScanUsagesInput::Target(target) => (target.path.clone(), target.line),
-        ScanUsagesInput::Symbol(symbol) => {
-            unreachable!("by-location scan echoed a symbol input: {symbol}")
-        }
-    }
-}
-
-fn symbol_references(entry: &ScanUsagesEntry) -> SymbolReferences {
-    let incomplete_reason = match entry.status {
-        ScanUsagesStatus::Found
-        | ScanUsagesStatus::VerifiedAbsent
-        | ScanUsagesStatus::NoExternalUsages => entry
-            .incomplete_reason
-            .map(|reason| format!("{reason:?}"))
-            .or_else(|| {
-                entry
-                    .files_truncated
-                    .map(|count| format!("{count} reference files omitted"))
-            }),
-        // Report the scan's own explanation, not just its verdict: a bare
-        // status leaves a consumer unable to tell a symbol the scan refused
-        // from one it could not resolve.
-        other => Some(match entry.message.as_deref() {
-            Some(message) => format!("scan status {other:?}: {message}"),
-            None => format!("scan status {other:?}"),
-        }),
-    };
-    let files = entry
-        .files
-        .iter()
-        .map(|group| ReferenceFile {
-            path: group.path.clone(),
-            hits: group.hit_count.unwrap_or(group.hits.len()),
-            lines: group.hits.iter().map(|hit| hit.line).collect(),
-        })
-        .collect();
-    SymbolReferences {
-        files,
-        incomplete_reason,
-    }
 }
 
 // ------------------------------------------------------------ verification
@@ -1129,8 +1088,9 @@ enum FileTestKind {
     /// reference.
     TestLike,
     /// Production by path and module structure, but holding test regions, so
-    /// the site's own position decides. Carries the file the decision needs.
-    InlineTests(ProjectFile),
+    /// the site's own position decides. Retain test declaration ranges once
+    /// per file, rather than hydrating declarations for every reference line.
+    InlineTests(Vec<(usize, usize)>),
     /// Production, with no test region for a site to be inside.
     Production,
     /// Not a file of the target revision's project, so nothing can be asked
@@ -1148,7 +1108,15 @@ impl TestFileClassifier {
             if is_test_like_file(analyzer, &file, &site.path, path_language(path)) {
                 FileTestKind::TestLike
             } else if analyzer.contains_tests(&file) {
-                FileTestKind::InlineTests(file)
+                FileTestKind::InlineTests(
+                    analyzer
+                        .get_declarations(&file)
+                        .into_iter()
+                        .filter(|unit| analyzer.in_test_region(unit))
+                        .filter_map(|unit| primary_range(analyzer, &unit))
+                        .map(|range| (range.start_line, range.end_line))
+                        .collect(),
+                )
             } else {
                 FileTestKind::Production
             }
@@ -1160,22 +1128,16 @@ impl TestFileClassifier {
                 "the target revision's project has no such file, so its references cannot be \
                  classified",
             ),
-            // A summarized scan reports this file's hit count without lines,
-            // and those hits can be on either side of the file's own test
-            // boundary. Crediting a test reference here would turn "the symbol
-            // was hot enough for the scan to summarize it" into "the symbol is
-            // tested", the one way this feature could be silently wrong in the
-            // reassuring direction.
-            FileTestKind::InlineTests(_) if site.lines.is_empty() => TestReference::Undecidable(
-                "the scan summarized this file's hits without lines, so they cannot be placed \
-                 inside or outside its test region",
-            ),
-            FileTestKind::InlineTests(file) => {
-                if site
-                    .lines
-                    .iter()
-                    .any(|line| enclosing_is_test_region(analyzer, file, *line))
-                {
+            FileTestKind::InlineTests(ranges) => {
+                assert!(
+                    !site.lines.is_empty(),
+                    "reference files retain source lines"
+                );
+                if site.lines.iter().any(|line| {
+                    ranges
+                        .iter()
+                        .any(|(start, end)| start <= line && line <= end)
+                }) {
                     TestReference::Test
                 } else {
                     TestReference::NonTest
@@ -1183,17 +1145,6 @@ impl TestFileClassifier {
             }
         }
     }
-}
-
-fn enclosing_is_test_region(analyzer: &dyn IAnalyzer, file: &ProjectFile, line: usize) -> bool {
-    analyzer
-        .get_declarations(file)
-        .into_iter()
-        .filter(|unit| {
-            primary_range(analyzer, unit)
-                .is_some_and(|range| range.start_line <= line && line <= range.end_line)
-        })
-        .any(|unit| analyzer.in_test_region(&unit))
 }
 
 // ---------------------------------------------------------------- baseline

@@ -26,11 +26,11 @@ use crate::analyzer::semantic::{
     HeapOracle, LocationResult, ObjectCardinality, ObservationPhase, OracleCandidate,
     OracleContractError, OracleRelationArena, OracleRelationId, OracleRelationKind,
     OracleRelationOwner, OracleRelationRecord, OracleSet, PointsToResult, ProcedureHandle,
-    ProcedurePortHandle, ProofStatus, SemanticCallSite, SemanticCapability, SemanticEffect,
-    SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork, StoreAtPoint,
-    StrongUpdateEvidence, TransferKind, UpdateEligibility, ValueAtPoint, ValueFlowKind,
-    ValueFlowOracle, ValueHandle, WeakUpdateReason, assignment_transfer,
+    ProcedurePortHandle, ProcedurePortKind, ProofStatus, SemanticCallSite, SemanticCapability,
+    SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
+    StoreAtPoint, StrongUpdateEvidence, TransferKind, UpdateEligibility, ValueAtPoint,
+    ValueFlowKind, ValueFlowOracle, ValueHandle, WeakUpdateReason, assignment_transfer,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -79,7 +79,7 @@ struct DraftSet<T> {
     ambiguous: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TraceState {
     value: crate::analyzer::semantic::ValueId,
     point: crate::analyzer::semantic::ProgramPointId,
@@ -89,6 +89,9 @@ struct TraceState {
     /// allowing a shallower route to the same semantic state to retain facts
     /// that a deeper, truncated route could not reach.
     summary_depth: usize,
+    /// Quality forced by a finite runtime alternative. The alternatives are
+    /// exhaustive when retained, but neither arm is selected by the IR.
+    alternative_quality: Option<(ProofStatus, EvidenceCompleteness)>,
 }
 
 fn merge_quality(
@@ -217,6 +220,29 @@ fn gap_impacts_heap(gap: &SemanticGap) -> bool {
     gap.impacts.contains(SemanticGapImpact::HeapRead)
         || gap.impacts.contains(SemanticGapImpact::HeapWrite)
         || gap.impacts.contains(SemanticGapImpact::Aliasing)
+}
+
+/// Whether a modeled read partition leaves this exact allocation result's
+/// object identity unchanged.
+///
+/// The missing read can still make values copied into the object incomplete;
+/// it cannot change the identity created by the allocation at the same point.
+/// Keep the discharge tied to all three structured facts so a general heap
+/// read that produces a pointer remains relevant to points-to resolution.
+fn allocation_owns_modeled_read_partition(
+    procedure: &ProcedureHandle,
+    gap: &SemanticGap,
+    value: crate::analyzer::semantic::ValueId,
+) -> bool {
+    gap.discharge == SemanticGapDischarge::ModeledEffectPartition
+        && gap.impacts
+            == crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+        && gap.subject == SemanticGapSubject::Value(value)
+        && procedure
+            .semantics()
+            .allocations()
+            .iter()
+            .any(|allocation| allocation.point == gap.point && allocation.result == value)
 }
 
 /// Whether `gap` can open a heap, alias, or points-to answer at all.
@@ -611,6 +637,24 @@ fn push_object_with_quality(
     }
 }
 
+fn push_trace_object(
+    drafts: &mut Vec<ObjectDraft>,
+    object: AbstractObject,
+    evidence: Vec<EvidenceHandle>,
+    alternative_quality: &Option<(ProofStatus, EvidenceCompleteness)>,
+) {
+    if let Some(quality) = alternative_quality {
+        push_object_with_quality(
+            drafts,
+            object,
+            evidence.clone(),
+            merge_quality(quality, &evidence_quality(&evidence)),
+        );
+    } else {
+        push_object(drafts, object, evidence);
+    }
+}
+
 fn truncate_object_drafts(
     drafts: &mut Vec<ObjectDraft>,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -666,6 +710,113 @@ fn symbolic_object(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn allocation_object_draft(
+    procedure: &ProcedureHandle,
+    query: &ValueAtPoint,
+    allocation: crate::analyzer::semantic::AllocationId,
+    inherited_evidence: &[EvidenceHandle],
+    event_evidence: EvidenceHandle,
+    cyclic: &mut Option<Option<CyclicRegions>>,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<ObjectDraft, InterruptionOrProvider> {
+    let allocation_row = procedure
+        .semantics()
+        .allocation(allocation)
+        .ok_or_else(|| {
+            InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                "allocation effect has a stale allocation ID",
+            ))
+        })?;
+    staged
+        .charge(SemanticWork {
+            allocations: 1,
+            ..SemanticWork::default()
+        })
+        .map_err(InterruptionOrProvider::Interruption)?;
+    if cyclic.is_none() {
+        *cyclic = Some(
+            cyclic_regions(procedure, staged, cancellation)
+                .map_err(InterruptionOrProvider::Interruption)?,
+        );
+    }
+    let regions = cyclic
+        .as_ref()
+        .expect("cyclic membership was derived above")
+        .as_ref();
+    let cycle_evidence = regions
+        .and_then(|regions| regions.cycle_evidence(allocation_row.point))
+        .map(<[_]>::to_vec);
+    let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
+        InterruptionOrProvider::Provider(SemanticProviderError::internal(
+            "allocation handle is stale",
+        ))
+    })?;
+    let recursive_context = query
+        .context()
+        .calls()
+        .iter()
+        .any(|call| call.procedure() == procedure);
+    let cardinality = if cycle_evidence.is_some() || recursive_context {
+        ObjectCardinality::Summary
+    } else if regions.is_some()
+        && !allocation_is_captured(procedure, allocation, allocation_row.result)
+    {
+        ObjectCardinality::Singleton
+    } else {
+        ObjectCardinality::Unknown
+    };
+    let object = AbstractObject::new(AbstractObjectIdentity::Allocation(handle), cardinality)
+        .map_err(|error| {
+            InterruptionOrProvider::Provider(internal_contract("invalid allocation object", error))
+        })?;
+    let cycle_evidence = cycle_evidence
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| evidence_handle(procedure, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(InterruptionOrProvider::Provider)?;
+    let recursive_evidence = query
+        .context()
+        .calls()
+        .iter()
+        .filter(|call| call.procedure() == procedure)
+        .map(|call| {
+            let row = call
+                .procedure()
+                .semantics()
+                .call_site(call.id())
+                .ok_or_else(|| {
+                    SemanticProviderError::internal(
+                        "oracle call context contains a stale call site",
+                    )
+                })?;
+            evidence_handle(call.procedure(), row.evidence)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(InterruptionOrProvider::Provider)?;
+    let evidence = dedup_evidence(
+        inherited_evidence
+            .iter()
+            .cloned()
+            .chain([
+                event_evidence,
+                evidence_handle(procedure, allocation_row.evidence)
+                    .map_err(InterruptionOrProvider::Provider)?,
+            ])
+            .chain(cycle_evidence)
+            .chain(recursive_evidence),
+    );
+    let quality = evidence_quality(&evidence);
+    Ok(ObjectDraft {
+        object,
+        evidence,
+        proof: quality.0,
+        completeness: quality.1,
+    })
+}
+
 #[derive(Debug, Default)]
 struct CallResultResolution {
     open: bool,
@@ -712,7 +863,7 @@ fn outcome_interruption<T>(outcome: &SemanticOutcome<T>) -> Option<Interruption>
 fn materialize_call_result(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
-    state: TraceState,
+    state: &TraceState,
     inherited_evidence: &[EvidenceHandle],
     drafts: &mut Vec<ObjectDraft>,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -768,7 +919,7 @@ fn materialize_call_result(
 fn materialize_one_call_result(
     oracle: &WorkspaceSemanticOracle<'_>,
     query: &ValueAtPoint,
-    state: TraceState,
+    state: &TraceState,
     call_row: &SemanticCallSite,
     inherited_evidence: &[EvidenceHandle],
     drafts: &mut Vec<ObjectDraft>,
@@ -813,7 +964,12 @@ fn materialize_one_call_result(
     let Some(dispatch) = dispatch_outcome.available_value() else {
         let draft = symbolic_object(procedure, result, caller_evidence)
             .map_err(InterruptionOrProvider::Provider)?;
-        push_object(&mut *drafts, draft.object, draft.evidence);
+        push_trace_object(
+            &mut *drafts,
+            draft.object,
+            draft.evidence,
+            &state.alternative_quality,
+        );
         resolution.open = true;
         return Ok(resolution);
     };
@@ -895,13 +1051,24 @@ fn materialize_one_call_result(
         .map_err(|error| {
             InterruptionOrProvider::Provider(internal_contract("invalid call-result object", error))
         })?;
+        let quality = state
+            .alternative_quality
+            .as_ref()
+            .map_or(quality.clone(), |alternative| {
+                merge_quality(alternative, &quality)
+            });
         push_object_with_quality(drafts, object, caller_evidence.clone(), quality);
     }
 
     if drafts.len() == initial_candidates {
         let draft = symbolic_object(procedure, result, caller_evidence)
             .map_err(InterruptionOrProvider::Provider)?;
-        push_object(drafts, draft.object, draft.evidence);
+        push_trace_object(
+            drafts,
+            draft.object,
+            draft.evidence,
+            &state.alternative_quality,
+        );
         resolution.open = true;
     }
     Ok(resolution)
@@ -946,6 +1113,7 @@ fn resolve_objects(
             point: query.point().id(),
             event_limit: initial_limit,
             summary_depth: 0,
+            alternative_quality: None,
         },
         Vec::<EvidenceHandle>::new(),
     )];
@@ -964,7 +1132,7 @@ fn resolve_objects(
                 Interruption::Cancelled,
             ));
         }
-        if !visited.insert(state) {
+        if !visited.insert(state.clone()) {
             continue;
         }
         staged
@@ -981,6 +1149,7 @@ fn resolve_objects(
             ))
         })?;
         let mut producer = None;
+        let mut producer_alternative_quality = None;
         for (index, event) in point.events[..state.event_limit].iter().enumerate().rev() {
             staged
                 .charge(SemanticWork {
@@ -1008,6 +1177,7 @@ fn resolve_objects(
                         gap,
                         state.value,
                     )
+                    && !allocation_owns_modeled_read_partition(procedure, gap, state.value)
                 {
                     open = true;
                 }
@@ -1033,8 +1203,60 @@ fn resolve_objects(
                 );
                 let draft = symbolic_object(procedure, value, evidence)
                     .map_err(InterruptionOrProvider::Provider)?;
-                push_object(&mut drafts, draft.object, draft.evidence);
+                push_trace_object(
+                    &mut drafts,
+                    draft.object,
+                    draft.evidence,
+                    &state.alternative_quality,
+                );
                 producer = Some((state.value, index, Vec::new()));
+                break;
+            }
+            if let SemanticEffect::ValueFlow {
+                kind:
+                    ValueFlowKind::BackingStoreAlternative {
+                        offset: _,
+                        allocation,
+                    },
+                source,
+                target,
+            } = event.effect
+                && target == state.value
+            {
+                let event_evidence = evidence_handle(procedure, event.evidence)
+                    .map_err(InterruptionOrProvider::Provider)?;
+                let draft = allocation_object_draft(
+                    procedure,
+                    query,
+                    allocation,
+                    &inherited_evidence,
+                    event_evidence.clone(),
+                    &mut cyclic,
+                    staged,
+                    cancellation,
+                )?;
+                let reason: Box<str> = "backing-store alternative arm was not selected".into();
+                let quality = (
+                    ProofStatus::Unproven(reason.clone()),
+                    EvidenceCompleteness::Partial(reason),
+                );
+                push_object_with_quality(
+                    &mut drafts,
+                    draft.object,
+                    draft.evidence,
+                    quality.clone(),
+                );
+                producer_alternative_quality = Some(quality);
+                producer = Some((
+                    source,
+                    index,
+                    dedup_evidence(
+                        inherited_evidence
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(event_evidence)),
+                    ),
+                ));
                 break;
             }
             let source = match event.effect {
@@ -1057,110 +1279,33 @@ fn resolve_objects(
                 break;
             }
             if let SemanticEffect::Allocation { allocation } = event.effect {
-                let allocation_row =
-                    procedure
-                        .semantics()
-                        .allocation(allocation)
-                        .ok_or_else(|| {
-                            InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                                "allocation effect has a stale allocation ID",
-                            ))
-                        })?;
-                if allocation_row.result == state.value {
-                    staged
-                        .charge(SemanticWork {
-                            allocations: 1,
-                            ..SemanticWork::default()
-                        })
-                        .map_err(InterruptionOrProvider::Interruption)?;
-                    if cyclic.is_none() {
-                        cyclic = Some(
-                            cyclic_regions(procedure, staged, cancellation)
-                                .map_err(InterruptionOrProvider::Interruption)?,
-                        );
-                    }
-                    let regions = cyclic
-                        .as_ref()
-                        .expect("cyclic membership was derived above")
-                        .as_ref();
-                    let cycle_evidence = regions
-                        .and_then(|regions| regions.cycle_evidence(allocation_row.point))
-                        .map(<[_]>::to_vec);
-                    let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
+                let allocation_result = procedure
+                    .semantics()
+                    .allocation(allocation)
+                    .ok_or_else(|| {
                         InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                            "allocation handle is stale",
+                            "allocation effect has a stale allocation ID",
                         ))
-                    })?;
-                    let recursive_context = query
-                        .context()
-                        .calls()
-                        .iter()
-                        .any(|call| call.procedure() == procedure);
-                    // #2444: an allocation denotes exactly one runtime object
-                    // when nothing can run its site twice within the activation
-                    // this query names, and when no closure can observe the
-                    // object from an activation whose loop and recursion
-                    // evidence this query does not hold. `Unknown` remains the
-                    // answer when the bounded loop derivation could not run at
-                    // all, because absence of a region is then not a proof.
-                    let cardinality = if cycle_evidence.is_some() || recursive_context {
-                        ObjectCardinality::Summary
-                    } else if regions.is_some()
-                        && !allocation_is_captured(procedure, allocation, allocation_row.result)
-                    {
-                        ObjectCardinality::Singleton
-                    } else {
-                        ObjectCardinality::Unknown
-                    };
-                    let object = AbstractObject::new(
-                        AbstractObjectIdentity::Allocation(handle),
-                        cardinality,
-                    )
-                    .map_err(|error| {
-                        InterruptionOrProvider::Provider(internal_contract(
-                            "invalid allocation object",
-                            error,
-                        ))
-                    })?;
-                    let cycle_evidence = cycle_evidence
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|id| evidence_handle(procedure, id))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(InterruptionOrProvider::Provider)?;
-                    let recursive_evidence = query
-                        .context()
-                        .calls()
-                        .iter()
-                        .filter(|call| call.procedure() == procedure)
-                        .map(|call| {
-                            let row = call
-                                .procedure()
-                                .semantics()
-                                .call_site(call.id())
-                                .ok_or_else(|| {
-                                    SemanticProviderError::internal(
-                                        "oracle call context contains a stale call site",
-                                    )
-                                })?;
-                            evidence_handle(call.procedure(), row.evidence)
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(InterruptionOrProvider::Provider)?;
-                    let evidence = dedup_evidence(
-                        inherited_evidence
-                            .iter()
-                            .cloned()
-                            .chain([
-                                evidence_handle(procedure, event.evidence)
-                                    .map_err(InterruptionOrProvider::Provider)?,
-                                evidence_handle(procedure, allocation_row.evidence)
-                                    .map_err(InterruptionOrProvider::Provider)?,
-                            ])
-                            .chain(cycle_evidence)
-                            .chain(recursive_evidence),
+                    })?
+                    .result;
+                if allocation_result == state.value {
+                    let draft = allocation_object_draft(
+                        procedure,
+                        query,
+                        allocation,
+                        &inherited_evidence,
+                        evidence_handle(procedure, event.evidence)
+                            .map_err(InterruptionOrProvider::Provider)?,
+                        &mut cyclic,
+                        staged,
+                        cancellation,
+                    )?;
+                    push_trace_object(
+                        &mut drafts,
+                        draft.object,
+                        draft.evidence,
+                        &state.alternative_quality,
                     );
-                    push_object(&mut drafts, object, evidence);
                     producer = Some((state.value, index, Vec::new()));
                     break;
                 }
@@ -1180,7 +1325,12 @@ fn resolve_objects(
                 );
                 let draft = symbolic_object(procedure, value, evidence)
                     .map_err(InterruptionOrProvider::Provider)?;
-                push_object(&mut drafts, draft.object, draft.evidence);
+                push_trace_object(
+                    &mut drafts,
+                    draft.object,
+                    draft.evidence,
+                    &state.alternative_quality,
+                );
                 producer = Some((state.value, index, Vec::new()));
                 break;
             }
@@ -1189,7 +1339,7 @@ fn resolve_objects(
             && let Some(resolution) = materialize_call_result(
                 oracle,
                 query,
-                state,
+                &state,
                 &inherited_evidence,
                 &mut drafts,
                 limits,
@@ -1209,12 +1359,15 @@ fn resolve_objects(
                     // that this producer chain was not fully explored.
                     truncated = true;
                 } else {
+                    let alternative_quality =
+                        producer_alternative_quality.or_else(|| state.alternative_quality.clone());
                     stack.push((
                         TraceState {
                             value: source,
                             point: state.point,
                             event_limit,
                             summary_depth: state.summary_depth + 1,
+                            alternative_quality,
                         },
                         evidence,
                     ));
@@ -1252,7 +1405,12 @@ fn resolve_objects(
                     value_row.kind,
                     SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
                 );
-                push_object(&mut drafts, draft.object, draft.evidence);
+                push_trace_object(
+                    &mut drafts,
+                    draft.object,
+                    draft.evidence,
+                    &state.alternative_quality,
+                );
             } else {
                 for (predecessor, edge_evidence) in predecessors {
                     let event_limit = procedure
@@ -1267,6 +1425,7 @@ fn resolve_objects(
                             point: predecessor,
                             event_limit,
                             summary_depth: state.summary_depth,
+                            alternative_quality: state.alternative_quality.clone(),
                         },
                         dedup_evidence(
                             inherited_evidence.iter().cloned().chain(std::iter::once(
@@ -1308,6 +1467,12 @@ fn resolve_objects(
 enum InterruptionOrProvider {
     Interruption(Interruption),
     Provider(SemanticProviderError),
+}
+
+impl From<Interruption> for InterruptionOrProvider {
+    fn from(interruption: Interruption) -> Self {
+        Self::Interruption(interruption)
+    }
 }
 
 fn materialize_points_to(
@@ -1660,7 +1825,15 @@ fn alias_relation(
     right: &DraftSet<LocationDraft>,
 ) -> AliasRelation {
     let exhaustive = left.coverage == CandidateCoverage::Exhaustive
-        && right.coverage == CandidateCoverage::Exhaustive;
+        && right.coverage == CandidateCoverage::Exhaustive
+        && left.candidates.iter().all(|candidate| {
+            matches!(candidate.proof, ProofStatus::Proven)
+                && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+        })
+        && right.candidates.iter().all(|candidate| {
+            matches!(candidate.proof, ProofStatus::Proven)
+                && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+        });
     if query.left() == query.right() {
         return AliasRelation::MustAlias;
     }
@@ -1947,6 +2120,387 @@ fn publication_gap_affects_names(
 
 /// Enumerate operations that can publish a fresh object's local aliases on
 /// the CFG slice between ownership establishment and one observation.
+fn formal_value_id(
+    procedure: &ProcedureHandle,
+    kind: ProcedurePortKind,
+) -> Option<crate::analyzer::semantic::ValueId> {
+    procedure.semantics().values().iter().find_map(|value| {
+        let matches = match kind {
+            ProcedurePortKind::Receiver => {
+                matches!(value.kind, SemanticValueKind::Receiver { .. })
+            }
+            ProcedurePortKind::Parameter { ordinal } => matches!(
+                value.kind,
+                SemanticValueKind::Parameter {
+                    ordinal: actual,
+                    ..
+                } if actual == ordinal
+            ),
+            ProcedurePortKind::NormalReturn => value.kind == SemanticValueKind::Return,
+            ProcedurePortKind::IndexedNormalReturn { .. }
+            | ProcedurePortKind::ExceptionalReturn
+            | ProcedurePortKind::Capture { .. } => false,
+        };
+        matches.then_some(value.id)
+    })
+}
+
+fn mapped_formals_for_actual(
+    bindings: &crate::analyzer::semantic::CallBindings,
+    actual: crate::analyzer::semantic::ValueId,
+) -> Vec<ProcedurePortHandle> {
+    let mut formals = Vec::new();
+    for binding in bindings.bindings() {
+        match binding {
+            crate::analyzer::semantic::CallBinding::Receiver {
+                actual: binding_actual,
+                formal,
+                ..
+            } if binding_actual.id() == actual => formals.push(formal.clone()),
+            crate::analyzer::semantic::CallBinding::ArgumentGroup(group) => {
+                formals.extend(
+                    group
+                        .mappings()
+                        .iter()
+                        .filter(|mapping| {
+                            mapping.value().actual().value().id() == actual
+                                && mapping.is_proven_complete()
+                        })
+                        .map(|mapping| mapping.value().formal().clone()),
+                );
+            }
+            crate::analyzer::semantic::CallBinding::ImplicitArgument { source, formal, .. }
+                if source.id() == actual =>
+            {
+                formals.push(formal.clone())
+            }
+            crate::analyzer::semantic::CallBinding::NormalReturn { .. }
+            | crate::analyzer::semantic::CallBinding::ExceptionalReturn { .. }
+            | crate::analyzer::semantic::CallBinding::Receiver { .. }
+            | crate::analyzer::semantic::CallBinding::ImplicitArgument { .. } => {}
+        }
+    }
+    formals.dedup();
+    formals
+}
+
+#[allow(clippy::too_many_arguments)]
+fn callee_formal_is_nonpublishing(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    procedure: &ProcedureHandle,
+    formal: &ProcedurePortHandle,
+    context: &crate::analyzer::semantic::OracleCallContext,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+    active_calls: &mut HashSet<crate::analyzer::semantic::CallSiteHandle>,
+) -> Result<bool, InterruptionOrProvider> {
+    let Some(formal_value) = formal_value_id(procedure, formal.kind()) else {
+        return Ok(false);
+    };
+
+    let mut copies = Vec::new();
+    for point in procedure.semantics().points() {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        staged.charge(SemanticWork {
+            program_points: 1,
+            events: point.events.len(),
+            ..SemanticWork::default()
+        })?;
+        for (event_index, event) in point.events.iter().enumerate() {
+            match event.effect {
+                SemanticEffect::Assignment { target, value }
+                    if assignment_transfer(&point.events, event_index, value, target).is_none() =>
+                {
+                    copies.push((value, target));
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+                    source,
+                    target,
+                } => copies.push((source, target)),
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = HashSet::default();
+    names.insert(formal_value);
+    let mut pending = vec![formal_value];
+    while let Some(current) = pending.pop() {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        staged.charge(SemanticWork {
+            values: 1,
+            ..SemanticWork::default()
+        })?;
+        for (source, target) in &copies {
+            if *source == current && names.insert(*target) {
+                pending.push(*target);
+            }
+        }
+    }
+
+    for point in procedure.semantics().points() {
+        if cancellation.is_cancelled() {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        staged.charge(SemanticWork {
+            events: point.events.len(),
+            ..SemanticWork::default()
+        })?;
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::MemoryStore {
+                    location, value, ..
+                } => {
+                    let location_uses_formal = procedure
+                        .semantics()
+                        .memory_location(location)
+                        .is_some_and(|location| {
+                            names.iter().any(|value| location.kind.uses_value(*value))
+                        });
+                    if names.contains(&value) || location_uses_formal {
+                        return Ok(false);
+                    }
+                }
+                SemanticEffect::MemoryLoad { location, .. } => {
+                    if procedure
+                        .semantics()
+                        .memory_location(location)
+                        .is_some_and(|location| location.kind.uses_value(formal_value))
+                    {
+                        // A load is the read-only callback case.
+                    }
+                }
+                SemanticEffect::CaptureBind { capture } => {
+                    let captures_formal = procedure
+                        .semantics()
+                        .captures()
+                        .iter()
+                        .find(|capture_row| capture_row.id == capture)
+                        .is_some_and(|capture_row| match capture_row.captured {
+                            CaptureSource::Value(value) => names.contains(&value),
+                            CaptureSource::Location(location) => procedure
+                                .semantics()
+                                .memory_location(location)
+                                .is_some_and(|location| {
+                                    names.iter().any(|value| location.kind.uses_value(*value))
+                                }),
+                        });
+                    if captures_formal {
+                        return Ok(false);
+                    }
+                }
+                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value }
+                    if value.is_some_and(|value| names.contains(&value)) =>
+                {
+                    return Ok(false);
+                }
+                SemanticEffect::AsyncSuspend { awaited, .. }
+                    if awaited.is_some_and(|value| names.contains(&value)) =>
+                {
+                    return Ok(false);
+                }
+                SemanticEffect::ValueFlow {
+                    kind:
+                        ValueFlowKind::Parameter
+                        | ValueFlowKind::Receiver
+                        | ValueFlowKind::Return
+                        | ValueFlowKind::IndexedReturn { .. }
+                        | ValueFlowKind::LanguageDefined,
+                    source,
+                    ..
+                } if names.contains(&source) => return Ok(false),
+                SemanticEffect::CallableCreation { ref callable, .. }
+                | SemanticEffect::CallableReference { ref callable, .. }
+                    if callable
+                        .bound_receiver
+                        .is_some_and(|receiver| names.contains(&receiver)) =>
+                {
+                    return Ok(false);
+                }
+                SemanticEffect::Invoke { call_site } => {
+                    let Some(call) = procedure.semantics().call_site(call_site) else {
+                        return Ok(false);
+                    };
+                    if !call_names_any(call, &names) {
+                        continue;
+                    }
+                    let Some(call_handle) = procedure.call_site_handle(call_site) else {
+                        return Ok(false);
+                    };
+                    if !call_is_nonpublishing(
+                        oracle,
+                        &call_handle,
+                        &names,
+                        context,
+                        staged,
+                        cancellation,
+                        active_calls,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                SemanticEffect::Gap { gap } => {
+                    let Some(gap) = procedure.semantics().gap(gap) else {
+                        return Ok(false);
+                    };
+                    let unresolved_effect = gap_impacts_heap(gap)
+                        || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                        || gap.impacts.contains(SemanticGapImpact::ValueFlow);
+                    if unresolved_effect && publication_gap_affects_names(procedure, gap, &names) {
+                        return Ok(false);
+                    }
+                }
+                SemanticEffect::Entry
+                | SemanticEffect::NormalExit
+                | SemanticEffect::ExceptionalExit
+                | SemanticEffect::ProcedureReturn { .. }
+                | SemanticEffect::Throw { .. }
+                | SemanticEffect::AsyncSuspend { .. }
+                | SemanticEffect::Assignment { .. }
+                | SemanticEffect::ValueFlow { .. }
+                | SemanticEffect::ValueUse { .. }
+                | SemanticEffect::Allocation { .. }
+                | SemanticEffect::CallableCreation { .. }
+                | SemanticEffect::CallableReference { .. }
+                | SemanticEffect::CallContinuation { .. }
+                | SemanticEffect::AsyncResume { .. }
+                | SemanticEffect::Synchronization { .. } => {}
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_is_nonpublishing(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    call: &crate::analyzer::semantic::CallSiteHandle,
+    names: &HashSet<crate::analyzer::semantic::ValueId>,
+    context: &crate::analyzer::semantic::OracleCallContext,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+    active_calls: &mut HashSet<crate::analyzer::semantic::CallSiteHandle>,
+) -> Result<bool, InterruptionOrProvider> {
+    if !active_calls.insert(call.clone()) {
+        return Ok(false);
+    }
+    let result = (|| {
+        let dispatch_outcome = {
+            let mut request = staged.request(cancellation);
+            oracle
+                .resolve_call(call, &mut request)
+                .map_err(InterruptionOrProvider::Provider)?
+        };
+        staged.work = staged.work.conservative_add(dispatch_outcome.work());
+        if let Some(interruption) = outcome_interruption(&dispatch_outcome) {
+            return Err(InterruptionOrProvider::Interruption(interruption));
+        }
+        let Some(dispatch) = dispatch_outcome.available_value() else {
+            return Ok(false);
+        };
+        if dispatch.coverage() != CandidateCoverage::Exhaustive
+            || !dispatch.boundaries().is_empty()
+            || dispatch.candidates().len() != 1
+        {
+            return Ok(false);
+        }
+        let candidate = &dispatch.candidates()[0];
+        if !matches!(candidate.proof(), ProofStatus::Proven)
+            || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+        {
+            return Ok(false);
+        }
+        let bindings_outcome = {
+            let mut request = staged.request(cancellation);
+            oracle
+                .call_bindings(call, candidate, context, &mut request)
+                .map_err(InterruptionOrProvider::Provider)?
+        };
+        staged.work = staged.work.conservative_add(bindings_outcome.work());
+        if let Some(interruption) = outcome_interruption(&bindings_outcome) {
+            return Err(InterruptionOrProvider::Interruption(interruption));
+        }
+        let Some(bindings) = bindings_outcome.available_value() else {
+            return Ok(false);
+        };
+        if bindings.coverage() != CandidateCoverage::Exhaustive {
+            return Ok(false);
+        }
+
+        let callee_context = context.extended(call.clone(), *oracle.limits());
+        if callee_context.was_truncated() {
+            return Ok(false);
+        }
+        let flow_outcome = {
+            let mut request = staged.request(cancellation);
+            oracle
+                .procedure_relations(candidate.target(), &callee_context, &mut request)
+                .map_err(InterruptionOrProvider::Provider)?
+        };
+        staged.work = staged.work.conservative_add(flow_outcome.work());
+        if let Some(interruption) = outcome_interruption(&flow_outcome) {
+            return Err(InterruptionOrProvider::Interruption(interruption));
+        }
+        let Some(flow) = flow_outcome.available_value() else {
+            return Ok(false);
+        };
+        if flow.coverage() != CandidateCoverage::Exhaustive {
+            return Ok(false);
+        }
+
+        let call_row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .ok_or_else(|| {
+                InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                    "escape proof reached a stale call site",
+                ))
+            })?;
+        let touched = std::iter::once(call_row.callee)
+            .chain(call_row.receiver)
+            .chain(call_row.arguments.iter().map(|argument| argument.value))
+            .filter(|value| names.contains(value))
+            .collect::<HashSet<_>>();
+        if touched.is_empty() {
+            return Ok(true);
+        }
+        for actual in touched {
+            let formals = mapped_formals_for_actual(bindings, actual);
+            if formals.is_empty() {
+                return Ok(false);
+            }
+            for formal in formals {
+                if !callee_formal_is_nonpublishing(
+                    oracle,
+                    candidate.target(),
+                    &formal,
+                    &callee_context,
+                    staged,
+                    cancellation,
+                    active_calls,
+                )? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    })();
+    active_calls.remove(call);
+    result
+}
+
 fn resolve_fresh_object_publications(
     query: &FreshObjectPublicationQuery,
     limits: crate::analyzer::semantic::OracleLimits,
@@ -2405,16 +2959,21 @@ fn materialize_fresh_object_publications(
 /// throwing it. Each of those hands the reference to code this query does not
 /// analyse. A local copy (`alias = box`) is not a publication -- both names
 /// stay inside the procedure, and the flow client already tracks them as
-/// separate carriers.
+/// separate carriers. An invocation is the one exception that can be
+/// discharged locally: only an exact dispatch, exact binding, and complete
+/// structured callee proof of a read-only formal permits that call partition
+/// to remain nonescaping.
 ///
 /// A lexical cell keeps its established rule: it does not escape while no
 /// capture names it. Every other identity has no such proof available here, so
 /// it may escape.
 fn object_escape_status(
+    oracle: &WorkspaceSemanticOracle<'_>,
     identity: &AbstractObjectIdentity,
+    context: &crate::analyzer::semantic::OracleCallContext,
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
-) -> Result<EscapeStatus, Interruption> {
+) -> Result<EscapeStatus, InterruptionOrProvider> {
     let allocation = match identity {
         AbstractObjectIdentity::Allocation(allocation) => allocation,
         AbstractObjectIdentity::LexicalCell(location) => {
@@ -2459,7 +3018,7 @@ fn object_escape_status(
             ..SemanticWork::default()
         })?;
         if cancellation.is_cancelled() {
-            return Err(Interruption::Cancelled);
+            return Err(Interruption::Cancelled.into());
         }
         for (event_index, event) in point.events.iter().enumerate() {
             match event.effect {
@@ -2498,7 +3057,7 @@ fn object_escape_status(
             ..SemanticWork::default()
         })?;
         if cancellation.is_cancelled() {
-            return Err(Interruption::Cancelled);
+            return Err(Interruption::Cancelled.into());
         }
         for event in &point.events {
             let published = match event.effect {
@@ -2519,14 +3078,26 @@ fn object_escape_status(
                     awaited.is_some_and(|value| names.contains(&value))
                 }
                 SemanticEffect::Invoke { call_site } => {
-                    semantics.call_site(call_site).is_some_and(|call| {
-                        names.contains(&call.callee)
-                            || call.receiver.is_some_and(|value| names.contains(&value))
-                            || call
-                                .arguments
-                                .iter()
-                                .any(|argument| names.contains(&argument.value))
-                    })
+                    let Some(call) = semantics.call_site(call_site) else {
+                        return Ok(EscapeStatus::MayEscape);
+                    };
+                    if !call_names_any(call, &names) {
+                        false
+                    } else {
+                        let Some(call_handle) = procedure.call_site_handle(call_site) else {
+                            return Ok(EscapeStatus::MayEscape);
+                        };
+                        let mut active_calls = HashSet::default();
+                        !call_is_nonpublishing(
+                            oracle,
+                            &call_handle,
+                            &names,
+                            context,
+                            staged,
+                            cancellation,
+                            &mut active_calls,
+                        )?
+                    }
                 }
                 _ => false,
             };
@@ -2919,6 +3490,27 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             evidence.truncate(self.limits().evidence_handles());
         }
         let mut quality = evidence_quality(&evidence);
+        if left
+            .candidates
+            .iter()
+            .chain(&right.candidates)
+            .any(|candidate| {
+                !matches!(candidate.proof, ProofStatus::Proven)
+                    || !matches!(candidate.completeness, EvidenceCompleteness::Complete)
+            })
+        {
+            quality = merge_quality(
+                &quality,
+                &(
+                    ProofStatus::Unproven(
+                        "alias candidates include an unresolved backing alternative".into(),
+                    ),
+                    EvidenceCompleteness::Partial(
+                        "alias candidates include an unresolved backing alternative".into(),
+                    ),
+                ),
+            );
+        }
         if evidence_truncated {
             quality.1 = EvidenceCompleteness::Partial(
                 "alias provenance was truncated by the oracle evidence limit".into(),
@@ -3139,9 +3731,16 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
             .map(|candidate| candidate.location.object().identity())
         {
             Some(identity) => {
-                match object_escape_status(identity, &mut staged, request.cancellation) {
+                match object_escape_status(
+                    self,
+                    identity,
+                    store.target().context(),
+                    &mut staged,
+                    request.cancellation,
+                ) {
                     Ok(escape) => escape,
-                    Err(interruption) => {
+                    Err(InterruptionOrProvider::Provider(error)) => return Err(error),
+                    Err(InterruptionOrProvider::Interruption(interruption)) => {
                         let partial = UpdateEligibility::Weak(
                             [WeakUpdateReason::IncompleteEscapeEvidence].into(),
                         );

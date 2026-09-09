@@ -3106,7 +3106,7 @@ fn java_scoped_type_qualifier_text<'a>(
     None
 }
 
-fn java_type_from_node_with_context(
+pub(crate) fn java_type_from_node_with_context(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     java: &JavaAnalyzer,

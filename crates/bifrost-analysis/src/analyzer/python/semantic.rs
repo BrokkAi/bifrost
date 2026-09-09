@@ -22,7 +22,11 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v15";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v17";
+
+const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
+const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
+const PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT: &str = "python.unknown_augmented_assignment";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -51,46 +55,33 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (
-            specs,
-            class_names,
-            class_constructors,
-            range_builtin_proof,
-            exception_builtin_proof,
-            str_builtin_proof,
-            isinstance_builtin_proof,
-            hasattr_builtin_proof,
-            initial_work,
-        ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete {
-                value,
-                initial_work,
-                ..
-            } => (
-                value.specs,
-                value.class_names,
-                value.class_constructors,
-                value.range_builtin_proof,
-                value.exception_builtin_proof,
-                value.str_builtin_proof,
-                value.isinstance_builtin_proof,
-                value.hasattr_builtin_proof,
-                initial_work,
-            ),
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            ProcedureEnumeration::Cancelled { work } => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work,
-                });
-            }
-        };
+        let (specs, class_names, class_constructors, builtin_proofs, initial_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    value,
+                    initial_work,
+                    ..
+                } => (
+                    value.specs,
+                    value.class_names,
+                    value.class_constructors,
+                    value.builtin_proofs,
+                    initial_work,
+                ),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
@@ -103,11 +94,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     spec,
                     &class_names,
                     &class_constructors,
-                    range_builtin_proof,
-                    exception_builtin_proof,
-                    str_builtin_proof,
-                    isinstance_builtin_proof,
-                    hasattr_builtin_proof,
+                    builtin_proofs,
                     staged_budget,
                     cancellation,
                 )
@@ -173,11 +160,20 @@ struct PythonProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     class_names: HashSet<Box<str>>,
     class_constructors: HashMap<Box<str>, ProcedureId>,
-    range_builtin_proof: bool,
-    exception_builtin_proof: bool,
-    str_builtin_proof: bool,
-    isinstance_builtin_proof: bool,
-    hasattr_builtin_proof: bool,
+    builtin_proofs: PythonBuiltinProofs,
+}
+
+/// Whether each builtin this lowering reads still denotes its builtin at the
+/// module level. A module binding of the same name, or a wildcard import that
+/// could introduce one, removes the proof for that name alone.
+#[derive(Debug, Clone, Copy)]
+struct PythonBuiltinProofs {
+    range: bool,
+    exception: bool,
+    str: bool,
+    isinstance: bool,
+    hasattr: bool,
+    r#type: bool,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<PythonProcedureInventory<'tree>>;
@@ -383,13 +379,15 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    let range_builtin_proof = !module_bindings.contains_key("range") && !module_wildcard_import;
-    let exception_builtin_proof =
-        !module_bindings.contains_key("Exception") && !module_wildcard_import;
-    let str_builtin_proof = !module_bindings.contains_key("str") && !module_wildcard_import;
-    let isinstance_builtin_proof =
-        !module_bindings.contains_key("isinstance") && !module_wildcard_import;
-    let hasattr_builtin_proof = !module_bindings.contains_key("hasattr") && !module_wildcard_import;
+    let unshadowed = |name: &str| !module_bindings.contains_key(name) && !module_wildcard_import;
+    let builtin_proofs = PythonBuiltinProofs {
+        range: unshadowed("range"),
+        exception: unshadowed("Exception"),
+        str: unshadowed("str"),
+        isinstance: unshadowed("isinstance"),
+        hasattr: unshadowed("hasattr"),
+        r#type: unshadowed("type"),
+    };
     let class_names = module_bindings
         .into_iter()
         .filter_map(|(name, kind)| {
@@ -417,11 +415,7 @@ fn enumerate_procedures<'tree>(
         specs,
         class_names,
         class_constructors,
-        range_builtin_proof,
-        exception_builtin_proof,
-        str_builtin_proof,
-        isinstance_builtin_proof,
-        hasattr_builtin_proof,
+        builtin_proofs,
     }))
 }
 
@@ -616,6 +610,13 @@ fn callable_shape<'tree>(
             },
             dispatch_extensibility,
             call_boundary,
+            receiver_binding: if formal_parameter_slots_for_owner(Language::Python, node, source)
+                .is_some_and(|layout| layout.python_binding == Some(PythonMethodBinding::Class))
+            {
+                crate::analyzer::semantic::ProcedureReceiverBinding::Class
+            } else {
+                crate::analyzer::semantic::ProcedureReceiverBinding::Instance
+            },
         },
     ))
 }
@@ -798,10 +799,7 @@ struct LoweringContext<'tree, 'targets> {
     enclosing_class: Option<Box<str>>,
     class_names: &'targets HashSet<Box<str>>,
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
-    range_builtin_proof: bool,
-    str_builtin_proof: bool,
-    isinstance_builtin_proof: bool,
-    hasattr_builtin_proof: bool,
+    builtin_proofs: PythonBuiltinProofs,
     bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
@@ -812,11 +810,7 @@ fn lower_procedure<'tree, 'targets>(
     spec: &ProcedureSpec<'tree>,
     class_names: &'targets HashSet<Box<str>>,
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
-    range_builtin_proof: bool,
-    exception_builtin_proof: bool,
-    str_builtin_proof: bool,
-    isinstance_builtin_proof: bool,
-    hasattr_builtin_proof: bool,
+    builtin_proofs: PythonBuiltinProofs,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -863,15 +857,12 @@ fn lower_procedure<'tree, 'targets>(
         enclosing_class: enclosing_class_name(prepared.source(), spec.callable).map(Into::into),
         class_names,
         class_constructors,
-        range_builtin_proof,
-        str_builtin_proof,
-        isinstance_builtin_proof,
-        hasattr_builtin_proof,
+        builtin_proofs,
         bindings,
         cleanups: Vec::new(),
     };
     let proven_instance_fields =
-        instance_field_proofs(prepared, prepared.source(), exception_builtin_proof);
+        instance_field_proofs(prepared, prepared.source(), builtin_proofs.exception);
     let HeapBindingProofs {
         known_lists,
         known_instances,
@@ -2432,6 +2423,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// The binding a condition reads when the condition is a walrus assignment.
+    ///
+    /// `if (origin := detect()):` and `if (m := match()) is None:` state a fact
+    /// about the bound name. The walrus lowers the name and the expression's
+    /// own result as two assignments from one source, so the result temporary
+    /// has no path back to the binding and narrowing finds no binding to
+    /// constrain. Name the binding instead.
+    fn walrus_binding_value(&self, node: Node<'tree>) -> Option<ValueId> {
+        let mut node = node;
+        while node.kind() == "parenthesized_expression" {
+            node = first_runtime_named_child(node)?;
+        }
+        if node.kind() != "named_expression" {
+            return None;
+        }
+        let name = node.child_by_field_name("name")?;
+        if name.kind() != "identifier" {
+            return None;
+        }
+        self.binding_value(node_text(self.prepared.source(), name)?)
+    }
+
     fn normalize_guard(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2439,7 +2452,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(GuardPredicate, Option<ValueId>), PythonLoweringError> {
         let arguments = call_arguments(node);
         if arguments.len() == 2
-            && self.proven_builtin_call(node, "isinstance", self.isinstance_builtin_proof)
+            && self.proven_builtin_call(node, "isinstance", self.builtin_proofs.isinstance)
         {
             let value_node = python_argument_value_node(arguments[0]);
             let classes_node = python_argument_value_node(arguments[1]);
@@ -2451,7 +2464,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok((GuardPredicate::InstanceOf { value, classes }, Some(subject)));
         }
         if arguments.len() == 2
-            && self.proven_builtin_call(node, "hasattr", self.hasattr_builtin_proof)
+            && self.proven_builtin_call(node, "hasattr", self.builtin_proofs.hasattr)
         {
             let value_node = python_argument_value_node(arguments[0]);
             let member_node = python_argument_value_node(arguments[1]);
@@ -2462,13 +2475,69 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let subject = self.expression_value(builder, node, expression_value_kind(node))?;
             return Ok((GuardPredicate::HasMember { value, member }, Some(subject)));
         }
+        if let Some(binding) = self.walrus_binding_value(node) {
+            return Ok((GuardPredicate::Truthy { value: binding }, Some(binding)));
+        }
         let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        // A condition that is a reference is read for its truth, and the
+        // subject value is that reference. A call or an operator names its own
+        // temporary, whose truth says nothing about any operand.
+        if matches!(node.kind(), "identifier" | "attribute") {
+            return Ok((GuardPredicate::Truthy { value: subject }, Some(subject)));
+        }
         Ok((
             GuardPredicate::Opaque {
                 digest: GuardConditionDigest::from_syntax_kind(node.kind()),
             },
             Some(subject),
         ))
+    }
+
+    /// The subject and classes operands of a `type(value) is C` or
+    /// `type(value) in (A, B)` condition.
+    ///
+    /// Only these two operators name the runtime class. The grammar spells
+    /// `is not` as one operator token, and it means the opposite arm, which
+    /// this predicate does not carry. `==` runs a metaclass `__eq__` that can
+    /// answer anything. A comparison chain carries more than one operator
+    /// token and states more than one relation, so it is not this shape.
+    fn exact_class_comparison(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, Node<'tree>, bool)> {
+        if node.kind() != "comparison_operator" {
+            return None;
+        }
+        let mut cursor = node.walk();
+        let operators = node
+            .children_by_field_name("operators", &mut cursor)
+            .map(|operator| operator.kind())
+            .collect::<Vec<_>>();
+        let exact_on_true = match operators.as_slice() {
+            ["is"] | ["in"] => true,
+            ["is not"] | ["not in"] => false,
+            _ => return None,
+        };
+        // The grammar gives a comparison no operand fields: its named children
+        // are the operands in source order.
+        let operands = named_children(node);
+        let [left, right] = operands.as_slice() else {
+            return None;
+        };
+        if !self.proven_builtin_call(*left, "type", self.builtin_proofs.r#type) {
+            return None;
+        }
+        let arguments = call_arguments(*left);
+        let [argument] = arguments.as_slice() else {
+            return None;
+        };
+        if matches!(
+            argument.kind(),
+            "keyword_argument" | "list_splat" | "dictionary_splat"
+        ) {
+            return None;
+        }
+        Some((*argument, *right, exact_on_true))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3062,6 +3131,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment" | "named_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
+            "augmented_assignment" => {
+                self.augmented_assignment_expression(builder, node, entry, next, scope, stack)
+            }
             "list" | "set" | "dictionary" => {
                 self.session
                     .add_allocation(builder, entry, result, AllocationKind::Object)?;
@@ -3108,8 +3180,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "augmented_assignment"
-            | "expression_list"
+            "expression_list"
             | "pair"
             | "slice"
             | "argument_list"
@@ -3152,221 +3223,141 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
-        let (binding, source_node) = if node.kind() == "named_expression" {
+        let (bindings, source_node) = if node.kind() == "named_expression" {
             (
-                node.child_by_field_name("name"),
+                node.child_by_field_name("name").into_iter().collect(),
                 node.child_by_field_name("value"),
             )
         } else {
-            (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            )
+            let (bindings, source) = assignment_chain(node);
+            (bindings, source)
         };
-        let proven_heap_store = binding.is_some_and(|binding| match binding.kind() {
-            "attribute" => binding
-                .child_by_field_name("object")
-                .zip(binding.child_by_field_name("attribute"))
-                .is_some_and(|(object, attribute)| {
-                    self.proven_instance_attribute(node, object, attribute)
-                }),
-            "subscript" => binding
-                .child_by_field_name("value")
-                .zip(binding.child_by_field_name("subscript"))
-                .is_some_and(|(value, index)| self.proven_list_index(node, value, index)),
-            _ => false,
-        });
-        let proven_local_instance = binding.zip(source_node).is_some_and(|(binding, source)| {
-            self.proven_local_instance_initialization(binding, source)
-        });
-        let structured_call_assignment = binding
-            .is_some_and(|binding| binding.kind() == "identifier")
-            && source_node.is_some_and(|source| source.kind() == "call");
-        let boundary = self.point(builder, node, Vec::new())?;
-        match (binding, source_node) {
-            (Some(binding), Some(source_node)) if binding.kind() == "identifier" => {
-                let name = node_text(self.prepared.source(), binding).ok_or_else(|| {
-                    PythonLoweringError::Invalid(
-                        "Python assignment has an invalid identifier range".into(),
-                    )
-                })?;
-                if let Some(target) = self.binding_value(name) {
-                    let source = self.expression_value(
-                        builder,
-                        source_node,
-                        expression_value_kind(source_node),
-                    )?;
-                    self.append_effect(
-                        builder,
-                        boundary,
-                        SemanticEffect::Assignment {
-                            target,
-                            value: source,
-                        },
-                    )?;
-                    let kind = if Some(target) == self.receiver {
-                        ValueFlowKind::Receiver
-                    } else if self.locals.get(name) == Some(&target) {
-                        ValueFlowKind::Local
-                    } else {
-                        ValueFlowKind::Parameter
-                    };
-                    self.append_effect(
-                        builder,
-                        boundary,
-                        SemanticEffect::ValueFlow {
-                            kind,
-                            source,
-                            target,
-                        },
-                    )?;
-                    if node.kind() == "named_expression" {
-                        let result =
-                            self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-                        self.append_effect(
-                            builder,
-                            boundary,
-                            SemanticEffect::Assignment {
-                                target: result,
-                                value: source,
-                            },
-                        )?;
+        let suppresses_implicit_exception = bindings.len() == 1
+            && source_node.is_some_and(|source| {
+                let binding = bindings[0];
+                match binding.kind() {
+                    "attribute" => binding
+                        .child_by_field_name("object")
+                        .zip(binding.child_by_field_name("attribute"))
+                        .is_some_and(|(object, attribute)| {
+                            self.proven_instance_attribute(node, object, attribute)
+                        }),
+                    "subscript" => binding
+                        .child_by_field_name("value")
+                        .zip(binding.child_by_field_name("subscript"))
+                        .is_some_and(|(value, index)| self.proven_list_index(node, value, index)),
+                    "identifier" => {
+                        self.proven_local_instance_initialization(binding, source)
+                            || source.kind() == "call"
                     }
+                    _ => false,
                 }
-            }
-            (Some(binding), Some(source_node)) if binding.kind() == "attribute" => {
-                let object = required_field(binding, "object")?;
-                let attribute = required_field(binding, "attribute")?;
-                let source = self.expression_value(
-                    builder,
-                    source_node,
-                    expression_value_kind(source_node),
-                )?;
-                let Some(member) = self.memory_member_locator(attribute)? else {
-                    self.add_gap(
-                        builder,
-                        boundary,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::Assignments,
-                        SemanticGapKind::Unsupported,
-                        "Python attribute assignment requires a structured identifier member",
-                    )?;
-                    self.edge(builder, boundary, next)?;
-                    let children = runtime_expression_children(node);
-                    return self.schedule_expressions(
-                        builder,
-                        entry,
-                        &children,
-                        EdgeTarget::normal(boundary),
-                        scope,
-                        stack,
-                    );
-                };
-                let base = self.expression_value(builder, object, expression_value_kind(object))?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    boundary,
-                    MemoryLocationKind::Field { base, member },
-                )?;
-                if !self.proven_instance_attribute(node, object, attribute) {
-                    self.add_gap(
-                        builder,
-                        boundary,
-                        SemanticGapSubject::MemoryLocation(location),
-                        SemanticCapability::Calls,
-                        SemanticGapKind::Unknown,
-                        "descriptor or special-method invocation requires type refinement",
-                    )?;
-                }
-                self.append_effect(
-                    builder,
-                    boundary,
-                    SemanticEffect::MemoryStore {
-                        kind: MemoryAccessKind::Field,
-                        location,
-                        value: source,
-                    },
-                )?;
-            }
-            (Some(binding), Some(source_node)) if binding.kind() == "subscript" => {
-                let value_node = required_field(binding, "value")?;
-                let subscript = required_field(binding, "subscript")?;
-                let source = self.expression_value(
-                    builder,
-                    source_node,
-                    expression_value_kind(source_node),
-                )?;
-                let base =
-                    self.expression_value(builder, value_node, expression_value_kind(value_node))?;
-                let index = self.constant_index_value(builder, subscript)?;
-                let location = self.session.add_memory_location(
-                    builder,
-                    boundary,
-                    MemoryLocationKind::Index {
-                        base,
-                        index,
-                        constant_index: None,
-                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
-                    },
-                )?;
-                if !self.proven_list_index(node, value_node, subscript) {
-                    self.add_gap(
-                        builder,
-                        boundary,
-                        SemanticGapSubject::MemoryLocation(location),
-                        SemanticCapability::Calls,
-                        SemanticGapKind::Unknown,
-                        "subscription special-method invocation requires type refinement",
-                    )?;
-                }
-                if index.is_none() {
-                    self.add_dynamic_index_gap(builder, boundary, location)?;
-                }
-                self.append_effect(
-                    builder,
-                    boundary,
-                    SemanticEffect::MemoryStore {
-                        kind: MemoryAccessKind::Index,
-                        location,
-                        value: source,
-                    },
-                )?;
-            }
-            (Some(_), Some(_)) => {
-                self.add_gap(
-                    builder,
-                    boundary,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Assignments,
-                    SemanticGapKind::Unsupported,
-                    "Python unpacking assignment identity is not yet lowered",
-                )?;
-            }
-            _ => {
-                self.add_gap(
-                    builder,
-                    boundary,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Assignments,
-                    SemanticGapKind::Unknown,
-                    "Python assignment is missing a structured binding or value",
-                )?;
-            }
-        }
-        if operation_can_throw_implicitly(node)
-            && !proven_heap_store
-            && !proven_local_instance
-            && !structured_call_assignment
+            });
+        let boundary = self.point(builder, node, Vec::new())?;
+        let completion = if let Some(source_node) = source_node
+            && !bindings.is_empty()
+            && bindings
+                .iter()
+                .all(|binding| is_assignment_target(*binding))
         {
+            let mut completion = boundary;
+            for binding in bindings {
+                completion = self.append_target_source_assignments(
+                    builder,
+                    completion,
+                    node,
+                    binding,
+                    Some(source_node),
+                    PYTHON_UNKNOWN_UNPACK_ELEMENT,
+                    scope,
+                    stack,
+                )?;
+            }
+            if node.kind() == "named_expression" {
+                let source = self.expression_value(
+                    builder,
+                    source_node,
+                    expression_value_kind(source_node),
+                )?;
+                let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    completion,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+            }
+            completion
+        } else {
+            self.add_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Python assignment is missing a structured writable target or value",
+            )?;
+            boundary
+        };
+        if operation_can_throw_implicitly(node) && !suppresses_implicit_exception {
             self.implicit_exception_gap(builder, boundary, node)?;
         }
-        self.edge(builder, boundary, next)?;
-        let children = runtime_expression_children(node);
+        self.edge(builder, completion, next)?;
+        // The entire RHS executes before unpacking or target evaluation.
+        // Its own lowering publishes any call, allocation, or exceptional edge.
+        let sources = source_node.into_iter().collect::<Vec<_>>();
         self.schedule_expressions(
             builder,
             entry,
-            &children,
+            &sources,
             EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn augmented_assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let target = required_field(node, "left")?;
+        let rhs = required_field(node, "right")?;
+        if !matches!(
+            target.kind(),
+            "identifier" | "keyword_identifier" | "attribute" | "subscript"
+        ) {
+            return self.unhandled_control_syntax(builder, node, entry, next);
+        }
+
+        let operation = self.point(builder, node, Vec::new())?;
+        self.implicit_exception_gap(builder, operation, node)?;
+        self.add_gap(
+            builder,
+            operation,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "augmented-assignment operator dispatch requires type refinement",
+        )?;
+        let result =
+            self.unknown_target_value(builder, node, PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT)?;
+        let store = self.point(builder, target, Vec::new())?;
+        self.append_target_assignment(builder, store, node, target, result)?;
+        self.edge(builder, operation, EdgeTarget::normal(store))?;
+        self.edge(builder, store, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[target, rhs],
+            EdgeTarget::normal(operation),
             scope,
             stack,
         )
@@ -3393,6 +3384,241 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             &self.proven_instance_fields,
         )
         .is_some_and(|class_name| class_name.as_ref() == expected_class.as_ref())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_target_source_assignments(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+        target: Node<'tree>,
+        source: Option<Node<'tree>>,
+        unknown_kind: &str,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, PythonLoweringError> {
+        let steps = assignment_target_steps(target, source);
+        if steps.is_empty()
+            || !steps
+                .iter()
+                .any(|step| matches!(step, AssignmentTargetStep::Leaf { .. }))
+        {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "Python assignment target has no structured writable leaves",
+            )?;
+            return Ok(point);
+        }
+        let mut previous = point;
+        for step in steps {
+            match step {
+                AssignmentTargetStep::UnpackBoundary { target, may_fail } => {
+                    let unpack_point = self.point(builder, target, Vec::new())?;
+                    self.edge(builder, previous, EdgeTarget::normal(unpack_point))?;
+                    if may_fail {
+                        self.implicit_exception_gap(builder, unpack_point, target)?;
+                    }
+                    previous = unpack_point;
+                }
+                AssignmentTargetStep::Leaf { target, source } => {
+                    let target_point = self.point(builder, target, Vec::new())?;
+                    let value = match source {
+                        Some(source) => {
+                            self.expression_value(builder, source, expression_value_kind(source))?
+                        }
+                        None => self.unknown_target_value(builder, target, unknown_kind)?,
+                    };
+                    self.append_target_assignment(builder, target_point, access, target, value)?;
+                    match target.kind() {
+                        "attribute"
+                            if !self.proven_instance_attribute(
+                                access,
+                                required_field(target, "object")?,
+                                required_field(target, "attribute")?,
+                            ) =>
+                        {
+                            self.implicit_exception_gap(builder, target_point, target)?;
+                        }
+                        "subscript"
+                            if !self.proven_list_index(
+                                access,
+                                required_field(target, "value")?,
+                                required_field(target, "subscript")?,
+                            ) =>
+                        {
+                            self.implicit_exception_gap(builder, target_point, target)?;
+                        }
+                        _ => {}
+                    }
+                    let runtime = assignment_target_runtime_nodes(target);
+                    self.schedule_expressions(
+                        builder,
+                        previous,
+                        &runtime,
+                        EdgeTarget::normal(target_point),
+                        scope,
+                        stack,
+                    )?;
+                    previous = target_point;
+                }
+            }
+        }
+        Ok(previous)
+    }
+
+    fn unknown_target_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        target: Node<'tree>,
+        kind: &str,
+    ) -> Result<ValueId, PythonLoweringError> {
+        let metadata = self.value_mapping(builder, target)?;
+        self.session.add_value_with_metadata(
+            builder,
+            metadata,
+            SemanticValueKind::LanguageDefined(kind.into()),
+        )
+    }
+
+    fn append_target_assignment(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+        target: Node<'tree>,
+        value: ValueId,
+    ) -> Result<(), PythonLoweringError> {
+        match target.kind() {
+            "identifier" | "keyword_identifier" => {
+                let name = node_text(self.prepared.source(), target).ok_or_else(|| {
+                    PythonLoweringError::Invalid(
+                        "Python assignment has an invalid identifier range".into(),
+                    )
+                })?;
+                let Some(target_value) = self.binding_value(name) else {
+                    return Ok(());
+                };
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::Assignment {
+                        target: target_value,
+                        value,
+                    },
+                )?;
+                let kind = if Some(target_value) == self.receiver {
+                    ValueFlowKind::Receiver
+                } else if self.locals.get(name) == Some(&target_value) {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::Parameter
+                };
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: value,
+                        target: target_value,
+                    },
+                )?;
+            }
+            "attribute" => {
+                let object = required_field(target, "object")?;
+                let attribute = required_field(target, "attribute")?;
+                let Some(member) = self.memory_member_locator(attribute)? else {
+                    self.add_gap(
+                        builder,
+                        point,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unsupported,
+                        "Python attribute assignment requires a structured identifier member",
+                    )?;
+                    return Ok(());
+                };
+                let base = self.expression_value(builder, object, expression_value_kind(object))?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Field { base, member },
+                )?;
+                if !self.proven_instance_attribute(access, object, attribute) {
+                    self.add_gap(
+                        builder,
+                        point,
+                        SemanticGapSubject::MemoryLocation(location),
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "descriptor or special-method invocation requires type refinement",
+                    )?;
+                }
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Field,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+            "subscript" => {
+                let value_node = required_field(target, "value")?;
+                let subscript = required_field(target, "subscript")?;
+                let base =
+                    self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+                let index = self.constant_index_value(builder, subscript)?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Index {
+                        base,
+                        index,
+                        constant_index: None,
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    },
+                )?;
+                if !self.proven_list_index(access, value_node, subscript) {
+                    self.add_gap(
+                        builder,
+                        point,
+                        SemanticGapSubject::MemoryLocation(location),
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unknown,
+                        "subscription special-method invocation requires type refinement",
+                    )?;
+                }
+                if index.is_none() {
+                    self.add_dynamic_index_gap(builder, point, location)?;
+                }
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+            _ => {
+                self.add_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "Python assignment target is not a structured writable target",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3492,11 +3718,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 operands[index + 1].kind(),
             ) {
                 ("is" | "is not", "none", right) if right != "none" => {
-                    let subject = self.expression_value(
-                        builder,
-                        operands[index + 1],
-                        expression_value_kind(operands[index + 1]),
-                    )?;
+                    let subject = match self.walrus_binding_value(operands[index + 1]) {
+                        Some(binding) => binding,
+                        None => self.expression_value(
+                            builder,
+                            operands[index + 1],
+                            expression_value_kind(operands[index + 1]),
+                        )?,
+                    };
                     (
                         GuardPredicate::NullComparison {
                             null_on_true: operator.kind() == "is",
@@ -3505,11 +3734,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )
                 }
                 ("is" | "is not", left, "none") if left != "none" => {
-                    let subject = self.expression_value(
-                        builder,
-                        operands[index],
-                        expression_value_kind(operands[index]),
-                    )?;
+                    let subject = match self.walrus_binding_value(operands[index]) {
+                        Some(binding) => binding,
+                        None => self.expression_value(
+                            builder,
+                            operands[index],
+                            expression_value_kind(operands[index]),
+                        )?,
+                    };
                     (
                         GuardPredicate::NullComparison {
                             null_on_true: operator.kind() == "is",
@@ -3518,14 +3750,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )
                 }
                 _ => {
-                    let subject =
-                        self.expression_value(builder, node, expression_value_kind(node))?;
-                    (
-                        GuardPredicate::Opaque {
-                            digest: GuardConditionDigest::from_syntax_kind(node.kind()),
-                        },
-                        Some(subject),
-                    )
+                    if let Some((value_node, classes_node, exact_on_true)) =
+                        self.exact_class_comparison(node)
+                    {
+                        let value_node = python_argument_value_node(value_node);
+                        let value = self.expression_value(
+                            builder,
+                            value_node,
+                            expression_value_kind(value_node),
+                        )?;
+                        let classes = self.expression_value(
+                            builder,
+                            classes_node,
+                            expression_value_kind(classes_node),
+                        )?;
+                        let subject =
+                            self.expression_value(builder, node, expression_value_kind(node))?;
+                        (
+                            GuardPredicate::ExactClass {
+                                value,
+                                classes,
+                                exact_on_true,
+                            },
+                            Some(subject),
+                        )
+                    } else {
+                        let subject =
+                            self.expression_value(builder, node, expression_value_kind(node))?;
+                        (
+                            GuardPredicate::Opaque {
+                                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                            },
+                            Some(subject),
+                        )
+                    }
                 }
             };
             self.session.add_guard_fact(
@@ -3857,7 +4115,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let test = self.point(builder, node, Vec::new())?;
         let binding_entry = self.point(builder, binding, Vec::new())?;
         let binding_boundary = self.point(builder, binding, Vec::new())?;
-        let binding_runtime = assignment_target_runtime_nodes(binding);
         let body_entry = self.point(builder, body, Vec::new())?;
         let first_iteration = self.builtin_range_has_first_iteration(iterable);
         let alternative_entry = alternative
@@ -3909,6 +4166,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "iteration-target evaluation, unpacking, and assignment failures are not lowered",
             )?;
         }
+        let iteration_source = single_literal_sequence_element(iterable);
+        let unknown_kind = if is_unpacking_target(binding) {
+            PYTHON_UNKNOWN_UNPACK_ELEMENT
+        } else {
+            PYTHON_UNKNOWN_ITERATION_ELEMENT
+        };
+        let binding_completion = self.append_target_source_assignments(
+            builder,
+            binding_boundary,
+            node,
+            binding,
+            iteration_source,
+            unknown_kind,
+            loop_scope,
+            stack,
+        )?;
         self.edge(
             builder,
             test,
@@ -3925,7 +4198,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalFalse,
             },
         )?;
-        self.edge(builder, binding_boundary, EdgeTarget::normal(body_entry))?;
+        self.edge(builder, binding_completion, EdgeTarget::normal(body_entry))?;
         if let (Some(alternative), Some(alternative_entry)) = (alternative, alternative_entry) {
             stack.push(Work::Statement {
                 node: alternative,
@@ -3943,14 +4216,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: loop_scope,
         });
-        self.schedule_expressions(
-            builder,
-            binding_entry,
-            &binding_runtime,
-            EdgeTarget::normal(binding_boundary),
-            loop_scope,
-            stack,
-        )?;
+        self.edge(builder, binding_entry, EdgeTarget::normal(binding_boundary))?;
         if first_iteration {
             let arguments = call_arguments(iterable);
             self.schedule_expressions(
@@ -3978,7 +4244,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn proven_builtin_range_call(&self, call: Node<'tree>) -> bool {
-        self.proven_builtin_call(call, "range", self.range_builtin_proof)
+        self.proven_builtin_call(call, "range", self.builtin_proofs.range)
             && python_range_literal_values(self.prepared.source(), call)
                 .is_some_and(|values| !matches!(values.as_slice(), [_, _, step] if *step == 0))
     }
@@ -4001,7 +4267,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// lexically unbound. This is the same proof shape as
     /// [`Self::proven_builtin_range_call`].
     fn proven_builtin_str_call(&self, call: Node<'tree>) -> bool {
-        self.proven_builtin_call(call, "str", self.str_builtin_proof)
+        self.proven_builtin_call(call, "str", self.builtin_proofs.str)
     }
 
     /// Lower a proven builtin `str(...)` call as a modeled boundary instead of
@@ -4476,12 +4742,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let receiver_node = python_call_receiver(function);
-        let receiver = receiver_node
-            .map(|receiver| {
-                self.expression_value(builder, receiver, expression_value_kind(receiver))
-            })
-            .transpose()?;
-        let callable_kind = if receiver.is_some() {
+        let qualifier = if let Some(receiver) = receiver_node
+            && receiver.kind() == "identifier"
+            && self.module_class_fallback_allowed(builder, receiver)?
+        {
+            Some(self.expression_value(builder, receiver, expression_value_kind(receiver))?)
+        } else {
+            None
+        };
+        let receiver = if qualifier.is_some() {
+            None
+        } else {
+            receiver_node
+                .map(|receiver| {
+                    self.expression_value(builder, receiver, expression_value_kind(receiver))
+                })
+                .transpose()?
+        };
+        let callable_kind = if let Some(qualifier) = qualifier {
+            CallableReferenceKind::TypeQualifiedMethod { qualifier }
+        } else if receiver.is_some() {
             CallableReferenceKind::BoundMethod
         } else {
             CallableReferenceKind::Function
@@ -5104,9 +5384,9 @@ fn python_binding_name_node<'tree>(
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     match node.kind() {
         "lambda" => SemanticValueKind::Callable,
-        "integer" | "float" | "true" | "false" | "none" | "ellipsis" | "string" => {
-            SemanticValueKind::Constant
-        }
+        "true" => SemanticValueKind::Boolean(true),
+        "false" => SemanticValueKind::Boolean(false),
+        "integer" | "float" | "none" | "ellipsis" | "string" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
     }
 }
@@ -5201,7 +5481,11 @@ fn assignment_target_runtime_nodes(target: Node<'_>) -> Vec<Node<'_>> {
     let mut stack = vec![target];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "attribute" | "subscript" => result.push(node),
+            "attribute" => result.extend(children_by_field_name(node, "object")),
+            "subscript" => {
+                result.extend(children_by_field_name(node, "value"));
+                result.extend(children_by_field_name(node, "subscript"));
+            }
             "identifier" | "keyword_identifier" => {}
             _ => {
                 let children = named_children(node);
@@ -5212,6 +5496,159 @@ fn assignment_target_runtime_nodes(target: Node<'_>) -> Vec<Node<'_>> {
         }
     }
     result
+}
+
+fn is_unpacking_target(target: Node<'_>) -> bool {
+    matches!(
+        target.kind(),
+        "pattern_list" | "tuple_pattern" | "list_pattern"
+    )
+}
+
+fn is_assignment_target(target: Node<'_>) -> bool {
+    matches!(
+        target.kind(),
+        "identifier"
+            | "keyword_identifier"
+            | "attribute"
+            | "subscript"
+            | "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+    )
+}
+
+/// Flatten Python's right-recursive chained-assignment grammar into runtime
+/// target order. The deepest right-hand expression executes once, followed
+/// by each target from left to right.
+fn assignment_chain<'tree>(node: Node<'tree>) -> (Vec<Node<'tree>>, Option<Node<'tree>>) {
+    let mut targets = Vec::new();
+    let mut assignment = node;
+    loop {
+        let Some(target) = assignment.child_by_field_name("left") else {
+            return (targets, None);
+        };
+        targets.push(target);
+        let Some(rhs) = assignment.child_by_field_name("right") else {
+            return (targets, None);
+        };
+        if rhs.kind() != "assignment" {
+            return (targets, Some(rhs));
+        }
+        assignment = rhs;
+    }
+}
+
+enum AssignmentTargetStep<'tree> {
+    UnpackBoundary {
+        target: Node<'tree>,
+        may_fail: bool,
+    },
+    Leaf {
+        target: Node<'tree>,
+        source: Option<Node<'tree>>,
+    },
+}
+
+fn assignment_target_steps<'tree>(
+    target: Node<'tree>,
+    source: Option<Node<'tree>>,
+) -> Vec<AssignmentTargetStep<'tree>> {
+    let mut result = Vec::new();
+    let mut stack = vec![(target, source)];
+    while let Some((target, source)) = stack.pop() {
+        match target.kind() {
+            "identifier" | "keyword_identifier" | "attribute" | "subscript" => {
+                result.push(AssignmentTargetStep::Leaf { target, source });
+            }
+            "list_splat_pattern" => {
+                let children = named_children(target);
+                if let Some(child) = children.first().copied() {
+                    stack.push((child, None));
+                }
+            }
+            "pattern_list" | "tuple_pattern" | "list_pattern" => {
+                let targets = named_children(target);
+                let (sources, may_fail) = assignment_target_sources(&targets, source);
+                result.push(AssignmentTargetStep::UnpackBoundary { target, may_fail });
+                for (target, source) in targets.into_iter().zip(sources).rev() {
+                    stack.push((target, source));
+                }
+            }
+            _ => {
+                let children = named_children(target);
+                for child in children.into_iter().rev() {
+                    stack.push((child, None));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn assignment_target_sources<'tree>(
+    targets: &[Node<'tree>],
+    source: Option<Node<'tree>>,
+) -> (Vec<Option<Node<'tree>>>, bool) {
+    let Some(sources) = source.and_then(unpack_source_children) else {
+        return (vec![None; targets.len()], true);
+    };
+    let starred = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| target.kind() == "list_splat_pattern")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if starred.len() > 1 {
+        return (vec![None; targets.len()], true);
+    }
+    let Some(&starred_index) = starred.first() else {
+        return if sources.len() == targets.len() {
+            (sources.into_iter().map(Some).collect(), false)
+        } else {
+            (vec![None; targets.len()], true)
+        };
+    };
+
+    let fixed_count = targets.len().saturating_sub(1);
+    if sources.len() < fixed_count {
+        return (vec![None; targets.len()], true);
+    }
+    let suffix_count = targets.len() - starred_index - 1;
+    let mut result = vec![None; targets.len()];
+    for (target, source) in result.iter_mut().zip(&sources).take(starred_index) {
+        *target = Some(*source);
+    }
+    for index in 0..suffix_count {
+        let target_index = starred_index + 1 + index;
+        let source_index = sources.len() - suffix_count + index;
+        result[target_index] = sources.get(source_index).copied();
+    }
+    (result, false)
+}
+
+fn unpack_source_children<'tree>(source: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    let mut source = source;
+    while source.kind() == "parenthesized_expression" {
+        source = first_runtime_named_child(source)?;
+    }
+    if !matches!(source.kind(), "expression_list" | "list" | "tuple") {
+        return None;
+    }
+    let children = runtime_expression_children(source);
+    (!children
+        .iter()
+        .any(|child| matches!(child.kind(), "list_splat" | "parenthesized_list_splat")))
+    .then_some(children)
+}
+
+fn single_literal_sequence_element<'tree>(source: Node<'tree>) -> Option<Node<'tree>> {
+    unpack_source_children(source).and_then(|children| {
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        Some(*child)
+    })
 }
 
 fn binding_requires_runtime_protocol(binding: Node<'_>) -> bool {
@@ -5756,6 +6193,197 @@ mod tests {
         assert!(assignments.contains(&(inner, parenthesized)));
         assert!(flows.contains(&(parenthesized, outer)));
         assert!(flows.iter().all(|(_, target)| *target != unrelated_literal));
+    }
+
+    #[test]
+    fn unpacking_assignment_publishes_rhs_values_in_target_order() {
+        let source = "def swap(left, right):\n    left, right = right, left\n    return left\n";
+        let parts = lower_fixture_named(source, Some("swap"));
+        let tree = parse(source);
+        let function = first_node_of_kind(&tree, "function_definition");
+        let body = function.child_by_field_name("body").expect("function body");
+        let assignment =
+            first_assignment_with_left_kind(body, "pattern_list", Some("expression_list"));
+        let left = assignment
+            .child_by_field_name("left")
+            .expect("assignment target");
+        let right = assignment
+            .child_by_field_name("right")
+            .expect("assignment source");
+        let targets = named_children(left);
+        let sources = named_children(right);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(sources.len(), 2);
+        let parameters = function
+            .child_by_field_name("parameters")
+            .expect("function parameters");
+        let parameters = named_children(parameters);
+        let target_left = value_for_node(
+            &parts,
+            parameters[0],
+            SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::One,
+                name: Some("left".into()),
+                passing_mode: FormalParameterPassingMode::PositionalOrNamed,
+            },
+        );
+        let target_right = value_for_node(
+            &parts,
+            parameters[1],
+            SemanticValueKind::Parameter {
+                ordinal: 1,
+                multiplicity: FormalMultiplicity::One,
+                name: Some("right".into()),
+                passing_mode: FormalParameterPassingMode::PositionalOrNamed,
+            },
+        );
+        let source_right = value_for_node(&parts, sources[0], SemanticValueKind::Temporary);
+        let source_left = value_for_node(&parts, sources[1], SemanticValueKind::Temporary);
+        let assignments = parts
+            .points
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } => Some((target, value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(assignments.contains(&(target_left, source_right)));
+        assert!(assignments.contains(&(target_right, source_left)));
+    }
+
+    #[test]
+    fn literal_tuple_unpacking_retains_each_element_identity() {
+        let source =
+            "def unpack(left, right):\n    first, second = (left, right)\n    return first\n";
+        let parts = lower_fixture_named(source, Some("unpack"));
+        let tree = parse(source);
+        let function = first_node_of_kind(&tree, "function_definition");
+        let body = function.child_by_field_name("body").expect("function body");
+        let assignment = first_assignment_with_left_kind(body, "pattern_list", Some("tuple"));
+        let left = assignment
+            .child_by_field_name("left")
+            .expect("assignment target");
+        let right = assignment
+            .child_by_field_name("right")
+            .expect("assignment source");
+        let targets = named_children(left);
+        let sources = named_children(right);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(sources.len(), 2);
+        let first = value_for_node(&parts, targets[0], SemanticValueKind::Local);
+        let second = value_for_node(&parts, targets[1], SemanticValueKind::Local);
+        let left_source = value_for_node(&parts, sources[0], SemanticValueKind::Temporary);
+        let right_source = value_for_node(&parts, sources[1], SemanticValueKind::Temporary);
+        assert!(
+            parts
+                .points
+                .iter()
+                .flat_map(|point| point.events.iter())
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { target, value }
+                        if target == first && value == left_source
+                ))
+        );
+        assert!(
+            parts
+                .points
+                .iter()
+                .flat_map(|point| point.events.iter())
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { target, value }
+                        if target == second && value == right_source
+                ))
+        );
+    }
+
+    #[test]
+    fn chained_assignment_publishes_one_rhs_for_each_target() {
+        let source = "def bind():\n    first = second = \"value\"\n";
+        let parts = lower_fixture_named(source, Some("bind"));
+        let tree = parse(source);
+        let function = first_node_of_kind(&tree, "function_definition");
+        let body = function.child_by_field_name("body").expect("function body");
+        let assignment = first_assignment_with_left_kind(body, "identifier", Some("assignment"));
+        let (targets, rhs) = assignment_chain(assignment);
+        assert_eq!(targets.len(), 2);
+        let rhs = rhs.expect("the chain has a final RHS");
+        let rhs = value_for_node(&parts, rhs, SemanticValueKind::Constant);
+        let target_values = targets
+            .into_iter()
+            .map(|target| value_for_node(&parts, target, SemanticValueKind::Local))
+            .collect::<Vec<_>>();
+        for target in target_values {
+            assert!(parts.points.iter().flat_map(|point| &point.events).any(
+                |event| matches!(event.effect, SemanticEffect::Assignment { target: assigned, value } if assigned == target && value == rhs)
+            ));
+        }
+    }
+
+    #[test]
+    fn augmented_assignment_replaces_its_binding_with_an_unknown_result() {
+        let source = "def update(flag):\n    flag |= unknown()\n";
+        let parts = lower_fixture_named(source, Some("update"));
+        let unknown = parts
+            .values
+            .iter()
+            .find(|value| {
+                matches!(
+                    &value.kind,
+                    SemanticValueKind::LanguageDefined(kind)
+                        if kind.as_ref() == PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT
+                )
+            })
+            .map(|value| value.id)
+            .expect("augmented assignment has an explicit unknown result");
+        let parameter = parts
+            .values
+            .iter()
+            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+            .map(|value| value.id)
+            .expect("fixture parameter");
+        assert!(parts.points.iter().flat_map(|point| &point.events).any(
+            |event| matches!(event.effect, SemanticEffect::Assignment { target, value } if target == parameter && value == unknown)
+        ));
+    }
+
+    #[test]
+    fn unknown_for_element_replaces_the_preexisting_binding() {
+        let parts = lower_fixture_named(
+            "def consume(values):\n    for item in values:\n        use(item)\n",
+            Some("consume"),
+        );
+        let item = parts
+            .values
+            .iter()
+            .find(|value| {
+                value.kind == SemanticValueKind::Local
+                    && parts
+                        .source_mappings
+                        .get(value.source.index())
+                        .is_some_and(|mapping| mapping.locator.anchor().span().start_byte() > 0)
+            })
+            .map(|value| value.id)
+            .expect("loop target local");
+        let unknown = parts
+            .values
+            .iter()
+            .filter(|value| {
+                matches!(
+                    &value.kind,
+                    SemanticValueKind::LanguageDefined(kind)
+                        if kind.as_ref() == PYTHON_UNKNOWN_ITERATION_ELEMENT
+                )
+            })
+            .map(|value| value.id)
+            .collect::<Vec<_>>();
+        assert_eq!(unknown.len(), 1);
+        assert!(parts.points.iter().flat_map(|point| point.events.iter()).any(
+            |event| matches!(event.effect, SemanticEffect::Assignment { target, value } if target == item && unknown.contains(&value))
+        ));
     }
 
     #[test]

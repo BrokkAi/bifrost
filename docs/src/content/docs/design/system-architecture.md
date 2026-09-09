@@ -161,3 +161,78 @@ Every subsystem is expected to preserve the same invariants:
 
 The [Evidence and Result Contract](../evidence-and-results/) shows how these
 invariants appear at the client boundary.
+
+## Policy coordinator: diff-base unit reuse
+
+The policy coordinator evaluates the requested policies against a workspace
+and, for `--diff-base`, a base revision. It applies the diff join, suppressions,
+scope, and reporting after evaluation. Reuse must produce the same canonical
+report and exit status as a fresh full evaluation. Execution timings, reuse
+measurements, and work counters describe the run and are excluded from that
+comparison; finding identities, ordering, evidence, diagnostics, completeness,
+and obligations are included.
+
+### Seed units and dependencies
+
+A seed unit restricts a query's initial file enumeration to one file. It does
+not restrict subsequent caller, import, dispatch, or other cross-file lookups.
+The recorded inputs of the execution determine whether the unit remains valid.
+The coordinator enumerates the current seeds on every run, so a newly matching
+file enters evaluation even when an earlier unit returned no rows.
+
+Only exhaustive, diagnostic-free units with complete dependency evidence may
+replace full execution. The coordinator checks cumulative budgets after
+merging. A failed proof widens the query to full execution.
+
+### Ordered union composition
+
+A full union visits branches in authored order and rows within each branch in
+that branch's execution order. A repeated row key keeps its first value and
+appends later provenance traces, retaining the first sixteen traces and the
+truncation indication. These rules are observable in policy evidence and in
+relational assertions that choose a representative row.
+
+Branch order cannot be exchanged with seed-file order. In particular,
+deduplicating all branches inside each file and then concatenating files can
+choose a different first writer. Sorting the final findings cannot repair that
+lost evidence.
+
+Sliceable union trees therefore retain each leaf branch's contribution in each
+file unit until the global merge. Each row carries its authored branch path in
+both its public and detailed provenance. The merge orders contributions by
+branch path, then seed-file order, then the leaf execution's row order. Only
+then does it deduplicate keys. Item and detailed evidence move together.
+
+The invariant is: for every row key, the merged value is the first value in
+the full branch-major execution, and its provenance is the same bounded prefix
+of that execution's trace sequence, with the same truncation indication.
+Ordered union concatenation is associative, as is retaining a bounded prefix
+while propagating truncation. Flattening nested unions without intervening
+steps preserves this invariant, including when branches enumerate overlapping
+files or only one branch's results change in an edited file.
+
+The eligibility check requires union-only Set nodes with no pipeline suffix on
+those nodes, supported leaf plans, and a common seed-file comparator. A suffix
+after a Set would consume already-deduplicated rows and needs a separate proof;
+intersection and difference are not distributive over arbitrary seed files.
+These shapes remain Whole. Registration-dependent typestate, value-flow,
+taint, and witness steps, and decorator-binding projections, also remain
+Whole. Unions containing `absent_member` are also excluded: that operation
+merges caller-root evidence into the value itself, which cannot be reproduced
+by retaining a first value and appending provenance. Selector compilation that
+consumes live selected-site lists retains its
+existing whole-union path until it can use the same global composition.
+
+### Budgets are part of the proof
+
+Full union execution divides remaining scan and pipeline budgets among its
+branches and may retry a starved branch. Exhaustive file units alone do not
+prove that a full union would avoid starvation.
+
+For a sliced union, cumulative scan and pipeline work must stay below the
+smallest branch share implied by the union tree. The bound uses the maximum
+product of sibling counts along a root-to-leaf path. This conservative test
+proves that the full execution cannot enter a fair-share retry. Semantic lanes
+are shared without this division and retain their ordinary cumulative checks.
+Reaching a bound requires full execution, preserving its completion and
+diagnostics rather than guessing which prefix it would return.

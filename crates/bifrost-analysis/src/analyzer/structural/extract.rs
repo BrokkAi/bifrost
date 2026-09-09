@@ -178,7 +178,6 @@ fn extract_file_facts_limited_with_tree(
 
     enum ExtractionFrame<'tree> {
         Enter(Node<'tree>, Option<u32>),
-        NextChild(Node<'tree>, Option<u32>, usize),
     }
 
     let mut stack = vec![ExtractionFrame::Enter(tree.root_node(), None)];
@@ -284,16 +283,18 @@ fn extract_file_facts_limited_with_tree(
                         previous_end = fact.range.end_byte;
                     }
                 }
-                stack.push(ExtractionFrame::NextChild(node, parent_for_children, 0));
-            }
-            ExtractionFrame::NextChild(node, enclosing, index) => {
-                if index >= node.named_child_count() {
-                    continue;
-                }
-                stack.push(ExtractionFrame::NextChild(node, enclosing, index + 1));
-                if let Some(child) = node.named_child(index) {
-                    stack.push(ExtractionFrame::Enter(child, enclosing));
-                }
+                // Push the children through one cursor rather than indexing
+                // them. `Node::named_child(i)` walks the child list from the
+                // start, so visiting a node's children by index is quadratic in
+                // its child count: on goqu's vendored 248k-line
+                // `sqlite3-binding.c` this walk was 99.6% of process CPU and
+                // timed out 100 probes. Popping still visits children in source
+                // order, so the traversal is unchanged.
+                brokk_bifrost_core::analyzer::tree_walk::push_named_children_reversed_as(
+                    node,
+                    &mut stack,
+                    |child| ExtractionFrame::Enter(child, parent_for_children),
+                );
             }
         }
     }
@@ -317,6 +318,10 @@ fn extract_file_facts_limited_with_tree(
     // do not survive pass one. All classifications are gathered flat and
     // bucketed below.
     let mut occurrence_roles: Vec<(u32, OccurrenceRole)> = embedded_occurrence_roles;
+    // One parent index for the whole file. Specs ask what encloses a node on
+    // essentially every fact, and `Node::parent` re-descends from the root each
+    // time, which is quadratic over a large file.
+    let parents = brokk_bifrost_core::analyzer::tree_walk::ParentIndex::new(tree.root_node());
     for (fact_id, source_node) in fact_sources.into_iter().enumerate() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return LimitedFileFacts::Cancelled;
@@ -330,6 +335,7 @@ fn extract_file_facts_limited_with_tree(
                 &mut occurrence_roles,
                 max_roles,
                 cancellation,
+                &parents,
             );
             spec.extract(node, kind, &mut sink);
             let (name, stop) = sink.into_parts();

@@ -25,13 +25,14 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_rql::structural::search::{
-    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
+    DetailedCodeQueryResult, execute_code_query_detailed_eager_index,
+    execute_code_query_detailed_eager_index_workspace, execute_code_query_expansion,
 };
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, CodeQueryResultValue,
     DetailedCodeQueryEvidence, DetailedCodeQueryProvenanceEvidence,
 };
-use brokk_bifrost_rql::{CodeQueryPlanSource, SetOperator};
+use brokk_bifrost_rql::{CodeQueryPlanSource, QueryStep, SetOperator};
 
 use crate::budget::PolicyBudget;
 use crate::definition::{PolicyAnalysis, PolicyAnalysisType};
@@ -342,6 +343,7 @@ impl StageOutcome {
 #[derive(Debug, Default)]
 pub(super) struct LocatedRows {
     rows: Vec<CodeQueryResultValue>,
+    evidence: Vec<DetailedCodeQueryEvidence>,
     exhaustive: bool,
     reasons: Vec<PolicyIncompleteReason>,
 }
@@ -350,15 +352,76 @@ impl LocatedRows {
     /// The rows the query returned for the candidate, judged against what that
     /// same query proved about its own row set.
     fn new(
-        rows: Vec<CodeQueryResultValue>,
-        completion: &CodeQueryCompletion,
-        truncated: bool,
+        executed: DetailedCodeQueryResult,
+        covers: impl Fn(&DetailedCodeQueryEvidence) -> bool,
     ) -> Self {
+        let completion = executed.result.completion();
+        let truncated = executed.result.truncated;
+        let evidence = executed
+            .evidence
+            .into_iter()
+            .filter(covers)
+            .collect::<Vec<_>>();
+        let rows = executed
+            .result
+            .results
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| evidence.iter().any(|item| item.result_index == *index))
+            .map(|(_, item)| item.value)
+            .collect();
         Self {
             rows,
+            evidence,
             exhaustive: !truncated && matches!(completion, CodeQueryCompletion::Complete),
-            reasons: absence_reasons(completion, truncated),
+            reasons: absence_reasons(&completion, truncated),
         }
+    }
+
+    /// Apply the evaluator's expansion suffix only to these source rows.
+    /// The executor selects the source prefix by exact detailed row identity
+    /// before running its ordinary pipeline steps. This also works for seeds
+    /// that do not retain derivation traces.
+    pub(super) fn expand(
+        &self,
+        query: &CodeQuery,
+        source_steps: usize,
+        context: &PolicyEvaluationContext<'_>,
+        budget: &PolicyBudget,
+    ) -> Self {
+        let mut query = query.clone();
+        query.result_detail = CodeQueryResultDetail::Full;
+        query.limit = budget.query_limits().max_pipeline_rows;
+        let analyzer = context
+            .workspace
+            .map_or(context.analyzer, |workspace| workspace.analyzer());
+        let executed = execute_code_query_expansion(
+            analyzer,
+            context.workspace,
+            &query,
+            source_steps,
+            &self.evidence,
+            budget.query_limits(),
+            context.cancellation,
+        );
+        let mut expanded = Self::new(executed, |_| true);
+        expanded.reasons.extend_from_slice(&self.reasons);
+        // A prefix can retain the candidate through lineage without its own
+        // output rows covering the candidate. There is then no located row to
+        // select for expansion, so an empty replay cannot establish a drop.
+        if self.evidence.is_empty() {
+            expanded
+                .reasons
+                .push(PolicyIncompleteReason::CapabilityIncomplete);
+        }
+        expanded.exhaustive &= self.exhaustive && !self.evidence.is_empty();
+        expanded.reasons.sort();
+        expanded.reasons.dedup();
+        expanded
+    }
+
+    pub(super) fn keys(&self) -> Vec<&brokk_bifrost_rql::structural::DetailedCodeQueryKey> {
+        self.evidence.iter().map(|row| &row.key).collect()
     }
 
     pub(super) fn rows(&self) -> &[CodeQueryResultValue] {
@@ -387,10 +450,13 @@ pub(super) struct StageWalk {
 }
 
 impl StageWalk {
-    /// The rows the complete selector returned for the candidate, empty unless
-    /// every presented stage retained it.
+    /// The candidate's rows after the complete selector and any replayed
+    /// expansion, empty unless every presented stage retained it.
     pub(super) const fn located(&self) -> &LocatedRows {
         &self.located
+    }
+    pub(super) fn replace_located(&mut self, located: LocatedRows) {
+        self.located = located;
     }
     pub(super) const fn prefixes_truncated(&self) -> bool {
         self.prefixes_truncated
@@ -430,9 +496,7 @@ pub(super) fn run_prefixes(
     let mut stages = Vec::with_capacity(executable);
     let mut executed_count = 0usize;
 
-    let execute_prefix = |prefix: usize| {
-        let mut query = selector.clone();
-        query.plan.steps.truncate(prefix);
+    let execute_query = |mut query: CodeQuery| {
         // Author-controlled presentation is not policy semantics: the
         // evaluator forces full detail and its own row bound, and a faithful
         // re-execution must do the same. The bound differs per family, so the
@@ -460,6 +524,11 @@ pub(super) fn run_prefixes(
                 context.cancellation,
             ),
         }
+    };
+    let execute_prefix = |prefix: usize| {
+        let mut query = selector.clone();
+        query.plan.steps.truncate(prefix);
+        execute_query(query)
     };
 
     // Run prefixes deepest-first. The deepest candidate-bearing result carries
@@ -510,7 +579,7 @@ pub(super) fn run_prefixes(
     later_prefix_state.reverse();
 
     let mut located = LocatedRows::default();
-    for ((prefix, mut executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
+    for ((prefix, executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
         executed_prefixes.into_iter().zip(later_prefix_state)
     {
         let label = match prefix.checked_sub(1) {
@@ -528,7 +597,7 @@ pub(super) fn run_prefixes(
                 .map(describe_span_covering)
         };
 
-        let stage = match covering {
+        let mut stage = match covering {
             Some(actual) => StageOutcome {
                 label,
                 outcome: ExplanationOutcome::Satisfied,
@@ -602,6 +671,50 @@ pub(super) fn run_prefixes(
                 }
             }
         };
+        if stage.outcome != ExplanationOutcome::Satisfied
+            && prefix.checked_sub(1).is_some_and(|index| {
+                matches!(
+                    selector.plan.steps.get(index),
+                    Some(QueryStep::AbsentMember)
+                )
+            })
+            && executed_count < max_executions
+        {
+            let mut sibling = selector.clone();
+            sibling.plan.steps.truncate(prefix);
+            let step = sibling
+                .plan
+                .steps
+                .last_mut()
+                .expect("an absent-member stage has a final step");
+            assert!(matches!(step, QueryStep::AbsentMember));
+            *step = QueryStep::ClassSet;
+            executed_count = executed_count.saturating_add(1);
+            let sibling = execute_query(sibling);
+            let mut unknowns = BTreeSet::new();
+            for evidence in &sibling.evidence {
+                if !evidence_covers_candidate(evidence, candidate) {
+                    continue;
+                }
+                let item = &sibling.result.results[evidence.result_index];
+                let CodeQueryResultValue::ClassSetRow { value } = &item.value else {
+                    continue;
+                };
+                if value.class.is_none() {
+                    unknowns.insert((value.origin.clone(), value.status));
+                }
+            }
+            if !unknowns.is_empty() {
+                let details = unknowns
+                    .into_iter()
+                    .map(|(origin, status)| format!("{origin} ({status})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                stage
+                    .actual
+                    .push_str(&format!("; class-set unknown origins/status: [{details}]"));
+            }
+        }
         let decided = stage.outcome != ExplanationOutcome::Satisfied;
         if !decided && prefix == step_count {
             // The complete selector is the relation a row binding stands for,
@@ -610,20 +723,9 @@ pub(super) fn run_prefixes(
                 !prefixes_omitted,
                 "the complete selector runs only when the budget omitted no prefix"
             );
-            let covering = executed
-                .evidence
-                .iter()
-                .filter(|evidence| evidence_covers_candidate(evidence, candidate))
-                .map(|evidence| evidence.result_index)
-                .collect::<Vec<_>>();
-            let truncated = executed.result.truncated;
-            let rows = std::mem::take(&mut executed.result.results)
-                .into_iter()
-                .enumerate()
-                .filter(|(index, _)| covering.contains(index))
-                .map(|(_, item)| item.value)
-                .collect();
-            located = LocatedRows::new(rows, &completion, truncated);
+            located = LocatedRows::new(executed, |evidence| {
+                evidence_covers_candidate(evidence, candidate)
+            });
         }
         stages.push(stage);
         if decided {

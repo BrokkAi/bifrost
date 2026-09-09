@@ -172,9 +172,9 @@ pub(crate) use php::{
 };
 pub use python::python_visible_same_file_candidates;
 pub(crate) use python::{
-    PythonDefinitionProvider, python_external_imported_symbol_bounded,
-    python_namespace_imported_class_name_bounded, python_type_lookup_resolution_bounded,
-    resolve_python_bounded,
+    PythonDefinitionProvider, python_attribute_callee_reads_a_field_bounded,
+    python_external_imported_symbol_bounded, python_namespace_imported_class_name_bounded,
+    python_type_lookup_resolution_bounded, resolve_python_bounded,
 };
 pub(crate) use resolution_session::{BoundedResolution, ResolutionSession};
 pub(crate) use ruby::{
@@ -854,11 +854,11 @@ fn resolve_definition_requests<'a>(
 /// Record what every request in one batch probes, before any of them runs.
 ///
 /// The entry is the only place a batch can name its inputs unconditionally.
-/// A resolver that reaches a declaration names its own probes on the way, but
+/// A resolver that reaches a declaration names its own reads on the way, but
 /// one that reaches nothing -- an import specifier that named no file, a
 /// receiver with no proven type, a name in no visible scope -- returns before
 /// any funnel runs, and a memoized answer skips the funnel a second time. So
-/// every request names its keys here, once, before the loop.
+/// every request names its speculative keys here before it resolves.
 fn record_definition_batch_probe_reads(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
@@ -894,6 +894,44 @@ fn record_definition_batch_probe_reads(
         {
             record_definition_probe_reads(analyzer, language, &site, &source);
         }
+    }
+}
+
+/// Publish the precise inputs of one successful definition request.
+///
+/// Shared declaration readers already publish their exact answers while hiding
+/// hydration. All remaining resolver reads stay dependencies: they can supply
+/// imports, re-exports, incomplete metadata, or other context that the selected
+/// declarations do not encode. A request that resolves nothing also retains
+/// every speculative probe to detect a declaration added later.
+fn publish_definition_reads(
+    analyzer: &dyn IAnalyzer,
+    outcome: &DefinitionLookupOutcome,
+    mut reads: Vec<ReadKey>,
+) {
+    if outcome.definitions.is_empty() {
+        for read in reads {
+            analyzer.record_read(read);
+        }
+        return;
+    }
+
+    let (_, declaration_reads) =
+        crate::analyzer::i_analyzer::capture_nested_reads(analyzer, || {
+            let indexes = analyzer.workspace_fact_indexes();
+            for declaration in &outcome.definitions {
+                if let Some(index) = indexes
+                    .iter()
+                    .find(|index| index.fact_index_language() == declaration.source().language())
+                {
+                    index.declaration_facts_digest(declaration);
+                }
+            }
+        });
+    reads.extend(declaration_reads);
+
+    for read in reads {
+        analyzer.record_read(read);
     }
 }
 
@@ -993,7 +1031,6 @@ fn resolve_definition_requests_traced<'a>(
         || AnalyzerQueryScope::new(analyzer),
         |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
     );
-    record_definition_batch_probe_reads(analyzer, context, &requests);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
     for request in &requests {
         if language_for_file(&request.file) == Language::Python {
@@ -1007,17 +1044,46 @@ fn resolve_definition_requests_traced<'a>(
         .into_iter()
         .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
         .map(|request| {
-            let is_python = language_for_file(&request.file) == Language::Python;
+            let language = language_for_file(&request.file);
+            let is_python = language == Language::Python;
             let file = request.file.clone();
-            let outcome = resolve_one(
-                analyzer,
-                token,
-                context,
-                request,
-                operation,
-                cancellation,
-                allow_rust_field_receiver_lexical,
-            );
+            let probes = if analyzer.read_ledger_attached() {
+                crate::analyzer::i_analyzer::capture_nested_reads(analyzer, || {
+                    record_definition_batch_probe_reads(
+                        analyzer,
+                        context,
+                        std::slice::from_ref(&request),
+                    );
+                })
+                .1
+            } else {
+                Vec::new()
+            };
+            let resolve = || {
+                resolve_one(
+                    analyzer,
+                    token,
+                    context,
+                    request,
+                    operation,
+                    cancellation,
+                    allow_rust_field_receiver_lexical,
+                )
+            };
+            let outcome = if analyzer.read_ledger_attached() {
+                let (outcome, mut reads) =
+                    crate::analyzer::i_analyzer::capture_nested_reads(analyzer, resolve);
+                // Only the speculative site probes are subsumed by a
+                // successful resolution. Preserve every actual resolver read.
+                reads.extend(probes.into_iter().filter(|read| {
+                    outcome.definitions.is_empty()
+                        || !matches!(read, ReadKey::Index { .. } | ReadKey::Scope { .. })
+                }));
+                publish_definition_reads(analyzer, &outcome, reads);
+                outcome
+            } else {
+                resolve()
+            };
             if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
                 *remaining -= 1;
                 if *remaining == 0 {
@@ -1542,6 +1608,7 @@ pub fn resolve_call_reference_definition_with_source(
         return None;
     }
 
+    record_definition_batch_probe_reads(analyzer, &mut context, std::slice::from_ref(&request));
     Some(resolve_one(
         analyzer,
         token,
@@ -2150,7 +2217,6 @@ fn resolve_one_with_evidence<'a>(
             None => {}
         }
     }
-    record_definition_probe_reads(analyzer, language, &site, &source);
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let mut call_application = CallApplicationKind::Unknown;
     let mut dispatch_extensibility = None;

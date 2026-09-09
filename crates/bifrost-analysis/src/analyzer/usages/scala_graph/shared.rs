@@ -74,7 +74,17 @@ where
             domain,
             ParseSpec::whole(&language),
             declarations,
-            |input| scan_edge_file(scala, token, &graph.types, file, state, class_ranges, input),
+            |input| {
+                scan_edge_file(
+                    scala,
+                    token,
+                    &graph.types,
+                    file,
+                    &state,
+                    class_ranges,
+                    input,
+                )
+            },
         )
     })
 }
@@ -106,7 +116,17 @@ where
             domain,
             ParseSpec::whole(&language),
             declarations,
-            |input| scan_edge_file(scala, token, &graph.types, file, state, class_ranges, input),
+            |input| {
+                scan_edge_file(
+                    scala,
+                    token,
+                    &graph.types,
+                    file,
+                    &state,
+                    class_ranges,
+                    input,
+                )
+            },
         )
     })
 }
@@ -168,8 +188,7 @@ impl ScalaWorkspaceSource for ScalaFrontierDispatch<'_> {
         }
         self.types
             .bulk_file_state(code_unit.source())
-            .and_then(|state| state.ranges.get(code_unit))
-            .cloned()
+            .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
     }
 
@@ -223,10 +242,10 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                 analyzer,
                 cancellation,
             );
-        let file_states = self
-            .scala
-            .bulk_file_states(workspace_files, BulkFileStateSource::Omit);
-        let unresolved_seed = self.scala.project_types_seed_from_file_states(file_states);
+        // The workspace-wide sweep derives the seed's type-namespace
+        // structures in bounded chunks; per-file facts for the files the
+        // query actually touches rehydrate lazily through the seed (#3142).
+        let unresolved_seed = self.scala.project_types_query_seed(&workspace_files);
         let resolved_seed = match relational_session.resolve_owned("scala_hierarchy", |frontier| {
             self.scala
                 .build_project_types_from_frontier(frontier, unresolved_seed.clone())
@@ -246,6 +265,9 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                 );
             }
         };
+        // The hierarchy inputs the unresolved seed carried served the pass
+        // above; the catalog and scan phases read through the resolved seed.
+        drop(unresolved_seed);
         let catalog = match relational_session.resolve_owned("scala_target_catalog", |frontier| {
             let types = self
                 .scala
@@ -303,6 +325,11 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         }
         let mut files = files.into_iter().collect::<Vec<_>>();
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        // Warm the scan set's per-file facts in batched reads ahead of the
+        // parallel walk, so a file's first touch is a memory hit rather than
+        // a store read on the scan's critical path.
+        let scan_files: Vec<ProjectFile> = files.iter().map(|(file, _)| file.clone()).collect();
+        resolved_seed.prefetch_file_facts(&scan_files);
         let mut prepared_files = Vec::with_capacity(files.len());
         for (file, eligibility) in files {
             if scan_scope.is_cancelled() {

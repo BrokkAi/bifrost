@@ -4,6 +4,13 @@ use brokk_bifrost_rql::structural::edges::EdgeProvenance;
 use brokk_bifrost_rql::structural::search::{DetailedCodeQueryResult, MergedUnitRows};
 use std::collections::HashSet;
 
+use crate::definition::PolicyAssertId;
+use crate::relational::{RelationalPlanIr, lower_occurrence_assert, validate_plan_ir};
+
+#[cfg(test)]
+mod occurrence_parity;
+
+use super::super::definition::RowExpansionStep;
 use super::super::units::AssertFileProduct;
 use super::*;
 
@@ -132,6 +139,7 @@ type AssertRowQueryExecutor = fn(
     brokk_bifrost_rql::structural::CodeQueryExecutionLimits,
     Option<&CancellationToken>,
     &mut CodeQueryRowFamilySession,
+    CodeQueryExecutionScope<'_>,
 ) -> brokk_bifrost_rql::structural::search::DetailedCodeQueryResult;
 
 /// Everything one assert-file iteration reads that the run computed once from
@@ -142,6 +150,7 @@ type AssertRowQueryExecutor = fn(
 struct AssertRunPlan<'a> {
     spec: &'a AssertionPolicySpec,
     occurrence_roles: Vec<OccurrenceRole>,
+    occurrence_plans: HashMap<PolicyAssertId, RelationalPlanIr>,
     candidate_roles: Vec<OccurrenceRole>,
     value_origin_roles: Vec<OccurrenceRole>,
     binding_row_roles: Vec<OccurrenceRole>,
@@ -223,9 +232,9 @@ impl<'a> AssertRunPlan<'a> {
             matches!(assertion, PolicyAssert::Occurrence(assertion) if assertion.require_target)
         });
         let execute_row_query: AssertRowQueryExecutor = if needs_occurrence_targets {
-            execute_code_query_detailed_eager_index_with_row_family_session
+            execute_code_query_detailed_eager_index_with_row_family_session_in_scope
         } else {
-            execute_code_query_detailed_eager_index_without_targets_with_row_family_session
+            execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope
         };
         let metadata = &policy.definition().metadata;
         let PolicyMessageSpec::Static { text } = &metadata.message else {
@@ -238,8 +247,22 @@ impl<'a> AssertRunPlan<'a> {
         ) else {
             return Err("assertion policy classification could not be reduced");
         };
+        let occurrence_plans = spec
+            .asserts
+            .iter()
+            .filter_map(|assertion| {
+                let PolicyAssert::Occurrence(assertion) = assertion else {
+                    return None;
+                };
+                let lowered = lower_occurrence_assert(assertion);
+                validate_plan_ir(&lowered)
+                    .expect("occurrence lowering must produce a valid relational plan");
+                Some((assertion.id.clone(), lowered))
+            })
+            .collect();
         Ok(Self {
             spec,
+            occurrence_plans,
             occurrence_roles,
             candidate_roles,
             value_origin_roles,
@@ -570,11 +593,10 @@ fn sliced_assertion_run(
     // Every unit key this policy will ask about, in one batch before the first
     // lookup, exactly as the query path prefetches its own.
     let subjects_by_path = run.subjects_by_path();
-    let files_by_rel = analyzed_files_by_rel_path(context);
     let mut keys = subject_units.keys;
     let mut assert_keys = Vec::with_capacity(subjects_by_path.len());
     for (path, file_subjects) in &subjects_by_path {
-        let Some(file) = files_by_rel.get(*path) else {
+        let Some(file) = run.files_by_rel.get(*path) else {
             // A subject row named a path the head does not analyze, so there is
             // no content identity to key its unit by.
             return Err(WidenReason::ReverseDependencyEvidenceMissing);
@@ -718,23 +740,6 @@ fn subject_rows_digest(
         "every subject of `{path}` is one of its own file's rows"
     );
     brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest::sha256(material)
-}
-
-/// Every analyzed file of the head, by its workspace-relative path.
-///
-/// A sliced run needs one for every subject path -- the language and the blob
-/// its unit is keyed by -- which is a different question from the
-/// declaration-state family's map and is computed whether or not that family
-/// runs.
-fn analyzed_files_by_rel_path(
-    context: &PolicyEvaluationContext<'_>,
-) -> HashMap<String, brokk_bifrost_analysis::analyzer::ProjectFile> {
-    context
-        .analyzer
-        .analyzed_files()
-        .into_iter()
-        .map(|file| (workspace_relative_key(&file), file))
-        .collect()
 }
 
 /// Evaluate one assertion policy over the whole workspace.
@@ -1048,19 +1053,15 @@ fn assertion_run<'a>(
         Ok(plan) => plan,
         Err(message) => return Err(Box::new(AssertionRunRefusal::Failed(message))),
     };
-    // Declaration-state rows are derived directly rather than queried: no seed
-    // spans the whole state family, and the rows joined here are exact
-    // per-declaration facts whose completeness the derivation itself states.
-    let files_by_rel = if plan.needs_declaration_state {
-        context
-            .analyzer
-            .analyzed_files()
-            .into_iter()
-            .map(|file| (workspace_relative_key(&file), file))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    // The run snapshot supplies both exact-file query scopes and, when used,
+    // declaration-state rows. It is created before any assert unit attaches a
+    // read ledger, so enumerating the workspace does not become a unit read.
+    let files_by_rel = context
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .map(|file| (workspace_relative_key(&file), file))
+        .collect();
     Ok(AssertionRun {
         plan,
         subjects,
@@ -1259,6 +1260,14 @@ fn evaluate_assert_file(
     let mut file_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut row_completions: Vec<CodeQueryCompletion> = Vec::new();
     let file_paths = [path];
+    let subject_file = files_by_rel
+        .get(path)
+        .expect("an assert-file unit is keyed by an analyzed file")
+        .clone();
+    let seed_files = [subject_file];
+    let mut workspace_files = files_by_rel.values().cloned().collect::<Vec<_>>();
+    workspace_files.sort();
+    let execution_scope = CodeQueryExecutionScope::for_seed_files(&seed_files, &workspace_files);
     let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
 
     // The assignment family runs *before* the other row families, because
@@ -1283,6 +1292,7 @@ fn evaluate_assert_file(
             budget.query_limits(),
             context.cancellation,
             &mut row_family_session,
+            execution_scope,
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
@@ -1408,6 +1418,7 @@ fn evaluate_assert_file(
             budget.query_limits(),
             context.cancellation,
             &mut row_family_session,
+            execution_scope,
         );
         file_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
@@ -1679,7 +1690,21 @@ fn evaluate_assert_file(
             }
             let violation = match assertion {
                 PolicyAssert::Occurrence(assertion) => {
-                    evaluate_occurrence_assert(assertion, &ast_ids, &rows_by_ast_id)
+                    let lowered = plan
+                        .occurrence_plans
+                        .get(&assertion.id)
+                        .expect("every occurrence assertion was lowered before file execution");
+                    #[cfg(test)]
+                    let violation =
+                        occurrence_parity::evaluate(assertion, &ast_ids, &rows_by_ast_id, lowered);
+                    #[cfg(not(test))]
+                    let violation = evaluate_lowered_occurrence_assert(
+                        assertion,
+                        &ast_ids,
+                        &rows_by_ast_id,
+                        lowered,
+                    );
+                    violation
                 }
                 PolicyAssert::Resolution(assertion) => evaluate_resolution_assert(
                     assertion,
@@ -2048,6 +2073,53 @@ fn retain_unconcluded_files_diagnostic(
     }
 }
 
+/// Lower a relational row expansion onto the source query's execution plan.
+///
+/// `MemberCandidates` remains unsupported because there is no admitted
+/// executable relational row domain for it. Every other row expansion step is
+/// lowered here, including the prerequisite receiver analysis for receiver
+/// projections.
+pub(crate) fn relational_expansion_query(
+    source: &CodeQuery,
+    step: RowExpansionStep,
+) -> Option<CodeQuery> {
+    let mut query = source.clone();
+    match step {
+        RowExpansionStep::ReceiverOutcome | RowExpansionStep::ReceiverEvidence => {
+            // The receiver row projections consume a receiver analysis. A
+            // source binding that is not already a receiver analysis is
+            // lowered through the production receiver analysis first, so
+            // the expansion rows are projections of the same solver run
+            // the ordinary receiver queries use.
+            let source_is_receiver_analysis = query
+                .validate_steps()
+                .map(|kind| kind == QueryValueKind::ReceiverAnalysis)
+                .unwrap_or(false);
+            if !source_is_receiver_analysis {
+                query
+                    .plan
+                    .steps
+                    .push(QueryStep::ReceiverTargets(Default::default()));
+            }
+            query.plan.steps.push(match step {
+                RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
+                RowExpansionStep::ReceiverEvidence => QueryStep::ReceiverEvidence,
+                _ => unreachable!("receiver expansion match is exhaustive"),
+            });
+        }
+        RowExpansionStep::MemberSelection => query.plan.steps.push(QueryStep::MemberSelection),
+        RowExpansionStep::MemberCandidates => return None,
+        RowExpansionStep::CandidateHierarchy => {
+            query.plan.steps.push(QueryStep::CandidateHierarchy)
+        }
+        RowExpansionStep::MemberFamily => query.plan.steps.push(QueryStep::MemberFamily),
+        RowExpansionStep::FamilyEdges => query.plan.steps.push(QueryStep::FamilyEdges),
+        RowExpansionStep::DispatchOutcome => query.plan.steps.push(QueryStep::DispatchOutcome),
+        RowExpansionStep::DispatchTargets => query.plan.steps.push(QueryStep::DispatchTargets),
+    }
+    Some(query)
+}
+
 /// Execute a decoded relational assertion plan: run every named query and
 /// expansion binding as a CodeQuery, evaluate the bounded join/group/aggregate
 /// plan over the returned rows, and assemble each violated group into one
@@ -2064,7 +2136,7 @@ fn evaluate_relational_assertion_policy(
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
     use super::super::definition::{
-        RowBindingName, RowBindingSource, RowExpansionStep, relational_binding_selector_path,
+        RowBindingName, RowBindingSource, relational_binding_selector_path,
     };
 
     let mut binding_queries: Vec<CodeQuery> = Vec::with_capacity(plan.bindings.len());
@@ -2116,84 +2188,18 @@ fn evaluate_relational_assertion_policy(
                         budget,
                     );
                 };
-                let projection = match step {
-                    RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
-                    RowExpansionStep::ReceiverEvidence => QueryStep::ReceiverEvidence,
-                    RowExpansionStep::MemberSelection => {
-                        // The member-selection projection consumes occurrence
-                        // rows directly; no receiver-analysis lowering exists
-                        // or is needed for it.
-                        let mut query = binding_queries[source_index].clone();
-                        query.plan.steps.push(QueryStep::MemberSelection);
-                        binding_index_by_name.insert(&binding.name, index);
-                        binding_queries.push(query);
-                        continue;
-                    }
-                    RowExpansionStep::DispatchOutcome | RowExpansionStep::DispatchTargets => {
-                        // Both dispatch steps consume the same site rows the
-                        // source binding already produced, so the expansion is
-                        // one appended step, not a second query.
-                        let mut query = binding_queries[source_index].clone();
-                        query.plan.steps.push(match step {
-                            RowExpansionStep::DispatchOutcome => QueryStep::DispatchOutcome,
-                            _ => QueryStep::DispatchTargets,
-                        });
-                        binding_index_by_name.insert(&binding.name, index);
-                        binding_queries.push(query);
-                        continue;
-                    }
-                    RowExpansionStep::MemberFamily | RowExpansionStep::FamilyEdges => {
-                        // Both family steps consume the member declaration rows
-                        // the source binding already produced, so the expansion
-                        // is one appended step rather than a second query.
-                        let mut query = binding_queries[source_index].clone();
-                        query.plan.steps.push(match step {
-                            RowExpansionStep::MemberFamily => QueryStep::MemberFamily,
-                            _ => QueryStep::FamilyEdges,
-                        });
-                        binding_index_by_name.insert(&binding.name, index);
-                        binding_queries.push(query);
-                        continue;
-                    }
-                    RowExpansionStep::CandidateHierarchy => {
-                        // The hierarchy-hop projection consumes the same
-                        // occurrence rows the candidate trace consumes, for
-                        // the same reason.
-                        let mut query = binding_queries[source_index].clone();
-                        query.plan.steps.push(QueryStep::CandidateHierarchy);
-                        binding_index_by_name.insert(&binding.name, index);
-                        binding_queries.push(query);
-                        continue;
-                    }
-                    other => {
-                        return failed_policy_run(
-                            policy,
-                            PolicyAnalysisType::Assertion,
-                            &format!(
-                                "row expansion `{}` has no executable row domain yet",
-                                other.label()
-                            ),
-                            budget,
-                        );
-                    }
+                let Some(query) = relational_expansion_query(&binding_queries[source_index], *step)
+                else {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        &format!(
+                            "row expansion `{}` has no executable row domain yet",
+                            step.label()
+                        ),
+                        budget,
+                    );
                 };
-                let mut query = binding_queries[source_index].clone();
-                // The receiver row projections consume a receiver analysis. A
-                // source binding that is not already a receiver analysis is
-                // lowered through the production receiver analysis first, so
-                // the expansion rows are projections of the same solver run
-                // the ordinary receiver queries use.
-                let source_is_receiver_analysis = query
-                    .validate_steps()
-                    .map(|kind| kind == QueryValueKind::ReceiverAnalysis)
-                    .unwrap_or(false);
-                if !source_is_receiver_analysis {
-                    query
-                        .plan
-                        .steps
-                        .push(QueryStep::ReceiverTargets(Default::default()));
-                }
-                query.plan.steps.push(projection);
                 query
             }
         };
@@ -3119,35 +3125,143 @@ impl<'rows> AssertionViolation<'rows> {
     }
 }
 
-fn evaluate_occurrence_assert<'rows>(
+/// Adapt a complete subject partition into the shared row engine, then project
+/// its verdict back through the existing occurrence finding contract. Query
+/// completion and AssertFile unit boundaries stay with the caller.
+fn evaluate_lowered_occurrence_assert<'rows>(
     assertion: &OccurrenceAssert,
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
+    lowered: &RelationalPlanIr,
 ) -> Option<AssertionViolation<'rows>> {
-    let mut actual: Vec<&CodeQueryOccurrence> = Vec::new();
-    for ast_id in ast_ids {
-        let Some(rows) = rows_by_ast_id.get(ast_id) else {
-            continue;
-        };
-        actual.extend(
-            rows.iter()
-                .copied()
-                .filter(|row| assertion_row_matches(assertion, row)),
-        );
-    }
-    if assertion
-        .cardinality
-        .satisfied_by(u32::try_from(actual.len()).unwrap_or(u32::MAX))
-    {
-        return None;
-    }
+    use crate::relational::{
+        IrLimits, IrRelationId, RelationCoverage, RelationalInput, evaluate_plan_ir,
+    };
+    use brokk_bifrost_rql::structural::search::{
+        DetailedCodeQueryDomain, UnitRowField, UnitRowScalar,
+    };
+
+    assert!(
+        !ast_ids.is_empty(),
+        "a complete subject capture has an AST identity"
+    );
+    // This is an indexed source restriction, not the assertion's join or
+    // predicate: retain every role at the demanded AST nodes. Deduplicate the
+    // lookup keys, not the source rows, so repeated captures retain bag semantics.
+    let mut demanded = HashSet::new();
+    let occurrences = ast_ids
+        .iter()
+        .filter(|ast_id| demanded.insert(**ast_id))
+        .filter_map(|ast_id| rows_by_ast_id.get(ast_id))
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let occurrence_rows = occurrences
+        .iter()
+        .map(|row| {
+            UnitRowItem::project(&CodeQueryResultItem {
+                value: CodeQueryResultValue::Occurrence {
+                    value: Box::new((*row).clone()),
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Only identity columns are read. These are projections of the captured
+    // AST nodes, not newly manufactured occurrence rows. One invocation is one
+    // subject, so its first capture provides a common, internal grouping key;
+    // that key never participates in a persisted finding or unit identity.
+    let captures = ast_ids
+        .iter()
+        .map(|ast_id| UnitRowItem {
+            domain: DetailedCodeQueryDomain::StructuralMatch,
+            path: "".into(),
+            range: None,
+            fields: vec![
+                UnitRowField {
+                    name: "id".into(),
+                    value: UnitRowScalar::StableId(ast_ids[0].into()),
+                },
+                UnitRowField {
+                    name: "ast_id".into(),
+                    value: UnitRowScalar::StableId((*ast_id).into()),
+                },
+            ],
+            terminal: None,
+            provenance: Vec::new(),
+            provenance_truncated: false,
+        })
+        .collect::<Vec<_>>();
+
+    // Inputs have already passed the existing subject/query budgets. Exact
+    // input-derived bounds let the shared engine run without introducing a
+    // second, smaller limit or truncating occurrence evidence at eight rows.
+    let tuples = captures.len().saturating_mul(occurrence_rows.len().max(1));
+    let mut plan = lowered.clone();
+    plan.limits = IrLimits {
+        max_source_rows: captures.len().max(occurrence_rows.len()),
+        max_expanded_rows: 1,
+        max_join_comparisons: tuples,
+        max_joined_rows: tuples,
+        max_groups: 1,
+        max_values_per_group: tuples,
+        max_representative_tuples: tuples,
+    };
+    let evaluation = evaluate_plan_ir(
+        &plan,
+        &[
+            RelationalInput {
+                binding: plan
+                    .source_binding(IrRelationId(0))
+                    .expect("capture source"),
+                rows: &captures,
+                coverage: RelationCoverage::Exhaustive,
+            },
+            RelationalInput {
+                binding: plan
+                    .source_binding(IrRelationId(1))
+                    .expect("occurrence source"),
+                rows: &occurrence_rows,
+                coverage: RelationCoverage::Exhaustive,
+            },
+        ],
+    )
+    .expect("validated occurrence IR reads its declared row fields");
+    assert!(
+        evaluation.exhaustive
+            && !evaluation.limit_exceeded
+            && evaluation.unmet_obligations.is_empty(),
+        "complete occurrence inputs fit their derived bounds: {evaluation:?}"
+    );
+    assert_eq!(
+        evaluation.work.produced_groups, 1,
+        "left join preserves the subject even at zero occurrences"
+    );
+    let mut violations = evaluation.violations.into_iter();
+    let result = violations.next()?;
+    assert!(
+        violations.next().is_none(),
+        "one subject has one cardinality assertion"
+    );
     let mut violation = AssertionViolation::new(
         assertion.expect.label(),
         assertion.cardinality.to_string(),
         None,
     );
-    violation.actual_count = u64::try_from(actual.len()).unwrap_or(u64::MAX);
-    violation.occurrences = actual;
+    violation.actual_count = result.actual;
+    violation.occurrences = result
+        .representatives
+        .iter()
+        .flatten()
+        .filter(|row| row.binding.as_str() == "occurrence")
+        .map(|row| occurrences[row.row])
+        .collect();
+    assert_eq!(
+        violation.actual_count,
+        violation.occurrences.len() as u64,
+        "the occurrence report retains every counted row before applying its presentation budget"
+    );
     Some(violation)
 }
 
@@ -5478,22 +5592,6 @@ fn evaluate_round_trip_assert<'rows>(
             Some(violation)
         }
     }
-}
-
-fn assertion_row_matches(assertion: &OccurrenceAssert, row: &CodeQueryOccurrence) -> bool {
-    if row.role != assertion.role.label() {
-        return false;
-    }
-    if let Some(namespace) = assertion.namespace
-        && row.namespace != namespace.label()
-    {
-        return false;
-    }
-    if assertion.require_target && !matches!(row.target, CodeQueryOccurrenceTarget::Resolved { .. })
-    {
-        return false;
-    }
-    true
 }
 
 /// A candidate row's location.

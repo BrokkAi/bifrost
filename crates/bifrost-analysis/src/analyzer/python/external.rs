@@ -26,6 +26,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
+use brokk_bifrost_python::declarations::PythonParameterSplat;
 use brokk_bifrost_python::syntax::python_plain_string_literal;
 use tree_sitter::Node;
 
@@ -989,7 +990,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         };
         if definition.kind() == "class_definition" {
             let qualified = format!("{owner}.{name}");
-            let hierarchy = definition
+            let mut hierarchy: Vec<HierarchyFact> = definition
                 .child_by_field_name("superclasses")
                 .map(|bases| {
                     named_children(bases)
@@ -1002,6 +1003,23 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Every Python class extends `object`, and a stub writes that base
+            // only when it writes another one too. Recording nothing here left
+            // 196 of the shipped stdlib pack's 560 classes -- `int`, `float`,
+            // `types.NoneType` among them -- with no ancestry at all, so no
+            // consumer could resolve their surface or exclude them from a
+            // guard.
+            if hierarchy.is_empty() && qualified != PYTHON_OBJECT_TYPE {
+                hierarchy.push(HierarchyFact {
+                    hierarchy_kind: crate::analyzer::semantic_model::HierarchyKind::Extends,
+                    target: TypeRef::Named {
+                        name: PYTHON_OBJECT_TYPE.to_owned(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    declaration_ordinal: None,
+                });
+            }
             let type_parameters = definition
                 .child_by_field_name("type_parameters")
                 .map(|list| type_parameter_names(list, self.source))
@@ -1022,6 +1040,13 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                     guard,
                 });
             }
+            return;
+        }
+        // `@name.setter` and `@name.deleter` declare the write half of the
+        // property `name` already declares. Recording them as members too
+        // gives one property name two competing records, and a member with
+        // competing records cannot be proven present on its owner.
+        if decorated.is_some_and(|node| declares_property_accessor(node, &name, self.source)) {
             return;
         }
         let decorators = decorated
@@ -2176,6 +2201,28 @@ fn node_identifier(node: Option<Node<'_>>, source: &str) -> Option<String> {
     .filter(|name| !name.is_empty())
 }
 
+/// Whether a decorated definition is the setter or deleter half of the
+/// property it is named for, rather than a member of its own.
+/// The root every Python class extends when it names no other base.
+const PYTHON_OBJECT_TYPE: &str = "builtins.object";
+
+fn declares_property_accessor(decorated: Node<'_>, name: &str, source: &str) -> bool {
+    named_children(decorated)
+        .filter(|child| child.kind() == "decorator")
+        .filter_map(|decorator| decorator.named_child(0))
+        .filter(|expression| expression.kind() == "attribute")
+        .any(|expression| {
+            let accessor = expression
+                .child_by_field_name("attribute")
+                .and_then(|attribute| node_identifier(Some(attribute), source));
+            let subject = expression
+                .child_by_field_name("object")
+                .and_then(|object| node_identifier(Some(object), source));
+            matches!(accessor.as_deref(), Some("setter" | "deleter"))
+                && subject.as_deref() == Some(name)
+        })
+}
+
 fn decorator_names(node: Node<'_>, source: &str) -> Vec<String> {
     named_children(node)
         .filter(|child| child.kind() == "decorator")
@@ -2273,25 +2320,9 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
 }
 
 fn python_variadic_parameter_mode(parameter: Node<'_>) -> Option<ParameterPassingMode> {
-    let kind = if matches!(
-        parameter.kind(),
-        "list_splat_pattern" | "dictionary_splat_pattern"
-    ) {
-        Some(parameter.kind())
-    } else {
-        named_children(parameter)
-            .find(|child| {
-                matches!(
-                    child.kind(),
-                    "list_splat_pattern" | "dictionary_splat_pattern"
-                )
-            })
-            .map(|child| child.kind())
-    };
-    match kind {
-        Some("list_splat_pattern") => Some(ParameterPassingMode::PositionalOnly),
-        Some("dictionary_splat_pattern") => Some(ParameterPassingMode::NamedOnly),
-        _ => None,
+    match brokk_bifrost_python::declarations::python_parameter_splat(parameter)? {
+        PythonParameterSplat::Positional => Some(ParameterPassingMode::PositionalOnly),
+        PythonParameterSplat::Keyword => Some(ParameterPassingMode::NamedOnly),
     }
 }
 
@@ -2463,12 +2494,20 @@ fn python_visibility(name: &str) -> Visibility {
 
 const PYTHON_VERSION_FILE_NAME: &str = ".python-version";
 const PYPROJECT_FILE_NAME: &str = "pyproject.toml";
+const SETUP_CFG_FILE_NAME: &str = "setup.cfg";
+const SETUP_PY_FILE_NAME: &str = "setup.py";
 const CPYTHON_TOOLCHAIN_NAME: &str = "cpython";
 const MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES: u64 = 256 * 1024;
 
 /// Resolve the standard-library dependency a workspace *declares* rather than
-/// installs: an exact `cpython` toolchain pin read from `.python-version` or
-/// from `pyproject.toml`'s `requires-python` lower bound (#1869).
+/// installs: an exact `cpython` toolchain pin read from `.python-version`, from
+/// `pyproject.toml`'s `requires-python` lower bound (#1869), or from the two
+/// setuptools spellings of the same declaration, `setup.cfg`'s
+/// `[options] python_requires` and `setup.py`'s `python_requires` keyword.
+///
+/// A setuptools project without a PEP 621 manifest is not a project that
+/// declares no interpreter. Reading only `pyproject.toml` left every such
+/// workspace with no Python semantic model at all.
 ///
 /// The dependency carries no artifacts on purpose. Preparation serves an
 /// artifact-less dependency from a compatible installed pack, so this is what
@@ -2500,14 +2539,14 @@ fn resolve_declared_python_stdlib_dependency(
         declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
     })?
     else {
-        return Ok(None);
+        return resolve_setuptools_python_requires(project_root, inputs_considered);
     };
     *inputs_considered += 1;
     let Some(requirement) = parse_pyproject_requires_python(&source).map_err(|message| {
         declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
     })?
     else {
-        return Ok(None);
+        return resolve_setuptools_python_requires(project_root, inputs_considered);
     };
     let version = requires_python_lower_bound(&requirement).map_err(|message| {
         declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
@@ -2517,6 +2556,88 @@ fn resolve_declared_python_stdlib_dependency(
         PYPROJECT_FILE_NAME,
         &requirement,
     )))
+}
+
+/// The setuptools spellings of `requires-python`, tried in the order
+/// setuptools itself resolves them: the declarative `setup.cfg` first, then the
+/// `setup.py` keyword.
+fn resolve_setuptools_python_requires(
+    project_root: &Path,
+    inputs_considered: &mut usize,
+) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+    let setup_cfg = project_root.join(SETUP_CFG_FILE_NAME);
+    if let Some(source) = read_bounded_declaration_file(&setup_cfg).map_err(|message| {
+        declaration_diagnostic("python.toolchain.requires_python", &setup_cfg, message)
+    })? {
+        *inputs_considered += 1;
+        if let Some(requirement) = parse_setup_cfg_python_requires(&source) {
+            let version = requires_python_lower_bound(&requirement).map_err(|message| {
+                declaration_diagnostic("python.toolchain.requires_python", &setup_cfg, message)
+            })?;
+            return Ok(Some(declared_python_stdlib_dependency(
+                version,
+                SETUP_CFG_FILE_NAME,
+                &requirement,
+            )));
+        }
+    }
+    let setup_py = project_root.join(SETUP_PY_FILE_NAME);
+    if !setup_py.is_file() {
+        return Ok(None);
+    }
+    *inputs_considered += 1;
+    let Some(requirement) =
+        brokk_bifrost_python::declarations::setuptools_setup_py_python_requires(&setup_py)
+    else {
+        return Ok(None);
+    };
+    let version = requires_python_lower_bound(&requirement).map_err(|message| {
+        declaration_diagnostic("python.toolchain.requires_python", &setup_py, message)
+    })?;
+    Ok(Some(declared_python_stdlib_dependency(
+        version,
+        SETUP_PY_FILE_NAME,
+        &requirement,
+    )))
+}
+
+/// Extract `[options] python_requires` from `setup.cfg` source.
+///
+/// `setup.cfg` is an INI document, not Python, so there is no grammar in this
+/// workspace that reads it. The scan is the format: a `[section]` header opens
+/// a section, and `key = value` inside `[options]` declares the requirement.
+/// A continuation line cannot appear in this value, which setuptools defines as
+/// a single specifier string.
+fn parse_setup_cfg_python_requires(source: &str) -> Option<String> {
+    let mut in_options = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            in_options = header.trim() == "options";
+            continue;
+        }
+        if !in_options {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "python_requires" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_owned());
+    }
+    None
 }
 
 fn declaration_diagnostic(
@@ -2842,6 +2963,7 @@ impl<'a> DiscoveryState<'a> {
             profile: DependencyDiscoveryProfile {
                 metadata_inputs_considered: self.metadata_inputs_considered,
                 dependencies_resolved: 0,
+                informational_evidence: Vec::new(),
             },
         }
     }
@@ -2851,6 +2973,7 @@ impl<'a> DiscoveryState<'a> {
             profile: DependencyDiscoveryProfile {
                 metadata_inputs_considered: self.metadata_inputs_considered,
                 dependencies_resolved: dependencies.len(),
+                informational_evidence: Vec::new(),
             },
             complete: !self.incomplete && self.suppressed_diagnostics.total() == 0,
             dependencies,
@@ -3570,6 +3693,36 @@ mod tests {
     }
 
     #[test]
+    fn setup_cfg_declares_the_setuptools_spelling_of_requires_python() {
+        assert_eq!(
+            parse_setup_cfg_python_requires(
+                "[metadata]\nname = pre_commit\npython_requires = >=3.7\n\n[options]\npython_requires = >=3.10\n"
+            )
+            .as_deref(),
+            Some(">=3.10"),
+            "only the [options] section declares the requirement"
+        );
+        assert_eq!(
+            parse_setup_cfg_python_requires("[options]\n  python_requires =  >=3.10, <4  \n")
+                .as_deref(),
+            Some(">=3.10, <4")
+        );
+        for silent in [
+            "",
+            "[options]\npackages = find:\n",
+            "python_requires = >=3.10\n",
+            "[options]\npython_requires =\n",
+            "[options]\n# python_requires = >=3.10\n",
+        ] {
+            assert_eq!(
+                parse_setup_cfg_python_requires(silent),
+                None,
+                "{silent:?} declares nothing"
+            );
+        }
+    }
+
+    #[test]
     fn requires_python_pins_the_provable_inclusive_lower_bound() {
         assert_eq!(
             requires_python_lower_bound(">=3.10").unwrap(),
@@ -3660,6 +3813,56 @@ mod tests {
             DependencyPackDiagnosticSeverity::Warning
         );
         assert!(diagnostic.message.contains("pypy3.10"), "{diagnostic:#?}");
+    }
+
+    #[test]
+    fn setuptools_declarations_resolve_the_toolchain_a_pyproject_would() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("setup.py"),
+            "from setuptools import setup
+
+setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
+",
+        )
+        .unwrap();
+        let mut inputs = 0;
+        let dependency = resolve_declared_python_stdlib_dependency(root.path(), &mut inputs)
+            .unwrap()
+            .expect("setup.py declares a toolchain");
+        assert_eq!(dependency.id, "python:stdlib:declared:cpython:3.11.0");
+        assert_eq!(inputs, 1);
+
+        // The declarative spelling wins over the imperative one, the way
+        // setuptools resolves them.
+        std::fs::write(
+            root.path().join("setup.cfg"),
+            "[options]\npython_requires = >=3.12\n",
+        )
+        .unwrap();
+        let mut inputs = 0;
+        let dependency = resolve_declared_python_stdlib_dependency(root.path(), &mut inputs)
+            .unwrap()
+            .expect("setup.cfg declares a toolchain");
+        assert_eq!(
+            dependency.id, "python:stdlib:declared:cpython:3.12.0",
+            "setup.cfg wins over setup.py"
+        );
+
+        // And a PEP 621 manifest still wins over both.
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"fixture\"\nrequires-python = \">=3.13\"\n",
+        )
+        .unwrap();
+        let mut inputs = 0;
+        let dependency = resolve_declared_python_stdlib_dependency(root.path(), &mut inputs)
+            .unwrap()
+            .expect("pyproject declares a toolchain");
+        assert_eq!(
+            dependency.id, "python:stdlib:declared:cpython:3.13.0",
+            "a PEP 621 manifest wins over both"
+        );
     }
 
     #[test]

@@ -13989,7 +13989,8 @@ impl OrphanedNamespaceScopeIndex {
         }
         struct Frame<'tree> {
             node: Node<'tree>,
-            children: std::vec::IntoIter<Node<'tree>>,
+            children: Vec<Node<'tree>>,
+            next: usize,
             parsed_scope: Vec<String>,
             run: Option<RecoveredNamespaceRegion>,
         }
@@ -14009,7 +14010,8 @@ impl OrphanedNamespaceScopeIndex {
             let mut cursor = node.walk();
             Frame {
                 node,
-                children: node.children(&mut cursor).collect::<Vec<_>>().into_iter(),
+                children: node.children(&mut cursor).collect(),
+                next: 0,
                 parsed_scope,
                 run: None,
             }
@@ -14022,21 +14024,30 @@ impl OrphanedNamespaceScopeIndex {
         let mut open = Vec::new();
         let mut lexical_scope = Vec::new();
         let mut frames = vec![frame(root, Vec::new(), source)];
-        while let Some(current) = frames.last_mut() {
-            let Some(child) = current.children.next() else {
+        // A frame's node is the previous frame's direct child, so the frame
+        // below answers what Node::parent would without re-descending from the
+        // root; per-node parent or sibling climbs are quadratic over a wide
+        // translation unit (#3141).
+        while !frames.is_empty() {
+            let parent_node = frames.len().checked_sub(2).map(|index| frames[index].node);
+            let current = frames.last_mut().expect("frames is non-empty");
+            if current.next == current.children.len() {
                 regions.extend(frames.pop().expect("the frame just borrowed").run);
                 continue;
-            };
+            }
+            let child = current.children[current.next];
+            current.next += 1;
             match child.kind() {
                 "{" if !child.is_missing() => {
                     regions.extend(current.run.take());
-                    let mut components = current
-                        .node
-                        .parent()
+                    let mut components = parent_node
                         .map(|parent| namespace_body_name_components(parent, current.node, source))
                         .unwrap_or_default();
                     if components.is_empty() {
-                        components = recovered_namespace_open_components(child, source);
+                        components = recovered_namespace_open_components(
+                            &current.children[..current.next - 1],
+                            source,
+                        );
                     }
                     open.push((child.start_byte(), lexical_scope.len()));
                     lexical_scope.extend(components);
@@ -14186,17 +14197,19 @@ impl OrphanedNamespaceScopeIndex {
 /// issue #3084). Read the head from those siblings so the brace stack names
 /// the scope the brace opens. An anonymous namespace has no representable
 /// name and keeps an opaque scope.
-fn recovered_namespace_open_components(open: Node<'_>, source: &str) -> Vec<String> {
+///
+/// `preceding` is the open brace's preceding siblings, nearest last. The
+/// caller already holds the container's child list; `Node::prev_sibling`
+/// would re-descend from the root for each step (#3141).
+fn recovered_namespace_open_components(preceding: &[Node<'_>], source: &str) -> Vec<String> {
     let mut head = Vec::new();
-    let mut previous = open.prev_sibling();
-    while let Some(node) = previous {
-        if node.kind() != "comment" {
-            head.push(node);
+    for &sibling in preceding.iter().rev() {
+        if sibling.kind() != "comment" {
+            head.push(sibling);
             if head.len() == 2 {
                 break;
             }
         }
-        previous = node.prev_sibling();
     }
     let [name, keyword] = head[..] else {
         return Vec::new();

@@ -708,6 +708,21 @@ fn validate_procedure(
                 ),
             ));
         }
+        if gap.discharge == SemanticGapDischarge::ModeledEffectPartition
+            && (!matches!(gap.subject, SemanticGapSubject::Value(_))
+                || gap.capability != SemanticCapability::IndexMemory
+                || gap.kind != SemanticGapKind::Unsupported
+                || gap.impacts != SemanticGapImpacts::single(SemanticGapImpact::HeapRead))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares a modeled effect partition outside a value-scoped unsupported index-memory read",
+                    gap.id
+                ),
+            ));
+        }
         validate_gap_impacts(id, gap)?;
         if (gap.kind == SemanticGapKind::ExceededBudget) != gap.budget.is_some() {
             return Err(SemanticIrError::procedure(
@@ -1102,13 +1117,17 @@ fn validate_guard_facts(
             }
         }
         match guard.predicate {
-            GuardPredicate::InstanceOf { value, classes } => {
+            GuardPredicate::InstanceOf { value, classes }
+            | GuardPredicate::ExactClass { value, classes, .. } => {
                 ensure_value(id, value, procedure.values.len(), "guarded value")?;
                 ensure_value(id, classes, procedure.values.len(), "guard classes")?;
             }
             GuardPredicate::HasMember { value, member } => {
                 ensure_value(id, value, procedure.values.len(), "guarded value")?;
                 ensure_value(id, member, procedure.values.len(), "guard member")?;
+            }
+            GuardPredicate::Truthy { value } => {
+                ensure_value(id, value, procedure.values.len(), "guarded value")?;
             }
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::NullComparison { .. }
@@ -2100,11 +2119,30 @@ fn validate_events(
                 } => {
                     ensure_value(id, *source, procedure.values.len(), "value-flow source")?;
                     ensure_value(id, *target, procedure.values.len(), "value-flow target")?;
-                    if let ValueFlowKind::BackingStore {
-                        offset: BackingStoreOffset::Value(offset),
-                    } = kind
-                    {
-                        ensure_value(id, *offset, procedure.values.len(), "backing-store offset")?;
+                    match kind {
+                        ValueFlowKind::BackingStore {
+                            offset: BackingStoreOffset::Value(offset),
+                        }
+                        | ValueFlowKind::BackingStoreAlternative {
+                            offset: BackingStoreOffset::Value(offset),
+                            ..
+                        } => {
+                            ensure_value(
+                                id,
+                                *offset,
+                                procedure.values.len(),
+                                "backing-store offset",
+                            )?;
+                        }
+                        ValueFlowKind::BackingStore { .. }
+                        | ValueFlowKind::BackingStoreAlternative { .. }
+                        | ValueFlowKind::Local
+                        | ValueFlowKind::Transfer(_)
+                        | ValueFlowKind::Parameter
+                        | ValueFlowKind::Receiver
+                        | ValueFlowKind::Return
+                        | ValueFlowKind::IndexedReturn { .. }
+                        | ValueFlowKind::LanguageDefined => {}
                     }
                     validate_value_flow_kind(procedure, *kind, *source, *target)?;
                     if let ValueFlowKind::Transfer(transfer) = kind {
@@ -2132,6 +2170,25 @@ fn validate_events(
                             ));
                         }
                         validate_transfer(procedure, *transfer, event.evidence, point.id)?;
+                    }
+                    if let ValueFlowKind::BackingStoreAlternative { allocation, .. } = kind {
+                        ensure_allocation(
+                            id,
+                            *allocation,
+                            procedure.allocations.len(),
+                            "backing-store alternative allocation",
+                        )?;
+                        let allocation_result = procedure.allocations[allocation.index()].result;
+                        if allocation_result == *source || allocation_result == *target {
+                            return Err(SemanticIrError::procedure(
+                                id,
+                                SemanticIrErrorKind::ValueFlowContract,
+                                format!(
+                                    "backing-store alternative allocation {} must have a separate hidden result from source {} and target {}",
+                                    allocation, source, target
+                                ),
+                            ));
+                        }
                     }
                 }
                 SemanticEffect::ValueUse { value, .. } => {
@@ -2514,6 +2571,7 @@ fn validate_callable_value(
             true,
             CallableReferenceKind::BoundMethod
             | CallableReferenceKind::UnboundMethod
+            | CallableReferenceKind::TypeQualifiedMethod { .. }
             | CallableReferenceKind::StaticMethod
             | CallableReferenceKind::Constructor,
         ) => {
@@ -2589,6 +2647,9 @@ fn validate_callable_value(
                 }
             }
         }
+    }
+    if let CallableReferenceKind::TypeQualifiedMethod { qualifier } = callable.kind {
+        ensure_value(id, qualifier, procedure.values.len(), "type qualifier")?;
     }
     match (callable.kind, callable.bound_receiver) {
         (CallableReferenceKind::BoundMethod, Some(receiver)) => {
@@ -2672,9 +2733,10 @@ fn validate_value_flow_kind(
     let source_kind = &procedure.values[source.index()].kind;
     let target_kind = &procedure.values[target.index()].kind;
     let valid = match kind {
-        ValueFlowKind::Local | ValueFlowKind::Transfer(_) | ValueFlowKind::BackingStore { .. } => {
-            true
-        }
+        ValueFlowKind::Local
+        | ValueFlowKind::Transfer(_)
+        | ValueFlowKind::BackingStore { .. }
+        | ValueFlowKind::BackingStoreAlternative { .. } => true,
         ValueFlowKind::Parameter => {
             matches!(source_kind, SemanticValueKind::Parameter { .. })
                 || matches!(target_kind, SemanticValueKind::Parameter { .. })
@@ -3210,6 +3272,9 @@ fn validate_gap_capability(
 }
 
 fn validate_gap_impacts(procedure: ProcedureId, gap: &SemanticGap) -> Result<(), SemanticIrError> {
+    if gap.discharge == SemanticGapDischarge::ModeledEffectPartition {
+        return Ok(());
+    }
     let required = SemanticGapImpacts::for_gap(gap.capability, gap.subject);
     let Some(missing) = required
         .iter()
@@ -3287,7 +3352,8 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
         SemanticEffect::ValueFlow { kind, .. } => match kind {
             ValueFlowKind::Local
             | ValueFlowKind::Transfer(_)
-            | ValueFlowKind::BackingStore { .. } => {
+            | ValueFlowKind::BackingStore { .. }
+            | ValueFlowKind::BackingStoreAlternative { .. } => {
                 &[SemanticCapability::Values, SemanticCapability::LocalFlow]
             }
             ValueFlowKind::Parameter => &[

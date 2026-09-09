@@ -21,6 +21,7 @@ use super::resolution::{
     default_scope_formation,
 };
 use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::tree_walk::ParentIndex;
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -419,6 +420,16 @@ impl CompiledKinds {
 /// extraction pass.
 pub struct RoleSink<'a> {
     fact_by_ts_node: &'a HashMap<usize, u32>,
+    /// AST parents for the tree being extracted.
+    ///
+    /// Specs ask "what encloses this node?" constantly -- every spec in the
+    /// fleet calls `Node::parent` or `nearest_ancestor` -- and tree-sitter has
+    /// no parent pointer, so each such call re-descends from the root and costs
+    /// the node's position in the tree. Extraction visits every fact node, so
+    /// that is quadratic in file size: on goqu's vendored 248k-line
+    /// `sqlite3-binding.c` it was 97% of process CPU and timed out 100 probes.
+    /// The driver builds this index once per file instead.
+    parents: &'a ParentIndex<'a>,
     name: Option<Span>,
     roles: &'a mut Vec<RoleTarget>,
     /// Per-node occurrence-role classifications emitted during this walk,
@@ -450,6 +461,7 @@ impl<'a> RoleSink<'a> {
         occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
         max_roles: usize,
         cancellation: Option<&'a CancellationToken>,
+        parents: &'a ParentIndex<'a>,
     ) -> Self {
         Self {
             fact_by_ts_node,
@@ -459,7 +471,23 @@ impl<'a> RoleSink<'a> {
             max_roles,
             cancellation,
             stop: None,
+            parents,
         }
+    }
+
+    /// The AST parent of `node`, answered from the walk's index.
+    ///
+    /// Identical to [`Node::parent`] -- the index is built from the same
+    /// visible-child relation -- but constant time rather than a re-descent
+    /// from the root.
+    pub fn parent(&self, node: Node<'a>) -> Option<Node<'a>> {
+        self.parents.parent(node)
+    }
+
+    /// The walk's parent index, for spec helpers that climb ancestors
+    /// themselves rather than asking one question.
+    pub fn parents(&self) -> &'a ParentIndex<'a> {
+        self.parents
     }
 
     /// Classify one identifier-bearing node's occurrence role.

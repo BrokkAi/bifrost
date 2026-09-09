@@ -108,8 +108,32 @@ impl<'a, K> EdgeNodeDomain<'a, K> {
 /// Selects how a whole-workspace per-file scan is finalized. Language builders
 /// are generic over this trait so the AST walk is written once while callers can
 /// request either site-bearing API edges or compact weights for graph algorithms.
+/// A whole-workspace edge build, accumulated one file at a time.
+///
+/// The build used to collect every file's [`PerFileEdges`] into a `Vec` and
+/// merge at the end, so peak memory was the sum over the workspace rather than
+/// the size of the result. On OpenBankProject/OBP-API -- 1,486 Scala files
+/// totalling 20 MB of source -- that reached 150 GB of resident memory for a
+/// scan that returns no usages, measured at ~0.1 GB per file over a ~1 GB
+/// baseline. Absorbing each file as it is produced keeps only one partial per
+/// rayon worker alive, so peak tracks the merged result and the worker count,
+/// not the file count.
+///
+/// Both merges are order-insensitive -- `UsageEdges` sorts each edge's sites in
+/// [`finish`](Self::finish) and `UsageEdgeWeights` accumulates counts -- so
+/// absorbing in parallel and combining partials cannot change the output.
 pub(crate) trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
-    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self;
+    /// Partial state for a subset of the workspace's files.
+    type Partial: Default + Send;
+
+    /// Fold one file's edges into `partial`, consuming them.
+    fn absorb(partial: &mut Self::Partial, per_file: PerFileEdges<K>);
+
+    /// Combine two partials built from disjoint file subsets.
+    fn combine(left: Self::Partial, right: Self::Partial) -> Self::Partial;
+
+    /// Apply the call-site cap and any ordering the output guarantees.
+    fn finish(partial: Self::Partial) -> Self;
 }
 
 /// The result of a whole-workspace edge build that also records whether every
@@ -247,15 +271,37 @@ fn cache_complete_usage_edges(
     }
 }
 
-impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdges<K> {
-    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
-        merge_and_cap(per_file)
+impl<K: NodeKey + Send> UsageEdgeBuildOutput<K> for UsageEdges<K> {
+    type Partial = EdgeSitesPartial<K>;
+
+    fn absorb(partial: &mut Self::Partial, per_file: PerFileEdges<K>) {
+        partial.absorb(per_file);
+    }
+
+    fn combine(mut left: Self::Partial, right: Self::Partial) -> Self::Partial {
+        left.combine(right);
+        left
+    }
+
+    fn finish(partial: Self::Partial) -> Self {
+        partial.finish()
     }
 }
 
-impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
-    fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
-        merge_weights_and_cap(per_file)
+impl<K: NodeKey + Send> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
+    type Partial = EdgeWeightsPartial<K>;
+
+    fn absorb(partial: &mut Self::Partial, per_file: PerFileEdges<K>) {
+        partial.absorb(per_file);
+    }
+
+    fn combine(mut left: Self::Partial, right: Self::Partial) -> Self::Partial {
+        left.combine(right);
+        left
+    }
+
+    fn finish(partial: Self::Partial) -> Self {
+        partial.finish()
     }
 }
 
@@ -415,7 +461,22 @@ where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
-    Output::merge(collect_per_file_edges(files, keep_file, scan))
+    // Stream: fold each file into a per-worker partial and drop it, rather than
+    // collecting every file's edges and merging at the end. Peak memory then
+    // tracks the merged result plus one partial per rayon worker, instead of the
+    // whole workspace at once.
+    let partial = files
+        .par_iter()
+        .filter(|file| keep_file(file))
+        // Borrow `scan` rather than move it: it's `Sync` but not necessarily `Send`,
+        // and rayon shares one mapper across worker threads.
+        .filter_map(|file| scan(file))
+        .fold(Output::Partial::default, |mut partial, per_file| {
+            Output::absorb(&mut partial, per_file);
+            partial
+        })
+        .reduce(Output::Partial::default, Output::combine);
+    Output::finish(partial)
 }
 
 /// Drive a whole-workspace edge build while retaining the identities of files
@@ -435,22 +496,33 @@ where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
-    let (per_file, omitted_files) = files
+    // Streamed for the same reason as `build_edge_output`: the omitted-file
+    // identities are small and must be kept, but the per-file edge maps are not
+    // and must not accumulate.
+    let (partial, mut omitted_files) = files
         .par_iter()
         .filter(|file| keep_file(file))
         .map(|file| scan(file).map_or_else(|| Err(file.clone()), Ok))
-        .partition::<Vec<_>, Vec<_>, _>(Result::is_ok);
-    let mut omitted_files = omitted_files
-        .into_iter()
-        .map(|result| match result {
-            Ok(_) => unreachable!("partitioned successful file result into omissions"),
-            Err(file) => file,
-        })
-        .collect::<Vec<_>>();
+        .fold(
+            || (Output::Partial::default(), Vec::new()),
+            |(mut partial, mut omitted), result| {
+                match result {
+                    Ok(per_file) => Output::absorb(&mut partial, per_file),
+                    Err(file) => omitted.push(file),
+                }
+                (partial, omitted)
+            },
+        )
+        .reduce(
+            || (Output::Partial::default(), Vec::new()),
+            |(left_partial, mut left_omitted), (right_partial, right_omitted)| {
+                left_omitted.extend(right_omitted);
+                (Output::combine(left_partial, right_partial), left_omitted)
+            },
+        );
     omitted_files.sort_unstable();
     omitted_files.dedup();
-    let per_file = per_file.into_iter().map(Result::unwrap).collect::<Vec<_>>();
-    let output = Output::merge(per_file);
+    let output = Output::finish(partial);
     if omitted_files.is_empty() {
         UsageEdgeBuildResult::Complete(output)
     } else {
@@ -462,25 +534,6 @@ where
 }
 
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below
-fn collect_per_file_edges<K, KeepFn, ScanFn>(
-    files: &[ProjectFile],
-    keep_file: KeepFn,
-    scan: ScanFn,
-) -> Vec<PerFileEdges<K>>
-where
-    K: NodeKey + Send,
-    KeepFn: Fn(&ProjectFile) -> bool + Sync,
-    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
-{
-    files
-        .par_iter()
-        .filter(|file| keep_file(file))
-        // Borrow `scan` rather than move it: it's `Sync` but not necessarily `Send`,
-        // and rayon shares one mapper across worker threads.
-        .filter_map(|file| scan(file))
-        .collect()
-}
-
 /// Build one file's edges: construct its declaration index and the
 /// [`FileEdgeScanInput`] the language reads, run the language `scan`, and stamp the
 /// file path onto the result. Every borrow the input hands out is scoped to this
@@ -644,17 +697,33 @@ where
 }
 
 /// Sum per-file results and drop callees past [`MAX_CALLSITES`] into `truncated`.
-pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> UsageEdges<K> {
-    // Each file's `edge_lines` already holds the distinct lines for that file, so
-    // concatenating per-file `(path, line)` pairs yields distinct `(file, line)`
-    // sites per edge. Unioning line numbers across files would instead collapse the
-    // same line number appearing in two files (e.g. a partial class) and undercount.
-    let mut edge_sites: BTreeMap<(K, K), Vec<CallSite>> = BTreeMap::new();
-    let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
-    let mut unproven_inbound: BTreeMap<K, usize> = BTreeMap::new();
-    for file in per_file {
+/// Call sites accumulated so far, before the call-site cap is applied.
+///
+/// Each file's `edge_lines` already holds the distinct lines for that file, so
+/// concatenating per-file `(path, line)` pairs yields distinct `(file, line)`
+/// sites per edge. Unioning line numbers across files would instead collapse
+/// the same line number appearing in two files (e.g. a partial class) and
+/// undercount.
+pub(crate) struct EdgeSitesPartial<K: NodeKey> {
+    edge_sites: BTreeMap<(K, K), Vec<CallSite>>,
+    callsites: BTreeMap<K, usize>,
+    unproven_inbound: BTreeMap<K, usize>,
+}
+
+impl<K: NodeKey> Default for EdgeSitesPartial<K> {
+    fn default() -> Self {
+        Self {
+            edge_sites: BTreeMap::new(),
+            callsites: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: NodeKey> EdgeSitesPartial<K> {
+    fn absorb(&mut self, file: PerFileEdges<K>) {
         for (key, lines) in file.edge_lines {
-            let sites = edge_sites.entry(key).or_default();
+            let sites = self.edge_sites.entry(key).or_default();
             sites.extend(lines.into_iter().map(|(line, mut evidence)| {
                 evidence.spans.sort_unstable();
                 CallSite {
@@ -666,13 +735,43 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
             }));
         }
         for (callee, sites) in file.callsites {
-            *callsites.entry(callee).or_insert(0) += sites.len();
+            *self.callsites.entry(callee).or_insert(0) += sites.len();
         }
         for (callee, sites) in file.unproven_inbound {
-            *unproven_inbound.entry(callee).or_insert(0) += sites.len();
+            *self.unproven_inbound.entry(callee).or_insert(0) += sites.len();
         }
     }
 
+    fn combine(&mut self, other: Self) {
+        for (key, sites) in other.edge_sites {
+            self.edge_sites.entry(key).or_default().extend(sites);
+        }
+        for (callee, total) in other.callsites {
+            *self.callsites.entry(callee).or_insert(0) += total;
+        }
+        for (callee, total) in other.unproven_inbound {
+            *self.unproven_inbound.entry(callee).or_insert(0) += total;
+        }
+    }
+
+    fn finish(self) -> UsageEdges<K> {
+        cap_edge_sites(self.edge_sites, self.callsites, self.unproven_inbound)
+    }
+}
+
+pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> UsageEdges<K> {
+    let mut partial = EdgeSitesPartial::default();
+    for file in per_file {
+        partial.absorb(file);
+    }
+    partial.finish()
+}
+
+fn cap_edge_sites<K: NodeKey>(
+    edge_sites: BTreeMap<(K, K), Vec<CallSite>>,
+    callsites: BTreeMap<K, usize>,
+    unproven_inbound: BTreeMap<K, usize>,
+) -> UsageEdges<K> {
     let truncated: BTreeMap<K, usize> = callsites
         .into_iter()
         .filter(|(_, total)| *total > MAX_CALLSITES)
@@ -694,27 +793,79 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
     }
 }
 
-pub(crate) fn merge_weights_and_cap<K: NodeKey>(
-    per_file: Vec<PerFileEdges<K>>,
-) -> UsageEdgeWeights<K> {
-    let mut edge_weights: BTreeMap<(K, K), UsageReferenceCounts> = BTreeMap::new();
-    let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
-    let mut unproven_inbound: BTreeMap<K, usize> = BTreeMap::new();
-    for file in per_file {
+/// Reference-kind counts accumulated so far, before the call-site cap.
+pub(crate) struct EdgeWeightsPartial<K: NodeKey> {
+    edge_weights: BTreeMap<(K, K), UsageReferenceCounts>,
+    callsites: BTreeMap<K, usize>,
+    unproven_inbound: BTreeMap<K, usize>,
+}
+
+impl<K: NodeKey> Default for EdgeWeightsPartial<K> {
+    fn default() -> Self {
+        Self {
+            edge_weights: BTreeMap::new(),
+            callsites: BTreeMap::new(),
+            unproven_inbound: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: NodeKey> EdgeWeightsPartial<K> {
+    fn absorb(&mut self, file: PerFileEdges<K>) {
         for (key, lines) in file.edge_lines {
-            let counts = edge_weights.entry(key).or_default();
+            let counts = self.edge_weights.entry(key).or_default();
             for evidence in lines.into_values() {
                 counts.record(evidence.kind);
             }
         }
         for (callee, sites) in file.callsites {
-            *callsites.entry(callee).or_insert(0) += sites.len();
+            *self.callsites.entry(callee).or_insert(0) += sites.len();
         }
         for (callee, sites) in file.unproven_inbound {
-            *unproven_inbound.entry(callee).or_insert(0) += sites.len();
+            *self.unproven_inbound.entry(callee).or_insert(0) += sites.len();
         }
     }
 
+    fn combine(&mut self, other: Self) {
+        for (key, counts) in other.edge_weights {
+            let target = self.edge_weights.entry(key).or_default();
+            target.calls = target.calls.saturating_add(counts.calls);
+            target.members = target.members.saturating_add(counts.members);
+            target.types = target.types.saturating_add(counts.types);
+            target.other = target.other.saturating_add(counts.other);
+        }
+        for (callee, total) in other.callsites {
+            *self.callsites.entry(callee).or_insert(0) += total;
+        }
+        for (callee, total) in other.unproven_inbound {
+            *self.unproven_inbound.entry(callee).or_insert(0) += total;
+        }
+    }
+
+    fn finish(self) -> UsageEdgeWeights<K> {
+        cap_edge_weights(self.edge_weights, self.callsites, self.unproven_inbound)
+    }
+}
+
+/// Merge an already-materialised file set into weights. The whole-workspace
+/// driver streams instead (see [`UsageEdgeBuildOutput`]), so this remains only
+/// for tests that construct their file set directly.
+#[cfg(test)]
+pub(crate) fn merge_weights_and_cap<K: NodeKey>(
+    per_file: Vec<PerFileEdges<K>>,
+) -> UsageEdgeWeights<K> {
+    let mut partial = EdgeWeightsPartial::default();
+    for file in per_file {
+        partial.absorb(file);
+    }
+    partial.finish()
+}
+
+fn cap_edge_weights<K: NodeKey>(
+    edge_weights: BTreeMap<(K, K), UsageReferenceCounts>,
+    callsites: BTreeMap<K, usize>,
+    unproven_inbound: BTreeMap<K, usize>,
+) -> UsageEdgeWeights<K> {
     let truncated: BTreeMap<K, usize> = callsites
         .into_iter()
         .filter(|(_, total)| *total > MAX_CALLSITES)

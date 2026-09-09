@@ -881,6 +881,22 @@ pub struct ResolvedTaintPolicySpec {
 }
 
 impl ResolvedTaintPolicySpec {
+    /// Whether a source-originated label is authorable at a sink. The solver
+    /// proves the concrete path; this check binds the projected label either
+    /// to the source declaration or to one of this policy's declared transform
+    /// additions, so projection cannot invent an undeclared relabeling.
+    pub fn authorizes_reached_label(
+        &self,
+        source: &ResolvedTaintSourceDefinition,
+        label: &TaintLabel,
+    ) -> bool {
+        source.labels.contains(label)
+            || self
+                .transforms
+                .iter()
+                .any(|transform| transform.definition.adds.contains(label))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: MayMode,

@@ -243,7 +243,7 @@ pub fn canonical_taint_findings_from_forward(
         for evidence in finding.origins().evidence() {
             for class in plan
                 .universe()
-                .stable_classes(evidence.classes())
+                .stable_classes(evidence.reached_classes())
                 .map_err(|_| TaintFindingError::InvalidResult)?
             {
                 let key = (

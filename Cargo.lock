@@ -351,6 +351,7 @@ version = "0.11.1"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-core",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

@@ -99,7 +99,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "fa5b34160bdb8cba222c37c31faeaaa589704e6d1fd27951f77f397aaafcb302",
+      "finding_id": "3efcd06f8f67a0f426130f71e613577a8985905c7c3a9b63522ad4e47124c3a5",
       "path": "crates/bifrost-analysis/src/analyzer/rust/dependency_discovery.rs",
       "identity_stability": "strong",
       "status": "accepted",

@@ -14,13 +14,19 @@
 //! `partial` and produces no finding, and `inconclusive`/`no_information`
 //! are never read as an empty or absent class set.
 
+mod binding_refinement;
+mod correlations;
+mod dynamic_stores;
+mod field_refinement;
 mod field_slots;
 mod plan;
+mod refinement_sources;
 mod report;
 mod solve;
 mod summary;
 
 pub use crate::analyzer::semantic::{SourceSite, SourceSiteKind};
+pub use dynamic_stores::DynamicWriteEvidence;
 pub use field_slots::{
     FieldSlot, FieldSlotIndex, FieldSlotIndexAcquisitionKind, FieldSlotIndexCache,
     FieldSlotIndexMissReason, active_semantic_model_pack_digest,

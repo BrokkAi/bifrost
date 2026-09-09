@@ -57,7 +57,7 @@ use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::DerivedArtifactId;
 use crate::analyzer::semantic::ids::StableDigest;
-use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, Language, ProjectFile, Range, SignatureMetadata};
 use crate::hash::HashSet;
 use crate::path_utils::rel_path_string;
 
@@ -121,6 +121,28 @@ impl IndexFamily {
 /// against another workspace and comparing digests is what detects the change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LookupKind {
+    /// The exact rendered-name answer of the shared resolver, including its
+    /// structured identifier compatibility view and request memo.
+    ResolvedName,
+    /// The definitions answered by one analyzer delegate or by the composite
+    /// workspace lookup.
+    Definitions,
+    /// The declaration candidates returned by one analyzer's identifier
+    /// lookup.
+    IdentifierCandidates,
+    /// The declaration candidates returned by one analyzer's short-name
+    /// lookup.
+    ShortNameCandidates,
+    /// The exact declaration facts used by a language resolver: the target
+    /// declaration identity and the optional declaration that owns it.
+    ///
+    /// This is deliberately separate from the declaration-index families. A
+    /// parent lookup can resolve without hydrating the target's declaring file,
+    /// while a structural fallback may read that file, and the answer digest
+    /// binds both the target and the resolved parent.
+    DeclarationFacts,
+    /// The structured signature metadata consumed for one declaration.
+    SignatureMetadata,
     /// The callers of one declaration, from the call relation.
     Callers,
     /// The callees of one declaration, from the call relation.
@@ -157,6 +179,12 @@ impl LookupKind {
     /// The label used in the canonical encoding and in diagnostics.
     pub const fn stable_label(self) -> &'static str {
         match self {
+            Self::ResolvedName => "resolved_name",
+            Self::Definitions => "definitions",
+            Self::IdentifierCandidates => "identifier_candidates",
+            Self::ShortNameCandidates => "short_name_candidates",
+            Self::DeclarationFacts => "declaration_facts",
+            Self::SignatureMetadata => "signature_metadata",
             Self::Callers => "callers",
             Self::Callees => "callees",
             Self::Usages => "usages",
@@ -405,6 +433,14 @@ impl ReadKey {
 
 /// Domain for the digest of an answer that is a set of declarations.
 const DECLARATION_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-set:v1";
+/// Domain for the exact declaration facts consumed by a language resolver.
+const DECLARATION_FACTS_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-facts:v1";
+/// Domain for a declaration-facts question whose declaration is absent.
+const ABSENT_DECLARATION_FACTS_DOMAIN: &[u8] = b"bifrost-read-ledger:absent-declaration-facts:v1";
+/// Domain for the structured signature metadata of one declaration.
+const SIGNATURE_METADATA_DOMAIN: &[u8] = b"bifrost-read-ledger:signature-metadata:v1";
+/// Domain for a signature-metadata question whose declaration is absent.
+const ABSENT_SIGNATURE_METADATA_DOMAIN: &[u8] = b"bifrost-read-ledger:absent-signature-metadata:v1";
 /// Domain for the answer digest of a summary lookup that found nothing.
 const ABSENT_SUMMARY_DOMAIN: &[u8] = b"bifrost-read-ledger:absent-summary:v1";
 /// Domain for the digest of an answer that is a set of files.
@@ -427,6 +463,15 @@ const FILE_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:file-set:v1";
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "question", rename_all = "snake_case")]
 pub enum LookupQuestion {
+    /// One name lookup, optionally restricted to one language delegate.
+    ///
+    /// `None` is the composite question: every language currently mounted,
+    /// including languages added in a later workspace revision. `Some` names
+    /// one delegate's answer.
+    Name {
+        language: Option<Language>,
+        name: Box<str>,
+    },
     /// One declaration, by the file it is declared in and its qualified name.
     Declaration {
         rel_path: Box<str>,
@@ -533,6 +578,7 @@ impl LookupQuestion {
     /// The label used in the canonical encoding and in diagnostics.
     pub const fn stable_label(&self) -> &'static str {
         match self {
+            Self::Name { .. } => "name",
             Self::Declaration { .. } => "declaration",
             Self::File { .. } => "file",
             Self::CallSite { .. } => "call_site",
@@ -544,11 +590,11 @@ impl LookupQuestion {
     /// The workspace-relative path this question is about, when it names one.
     pub fn rel_path(&self) -> Option<&str> {
         match self {
+            Self::Name { .. } | Self::Summary { .. } => None,
             Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
             | Self::CallSite { rel_path, .. }
             | Self::ProcedureCallSite { rel_path, .. } => Some(rel_path),
-            Self::Summary { .. } => None,
         }
     }
 
@@ -556,6 +602,16 @@ impl LookupQuestion {
     fn push_canonical(&self, hasher: &mut CanonicalHasher) {
         hasher.field("question", self.stable_label().as_bytes());
         match self {
+            Self::Name { language, name } => {
+                match language {
+                    Some(language) => {
+                        hasher.field("language_present", &[1]);
+                        hasher.field("language", language.config_label().as_bytes());
+                    }
+                    None => hasher.field("language_present", &[0]),
+                }
+                hasher.field("name", name.as_bytes());
+            }
             Self::Declaration { rel_path, fq_name } => {
                 hasher.field("rel_path", rel_path.as_bytes());
                 hasher.field("fq_name", fq_name.as_bytes());
@@ -607,6 +663,54 @@ pub fn declaration_set_digest<'a>(units: impl IntoIterator<Item = &'a CodeUnit>)
         hasher.field(&path, fq_name.as_bytes());
     }
     StableDigest::from_array(hasher.finish())
+}
+
+/// The canonical digest of the exact declaration facts a resolver consumed.
+///
+/// A declaration identity includes the normalized source path, structured
+/// qualified name, kind, synthetic bit, and signature. The optional parent is
+/// folded separately so a target whose owner changes cannot retain the old
+/// answer even when the target's own identity is unchanged.
+pub fn declaration_facts_digest(declaration: &CodeUnit, parent: Option<&CodeUnit>) -> StableDigest {
+    let mut hasher = CanonicalHasher::new(DECLARATION_FACTS_DOMAIN);
+    hasher.field(
+        "declaration",
+        declaration.declaration_id().as_str().as_bytes(),
+    );
+    match parent {
+        Some(parent) => hasher.field("parent", parent.declaration_id().as_str().as_bytes()),
+        None => hasher.field("parent", b"absent"),
+    }
+    StableDigest::from_array(hasher.finish())
+}
+
+/// The answer digest of a declaration-facts lookup whose declaration is absent.
+pub fn absent_declaration_facts_digest() -> StableDigest {
+    StableDigest::from_array(CanonicalHasher::new(ABSENT_DECLARATION_FACTS_DOMAIN).finish())
+}
+
+/// The canonical digest of one declaration's structured signature metadata.
+pub fn signature_metadata_digest(
+    declaration: &CodeUnit,
+    metadata: &[SignatureMetadata],
+) -> StableDigest {
+    let mut hasher = CanonicalHasher::new(SIGNATURE_METADATA_DOMAIN);
+    hasher.field(
+        "declaration",
+        declaration.declaration_id().as_str().as_bytes(),
+    );
+    hasher.sequence("metadata", metadata, |hasher, metadata| {
+        hasher.value(
+            &serde_json::to_vec(metadata)
+                .expect("signature metadata has a deterministic serialization"),
+        );
+    });
+    StableDigest::from_array(hasher.finish())
+}
+
+/// The answer digest of a signature-metadata lookup whose declaration is absent.
+pub fn absent_signature_metadata_digest() -> StableDigest {
+    StableDigest::from_array(CanonicalHasher::new(ABSENT_SIGNATURE_METADATA_DOMAIN).finish())
 }
 
 /// The answer digest of a procedure-summary lookup that found nothing.
@@ -664,11 +768,10 @@ impl std::fmt::Display for ReadSetDigest {
 /// The set of inputs one request read, plus the crossings it could not name.
 ///
 /// Shared behind an `Arc` and written from every thread the analyzer spends the
-/// request's work on: the registry of open query contexts broadcasts a funnel
-/// crossing to every open ledger whichever thread crossed it, exactly as it
-/// broadcasts information-tier crossings. Under a host that serves concurrent
-/// requests a ledger therefore over-records, which makes a read set a superset
-/// of its true reads: sound, never unsound.
+/// request's work on. A replayable funnel's nested capture shadows only its
+/// explicitly linked enclosing ledger; unrelated concurrent request ledgers
+/// still receive the read. Ordinary nested scopes carry no ledger and leave
+/// their enclosing ledger visible.
 #[derive(Debug, Default)]
 pub struct ReadLedger {
     keys: Mutex<HashSet<ReadKey>>,
@@ -876,6 +979,14 @@ mod tests {
     #[test]
     fn a_lookup_question_round_trips_through_serde() {
         let questions = [
+            LookupQuestion::Name {
+                language: Some(Language::Rust),
+                name: Box::from("crate::a::f"),
+            },
+            LookupQuestion::Name {
+                language: None,
+                name: Box::from("crate::a::f"),
+            },
             LookupQuestion::Declaration {
                 rel_path: Box::from("src/a.rs"),
                 fq_name: Box::from("crate::a::f"),
@@ -917,6 +1028,37 @@ mod tests {
                 serde_json::from_str(&encoded).expect("question deserializes");
             assert_eq!(decoded, question, "{encoded}");
         }
+    }
+
+    #[test]
+    fn a_composite_name_question_is_distinct_from_each_delegate_question() {
+        let answer = StableDigest::sha256("answer");
+        let composite = ReadKey::lookup(
+            LookupKind::Definitions,
+            LookupQuestion::Name {
+                language: None,
+                name: Box::from("crate::a::f"),
+            },
+            answer,
+        );
+        let rust = ReadKey::lookup(
+            LookupKind::Definitions,
+            LookupQuestion::Name {
+                language: Some(Language::Rust),
+                name: Box::from("crate::a::f"),
+            },
+            answer,
+        );
+        let java = ReadKey::lookup(
+            LookupKind::Definitions,
+            LookupQuestion::Name {
+                language: Some(Language::Java),
+                name: Box::from("crate::a::f"),
+            },
+            answer,
+        );
+        assert_ne!(composite.canonical_digest(), rust.canonical_digest());
+        assert_ne!(rust.canonical_digest(), java.canonical_digest());
     }
 
     #[test]

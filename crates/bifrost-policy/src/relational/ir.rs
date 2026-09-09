@@ -311,6 +311,10 @@ impl fmt::Display for IrPredicate {
 pub enum IrJoinKind {
     /// Every matching pair, with both schemas concatenated.
     Inner,
+    /// Every matching pair plus one null-extended row for each left row with
+    /// no partner. The right schema is carried with every right field marked
+    /// nullable.
+    Left,
     /// The left rows that have at least one partner. The right schema is not
     /// carried, so a semi join filters without multiplying rows.
     Semi,
@@ -323,6 +327,7 @@ impl IrJoinKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Inner => "inner",
+            Self::Left => "left",
             Self::Semi => "semi",
             Self::Anti => "anti",
         }
@@ -520,7 +525,15 @@ pub struct IrLimits {
     pub max_joined_rows: usize,
     pub max_groups: usize,
     pub max_values_per_group: usize,
+    /// The maximum contributing tuples retained per grouped result for
+    /// diagnostics. The aggregate itself is never truncated by this bound.
+    pub max_representative_tuples: usize,
 }
+
+/// The default number of contributing tuples retained for one violated group.
+/// The bound is an IR concern so evaluator and lowerer code can share it
+/// without making the IR depend on the evaluator module.
+pub const DEFAULT_MAX_REPRESENTATIVE_TUPLES: usize = 8;
 
 impl From<RelationalAssertionLimits> for IrLimits {
     fn from(limits: RelationalAssertionLimits) -> Self {
@@ -531,6 +544,7 @@ impl From<RelationalAssertionLimits> for IrLimits {
             max_joined_rows: limits.max_joined_rows,
             max_groups: limits.max_groups,
             max_values_per_group: limits.max_values_per_group,
+            max_representative_tuples: DEFAULT_MAX_REPRESENTATIVE_TUPLES,
         }
     }
 }
@@ -629,12 +643,18 @@ pub fn expansion_result_domain(
     }
 }
 
-/// The schema a join publishes: an inner join concatenates both sides, and the
-/// two filtering joins publish the left side only.
+/// The schema a join publishes: an inner join concatenates both sides, a left
+/// join concatenates the right side as nullable fields, and the two filtering
+/// joins publish the left side only.
 pub fn join_schema(left: &IrSchema, right: &IrSchema, kind: IrJoinKind) -> IrSchema {
     let mut fields = left.fields().to_vec();
-    if kind == IrJoinKind::Inner {
-        fields.extend(right.fields().iter().cloned());
+    match kind {
+        IrJoinKind::Inner => fields.extend(right.fields().iter().cloned()),
+        IrJoinKind::Left => fields.extend(right.fields().iter().cloned().map(|mut field| {
+            field.nullable = true;
+            field
+        })),
+        IrJoinKind::Semi | IrJoinKind::Anti => {}
     }
     IrSchema::new(fields)
 }

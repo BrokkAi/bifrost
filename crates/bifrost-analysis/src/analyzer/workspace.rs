@@ -26,49 +26,9 @@ use crate::analyzer::{
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-
-struct WorkspaceBuildLock {
-    _file: File,
-}
-
-impl WorkspaceBuildLock {
-    fn acquire(db_path: &Path) -> Result<Self, StoreError> {
-        // Keep the established sidecar name so processes running older Bifrost
-        // builds coordinate on the same OS lock during an upgrade.
-        let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                StoreError::new(format!(
-                    "failed to open workspace analyzer build lock {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
-        let _scope = profiling::scope("WorkspaceAnalyzer::build_lock_wait");
-        file.lock().map_err(|error| {
-            StoreError::new(format!(
-                "failed to acquire workspace analyzer build lock {}: {error}",
-                lock_path.display()
-            ))
-        })?;
-        Ok(Self { _file: file })
-    }
-}
-
-fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
-    let mut path = OsString::from(db_path.as_os_str());
-    path.push(suffix);
-    PathBuf::from(path)
-}
 
 /// The repository's shared content-addressed analyzer cache, opened once for a
 /// request that analyzes immutable revisions of that repository.
@@ -128,42 +88,56 @@ impl SharedAnalyzerCache {
 
     /// Claim the workspace projection rows an immutable image at `image_root`
     /// is about to publish, so they are removed when the request ends.
-    pub(crate) fn claim_revision_workspace(
-        &self,
-        image_root: &Path,
-    ) -> RevisionWorkspaceProjection {
-        RevisionWorkspaceProjection {
-            store: self.store(),
+    pub(crate) fn claim_revision_workspace(&self, image_root: &Path) -> WorkspaceProjectionLease {
+        WorkspaceProjectionLease::new(
+            self.store(),
             // Resolved now, while the export directory still exists:
             // `WorkspaceId::for_root` canonicalizes, and a canonicalization
             // that fails after the directory is unlinked would produce a
             // different identity than the build published under.
-            workspace_id: crate::analyzer::store::WorkspaceId::for_root(image_root),
-        }
+            crate::analyzer::store::WorkspaceId::for_root(image_root),
+        )
     }
 }
 
-/// The workspace projection rows one immutable revision image publishes into a
-/// shared cache, removed when this value drops.
+/// The workspace projection rows one session publishes into a shared cache,
+/// removed when this value drops. Scoped live projects retain this lease in
+/// their analyzer contexts; immutable revision exports retain it with the image.
 ///
 /// Query paths mount a workspace's files through `workspace_heads` and
 /// `workspace_file_versions`, so a revision image must publish them to be
 /// queryable at all -- declaration lookup, package resolution and path-symbol
-/// resolution all read those rows. They describe a temp-directory root that
-/// stops existing when the request ends, though, so leaving them behind would
+/// resolution all read those rows. They describe a session's file set rather
+/// than a live workspace, though, so leaving them behind would
 /// grow the shared cache by one whole file listing per request forever. The
 /// parsed blob facts the same build published are keyed by content and stay:
 /// those are the reusable asset.
-pub(crate) struct RevisionWorkspaceProjection {
+pub(crate) struct WorkspaceProjectionLease {
     store: Arc<crate::analyzer::store::AnalyzerStore>,
     workspace_id: crate::analyzer::store::WorkspaceId,
 }
 
-impl Drop for RevisionWorkspaceProjection {
+impl WorkspaceProjectionLease {
+    pub(crate) fn new(
+        store: Arc<crate::analyzer::store::AnalyzerStore>,
+        workspace_id: crate::analyzer::store::WorkspaceId,
+    ) -> Self {
+        assert!(
+            store.db_path().is_some(),
+            "projection leases require a persistent store"
+        );
+        Self {
+            store,
+            workspace_id,
+        }
+    }
+}
+
+impl Drop for WorkspaceProjectionLease {
     fn drop(&mut self) {
         if let Err(error) = self.store.delete_workspace_projection(&self.workspace_id) {
             eprintln!(
-                "bifrost: could not drop the revision image's workspace projection rows from the \
+                "bifrost: could not drop the session's workspace projection rows from the \
                  shared analyzer cache; they will be reclaimed when this language's analysis \
                  generation next changes: {error}"
             );
@@ -1167,11 +1141,6 @@ impl WorkspaceAnalyzer {
     /// - An explicit do-not-write-here operator opt-out, for a checkout you do
     ///   not own and must leave byte-identical.
     /// - Deliberate cold-build measurement.
-    /// - A partial file set over a *live* workspace root, such as a
-    ///   changed-file-scoped view of it. Writing an on-disk cache under that
-    ///   root's workspace identity would be actively wrong: a build publishes
-    ///   workspace projection rows, and a partial file set must not become the
-    ///   workspace's cached picture of itself.
     ///
     /// Tests are fine: a hermetic small fixture wants no cache to survive it.
     ///
@@ -1184,15 +1153,33 @@ impl WorkspaceAnalyzer {
     /// a blob's facts partial. The workspace rows such a build publishes name a
     /// self-deleting export directory and are removed by the caller's
     /// [`SharedAnalyzerCache::claim_revision_workspace`] lease, which is the
-    /// part a live root cannot have. That path no longer falls back here when a
-    /// host's cache will not open either; it reports the failure. What still
-    /// arrives here is the partial case above: a worktree image, whose file set
-    /// is a slice of a live workspace.
+    /// part an ordinary persisted live build cannot have. A scoped live project
+    /// instead uses [`Self::build_scoped_persisted`], whose unique session
+    /// identity isolates its partial projection from the live workspace.
+    /// Revision analysis that explicitly supplies no shared cache, including
+    /// the current diff worktree-image path, still takes this ephemeral door.
     pub fn build_ephemeral_footgun(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None)
+    }
+
+    /// Share the rooted project's persistent blob cache while isolating its
+    /// selected file set in a session projection. Cache location and build
+    /// serialization are the same as for [`Self::build_persisted`], but the
+    /// live workspace's identity is never used to publish this partial view.
+    ///
+    /// Every analyzer context, including clones and lazy language delegates,
+    /// holds the projection lease. The final drop removes only session rows;
+    /// complete blob facts remain reusable. Store errors propagate, and this
+    /// does not change [`Project::persistence_root`] for a scoped project.
+    pub fn build_scoped_persisted(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::scoped_store_context(project.as_ref())?;
         Self::build_filtered(project, config, None, store_context, None)
     }
 
@@ -1364,23 +1351,30 @@ impl WorkspaceAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
-        // Persisted workspaces share parsed blobs, so serialize the complete
-        // reconciliation, not just the first population. Otherwise concurrent
-        // worktrees all snapshot the same missing set and each creates a full
-        // analyzer pool before any of them can publish reusable results.
-        let build_lock = if let Some(db_path) = store_context.store.db_path() {
-            profiling::note("workspace.store=persistent");
-            Some(WorkspaceBuildLock::acquire(db_path)?)
-        } else {
-            profiling::note("workspace.store=ephemeral");
-            None
-        };
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.
         let mut store_context = crate::analyzer::AnalyzerStoreContext {
             build_abort: Arc::new(crate::analyzer::BuildAbort::default()),
             ..store_context
+        };
+        // Persisted workspaces share parsed blobs, so serialize the complete
+        // reconciliation, not just the first population. Otherwise concurrent
+        // worktrees all snapshot the same missing set and each creates a full
+        // analyzer pool before any of them can publish reusable results.
+        //
+        // Declare the lock after the store context so unwinding drops it before
+        // the context joins any GC task that is waiting for this same lock.
+        let build_lock = if let Some(db_path) = store_context.store.db_path() {
+            profiling::note("workspace.store=persistent");
+            let _scope = profiling::scope("WorkspaceAnalyzer::build_lock_wait");
+            Some(
+                brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(db_path)
+                    .map_err(StoreError::new)?,
+            )
+        } else {
+            profiling::note("workspace.store=ephemeral");
+            None
         };
         let mut delegates = BTreeMap::new();
         let project_languages = project.analyzer_languages();
@@ -1986,6 +1980,99 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn scoped_cache_projections_are_isolated_and_retained_by_analyzer_clones() {
+        let fixture = InlineTestProject::new()
+            .file("src/app.py", "class Box:\n    pass\n")
+            .file("other/extra.py", "class Extra:\n    pass\n")
+            .with_git()
+            .build();
+        let first_project: Arc<dyn Project> = Arc::new(crate::analyzer::FileSetProject::new(
+            fixture.root(),
+            [PathBuf::from("src/app.py")],
+        ));
+        let second_project: Arc<dyn Project> = Arc::new(crate::analyzer::FileSetProject::new(
+            fixture.root(),
+            [PathBuf::from("other/extra.py")],
+        ));
+        assert!(first_project.persistence_root().is_none());
+        let first = WorkspaceAnalyzer::build_scoped_persisted(
+            Arc::clone(&first_project),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let second =
+            WorkspaceAnalyzer::build_scoped_persisted(second_project, AnalyzerConfig::default())
+                .unwrap();
+        let conn =
+            Connection::open(crate::analyzer::store::analyzer_db_path(fixture.root())).unwrap();
+        let projection_files = || {
+            conn.prepare(
+                "SELECT workspace_id, rel_path FROM workspace_file_versions
+                 WHERE valid_until IS NULL ORDER BY rel_path",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let files = projection_files();
+        assert_eq!(files.len(), 2, "overlapping scope lifetimes: {files:?}");
+        assert_eq!(files[0].1, "other/extra.py");
+        assert_eq!(files[1].1, "src/app.py");
+        assert_ne!(files[0].0, files[1].0);
+        let live_id = crate::gitblob::workspace_cache_identity(fixture.root());
+        assert!(files.iter().all(|(id, _)| id != &live_id));
+
+        let retained = first.clone_with_project(Arc::clone(&first_project));
+        drop(first);
+        assert_eq!(
+            projection_files(),
+            files,
+            "clones must retain the projection"
+        );
+        drop(second);
+        assert_eq!(projection_files(), vec![files[1].clone()]);
+        let declarations = retained.analyzer().get_all_declarations();
+        let classes: Vec<_> = declarations
+            .iter()
+            .filter(|unit| unit.is_class())
+            .map(|unit| unit.identifier())
+            .collect();
+        assert_eq!(classes, vec!["Box"], "retained scope: {declarations:?}");
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.source() == &fixture.file("src/app.py"))
+        );
+        drop(retained);
+        assert!(projection_files().is_empty());
+        for table in ["workspace_heads", "workspace_revisions"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "session must release {table}");
+        }
+        let blobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blobs, 2, "projection cleanup must retain content facts");
+        let warm =
+            WorkspaceAnalyzer::build_scoped_persisted(first_project, AnalyzerConfig::default())
+                .unwrap();
+        let provider = warm.analyzer().structural_fact_providers()[0];
+        assert_eq!(provider.structural_extraction_count(), 0);
+        assert_eq!(
+            std::collections::HashSet::<_>::from_iter(warm.analyzer().get_all_declarations()),
+            std::collections::HashSet::<_>::from_iter(declarations),
+        );
+    }
 
     #[test]
     fn intrinsic_models_activate_when_dependency_discovery_fails() {

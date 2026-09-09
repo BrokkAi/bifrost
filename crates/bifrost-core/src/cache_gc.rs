@@ -1,7 +1,8 @@
 //! Opportunistic GC driver for analyzer rows in the Bifrost cache DB.
 
-use std::ffi::OsStr;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -23,6 +24,50 @@ const GC_CLAIM_TTL_SECS: i64 = 3600;
 
 static AUTO_BLOB_THRESHOLD: AtomicI64 = AtomicI64::new(GC_AUTO_BLOB_THRESHOLD);
 static MIN_INTERVAL_SECS: AtomicI64 = AtomicI64::new(GC_MIN_INTERVAL_SECS);
+
+/// Serializes complete analyzer-cache reconciliation with garbage collection.
+///
+/// A build publishes blob facts before it publishes the workspace projection
+/// that retains them. Collection must therefore hold this same lock: SQLite
+/// transaction boundaries alone cannot distinguish that publication window
+/// from an unreachable blob left by a completed build.
+#[doc(hidden)]
+pub struct AnalyzerCacheBuildLock {
+    _file: File,
+}
+
+impl AnalyzerCacheBuildLock {
+    pub fn acquire(db_path: &Path) -> Result<Self, String> {
+        // Keep the established sidecar name so processes running older Bifrost
+        // builds coordinate on the same OS lock during an upgrade.
+        let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open workspace analyzer build lock {}: {error}",
+                    lock_path.display()
+                )
+            })?;
+        file.lock().map_err(|error| {
+            format!(
+                "failed to acquire workspace analyzer build lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = OsString::from(db_path.as_os_str());
+    path.push(suffix);
+    PathBuf::from(path)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcOutcome {
@@ -101,6 +146,18 @@ fn run_gc(
             return Err(format!("cache GC could not inspect Git remotes: {error}"));
         }
     }
+    // A builder commits content facts before the workspace projection that
+    // retains them. Wait for the complete reconciliation before snapshotting
+    // candidates, or collection can reclaim a revision image in that window.
+    // Claim first so concurrent scheduled tasks skip instead of forming a
+    // lock convoy behind the builder.
+    let _build_lock = match AnalyzerCacheBuildLock::acquire(db_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            clear_gc_claim(db_path)?;
+            return Err(error);
+        }
+    };
     match sweep_with_claim(&claim, repo, workspace_root) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
@@ -801,6 +858,74 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![live_oid]);
+    }
+
+    /// A persisted build commits blob facts before its workspace projection.
+    /// Collection may claim work during that interval, but it must not inspect
+    /// candidates until the build publishes the projection and releases the
+    /// shared lock.
+    #[test]
+    fn gc_waits_for_complete_analyzer_cache_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let _repo = gitblob::test_repo::init_repo(&repo_root);
+        let db_path = gitblob::cache_db_path(&repo_root);
+        let unpublished_oid = "2222222222222222222222222222222222222222";
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                [unpublished_oid],
+            )
+            .unwrap();
+        }
+
+        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let gc_root = repo_root.clone();
+        let gc_db = db_path.clone();
+        let gc = std::thread::spawn(move || {
+            let repo = Repository::open(&gc_root).unwrap();
+            force_gc(&gc_db, &repo, &gc_root)
+        });
+
+        let conn = Connection::open(&db_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let claim_until: i64 = conn
+                .query_row(
+                    "SELECT gc_claim_until FROM cache_state WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if claim_until > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collection never claimed the deterministic build-overlap fixture"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
+                [unpublished_oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "collection must not inspect facts from an incomplete build"
+        );
+
+        drop(build_lock);
+        let outcome = gc.join().unwrap().unwrap();
+        assert_eq!(outcome.analyzer_dropped, 1);
     }
 
     #[test]

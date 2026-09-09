@@ -1,15 +1,16 @@
 use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::semantic::{
-    AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
-    CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
-    CandidateCoverage, ControlEdgeId, ControlEdgeKind, DeclarationLocator, DeclarationSegmentKind,
-    DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, LengthDelimitedDigest,
-    MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle,
+    AbstractLocation, AbstractObject, AccessPath, AccessPathRoot, AccessPathTail, AccessSelector,
+    CallArgumentEndpoint, CallBinding, CallBindings, CallSiteHandle, CallSiteId, CallableTarget,
+    CallableTargetResolution, CandidateCoverage, ControlEdgeId, ControlEdgeKind,
+    DeclarationLocator, DeclarationSegmentKind, DispatchBoundaryKind, EvidenceCompleteness,
+    GuardFact, IcfgEdgeKind, LengthDelimitedDigest, MemoryLocationKind, ObjectCardinality,
+    OracleLimits, ProcedureHandle, ProcedurePortKind, ProcedureSemantics, ProgramPointHandle,
     ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticCapability,
     SemanticEffect, SemanticGapHandle, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticValueKind, StableDigest, ValueFlowRelationKind, ValueFlowSnapshot,
-    ValueTransfer,
+    SemanticLocator, SemanticValueKind, StableDigest, ValueFlowEndpoint, ValueFlowKind,
+    ValueFlowRelationKind, ValueFlowSnapshot, ValueTransfer,
 };
 use crate::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -30,6 +31,8 @@ pub const MAX_VALUE_FLOW_CARRIERS: usize = 262_144;
 pub const MAX_VALUE_FLOW_RELATIONS: usize = 1_000_000;
 pub const MAX_VALUE_FLOW_SOURCES: usize = 65_536;
 pub const MAX_VALUE_FLOW_SINKS: usize = 65_536;
+pub const MAX_VALUE_FLOW_ACCESS_PATH: usize = 64;
+const DEFAULT_VALUE_FLOW_ACCESS_PATH: usize = 8;
 const FALLBACK_COMPONENT_SUMMARY_IDENTITY: &[u8] =
     b"bifrost-value-flow-fallback-component-summary-identity-v1";
 
@@ -42,6 +45,38 @@ pub struct ValueFlowEdgeKillSpec {
     pub kind: ControlEdgeKind,
     pub carrier: ValueFlowCarrier,
     pub sources: Vec<ValueFlowEventKey>,
+}
+
+/// One policy-authored point-local carrier relation.
+///
+/// The relation is deliberately separate from the analyzer snapshot: policy
+/// transforms add topology between two already-structured carriers, but do
+/// not claim that the language adapter observed that topology in the body.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValueFlowLocalRuleSpec {
+    point: ProgramPointHandle,
+    source: ValueFlowCarrier,
+    target: ValueFlowCarrier,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+impl ValueFlowLocalRuleSpec {
+    pub const fn new(
+        point: ProgramPointHandle,
+        source: ValueFlowCarrier,
+        target: ValueFlowCarrier,
+        proof: ProofStatus,
+        completeness: EvidenceCompleteness,
+    ) -> Self {
+        Self {
+            point,
+            source,
+            target,
+            proof,
+            completeness,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +103,7 @@ pub struct ValueFlowPlanLimits {
     max_relations: usize,
     max_sources: usize,
     max_sinks: usize,
+    max_access_path: usize,
 }
 
 impl ValueFlowPlanLimits {
@@ -77,6 +113,26 @@ impl ValueFlowPlanLimits {
         max_sources: usize,
         max_sinks: usize,
     ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_access_path_limit(
+            max_carriers,
+            max_relations,
+            max_sources,
+            max_sinks,
+            DEFAULT_VALUE_FLOW_ACCESS_PATH,
+        )
+    }
+
+    /// Construct plan limits with an explicit bound for paths projected over
+    /// an exact call binding. Snapshot paths are already bounded by the
+    /// semantic oracle; this second bound controls the caller-path plus
+    /// callee-selector concatenation performed by this plan.
+    pub fn with_access_path_limit(
+        max_carriers: usize,
+        max_relations: usize,
+        max_sources: usize,
+        max_sinks: usize,
+        max_access_path: usize,
+    ) -> Result<Self, ValueFlowPlanError> {
         if max_carriers == 0
             || max_carriers > MAX_VALUE_FLOW_CARRIERS
             || max_relations == 0
@@ -85,6 +141,8 @@ impl ValueFlowPlanLimits {
             || max_sources > MAX_VALUE_FLOW_SOURCES
             || max_sinks == 0
             || max_sinks > MAX_VALUE_FLOW_SINKS
+            || max_access_path == 0
+            || max_access_path > MAX_VALUE_FLOW_ACCESS_PATH
         {
             return Err(ValueFlowPlanError::InvalidLimits);
         }
@@ -93,6 +151,7 @@ impl ValueFlowPlanLimits {
             max_relations,
             max_sources,
             max_sinks,
+            max_access_path,
         })
     }
 }
@@ -104,6 +163,7 @@ impl Default for ValueFlowPlanLimits {
             max_relations: MAX_VALUE_FLOW_RELATIONS,
             max_sources: MAX_VALUE_FLOW_SOURCES,
             max_sinks: MAX_VALUE_FLOW_SINKS,
+            max_access_path: DEFAULT_VALUE_FLOW_ACCESS_PATH,
         }
     }
 }
@@ -143,6 +203,9 @@ pub(crate) struct LocalFlowRule {
     pub target: ValueFlowCarrierId,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    /// This topology was injected by a policy-local transform. Taint attaches
+    /// label rewriting to this exact relation instead of to a carrier phase.
+    pub policy_local: bool,
     /// The heap oracle certified this store as a strong update (#2444), so a
     /// client may replace rather than join the facts at `target`.
     pub strong_update: bool,
@@ -151,12 +214,15 @@ pub(crate) struct LocalFlowRule {
 /// One point-local rule as the flow clients read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalRuleView {
+    pub event_index: u32,
     pub source: ValueFlowCarrierId,
     pub target: ValueFlowCarrierId,
     pub kind: ValueFlowRelationKind,
     pub transfer: Option<ValueTransfer>,
     /// The rule's own evidence is proven and complete.
     pub complete: bool,
+    /// Whether a policy-local transform owns this exact relation.
+    pub policy_local: bool,
     /// The store this rule publishes overwrites `target` outright (#2444).
     pub strong_update: bool,
 }
@@ -178,6 +244,7 @@ pub(crate) struct ValueFlowLocalSummaryRule {
     target: ValueFlowCarrierKey,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    policy_local: bool,
     /// Part of the identity: two plans that disagree about whether a store
     /// kills its target do not compute the same summary.
     strong_update: bool,
@@ -226,10 +293,23 @@ pub(crate) struct ValueFlowEdgeKillSummaryRule {
     sources: Box<[ValueFlowEventKey]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ValueFlowConditionalSourceSummaryRule {
+    point: ProgramPointId,
+    phase: ValueFlowObservationPhase,
+    key: ValueFlowEventKey,
+    carrier: ValueFlowCarrierKey,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    triggers: Box<[ValueFlowEventKey]>,
+}
+
 /// Stable, procedure-local value-flow identity used by reusable client summaries.
 ///
-/// Source, sink, sanitizer, and transform matching are intentionally absent;
-/// clients add those independently according to their invalidation contract.
+/// Ordinary source, sink, sanitizer, and transform matching are intentionally
+/// absent; clients add those independently according to their invalidation
+/// contract. Conditional sources are included because their trigger relation
+/// changes transfer behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ValueFlowCarrierSummaryIdentity {
     unmodeled_call_behavior: UnmodeledCallBehavior,
@@ -241,18 +321,24 @@ pub(crate) struct ValueFlowCarrierSummaryIdentity {
     curated_models: Box<[ValueFlowCuratedModelSummaryRule]>,
     fallback_rules: Box<[ValueFlowFallbackSummaryRule]>,
     location_bindings: Box<[ValueFlowLocationBindingSummaryRule]>,
+    conditional_sources: Box<[ValueFlowConditionalSourceSummaryRule]>,
     edge_kills: Box<[ValueFlowEdgeKillSummaryRule]>,
 }
 
-/// Canonical query-local guard behavior needed to partition reusable entries.
+/// Canonical query-local source-selective behavior needed to partition
+/// reusable entries. It includes guard edge kills and source activations whose
+/// membership depends on the incoming source.
 #[derive(Debug, Clone)]
 pub(crate) struct ValueFlowSourceBehaviorIdentity {
+    conditional_sources: Box<[ValueFlowConditionalSourceSummaryRule]>,
     edge_kills: Box<[ValueFlowEdgeKillSummaryRule]>,
 }
 
 impl ValueFlowSourceBehaviorIdentity {
     pub(crate) fn work_units(&self) -> usize {
-        1usize.saturating_add(self.edge_kills.len())
+        1usize
+            .saturating_add(self.conditional_sources.len())
+            .saturating_add(self.edge_kills.len())
     }
 
     pub(crate) fn fingerprint(
@@ -261,7 +347,22 @@ impl ValueFlowSourceBehaviorIdentity {
         source: &ValueFlowEventKey,
     ) -> StableDigest {
         let mut digest =
-            LengthDelimitedDigest::new(b"bifrost-value-flow-source-edge-kill-behavior-v1");
+            LengthDelimitedDigest::new(b"bifrost-value-flow-source-selective-behavior-v2");
+        push_summary_len(&mut digest, self.conditional_sources.len());
+        for row in &self.conditional_sources {
+            digest.push(b"conditional_source");
+            digest.push(&row.point.get().to_le_bytes());
+            digest.push(match row.phase {
+                ValueFlowObservationPhase::BeforeEffects => b"before_effects",
+                ValueFlowObservationPhase::AfterEffects => b"after_effects",
+            });
+            push_summary_event(&mut digest, &row.key, Some(procedure));
+            push_summary_carrier(&mut digest, &row.carrier, Some(procedure));
+            push_proof(&mut digest, &row.proof);
+            push_completeness(&mut digest, &row.completeness);
+            push_summary_len(&mut digest, row.triggers.len());
+            push_summary_bool(&mut digest, row.triggers.binary_search(source).is_ok());
+        }
         push_summary_len(&mut digest, self.edge_kills.len());
         for kill in &self.edge_kills {
             digest.push(&kill.point.get().to_le_bytes());
@@ -278,7 +379,7 @@ impl ValueFlowCarrierSummaryIdentity {
     /// Whether this procedure's transfer relation can distinguish entry
     /// sources. Callers propagate this bit through their dependency closure.
     pub(crate) fn has_source_selective_edge_kills(&self) -> bool {
-        !self.edge_kills.is_empty()
+        !self.edge_kills.is_empty() || !self.conditional_sources.is_empty()
     }
 
     /// Checkout-independent identity of the exact carrier transfer contract.
@@ -327,7 +428,14 @@ impl ValueFlowCarrierSummaryIdentity {
     }
 
     pub(crate) fn edge_kill_sources(&self) -> impl Iterator<Item = &ValueFlowEventKey> {
-        self.edge_kills.iter().flat_map(|kill| kill.sources.iter())
+        self.edge_kills
+            .iter()
+            .flat_map(|kill| kill.sources.iter())
+            .chain(
+                self.conditional_sources
+                    .iter()
+                    .flat_map(|source| source.triggers.iter()),
+            )
     }
 
     /// Source-parametric transfer behavior at this procedure's guard edges.
@@ -338,6 +446,7 @@ impl ValueFlowCarrierSummaryIdentity {
     /// changes which arm kills the source.
     pub(crate) fn source_behavior_identity(&self) -> ValueFlowSourceBehaviorIdentity {
         ValueFlowSourceBehaviorIdentity {
+            conditional_sources: self.conditional_sources.clone(),
             edge_kills: self.edge_kills.clone(),
         }
     }
@@ -350,11 +459,11 @@ impl ValueFlowCarrierSummaryIdentity {
         >,
     ) -> StableDigest {
         let domain: &[u8] = if internal_source_owners.is_some() {
-            b"bifrost-value-flow-procedure-closure-summary-identity-v5"
+            b"bifrost-value-flow-procedure-closure-summary-identity-v6"
         } else if procedure.is_some() {
-            b"bifrost-value-flow-procedure-local-summary-identity-v3"
+            b"bifrost-value-flow-procedure-local-summary-identity-v4"
         } else {
-            b"bifrost-value-flow-carrier-summary-identity-v2"
+            b"bifrost-value-flow-carrier-summary-identity-v3"
         };
         let mut digest = LengthDelimitedDigest::new(domain);
         digest.push(self.unmodeled_call_behavior.label().as_bytes());
@@ -379,6 +488,9 @@ impl ValueFlowCarrierSummaryIdentity {
             push_summary_carrier(&mut digest, &rule.target, procedure);
             push_proof(&mut digest, &rule.proof);
             push_completeness(&mut digest, &rule.completeness);
+            if rule.policy_local {
+                digest.push(b"policy-local");
+            }
             push_summary_bool(&mut digest, rule.strong_update);
         }
 
@@ -437,6 +549,34 @@ impl ValueFlowCarrierSummaryIdentity {
             digest.push(&binding.call.get().to_le_bytes());
             push_summary_port(&mut digest, &binding.port);
             push_summary_carrier(&mut digest, &binding.carrier, procedure);
+        }
+
+        push_summary_len(&mut digest, self.conditional_sources.len());
+        for source in &self.conditional_sources {
+            digest.push(b"conditional_source");
+            digest.push(&source.point.get().to_le_bytes());
+            digest.push(match source.phase {
+                ValueFlowObservationPhase::BeforeEffects => b"before_effects",
+                ValueFlowObservationPhase::AfterEffects => b"after_effects",
+            });
+            push_summary_event(&mut digest, &source.key, procedure);
+            push_summary_carrier(&mut digest, &source.carrier, procedure);
+            push_proof(&mut digest, &source.proof);
+            push_completeness(&mut digest, &source.completeness);
+            let triggers = source
+                .triggers
+                .iter()
+                .filter(|trigger| {
+                    internal_source_owners.is_none_or(|owners| owners.contains_key(*trigger))
+                })
+                .collect::<Vec<_>>();
+            push_summary_len(&mut digest, triggers.len());
+            for trigger in triggers {
+                let source_procedure = internal_source_owners
+                    .and_then(|owners| owners.get(trigger))
+                    .or(procedure);
+                push_summary_event(&mut digest, trigger, source_procedure);
+            }
         }
 
         // Runtime transfer unions source membership for duplicate structural
@@ -560,6 +700,27 @@ impl ValueFlowCarrierSummaryIdentity {
                 })
                 .fold(0usize, usize::saturating_add),
         );
+        let conditional_sources = size_of_val(self.conditional_sources.as_ref()).saturating_add(
+            self.conditional_sources
+                .iter()
+                .map(|source| {
+                    source
+                        .key
+                        .retained_bytes()
+                        .saturating_add(source.carrier.retained_bytes())
+                        .saturating_add(proof_heap_bytes(&source.proof))
+                        .saturating_add(completeness_heap_bytes(&source.completeness))
+                        .saturating_add(size_of_val(source.triggers.as_ref()))
+                        .saturating_add(
+                            source
+                                .triggers
+                                .iter()
+                                .map(ValueFlowEventKey::retained_bytes)
+                                .fold(0usize, usize::saturating_add),
+                        )
+                })
+                .fold(0usize, usize::saturating_add),
+        );
         std::mem::size_of::<Self>()
             .saturating_add(local)
             .saturating_add(calls)
@@ -574,6 +735,7 @@ impl ValueFlowCarrierSummaryIdentity {
             )
             .saturating_add(fallbacks)
             .saturating_add(location_bindings)
+            .saturating_add(conditional_sources)
             .saturating_add(edge_kills)
     }
 }
@@ -754,6 +916,10 @@ fn push_value_transfer(digest: &mut LengthDelimitedDigest, transfer: Option<Valu
             digest.push(b"call_site_operation");
             digest.push(&call.get().to_le_bytes());
         }
+        TransferOperation::CallArgumentConversion(conversion) => {
+            digest.push(b"call_argument_conversion_operation");
+            digest.push(conversion.as_bytes());
+        }
         TransferOperation::Unknown => digest.push(b"unknown_operation"),
     }
 }
@@ -821,6 +987,9 @@ enum SnapshotOpenness {
 fn classify_snapshot_openness(
     snapshot: &ValueFlowSnapshot,
     binding_complete: &HashMap<CallSiteHandle, bool>,
+    bindings: &[ValueFlowInput<CallBindings>],
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+    limits: ValueFlowPlanLimits,
     sources: &[ValueFlowSourceSpec],
     sinks: &[ValueFlowSinkSpec],
 ) -> SnapshotOpenness {
@@ -857,6 +1026,11 @@ fn classify_snapshot_openness(
         if crate::analyzer::semantic::workspace_oracle::constructor_call_gap_is_discharged(
             procedure.semantics(),
             gap,
+        ) {
+            continue;
+        }
+        if parameter_index_gap_is_refined_by_call_bindings(
+            snapshot, gap, bindings, snapshots, limits,
         ) {
             continue;
         }
@@ -898,6 +1072,146 @@ fn classify_snapshot_openness(
         }
     }
     SnapshotOpenness::Refinable(residual)
+}
+
+/// Refine only the parameter-backed constant-index partition that an exact
+/// caller binding models. The canonical-index marker alone remains the narrow
+/// #2831 proof; this additional discharge requires every entered call to bind
+/// the exact formal to one complete structured caller origin.
+fn parameter_index_gap_is_refined_by_call_bindings(
+    snapshot: &ValueFlowSnapshot,
+    gap: &crate::analyzer::semantic::SemanticGap,
+    bindings: &[ValueFlowInput<CallBindings>],
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+    limits: ValueFlowPlanLimits,
+) -> bool {
+    if gap.discharge != crate::analyzer::semantic::SemanticGapDischarge::CanonicalIndexIdentity {
+        return false;
+    }
+    let crate::analyzer::semantic::SemanticGapSubject::MemoryLocation(location) = gap.subject
+    else {
+        return false;
+    };
+    let Some(crate::analyzer::semantic::MemoryLocationKind::Index {
+        base,
+        constant_index: Some(_),
+        ..
+    }) = snapshot
+        .procedure()
+        .semantics()
+        .memory_location(location)
+        .map(|location| &location.kind)
+    else {
+        return false;
+    };
+
+    let mut pending = vec![*base];
+    let mut visited = HashSet::default();
+    let mut ordinal = None;
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(crate::analyzer::semantic::SemanticValueKind::Parameter {
+            ordinal: current_ordinal,
+            ..
+        }) = snapshot
+            .procedure()
+            .semantics()
+            .value(current)
+            .map(|value| &value.kind)
+            && ordinal
+                .replace(*current_ordinal)
+                .is_some_and(|old| old != *current_ordinal)
+        {
+            return false;
+        }
+        for point in snapshot.procedure().semantics().points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value } if target == current => {
+                        pending.push(value);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind:
+                            ValueFlowKind::Local
+                            | ValueFlowKind::BackingStore { .. }
+                            | ValueFlowKind::Parameter,
+                        source,
+                        target,
+                    } if target == current => pending.push(source),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let Some(ordinal) = ordinal else {
+        return false;
+    };
+
+    let matching = bindings
+        .iter()
+        .filter(|input| input.value().callee().durable_key() == snapshot.procedure().durable_key())
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return false;
+    }
+    let path_limits = call_location_oracle_limits(limits.max_access_path);
+    matching.into_iter().all(|input| {
+        let binding = input.value();
+        if !input.status().is_complete()
+            || binding.coverage() != CandidateCoverage::Exhaustive
+            || binding.context().was_truncated()
+            || !matches!(binding.candidate().proof(), ProofStatus::Proven)
+            || !matches!(
+                binding.candidate().completeness(),
+                EvidenceCompleteness::Complete
+            )
+        {
+            return false;
+        }
+        let caller_snapshot = snapshot_for_procedure(snapshots, binding.call().procedure());
+        let actuals = binding.bindings().iter().flat_map(|binding| match binding {
+            CallBinding::ArgumentGroup(group) => group
+                .mappings()
+                .iter()
+                .filter(|mapping| {
+                    matches!(
+                        mapping.value().formal().kind(),
+                        ProcedurePortKind::Parameter { ordinal: actual } if actual == ordinal
+                    )
+                })
+                .map(|mapping| {
+                    (
+                        mapping.value().actual(),
+                        mapping.proof(),
+                        mapping.completeness(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        });
+        let actuals = actuals.collect::<Vec<_>>();
+        actuals.len() == 1
+            && matches!(actuals[0].1, ProofStatus::Proven)
+            && matches!(actuals[0].2, EvidenceCompleteness::Complete)
+            && {
+                let origins = caller_origin_paths(
+                    actuals[0].0,
+                    caller_snapshot,
+                    limits.max_carriers,
+                    path_limits,
+                );
+                !origins.incomplete
+                    && origins.origins.len() == 1
+                    && origins.origins[0].location.path().is_exact()
+                    && matches!(origins.origins[0].proof, ProofStatus::Proven)
+                    && matches!(
+                        origins.origins[0].completeness,
+                        EvidenceCompleteness::Complete
+                    )
+            }
+    })
 }
 
 /// The value carriers whose incomplete semantics can affect a selected source
@@ -1083,6 +1397,36 @@ pub(crate) struct CallFlowRule {
     pub completeness: EvidenceCompleteness,
 }
 
+/// A call-location rule before its endpoints receive dense plan-local IDs.
+///
+/// Keeping this intermediate form lets projected locations participate in the
+/// same carrier and relation limits as snapshot rows. It also means a path is
+/// never synthesized after `carrier_ids` has been assigned, where a forgotten
+/// endpoint would otherwise become a partial, unindexed transfer.
+#[derive(Debug, Clone)]
+struct PendingCallFlowRule {
+    call: CallSiteHandle,
+    callee: ProcedureHandle,
+    kind: CallFlowRuleKind,
+    source: ValueFlowCarrier,
+    target: ValueFlowCarrier,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+#[derive(Debug, Clone)]
+struct CallerOrigin {
+    location: AbstractLocation,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+#[derive(Debug, Default)]
+struct CallerOriginSearch {
+    origins: Vec<CallerOrigin>,
+    incomplete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallFallbackProfile {
     call: CallSiteHandle,
@@ -1236,6 +1580,11 @@ pub enum ValueFlowIncompleteCause {
     SinkEvidence {
         point: ProgramPointHandle,
     },
+    /// A policy-local relation was structurally bound, but its selector or
+    /// port evidence was not both proven and complete.
+    LocalRuleEvidence {
+        point: ProgramPointHandle,
+    },
 }
 
 impl ValueFlowIncompleteCause {
@@ -1249,7 +1598,8 @@ impl ValueFlowIncompleteCause {
             | Self::CallBindingCoverage { .. }
             | Self::UnenteredProcedure { .. }
             | Self::SourceEvidence { .. }
-            | Self::SinkEvidence { .. } => None,
+            | Self::SinkEvidence { .. }
+            | Self::LocalRuleEvidence { .. } => None,
         }
     }
 
@@ -1261,7 +1611,9 @@ impl ValueFlowIncompleteCause {
             Self::SemanticGap { gap, .. } => gap.procedure(),
             Self::CallResolution { call, .. } => call.procedure(),
             Self::CallBinding { callee, .. } | Self::CallBindingCoverage { callee, .. } => callee,
-            Self::SourceEvidence { point } | Self::SinkEvidence { point } => point.procedure(),
+            Self::SourceEvidence { point }
+            | Self::SinkEvidence { point }
+            | Self::LocalRuleEvidence { point } => point.procedure(),
         }
     }
 
@@ -1281,6 +1633,7 @@ impl ValueFlowIncompleteCause {
             Self::UnenteredProcedure { .. } => "procedure entry",
             Self::SourceEvidence { .. } => "source evidence",
             Self::SinkEvidence { .. } => "sink evidence",
+            Self::LocalRuleEvidence { .. } => "policy-local flow-rule evidence",
         }
     }
 }
@@ -1290,6 +1643,7 @@ pub(crate) struct BoundValueFlowSource {
     pub id: ValueFlowSourceId,
     pub spec: ValueFlowSourceSpec,
     pub carrier: ValueFlowCarrierId,
+    pub activation_triggers: Option<Box<[ValueFlowSourceId]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1740,6 +2094,7 @@ impl ValueFlowPlan {
         {
             return Err(ValueFlowPlanError::DuplicateEventKey);
         }
+        validate_source_activation_triggers(&sources)?;
 
         let mount = root.artifact().key().mount();
         let mut discovery_status = SemanticInputStatus::Complete;
@@ -1787,6 +2142,7 @@ impl ValueFlowPlan {
         let mut non_snapshot_discovery_complete = true;
         let mut endpoint_discovery_complete = true;
         let mut incomplete_binding_calls: Vec<CallSiteHandle> = Vec::new();
+        let mut pending_call_location_rules = Vec::new();
         let mut binding_complete = HashMap::<CallSiteHandle, bool>::default();
         for input in &bindings {
             let complete = input.status().is_complete()
@@ -1829,22 +2185,28 @@ impl ValueFlowPlan {
             // What the region must not do is decide an endpoint bound inside
             // one, and the source and sink loops below catch exactly that.
             let entered_procedure = entered.contains(&input.value().procedure().durable_key());
-            // A snapshot left Unknown only by call-target refinement gaps is
-            // answered by this plan's own complete resolutions and bindings of
-            // exactly those calls (#1952): the refinement the gaps demand has
-            // been performed, so the input does not open discovery. Residual
-            // refinement calls without a complete binding stay open here and
-            // may still be closed by a fully modeled execution boundary.
+            // A typed incomplete snapshot can still be answered by this plan's
+            // own exact call evidence: call-target gaps by complete resolution
+            // (#1952), or a formal constant-index identity by its exact caller
+            // binding (#2856). The classifier closes only the matching gap
+            // partition; every residual gap stays open.
             let discovery = if !entered_procedure
                 || (input.status().is_complete()
                     && input.value().coverage() == CandidateCoverage::Exhaustive)
             {
                 SnapshotDiscovery::Complete
-            } else if matches!(input.status(), SemanticInputStatus::Unknown)
+            } else if !input.status().is_complete()
                 && input.value().coverage() == CandidateCoverage::Open
             {
-                match classify_snapshot_openness(input.value(), &binding_complete, &sources, &sinks)
-                {
+                match classify_snapshot_openness(
+                    input.value(),
+                    &binding_complete,
+                    &bindings,
+                    &snapshots,
+                    limits,
+                    &sources,
+                    &sinks,
+                ) {
                     SnapshotOpenness::Refinable(residual) if residual.is_empty() => {
                         SnapshotDiscovery::Complete
                     }
@@ -1943,6 +2305,26 @@ impl ValueFlowPlan {
                 relation_count = relation_count.saturating_add(call_binding_rule_count(binding));
                 append_binding_carriers(binding, &mut carrier_candidates)?;
             }
+        }
+        // Whole-value call rules above are sufficient for scalar values, but a
+        // formal slice/array view also names element locations. Project those
+        // locations only when both sides of the exact binding have structured
+        // snapshot evidence. Open bindings remain represented by their normal
+        // conservative value rules and never acquire an optimistic location
+        // transfer here.
+        for input in &bindings {
+            append_call_location_rules(
+                input.value(),
+                &snapshots,
+                limits.max_carriers,
+                limits.max_access_path,
+                &mut pending_call_location_rules,
+            )?;
+        }
+        relation_count = relation_count.saturating_add(pending_call_location_rules.len());
+        for rule in &pending_call_location_rules {
+            carrier_candidates.push(rule.source.clone());
+            carrier_candidates.push(rule.target.clone());
         }
         // An endpoint observed in a procedure the solve cannot enter was not
         // analyzed: a sink there can never report, and calling the region clean
@@ -2043,6 +2425,7 @@ impl ValueFlowPlan {
                     target: lookup_carrier(&carrier_ids, &relation.target)?,
                     proof: relation.proof.clone(),
                     completeness: relation.completeness.clone(),
+                    policy_local: false,
                     strong_update: relation.strong_update,
                 });
             }
@@ -2050,20 +2433,26 @@ impl ValueFlowPlan {
         local_rules.sort_by(compare_local_rules);
 
         let mut call_rules = Vec::new();
-        for input in bindings {
-            let (bindings, _) = input.into_parts();
-            append_call_rules(&bindings, &carrier_ids, &mut call_rules)?;
+        for input in &bindings {
+            append_call_rules(input.value(), &carrier_ids, &mut call_rules)?;
+        }
+        for rule in pending_call_location_rules {
+            call_rules.push(CallFlowRule {
+                call: rule.call,
+                callee: rule.callee,
+                kind: rule.kind,
+                source: *carrier_ids
+                    .get(&rule.source)
+                    .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                target: *carrier_ids
+                    .get(&rule.target)
+                    .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                proof: rule.proof,
+                completeness: rule.completeness,
+            });
         }
         call_rules.sort_by(compare_call_rules);
-        call_rules.dedup_by(|left, right| {
-            left.call == right.call
-                && left.callee == right.callee
-                && left.kind == right.kind
-                && left.source == right.source
-                && left.target == right.target
-                && left.proof == right.proof
-                && left.completeness == right.completeness
-        });
+        merge_duplicate_call_rules(&mut call_rules);
 
         let carrier_components = build_carrier_components(carriers.len(), &local_rules);
         let fallback_locations =
@@ -2076,16 +2465,22 @@ impl ValueFlowPlan {
             &carrier_components,
         );
 
+        let source_activation_triggers = sources
+            .iter()
+            .map(|spec| bind_source_activation_triggers(spec, &sources))
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
         let bound_sources = sources
             .into_iter()
+            .zip(source_activation_triggers)
             .enumerate()
-            .map(|(index, spec)| {
+            .map(|(index, (spec, activation_triggers))| {
                 Ok(BoundValueFlowSource {
                     id: ValueFlowSourceId::try_from_index(index)
                         .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
                     carrier: *carrier_ids
                         .get(spec.carrier())
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                    activation_triggers,
                     spec,
                 })
             })
@@ -2237,6 +2632,13 @@ impl ValueFlowPlan {
         let source_heap = self.sources.iter().fold(0usize, |total, source| {
             total
                 .saturating_add(source.spec.key().retained_bytes())
+                .saturating_add(source.spec.activation_triggers_retained_bytes())
+                .saturating_add(
+                    source
+                        .activation_triggers
+                        .as_ref()
+                        .map_or(0, |triggers| size_of_val(triggers.as_ref())),
+                )
                 .saturating_add(self.carrier_keys[source.carrier.index()].retained_bytes())
                 .saturating_add(proof_heap_bytes(source.spec.proof()))
                 .saturating_add(completeness_heap_bytes(source.spec.completeness()))
@@ -2424,6 +2826,81 @@ impl ValueFlowPlan {
         Ok(self)
     }
 
+    /// Inject policy-authored point-local relations between carriers that the
+    /// analyzer has already mounted in this plan.
+    ///
+    /// The exact relation is retained in propagation and reusable-summary
+    /// identity. Evidence quality belongs to the rule, so a partial selector
+    /// can carry a may-flow but cannot make that path or a clean result
+    /// conclusive.
+    pub fn with_local_rules(
+        mut self,
+        rules: Vec<ValueFlowLocalRuleSpec>,
+    ) -> Result<Self, ValueFlowPlanError> {
+        if self.local_rules.len().saturating_add(rules.len()) > MAX_VALUE_FLOW_RELATIONS {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        let mount = self.root.artifact().key().mount();
+        let mut bound = Vec::with_capacity(rules.len());
+        for rule in rules {
+            validate_event(&rule.point, &rule.source, mount)?;
+            validate_event(&rule.point, &rule.target, mount)?;
+            bound.push(LocalFlowRule {
+                point: rule.point,
+                event_index: u32::MAX,
+                kind: ValueFlowRelationKind::LanguageDefined,
+                transfer: None,
+                source: self
+                    .carrier_id(&rule.source)
+                    .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                target: self
+                    .carrier_id(&rule.target)
+                    .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                proof: rule.proof,
+                completeness: rule.completeness,
+                policy_local: true,
+                strong_update: false,
+            });
+        }
+        bound.sort_by(compare_local_rules);
+        if bound.windows(2).any(|pair| {
+            pair[0].point == pair[1].point
+                && pair[0].source == pair[1].source
+                && pair[0].target == pair[1].target
+        }) {
+            return Err(ValueFlowPlanError::DuplicateLocalRule);
+        }
+        for rule in &bound {
+            let evidence_complete = matches!(rule.proof, ProofStatus::Proven)
+                && matches!(rule.completeness, EvidenceCompleteness::Complete);
+            if !evidence_complete && self.first_incomplete_cause.is_none() {
+                self.first_incomplete_cause = Some(ValueFlowIncompleteCause::LocalRuleEvidence {
+                    point: rule.point.clone(),
+                });
+            }
+            self.non_snapshot_discovery_complete &= evidence_complete;
+            self.discovery_complete &= evidence_complete;
+            self.structural_discovery_complete &= evidence_complete;
+        }
+        let mut local_rules = self.local_rules.into_vec();
+        local_rules.extend(bound);
+        local_rules.sort_by(compare_local_rules);
+        let carrier_components = build_carrier_components(self.carriers.len(), &local_rules);
+        self.fallback_locations =
+            build_fallback_location_index(&self.carriers, &self.carrier_ids, &carrier_components);
+        self.fallback_profiles = build_call_fallback_profiles(
+            std::iter::once(&self.root)
+                .chain(self.snapshot_procedures.iter())
+                .collect::<Vec<_>>(),
+            &self.carrier_ids,
+            &carrier_components,
+        )
+        .into_boxed_slice();
+        self.local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        self.local_rules = local_rules.into_boxed_slice();
+        Ok(self)
+    }
+
     pub fn carriers(&self) -> &[ValueFlowCarrier] {
         &self.carriers
     }
@@ -2442,7 +2919,9 @@ impl ValueFlowPlan {
     }
 
     /// Stable carriers that an interprocedural call can seed at this callee's
-    /// summary entry. Root summaries begin with Zero and need no carrier row.
+    /// summary entry. These are usually formal ports, but an exact structured
+    /// call binding can also seed a callee location projected from the caller.
+    /// Root summaries begin with Zero and need no carrier row.
     pub(crate) fn summary_entry_carriers_by_procedure(
         &self,
     ) -> HashMap<ProcedureHandle, Box<[ValueFlowCarrierKey]>> {
@@ -2462,13 +2941,6 @@ impl ValueFlowPlan {
             .map(|(procedure, mut carriers)| {
                 carriers.sort_unstable();
                 carriers.dedup();
-                debug_assert!(carriers.iter().all(|carrier| {
-                    matches!(
-                        carrier,
-                        ValueFlowCarrierKey::Port { procedure: owner, .. }
-                            if owner == procedure.semantics().locator()
-                    )
-                }));
                 (procedure, carriers.into_boxed_slice())
             })
             .collect()
@@ -2508,9 +2980,10 @@ impl ValueFlowPlan {
     /// sink observations are deliberately excluded so compatible clients can
     /// union their demand sets and share one fixed-point solve.
     pub fn propagation_semantics_hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Default argument flow consumes a callee-owned entry source. Rotate
-        // retained summary identities when that transfer relation changes.
-        state.write(b"bifrost-value-flow-propagation-semantics-v2");
+        // Parameter and receiver transfers can replace a mutable local carrier
+        // and therefore change the fixed-point result. Rotate retained summary
+        // identities when that propagation relation changes.
+        state.write(b"bifrost-value-flow-propagation-semantics-v3");
         self.root.hash(state);
         self.unmodeled_call_behavior.hash(state);
         self.external_summaries.fingerprint().hash(state);
@@ -2528,6 +3001,9 @@ impl ValueFlowPlan {
             self.carrier_keys[rule.target.index()].hash(state);
             rule.proof.hash(state);
             rule.completeness.hash(state);
+            if rule.policy_local {
+                state.write(b"policy-local");
+            }
             rule.strong_update.hash(state);
         }
         for rule in &self.call_rules {
@@ -2555,6 +3031,21 @@ impl ValueFlowPlan {
                 .hash(state);
             kill.sources.hash(state);
         }
+        let conditional_sources = self
+            .sources
+            .iter()
+            .filter(|source| source.spec.activation_triggers().is_some())
+            .collect::<Vec<_>>();
+        conditional_sources.len().hash(state);
+        for source in conditional_sources {
+            source.spec.key().hash(state);
+            source.spec.point().hash(state);
+            source.spec.phase().hash(state);
+            self.carrier_keys[source.carrier.index()].hash(state);
+            source.spec.proof().hash(state);
+            source.spec.completeness().hash(state);
+            source.spec.activation_triggers().hash(state);
+        }
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.discovery_status.hash(state);
@@ -2571,11 +3062,176 @@ impl ValueFlowPlan {
             && same_call_rules(self, other)
             && same_summary_location_bindings(self, other)
             && self.edge_kills == other.edge_kills
+            && same_conditional_source_specs(self, other)
             && self.snapshot_procedures == other.snapshot_procedures
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
             && self.discovery_complete == other.discovery_complete
             && self.structural_discovery_complete == other.structural_discovery_complete
+    }
+
+    /// Rebind source observations and source-selective edge kills after a
+    /// refinement pass. Retained snapshots, call bindings, sinks, models, and
+    /// call behavior remain the same; only demand observations and their
+    /// source IDs are replaced. Reassigning every carrier through the stable
+    /// key index keeps IDs valid when refinement introduces a new carrier.
+    pub(crate) fn with_replaced_sources_and_edge_kills(
+        &self,
+        mut sources: Vec<ValueFlowSourceSpec>,
+        mut edge_kills: Vec<ValueFlowEdgeKillSpec>,
+    ) -> Result<Self, ValueFlowPlanError> {
+        if sources.len() > MAX_VALUE_FLOW_SOURCES {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        sources.sort_by(|left, right| left.key().cmp(right.key()));
+        if adjacent_duplicate(sources.iter().map(ValueFlowSourceSpec::key)) {
+            return Err(ValueFlowPlanError::DuplicateEventKey);
+        }
+
+        let mount = self.root.artifact().key().mount();
+        for source in &sources {
+            validate_event(source.point(), source.carrier(), mount)?;
+        }
+
+        for kill in &mut edge_kills {
+            kill.sources.sort_unstable();
+            kill.sources.dedup();
+        }
+        edge_kills.sort_by(compare_edge_kills);
+        edge_kills.dedup();
+        for kill in &edge_kills {
+            validate_event(&kill.point, &kill.carrier, mount)?;
+            let edge_exists = kill
+                .point
+                .procedure()
+                .semantics()
+                .successor_edges(kill.point.id())
+                .any(|(_, edge)| edge.target_point == kill.target && edge.kind == kill.kind);
+            if !edge_exists
+                || kill.sources.is_empty()
+                || kill.sources.iter().any(|key| {
+                    sources
+                        .binary_search_by(|source| source.key().cmp(key))
+                        .is_err()
+                })
+            {
+                return Err(ValueFlowPlanError::InvalidEdgeKill);
+            }
+        }
+
+        let mut carrier_candidates = self.carriers.to_vec();
+        carrier_candidates.extend(sources.iter().map(|source| source.carrier().clone()));
+        carrier_candidates.extend(edge_kills.iter().map(|kill| kill.carrier.clone()));
+        let CarrierIndex {
+            carriers,
+            carrier_keys,
+            carrier_ids,
+        } = assign_carrier_ids(carrier_candidates, MAX_VALUE_FLOW_CARRIERS)?;
+        let remap = |id: ValueFlowCarrierId| {
+            carrier_ids
+                .get(&self.carriers[id.index()])
+                .copied()
+                .ok_or(ValueFlowPlanError::MissingCarrier)
+        };
+
+        let mut local_rules = self.local_rules.to_vec();
+        for rule in &mut local_rules {
+            rule.source = remap(rule.source)?;
+            rule.target = remap(rule.target)?;
+        }
+        let mut call_rules = self.call_rules.to_vec();
+        for rule in &mut call_rules {
+            rule.source = remap(rule.source)?;
+            rule.target = remap(rule.target)?;
+        }
+        let mut summary_location_bindings = self.summary_location_bindings.to_vec();
+        for binding in &mut summary_location_bindings {
+            binding.carrier = remap(binding.carrier)?;
+        }
+
+        validate_source_activation_triggers(&sources)?;
+        let source_activation_triggers = sources
+            .iter()
+            .map(|spec| bind_source_activation_triggers(spec, &sources))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bound_sources = sources
+            .into_iter()
+            .zip(source_activation_triggers)
+            .enumerate()
+            .map(|(index, (spec, activation_triggers))| {
+                Ok(BoundValueFlowSource {
+                    id: ValueFlowSourceId::try_from_index(index)
+                        .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
+                    carrier: *carrier_ids
+                        .get(spec.carrier())
+                        .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                    activation_triggers,
+                    spec,
+                })
+            })
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+        let mut bound_sinks = self.sinks.to_vec();
+        for sink in &mut bound_sinks {
+            sink.carrier = remap(sink.carrier)?;
+        }
+
+        let carrier_components = build_carrier_components(carriers.len(), &local_rules);
+        let fallback_locations =
+            build_fallback_location_index(&carriers, &carrier_ids, &carrier_components);
+        let fallback_profiles = build_call_fallback_profiles(
+            std::iter::once(&self.root)
+                .chain(self.snapshot_procedures.iter())
+                .collect::<Vec<_>>(),
+            &carrier_ids,
+            &carrier_components,
+        );
+        let local_rule_reverse_index = build_local_rule_reverse_index(&local_rules);
+        let call_rule_reverse_index = build_call_rule_reverse_index(&call_rules);
+        let source_index = build_observation_index(&bound_sources, |source| ObservationKey {
+            point: source.spec.point().clone(),
+            phase: source.spec.phase(),
+        });
+        let sink_index = build_observation_index(&bound_sinks, |sink| ObservationKey {
+            point: sink.spec.point().clone(),
+            phase: sink.spec.phase(),
+        });
+        let edge_kill_index = build_edge_kill_index(&edge_kills, &carrier_ids, &bound_sources)?;
+
+        Ok(Self {
+            root: self.root.clone(),
+            unmodeled_call_behavior: self.unmodeled_call_behavior,
+            external_summaries: self.external_summaries.clone(),
+            curated_call_models: self.curated_call_models.clone(),
+            carriers: carriers.into_boxed_slice(),
+            carrier_keys: carrier_keys.into_boxed_slice(),
+            carrier_ids,
+            local_rules: local_rules.into_boxed_slice(),
+            local_rule_reverse_index,
+            call_rules: call_rules.into_boxed_slice(),
+            call_rule_reverse_index,
+            fallback_profiles: fallback_profiles.into_boxed_slice(),
+            fallback_locations,
+            summary_location_bindings: summary_location_bindings.into_boxed_slice(),
+            sources: bound_sources.into_boxed_slice(),
+            source_index,
+            sinks: bound_sinks.into_boxed_slice(),
+            sink_index,
+            edge_kills: edge_kills.into_boxed_slice(),
+            edge_kill_index,
+            infeasible_points: self.infeasible_points.clone(),
+            snapshot_procedures: self.snapshot_procedures.clone(),
+            binding_pairs: self.binding_pairs.clone(),
+            discovery_status: self.discovery_status,
+            first_incomplete_cause: self.first_incomplete_cause.clone(),
+            snapshot_discoveries: self.snapshot_discoveries.clone(),
+            non_snapshot_discovery_complete: self.non_snapshot_discovery_complete,
+            endpoint_discovery_complete: self.endpoint_discovery_complete,
+            incomplete_binding_calls: self.incomplete_binding_calls.clone(),
+            ambiguous_dispatch: self.ambiguous_dispatch,
+            discovery_complete: self.discovery_complete,
+            structural_discovery_complete: self.structural_discovery_complete,
+            owner: Arc::new(()),
+        })
     }
 
     /// Union endpoint observations from transfer-compatible plans and rebind
@@ -2636,16 +3292,23 @@ impl ValueFlowPlan {
         {
             return Err(ValueFlowPlanError::DuplicateEventKey);
         }
+        validate_source_activation_triggers(&source_specs)?;
+        let source_activation_triggers = source_specs
+            .iter()
+            .map(|spec| bind_source_activation_triggers(spec, &source_specs))
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
         let sources = source_specs
             .into_iter()
+            .zip(source_activation_triggers)
             .enumerate()
-            .map(|(index, spec)| {
+            .map(|(index, (spec, activation_triggers))| {
                 Ok(BoundValueFlowSource {
                     id: ValueFlowSourceId::try_from_index(index)
                         .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
                     carrier: *carrier_ids
                         .get(spec.carrier())
                         .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                    activation_triggers,
                     spec,
                 })
             })
@@ -3441,6 +4104,7 @@ impl ValueFlowPlan {
             curated_models: Vec<ValueFlowCuratedModelSummaryRule>,
             fallback_rules: Vec<ValueFlowFallbackSummaryRule>,
             location_bindings: Vec<ValueFlowLocationBindingSummaryRule>,
+            conditional_sources: Vec<ValueFlowConditionalSourceSummaryRule>,
             edge_kills: Vec<ValueFlowEdgeKillSummaryRule>,
         }
 
@@ -3463,6 +4127,7 @@ impl ValueFlowPlan {
                     target: self.carrier_keys[rule.target.index()].clone(),
                     proof: rule.proof.clone(),
                     completeness: rule.completeness.clone(),
+                    policy_local: rule.policy_local,
                     strong_update: rule.strong_update,
                 });
         }
@@ -3547,6 +4212,24 @@ impl ValueFlowPlan {
                     carrier: self.carrier_keys[binding.carrier.index()].clone(),
                 });
         }
+        for source in &self.sources {
+            let Some(triggers) = source.spec.activation_triggers() else {
+                continue;
+            };
+            builders
+                .entry(source.spec.point().procedure().clone())
+                .or_default()
+                .conditional_sources
+                .push(ValueFlowConditionalSourceSummaryRule {
+                    point: source.spec.point().id(),
+                    phase: source.spec.phase(),
+                    key: source.spec.key().clone(),
+                    carrier: self.carrier_keys[source.carrier.index()].clone(),
+                    proof: source.spec.proof().clone(),
+                    completeness: source.spec.completeness().clone(),
+                    triggers: triggers.to_vec().into_boxed_slice(),
+                });
+        }
         for kill in &self.edge_kills {
             let carrier = self
                 .carrier_ids
@@ -3590,6 +4273,9 @@ impl ValueFlowPlan {
                         curated_models: builder.curated_models.into_boxed_slice(),
                         fallback_rules: builder.fallback_rules.into_boxed_slice(),
                         location_bindings: builder.location_bindings.into_boxed_slice(),
+                        conditional_sources: normalize_summary_conditional_sources(
+                            builder.conditional_sources,
+                        ),
                         edge_kills: normalize_summary_edge_kills(builder.edge_kills),
                     },
                 )
@@ -3603,6 +4289,12 @@ impl ValueFlowPlan {
             .saturating_add(self.call_rules.len())
             .saturating_add(self.curated_call_models.len())
             .saturating_add(self.summary_location_bindings.len())
+            .saturating_add(
+                self.sources
+                    .iter()
+                    .filter(|source| source.spec.activation_triggers().is_some())
+                    .count(),
+            )
             .saturating_add(self.edge_kills.len())
             .saturating_add(
                 self.fallback_profiles
@@ -4222,8 +4914,16 @@ impl ValueFlowPlan {
             .map_or(&[], Box::as_ref)
     }
 
+    /// Whether the forward-only client is required because propagation
+    /// depends on the incoming source identity. Conditional sources have the
+    /// same restriction as source-selective edge kills: the backward client
+    /// cannot reconstruct their activation from a demand alone.
     pub(crate) fn has_edge_kills(&self) -> bool {
         !self.edge_kills.is_empty()
+            || self
+                .sources
+                .iter()
+                .any(|source| source.spec.activation_triggers().is_some())
     }
 
     pub(crate) fn local_rule_views(
@@ -4231,12 +4931,14 @@ impl ValueFlowPlan {
         point: &ProgramPointHandle,
     ) -> impl Iterator<Item = LocalRuleView> {
         self.local_rules_at(point).map(|rule| LocalRuleView {
+            event_index: rule.event_index,
             source: rule.source,
             target: rule.target,
             kind: rule.kind,
             transfer: rule.transfer,
             complete: matches!(rule.proof, ProofStatus::Proven)
                 && matches!(rule.completeness, EvidenceCompleteness::Complete),
+            policy_local: rule.policy_local,
             strong_update: rule.strong_update,
         })
     }
@@ -4258,15 +4960,27 @@ impl ValueFlowPlan {
             .map(move |index| {
                 let rule = &self.local_rules[*index];
                 LocalRuleView {
+                    event_index: rule.event_index,
                     source: rule.source,
                     target: rule.target,
                     kind: rule.kind,
                     transfer: rule.transfer,
                     complete: matches!(rule.proof, ProofStatus::Proven)
                         && matches!(rule.completeness, EvidenceCompleteness::Complete),
+                    policy_local: rule.policy_local,
                     strong_update: rule.strong_update,
                 }
             })
+    }
+
+    pub(crate) fn has_policy_local_rule(
+        &self,
+        point: &ProgramPointHandle,
+        source: ValueFlowCarrierId,
+        target: ValueFlowCarrierId,
+    ) -> bool {
+        self.local_rules_at(point)
+            .any(|rule| rule.policy_local && rule.source == source && rule.target == target)
     }
 
     pub(crate) fn call_rules<'a>(
@@ -4814,6 +5528,34 @@ func run() [1]int {
         plan.local_rules[transfer].transfer = changed.local_rules[transfer].transfer;
         assert!(plan.has_same_propagation_semantics(&changed));
     }
+
+    #[test]
+    fn call_argument_conversion_digest_changes_flow_fingerprint_and_order() {
+        use crate::analyzer::semantic::{TransferKind, TransferOperation, ValuePreservation};
+
+        let first = ValueTransfer {
+            kind: TransferKind::Conversion {
+                preservation: ValuePreservation::Preserving,
+            },
+            operation: TransferOperation::CallArgumentConversion(StableDigest::sha256(
+                b"conversion-one",
+            )),
+        };
+        let second = ValueTransfer {
+            operation: TransferOperation::CallArgumentConversion(StableDigest::sha256(
+                b"conversion-two",
+            )),
+            ..first
+        };
+
+        let mut first_fingerprint = LengthDelimitedDigest::new(b"transfer-test");
+        push_value_transfer(&mut first_fingerprint, Some(first));
+        let mut second_fingerprint = LengthDelimitedDigest::new(b"transfer-test");
+        push_value_transfer(&mut second_fingerprint, Some(second));
+
+        assert_ne!(first_fingerprint.finish(), second_fingerprint.finish());
+        assert_ne!(transfer_rank(Some(first)), transfer_rank(Some(second)));
+    }
 }
 
 fn rule_target(rule: &CallFlowRule) -> (ValueFlowCarrierId, bool) {
@@ -4833,7 +5575,9 @@ pub enum ValueFlowPlanError {
     ContextSensitiveInputUnsupported,
     InvalidCallArgumentLocation,
     DuplicateEventKey,
+    DuplicateLocalRule,
     InvalidEdgeKill,
+    InvalidSourceActivation,
     DuplicateCallModel,
     StaleCallModel,
     InvalidSummaryLocationPort,
@@ -4866,9 +5610,14 @@ impl fmt::Display for ValueFlowPlanError {
                 formatter.write_str("call argument contains an invalid abstract location")
             }
             Self::DuplicateEventKey => formatter.write_str("duplicate value-flow event key"),
+            Self::DuplicateLocalRule => {
+                formatter.write_str("duplicate policy-local value-flow rule")
+            }
             Self::InvalidEdgeKill => {
                 formatter.write_str("value-flow edge kill names an absent edge, source, or carrier")
             }
+            Self::InvalidSourceActivation => formatter
+                .write_str("value-flow source activation names an empty or absent trigger source"),
             Self::DuplicateCallModel => {
                 formatter.write_str("multiple curated call models target the same call site")
             }
@@ -5048,6 +5797,523 @@ fn call_binding_rule_count(binding: &CallBinding) -> usize {
         CallBinding::ArgumentGroup(group) => group.mappings().len(),
         _ => 1,
     }
+}
+
+fn call_location_oracle_limits(max_access_path: usize) -> OracleLimits {
+    let mut values = OracleLimits::default().values();
+    values.access_path_length = max_access_path;
+    OracleLimits::new(values).expect("validated value-flow access-path limit is positive")
+}
+
+fn snapshot_for_procedure<'a>(
+    snapshots: &'a [ValueFlowInput<ValueFlowSnapshot>],
+    procedure: &ProcedureHandle,
+) -> Option<&'a ValueFlowSnapshot> {
+    snapshots
+        .iter()
+        .find(|input| input.value().procedure().durable_key() == procedure.durable_key())
+        .map(ValueFlowInput::value)
+}
+
+fn binding_coverage_quality(bindings: &CallBindings) -> (ProofStatus, EvidenceCompleteness) {
+    if bindings.coverage() == CandidateCoverage::Exhaustive && !bindings.context().was_truncated() {
+        (ProofStatus::Proven, EvidenceCompleteness::Complete)
+    } else {
+        (
+            ProofStatus::Unproven("call binding coverage is incomplete".into()),
+            EvidenceCompleteness::Partial("call binding coverage is incomplete".into()),
+        )
+    }
+}
+
+fn formal_location_carriers(
+    snapshot: &ValueFlowSnapshot,
+    formal: &crate::analyzer::semantic::ProcedurePortHandle,
+) -> Vec<CallerOrigin> {
+    let mut locations = Vec::<CallerOrigin>::new();
+    for relation in snapshot.relations() {
+        for endpoint in [&relation.source, &relation.target] {
+            let ValueFlowEndpoint::Location(location) = endpoint else {
+                continue;
+            };
+            if !matches!(
+                location.path().root(),
+                AccessPathRoot::ProcedurePort(port) if port == formal
+            ) {
+                continue;
+            }
+            if let Some(existing) = locations
+                .iter_mut()
+                .find(|existing| existing.location == **location)
+            {
+                existing.proof = merge_call_rule_proof(&existing.proof, relation.proof.clone());
+                existing.completeness = merge_call_rule_completeness(
+                    &existing.completeness,
+                    relation.completeness.clone(),
+                );
+            } else {
+                locations.push(CallerOrigin {
+                    location: (**location).clone(),
+                    proof: relation.proof.clone(),
+                    completeness: relation.completeness.clone(),
+                });
+            }
+        }
+    }
+    locations
+}
+
+fn port_location(
+    port: &crate::analyzer::semantic::ProcedurePortHandle,
+    limits: OracleLimits,
+) -> Result<AbstractLocation, ValueFlowPlanError> {
+    let root = match port.kind() {
+        ProcedurePortKind::Capture { .. } => AccessPathRoot::CaptureSlot(port.clone()),
+        ProcedurePortKind::Receiver
+        | ProcedurePortKind::Parameter { .. }
+        | ProcedurePortKind::NormalReturn
+        | ProcedurePortKind::IndexedNormalReturn { .. }
+        | ProcedurePortKind::ExceptionalReturn => AccessPathRoot::ProcedurePort(port.clone()),
+    };
+    let object = AbstractObject::new(root.clone(), ObjectCardinality::Unknown)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    let path = AccessPath::exact(root, Vec::new(), limits)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    AbstractLocation::new(object, path).map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)
+}
+
+fn value_location(
+    value: &crate::analyzer::semantic::ValueHandle,
+    limits: OracleLimits,
+) -> Result<AbstractLocation, ValueFlowPlanError> {
+    let root = AccessPathRoot::Value(value.clone());
+    let object = AbstractObject::new(root.clone(), ObjectCardinality::Unknown)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    let path = AccessPath::exact(root, Vec::new(), limits)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    AbstractLocation::new(object, path).map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)
+}
+
+fn relation_has_identity_barrier(relation: &crate::analyzer::semantic::ValueFlowRelation) -> bool {
+    if relation.transfer.is_some() {
+        return true;
+    }
+    let Some(point) = relation
+        .point
+        .procedure()
+        .semantics()
+        .point(relation.point.id())
+    else {
+        debug_assert!(false, "validated value-flow relation names a live point");
+        return true;
+    };
+    matches!(
+        point
+            .events
+            .get(relation.event_index as usize)
+            .map(|event| &event.effect),
+        Some(SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Transfer(_),
+            ..
+        })
+    )
+}
+
+fn append_origin(
+    search: &mut CallerOriginSearch,
+    location: AbstractLocation,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    max_origins: usize,
+) {
+    if let Some(existing) = search
+        .origins
+        .iter_mut()
+        .find(|existing| existing.location == location)
+    {
+        existing.proof = merge_call_rule_proof(&existing.proof, proof);
+        existing.completeness = merge_call_rule_completeness(&existing.completeness, completeness);
+        return;
+    }
+    if search.origins.len() >= max_origins {
+        search.incomplete = true;
+        return;
+    }
+    search.origins.push(CallerOrigin {
+        location,
+        proof,
+        completeness,
+    });
+}
+
+fn caller_origin_paths(
+    actual: &CallArgumentEndpoint,
+    snapshot: Option<&ValueFlowSnapshot>,
+    max_origins: usize,
+    path_limits: OracleLimits,
+) -> CallerOriginSearch {
+    if let CallArgumentEndpoint::Location { location, .. } = actual {
+        let mut search = CallerOriginSearch::default();
+        let mut completeness = EvidenceCompleteness::Complete;
+        if !location.path().is_exact() {
+            completeness = EvidenceCompleteness::Partial(
+                "caller argument location retains an unresolved access path".into(),
+            );
+        }
+        let Ok(ValueFlowCarrier::Location(location)) = argument_carrier(actual) else {
+            search.incomplete = true;
+            return search;
+        };
+        append_origin(
+            &mut search,
+            *location,
+            ProofStatus::Proven,
+            completeness,
+            max_origins,
+        );
+        return search;
+    }
+
+    let Some(snapshot) = snapshot else {
+        return CallerOriginSearch {
+            incomplete: true,
+            ..CallerOriginSearch::default()
+        };
+    };
+    let CallArgumentEndpoint::Value(actual) = actual else {
+        unreachable!("location call argument endpoint returned above")
+    };
+    let mut incoming = HashMap::<_, Vec<&crate::analyzer::semantic::ValueFlowRelation>>::default();
+    for relation in snapshot.relations() {
+        if let ValueFlowEndpoint::Value(target) = &relation.target {
+            incoming.entry(target.clone()).or_default().push(relation);
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PendingOrigin {
+        value: crate::analyzer::semantic::ValueHandle,
+        proof: ProofStatus,
+        completeness: EvidenceCompleteness,
+        depth: usize,
+    }
+    let mut pending = vec![PendingOrigin {
+        value: actual.clone(),
+        proof: ProofStatus::Proven,
+        completeness: EvidenceCompleteness::Complete,
+        depth: 0,
+    }];
+    let mut visited = HashSet::default();
+    let mut search = CallerOriginSearch::default();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current.value.clone()) {
+            continue;
+        }
+        if current.depth >= path_limits.access_path_length() {
+            search.incomplete = true;
+            continue;
+        }
+        let Some(relations) = incoming.get(&current.value) else {
+            search.incomplete = true;
+            continue;
+        };
+        for relation in relations {
+            let proof = merge_call_rule_proof(&current.proof, relation.proof.clone());
+            let completeness =
+                merge_call_rule_completeness(&current.completeness, relation.completeness.clone());
+            if relation_has_identity_barrier(relation) {
+                // A transfer may carry ordinary value dependence but never
+                // proves that the caller and callee observe one backing store.
+                continue;
+            }
+            match (&relation.source, relation.kind) {
+                (ValueFlowEndpoint::Location(location), ValueFlowRelationKind::MemoryLoad)
+                | (ValueFlowEndpoint::Location(location), ValueFlowRelationKind::Assignment)
+                | (ValueFlowEndpoint::Location(location), ValueFlowRelationKind::Allocation) => {
+                    let location = if relation.kind == ValueFlowRelationKind::Allocation {
+                        match value_location(&current.value, path_limits) {
+                            Ok(location) => location,
+                            Err(_) => {
+                                search.incomplete = true;
+                                continue;
+                            }
+                        }
+                    } else {
+                        (**location).clone()
+                    };
+                    append_origin(&mut search, location, proof, completeness, max_origins);
+                }
+                (ValueFlowEndpoint::Port(port), ValueFlowRelationKind::Parameter)
+                | (ValueFlowEndpoint::Port(port), ValueFlowRelationKind::Receiver) => {
+                    match port_location(port, path_limits) {
+                        Ok(location) => {
+                            append_origin(&mut search, location, proof, completeness, max_origins)
+                        }
+                        Err(_) => search.incomplete = true,
+                    }
+                }
+                (ValueFlowEndpoint::Value(source), ValueFlowRelationKind::Assignment) => {
+                    pending.push(PendingOrigin {
+                        value: source.clone(),
+                        proof,
+                        completeness,
+                        depth: current.depth.saturating_add(1),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    search
+}
+
+struct ProjectedLocationRuleInputs<'input> {
+    bindings: &'input CallBindings,
+    actual: &'input CallArgumentEndpoint,
+    mapping_proof: ProofStatus,
+    mapping_completeness: EvidenceCompleteness,
+    kind: CallFlowRuleKind,
+    callee_locations: &'input [CallerOrigin],
+    caller_snapshot: Option<&'input ValueFlowSnapshot>,
+    max_origins: usize,
+    path_limits: OracleLimits,
+}
+
+fn append_projected_location_rules(
+    inputs: ProjectedLocationRuleInputs<'_>,
+    output: &mut Vec<PendingCallFlowRule>,
+) {
+    let ProjectedLocationRuleInputs {
+        bindings,
+        actual,
+        mapping_proof,
+        mapping_completeness,
+        kind,
+        callee_locations,
+        caller_snapshot,
+        max_origins,
+        path_limits,
+    } = inputs;
+    let origins = caller_origin_paths(actual, caller_snapshot, max_origins, path_limits);
+    if origins.origins.is_empty() {
+        return;
+    }
+    let multiple_origins = origins.incomplete || origins.origins.len() > 1;
+    for origin in origins.origins {
+        for formal_location in callee_locations {
+            let (location, truncated) = match substitute_call_location(
+                &origin.location,
+                &formal_location.location,
+                path_limits,
+            ) {
+                Ok(location) => location,
+                Err(_) => continue,
+            };
+            let mut proof = bindings.candidate().proof().clone();
+            proof = merge_call_rule_proof(&proof, mapping_proof.clone());
+            proof = merge_call_rule_proof(&proof, origin.proof.clone());
+            proof = merge_call_rule_proof(&proof, formal_location.proof.clone());
+            let mut completeness = bindings.candidate().completeness().clone();
+            completeness =
+                merge_call_rule_completeness(&completeness, mapping_completeness.clone());
+            completeness = merge_call_rule_completeness(&completeness, origin.completeness.clone());
+            completeness =
+                merge_call_rule_completeness(&completeness, formal_location.completeness.clone());
+            if multiple_origins {
+                completeness = merge_call_rule_completeness(
+                    &completeness,
+                    EvidenceCompleteness::Partial(
+                        "caller actual has multiple or incomplete backing origins".into(),
+                    ),
+                );
+            }
+            if truncated {
+                completeness = merge_call_rule_completeness(
+                    &completeness,
+                    EvidenceCompleteness::Partial("call-location access path was bounded".into()),
+                );
+            }
+            output.push(PendingCallFlowRule {
+                call: bindings.call().clone(),
+                callee: bindings.callee().clone(),
+                kind,
+                source: if kind == CallFlowRuleKind::Call {
+                    ValueFlowCarrier::Location(Box::new(origin.location.clone()))
+                } else {
+                    ValueFlowCarrier::Location(Box::new(formal_location.location.clone()))
+                },
+                target: if kind == CallFlowRuleKind::Call {
+                    ValueFlowCarrier::Location(Box::new(formal_location.location.clone()))
+                } else {
+                    ValueFlowCarrier::Location(Box::new(location))
+                },
+                proof,
+                completeness,
+            });
+        }
+    }
+}
+
+fn append_call_location_rules(
+    bindings: &CallBindings,
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+    max_origins: usize,
+    max_access_path: usize,
+    output: &mut Vec<PendingCallFlowRule>,
+) -> Result<(), ValueFlowPlanError> {
+    let caller_snapshot = snapshot_for_procedure(snapshots, bindings.call().procedure());
+    let callee_snapshot = snapshot_for_procedure(snapshots, bindings.callee());
+    let Some(callee_snapshot) = callee_snapshot else {
+        return Ok(());
+    };
+    let path_limits = call_location_oracle_limits(max_access_path);
+    let (coverage_proof, coverage_completeness) = binding_coverage_quality(bindings);
+    for binding in bindings.bindings() {
+        match binding {
+            CallBinding::Receiver { actual, formal, .. } => {
+                let actual = CallArgumentEndpoint::Value(actual.clone());
+                let formal_locations = formal_location_carriers(callee_snapshot, formal);
+                append_projected_location_rules(
+                    ProjectedLocationRuleInputs {
+                        bindings,
+                        actual: &actual,
+                        mapping_proof: coverage_proof.clone(),
+                        mapping_completeness: coverage_completeness.clone(),
+                        kind: CallFlowRuleKind::Call,
+                        callee_locations: &formal_locations,
+                        caller_snapshot,
+                        max_origins,
+                        path_limits,
+                    },
+                    output,
+                );
+                append_projected_location_rules(
+                    ProjectedLocationRuleInputs {
+                        bindings,
+                        actual: &actual,
+                        mapping_proof: coverage_proof.clone(),
+                        mapping_completeness: coverage_completeness.clone(),
+                        kind: CallFlowRuleKind::NormalReturn,
+                        callee_locations: &formal_locations,
+                        caller_snapshot,
+                        max_origins,
+                        path_limits,
+                    },
+                    output,
+                );
+            }
+            CallBinding::ArgumentGroup(group) => {
+                for mapping in group.mappings() {
+                    let mapping_value = mapping.value();
+                    let actual = mapping_value.actual();
+                    let formal_locations =
+                        formal_location_carriers(callee_snapshot, mapping_value.formal());
+                    let mapping_completeness = merge_call_rule_completeness(
+                        &coverage_completeness,
+                        mapping.completeness().clone(),
+                    );
+                    let mapping_proof =
+                        merge_call_rule_proof(&coverage_proof, mapping.proof().clone());
+                    append_projected_location_rules(
+                        ProjectedLocationRuleInputs {
+                            bindings,
+                            actual,
+                            mapping_proof: mapping_proof.clone(),
+                            mapping_completeness: mapping_completeness.clone(),
+                            kind: CallFlowRuleKind::Call,
+                            callee_locations: &formal_locations,
+                            caller_snapshot,
+                            max_origins,
+                            path_limits,
+                        },
+                        output,
+                    );
+                    append_projected_location_rules(
+                        ProjectedLocationRuleInputs {
+                            bindings,
+                            actual,
+                            mapping_proof,
+                            mapping_completeness,
+                            kind: CallFlowRuleKind::NormalReturn,
+                            callee_locations: &formal_locations,
+                            caller_snapshot,
+                            max_origins,
+                            path_limits,
+                        },
+                        output,
+                    );
+                }
+            }
+            CallBinding::NormalReturn { formal, result, .. } => {
+                let actual = CallArgumentEndpoint::Value(result.clone());
+                let formal_locations = formal_location_carriers(callee_snapshot, formal);
+                append_projected_location_rules(
+                    ProjectedLocationRuleInputs {
+                        bindings,
+                        actual: &actual,
+                        mapping_proof: coverage_proof.clone(),
+                        mapping_completeness: coverage_completeness.clone(),
+                        kind: CallFlowRuleKind::NormalReturn,
+                        callee_locations: &formal_locations,
+                        caller_snapshot,
+                        max_origins,
+                        path_limits,
+                    },
+                    output,
+                );
+            }
+            CallBinding::ImplicitArgument { .. } | CallBinding::ExceptionalReturn { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn substitute_call_location(
+    actual: &AbstractLocation,
+    formal: &AbstractLocation,
+    limits: OracleLimits,
+) -> Result<(AbstractLocation, bool), ValueFlowPlanError> {
+    let mut selectors = actual.path().selectors().to_vec();
+    let mut lossy = !actual.path().is_exact() || !formal.path().is_exact();
+    for selector in formal.path().selectors() {
+        selectors.push(match selector {
+            AccessSelector::Field(field) => AccessSelector::Field(field.clone()),
+            AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(value)) => {
+                AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(*value))
+            }
+            AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Any) => {
+                lossy = true;
+                AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Any)
+            }
+            AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Exact(_)) => {
+                // The exact index handle belongs to the callee procedure. A
+                // caller plan cannot retain it after root substitution; the
+                // structured wildcard is the precise bounded approximation.
+                lossy = true;
+                AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Any)
+            }
+        });
+    }
+    if selectors.len() > limits.access_path_length() {
+        selectors.truncate(limits.access_path_length());
+        lossy = true;
+    }
+    let tail = if lossy
+        || actual.path().tail() == AccessPathTail::Summary
+        || formal.path().tail() == AccessPathTail::Summary
+    {
+        AccessPathTail::Summary
+    } else {
+        AccessPathTail::Exact
+    };
+    let root = actual.path().root().clone();
+    let object = AbstractObject::new(root.clone(), actual.object().cardinality())
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    let path = AccessPath::bounded(root, selectors, tail, limits)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    let location = AbstractLocation::new(object, path)
+        .map_err(|_| ValueFlowPlanError::InvalidCallArgumentLocation)?;
+    Ok((location, lossy))
 }
 
 fn append_call_rules(
@@ -5453,20 +6719,23 @@ fn compare_local_rules(left: &LocalFlowRule, right: &LocalFlowRule) -> Ordering 
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| relation_kind_rank(left.kind).cmp(&relation_kind_rank(right.kind)))
         .then_with(|| transfer_rank(left.transfer).cmp(&transfer_rank(right.transfer)))
+        .then_with(|| left.policy_local.cmp(&right.policy_local))
 }
 
-fn transfer_rank(transfer: Option<ValueTransfer>) -> (u8, u8, u32) {
+fn transfer_rank(transfer: Option<ValueTransfer>) -> (u8, u8, u32, StableDigest) {
     use crate::analyzer::semantic::{
         MoveInvalidation, TransferKind, TransferOperation, ValuePreservation,
     };
 
     let Some(transfer) = transfer else {
-        return (0, 0, 0);
+        return (0, 0, 0, StableDigest::from_array([0; 32]));
     };
-    let (operation, call_site) = match transfer.operation {
-        TransferOperation::None => (0, 0),
-        TransferOperation::CallSite(call) => (1, call.get()),
-        TransferOperation::Unknown => (2, 0),
+    let zero_digest = StableDigest::from_array([0; 32]);
+    let (operation, call_site, conversion) = match transfer.operation {
+        TransferOperation::None => (0, 0, zero_digest),
+        TransferOperation::CallSite(call) => (1, call.get(), zero_digest),
+        TransferOperation::Unknown => (2, 0, zero_digest),
+        TransferOperation::CallArgumentConversion(conversion) => (3, 0, conversion),
     };
     let kind = match transfer.kind {
         TransferKind::Copy => 1,
@@ -5489,7 +6758,7 @@ fn transfer_rank(transfer: Option<ValueTransfer>) -> (u8, u8, u32) {
         TransferKind::Boxing => 8,
         TransferKind::Unboxing => 9,
     };
-    (kind, operation, call_site)
+    (kind, operation, call_site, conversion)
 }
 
 fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
@@ -5509,6 +6778,7 @@ fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
                         == right.carrier_keys[right_rule.target.index()]
                     && left_rule.proof == right_rule.proof
                     && left_rule.completeness == right_rule.completeness
+                    && left_rule.policy_local == right_rule.policy_local
                     && left_rule.strong_update == right_rule.strong_update
             })
 }
@@ -5546,6 +6816,20 @@ fn same_summary_location_bindings(left: &ValueFlowPlan, right: &ValueFlowPlan) -
             })
 }
 
+fn same_conditional_source_specs(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    let left_sources = left
+        .sources
+        .iter()
+        .filter(|source| source.spec.activation_triggers().is_some())
+        .map(|source| &source.spec);
+    let right_sources = right
+        .sources
+        .iter()
+        .filter(|source| source.spec.activation_triggers().is_some())
+        .map(|source| &source.spec);
+    left_sources.eq(right_sources)
+}
+
 fn relation_kind_rank(kind: ValueFlowRelationKind) -> u8 {
     match kind {
         ValueFlowRelationKind::Assignment => 0,
@@ -5569,6 +6853,26 @@ fn compare_call_rules(left: &CallFlowRule, right: &CallFlowRule) -> Ordering {
         .then_with(|| call_rule_rank(left.kind).cmp(&call_rule_rank(right.kind)))
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.target.cmp(&right.target))
+}
+
+fn merge_duplicate_call_rules(rules: &mut Vec<CallFlowRule>) {
+    let mut merged: Vec<CallFlowRule> = Vec::with_capacity(rules.len());
+    for rule in rules.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && previous.call == rule.call
+            && previous.callee == rule.callee
+            && previous.kind == rule.kind
+            && previous.source == rule.source
+            && previous.target == rule.target
+        {
+            previous.proof = merge_call_rule_proof(&previous.proof, rule.proof);
+            previous.completeness =
+                merge_call_rule_completeness(&previous.completeness, rule.completeness);
+        } else {
+            merged.push(rule);
+        }
+    }
+    *rules = merged;
 }
 
 fn call_rule_rank(kind: CallFlowRuleKind) -> u8 {
@@ -5630,6 +6934,62 @@ fn normalize_summary_edge_kills(
         }
     }
     normalized.into_boxed_slice()
+}
+
+fn normalize_summary_conditional_sources(
+    mut rows: Vec<ValueFlowConditionalSourceSummaryRule>,
+) -> Box<[ValueFlowConditionalSourceSummaryRule]> {
+    rows.sort_by(|left, right| {
+        left.point
+            .cmp(&right.point)
+            .then_with(|| left.phase.cmp(&right.phase))
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.carrier.cmp(&right.carrier))
+    });
+    rows.dedup();
+    rows.into_boxed_slice()
+}
+
+fn validate_source_activation_triggers(
+    sources: &[ValueFlowSourceSpec],
+) -> Result<(), ValueFlowPlanError> {
+    for source in sources {
+        let Some(triggers) = source.activation_triggers() else {
+            continue;
+        };
+        if triggers.is_empty()
+            || triggers.windows(2).any(|pair| pair[0] >= pair[1])
+            || triggers.iter().any(|trigger| {
+                sources
+                    .binary_search_by(|candidate| candidate.key().cmp(trigger))
+                    .is_err()
+            })
+        {
+            return Err(ValueFlowPlanError::InvalidSourceActivation);
+        }
+    }
+    Ok(())
+}
+
+fn bind_source_activation_triggers(
+    source: &ValueFlowSourceSpec,
+    sources: &[ValueFlowSourceSpec],
+) -> Result<Option<Box<[ValueFlowSourceId]>>, ValueFlowPlanError> {
+    source
+        .activation_triggers()
+        .map(|triggers| {
+            triggers
+                .iter()
+                .map(|trigger| {
+                    sources
+                        .binary_search_by(|candidate| candidate.key().cmp(trigger))
+                        .ok()
+                        .and_then(|index| ValueFlowSourceId::try_from_index(index).ok())
+                        .ok_or(ValueFlowPlanError::InvalidSourceActivation)
+                })
+                .collect::<Result<Box<[_]>, _>>()
+        })
+        .transpose()
 }
 
 fn build_edge_kill_index(

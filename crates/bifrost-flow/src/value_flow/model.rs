@@ -659,6 +659,10 @@ pub struct ValueFlowSourceSpec {
     carrier: ValueFlowCarrier,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    /// Source events that must already reach this source's carrier at its
+    /// observation point before this source can be activated. `None` keeps
+    /// the historical unconditional source behavior.
+    conditional_triggers: Option<Box<[ValueFlowEventKey]>>,
 }
 
 impl ValueFlowSourceSpec {
@@ -677,7 +681,22 @@ impl ValueFlowSourceSpec {
             carrier,
             proof,
             completeness,
+            conditional_triggers: None,
         }
+    }
+
+    /// Make this source conditional on one of the supplied source events
+    /// already reaching the same carrier at this observation point.
+    ///
+    /// The plan validates that every trigger names a source in the plan. The
+    /// builder canonicalizes the set so source identity and summary behavior
+    /// do not depend on caller ordering or duplicate entries.
+    pub fn when_sources_reach(mut self, mut triggers: Vec<ValueFlowEventKey>) -> Self {
+        triggers.sort_unstable();
+        triggers.dedup();
+        assert!(!triggers.is_empty(), "a conditional source needs a trigger");
+        self.conditional_triggers = Some(triggers.into_boxed_slice());
+        self
     }
 
     pub fn key(&self) -> &ValueFlowEventKey {
@@ -702,6 +721,23 @@ impl ValueFlowSourceSpec {
 
     pub fn completeness(&self) -> &EvidenceCompleteness {
         &self.completeness
+    }
+
+    /// Source events that activate this source, or `None` for an
+    /// unconditional source.
+    pub fn activation_triggers(&self) -> Option<&[ValueFlowEventKey]> {
+        self.conditional_triggers.as_deref()
+    }
+
+    pub(crate) fn activation_triggers_retained_bytes(&self) -> usize {
+        self.conditional_triggers.as_ref().map_or(0, |triggers| {
+            std::mem::size_of_val(triggers.as_ref()).saturating_add(
+                triggers
+                    .iter()
+                    .map(ValueFlowEventKey::retained_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+        })
     }
 }
 

@@ -1376,6 +1376,11 @@ impl Decoder {
             })
             .transpose()?
             .unwrap_or_default();
+        let transforms = fields
+            .get("transforms")
+            .map(|value| self.decode_flow_transform_set(value, &format!("{path}/transforms")))
+            .transpose()?
+            .unwrap_or_default();
         Ok(TaintPolicySpec {
             mode: MayMode::May,
             call_modeling: fields
@@ -1387,7 +1392,7 @@ impl Decoder {
             sinks: observations,
             sanitizers: kills,
             entry_points: TaintEndpointSet::default(),
-            transforms: TaintEndpointSet::default(),
+            transforms,
             external_models: TaintEndpointSet::default(),
             store_writes: Vec::new(),
             store_reads: Vec::new(),
@@ -1494,6 +1499,39 @@ impl Decoder {
         })
     }
 
+    fn decode_flow_transform_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEndpointSet<TaintTransformSpec>, PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Flow,
+            PolicyRecordContext::Transforms,
+            false,
+            path,
+        )?;
+        let mut entries = Vec::with_capacity(parts.entries.len());
+        let mut ids = HashSet::with_capacity(parts.entries.len());
+        for entry in &parts.entries {
+            let value = self.decode_flow_transform(entry, path)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    format!("duplicate transform ID `{}`", value.id),
+                ));
+            }
+            entries.push(value);
+        }
+        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(TaintEndpointSet {
+            include_sets: parts.include_sets,
+            include_matches: parts.include_matches,
+            entries,
+        })
+    }
+
     fn decode_flow_origin(
         &mut self,
         expr: &Expr,
@@ -1586,6 +1624,37 @@ impl Decoder {
                 PolicyValueShape::PolicyPort,
             )?),
             removes: vec![flow_internal_label()],
+        })
+    }
+
+    fn decode_flow_transform(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintTransformSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
+        let fields = RecordCursor::parse(expr, PolicyRecord::TransformEntry, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "transform ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintTransformSpec {
+            id,
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            input: decoded_binding_to_port(decode_binding(
+                fields.required("input"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            output: decoded_binding_to_port(decode_binding(
+                fields.required("output"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            removes: Vec::new(),
+            adds: Vec::new(),
         })
     }
 
@@ -1792,7 +1861,7 @@ impl Decoder {
         let parts = self.decode_taint_set_parts(
             expr,
             PolicyAnalysisKind::Taint,
-            PolicyRecordContext::TaintTransforms,
+            PolicyRecordContext::Transforms,
             false,
             path,
         )?;
@@ -7178,6 +7247,22 @@ mod tests {
         )
     }
 
+    fn flow_policy(extra: &str) -> String {
+        format!(
+            r#"(policy :id "test.flow" :name "Flow" :message "M" :severity warning
+                :analysis (analysis :type flow :mode may
+                  :origins (endpoint-set :entries [
+                    (origin :id source :display-name "Source"
+                      :selector (rql (language java (call :callee (name "source"))))
+                      :bind return-value)])
+                  :observations (endpoint-set :entries [
+                    (observation :id sink :display-name "Sink"
+                      :selector (rql (language java (call :callee (name "sink"))))
+                      :observed-operand (argument :index 0))])
+                  {extra}))"#
+        )
+    }
+
     fn assert_error_token(source: &str, code: &str, token: &str) {
         let error = parse(source).unwrap_err().diagnostic;
         assert_eq!(error.code, code);
@@ -9267,5 +9352,68 @@ mod tests {
 
         let inside_query = "(policy :analysis (analysis :selector (rql (call ";
         assert!(rqlp_source_completion_at(inside_query, inside_query.len()).is_none());
+    }
+
+    #[test]
+    fn flow_transforms_decode_as_neutral_input_to_output_carriers() {
+        let source = flow_policy(
+            r#":transforms (endpoint-set :entries [
+                (transform :id normalize
+                  :selector (rql (language java (call :callee (name "normalize"))))
+                  :input (argument :index 0)
+                  :output return-value)])"#,
+        );
+        let parsed = parse(&source).expect("the flow transform parses");
+        let RqlpDocument::Policy { definition } = parsed.document() else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Flow { spec } = &definition.analysis else {
+            panic!("expected flow analysis")
+        };
+        let [transform] = spec.transforms.entries.as_slice() else {
+            panic!("expected one flow transform")
+        };
+        assert_eq!(transform.id.as_str(), "normalize");
+        assert_eq!(transform.input, PolicyPort::ArgumentIndex { index: 0 });
+        assert_eq!(transform.output, PolicyPort::ReturnValue);
+        assert!(transform.removes.is_empty() && transform.adds.is_empty());
+
+        let canonical = parsed.document().to_normalized_authored_json();
+        assert_eq!(canonical["analysis"]["transforms"][0]["id"], "normalize");
+        assert!(
+            canonical["analysis"]["transforms"][0]
+                .get("removes")
+                .is_none()
+        );
+        assert!(canonical["analysis"]["transforms"][0].get("adds").is_none());
+    }
+
+    #[test]
+    fn flow_transforms_reject_taint_label_effect_fields() {
+        let source = flow_policy(
+            r#":transforms (endpoint-set :entries [
+                (transform :id normalize
+                  :selector (rql (language java (call :callee (name "normalize"))))
+                  :input (argument :index 0)
+                  :output return-value
+                  :removes [user-input])])"#,
+        );
+        assert_error_token(&source, "field-not-allowed", ":removes");
+    }
+
+    #[test]
+    fn taint_transforms_still_require_a_non_empty_effect() {
+        let source = taint_policy(
+            r#":transforms (endpoint-set :entries [
+                (transform :id normalize
+                  :selector (rql (language java (call :callee (name "normalize"))))
+                  :input (argument :index 0)
+                  :output return-value)])"#,
+        );
+        let error = parse(&source)
+            .expect_err("an empty taint transform must be rejected")
+            .diagnostic;
+        assert_eq!(error.code, "empty-transform");
+        assert!(source[error.range].starts_with("(transform"));
     }
 }

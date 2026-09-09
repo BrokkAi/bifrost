@@ -395,11 +395,13 @@ fn valid_unknown_reason(reason: &str) -> bool {
             | "pack_incomplete"
             | "uncertain_flow"
             | "field_slot_incomplete"
+            | "dynamic_field_write"
             | "solver_budget"
             | "semantic_budget"
             | "incomplete_root"
             | "open_type_bound"
             | "scalar_receiver"
+            | "class_creation"
     )
 }
 

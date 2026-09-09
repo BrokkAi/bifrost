@@ -902,6 +902,86 @@ mod tests {
             ReadKey::path_absent(Language::Java, "src/Missing.java"),
             ReadKey::index(IndexFamily::DefinitionExact, b"com.example.Main"),
             ReadKey::lookup(
+                LookupKind::ResolvedName,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::ResolvedName,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::Definitions,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::Definitions,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::IdentifierCandidates,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::IdentifierCandidates,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::ShortNameCandidates,
+                LookupQuestion::Name {
+                    language: Some(Language::Java),
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::ShortNameCandidates,
+                LookupQuestion::Name {
+                    language: None,
+                    name: Box::from("com.example.Main"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::DeclarationFacts,
+                LookupQuestion::Declaration {
+                    rel_path: Box::from("src/Main.java"),
+                    fq_name: Box::from("com.example.Main#run"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::SignatureMetadata,
+                LookupQuestion::Declaration {
+                    rel_path: Box::from("src/Main.java"),
+                    fq_name: Box::from("com.example.Main#run"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
                 LookupKind::Callers,
                 LookupQuestion::Declaration {
                     rel_path: Box::from("src/Main.java"),

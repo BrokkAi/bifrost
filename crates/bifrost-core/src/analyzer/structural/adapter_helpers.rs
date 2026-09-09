@@ -47,12 +47,28 @@ pub fn nearest_ancestor<'tree>(
 /// The grammar field name `child` occupies in `parent`, or `None` when the
 /// child is unnamed-positional. Occurrence-role classification is written
 /// against AST fields, so every adapter needs this exact question answered.
+///
+/// Walked with a cursor, not indexed. `Node::child(i)` re-descends the child
+/// list from the start on every call -- and must step through invisible nodes
+/// to reach the i-th visible one -- so indexing `0..child_count` is quadratic
+/// in the child count and superlinear in the subtree those children span. A
+/// cursor advances to the next sibling in constant time, which makes the scan
+/// linear. This runs for every occurrence-role classification in every
+/// language adapter, so the difference is not academic: it was 98% of the
+/// fuzzer's CPU on a wide-node file.
 pub fn field_name_in_parent(parent: Node<'_>, child: Node<'_>) -> Option<&'static str> {
-    (0..parent.child_count()).find_map(|index| {
-        (parent.child(index) == Some(child))
-            .then(|| parent.field_name_for_child(index as u32))
-            .flatten()
-    })
+    let mut cursor = parent.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        if cursor.node() == child {
+            return cursor.field_name();
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
 }
 
 /// Whether `child` occupies `parent`'s `field`.

@@ -314,7 +314,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
     if !state.writer.open_with(2, |writer| {
         write!(
             writer,
-            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {} :call-boundary {}",
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {} :call-boundary {} :receiver-binding {}",
             procedure.id(),
             quoted(procedure.kind().label()),
             optional_id(procedure.lexical_parent()),
@@ -330,6 +330,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
             quoted(properties.invocation.label()),
             quoted(properties.dispatch_extensibility.label()),
             quoted(properties.call_boundary.label()),
+            quoted(properties.receiver_binding.label()),
         )
     }) {
         return false;
@@ -932,12 +933,27 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                     TransferOperation::CallSite(call_site) => {
                         write!(writer, " :operation-call-site {call_site}")?;
                     }
+                    TransferOperation::CallArgumentConversion(conversion) => {
+                        write!(writer, " :operation-call-argument-conversion {conversion}")?;
+                    }
                     TransferOperation::Unknown => {
                         writer.write_str(" :operation \"unknown\"")?;
                     }
                 }
             }
             if let ValueFlowKind::BackingStore { offset } = kind {
+                match offset {
+                    BackingStoreOffset::Zero => writer.write_str(" :element-offset 0")?,
+                    BackingStoreOffset::Constant(offset) => {
+                        write!(writer, " :element-offset {offset}")?;
+                    }
+                    BackingStoreOffset::Value(value) => {
+                        write!(writer, " :element-offset-value {value}")?;
+                    }
+                }
+            }
+            if let ValueFlowKind::BackingStoreAlternative { offset, allocation } = kind {
+                write!(writer, " :alternative-allocation {allocation}")?;
                 match offset {
                     BackingStoreOffset::Zero => writer.write_str(" :element-offset 0")?,
                     BackingStoreOffset::Constant(offset) => {
@@ -1044,6 +1060,9 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
 
 fn write_callable(writer: &mut dyn fmt::Write, callable: &CallableValue) -> fmt::Result {
     write!(writer, ":callable-kind {} ", quoted(callable.kind.label()))?;
+    if let super::ir::CallableReferenceKind::TypeQualifiedMethod { qualifier } = callable.kind {
+        write!(writer, ":type-qualifier {qualifier} ")?;
+    }
     write_target_resolution(writer, &callable.targets)?;
     write!(
         writer,

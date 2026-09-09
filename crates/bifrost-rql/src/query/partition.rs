@@ -1,11 +1,10 @@
 //! Whether a plan's rows can be produced one seed file at a time.
 //!
 //! An incremental policy evaluation executes a sliceable plan once per seed
-//! file and merges the per-seed row vectors in seed order (issue:
-//! impact-sliced `--diff-base`, Milestone 2). That merge reproduces the whole
-//! execution's row vector because the pipeline is input-row-major and its
-//! dedup is first-writer-wins, so the classification here is a property of the
-//! plan's structure alone -- never of the policy that authored it.
+//! file. Ordinary plans merge in seed order; eligible unions restore authored
+//! branch order before seed order and first-writer deduplication. Eligibility
+//! is a property of the plan structure, never of the policy that authored it.
+//! The caller must also prove cumulative budget headroom before using a merge.
 
 use super::ir::{CodeQueryPlan, CodeQueryPlanSource};
 use super::schema::QueryStepOp;
@@ -16,6 +15,9 @@ pub enum PlanPartitioning {
     /// The plan's rows are the concatenation, in seed order, of the rows of one
     /// execution per seed file, deduplicated first-writer-wins.
     BySeed,
+    /// The plan is an all-union composition whose leaves may be executed per
+    /// seed file and merged in branch order before first-writer deduplication.
+    BySeedUnion,
     /// The plan must be executed once over the whole workspace.
     Whole,
 }
@@ -23,12 +25,17 @@ pub enum PlanPartitioning {
 impl PlanPartitioning {
     /// Classify `plan` from its source kind and its steps.
     ///
-    /// Three shapes are `Whole`:
+    /// Set plans are `Whole` unless they are suffix-free unions whose leaves
+    /// are all seed-partitionable and use one comparator family. The remaining
+    /// shapes are `Whole`:
     ///
-    /// - A `Set` source. A set node gives each branch a fair share of the live
-    ///   budget, re-runs a starved branch, and drops truncated seed results
-    ///   before that retry, so a branch's row set depends on what earlier
-    ///   branches consumed. Nothing about a per-seed execution reproduces that.
+    /// - An intersect/except source, or a union with a suffix. Those operators
+    ///   consume cross-seed membership or a deduplicated set of branch rows,
+    ///   so their result cannot be reconstructed from independent seed rows.
+    ///   A union with an `absent_member` step is also whole because its root
+    ///   evidence payload is merged by representative selection rather than by
+    ///   traces alone. Eligible unions handle their fair-budget retry boundary
+    ///   in the merged unit cap proof below.
     /// - A `decorator_bindings` step. Its rows carry
     ///   `DetailedCodeQueryDecoratedParameterEvidence`, runtime-only semantic
     ///   identity that is deliberately outside the serializable row model, so a
@@ -44,20 +51,106 @@ impl PlanPartitioning {
     /// steps (whose only reordering is a stable sort by artifact file over
     /// seed-major input).
     pub fn classify(plan: &CodeQueryPlan) -> Self {
-        if matches!(plan.source, CodeQueryPlanSource::Set { .. }) {
-            return Self::Whole;
+        if matches!(&plan.source, CodeQueryPlanSource::Set { .. }) {
+            return Self::classify_union(plan).map_or(Self::Whole, |_| Self::BySeedUnion);
         }
-        if plan.steps.iter().any(|step| {
-            step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
-        }) {
-            return Self::Whole;
-        }
-        Self::BySeed
+        Self::classify_leaf(plan)
     }
 
     /// Whether this plan may be executed one seed file at a time.
     pub const fn is_by_seed(self) -> bool {
-        matches!(self, Self::BySeed)
+        matches!(self, Self::BySeed | Self::BySeedUnion)
+    }
+
+    /// Whether this plan is an eligible all-union composition.
+    pub const fn is_seed_union(self) -> bool {
+        matches!(self, Self::BySeedUnion)
+    }
+
+    fn classify_leaf(plan: &CodeQueryPlan) -> Self {
+        if plan.steps.iter().any(|step| {
+            step.op() == QueryStepOp::DecoratorBindings || step.op().is_registration_dependent()
+        }) {
+            Self::Whole
+        } else {
+            Self::BySeed
+        }
+    }
+
+    /// Validate the restricted union shape and return its checked fair-share
+    /// divisor. Every set node must be a suffix-free union, and every leaf must
+    /// be a seed-partitionable plan with the same seed ordering family.
+    pub(crate) fn classify_union(plan: &CodeQueryPlan) -> Option<usize> {
+        let CodeQueryPlanSource::Set { .. } = &plan.source else {
+            return None;
+        };
+
+        let mut pending = vec![(plan, 1usize)];
+        let mut maximum_divisor = 1usize;
+        let mut leaves = 0usize;
+        let mut comparator = None;
+        while let Some((current, divisor)) = pending.pop() {
+            match &current.source {
+                CodeQueryPlanSource::Set { op, branches } => {
+                    if *op != super::ir::SetOperator::Union || !current.steps.is_empty() {
+                        return None;
+                    }
+                    let next_divisor = divisor.checked_mul(branches.len())?;
+                    for branch in branches.iter().rev() {
+                        pending.push((branch, next_divisor));
+                    }
+                    maximum_divisor = maximum_divisor.max(next_divisor);
+                }
+                _ => {
+                    if !Self::classify_leaf(current).is_by_seed()
+                        || current
+                            .steps
+                            .iter()
+                            .any(|step| step.op() == QueryStepOp::AbsentMember)
+                    {
+                        return None;
+                    }
+                    let leaf_comparator = matches!(&current.source, CodeQueryPlanSource::Seed(_));
+                    if comparator.is_some_and(|known| known != leaf_comparator) {
+                        return None;
+                    }
+                    comparator = Some(leaf_comparator);
+                    leaves = leaves.checked_add(1)?;
+                }
+            }
+        }
+        if leaves == 0 {
+            return None;
+        }
+        Some(maximum_divisor)
+    }
+
+    /// Return the non-set leaves and their full branch paths for an eligible
+    /// union. The traversal is iterative so query depth cannot consume the
+    /// Rust call stack.
+    pub(crate) fn union_leaf_plans(
+        plan: &CodeQueryPlan,
+    ) -> Option<Vec<(&CodeQueryPlan, Vec<usize>)>> {
+        Self::classify_union(plan)?;
+        let mut pending = vec![(plan, Vec::new())];
+        let mut leaves = Vec::new();
+        while let Some((current, path)) = pending.pop() {
+            match &current.source {
+                CodeQueryPlanSource::Set { branches, .. } => {
+                    for (index, branch) in branches.iter().enumerate().rev() {
+                        let mut branch_path = path.clone();
+                        branch_path.push(index);
+                        pending.push((branch, branch_path));
+                    }
+                }
+                _ => leaves.push((current, path)),
+            }
+        }
+        assert!(
+            !leaves.is_empty(),
+            "an eligible union has at least one leaf"
+        );
+        Some(leaves)
     }
 }
 
@@ -213,13 +306,103 @@ mod tests {
     }
 
     #[test]
-    fn a_set_source_forces_a_whole_plan() {
+    fn a_suffix_free_union_is_partitioned_by_seed() {
         let plan = plan(json!({
             "union": [
                 { "match": { "kind": "function" } },
                 { "match": { "kind": "class" } }
             ]
         }));
+        assert_eq!(
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
+        );
+        assert!(PlanPartitioning::classify(&plan).is_by_seed());
+        assert!(PlanPartitioning::classify(&plan).is_seed_union());
+    }
+
+    #[test]
+    fn a_nested_suffix_free_union_is_partitioned_by_seed() {
+        let plan = plan(json!({
+            "union": [
+                {
+                    "union": [
+                        { "match": { "kind": "function" } },
+                        { "match": { "kind": "class" } }
+                    ]
+                },
+                { "match": { "kind": "method" } }
+            ]
+        }));
+        assert_eq!(
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
+        );
+    }
+
+    #[test]
+    fn mixed_seed_comparators_keep_a_union_whole() {
+        let plan = plan(json!({
+            "union": [
+                { "match": { "kind": "function" }, "steps": [{ "op": "file_of" }] },
+                { "occurrences": { "class": "reference" }, "steps": [{ "op": "file_of" }] }
+            ]
+        }));
         assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+    }
+
+    #[test]
+    fn a_union_with_a_set_suffix_stays_whole() {
+        let plan = plan(json!({
+            "union": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "class" } }
+            ],
+            "steps": [{ "op": "file_of" }]
+        }));
+        assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+    }
+
+    #[test]
+    fn intersect_and_except_stay_whole() {
+        let intersect = json!({
+            "intersect": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } }
+            ]
+        });
+        let except = json!({
+            "except": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function" } }
+            ]
+        });
+        for query in [intersect, except] {
+            let plan = plan(query);
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+        }
+    }
+
+    #[test]
+    fn registration_and_absence_steps_keep_union_whole() {
+        for steps in [
+            json!([
+                { "op": "procedure_of" },
+                { "op": "typestate", "protocol_ref": "test:protocol" }
+            ]),
+            json!([
+                { "op": "procedure_of" },
+                { "op": "absent_member" }
+            ]),
+        ] {
+            let query = json!({
+                "union": [
+                    { "match": { "kind": "function" }, "steps": steps.clone() },
+                    { "match": { "kind": "function" }, "steps": steps }
+                ]
+            });
+            let plan = plan(query);
+            assert_eq!(PlanPartitioning::classify(&plan), PlanPartitioning::Whole);
+        }
     }
 }

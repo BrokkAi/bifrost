@@ -17,7 +17,7 @@
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserializer, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use brokk_bifrost_analysis::analyzer::invalidation::{ArtifactVerdictLog, BudgetMode};
 use brokk_bifrost_analysis::analyzer::read_ledger::read_set_digest;
@@ -89,8 +89,9 @@ fn policy_substrate_epoch() -> StableDigest {
 ///
 /// A `Seed` unit is keyed by the file its seed enumeration walked and the blob
 /// that path resolved to, because the same path holding different bytes is a
-/// different unit even when nothing else moved. `Whole` is the whole policy,
-/// which is what a widened evaluation publishes.
+/// different unit even when nothing else moved. `Whole` is retained for
+/// loading legacy persisted products, but new widened evaluations do not mint
+/// it: a widened run evaluates directly and publishes no unit.
 ///
 /// A `Binding` unit is one seed file of one row binding of a relational
 /// assertion policy. It names the binding beside the file, because one
@@ -800,9 +801,10 @@ impl PolicyUnitStore for InMemoryPolicyUnitStore {
 /// serves one process and forgets.
 ///
 /// Reads are prefetched per policy in one query and publications are buffered
-/// until the caller flushes them, because a unit publication is one row plus
-/// its read set and one transaction per policy is what keeps a widened policy
-/// from leaving a half-published unit set behind.
+/// until the caller flushes them. The incremental context commits a complete
+/// policy attempt to this store before buffering, so a widened attempt never
+/// leaves a half-published unit set behind; the buffered rows are then written
+/// in one database transaction.
 pub struct PersistedPolicyUnitStore {
     store: Arc<AnalyzerStore>,
     loaded: HashMap<PolicyUnitKey, PolicyUnit>,
@@ -1155,6 +1157,10 @@ pub struct PolicyIncrementalContext<'a> {
     verdicts: ArtifactVerdictLog,
     runs: RefCell<Vec<PolicyIncrementalRun>>,
     units: RefCell<Vec<(PolicyId, Vec<PolicyUnitKey>)>>,
+    /// Recomputed units stay provisional until their policy's complete unit
+    /// key set is recorded. A sliced attempt can widen after recomputing one
+    /// or more units; those products must not become visible to later runs.
+    staged: RefCell<HashMap<PolicyId, HashMap<PolicyUnitKey, PolicyUnit>>>,
 }
 
 impl<'a> PolicyIncrementalContext<'a> {
@@ -1174,6 +1180,7 @@ impl<'a> PolicyIncrementalContext<'a> {
             verdicts: ArtifactVerdictLog::default(),
             runs: RefCell::new(Vec::new()),
             units: RefCell::new(Vec::new()),
+            staged: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1201,7 +1208,21 @@ impl<'a> PolicyIncrementalContext<'a> {
 
     /// Record what one policy's evaluation did with its units.
     pub fn record_run(&self, run: PolicyIncrementalRun) {
+        // A successful sliced attempt has already committed through
+        // record_units. Drop anything left by a widened or failed attempt, so
+        // provisional products cannot leak into a later policy attempt.
+        self.staged.borrow_mut().remove(&run.policy_id);
         self.runs.borrow_mut().push(run);
+    }
+
+    /// Keep one recomputed unit provisional until its policy succeeds.
+    pub(crate) fn stage_unit(&self, policy_id: PolicyId, unit: PolicyUnit) {
+        let mut staged = self.staged.borrow_mut();
+        let units = staged.entry(policy_id).or_default();
+        assert!(
+            units.insert(unit.key.clone(), unit).is_none(),
+            "one policy attempt cannot recompute the same unit key twice"
+        );
     }
 
     /// Record the units one policy's product was merged from.
@@ -1210,6 +1231,30 @@ impl<'a> PolicyIncrementalContext<'a> {
     /// evaluation names these as the work behind its findings and a partial
     /// list would name work that no policy did.
     pub fn record_units(&self, policy_id: PolicyId, keys: Vec<PolicyUnitKey>) {
+        let mut staged = self
+            .staged
+            .borrow_mut()
+            .remove(&policy_id)
+            .unwrap_or_default();
+        let mut seen = HashSet::with_capacity(keys.len());
+        let mut committed = Vec::with_capacity(staged.len());
+        for key in &keys {
+            assert!(
+                seen.insert(key),
+                "a complete unit-key set cannot contain duplicate keys"
+            );
+            if let Some(unit) = staged.remove(key) {
+                committed.push(unit);
+            }
+        }
+        assert!(
+            staged.is_empty(),
+            "every recomputed unit must be included in the complete unit-key set"
+        );
+        let mut store = self.store.borrow_mut();
+        for unit in committed {
+            store.publish(unit);
+        }
         self.units.borrow_mut().push((policy_id, keys));
     }
 

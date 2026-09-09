@@ -482,6 +482,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
             dependencies_resolved: resolved.len(),
+            informational_evidence: Vec::new(),
         },
         dependencies: resolved,
         complete: !diagnostics

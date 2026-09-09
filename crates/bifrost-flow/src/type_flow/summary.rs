@@ -62,9 +62,11 @@ use super::field_slots::FieldSlotIndexCache;
 use super::plan::ProcedureDispatchReadContract;
 use super::{FieldSlotIndex, TypeFlowPlan};
 
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v8";
+// Formal assignments now overwrite the port read by guards and later uses.
+// Persisted surfaces from before #3124 must not replay the old value target.
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v9";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
-const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v2";
+const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";
 const CLASS_SET_SUMMARY_ENTRY: &[u8] = b"bifrost-class-set-summary-entry-v3";
 const CLASS_SET_SUMMARY_LOOKUP: &[u8] = b"bifrost-class-set-summary-lookup-v3";
@@ -2374,8 +2376,12 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         let mut preparation_rejections = carrier_contracts
             .iter()
             .map(|(procedure, _)| {
-                (!procedure_call_contract_is_complete(plan, procedure))
-                    .then_some(SummaryProfileReason::PreparationCallContract)
+                if plan.procedure_requires_source_refinement(procedure) {
+                    Some(SummaryProfileReason::PreparationDependency)
+                } else {
+                    (!procedure_call_contract_is_complete(plan, procedure))
+                        .then_some(SummaryProfileReason::PreparationCallContract)
+                }
             })
             .collect::<Vec<_>>();
         let mut locally_complete = carrier_contracts
@@ -4671,7 +4677,7 @@ fn class_atom_fingerprint(atom: &ClassAtom) -> StableDigest {
         }
         ClassAtom::Unknown(reason) => {
             digest.push(b"unknown");
-            digest.push(reason.label().as_bytes());
+            digest.push(reason.to_string().as_bytes());
         }
     }
     digest.finish()
@@ -5559,6 +5565,21 @@ fn rebind_equal_output_dependency(
 }
 
 impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
+    fn root_summary_for(
+        &mut self,
+        root: &ProcedureHandle,
+        entry_fact: ValueFlowFact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<ValueFlowFact>>, ReusableSummaryError> {
+        debug_assert_eq!(entry_fact, ValueFlowFact::zero());
+        debug_assert!(self.pending_root_summary.is_none());
+        self.pending_root_summary = Some(PendingRootSummary {
+            source_behaviors: HashMap::default(),
+            admission: None,
+        });
+        self.summary_for(root, root, entry_fact, request)
+    }
+
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
@@ -5569,6 +5590,9 @@ impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
         if request.cancellation.is_cancelled() {
             return Err(SolverTermination::Cancelled.into());
         }
+        let root_probe = self.pending_root_summary.is_some()
+            && procedure == root
+            && entry_fact == ValueFlowFact::zero();
         if self.type_plan.is_summary_cut(procedure) {
             if entry_fact.is_terminal_meeting() {
                 // `ValueFlowClient::apply_point` kills a Meeting before it can
@@ -5643,16 +5667,9 @@ impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
                     }
                 },
             };
-            return self
-                .finish_validated_summary(procedure, root, entry_fact, validated, request, true);
-        }
-        let root_probe = procedure == root && entry_fact == ValueFlowFact::zero();
-        if root_probe {
-            debug_assert!(self.pending_root_summary.is_none());
-            self.pending_root_summary = Some(PendingRootSummary {
-                source_behaviors: HashMap::default(),
-                admission: None,
-            });
+            return self.finish_validated_summary(
+                procedure, entry_fact, validated, request, true, root_probe,
+            );
         }
         let Some(source_sensitive) = self
             .procedures
@@ -5727,7 +5744,7 @@ impl ReusableSummaryProvider<ValueFlowFact> for PreparedClassSetSummaries<'_> {
                     }
                 },
             };
-        self.finish_validated_summary(procedure, root, entry_fact, validated, request, false)
+        self.finish_validated_summary(procedure, entry_fact, validated, request, false, root_probe)
     }
 
     fn commit_root_summary(
@@ -5762,11 +5779,11 @@ impl PreparedClassSetSummaries<'_> {
     fn finish_validated_summary(
         &mut self,
         procedure: &ProcedureHandle,
-        root: &ProcedureHandle,
         entry_fact: ValueFlowFact,
         validated: ValidatedClassSetSummary,
         request: &mut DataflowRequest<'_>,
         mandatory: bool,
+        root_probe: bool,
     ) -> Result<Option<ReusableProcedureSummary<ValueFlowFact>>, ReusableSummaryError> {
         let runtime_key = class_set_runtime_lookup_key(&validated.summary.key);
         let used_summary = Arc::clone(&validated.summary);
@@ -5780,7 +5797,7 @@ impl PreparedClassSetSummaries<'_> {
         let Some(reusable) = reusable else {
             return Ok(None);
         };
-        if procedure == root && entry_fact == ValueFlowFact::zero() {
+        if root_probe {
             let pending = self
                 .pending_root_summary
                 .as_mut()
@@ -6093,6 +6110,21 @@ mod tests {
         WorkspaceValueFlowProvider, solve_value_flow_entry_with_reusable_summaries,
         solve_value_flow_with_reusable_summaries, solve_value_flow_with_summaries,
     };
+
+    #[test]
+    fn named_unknown_guard_payloads_have_distinct_atom_fingerprints() {
+        let first = ClassAtom::Unknown(UnknownReason::UnmodeledGuard {
+            class: "pkg.First".into(),
+        });
+        let second = ClassAtom::Unknown(UnknownReason::UnmodeledGuard {
+            class: "pkg.Second".into(),
+        });
+
+        assert_ne!(
+            class_atom_fingerprint(&first),
+            class_atom_fingerprint(&second)
+        );
+    }
 
     #[test]
     fn summary_profile_is_typed_serializable_and_saturating() {
@@ -7759,6 +7791,31 @@ mod tests {
 
         let state = TypeFlowSummaryState::default();
         let (plan, behavior) = runtime_plan(&workspace, &field_slots, &procedures["root"]);
+        let mut recursive_callee = PreparedClassSetSummaries::new(
+            TypeFlowSummaryState::default(),
+            &workspace,
+            &plan,
+            &field_slots,
+            behavior,
+        );
+        let cancellation = CancellationToken::default();
+        let mut callee_budget = SolverBudget::default();
+        assert!(
+            recursive_callee
+                .summary_for(
+                    &procedures["root"],
+                    &procedures["root"],
+                    ValueFlowFact::zero(),
+                    &mut DataflowRequest::new(&mut callee_budget, &cancellation),
+                )
+                .expect("a recursive root callee lookup completes")
+                .is_some()
+        );
+        assert!(
+            recursive_callee.pending_root_summary.is_none(),
+            "an ordinary recursive callee lookup must not open a root transaction"
+        );
+
         let mut prepared = PreparedClassSetSummaries::new(
             state.clone(),
             &workspace,
@@ -7769,12 +7826,10 @@ mod tests {
         prepared.take_retained_publication_writes();
         assert!(prepared.has_reusable_rows());
         assert!(prepared.source_behavior_cache.is_empty());
-        let cancellation = CancellationToken::default();
         let mut probe_budget = SolverBudget::default();
         assert!(
             prepared
-                .summary_for(
-                    &procedures["root"],
+                .root_summary_for(
                     &procedures["root"],
                     ValueFlowFact::zero(),
                     &mut DataflowRequest::new(&mut probe_budget, &cancellation),
@@ -7947,8 +8002,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let mut zero_budget = SolverBudget::new(SolverWork::uniform(0));
         let rejected = prepared
-            .summary_for(
-                &procedures["root"],
+            .root_summary_for(
                 &procedures["root"],
                 ValueFlowFact::zero(),
                 &mut DataflowRequest::new(&mut zero_budget, &cancellation),
@@ -10074,7 +10128,7 @@ mod tests {
                     let unknown = set
                         .unknown
                         .iter()
-                        .map(|reason| reason.label())
+                        .map(ToString::to_string)
                         .collect::<Vec<_>>();
                     (
                         Box::<str>::from(procedure_name(&set.site.procedure)),

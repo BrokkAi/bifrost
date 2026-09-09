@@ -27,18 +27,19 @@ use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
     AccessPathTail, AccessSelector, AllocationHandle, BackingStoreOffset, CallArgumentEndpoint,
     CallArgumentExpansion, CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding,
-    CallBindings, CallPassingMode, CandidateCoverage, CaptureSource, ControlEdgeKind,
-    DeclarationSegmentKind, DispatchCandidate, EvidenceCompleteness, EvidenceHandle,
-    FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector, MemoryLocationId,
-    MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
-    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, ProcedureCallBoundary, ProcedureHandle, ProcedureKind,
-    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator,
-    SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticValueKind, SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
-    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId,
-    ValueTransfer, assignment_transfer, gap_certifies_canonical_index_identity,
+    CallBindings, CallPassingMode, CallerReceiverBinding, CandidateCoverage, CaptureSource,
+    ControlEdgeKind, DeclarationSegmentKind, DispatchCandidate, EvidenceCompleteness,
+    EvidenceHandle, FormalMultiplicity, HeapOracle, ImplicitArgumentKind, IndexSelector,
+    MemoryLocationId, MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate,
+    OracleRelationArena, OracleRelationHandle, OracleRelationId, OracleRelationKind,
+    OracleRelationOwner, OracleRelationRecord, ProcedureCallBoundary, ProcedureHandle,
+    ProcedureKind, ProcedurePortHandle, ProcedurePortKind, ProcedureReceiverBinding,
+    ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticCapability,
+    SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
+    SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
+    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId, ValueTransfer,
+    assignment_transfer, gap_certifies_canonical_index_identity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1038,6 +1039,181 @@ pub fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGap) -> b
         || gap.impacts.contains(SemanticGapImpact::HeapWrite)
 }
 
+/// A value-scoped, read-only heap gap is irrelevant when that exact local
+/// identity and every identity-preserving alias are only written, never read
+/// or published. This keeps an append replacement's unmodeled copy of prior
+/// elements from poisoning the independently proven new-backing separation,
+/// while any later read, return, capture, or call still fails closed.
+fn unobserved_local_heap_read_gap_is_discharged(
+    procedure: &ProcedureHandle,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> bool {
+    if gap.impacts
+        != crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+        || gap.discharge != SemanticGapDischarge::ModeledEffectPartition
+    {
+        return false;
+    }
+    let SemanticGapSubject::Value(subject) = gap.subject else {
+        return false;
+    };
+
+    let mut aliases = HashSet::from([subject]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for point in procedure.semantics().points() {
+            for event in &point.events {
+                let alias = match event.effect {
+                    SemanticEffect::Assignment { target, value } => Some((value, target)),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+                        source,
+                        target,
+                    } => Some((source, target)),
+                    _ => None,
+                };
+                if let Some((source, target)) = alias
+                    && aliases.contains(&source)
+                    && aliases.insert(target)
+                {
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for point in procedure.semantics().points() {
+        for event in &point.events {
+            match &event.effect {
+                SemanticEffect::MemoryLoad { location, .. } => {
+                    if procedure
+                        .semantics()
+                        .memory_location(*location)
+                        .is_some_and(|row| aliases.iter().any(|value| row.kind.uses_value(*value)))
+                    {
+                        return false;
+                    }
+                }
+                SemanticEffect::MemoryStore { value, .. } if aliases.contains(value) => {
+                    return false;
+                }
+                SemanticEffect::CaptureBind { capture } => {
+                    let Some(row) = procedure.semantics().capture(*capture) else {
+                        return false;
+                    };
+                    let publishes = match row.captured {
+                        CaptureSource::Value(value) => aliases.contains(&value),
+                        CaptureSource::Location(location) => procedure
+                            .semantics()
+                            .memory_location(location)
+                            .is_some_and(|row| {
+                                aliases.iter().any(|value| row.kind.uses_value(*value))
+                            }),
+                    };
+                    if publishes {
+                        return false;
+                    }
+                }
+                SemanticEffect::Invoke { call_site } => {
+                    let Some(call) = procedure.semantics().call_site(*call_site) else {
+                        return false;
+                    };
+                    if aliases.contains(&call.callee)
+                        || call.receiver.is_some_and(|value| aliases.contains(&value))
+                        || call
+                            .arguments
+                            .iter()
+                            .any(|argument| aliases.contains(&argument.value))
+                    {
+                        return false;
+                    }
+                }
+                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value }
+                    if value.is_some_and(|value| aliases.contains(&value)) =>
+                {
+                    return false;
+                }
+                SemanticEffect::AsyncSuspend { awaited, .. }
+                    if awaited.is_some_and(|value| aliases.contains(&value)) =>
+                {
+                    return false;
+                }
+                SemanticEffect::CallableCreation { callable, .. }
+                | SemanticEffect::CallableReference { callable, .. }
+                    if callable
+                        .bound_receiver
+                        .is_some_and(|value| aliases.contains(&value)) =>
+                {
+                    return false;
+                }
+                SemanticEffect::ValueFlow { kind, source, .. }
+                    if aliases.contains(source)
+                        && !matches!(
+                            kind,
+                            ValueFlowKind::Local | ValueFlowKind::BackingStore { .. }
+                        ) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// Whether a local base is the exact result (or an identity-preserving local
+/// alias) of an operation whose remaining semantics are a modeled read-only
+/// partition. For Go today this identifies the fresh result of a proven
+/// reallocating append without treating arbitrary secondary slice bindings as
+/// canonical-index proofs.
+fn value_traces_to_modeled_read_partition(procedure: &ProcedureHandle, base: ValueId) -> bool {
+    let partitioned = procedure
+        .semantics()
+        .gaps()
+        .iter()
+        .filter_map(|gap| {
+            (gap.discharge == SemanticGapDischarge::ModeledEffectPartition
+                && gap.impacts
+                    == crate::analyzer::semantic::SemanticGapImpacts::single(
+                        SemanticGapImpact::HeapRead,
+                    ))
+            .then_some(gap.subject)
+        })
+        .filter_map(|subject| match subject {
+            SemanticGapSubject::Value(value) => Some(value),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut pending = vec![base];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if partitioned.contains(&current) {
+            return true;
+        }
+        for point in procedure.semantics().points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value } if target == current => {
+                        pending.push(value);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+                        source,
+                        target,
+                    } if target == current => pending.push(source),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Whether any point reachable through an exceptional or cleanup edge, before
 /// the exceptional exit, runs user code (an assignment, flow, memory access,
 /// allocation, capture, call, or valued throw).
@@ -1244,9 +1420,15 @@ fn location_value_reads(location: &MemoryLocationKind) -> usize {
 enum LoadOrigin {
     Unique(MemoryLocationId),
     Value(ValueId),
+    ProcedurePort(ProcedurePortKind),
     BackingStore {
         source: ValueId,
         offset: BackingStoreOffset,
+    },
+    BackingStoreAlternative {
+        source: ValueId,
+        offset: BackingStoreOffset,
+        allocation: crate::analyzer::semantic::AllocationId,
     },
     Ambiguous,
 }
@@ -1254,6 +1436,8 @@ enum LoadOrigin {
 #[derive(Debug)]
 enum AccessPathRootDraft {
     Value(ValueId),
+    ProcedurePort(ProcedurePortKind),
+    Allocation(crate::analyzer::semantic::AllocationId),
     Static(SemanticLocator),
     LexicalCell(MemoryLocationId),
     Capture(MemoryLocationId),
@@ -1369,6 +1553,84 @@ fn procedure_value_facts(
                         ..SemanticWork::default()
                     })?;
                     Some((target, LoadOrigin::BackingStore { source, offset }))
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::BackingStoreAlternative { offset, allocation },
+                    source,
+                    target,
+                } => {
+                    charge(SemanticWork {
+                        values: 2,
+                        allocations: 1,
+                        nested_entries: 2,
+                        ..SemanticWork::default()
+                    })?;
+                    Some((
+                        target,
+                        LoadOrigin::BackingStoreAlternative {
+                            source,
+                            offset,
+                            allocation,
+                        },
+                    ))
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Parameter,
+                    source,
+                    target,
+                } => {
+                    charge(SemanticWork {
+                        values: 2,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    let source_kind = semantics.value(source).map(|value| &value.kind);
+                    let target_kind = semantics.value(target).map(|value| &value.kind);
+                    match (source_kind, target_kind) {
+                        (Some(SemanticValueKind::Parameter { ordinal, .. }), _) => Some((
+                            target,
+                            LoadOrigin::ProcedurePort(ProcedurePortKind::Parameter {
+                                ordinal: *ordinal,
+                            }),
+                        )),
+                        (_, Some(SemanticValueKind::Parameter { ordinal, .. })) => Some((
+                            source,
+                            LoadOrigin::ProcedurePort(ProcedurePortKind::Parameter {
+                                ordinal: *ordinal,
+                            }),
+                        )),
+                        _ => None,
+                    }
+                }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Receiver,
+                    source,
+                    target,
+                } => {
+                    charge(SemanticWork {
+                        values: 2,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    let source_is_receiver = semantics.value(source).is_some_and(|value| {
+                        matches!(value.kind, SemanticValueKind::Receiver { .. })
+                    });
+                    let target_is_receiver = semantics.value(target).is_some_and(|value| {
+                        matches!(value.kind, SemanticValueKind::Receiver { .. })
+                    });
+                    if source_is_receiver {
+                        Some((
+                            target,
+                            LoadOrigin::ProcedurePort(ProcedurePortKind::Receiver),
+                        ))
+                    } else if target_is_receiver {
+                        Some((
+                            source,
+                            LoadOrigin::ProcedurePort(ProcedurePortKind::Receiver),
+                        ))
+                    } else {
+                        None
+                    }
                 }
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Transfer(_),
@@ -1545,6 +1807,19 @@ enum ValueOriginWalk {
         offset: Option<u128>,
         summarized: bool,
     },
+    /// The walk reached a formal parameter or receiver. Formal roots retain
+    /// the durable procedure-port identity instead of becoming procedure-local
+    /// temporary values.
+    Port {
+        kind: ProcedurePortKind,
+        offset: Option<u128>,
+        summarized: bool,
+    },
+    Allocation {
+        allocation: crate::analyzer::semantic::AllocationId,
+        offset: Option<u128>,
+        summarized: bool,
+    },
     /// The walk reached a value a memory load defines. `value` is that value,
     /// so a caller that declines to follow the load still names a root.
     Load {
@@ -1552,6 +1827,12 @@ enum ValueOriginWalk {
         value: ValueId,
         offset: Option<u128>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AlternativeChoice {
+    Source,
+    Allocation,
 }
 
 /// Walk one value back through the unconditional copies that define it.
@@ -1566,6 +1847,8 @@ fn walk_value_origin(
     start: ValueId,
     visited: &mut HashSet<ValueId>,
     exact_integer: impl Fn(ValueId) -> Option<u128>,
+    choices: &[AlternativeChoice],
+    choice_index: &mut usize,
 ) -> ValueOriginWalk {
     let mut current = start;
     let mut offset = Some(0_u128);
@@ -1585,6 +1868,48 @@ fn walk_value_origin(
                     .zip(step)
                     .and_then(|(offset, step)| offset.checked_add(step));
                 current = *source;
+            }
+            Some(LoadOrigin::ProcedurePort(kind)) => {
+                return ValueOriginWalk::Port {
+                    kind: *kind,
+                    offset,
+                    summarized: false,
+                };
+            }
+            Some(LoadOrigin::BackingStoreAlternative {
+                source,
+                offset: step,
+                allocation,
+            }) => {
+                let choice = choices.get(*choice_index).copied();
+                *choice_index = (*choice_index).saturating_add(1);
+                match choice {
+                    Some(AlternativeChoice::Source) => {
+                        let step = match step {
+                            BackingStoreOffset::Zero => Some(0),
+                            BackingStoreOffset::Constant(step) => Some(*step),
+                            BackingStoreOffset::Value(value) => exact_integer(*value),
+                        };
+                        offset = offset
+                            .zip(step)
+                            .and_then(|(offset, step)| offset.checked_add(step));
+                        current = *source;
+                    }
+                    Some(AlternativeChoice::Allocation) => {
+                        return ValueOriginWalk::Allocation {
+                            allocation: *allocation,
+                            offset,
+                            summarized: false,
+                        };
+                    }
+                    None => {
+                        return ValueOriginWalk::Root {
+                            value: current,
+                            offset,
+                            summarized: true,
+                        };
+                    }
+                }
             }
             Some(LoadOrigin::Unique(location)) => {
                 return ValueOriginWalk::Load {
@@ -1620,11 +1945,46 @@ fn resolve_access_path<'location>(
     cancellation: &crate::CancellationToken,
     location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
     exact_integer: impl Fn(ValueId) -> Option<u128> + Copy,
+    charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
+) -> Result<AccessPathResolution, SemanticProviderError> {
+    resolve_access_path_with_choice(
+        location,
+        AccessPathResolutionInputs {
+            load_origins,
+            selector_limit,
+            cancellation,
+            choices: &[],
+        },
+        location_kind,
+        exact_integer,
+        charge,
+    )
+}
+
+struct AccessPathResolutionInputs<'input> {
+    load_origins: &'input HashMap<ValueId, LoadOrigin>,
+    selector_limit: usize,
+    cancellation: &'input crate::CancellationToken,
+    choices: &'input [AlternativeChoice],
+}
+
+fn resolve_access_path_with_choice<'location>(
+    location: MemoryLocationId,
+    inputs: AccessPathResolutionInputs<'_>,
+    location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
+    exact_integer: impl Fn(ValueId) -> Option<u128> + Copy,
     mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
 ) -> Result<AccessPathResolution, SemanticProviderError> {
+    let AccessPathResolutionInputs {
+        load_origins,
+        selector_limit,
+        cancellation,
+        choices,
+    } = inputs;
     let mut current = location;
     let mut visited = HashSet::new();
     let mut visited_values = HashSet::new();
+    let mut choice_index = 0usize;
     let mut selectors = VecDeque::new();
     let mut summarized = false;
 
@@ -1690,7 +2050,14 @@ fn resolve_access_path<'location>(
             }
         };
 
-        match walk_value_origin(load_origins, base, &mut visited_values, exact_integer) {
+        match walk_value_origin(
+            load_origins,
+            base,
+            &mut visited_values,
+            exact_integer,
+            choices,
+            &mut choice_index,
+        ) {
             ValueOriginWalk::Root {
                 value,
                 offset,
@@ -1698,6 +2065,22 @@ fn resolve_access_path<'location>(
             } => {
                 summarized |= joined || !apply_backing_offset(&mut selectors, offset);
                 break AccessPathRootDraft::Value(value);
+            }
+            ValueOriginWalk::Port {
+                kind,
+                offset,
+                summarized: joined,
+            } => {
+                summarized |= joined || !apply_backing_offset(&mut selectors, offset);
+                break AccessPathRootDraft::ProcedurePort(kind);
+            }
+            ValueOriginWalk::Allocation {
+                allocation,
+                offset,
+                summarized: joined,
+            } => {
+                summarized |= joined || !apply_backing_offset(&mut selectors, offset);
+                break AccessPathRootDraft::Allocation(allocation);
             }
             ValueOriginWalk::Load {
                 location,
@@ -1748,6 +2131,83 @@ fn apply_backing_offset(
     };
     *index = translated;
     true
+}
+
+/// Enumerate the finite alternative choices reachable from a memory location.
+/// The worklist keeps nested alternatives distinct: an outer retained arm can
+/// still encounter an inner fresh arm. The returned boolean records a breadth
+/// truncation without hiding the candidates already retained.
+fn alternative_choice_plans<'location>(
+    location: MemoryLocationId,
+    load_origins: &HashMap<ValueId, LoadOrigin>,
+    location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
+    limit: usize,
+) -> (Vec<Vec<AlternativeChoice>>, bool) {
+    enum Pending {
+        Location(MemoryLocationId, Vec<AlternativeChoice>),
+        Value(ValueId, Vec<AlternativeChoice>),
+    }
+    let limit = limit.max(2);
+    let mut pending = vec![Pending::Location(location, Vec::new())];
+    let mut seen = HashSet::new();
+    let mut plans = Vec::new();
+    let mut truncated = false;
+    while let Some(state) = pending.pop() {
+        let (tag, id, choices) = match &state {
+            Pending::Location(location, choices) => (0_u8, location.index(), choices),
+            Pending::Value(value, choices) => (1_u8, value.index(), choices),
+        };
+        if !seen.insert((tag, id, choices.len())) {
+            continue;
+        }
+        match state {
+            Pending::Location(current, choices) => {
+                let Some(kind) = location_kind(current) else {
+                    plans.push(choices);
+                    continue;
+                };
+                let Some(base) = (match kind {
+                    MemoryLocationKind::Field { base, .. }
+                    | MemoryLocationKind::Index { base, .. } => Some(*base),
+                    MemoryLocationKind::Static { .. }
+                    | MemoryLocationKind::LexicalCell { .. }
+                    | MemoryLocationKind::Capture { .. } => None,
+                }) else {
+                    plans.push(choices);
+                    continue;
+                };
+                pending.push(Pending::Value(base, choices));
+            }
+            Pending::Value(value, choices) => match load_origins.get(&value) {
+                Some(LoadOrigin::Value(next))
+                | Some(LoadOrigin::BackingStore { source: next, .. }) => {
+                    pending.push(Pending::Value(*next, choices));
+                }
+                Some(LoadOrigin::Unique(next)) => {
+                    pending.push(Pending::Location(*next, choices));
+                }
+                Some(LoadOrigin::BackingStoreAlternative { source, .. }) => {
+                    let mut source_choices = choices.clone();
+                    source_choices.push(AlternativeChoice::Source);
+                    pending.push(Pending::Value(*source, source_choices));
+                    let mut allocation_choices = choices;
+                    allocation_choices.push(AlternativeChoice::Allocation);
+                    plans.push(allocation_choices);
+                }
+                Some(LoadOrigin::ProcedurePort(_)) | Some(LoadOrigin::Ambiguous) | None => {
+                    plans.push(choices);
+                }
+            },
+        }
+        if plans.len() >= limit {
+            truncated = !pending.is_empty();
+            break;
+        }
+    }
+    if plans.is_empty() {
+        plans.push(Vec::new());
+    }
+    (plans, truncated)
 }
 
 /// Whether a bounded location names a non-constant exact index selector.
@@ -2030,6 +2490,23 @@ fn materialize_abstract_location(
                 AccessPathRoot::Value(value),
             )
         }
+        AccessPathRootDraft::ProcedurePort(kind) => {
+            let port = ProcedurePortHandle::new(procedure.clone(), kind)
+                .map_err(|error| internal_contract("invalid procedure port root", error))?;
+            (
+                AbstractObjectIdentity::ProcedurePort(port.clone()),
+                AccessPathRoot::ProcedurePort(port),
+            )
+        }
+        AccessPathRootDraft::Allocation(allocation) => {
+            let allocation = procedure.allocation_handle(allocation).ok_or_else(|| {
+                SemanticProviderError::internal("alternative allocation root is stale")
+            })?;
+            (
+                AbstractObjectIdentity::Allocation(allocation.clone()),
+                AccessPathRoot::Allocation(allocation),
+            )
+        }
         AccessPathRootDraft::Static(member) => {
             let member = ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member)
                 .map_err(|error| internal_contract("invalid static locator", error))?;
@@ -2119,6 +2596,96 @@ fn allocation_location(
         .map_err(|error| internal_contract("invalid allocation path", error))?;
     AbstractLocation::new(object, path)
         .map_err(|error| internal_contract("invalid allocation location", error))
+}
+
+/// Materialize the source-backed arm of a bounded backing-store alternative.
+/// The source value is first canonicalized through local copies and formal
+/// origins. The alternative event itself names the complete source backing;
+/// its offset is composed only when a downstream access path is resolved.
+/// Dynamic or joined existing offsets retain a summary tail so the candidate
+/// remains a useful may-path without becoming an exact separation claim.
+fn backing_store_alternative_location(
+    procedure: &ProcedureHandle,
+    source: ValueId,
+    offset: BackingStoreOffset,
+    load_origins: &HashMap<ValueId, LoadOrigin>,
+    exact_integer: impl Fn(ValueId) -> Option<u128>,
+    limits: crate::analyzer::semantic::OracleLimits,
+) -> Result<(AbstractLocation, bool), SemanticProviderError> {
+    let mut visited = HashSet::new();
+    let mut choice_index = 0usize;
+    let origin = walk_value_origin(
+        load_origins,
+        source,
+        &mut visited,
+        exact_integer,
+        &[],
+        &mut choice_index,
+    );
+    let (root, prior_offset, mut summarized) = match origin {
+        ValueOriginWalk::Root {
+            value,
+            offset,
+            summarized,
+        } => (AccessPathRootDraft::Value(value), offset, summarized),
+        ValueOriginWalk::Port {
+            kind,
+            offset,
+            summarized,
+        } => (AccessPathRootDraft::ProcedurePort(kind), offset, summarized),
+        ValueOriginWalk::Allocation {
+            allocation,
+            offset,
+            summarized,
+        } => (
+            AccessPathRootDraft::Allocation(allocation),
+            offset,
+            summarized,
+        ),
+        ValueOriginWalk::Load { value, offset, .. } => {
+            (AccessPathRootDraft::Value(value), offset, true)
+        }
+    };
+
+    let mut selectors = Vec::new();
+    // The alternative event maps the complete source backing. Its own offset
+    // is applied only when a downstream access path composes with this value;
+    // an index here would incorrectly narrow the alternative relation itself.
+    let _ = offset;
+    match prior_offset {
+        Some(prior) => {
+            if prior != 0 {
+                selectors.push(AccessSelectorDraft::Index {
+                    value: None,
+                    constant: Some(prior),
+                    identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                });
+            }
+        }
+        None => append_any_selector(&mut selectors, &mut summarized),
+    }
+    materialize_abstract_location(
+        procedure,
+        AccessPathDraft {
+            root,
+            selectors,
+            tail: if summarized {
+                AccessPathTail::Summary
+            } else {
+                AccessPathTail::Exact
+            },
+        },
+        limits,
+    )
+}
+
+fn append_any_selector(selectors: &mut Vec<AccessSelectorDraft>, summarized: &mut bool) {
+    selectors.push(AccessSelectorDraft::Index {
+        value: None,
+        constant: None,
+        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+    });
+    *summarized = true;
 }
 
 fn push_flow_relation(
@@ -2552,8 +3119,10 @@ impl WorkspaceSemanticOracle<'_> {
         else {
             return Ok(false);
         };
-        if !bases.is_locally_allocated(*base)
-            || !bases.canonical_base_has_no_secondary_binding_owner(*base)
+        let modeled_read_partition = value_traces_to_modeled_read_partition(procedure, *base);
+        if !modeled_read_partition
+            && (!bases.is_locally_allocated(*base)
+                || !bases.canonical_base_has_no_secondary_binding_owner(*base))
         {
             return Ok(false);
         }
@@ -2864,6 +3433,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
                     && !constructor_call_gap_is_discharged(procedure.semantics(), gap)
                     && !canonical_index_identity_discharged
+                    && !unobserved_local_heap_read_gap_is_discharged(procedure, gap)
                     && !implicit_abort_gap_is_discharged(gap, abort_user_code)
                     && !super::external_constant_field_read_discharges_gap(
                         gap,
@@ -2965,6 +3535,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 }
 
                 let mut access_path = None;
+                let mut alternative_access_paths = Vec::new();
+                let mut alternative_paths_truncated = false;
                 let relation_work = match &event.effect {
                     SemanticEffect::Assignment { .. } | SemanticEffect::ValueFlow { .. } => {
                         Some(SemanticWork {
@@ -2983,26 +3555,73 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     }),
                     SemanticEffect::MemoryLoad { location, .. }
                     | SemanticEffect::MemoryStore { location, .. } => {
-                        let resolved = match resolve_access_path(
+                        let (plans, plans_truncated) = alternative_choice_plans(
                             *location,
                             &load_origins,
-                            self.limits().access_path_length(),
-                            request.cancellation,
                             |id| {
                                 procedure
                                     .semantics()
                                     .memory_location(id)
                                     .map(|row| &row.kind)
                             },
-                            exact_integer,
-                            |work| staged.charge(work),
-                        )? {
-                            AccessPathResolution::Resolved(resolved) => resolved,
-                            AccessPathResolution::Interrupted(stop) => {
-                                interrupted = Some(stop);
-                                break 'points;
+                            self.limits().provenance_records(),
+                        );
+                        let has_alternative = plans.iter().any(|plan| !plan.is_empty());
+                        alternative_paths_truncated = plans_truncated;
+                        let mut paths = Vec::new();
+                        if has_alternative {
+                            for plan in plans {
+                                match resolve_access_path_with_choice(
+                                    *location,
+                                    AccessPathResolutionInputs {
+                                        load_origins: &load_origins,
+                                        selector_limit: self.limits().access_path_length(),
+                                        cancellation: request.cancellation,
+                                        choices: &plan,
+                                    },
+                                    |id| {
+                                        procedure
+                                            .semantics()
+                                            .memory_location(id)
+                                            .map(|row| &row.kind)
+                                    },
+                                    exact_integer,
+                                    |work| staged.charge(work),
+                                )? {
+                                    AccessPathResolution::Resolved(resolved) => {
+                                        paths.push(resolved)
+                                    }
+                                    AccessPathResolution::Interrupted(stop) => {
+                                        interrupted = Some(stop);
+                                        break 'points;
+                                    }
+                                }
                             }
-                        };
+                        }
+                        if !has_alternative {
+                            match resolve_access_path(
+                                *location,
+                                &load_origins,
+                                self.limits().access_path_length(),
+                                request.cancellation,
+                                |id| {
+                                    procedure
+                                        .semantics()
+                                        .memory_location(id)
+                                        .map(|row| &row.kind)
+                                },
+                                exact_integer,
+                                |work| staged.charge(work),
+                            )? {
+                                AccessPathResolution::Resolved(resolved) => paths.push(resolved),
+                                AccessPathResolution::Interrupted(stop) => {
+                                    interrupted = Some(stop);
+                                    break 'points;
+                                }
+                            }
+                        }
+                        let resolved = paths.remove(0);
+                        alternative_access_paths = paths;
                         let work = SemanticWork {
                             values: 1,
                             evidence: 1,
@@ -3093,9 +3712,40 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     interrupted = Some(stop);
                     break 'points;
                 }
+                if matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative { .. },
+                        ..
+                    }
+                ) && let Err(stop) = staged.charge(SemanticWork {
+                    values: 2,
+                    allocations: 1,
+                    nested_entries: 2,
+                    ..SemanticWork::default()
+                }) {
+                    interrupted = Some(stop);
+                    break 'points;
+                }
 
                 let evidence = evidence_handle(procedure, event.evidence)?;
+                let alternative_relation = matches!(
+                    &event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative { .. },
+                        ..
+                    }
+                );
                 let (proof, mut completeness) = evidence_quality(std::slice::from_ref(&evidence));
+                if alternative_relation
+                    || !alternative_access_paths.is_empty()
+                    || alternative_paths_truncated
+                {
+                    completeness = EvidenceCompleteness::Partial(
+                        "backing-store alternative retains both access-path candidates".into(),
+                    );
+                    open = true;
+                }
                 let mut exact_index = false;
                 /// One relation derived from the event being projected, rather
                 /// than from the event's own endpoints.
@@ -3120,10 +3770,51 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 let (kind, source, target, summary) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => (
                         ValueFlowRelationKind::Assignment,
-                        ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
-                        ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *value)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
                         false,
                     ),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStoreAlternative { offset, allocation },
+                        source,
+                        target,
+                    } => {
+                        let (source_location, source_summary) = backing_store_alternative_location(
+                            procedure,
+                            *source,
+                            *offset,
+                            &load_origins,
+                            exact_integer,
+                            *self.limits(),
+                        )?;
+                        let allocation =
+                            procedure.allocation_handle(*allocation).ok_or_else(|| {
+                                SemanticProviderError::internal(
+                                    "backing-store alternative allocation is stale",
+                                )
+                            })?;
+                        let allocation_location = allocation_location(allocation, *self.limits())?;
+                        let target = ValueFlowEndpoint::Value(value_handle(procedure, *target)?);
+                        smashed.push(DerivedRelation {
+                            kind: ValueFlowRelationKind::Assignment,
+                            source: ValueFlowEndpoint::Location(Box::new(allocation_location)),
+                            target: target.clone(),
+                            quality: Some((
+                                ProofStatus::Unproven(
+                                    "backing-store alternative has two runtime candidates".into(),
+                                ),
+                                EvidenceCompleteness::Partial(
+                                    "backing-store alternative retains both candidates".into(),
+                                ),
+                            )),
+                        });
+                        (
+                            ValueFlowRelationKind::Assignment,
+                            ValueFlowEndpoint::Location(Box::new(source_location)),
+                            target,
+                            source_summary,
+                        )
+                    }
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Local,
                         source,
@@ -3140,63 +3831,28 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         target,
                     } => (
                         ValueFlowRelationKind::Assignment,
-                        ValueFlowEndpoint::Value(value_handle(procedure, *source)?),
-                        ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *source)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
                         false,
                     ),
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Parameter,
                         source,
                         target,
-                    } => {
-                        let source_row = procedure.semantics().value(*source).ok_or_else(|| {
-                            SemanticProviderError::internal("parameter flow has a stale source")
-                        })?;
-                        let target_row = procedure.semantics().value(*target).ok_or_else(|| {
-                            SemanticProviderError::internal("parameter flow has a stale target")
-                        })?;
-                        match (&source_row.kind, &target_row.kind) {
-                            (SemanticValueKind::Parameter { ordinal, .. }, _) => (
-                                ValueFlowRelationKind::Parameter,
-                                ValueFlowEndpoint::Port(
-                                    ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
-                                        .map_err(|error| {
-                                            internal_contract("invalid parameter port", error)
-                                        })?,
-                                ),
-                                ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
-                                false,
-                            ),
-                            (_, SemanticValueKind::Parameter { ordinal, .. }) => (
-                                ValueFlowRelationKind::Parameter,
-                                ValueFlowEndpoint::Value(value_handle(procedure, *source)?),
-                                ValueFlowEndpoint::Port(
-                                    ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
-                                        .map_err(|error| {
-                                            internal_contract("invalid parameter port", error)
-                                        })?,
-                                ),
-                                false,
-                            ),
-                            _ => {
-                                return Err(SemanticProviderError::internal(
-                                    "parameter flow has no parameter endpoint",
-                                ));
-                            }
-                        }
-                    }
+                    } => (
+                        ValueFlowRelationKind::Parameter,
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *source)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
+                        false,
+                    ),
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Receiver,
+                        source,
                         target,
-                        ..
                     } => (
                         ValueFlowRelationKind::Receiver,
-                        ValueFlowEndpoint::Port(
-                            ProcedurePortHandle::receiver(procedure.clone()).map_err(|error| {
-                                internal_contract("invalid receiver port", error)
-                            })?,
-                        ),
-                        ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *source)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
                         false,
                     ),
                     SemanticEffect::ValueFlow {
@@ -3270,7 +3926,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory loads resolve an access path"),
                             *self.limits(),
                         )?;
-                        let unproven_index = location_has_unproven_exact_index(&location);
+                        let unproven_index =
+                            summary || location_has_unproven_exact_index(&location);
                         exact_index |= unproven_index;
                         let loaded = ValueFlowEndpoint::Value(value_handle(procedure, *result)?);
                         // #2453: an element read of a tainted array carries the
@@ -3312,6 +3969,19 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 quality: None,
                             });
                         }
+                        for alternative in alternative_access_paths.drain(..) {
+                            let (alternative, _) = materialize_abstract_location(
+                                procedure,
+                                alternative,
+                                *self.limits(),
+                            )?;
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                source: ValueFlowEndpoint::Location(Box::new(alternative)),
+                                target: loaded.clone(),
+                                quality: None,
+                            });
+                        }
                         let source = direct_capture_port_endpoint(procedure, *memory)?
                             .unwrap_or_else(|| ValueFlowEndpoint::Location(Box::new(location)));
                         (ValueFlowRelationKind::MemoryLoad, source, loaded, summary)
@@ -3328,7 +3998,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory stores resolve an access path"),
                             *self.limits(),
                         )?;
-                        let unproven_index = location_has_unproven_exact_index(&location);
+                        let unproven_index =
+                            summary || location_has_unproven_exact_index(&location);
                         exact_index |= unproven_index;
                         let stored = ValueFlowEndpoint::Value(value_handle(procedure, *value)?);
                         // #2453, the write direction. Every element store also
@@ -3355,6 +4026,19 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 kind: ValueFlowRelationKind::MemoryStore,
                                 source: stored.clone(),
                                 target: container,
+                                quality: None,
+                            });
+                        }
+                        for alternative in alternative_access_paths.drain(..) {
+                            let (alternative, _) = materialize_abstract_location(
+                                procedure,
+                                alternative,
+                                *self.limits(),
+                            )?;
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                source: stored.clone(),
+                                target: ValueFlowEndpoint::Location(Box::new(alternative)),
                                 quality: None,
                             });
                         }
@@ -3575,6 +4259,10 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         break 'points;
                     }
                 }
+                if alternative_paths_truncated {
+                    truncated = true;
+                    break 'points;
+                }
             }
         }
 
@@ -3592,11 +4280,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     break;
                 }
                 let mut visited_values = HashSet::new();
+                let mut choice_index = 0usize;
                 let (root, prefix, summarized) = match walk_value_origin(
                     &load_origins,
                     read.value,
                     &mut visited_values,
                     exact_integer,
+                    &[],
+                    &mut choice_index,
                 ) {
                     ValueOriginWalk::Root {
                         value,
@@ -3604,6 +4295,34 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         summarized,
                     } => (
                         AccessPathRoot::Value(value_handle(procedure, value)?),
+                        Vec::new(),
+                        summarized || offset != Some(0),
+                    ),
+                    ValueOriginWalk::Port {
+                        kind,
+                        offset,
+                        summarized,
+                    } => (
+                        AccessPathRoot::ProcedurePort(
+                            ProcedurePortHandle::new(procedure.clone(), kind).map_err(|error| {
+                                internal_contract("invalid formal procedure port", error)
+                            })?,
+                        ),
+                        Vec::new(),
+                        summarized || offset != Some(0),
+                    ),
+                    ValueOriginWalk::Allocation {
+                        allocation,
+                        offset,
+                        summarized,
+                    } => (
+                        AccessPathRoot::Allocation(
+                            procedure.allocation_handle(allocation).ok_or_else(|| {
+                                SemanticProviderError::internal(
+                                    "alternative allocation root is stale",
+                                )
+                            })?,
+                        ),
                         Vec::new(),
                         summarized || offset != Some(0),
                     ),
@@ -3867,9 +4586,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 interrupted = Some(stop);
                 break;
             }
+            // Internal callee value-flow gaps belong to the callee snapshot,
+            // not to the actual/formal binding partition. Only evaluation and
+            // return-transfer gaps can weaken the binding itself.
             let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-                || gap.impacts.contains(SemanticGapImpact::ValueFlow))
+                || gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
                 && call_target_refinement_call(callee.semantics(), gap).is_none()
                 && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code)
                 && !super::external_constant_field_read_discharges_gap(
@@ -3947,16 +4668,24 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             .collect::<Vec<_>>();
         formals.sort_by_key(|(ordinal, _, _, _, _)| *ordinal);
 
+        let caller_receiver_binding = call
+            .procedure()
+            .semantics()
+            .proven_caller_receiver_binding(call.id());
+        let mut receiver_needs_actual = caller_receiver_binding
+            .is_some_and(|binding| binding.passes_receiver_as_argument(callee.semantics()));
+        let receiver_formal = callee
+            .semantics()
+            .values()
+            .iter()
+            .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }));
         let mut bound_formals = std::collections::HashSet::new();
         if interrupted.is_none()
-            && let Some(receiver_row) = callee
-                .semantics()
-                .values()
-                .iter()
-                .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
+            && !receiver_needs_actual
+            && let Some(receiver_row) = receiver_formal
         {
             // A call that spells no receiver operand can still dispatch on
-            // one, two different ways.
+            // an implicit value or a type qualifier.
             //
             // The first is a constructor call: `new Type(...)` spells no
             // receiver syntax at all (there is no existing object to invoke
@@ -3973,9 +4702,15 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             // implicit actual only when the sibling identity is
             // structurally proven; otherwise the missing operand keeps the
             // binding honestly open.
-            let (actual, extra_evidence) = match call_row.receiver {
-                Some(actual_id) => (Some(actual_id), None),
-                None => {
+            let (actual, extra_evidence) = match (call_row.receiver, caller_receiver_binding) {
+                (Some(actual_id), _) => (Some(actual_id), None),
+                (None, Some(CallerReceiverBinding::TypeQualified(qualifier)))
+                    if callee.semantics().properties().receiver_binding
+                        == ProcedureReceiverBinding::Class =>
+                {
+                    (Some(qualifier), None)
+                }
+                (None, _) => {
                     match constructor_call_allocation_site(call.procedure().semantics(), &call_row)
                     {
                         Some(allocation) => (
@@ -4065,7 +4800,21 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 break;
             }
             let actual = value_handle(call.procedure(), argument.value)?;
-            let selected = match &argument.expansion {
+            let explicit_receiver = receiver_needs_actual
+                && !positional_width_unknown
+                && matches!(
+                    argument.expansion,
+                    CallArgumentExpansion::Direct(
+                        crate::analyzer::semantic::ArgumentDomain::Positional
+                            | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword
+                    )
+                );
+            let selected = if explicit_receiver {
+                receiver_needs_actual = false;
+                let receiver = receiver_formal.expect("an unbound method has a receiver formal");
+                Some((None, &receiver.evidence, false, CallArgumentMember::Whole))
+            } else {
+                (match &argument.expansion {
                 CallArgumentExpansion::Direct(
                     crate::analyzer::semantic::ArgumentDomain::Positional
                     | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
@@ -4171,6 +4920,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     crate::analyzer::semantic::ArgumentDomain::Positional
                     | crate::analyzer::semantic::ArgumentDomain::PositionalOrKeyword,
                 ) => None,
+            }).map(|(ordinal, evidence, rest, member)| (Some(ordinal), evidence, rest, member))
             };
             let closure_evidence = vec![call_evidence.clone()];
             let mut relation_evidence = vec![closure_evidence.clone()];
@@ -4181,18 +4931,21 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 ]);
                 relation_evidence.push(mapping_evidence.clone());
                 let (proof, completeness) = evidence_quality(&mapping_evidence);
-                if !rest {
+                if !rest && let Some(ordinal) = ordinal {
                     bound_formals.insert(ordinal);
                 }
+                let formal = match ordinal {
+                    Some(ordinal) => ProcedurePortHandle::parameter(callee.clone(), ordinal),
+                    None => ProcedurePortHandle::receiver(callee.clone()),
+                }
+                .map_err(|error| internal_contract("invalid callee argument port", error))?;
                 Some((
                     mapping_evidence,
                     CallArgumentMapping::new(
                         source_index as u32,
                         member,
                         CallArgumentEndpoint::Value(actual),
-                        ProcedurePortHandle::parameter(callee.clone(), ordinal).map_err(
-                            |error| internal_contract("invalid callee parameter port", error),
-                        )?,
+                        formal,
                         CallPassingMode::Value,
                     ),
                     proof,
@@ -4234,6 +4987,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 mapping,
                 coverage: group_coverage,
             });
+        }
+
+        if receiver_needs_actual {
+            build.open = true;
+            argument_binding_uncertain = true;
         }
 
         // A default is a saved callee-owned value, not a call expression to

@@ -14,6 +14,7 @@ mod clones;
 mod default_arguments;
 pub(crate) mod diagnostics;
 pub mod external;
+mod guard_summary;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;

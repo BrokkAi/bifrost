@@ -166,11 +166,63 @@ Python member absence needs more than a declaration lookup: another procedure
 can install an instance attribute. The class-set engine consults the cached
 workspace store survey before accepting declaration-only absence. Attributed
 writes are keyed by class and member; writes with an unknown receiver keep the
-named member open. An unknown attribute name or an incomplete survey keeps the
-relevant surface open. Member guards such as `hasattr` consult that same survey
+named member open. For an unknown attribute name, a preliminary class-flow survey retains the
+receiver and mutation site. It composes caller bindings with ordered local
+writes, then opens only the possible receiver classes. Declared receiver bounds
+include known subclasses; unbound entry parameters contribute only the classes
+supplied by workspace callers. An unbounded receiver or an incomplete survey
+keeps the surface open with an explicit reason naming the mutation site.
+The preliminary survey does not use member absence to exclude classes. It
+repeats as affected field slots open until the effects stabilize, within shared
+semantic and solver budgets. Member guards such as `hasattr` consult that same survey
 before excluding a receiver class. A possible store does not invent a callable declaration
-or an exhaustive dispatch target. The survey shares the field-slot index's
-validity, bounded persistence, and replay accounting.
+or an exhaustive dispatch target. The syntactic survey shares the field-slot index's validity, bounded persistence,
+and replay accounting. Surveys requiring dynamic receiver propagation remain
+request-local; their additional solver work is not covered by artifact-only
+persistent replay.
+
+Class sets follow ordered binding writes, including writes to parameters,
+receivers, loop targets, and unpacking targets. A guard on a saved read can
+constrain the current binding only while that read still names its current
+value. For ordinary receiver fields, a procedure-local analysis tracks stores
+and guards across control-flow joins. Calls and potentially effectful lookups
+invalidate those field constraints; they retain explicit uncertainty.
+
+Boolean flags can also preserve a local relationship between branch-specific
+assignments. The engine excludes a class on a flag's guard edge only when every
+reaching definition carrying that class has the opposite boolean value. These
+bounded refinements use preliminary value-flow evidence and repeat when one
+field store depends on another refined load. Preliminary or exhausted results
+cannot publish complete summaries. Procedures whose refinements depend on that
+evidence retain their bodies instead of publishing reusable body cuts.
+
+An `isinstance` guard whose class or instance relation cannot be modeled adds
+an explicit `unmodeled_guard:<class>` remainder when an undecidable candidate
+reaches the predicate's true edge.
+Incoming classes remain useful positive evidence, but the remainder prevents
+an absent-member proof on that path. The false edge retains its previous
+evidence. Negation and short-circuit expressions use the predicate's structured
+edge mapping, so the remainder follows the arm conditioned on the unmodeled
+check. The temporary remainder on the guarded binding ends when control
+reaches the false arm or the branches rejoin; assignments can replace it
+earlier. Class-set rows and explanations retain the named reason, separately
+from dynamic-attribute uncertainty. Policy candidate explanations can replay
+the corresponding class-set projection within their query budget to show
+these reasons without changing the policy verdict.
+
+Python also derives member-guard summaries from ordinary workspace module
+functions called by an unqualified name, including explicit from-imports,
+with one parameter, local assignments, and one final return. The body must use
+supported, unshadowed builtins and structural boolean expressions: `hasattr`,
+`getattr` with a literal member and `None` default, `callable` on the retrieved
+value, and class-object checks. Unknown calls, side effects, rebinding, and
+ambiguous callable identities prevent summarization. A missing member can
+disprove the helper's true arm; a declared member alone does not prove that its
+value is callable. Class-object checks remain unknown when the class domain
+cannot decide them, preserving both outcomes. These summaries are derived
+from current indexed syntax during plan construction. Their edge removals
+participate in the existing reusable solver identity; no separate guard-summary
+table is persisted.
 
 Each client keeps separate plans and result types. A taint class, protocol
 state, and inferred class identity retain distinct types. Language-specific
