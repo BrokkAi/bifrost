@@ -8,11 +8,11 @@
     "minimumBinaryVersion": "0.11.0",
     "allowPrerelease": false,
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "c1bfbf19a2b30cc38c47bbf3a33c6520148cb206e83dae2aa773dc681525d717",
-      "aarch64-unknown-linux-gnu": "f8ec63c83d3573a0e2e21f3154aa823097763bb193cfd59037917f4461fafedb",
-      "universal-apple-darwin": "b76fe92859798deb684f38cb454b3acec735b6b6cce91cec714c4a24a345c472",
-      "x86_64-pc-windows-msvc": "ed7a53843adb7da5152f409ec01ca65f0dab89d580aa979fd4e5b806a9f8c9c8",
-      "x86_64-unknown-linux-gnu": "b23e49ef5ed9affd92c077e28fdb6f1222f574dafc4588312148b4aee85537e2"
+      "aarch64-pc-windows-msvc": "9f7cd8e607cb5d8f97db2f4eda27298682b20233fc9ea5e44af68366fff25c80",
+      "aarch64-unknown-linux-gnu": "48d92ede8e09d618ff046a55483667b65e5acdeb0e5094160593764f5112e3a4",
+      "universal-apple-darwin": "23502defc71d0f860dc011fb53ec501cf952848b611675eed45d769d2194467c",
+      "x86_64-pc-windows-msvc": "b58ed34886ee9f9b4190c2bcd69e165d79f6230ba3ecb08dcbc18395c503cc57",
+      "x86_64-unknown-linux-gnu": "3e3594bf29f10e9a0003b1b94f37937314f4d0453c8272f6869c909c70f7eba7"
     }
   },
   "publisher": "brokk",
