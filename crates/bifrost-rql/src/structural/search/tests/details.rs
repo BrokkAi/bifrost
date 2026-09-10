@@ -1547,9 +1547,16 @@ fn assert_row_projects_its_whole_registered_surface(value: &CodeQueryResultValue
         domain.label()
     );
     for field in domain.row_fields() {
-        let projected = row
-            .field(field.name)
-            .unwrap_or_else(|error| panic!("registered field must project: {error}"));
+        let projected = match row.field(field.name) {
+            Ok(projected) => projected,
+            Err(error) => {
+                assert!(
+                    error.unknown_reason().is_some(),
+                    "registered field must project a value or typed unknown: {error}"
+                );
+                continue;
+            }
+        };
         match projected {
             Some(scalar) => assert_eq!(
                 scalar.scalar_type(),

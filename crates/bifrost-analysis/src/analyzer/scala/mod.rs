@@ -80,7 +80,9 @@ pub(crate) use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmProofGap, model_disposition_over_tiers,
     prove_against_active_model,
 };
-use brokk_bifrost_jvm::scala::graph::inverted::{ScalaProjectTypesSeed, ScalaProjectTypesSweep};
+use brokk_bifrost_jvm::scala::graph::inverted::{
+    ScalaProjectTypesSeed, ScalaProjectTypesSweep, ScalaSourceFactsCache,
+};
 pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
     ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaFileFactsProvider,
     ScalaForwardOwnerFacts, ScalaNameProof, ScalaSource,
@@ -716,6 +718,9 @@ pub struct ScalaAnalyzer {
     /// Files whose full per-file facts the current analyzer generation's
     /// targeted usage queries materialized through the lazy provider (#3142).
     scala_query_file_facts_touched: Arc<AtomicUsize>,
+    /// Per-generation source-facts parse cache shared by every targeted
+    /// usage query's `ProjectTypes` (see `ScalaSourceFactsCache`).
+    scala_source_facts_by_file: ScalaSourceFactsCache,
     #[cfg(any(test, feature = "test-support"))]
     scala_query_parse_count: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -952,6 +957,7 @@ impl ScalaAnalyzer {
             build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_file_facts_touched = Arc::new(AtomicUsize::new(0));
+        clone.scala_source_facts_by_file = Arc::new(Mutex::new(HashMap::default()));
         #[cfg(any(test, feature = "test-support"))]
         {
             clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
@@ -1000,6 +1006,7 @@ impl ScalaAnalyzer {
             dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_file_facts_touched: Arc::new(AtomicUsize::new(0)),
+            scala_source_facts_by_file: Arc::new(Mutex::new(HashMap::default())),
             #[cfg(any(test, feature = "test-support"))]
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -1238,6 +1245,7 @@ impl ScalaAnalyzer {
             Arc::clone(&self.scala_query_file_facts_touched),
             files,
         )
+        .with_source_facts_cache(Arc::clone(&self.scala_source_facts_by_file))
     }
 
     pub(crate) fn build_project_types_from_frontier(

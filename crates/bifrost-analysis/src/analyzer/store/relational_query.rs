@@ -69,13 +69,7 @@ fn unit_matches_requested_name<A: LanguageAdapter>(
         unit.fq().clone()
     };
     if has_unknown_segments(requested) {
-        actual.display_native(
-            adapter.language(),
-            crate::analyzer::fq_name::segment_interner(),
-        ) == requested.display_native(
-            adapter.language(),
-            crate::analyzer::fq_name::segment_interner(),
-        )
+        actual.same_native_spelling(requested, adapter.language())
     } else {
         actual == *requested
     }

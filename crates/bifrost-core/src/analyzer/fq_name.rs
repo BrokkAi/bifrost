@@ -317,6 +317,51 @@ impl FqName {
         self.render(interner, Some(lang)).text
     }
 
+    /// Compare native spellings without allocating rendered strings. Unlike
+    /// `same_segment_texts`, this retains separators and companion suffixes,
+    /// including spellings carried inside a single unresolved segment.
+    pub fn same_native_spelling(&self, other: &Self, lang: Language) -> bool {
+        let mut left_parts = self.native_spelling_parts(lang);
+        let mut right_parts = other.native_spelling_parts(lang);
+        let mut left = left_parts.next();
+        let mut right = right_parts.next();
+        while let (Some(a), Some(b)) = (left, right) {
+            let shared = a.len().min(b.len());
+            if a[..shared] != b[..shared] {
+                return false;
+            }
+            left = if shared == a.len() {
+                left_parts.next()
+            } else {
+                Some(&a[shared..])
+            };
+            right = if shared == b.len() {
+                right_parts.next()
+            } else {
+                Some(&b[shared..])
+            };
+        }
+        left.is_none() && right.is_none()
+    }
+
+    fn native_spelling_parts(&self, lang: Language) -> impl Iterator<Item = &'static [u8]> + '_ {
+        let interner = segment_interner();
+        let mut previous = None;
+        self.segments.iter().flat_map(move |&id| {
+            let (text, kind) = interner.resolve(id);
+            let join = previous.map_or("", |previous| separator(previous, kind, Some(lang)));
+            previous = Some(kind);
+            let suffix = if kind == SegmentKind::Companion {
+                "$"
+            } else {
+                ""
+            };
+            [join.as_bytes(), text.as_bytes(), suffix.as_bytes()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+        })
+    }
+
     /// The native rendering together with the byte span each segment occupies
     /// in it, so a caller that needs several projections of one name (its
     /// package prefix, its declaration tail, its terminal identifier, its
@@ -1636,6 +1681,29 @@ mod fq_name_properties {
     }
 
     proptest! {
+        #[test]
+        fn native_spelling_comparison_agrees_with_rendering(
+            segments in segment_list(),
+            other_segments in segment_list(),
+            language in language(),
+        ) {
+            let interner = segment_interner();
+            let name = intern_all(&segments);
+            let rendered = name.display_native(language, interner);
+            let packed = FqName::new().with_pushed(
+                interner.intern(&rendered, SegmentKind::Unknown),
+            );
+            let unknown = intern_all(&segments.iter().map(|(text, _)| {
+                (text.clone(), SegmentKind::Unknown)
+            }).collect::<Vec<_>>());
+            for other in [intern_all(&other_segments), packed, unknown, FqName::new()] {
+                let expected = rendered == other.display_native(language, interner);
+                prop_assert_eq!(name.same_native_spelling(&other, language), expected);
+                prop_assert_eq!(other.same_native_spelling(&name, language), expected);
+            }
+            prop_assert!(FqName::new().same_native_spelling(&FqName::new(), language));
+        }
+
         /// The string half of the repair is a fixed point of the structure half.
         ///
         /// [`normalize_joined`] is what a frontend stores; [`joined_segments`]

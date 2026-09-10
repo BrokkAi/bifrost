@@ -113,12 +113,25 @@ pub enum OracleRelationSubject {
     DispatchBoundary(DispatchBoundaryKind),
 }
 
+/// Captured dependency identity for a runtime-model interpretation of a load.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeReadRelationEvidence {
+    pub refinement_identity: super::super::StableDigest,
+    pub active_model_set_hash: String,
+    pub runtime_profile_digest: String,
+    pub manifest_digest: String,
+    pub shard_id: String,
+    pub exposure_id: String,
+    pub behavior_id: String,
+}
+
 /// One resolvable relation record backed by validated semantic evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OracleRelationRecord {
     kind: OracleRelationKind,
     subject: Option<OracleRelationSubject>,
     evidence: Box<[EvidenceHandle]>,
+    runtime_read: Option<RuntimeReadRelationEvidence>,
 }
 
 impl OracleRelationRecord {
@@ -196,7 +209,17 @@ impl OracleRelationRecord {
             kind,
             subject,
             evidence: evidence.into_boxed_slice(),
+            runtime_read: None,
         })
+    }
+
+    pub(crate) fn with_runtime_read(mut self, evidence: RuntimeReadRelationEvidence) -> Self {
+        self.runtime_read = Some(evidence);
+        self
+    }
+
+    pub fn runtime_read(&self) -> Option<&RuntimeReadRelationEvidence> {
+        self.runtime_read.as_ref()
     }
 
     pub const fn kind(&self) -> OracleRelationKind {

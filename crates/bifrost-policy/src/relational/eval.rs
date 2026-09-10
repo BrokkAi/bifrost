@@ -22,8 +22,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use brokk_bifrost_rql::structural::CodeQueryRowRef;
 use brokk_bifrost_rql::structural::search::UnitRowItem;
+use brokk_bifrost_rql::structural::{CodeQueryRowFieldUnknownReason, CodeQueryRowRef};
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
@@ -133,6 +133,14 @@ pub enum RelationalAssertionEvaluationError {
         binding: String,
         field: String,
     },
+    /// A registered field was present on the row but its evidence was
+    /// unavailable. This is distinct from a missing field and is consumed by
+    /// `load_rows` as an incomplete row rather than as a runtime failure.
+    RowFieldUnavailable {
+        binding: String,
+        field: String,
+        reason: CodeQueryRowFieldUnknownReason,
+    },
     /// The plan could not be lowered or did not validate. A decoded policy is
     /// validated at load, so this is an internal invariant failure.
     InvalidPlan {
@@ -160,6 +168,16 @@ impl std::fmt::Display for RelationalAssertionEvaluationError {
             }
             Self::RowField { binding, field } => {
                 write!(formatter, "binding `{binding}` has no field `{field}`")
+            }
+            Self::RowFieldUnavailable {
+                binding,
+                field,
+                reason,
+            } => {
+                write!(
+                    formatter,
+                    "binding `{binding}` field `{field}` has unavailable evidence: {reason:?}"
+                )
             }
             Self::InvalidPlan { message } => {
                 write!(formatter, "invalid relational plan: {message}")
@@ -196,11 +214,39 @@ struct EvalRelation {
     /// Why rows of this relation may not be witness-sound. Empty when every row
     /// is established.
     witness_reasons: Vec<PolicyIncompleteReason>,
+    /// Typed evidence that one or more input rows were omitted because a
+    /// referenced field was unavailable. This is separate from coverage:
+    /// filters and joins can still retain sound rows from the known subset,
+    /// while aggregate values over that subset are not witnesses.
+    unknown_inputs: UnknownInputEvidence,
 }
 
 impl EvalRelation {
     fn index_of(&self, column: &IrColumn) -> Option<usize> {
         self.layout.iter().position(|candidate| candidate == column)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct UnknownInputEvidence {
+    reasons: Vec<CodeQueryRowFieldUnknownReason>,
+}
+
+impl UnknownInputEvidence {
+    fn push(&mut self, reason: CodeQueryRowFieldUnknownReason) {
+        if !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
+        }
+    }
+
+    fn extend(&mut self, other: &Self) {
+        for reason in &other.reasons {
+            self.push(*reason);
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.reasons.is_empty()
     }
 }
 
@@ -460,8 +506,12 @@ pub fn evaluate_plan_ir(
         }
     }
 
-    let exhaustive =
-        inputs.iter().all(|input| input.coverage.is_exhaustive()) && !state.limit_exceeded;
+    let exhaustive = inputs.iter().all(|input| input.coverage.is_exhaustive())
+        && relations
+            .iter()
+            .filter_map(Option::as_ref)
+            .all(|relation| relation.coverage.is_exhaustive())
+        && !state.limit_exceeded;
     Ok(RelationalAssertionEvaluation {
         violations,
         unmet_obligations: obligations.retained,
@@ -674,6 +724,7 @@ fn evaluate_relation(
             state.limits.max_source_rows,
             RelationCoverage::Exhaustive,
             Vec::new(),
+            UnknownInputEvidence::default(),
             inputs,
             referenced,
             state,
@@ -682,6 +733,7 @@ fn evaluate_relation(
             let source = input_relation(*input)?;
             let coverage = source.coverage.clone();
             let witness_reasons = source.witness_reasons.clone();
+            let unknown_inputs = source.unknown_inputs.clone();
             load_rows(
                 plan,
                 id,
@@ -689,6 +741,7 @@ fn evaluate_relation(
                 state.limits.max_expanded_rows,
                 coverage,
                 witness_reasons,
+                unknown_inputs,
                 inputs,
                 referenced,
                 state,
@@ -729,6 +782,7 @@ fn evaluate_relation(
                 tuples,
                 coverage: source.coverage.clone(),
                 witness_reasons: source.witness_reasons.clone(),
+                unknown_inputs: source.unknown_inputs.clone(),
             })
         }
         IrRelationOp::Filter { input, predicates } => {
@@ -744,6 +798,7 @@ fn evaluate_relation(
                 tuples,
                 coverage: source.coverage.clone(),
                 witness_reasons: source.witness_reasons.clone(),
+                unknown_inputs: source.unknown_inputs.clone(),
             })
         }
         IrRelationOp::Join {
@@ -781,6 +836,7 @@ fn load_rows(
     max_rows: usize,
     inherited: RelationCoverage,
     witness_reasons: Vec<PolicyIncompleteReason>,
+    mut unknown_inputs: UnknownInputEvidence,
     inputs: &HashMap<&str, &RelationalInput<'_>>,
     referenced: &BTreeSet<IrColumn>,
     state: &mut EvalState,
@@ -813,8 +869,20 @@ fn load_rows(
     let mut tuples = Vec::with_capacity(count);
     for (row, item) in input.rows[..count].iter().enumerate() {
         let mut values = Vec::with_capacity(layout.len());
+        let mut unavailable = false;
         for column in &layout {
-            values.push(row_field(item, binding, &column.name)?);
+            match row_field(item, binding, &column.name) {
+                Ok(value) => values.push(value),
+                Err(RelationalAssertionEvaluationError::RowFieldUnavailable { reason, .. }) => {
+                    unknown_inputs.push(reason);
+                    unavailable = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if unavailable {
+            continue;
         }
         tuples.push(EvalTuple {
             values,
@@ -825,11 +893,17 @@ fn load_rows(
             witness_sound: true,
         });
     }
+    if !unknown_inputs.is_empty() {
+        coverage = coverage.meet(RelationCoverage::incomplete(vec![
+            PolicyIncompleteReason::CapabilityIncomplete,
+        ]));
+    }
     Ok(EvalRelation {
         layout,
         tuples,
         coverage,
         witness_reasons,
+        unknown_inputs,
     })
 }
 
@@ -856,6 +930,8 @@ fn evaluate_join(
             Ok((left_index, right_index))
         })
         .collect::<EvalResult<Vec<_>>>()?;
+    let mut unknown_inputs = left.unknown_inputs.clone();
+    unknown_inputs.extend(&right.unknown_inputs);
 
     // Anti joins and unmatched left-join rows are present because nothing
     // matched them. That is only a fact about the world when the right relation
@@ -979,6 +1055,7 @@ fn evaluate_join(
         tuples: joined,
         coverage,
         witness_reasons,
+        unknown_inputs,
     })
 }
 
@@ -1002,6 +1079,11 @@ fn evaluate_group(
 
     let mut coverage = input.coverage.clone();
     let mut witness_reasons = input.witness_reasons.clone();
+    if !input.unknown_inputs.is_empty() {
+        witness_reasons.push(PolicyIncompleteReason::CapabilityIncomplete);
+        witness_reasons.sort();
+        witness_reasons.dedup();
+    }
     let mut grouped: HashMap<Vec<Option<RowScalar>>, GroupRows<'_>> = HashMap::new();
     let mut any_group_truncated = false;
     for tuple in &input.tuples {
@@ -1048,7 +1130,9 @@ fn evaluate_group(
                 aggregate,
             )?)));
         }
-        let witness_sound = !rows.truncated && rows.tuples.iter().all(|tuple| tuple.witness_sound);
+        let witness_sound = input.unknown_inputs.is_empty()
+            && !rows.truncated
+            && rows.tuples.iter().all(|tuple| tuple.witness_sound);
         let contributors = rows
             .tuples
             .iter()
@@ -1080,6 +1164,7 @@ fn evaluate_group(
         tuples,
         coverage,
         witness_reasons,
+        unknown_inputs: input.unknown_inputs.clone(),
     })
 }
 
@@ -1269,12 +1354,19 @@ impl ReplayRow {
     ) -> EvalResult<Self> {
         let mut values = Vec::with_capacity(columns.len());
         for (column, field) in columns {
-            let value =
-                row.field(field)
-                    .map_err(|_| RelationalAssertionEvaluationError::RowField {
+            let value = row
+                .field(field)
+                .map_err(|error| match error.unknown_reason() {
+                    Some(reason) => RelationalAssertionEvaluationError::RowFieldUnavailable {
                         binding: column.qualifier.clone(),
                         field: field.clone(),
-                    })?;
+                        reason,
+                    },
+                    None => RelationalAssertionEvaluationError::RowField {
+                        binding: column.qualifier.clone(),
+                        field: field.clone(),
+                    },
+                })?;
             values.push(value.map(RowScalar::from));
         }
         Ok(Self {
@@ -1283,6 +1375,7 @@ impl ReplayRow {
                 tuples: Vec::new(),
                 coverage: RelationCoverage::Exhaustive,
                 witness_reasons: Vec::new(),
+                unknown_inputs: UnknownInputEvidence::default(),
             },
             tuple: EvalTuple {
                 values,
@@ -1384,8 +1477,15 @@ fn row_field(
 ) -> EvalResult<Option<RowScalar>> {
     row.field(field)
         .map(|value| value.map(RowScalar::from))
-        .map_err(|_| RelationalAssertionEvaluationError::RowField {
-            binding: binding.as_str().to_string(),
-            field: field.to_string(),
+        .map_err(|error| match error.unknown_reason() {
+            Some(reason) => RelationalAssertionEvaluationError::RowFieldUnavailable {
+                binding: binding.as_str().to_string(),
+                field: field.to_string(),
+                reason,
+            },
+            None => RelationalAssertionEvaluationError::RowField {
+                binding: binding.as_str().to_string(),
+                field: field.to_string(),
+            },
         })
 }

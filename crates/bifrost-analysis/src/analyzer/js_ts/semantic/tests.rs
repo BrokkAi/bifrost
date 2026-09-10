@@ -1627,3 +1627,85 @@ fn absent_array_element_field_keeps_field_identity_incomplete() {
         gap.capability == SemanticCapability::FieldMemory && gap.kind == SemanticGapKind::Unknown
     }));
 }
+
+#[test]
+fn runtime_keyed_loads_retain_numeric_index_and_structural_value_mapping() {
+    let source = "function probe() { return process.argv[2]; }";
+    for procedures in [
+        lower_typescript_source(source),
+        lower_javascript_parts(source),
+    ] {
+        let mut found = false;
+        for procedure in &procedures {
+            for point in &procedure.points {
+                for event in &point.events {
+                    let SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } = event.effect
+                    else {
+                        continue;
+                    };
+                    if matches!(
+                        procedure.memory_locations[location.index()].kind,
+                        crate::analyzer::semantic::MemoryLocationKind::Index {
+                            constant_index: Some(2),
+                            ..
+                        }
+                    ) {
+                        let terminal_mapping = &procedure.source_mappings
+                            [procedure.values[result.index()].source.index()];
+                        let span = terminal_mapping.locator.anchor().span();
+                        assert_eq!(
+                            &source[span.start_byte() as usize..span.end_byte() as usize],
+                            "process.argv[2]"
+                        );
+                        let crate::analyzer::semantic::MemoryLocationKind::Index { base, .. } =
+                            procedure.memory_locations[location.index()].kind
+                        else {
+                            unreachable!("selected an indexed runtime load")
+                        };
+                        let container_mapping = &procedure.source_mappings
+                            [procedure.values[base.index()].source.index()];
+                        assert!(
+                            container_mapping.ast_identity.is_some(),
+                            "normalized runtime candidate retains its AST identity"
+                        );
+                        assert!(procedure.gaps.iter().any(|gap| gap.point == point.id
+                        && gap.discharge == crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior));
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "the indexed load must remain an executable semantic effect"
+        );
+    }
+}
+
+#[test]
+fn runtime_keyed_store_gaps_are_not_read_discharges() {
+    let source =
+        "function write(value) { process.env.DFB_INPUT = value; process.argv[2] = value; }";
+    for procedures in [
+        lower_typescript_source(source),
+        lower_javascript_parts(source),
+    ] {
+        let mut stores = 0;
+        for procedure in procedures {
+            for point in &procedure.points {
+                if point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::MemoryStore { .. }))
+                {
+                    stores += 1;
+                    assert!(procedure.gaps.iter().filter(|gap| gap.point == point.id).all(|gap|
+                        gap.discharge != crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior));
+                }
+            }
+        }
+        assert_eq!(stores, 2);
+    }
+}

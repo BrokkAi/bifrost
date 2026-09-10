@@ -9,6 +9,7 @@ mod assertion;
 mod cvss_evidence;
 mod typestate_compilation;
 
+pub(crate) use assertion::SubjectQueryBatch;
 use assertion::evaluate_assertion_policy;
 pub(crate) use assertion::relational_expansion_query;
 use cvss_evidence::*;
@@ -446,6 +447,7 @@ pub(crate) trait TypestatePolicyEvaluator:
 
 /// Built-in match evaluator with optional future-analysis adapters.
 pub struct DefaultPolicyEvaluator<'a> {
+    subject_batch: Option<&'a SubjectQueryBatch<'a>>,
     taint: Option<&'a dyn TaintPolicyEvaluator>,
     typestate: Option<&'a dyn TypestatePolicyEvaluator>,
     /// Request-selected activation shared by assertion flow derivation and
@@ -463,6 +465,7 @@ impl<'a> DefaultPolicyEvaluator<'a> {
         typestate: Option<&'a dyn TypestatePolicyEvaluator>,
     ) -> Self {
         let evaluator = Self {
+            subject_batch: None,
             taint: None,
             typestate: None,
             active_semantic_model_snapshot: None,
@@ -491,6 +494,11 @@ impl<'a> DefaultPolicyEvaluator<'a> {
         typestate: &'a dyn TypestatePolicyEvaluator,
     ) -> Self {
         self.typestate = Some(typestate);
+        self
+    }
+
+    pub(crate) fn with_subject_batch(mut self, batch: Option<&'a SubjectQueryBatch<'a>>) -> Self {
+        self.subject_batch = batch;
         self
     }
 
@@ -537,6 +545,7 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
                 context,
                 &host_budget,
                 self.active_semantic_model_snapshot.clone(),
+                self.subject_batch,
             ),
             // Flow executes the production taint pipeline over the same
             // resolved model with one internal label (#2436); only the run's
@@ -2638,6 +2647,7 @@ fn executable_match_query(
             | QueryValueKind::ExpressionSite
             | QueryValueKind::JsxAttributeValue
             | QueryValueKind::FieldWriteValue
+            | QueryValueKind::KeyedReadValue
             | QueryValueKind::Occurrence
             // A binding and a resolution candidate are both exact facts about
             // one source position, so a match policy listing suspicious
@@ -4032,6 +4042,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
         DetailedCodeQueryDomain::JsxAttributeValue => Some(MatchResultDomain::JsxAttributeValue),
         DetailedCodeQueryDomain::FieldWriteValue => Some(MatchResultDomain::FieldWriteValue),
+        // Runtime keyed reads are exact source-position rows. Match policies
+        // use the existing structural finding envelope while selector policies
+        // retain the typed endpoint evidence for taint binding.
+        DetailedCodeQueryDomain::RuntimeKeyedReadValue => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::LexicalScope => Some(MatchResultDomain::LexicalScope),
@@ -4153,6 +4167,9 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, rhs_ast_id.as_bytes());
             update_hash(&mut hasher, receiver_identity_id.as_bytes());
             update_hash(&mut hasher, member_target_id.as_bytes());
+        }
+        DetailedCodeQueryKey::RuntimeKeyedReadValue { id } => {
+            update_hash(&mut hasher, id.as_bytes());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {

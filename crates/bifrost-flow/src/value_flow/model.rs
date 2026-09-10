@@ -178,6 +178,9 @@ fn same_root(left: &AccessPathRoot, right: &AccessPathRoot) -> bool {
         | (AccessPathRoot::External(left), AccessPathRoot::External(right)) => {
             same_scoped_locator(left, right)
         }
+        (AccessPathRoot::RuntimeObject(left), AccessPathRoot::RuntimeObject(right)) => {
+            left == right
+        }
         _ => false,
     }
 }
@@ -194,6 +197,7 @@ fn same_path(left: &AccessPath, right: &AccessPath) -> bool {
                 (AccessSelector::Field(left), AccessSelector::Field(right)) => {
                     same_scoped_locator(left, right)
                 }
+                (AccessSelector::Property(left), AccessSelector::Property(right)) => left == right,
                 (
                     AccessSelector::Index(IndexSelector::Exact(left)),
                     AccessSelector::Index(IndexSelector::Exact(right)),
@@ -249,6 +253,19 @@ pub enum ValueFlowCarrierKey {
     ScopedRoot {
         kind: ValueFlowScopedRootKind,
         locator: SemanticLocator,
+    },
+    RuntimeObject {
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: StableDigest,
+        active_model_set_hash: String,
+        manifest_digest: String,
+        shard_id: String,
+        behavior_id: String,
+        activation_source: String,
     },
     LexicalCell {
         locator: SemanticLocator,
@@ -354,6 +371,32 @@ impl ValueFlowCarrierKey {
                     });
                     push_carrier_locator(digest, locator, procedure);
                 }
+                Part::Carrier(Self::RuntimeObject {
+                    runtime_profile_digest,
+                    realm,
+                    exposure_id,
+                    container_member,
+                    state_boundary,
+                    refinement_identity,
+                    active_model_set_hash,
+                    manifest_digest,
+                    shard_id,
+                    behavior_id,
+                    activation_source,
+                }) => {
+                    digest.push(b"runtime_object");
+                    digest.push(runtime_profile_digest.as_bytes());
+                    digest.push(realm.as_bytes());
+                    digest.push(exposure_id.as_bytes());
+                    digest.push(container_member.as_bytes());
+                    digest.push(state_boundary.as_bytes());
+                    digest.push(refinement_identity.as_bytes());
+                    digest.push(active_model_set_hash.as_bytes());
+                    digest.push(manifest_digest.as_bytes());
+                    digest.push(shard_id.as_bytes());
+                    digest.push(behavior_id.as_bytes());
+                    digest.push(activation_source.as_bytes());
+                }
                 Part::Carrier(Self::LexicalCell { locator, binding }) => {
                     digest.push(b"lexical_cell");
                     push_carrier_locator(digest, locator, procedure);
@@ -386,6 +429,10 @@ impl ValueFlowCarrierKey {
                 Part::Selector(ValueFlowSelectorKey::Field(locator)) => {
                     digest.push(b"field");
                     push_carrier_locator(digest, locator, procedure);
+                }
+                Part::Selector(ValueFlowSelectorKey::Property(property)) => {
+                    digest.push(b"property");
+                    digest.push(property.as_bytes());
                 }
                 Part::Selector(ValueFlowSelectorKey::ExactIndex(index)) => {
                     digest.push(b"exact_index");
@@ -424,6 +471,32 @@ impl ValueFlowCarrierKey {
                 Self::Allocation { locator } | Self::ScopedRoot { locator, .. } => {
                     total = total.saturating_add(semantic_locator_heap_bytes(locator));
                 }
+                Self::RuntimeObject {
+                    runtime_profile_digest,
+                    realm,
+                    exposure_id,
+                    container_member,
+                    state_boundary,
+                    active_model_set_hash,
+                    manifest_digest,
+                    shard_id,
+                    behavior_id,
+                    activation_source,
+                    ..
+                } => {
+                    total = total
+                        .saturating_add(runtime_profile_digest.len())
+                        .saturating_add(realm.len())
+                        .saturating_add(exposure_id.len())
+                        .saturating_add(container_member.len())
+                        .saturating_add(state_boundary.len())
+                        .saturating_add(active_model_set_hash.len())
+                        .saturating_add(manifest_digest.len())
+                        .saturating_add(shard_id.len())
+                        .saturating_add(behavior_id.len())
+                        .saturating_add(activation_source.len())
+                        .saturating_add(std::mem::size_of::<StableDigest>());
+                }
                 Self::LexicalCell { locator, binding } => {
                     total = total
                         .saturating_add(semantic_locator_heap_bytes(locator))
@@ -452,6 +525,9 @@ impl ValueFlowCarrierKey {
                         match selector {
                             ValueFlowSelectorKey::Field(locator) => {
                                 total = total.saturating_add(semantic_locator_heap_bytes(locator));
+                            }
+                            ValueFlowSelectorKey::Property(property) => {
+                                total = total.saturating_add(property.len());
                             }
                             ValueFlowSelectorKey::ExactIndex(key) => {
                                 total = total.saturating_add(std::mem::size_of::<Self>());
@@ -535,6 +611,7 @@ pub enum ValueFlowScopedRootKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ValueFlowSelectorKey {
     Field(SemanticLocator),
+    Property(String),
     ExactIndex(Box<ValueFlowCarrierKey>),
     ConstantIndex(u128),
     AnyIndex,
@@ -917,6 +994,31 @@ fn carrier_key(identity: &DurableObjectIdentity) -> ValueFlowCarrierKey {
             kind: ValueFlowScopedRootKind::External,
             locator: locator.clone(),
         },
+        DurableObjectIdentity::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        } => ValueFlowCarrierKey::RuntimeObject {
+            runtime_profile_digest: runtime_profile_digest.clone(),
+            realm: realm.clone(),
+            exposure_id: exposure_id.clone(),
+            container_member: container_member.clone(),
+            state_boundary: state_boundary.clone(),
+            refinement_identity: *refinement_identity,
+            active_model_set_hash: active_model_set_hash.clone(),
+            manifest_digest: manifest_digest.clone(),
+            shard_id: shard_id.clone(),
+            behavior_id: behavior_id.clone(),
+            activation_source: activation_source.clone(),
+        },
     }
 }
 
@@ -946,6 +1048,7 @@ fn root_key(root: &AccessPathRoot) -> Result<ValueFlowCarrierKey, ValueFlowModel
 fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, ValueFlowModelError> {
     match selector {
         AccessSelector::Field(field) => Ok(ValueFlowSelectorKey::Field(field.locator().clone())),
+        AccessSelector::Property(property) => Ok(ValueFlowSelectorKey::Property(property.clone())),
         AccessSelector::Index(IndexSelector::Exact(index)) => Ok(ValueFlowSelectorKey::ExactIndex(
             Box::new(value_key(index)?),
         )),

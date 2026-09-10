@@ -582,6 +582,9 @@ fn write_memory_location(writer: &mut dyn fmt::Write, location: &MemoryLocation)
             write_locator(writer, member)?;
             writer.write_char(')')?;
         }
+        MemoryLocationKind::Property { base, key } => {
+            write!(writer, " :base {base} :property-key {}", quoted(key))?;
+        }
         MemoryLocationKind::Static { member } => {
             writer.write_str(" :member (locator ")?;
             write_locator(writer, member)?;
@@ -796,7 +799,7 @@ fn write_gap(writer: &mut dyn fmt::Write, gap: &SemanticGap) -> fmt::Result {
         write!(
             writer,
             "(budget :dimension {} :limit {} :attempted {})",
-            quoted(budget.dimension().label()),
+            quoted(budget.dimension().public_lane().label()),
             budget.limit(),
             budget.attempted(),
         )?;
@@ -1848,7 +1851,7 @@ mod tests {
         assert!(gap_rendered.contains(
             ":impacts (\"call_evaluation\" \"return_transfer\" \"value_flow\" \"heap_read\" \"heap_write\" \"aliasing\")"
         ));
-        assert!(gap_rendered.contains(":dimension \"program_points\" :limit 1 :attempted 2"));
+        assert!(gap_rendered.contains(":dimension \"rows\" :limit 1 :attempted 2"));
 
         let capture = CaptureBinding {
             id: super::super::ids::CaptureId::new(0),

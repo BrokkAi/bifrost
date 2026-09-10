@@ -240,6 +240,7 @@ pub(super) fn measure_artifact_work(
             match &location.kind {
                 MemoryLocationKind::Field { member, .. }
                 | MemoryLocationKind::Static { member } => account_locator(member, &mut work),
+                MemoryLocationKind::Property { key, .. } => account_text(key, &mut work),
                 MemoryLocationKind::Index { .. }
                 | MemoryLocationKind::LexicalCell { .. }
                 | MemoryLocationKind::Capture { .. } => {}
@@ -676,6 +677,37 @@ fn validate_procedure(
                     gap.id
                 ),
             ));
+        }
+        if gap.discharge == SemanticGapDischarge::RuntimeReadBehavior {
+            let valid_subject = match (gap.capability, gap.subject) {
+                (SemanticCapability::FieldMemory | SemanticCapability::IndexMemory,
+                    SemanticGapSubject::MemoryLocation(location)) => {
+                    procedure.points[gap.point.index()].events.iter().any(|event| {
+                        matches!(event.effect, SemanticEffect::MemoryLoad { location: found, .. } if found == location)
+                    })
+                }
+                (SemanticCapability::ExceptionalControlFlow, SemanticGapSubject::Point) => {
+                    procedure.points[gap.point.index()].events.iter().any(|event| {
+                        matches!(event.effect, SemanticEffect::MemoryLoad { .. })
+                    })
+                }
+                _ => false,
+            };
+            if !valid_subject
+                || !matches!(
+                    gap.kind,
+                    SemanticGapKind::Unknown | SemanticGapKind::Unsupported
+                )
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GapContract,
+                    format!(
+                        "runtime-read gap {} must name its executable property or index load",
+                        gap.id
+                    ),
+                ));
+            }
         }
         if gap.kind == SemanticGapKind::Unproven
             && !matches!(
@@ -1150,6 +1182,9 @@ fn validate_memory_location(
         MemoryLocationKind::Field { base, member } => {
             ensure_value(id, *base, procedure.values.len(), "field base")?;
             validate_memory_member_locator(id, member, "field member")?;
+        }
+        MemoryLocationKind::Property { base, .. } => {
+            ensure_value(id, *base, procedure.values.len(), "property base")?;
         }
         MemoryLocationKind::Static { member } => {
             validate_memory_member_locator(id, member, "static member")?;
@@ -2814,6 +2849,10 @@ fn validate_memory_access_kind(
     let matches = matches!(
         (access, location_kind),
         (MemoryAccessKind::Field, MemoryLocationKind::Field { .. })
+            | (
+                MemoryAccessKind::Property,
+                MemoryLocationKind::Property { .. }
+            )
             | (MemoryAccessKind::Static, MemoryLocationKind::Static { .. })
             | (MemoryAccessKind::Index, MemoryLocationKind::Index { .. })
             | (
@@ -3297,6 +3336,7 @@ fn validate_gap_impacts(procedure: ProcedureId, gap: &SemanticGap) -> Result<(),
 fn memory_location_capability(kind: &MemoryLocationKind) -> SemanticCapability {
     match kind {
         MemoryLocationKind::Field { .. } => SemanticCapability::FieldMemory,
+        MemoryLocationKind::Property { .. } => SemanticCapability::FieldMemory,
         MemoryLocationKind::Static { .. } => SemanticCapability::StaticMemory,
         MemoryLocationKind::Index { .. } => SemanticCapability::IndexMemory,
         MemoryLocationKind::LexicalCell { .. } => SemanticCapability::LocalFlow,
@@ -3307,6 +3347,7 @@ fn memory_location_capability(kind: &MemoryLocationKind) -> SemanticCapability {
 fn memory_access_capability(kind: MemoryAccessKind) -> SemanticCapability {
     match kind {
         MemoryAccessKind::Field => SemanticCapability::FieldMemory,
+        MemoryAccessKind::Property => SemanticCapability::FieldMemory,
         MemoryAccessKind::Static => SemanticCapability::StaticMemory,
         MemoryAccessKind::Index => SemanticCapability::IndexMemory,
         MemoryAccessKind::LexicalCell => SemanticCapability::LocalFlow,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::semantic::{
-    DurablePortIdentity, ProcedureLocalLocator, SemanticArtifactLeaseCharge, ValueId,
+    DurablePortIdentity, ProcedureLocalLocator, RuntimeKeyedReadEndpoint,
+    SemanticArtifactLeaseCharge, ValueId,
 };
 
 #[derive(Debug)]
@@ -101,6 +102,9 @@ pub struct DetailedCodeQueryEvidence {
     /// or other runtime allocation. The corresponding artifact dependency is
     /// carried by `CodeQuerySemanticReceipt` when this is populated.
     pub decorated_parameter: Option<DetailedCodeQueryDecoratedParameterEvidence>,
+    /// Runtime-only exact endpoint retained for policy matched-value binding.
+    /// This is never serialized or carried by a reusable unit product.
+    pub runtime_keyed_read: Option<RuntimeKeyedReadEndpoint>,
 }
 
 /// Exact semantic selection evidence for a decorated parameter.
@@ -326,7 +330,7 @@ mod value_domain {
     use crate::analyzer::CodeUnitType;
     use crate::analyzer::semantic::CandidateCoverage;
     use crate::analyzer::semantic::capabilities::SemanticCapability;
-    use crate::analyzer::semantic::provider::SemanticBudgetDimension;
+    use crate::analyzer::semantic::provider::SemanticBudgetLane;
     use crate::analyzer::semantic::{
         ControlEdgeKind, DispatchBoundaryKind, EvidenceCompleteness, ExecutionTiming,
         ProcedureKind, ProofStatus,
@@ -433,7 +437,7 @@ mod value_domain {
     pub(super) const CONTROL_EDGE_KIND: &[&str] = ControlEdgeKind::LABELS;
     pub(super) const SEMANTIC_STATUS: &[&str] = SemanticInputStatus::LABELS;
     pub(super) const SEMANTIC_CAPABILITY: &[&str] = SemanticCapability::LABELS;
-    pub(super) const SEMANTIC_BUDGET_DIMENSION: &[&str] = SemanticBudgetDimension::LABELS;
+    pub(super) const SEMANTIC_BUDGET_LANE: &[&str] = SemanticBudgetLane::LABELS;
 
     pub(super) const USAGE_KIND: &[&str] = UsageHitKind::WIRE_LABELS;
     pub(super) const USAGE_PROOF: &[&str] = brokk_bifrost_rql::schema::USAGE_PROOF_LABELS;
@@ -452,6 +456,13 @@ mod value_domain {
     pub(super) const FIELD_WRITE_PROOF: &[&str] = &["precise"];
     pub(super) const FIELD_WRITE_COMPLETENESS: &[&str] = &["complete"];
     pub(super) const FIELD_WRITE_COVERAGE: &[&str] = &["exhaustive"];
+    pub(super) const RUNTIME_KEY_KIND: &[&str] = &["property", "index", "unknown"];
+    pub(super) const RUNTIME_SOURCE_ORIGIN: &[&str] =
+        &["pristine_runtime_input", "mutated", "indeterminate"];
+    pub(super) const RUNTIME_READ_OUTCOME: &[&str] =
+        &["endpoint", "conclusive_exclusion", "incomplete"];
+    pub(super) const RUNTIME_READ_PROOF: &[&str] = ProofStatus::LABELS;
+    pub(super) const RUNTIME_READ_COMPLETENESS: &[&str] = EvidenceCompleteness::LABELS;
 
     pub(super) const DISPATCH_OUTCOME: &[&str] = dispatch::DISPATCH_OUTCOME_LABELS;
     pub(super) const DISPATCH_ARM: &[&str] = dispatch::DISPATCH_ARM_LABELS;
@@ -679,6 +690,14 @@ impl CodeQueryRowScalarRef<'_> {
 pub struct CodeQueryRowFieldError {
     domain: DetailedCodeQueryDomain,
     field: String,
+    unknown_reason: Option<CodeQueryRowFieldUnknownReason>,
+}
+
+/// Missing evidence for a registered field is not an absent optional value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryRowFieldUnknownReason {
+    CallConversion(crate::analyzer::usages::call_conversion::ConversionUnknown),
 }
 
 impl CodeQueryRowFieldError {
@@ -691,7 +710,24 @@ impl CodeQueryRowFieldError {
         Self {
             domain,
             field: field.to_string(),
+            unknown_reason: None,
         }
+    }
+
+    pub fn unknown(
+        domain: DetailedCodeQueryDomain,
+        field: &str,
+        reason: CodeQueryRowFieldUnknownReason,
+    ) -> Self {
+        Self {
+            domain,
+            field: field.to_owned(),
+            unknown_reason: Some(reason),
+        }
+    }
+
+    pub const fn unknown_reason(&self) -> Option<CodeQueryRowFieldUnknownReason> {
+        self.unknown_reason
     }
 
     pub const fn domain(&self) -> DetailedCodeQueryDomain {
@@ -705,6 +741,14 @@ impl CodeQueryRowFieldError {
 
 impl std::fmt::Display for CodeQueryRowFieldError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(reason) = self.unknown_reason {
+            return write!(
+                formatter,
+                "field `{}.{}` has unknown evidence: {reason:?}",
+                self.domain.label(),
+                self.field,
+            );
+        }
         write!(
             formatter,
             "field `{}` is not registered for CodeQuery domain `{}`",
@@ -720,6 +764,15 @@ impl std::error::Error for CodeQueryRowFieldError {}
 #[derive(Debug, Clone, Copy)]
 pub struct CodeQueryRowRef<'a> {
     value: &'a CodeQueryResultValue,
+}
+
+macro_rules! detailed_query_kind_pattern {
+    ($kind:ident, RuntimeKeyedReadValue) => {
+        $kind::KeyedReadValue
+    };
+    ($kind:ident, $variant:ident) => {
+        $kind::$variant
+    };
 }
 
 /// Declare one detailed row domain, once (issue #2498).
@@ -777,7 +830,7 @@ macro_rules! detailed_row_domains {
         impl $domain {
             pub const fn from_query_value_kind(kind: $kind) -> Self {
                 match kind {
-                    $($kind::$variant => Self::$variant,)+
+                    $(detailed_query_kind_pattern!($kind, $variant) => Self::$variant,)+
                 }
             }
 
@@ -1205,6 +1258,29 @@ detailed_row_domains! {
                     ),
         ],
     },
+    RuntimeKeyedReadValue => "keyed_read_value" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("runtime", Scalar::String),
+                    CodeQueryRowField::required("global", Scalar::String),
+                    CodeQueryRowField::required("container", Scalar::String),
+                    CodeQueryRowField::required_enum("key_kind", value_domain::RUNTIME_KEY_KIND),
+                    CodeQueryRowField::optional("property", Scalar::String),
+                    CodeQueryRowField::optional("index", Scalar::Integer),
+                    CodeQueryRowField::required_enum("source_origin", value_domain::RUNTIME_SOURCE_ORIGIN),
+                    CodeQueryRowField::required_enum("outcome", value_domain::RUNTIME_READ_OUTCOME),
+                    CodeQueryRowField::required_enum("proof", value_domain::RUNTIME_READ_PROOF),
+                    CodeQueryRowField::required_enum("completeness", value_domain::RUNTIME_READ_COMPLETENESS),
+                    CodeQueryRowField::optional("active_model_set_hash", Scalar::String),
+                    CodeQueryRowField::optional("refinement_identity", Scalar::String),
+                    CodeQueryRowField::optional("exposure_id", Scalar::StableId),
+                    CodeQueryRowField::optional("behavior_id", Scalar::StableId),
+                    CodeQueryRowField::required("conclusive_exclusion", Scalar::Boolean),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
     CallShape => "call_shape" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -1329,12 +1405,16 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("formal_index", Scalar::Integer),
                     CodeQueryRowField::optional("formal_name", Scalar::String),
                     CodeQueryRowField::optional_enum("binding_kind", value_domain::CALL_BINDING_KIND),
-                    CodeQueryRowField::optional_open_enum(
+                    CodeQueryRowField::optional_enum(
                         "conversion",
-                        "the conversion vocabulary is each language's own (Java widening \
-                         and boxing, Rust deref and unsizing coercions, TypeScript \
-                         structural assignability) and no adapter publishes one yet, so \
-                         enumerating it here would be a table with no producer",
+                        crate::analyzer::usages::call_conversion::ConversionKind::LABELS,
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "conversion_status", &["proven", "unknown", "not_applicable"],
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "conversion_reason",
+                        crate::analyzer::usages::call_conversion::ConversionUnknown::LABELS,
                     ),
                     CodeQueryRowField::required_enum("mapping", value_domain::CALL_BINDING_MAPPING),
                     CodeQueryRowField::optional_enum("reason", value_domain::CALL_BINDING_REASON),
@@ -1804,7 +1884,7 @@ detailed_row_domains! {
                     ),
                     CodeQueryRowField::optional_enum(
                         "exceeded_limit",
-                        value_domain::SEMANTIC_BUDGET_DIMENSION
+                        value_domain::SEMANTIC_BUDGET_LANE
                     ),
         ],
     },
@@ -2293,6 +2373,8 @@ impl<'a> CodeQueryRowRef<'a> {
         self.domain().row_fields()
     }
 
+    /// Read a scalar, preserving the distinction between an absent optional
+    /// value (`Ok(None)`) and unavailable proof (`Err` with `unknown_reason`).
     pub fn field(
         self,
         name: &str,
@@ -2300,6 +2382,16 @@ impl<'a> CodeQueryRowRef<'a> {
         let Some(schema) = self.fields().iter().find(|field| field.name == name) else {
             return Err(CodeQueryRowFieldError::unregistered(self.domain(), name));
         };
+        if name == "conversion"
+            && let CodeQueryResultValue::CallBinding { value } = self.value
+            && let Some(reason) = value.conversion_reason
+        {
+            return Err(CodeQueryRowFieldError::unknown(
+                self.domain(),
+                name,
+                CodeQueryRowFieldUnknownReason::CallConversion(reason),
+            ));
+        }
         let value = project_code_query_row_field(self.value, name);
         debug_assert!(
             value.is_none() || value.is_some_and(|value| value.scalar_type() == schema.scalar_type),
@@ -2829,6 +2921,57 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::FieldWriteValue { value }, "coverage") => {
             Some(Scalar::ConstrainedEnum(value.coverage))
         }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "runtime") => {
+            Some(Scalar::String(&value.runtime))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "global") => {
+            Some(Scalar::String(&value.global))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "container") => {
+            Some(Scalar::String(&value.container))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "key_kind") => {
+            Some(Scalar::ConstrainedEnum(value.key_kind))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "property") => {
+            value.property.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "index") => {
+            value.index.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "source_origin") => {
+            Some(Scalar::ConstrainedEnum(value.source_origin))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "active_model_set_hash") => {
+            value.active_model_set_hash.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "refinement_identity") => {
+            value.refinement_identity.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "exposure_id") => {
+            value.exposure_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "behavior_id") => {
+            value.behavior_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "conclusive_exclusion") => {
+            Some(Scalar::Boolean(value.conclusive_exclusion))
+        }
+        (CodeQueryResultValue::RuntimeKeyedReadValue { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
+        }
         (CodeQueryResultValue::CallShape { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::CallShape { value }, "site_id") => {
             Some(Scalar::StableId(&value.site_id))
@@ -3254,6 +3397,12 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallBinding { value }, "conversion") => {
             value.conversion.as_deref().map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::CallBinding { value }, "conversion_status") => {
+            Some(Scalar::ConstrainedEnum(value.conversion_status))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "conversion_reason") => value
+            .conversion_reason
+            .map(|reason| Scalar::ConstrainedEnum(reason.label())),
         (CodeQueryResultValue::CallBinding { value }, "mapping") => {
             Some(Scalar::ConstrainedEnum(value.mapping))
         }
@@ -4588,6 +4737,9 @@ pub enum DetailedCodeQueryKey {
         receiver_identity_id: String,
         member_target_id: String,
     },
+    RuntimeKeyedReadValue {
+        id: String,
+    },
     DispatchOutcome {
         id: String,
         site_id: String,
@@ -4929,8 +5081,12 @@ fn assert_row_projects_its_registered_surface(value: &CodeQueryResultValue) {
     for field in domain.row_fields() {
         // `field` itself asserts the scalar type, the nullability and the
         // value domain; reaching every registered name is what this adds.
-        row.field(field.name)
-            .unwrap_or_else(|error| panic!("registered field must project: {error}"));
+        if let Err(error) = row.field(field.name) {
+            assert!(
+                error.unknown_reason().is_some(),
+                "registered field must project a value or typed unknown: {error}"
+            );
+        }
     }
 }
 
@@ -5077,6 +5233,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
         | CodeQueryResultValue::FieldWriteValue { .. }
+        | CodeQueryResultValue::RuntimeKeyedReadValue { .. }
         | CodeQueryResultValue::DispatchOutcome { .. }
         | CodeQueryResultValue::DispatchTarget { .. }
         | CodeQueryResultValue::MemberFamily { .. }
@@ -5171,6 +5328,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
         | DetailedCodeQueryKey::FieldWriteValue { .. }
+        | DetailedCodeQueryKey::RuntimeKeyedReadValue { .. }
         | DetailedCodeQueryKey::DispatchOutcome { .. }
         | DetailedCodeQueryKey::DispatchTarget { .. }
         | DetailedCodeQueryKey::MemberFamily { .. }
@@ -5323,6 +5481,26 @@ mod toy_domain {
 #[cfg(test)]
 mod registry {
     use super::*;
+
+    #[test]
+    fn exceeded_limit_publishes_only_the_five_budget_lanes() {
+        let field = DetailedCodeQueryDomain::DispatchOutcome
+            .row_fields()
+            .iter()
+            .find(|field| field.name == "exceeded_limit")
+            .expect("dispatch outcome registers its budget limit");
+        assert!(field.nullable);
+        assert_eq!(
+            field.value_domain,
+            Some(CodeQueryEnumDomain::Labels(&[
+                "source",
+                "rows",
+                "retained_bytes",
+                "steps",
+                "files",
+            ])),
+        );
+    }
 
     /// #2956: the class-set Unknown reasons (`unknown:<label>` origins) are
     /// row values behind a registered open enum, so renaming `budget` to

@@ -1423,7 +1423,9 @@ pub fn infer_indexed_local_element_type(
         if node != scope && is_local_scope(node) {
             continue;
         }
-        if let Some((left, right)) = assignment_parts(node) {
+        if node.end_byte() <= before_byte
+            && let Some((left, right)) = assignment_parts(node)
+        {
             if left.kind() == "variable_name"
                 && variable_identifier(left, source) == collection_name
             {
@@ -1564,8 +1566,31 @@ pub fn collection_element_type_fq_name(
     bindings: &LocalInferenceEngine<String>,
     enclosing_owner: &mut dyn FnMut(usize, usize) -> Option<String>,
 ) -> Option<String> {
+    collection_element_type_fq_name_inner(
+        php,
+        analyzer,
+        collection,
+        source,
+        ctx,
+        bindings,
+        enclosing_owner,
+        MAX_NESTED_COLLECTION_INFERENCE_DEPTH,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collection_element_type_fq_name_inner(
+    php: &dyn PhpSource,
+    analyzer: PhpGraphSource<'_>,
+    collection: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    bindings: &LocalInferenceEngine<String>,
+    enclosing_owner: &mut dyn FnMut(usize, usize) -> Option<String>,
+    remaining_collection_depth: usize,
+) -> Option<String> {
     match collection.kind() {
-        "variable_name" => infer_indexed_local_element_type(
+        "variable_name" if remaining_collection_depth > 0 => infer_indexed_local_element_type(
             collection,
             source,
             collection.start_byte(),
@@ -1578,6 +1603,7 @@ pub fn collection_element_type_fq_name(
                     ctx,
                     bindings,
                     enclosing_owner,
+                    remaining_collection_depth - 1,
                 )
             },
         ),
@@ -1608,6 +1634,7 @@ pub fn collection_element_type_fq_name(
                 ctx,
                 bindings,
                 enclosing_owner,
+                remaining_collection_depth,
             )?;
             let member = collection.child_by_field_name("name")?;
             collapsed_declared_member_fact(
@@ -1767,9 +1794,16 @@ where
         ctx,
         bindings,
         &mut enclosing_owner,
+        MAX_NESTED_COLLECTION_INFERENCE_DEPTH,
     )
 }
 
+// Collection element inference can follow values written from another local
+// collection. Source-order checks make every such step move backward, while
+// this cap keeps the best-effort dataflow walk stack-safe for generated chains.
+const MAX_NESTED_COLLECTION_INFERENCE_DEPTH: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
 fn instance_receiver_type_fq_name_inner(
     php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
@@ -1778,6 +1812,7 @@ fn instance_receiver_type_fq_name_inner(
     ctx: &PhpFileContext,
     bindings: &LocalInferenceEngine<String>,
     enclosing_owner: &mut dyn FnMut(usize, usize) -> Option<String>,
+    remaining_collection_depth: usize,
 ) -> Option<String> {
     enum Visit<'tree> {
         Resolve(Node<'tree>),
@@ -1801,7 +1836,7 @@ fn instance_receiver_type_fq_name_inner(
                         } else if let Some(collection) =
                             enclosing_foreach_collection(node, source, || true)
                         {
-                            collection_element_type_fq_name(
+                            collection_element_type_fq_name_inner(
                                 php,
                                 analyzer,
                                 collection,
@@ -1809,6 +1844,7 @@ fn instance_receiver_type_fq_name_inner(
                                 ctx,
                                 bindings,
                                 enclosing_owner,
+                                remaining_collection_depth,
                             )
                             .or_else(|| {
                                 foreach_value_reassigned_before(node, source)
@@ -1841,7 +1877,7 @@ fn instance_receiver_type_fq_name_inner(
                                     .any(|unit| unit.is_function())
                             },
                         ) {
-                            collection_element_type_fq_name(
+                            collection_element_type_fq_name_inner(
                                 php,
                                 analyzer,
                                 collection,
@@ -1849,6 +1885,7 @@ fn instance_receiver_type_fq_name_inner(
                                 ctx,
                                 bindings,
                                 enclosing_owner,
+                                remaining_collection_depth,
                             )
                         } else {
                             None
@@ -1873,7 +1910,7 @@ fn instance_receiver_type_fq_name_inner(
                         let Some(collection) = node.named_child(0) else {
                             continue;
                         };
-                        if let Some(value) = collection_element_type_fq_name(
+                        if let Some(value) = collection_element_type_fq_name_inner(
                             php,
                             analyzer,
                             collection,
@@ -1881,6 +1918,7 @@ fn instance_receiver_type_fq_name_inner(
                             ctx,
                             bindings,
                             enclosing_owner,
+                            remaining_collection_depth,
                         ) {
                             resolved.insert(node.id(), value);
                         }

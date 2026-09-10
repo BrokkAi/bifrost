@@ -6191,6 +6191,7 @@ mod tests {
             ClosureLimits { max_procedures: 16 },
             &mut plan_budget,
             &cancellation,
+            &mut Default::default(),
         )
         .expect("projection fixture plan builds");
         let mut solve_budget = SemanticBudget::default();
@@ -6824,6 +6825,7 @@ mod tests {
             ClosureLimits { max_procedures: 16 },
             &mut semantic_budget,
             &cancellation,
+            &mut Default::default(),
         )
         .expect("runtime identity fixture plan builds");
         let behavior = WorkspaceIcfgProvider::new(workspace).behavior_identity();
@@ -6906,6 +6908,7 @@ mod tests {
             ClosureLimits { max_procedures: 16 },
             &mut semantic_budget,
             &cancellation,
+            &mut Default::default(),
             &mut cuts,
         )
         .expect("runtime cut fixture plan builds");

@@ -493,6 +493,7 @@ fn foundry_selector(selector: &ValueFlowSelectorKey) -> FoundrySelector {
                 .unwrap_or_default()
                 .to_owned(),
         },
+        ValueFlowSelectorKey::Property(name) => FoundrySelector::Property { name: name.clone() },
         ValueFlowSelectorKey::ExactIndex(_) | ValueFlowSelectorKey::ConstantIndex(_) => {
             FoundrySelector::ExactIndex
         }
@@ -1077,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unmodeled_heap_read_is_recorded_rather_than_answered_with_no_flow() {
+    fn a_heap_read_retains_qualified_flow_without_claiming_completeness() {
         let root = tempfile::tempdir().expect("temporary workspace");
         std::fs::create_dir_all(root.path().join("probe")).expect("package directory");
         std::fs::write(
@@ -1099,11 +1100,35 @@ mod tests {
         let entry = entry_for(&run, "read(Box)");
         let derivation = entry.derivation.as_ref().expect("a derived entry");
 
-        // The field read reaches the return, but the value-flow oracle reports
-        // the heap capability as unsupported rather than relating the parameter
-        // port to a path beneath it. The entry must therefore stay partial: a
-        // `no_flow` claim here would be a silent false negative.
-        assert!(entry.transfers.is_empty());
+        // Shared formal-origin tracking (#2856) roots the field location at
+        // parameter[0], so the foundry can seed its qualified input path. The
+        // port-level transfer is only a projection of that field read. Retain
+        // both the positive flow and the open boundary: neither an empty
+        // `no_flow` claim nor a complete summary describes this body.
+        assert_eq!(
+            entry.rendered_transfers(),
+            vec!["parameter[0]->normal_return@normal".to_owned()]
+        );
+        assert_eq!(derivation.unproven_transfers, 0);
+        let [flow] = derivation.fine_grained.as_slice() else {
+            panic!(
+                "expected one field-read flow: {:?}",
+                derivation.fine_grained
+            );
+        };
+        assert_eq!(flow.input.port, "parameter[0]");
+        assert!(matches!(
+            flow.input.selectors.as_slice(),
+            [FoundrySelector::Field { .. }]
+        ));
+        assert_eq!(
+            flow.output,
+            FoundryAccessPath {
+                port: "normal_return".to_owned(),
+                selectors: Vec::new(),
+            }
+        );
+        assert_eq!(flow.exit_kind, "normal");
         assert_eq!(entry.claim, FoundryClaim::Flows);
         assert_eq!(entry.completeness, FoundryCompleteness::Partial);
         assert!(

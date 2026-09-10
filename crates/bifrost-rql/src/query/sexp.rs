@@ -893,6 +893,44 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             }
             append_step(expr, &items[items.len() - 1], step)
         }
+        RqlForm::KeyedReadValue => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::KeyedReadValue.label().to_string()),
+            );
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0]
+                    .as_symbol()
+                    .ok_or_else(|| lower_error(&pair[0], "expected an option name"))?;
+                let option = QueryStepOp::KeyedReadValue
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| lower_error(&pair[0], format!("unknown {head} option {key}")))?;
+                let field = option.field().label();
+                let value = match option.field() {
+                    QueryStepField::Index => number_value(&pair[1], head)?,
+                    QueryStepField::Runtime
+                    | QueryStepField::Global
+                    | QueryStepField::Container
+                    | QueryStepField::Property
+                    | QueryStepField::SourceOrigin => Value::String(symbol_or_string(&pair[1])?),
+                    _ => unreachable!("keyed-read-value registry contains only its options"),
+                };
+                if step.insert(field.to_string(), value).is_some() {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
+        }
         RqlForm::DecoratorBindings => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
                 return Err(lower_error(
@@ -1791,6 +1829,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
         | RqlForm::MemberTargets
+        | RqlForm::KeyedReadValue
         | RqlForm::FieldWriteValue
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence

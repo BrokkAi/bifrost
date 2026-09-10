@@ -54,14 +54,14 @@ use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings, CallSiteHandle,
-    CandidateCoverage, DispatchCandidate, DispatchReadAttribution, DispatchResult,
+    CandidateCoverage, DispatchCandidate, DispatchHints, DispatchReadAttribution, DispatchResult,
     DurablePortIdentity, EvidenceCompleteness, ExactExternalProcedureTarget, LengthDelimitedDigest,
     ObservationPhase, OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticExecutionBudget,
-    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingKind,
-    UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle, WorkspaceIcfgProvider,
-    WorkspaceRelativePath, WorkspaceSemanticOracle, authored_procedure_target_identity,
-    dispatch_read_attribution,
+    ProgramPointHandle, ProofStatus, RuntimeReadSourceOrigin, SemanticArtifactKey, SemanticBudget,
+    SemanticExecutionBudget, SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork,
+    SourceMappingKind, UnmaterializedExternalTarget, ValueFlowSnapshot, ValueHandle,
+    WorkspaceIcfgProvider, WorkspaceRelativePath, WorkspaceSemanticOracle,
+    authored_procedure_target_identity, dispatch_read_attribution,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -574,6 +574,7 @@ impl ProductionTaintPolicyEvaluator {
                     budget.max_selector_results(),
                     cancellation,
                 )
+                .with_active_semantic_model_snapshot(snapshot.clone())
                 .compile(policy, spec),
                 Err(message) => Err(Box::new(TaintPolicyCompileFailure {
                     error: TaintPolicyCompileError::Model(message.clone()),
@@ -838,6 +839,10 @@ impl TaintPolicyEvaluator for ProductionTaintPolicyEvaluator {
 
 pub(crate) struct TaintPolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
+    /// The immutable activation used by selector semantic rows. Matched-value
+    /// keyed reads must revalidate against this same snapshot before entering
+    /// the value-flow plan.
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
     /// Selector rows this compile refused to bind because they named more than
     /// one distinct semantic call site, or because a `(argument :name ...)`
@@ -1517,12 +1522,24 @@ impl<'a> TaintPolicyCompiler<'a> {
                 // funnels nobody names, so its selectors stay whole too.
                 CodeQueryExecutionScope::whole_workspace(),
             ),
+            active_semantic_model_snapshot: None,
             active_semantic_models,
             refused_sites: Vec::new(),
             named_actuals: HashMap::new(),
             bound_endpoints: BoundEndpointCounts::default(),
             authored_selector_summary: false,
         }
+    }
+
+    pub(crate) fn with_active_semantic_model_snapshot(
+        mut self,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        self.active_semantic_models = snapshot
+            .as_ref()
+            .map(|snapshot| Arc::clone(snapshot.active_models()));
+        self.active_semantic_model_snapshot = snapshot;
+        self
     }
 
     fn compile(
@@ -3481,16 +3498,36 @@ impl<'a> TaintPolicyCompiler<'a> {
         if let Some(parameter) = selection.decorated_parameter.clone() {
             return self.resolve_decorated_parameter_value(selection, parameter);
         }
-        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let workspace = self.selectors.workspace();
+        let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
+            workspace,
+            self.active_semantic_model_snapshot.as_deref(),
+            DispatchHints::empty(),
+        );
         let outcome = {
             let mut request = self.selectors.semantic_request();
-            oracle
-                .pointees_at_source(
-                    &selection.file,
-                    super::selector_compiler::source_range(&selection.span),
-                    &mut request,
-                )
-                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            if let Some(endpoint) = selection.runtime_keyed_read.as_ref() {
+                oracle
+                    .pointees_for_keyed_read(endpoint, &mut request)
+                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            } else {
+                if selection.runtime_keyed_read_row {
+                    if selection.runtime_keyed_read_conclusive_exclusion {
+                        return Ok(Vec::new());
+                    }
+                    return Err(TaintPolicyCompileError::SemanticUnavailable(
+                        "runtime keyed-read selector produced incomplete endpoint evidence"
+                            .to_owned(),
+                    ));
+                }
+                oracle
+                    .pointees_at_source(
+                        &selection.file,
+                        super::selector_compiler::source_range(&selection.span),
+                        &mut request,
+                    )
+                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            }
         };
         require_uninterrupted_outcome(&outcome, "taint matched source binding")?;
         self.selectors
@@ -3507,23 +3544,54 @@ impl<'a> TaintPolicyCompiler<'a> {
                 Arc::clone(observation.query().point().procedure().artifact()),
             );
         }
+        let endpoint_quality = selection.runtime_keyed_read.as_ref().map(|endpoint| {
+            if endpoint.source_origin != RuntimeReadSourceOrigin::PristineRuntimeInput {
+                return (
+                    ProofStatus::Unproven(
+                        "runtime keyed-read source origin is not pristine runtime input".into(),
+                    ),
+                    EvidenceCompleteness::Partial(
+                        "runtime keyed-read source origin is not eligible for matched-value".into(),
+                    ),
+                );
+            }
+            (endpoint.proof.clone(), endpoint.completeness.clone())
+        });
         let proof = if matches!(outcome, SemanticOutcome::Complete { .. }) {
-            selection.proof
+            endpoint_quality.as_ref().map_or_else(
+                || selection.proof.clone(),
+                |(proof, _)| conjoin_proof(&selection.proof, proof),
+            )
         } else {
-            conjoin_proof(
+            let proof = conjoin_proof(
                 &selection.proof,
                 &ProofStatus::Unproven("matched source observation is not proven".into()),
-            )
+            );
+            endpoint_quality
+                .as_ref()
+                .map_or(proof.clone(), |(endpoint_proof, _)| {
+                    conjoin_proof(&proof, endpoint_proof)
+                })
         };
         let completeness = if result.coverage() == CandidateCoverage::Exhaustive {
-            selection.completeness
+            endpoint_quality.as_ref().map_or_else(
+                || selection.completeness.clone(),
+                |(_, endpoint_completeness)| {
+                    conjoin_completeness(&selection.completeness, endpoint_completeness)
+                },
+            )
         } else {
-            conjoin_completeness(
+            let completeness = conjoin_completeness(
                 &selection.completeness,
                 &EvidenceCompleteness::Partial(
                     "matched source observation coverage is not exhaustive".into(),
                 ),
-            )
+            );
+            endpoint_quality
+                .as_ref()
+                .map_or(completeness.clone(), |(_, endpoint_completeness)| {
+                    conjoin_completeness(&completeness, endpoint_completeness)
+                })
         };
         Ok(result
             .observations()

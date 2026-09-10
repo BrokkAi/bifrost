@@ -20,9 +20,6 @@ use crate::analyzer::usages::callable_signature::{
     CallableSignatureReport, callable_signature_reports,
 };
 
-/// Domain separator for the declaration-site anchor of a signature row id.
-const DECLARATION_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.callable_signature_site.v1";
-
 /// One declaration's projected signature entry, shared by its signature row
 /// and each of its parameter rows so a parameter never re-derives the report.
 #[derive(Debug, Clone)]
@@ -88,12 +85,10 @@ pub(super) fn callable_signature_expansions_for_declaration(
 /// byte range. Two overloads of one name are two sites and must never share
 /// it.
 pub(super) fn declaration_site_id(declaration: &DeclarationValue) -> String {
-    let mut digest = LengthDelimitedDigest::new(DECLARATION_SITE_ID_DOMAIN);
-    digest.push(rel_path_string(declaration.unit.source()).as_bytes());
-    digest.push(declaration.unit.fq_name().as_bytes());
-    digest.push(&declaration.range.start_byte.to_le_bytes());
-    digest.push(&declaration.range.end_byte.to_le_bytes());
-    digest.finish().to_string()
+    brokk_bifrost_analysis::analyzer::usages::callable_signature::declaration_site_id(
+        &declaration.unit,
+        declaration.range,
+    )
 }
 
 /// Expand one already-derived signature row into its ordered parameter rows.

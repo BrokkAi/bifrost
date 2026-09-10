@@ -108,11 +108,13 @@ fn visit_retained_artifacts<'a>(
                 | AccessPathRoot::TypeSummary(locator)
                 | AccessPathRoot::ModuleObject(locator)
                 | AccessPathRoot::External(locator) => visit(locator.scope()),
+                AccessPathRoot::RuntimeObject(_) => {}
             },
             RetainedNode::AccessPath(path) => {
                 for selector in path.selectors().iter().rev() {
                     match selector {
                         AccessSelector::Field(field) => visit(field.scope()),
+                        AccessSelector::Property(_) => {}
                         AccessSelector::Index(IndexSelector::Exact(index)) => {
                             stack.push(RetainedNode::Procedure(index.procedure()));
                         }

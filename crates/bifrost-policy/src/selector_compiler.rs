@@ -90,6 +90,14 @@ pub(super) struct PolicySelectedSite {
     /// decorated-parameter query row. The corresponding artifact dependency
     /// is admitted into this selector session before the row escapes.
     pub(super) decorated_parameter: Option<PolicyDecoratedParameterSelection>,
+    /// Exact runtime keyed-read endpoint retained for matched-value policy
+    /// binding. This live descriptor is never persisted in unit products.
+    pub(super) runtime_keyed_read:
+        Option<brokk_bifrost_analysis::analyzer::semantic::RuntimeKeyedReadEndpoint>,
+    /// A keyed-read selector may produce a complete terminal row proving that
+    /// no endpoint exists. Preserve that distinction for matched-value.
+    pub(super) runtime_keyed_read_row: bool,
+    pub(super) runtime_keyed_read_conclusive_exclusion: bool,
     /// This exact row came from the narrowly retained positive subset of an
     /// otherwise incomplete result-contract query.
     pub(super) retained_incomplete_result_contract_query: bool,
@@ -1206,6 +1214,29 @@ impl<'a> PolicySelectorSession<'a> {
                 };
                 let retained_incomplete_result_contract_query =
                     result_contract_subset && result_contract.is_some();
+                let (
+                    runtime_keyed_read,
+                    runtime_keyed_read_row,
+                    runtime_keyed_read_conclusive_exclusion,
+                ) = match (
+                    &item.value,
+                    evidence.runtime_keyed_read.as_ref(),
+                ) {
+                    (
+                        CodeQueryResultValue::RuntimeKeyedReadValue { .. },
+                        Some(endpoint),
+                    ) => (Some(endpoint.clone()), true, false),
+                    (CodeQueryResultValue::RuntimeKeyedReadValue { value }, None) => {
+                        (None, true, value.conclusive_exclusion)
+                    }
+                    (_, Some(_)) => {
+                        return Err(PolicySelectorSessionError::Unavailable(format!(
+                            "selector `{}` attached runtime keyed-read evidence to another row kind",
+                            selector.path
+                        )));
+                    }
+                    (_, None) => (None, false, false),
+                };
                 Ok(Some(PolicySelectedSite {
                     file: evidence.file,
                     span,
@@ -1215,6 +1246,9 @@ impl<'a> PolicySelectorSession<'a> {
                     call_shape,
                     call_binding: None,
                     decorated_parameter,
+                    runtime_keyed_read,
+                    runtime_keyed_read_row,
+                    runtime_keyed_read_conclusive_exclusion,
                     retained_incomplete_result_contract_query,
                 }))
             })
@@ -1456,6 +1490,9 @@ impl<'a> PolicySelectorSession<'a> {
                     result_contract: None,
                     call_shape: None,
                     decorated_parameter: None,
+                    runtime_keyed_read: None,
+                    runtime_keyed_read_row: false,
+                    runtime_keyed_read_conclusive_exclusion: false,
                     retained_incomplete_result_contract_query: false,
                     call_binding: Some(PolicySelectedCallBinding {
                         row_id: value.id.clone(),
@@ -2369,6 +2406,9 @@ fn selector_site_is_projectable(site: &PolicySelectedSite) -> bool {
         && site.call_shape.is_none()
         && site.call_binding.is_none()
         && site.decorated_parameter.is_none()
+        && !site.runtime_keyed_read_row
+        && site.runtime_keyed_read.is_none()
+        && !site.runtime_keyed_read_conclusive_exclusion
         && !site.retained_incomplete_result_contract_query
 }
 
@@ -2575,6 +2615,9 @@ impl<'a> SelectorUnits<'a> {
                     call_shape: None,
                     call_binding: None,
                     decorated_parameter: None,
+                    runtime_keyed_read: None,
+                    runtime_keyed_read_row: false,
+                    runtime_keyed_read_conclusive_exclusion: false,
                     retained_incomplete_result_contract_query: false,
                 })
             })
@@ -2817,6 +2860,43 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::RuntimeKeyedReadValue { value } => {
+                if value.terminal {
+                    if value.conclusive_exclusion && value.outcome == "conclusive_exclusion" {
+                        (ProofStatus::Proven, EvidenceCompleteness::Complete)
+                    } else {
+                        (
+                            ProofStatus::Unproven(
+                                "runtime keyed-read endpoint coverage is incomplete".into(),
+                            ),
+                            EvidenceCompleteness::Partial(
+                                format!(
+                                    "runtime keyed-read limitations are {:?}",
+                                    value.limitations
+                                )
+                                .into(),
+                            ),
+                        )
+                    }
+                } else {
+                    let proof = proof_from_label(value.proof);
+                    let completeness = if value.outcome == "endpoint"
+                        && value.completeness == "complete"
+                        && value.source_origin == "pristine_runtime_input"
+                    {
+                        EvidenceCompleteness::Complete
+                    } else {
+                        EvidenceCompleteness::Partial(
+                            format!(
+                                "runtime keyed-read evidence is outcome={}, source_origin={}, completeness={}",
+                                value.outcome, value.source_origin, value.completeness
+                            )
+                            .into(),
+                        )
+                    };
+                    (proof, completeness)
+                }
+            }
             // An edge row carries its own proof attribution, exactly as a
             // reference site does; set-level completeness is the query's
             // diagnostics' business (#1479).

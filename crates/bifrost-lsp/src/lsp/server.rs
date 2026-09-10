@@ -1801,6 +1801,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::MemberFamilyEdge { value } => &value.path,
                     CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
                     CodeQueryResultValue::FieldWriteValue { value } => &value.path,
+                    CodeQueryResultValue::RuntimeKeyedReadValue { value } => &value.path,
                     CodeQueryResultValue::CallShape { value } => &value.path,
                     CodeQueryResultValue::CallResult { value } => &value.path,
                     CodeQueryResultValue::CallArgumentGroup { value } => &value.path,

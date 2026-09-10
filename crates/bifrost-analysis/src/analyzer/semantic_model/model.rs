@@ -43,6 +43,467 @@ pub const CPP_DECLARATION_SCHEME: &str = "csmi.cpp.declaration";
 pub const CPP_DECLARATION_SCHEME_VERSION: &str = "0.1.0";
 pub const CPP_SIGNATURE_DISAMBIGUATOR_PREFIX: &str = "cppsig-0.1:";
 
+/// The CSMI runtime-values vocabulary consumed by the native semantic-model
+/// layer.  Keep this identity next to the typed records so activation and
+/// interchange cannot silently drift apart.
+pub const RUNTIME_VALUES_VOCABULARY: &str = "csmi.runtime-values";
+pub const RUNTIME_VALUES_VERSION: &str = "0.1.0";
+pub const RUNTIME_VALUES_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/runtime-values/0.1/schema.json";
+pub const COLLECTION_FLOW_VOCABULARY: &str = "csmi.collection-flow";
+pub const COLLECTION_FLOW_VERSION: &str = "0.1.0";
+pub const COLLECTION_FLOW_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/collection-flow/0.1/schema.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeValuesPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposures: Vec<RuntimeGlobalExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behaviors: Vec<KeyedReadBehavior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binding_evidence: Vec<RuntimeGlobalBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<KeyedReadObservation>,
+}
+
+/// Typed native companion for the CSMI collection-flow vocabulary. Collection
+/// flow is kept beside the declaration payload because it has the same shard
+/// activation, provenance, and cache identity as all other authored facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionFlowsPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<CollectionFlowFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionFlowFact {
+    pub callable: String,
+    #[schemars(with = "serde_json::Value")]
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Completeness>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+impl CollectionFlowsPayload {
+    pub fn record_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    pub fn flow(&self, callable: &str) -> Option<&CollectionFlowFact> {
+        self.flows.iter().find(|flow| flow.callable == callable)
+    }
+}
+
+impl RuntimeValuesPayload {
+    pub fn record_count(&self) -> usize {
+        self.exposures
+            .len()
+            .saturating_add(self.behaviors.len())
+            .saturating_add(self.binding_evidence.len())
+            .saturating_add(self.observations.len())
+    }
+
+    pub fn exposure(&self, id: &str) -> Option<&RuntimeGlobalExposure> {
+        self.exposures
+            .iter()
+            .find(|record| record.exposure_id == id)
+    }
+
+    pub fn behavior(&self, id: &str) -> Option<&KeyedReadBehavior> {
+        self.behaviors
+            .iter()
+            .find(|record| record.behavior_id == id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGlobalExposure {
+    #[serde(rename = "exposureId")]
+    pub exposure_id: String,
+    pub languages: Vec<String>,
+    #[serde(rename = "bindingName")]
+    pub binding_name: String,
+    pub runtime: RuntimeApplicability,
+    #[serde(rename = "runtimeProfileDigest")]
+    pub runtime_profile_digest: String,
+    #[serde(rename = "rootIdentity")]
+    pub root_identity: RuntimeRootIdentity,
+    pub members: Vec<String>,
+    pub activation: RuntimeExposureActivation,
+    pub evidence: RuntimeEvidence,
+    pub coverage: RuntimeCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<RuntimeValueExtension>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyedReadBehavior {
+    #[serde(rename = "behaviorId")]
+    pub behavior_id: String,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: String,
+    #[serde(rename = "containerMember")]
+    pub container_member: String,
+    #[serde(rename = "acceptedKeys")]
+    pub accepted_keys: RuntimeAcceptedKeys,
+    #[serde(rename = "normalResult")]
+    pub normal_result: RuntimeNormalResult,
+    #[serde(rename = "exceptionBehavior")]
+    pub exception_behavior: RuntimeExceptionBehavior,
+    #[serde(rename = "mutationModel")]
+    pub mutation_model: RuntimeMutationModel,
+    pub materialization: RuntimeMaterialization,
+    pub evidence: RuntimeEvidence,
+    pub coverage: RuntimeCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<RuntimeValueExtension>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGlobalBindingEvidence {
+    #[serde(rename = "bindingEvidenceId")]
+    pub binding_evidence_id: String,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: String,
+    pub activation: RuntimeActivationEvidence,
+    pub language: String,
+    pub dialect: String,
+    #[serde(rename = "rootOccurrence")]
+    pub root_occurrence: RuntimeSourceRange,
+    #[serde(rename = "scopeIdentity")]
+    pub scope_identity: RuntimeScopedIdentity,
+    #[serde(rename = "lexicalBinding")]
+    pub lexical_binding: RuntimeLexicalBinding,
+    pub rebinding: RuntimeRebinding,
+    pub evidence: RuntimeEvidence,
+    pub coverage: RuntimeCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<RuntimeValueExtension>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyedReadObservation {
+    #[serde(rename = "observationId")]
+    pub observation_id: String,
+    #[serde(rename = "bindingEvidenceId")]
+    pub binding_evidence_id: String,
+    #[serde(rename = "behaviorId")]
+    pub behavior_id: String,
+    #[serde(rename = "baseValue")]
+    pub base_value: RuntimeScopedIdentity,
+    pub key: RuntimeStaticKey,
+    #[serde(rename = "sourceForm")]
+    pub source_form: RuntimeSourceForm,
+    #[serde(rename = "loadOperation")]
+    pub load_operation: RuntimeScopedIdentity,
+    #[serde(rename = "resultValue")]
+    pub result_value: RuntimeScopedIdentity,
+    #[serde(rename = "observationPoint")]
+    pub observation_point: RuntimeScopedIdentity,
+    pub phase: RuntimeObservationPhase,
+    pub expression: RuntimeSourceRange,
+    #[serde(rename = "sourceOrigin")]
+    pub source_origin: RuntimeSourceOrigin,
+    #[serde(rename = "normalOutcome")]
+    pub normal_outcome: RuntimeNormalOutcome,
+    #[serde(rename = "exceptionOutcome")]
+    pub exception_outcome: RuntimeExceptionOutcome,
+    pub evidence: RuntimeEvidence,
+    pub coverage: RuntimeCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<RuntimeValueExtension>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeEvidence {
+    pub producer: String,
+    pub method: String,
+    #[serde(rename = "inputsDigest")]
+    pub inputs_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeValueExtension {
+    pub vocabulary: String,
+    pub version: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeApplicability {
+    #[serde(rename = "runtimeFamily")]
+    pub runtime_family: String,
+    #[serde(rename = "runtimeArtifact")]
+    pub runtime_artifact: String,
+    #[serde(rename = "runtimeArtifactDigest")]
+    pub runtime_artifact_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    pub realm: String,
+    #[serde(rename = "moduleMode")]
+    pub module_mode: String,
+    #[serde(rename = "initializationBoundary")]
+    pub initialization_boundary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "hostAssumptions")]
+    pub host_assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRootIdentity {
+    pub scheme: String,
+    #[serde(rename = "schemeVersion")]
+    pub scheme_version: String,
+    pub descriptors: Vec<RuntimeRootDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRootDescriptor {
+    pub role: RuntimeRootRole,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRootRole {
+    Runtime,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSourceRange {
+    pub resource: String,
+    #[serde(rename = "resourceDigest")]
+    pub resource_digest: String,
+    #[serde(rename = "startByte")]
+    pub start_byte: u64,
+    #[serde(rename = "endByte")]
+    pub end_byte: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeScopedIdentity {
+    #[serde(rename = "ownerDigest")]
+    pub owner_digest: String,
+    pub kind: RuntimeIdentityKind,
+    #[serde(rename = "locatorDigest")]
+    pub locator_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdentityKind {
+    Scope,
+    Value,
+    Operation,
+    Point,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeActivationEvidence {
+    pub outcome: RuntimeActivationOutcome,
+    #[serde(rename = "runtimeProfileDigest")]
+    pub runtime_profile_digest: String,
+    #[serde(rename = "activeSetDigest")]
+    pub active_set_digest: String,
+    #[serde(rename = "activeExposureIds")]
+    pub active_exposure_ids: Vec<String>,
+    #[serde(rename = "modelDigest")]
+    pub model_digest: String,
+    #[serde(rename = "activationSource")]
+    pub activation_source: String,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeActivationOutcome {
+    Matched,
+    NotMatched,
+    Indeterminate,
+    Conflict,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCoverage {
+    pub status: RuntimeCoverageStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<RuntimeCoverageLimitation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeCoverageStatus {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeCoverageLimitation {
+    ActivationMissing,
+    ActivationConflict,
+    ActivationUnsupported,
+    LexicalBindingIndeterminate,
+    RebindingIndeterminate,
+    MutationIncomplete,
+    AccessorOrProxyIncomplete,
+    MaterializationIncomplete,
+    ExceptionBehaviorIndeterminate,
+    DynamicKey,
+    UnsupportedIndex,
+    Cancelled,
+    BudgetExhausted,
+    StaleEvidence,
+    AmbiguousOwner,
+    CoverageLimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeExposureActivation {
+    Enabled,
+    Disabled,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeAcceptedKeys {
+    StaticProperty,
+    StaticIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeNormalResult {
+    ValueOrUndefined,
+    Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeExceptionBehavior {
+    Nonthrowing,
+    MayThrow,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMutationModel {
+    PristineInputUntilWrite,
+    OrdinaryMutable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMaterialization {
+    Eager,
+    Lazy,
+    HostDefined,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeLexicalBinding {
+    Absent,
+    Present,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeRebinding {
+    Excluded,
+    Present,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RuntimeStaticKey {
+    Property { value: String },
+    Index { value: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSourceForm {
+    Dot,
+    BracketString,
+    BracketNumber,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeObservationPhase {
+    BeforeEffects,
+    AfterEffects,
+    Exceptional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSourceOrigin {
+    PristineRuntimeInput,
+    Mutated,
+    Indeterminate,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeNormalOutcome {
+    Exact,
+    Partial,
+    Unsupported,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeExceptionOutcome {
+    Excluded,
+    Possible,
+    Unsupported,
+    Indeterminate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
@@ -470,6 +931,13 @@ pub struct AuthoredShard {
     pub id: String,
     pub activation: Vec<ActivationSelector>,
     pub payload: AuthoredPayload,
+    /// Runtime-global and keyed-read contracts are a shard companion rather
+    /// than declarations. Keeping them beside the activation selectors makes
+    /// the active snapshot own the same applicability and provenance boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_values: Option<RuntimeValuesPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_flows: Option<CollectionFlowsPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

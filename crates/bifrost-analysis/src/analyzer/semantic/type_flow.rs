@@ -1081,6 +1081,29 @@ pub trait TypeFlowAdapter: Send + Sync {
         vec![NarrowingVerdict::Unknown; atoms.len()]
     }
 
+    /// Every value [`call_guard_narrowing`](Self::call_guard_narrowing) and
+    /// [`normal_return_type_constraints`](Self::normal_return_type_constraints)
+    /// can name as a subject in `procedure`.
+    ///
+    /// Binding refinement carries temporal-identity state only for the values
+    /// a consumer can ask about, so an implementation that names a value
+    /// outside this set asks about state that was never carried. Both methods
+    /// constrain an actual argument of a call, so the default answer is every
+    /// call-site argument. An adapter that recognizes fewer calls should say
+    /// so here; the answer is a promise, and the consumer checks it.
+    fn refinement_subjects(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+    ) -> Vec<ValueId> {
+        procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .flat_map(|call| call.arguments.iter().map(|argument| argument.value))
+            .collect()
+    }
+
     /// Derive a guard from an exactly resolved workspace predicate call.
     /// Return the constrained actual argument and one verdict per candidate,
     /// with the same true/false-arm contract as `narrowing_verdicts`.

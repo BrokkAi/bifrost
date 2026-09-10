@@ -522,6 +522,8 @@ fn finish_production(
             members,
             relations: Vec::new(),
         },
+        runtime_values: None,
+        collection_flows: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),

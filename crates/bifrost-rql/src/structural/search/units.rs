@@ -619,6 +619,7 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::ReceiverOutcome(id) => key("receiver_outcome").text(id).finish(),
         PipelineKey::ReceiverEvidence(id) => key("receiver_evidence").text(id).finish(),
         PipelineKey::FieldWriteValue(id) => key("field_write_value").text(id).finish(),
+        PipelineKey::RuntimeKeyedReadValue(id) => key("keyed_read_value").text(id).finish(),
         PipelineKey::CallShape(id) => key("call_shape").text(id).finish(),
         PipelineKey::CallArgumentGroup(id) => key("call_argument_group").text(id).finish(),
         PipelineKey::CallArgument(id) => key("call_argument").text(id).finish(),
@@ -882,6 +883,7 @@ impl UnitRowEvidence {
                 .map(|provenance| provenance.to_detailed(root))
                 .collect(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         }
     }
 }
@@ -1014,14 +1016,18 @@ pub struct UnitRowItem {
     /// Every scalar the row's domain declares and this row carries, in the
     /// domain's own declaration order.
     ///
-    /// This is the row's whole addressable surface -- exactly what
-    /// [`CodeQueryRowRef::field`] answers -- carried because a relational
+    /// Together with `unknown_fields`, this is the row's whole addressable
+    /// surface -- exactly what [`CodeQueryRowRef::field`] answers. It is carried because a relational
     /// assertion reads its bindings' rows by field name, and it reads them
     /// from the merged product of units rather than from a live execution.
     /// Optional fields the row does not carry are absent rather than null, the
     /// same answer the live row gives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<UnitRowField>,
+    /// Registered fields whose evidence is unavailable. Preserve this across
+    /// unit reuse so a cached unknown cannot become an ordinary absent value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_fields: Vec<UnitRowUnknownField>,
     /// The per-family fields the policy match adapter reads, or `None` for an
     /// analysis-only row the adapter refuses before reading any field of it.
     pub terminal: Option<UnitRowItemTerminal>,
@@ -1034,23 +1040,29 @@ impl UnitRowItem {
     pub fn project(item: &CodeQueryResultItem) -> Self {
         let domain = item.value.detailed_domain();
         let row = item.value.row();
+        let mut fields = Vec::new();
+        let mut unknown_fields = Vec::new();
+        for field in domain.row_fields() {
+            match row.field(field.name) {
+                Ok(Some(value)) => fields.push(UnitRowField {
+                    name: boxed(field.name),
+                    value: UnitRowScalar::project(value),
+                }),
+                Ok(None) => {}
+                Err(error) => unknown_fields.push(UnitRowUnknownField {
+                    name: boxed(field.name),
+                    reason: error
+                        .unknown_reason()
+                        .expect("registered fields fail only for unavailable evidence"),
+                }),
+            }
+        }
         Self {
             domain,
             path: boxed(row_path(&item.value)),
             range: item.value.display_range(),
-            fields: domain
-                .row_fields()
-                .iter()
-                .filter_map(|field| {
-                    let value = row
-                        .field(field.name)
-                        .expect("a domain declares only fields its own rows answer")?;
-                    Some(UnitRowField {
-                        name: boxed(field.name),
-                        value: UnitRowScalar::project(value),
-                    })
-                })
-                .collect(),
+            fields,
+            unknown_fields,
             terminal: UnitRowItemTerminal::project(&item.value),
             provenance: item
                 .provenance
@@ -1064,8 +1076,9 @@ impl UnitRowItem {
     /// One scalar of this row, by the field name its domain declares.
     ///
     /// The same answer [`CodeQueryRowRef::field`] gives for the row this was
-    /// projected from: `Err` for a field the domain does not declare, `Ok(None)`
-    /// for a declared field this row does not carry.
+    /// projected from: `Err` for an unregistered field or unavailable evidence,
+    /// and `Ok(None)` for a genuinely absent optional value. Unknown evidence
+    /// carries a typed reason and must not be interpreted as null.
     pub fn field(
         &self,
         name: &str,
@@ -1078,12 +1091,29 @@ impl UnitRowItem {
         {
             return Err(CodeQueryRowFieldError::unregistered(self.domain, name));
         }
+        if let Some(field) = self
+            .unknown_fields
+            .iter()
+            .find(|field| field.name.as_ref() == name)
+        {
+            return Err(CodeQueryRowFieldError::unknown(
+                self.domain,
+                name,
+                field.reason,
+            ));
+        }
         Ok(self
             .fields
             .iter()
             .find(|field| field.name.as_ref() == name)
             .map(|field| field.value.borrowed()))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRowUnknownField {
+    pub name: Box<str>,
+    pub reason: CodeQueryRowFieldUnknownReason,
 }
 
 /// One scalar of a row's addressable field surface, owned.
@@ -1299,6 +1329,9 @@ impl UnitRowItemTerminal {
                     coverage: boxed(value.coverage),
                 }
             }
+            CodeQueryResultValue::RuntimeKeyedReadValue { .. } => {
+                UnitRowItemTerminal::SourcePosition
+            }
             CodeQueryResultValue::CallResult { value } => UnitRowItemTerminal::CallResult {
                 proof: boxed(value.proof),
             },
@@ -1380,6 +1413,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::DecoratedParameter { value } => &value.path,
         CodeQueryResultValue::JsxAttributeValue { value } => &value.path,
         CodeQueryResultValue::FieldWriteValue { value } => &value.path,
+        CodeQueryResultValue::RuntimeKeyedReadValue { value } => &value.path,
         CodeQueryResultValue::CallResult { value } => &value.path,
         CodeQueryResultValue::Occurrence { value } => &value.path,
         CodeQueryResultValue::LexicalScope { value } => &value.path,
@@ -1873,6 +1907,10 @@ fn row_branch(row: &UnitRow) -> &[usize] {
 /// extended together because the policy adapter rejects a row whose two
 /// provenance vectors differ in length.
 fn merge_duplicate_row(item: &mut UnitRowItem, evidence: &mut UnitRowEvidence, row: UnitRow) {
+    assert_eq!(
+        item.unknown_fields, row.item.unknown_fields,
+        "duplicate rows in one query snapshot have the same field evidence"
+    );
     debug_assert_eq!(
         item.provenance.len(),
         evidence.provenance.len(),

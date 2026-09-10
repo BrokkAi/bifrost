@@ -18,14 +18,15 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{Language, ProjectFile, Range, parser_language_for_dialect};
 use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC;
+use brokk_bifrost_js_ts::structural::{JAVASCRIPT_STRUCTURAL_SPEC, TYPESCRIPT_STRUCTURAL_SPEC};
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
+    pattern_binder_identifiers, static_member_receiver,
 };
 use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v16";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v19";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v17";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v20";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -88,18 +89,21 @@ enum StructuralNodeIndexOutcome {
 }
 
 impl StructuralNodeIndex {
-    fn for_typescript(
+    fn for_source(
         prepared: &PreparedSyntaxTree,
         max_work_items: usize,
         cancellation: &CancellationToken,
     ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
         let grammar = parser_language_for_dialect(prepared.dialect()).ok_or_else(|| {
             SemanticProviderError::internal(
-                "TypeScript semantic lowering has no structural parser language",
+                "JS/TS semantic lowering has no structural parser language",
             )
         })?;
         let extracted = extract_file_facts_from_tree_limited(
-            &TYPESCRIPT_STRUCTURAL_SPEC,
+            match prepared.dialect().language() {
+                Language::JavaScript => &JAVASCRIPT_STRUCTURAL_SPEC,
+                _ => &TYPESCRIPT_STRUCTURAL_SPEC,
+            },
             &grammar,
             prepared.tree(),
             prepared.source(),
@@ -116,7 +120,7 @@ impl StructuralNodeIndex {
             LimitedFileFacts::Cancelled => return Ok(StructuralNodeIndexOutcome::Cancelled),
             LimitedFileFacts::Unavailable => {
                 return Err(SemanticProviderError::internal(
-                    "TypeScript structural identity extraction is unavailable",
+                    "JS/TS structural identity extraction is unavailable",
                 ));
             }
             LimitedFileFacts::Complete(_) => {
@@ -296,12 +300,12 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
             })
             .collect::<HashMap<_, _>>();
         let imports = compute_import_binder(prepared.source(), prepared.tree());
-        let structural_node_index = if matches!(self.flavor, JsTsSemanticFlavor::TypeScript) {
+        let structural_node_index = {
             let max_work_items = budget
                 .limits()
                 .nested_entries
                 .saturating_sub(inventory_work.nested_entries);
-            match StructuralNodeIndex::for_typescript(prepared, max_work_items, cancellation)? {
+            match StructuralNodeIndex::for_source(prepared, max_work_items, cancellation)? {
                 StructuralNodeIndexOutcome::Complete { index, work_items } => {
                     let work = SemanticWork {
                         nested_entries: work_items,
@@ -335,8 +339,6 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                     });
                 }
             }
-        } else {
-            None
         };
         if cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -501,6 +503,12 @@ struct CleanupRegion<'tree> {
     id: CleanupRegionId,
     body: Node<'tree>,
     outer_scope: ScopeFrameId,
+}
+
+#[derive(Clone)]
+struct EntryIteration {
+    receiver: ValueId,
+    fields: Vec<SemanticLocator>,
 }
 
 type ElementFieldLocators = HashMap<Box<str>, SemanticLocator>;

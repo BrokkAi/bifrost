@@ -2811,7 +2811,8 @@ fn neutral_object_supports_receiver(
             | AbstractObjectIdentity::LexicalCell(_)
             | AbstractObjectIdentity::CaptureSlot(_)
             | AbstractObjectIdentity::TypeSummary(_)
-            | AbstractObjectIdentity::External(_),
+            | AbstractObjectIdentity::External(_)
+            | AbstractObjectIdentity::RuntimeObject(_),
             _,
         ) => true,
         _ => false,
@@ -3164,6 +3165,7 @@ fn project_receiver_values(
             | AbstractObjectIdentity::TypeSummary(_)
             | AbstractObjectIdentity::ModuleObject(_)
             | AbstractObjectIdentity::External(_) => nominal_instance = true,
+            AbstractObjectIdentity::RuntimeObject(_) => {}
         }
     }
     let static_reference = matches!(

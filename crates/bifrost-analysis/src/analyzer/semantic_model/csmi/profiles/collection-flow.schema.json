@@ -1,0 +1,756 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/collection-flow/0.1/schema.json",
+  "title": "CSMI collection-flow 0.1.0 payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "callable",
+    "roots",
+    "transfers",
+    "invocations"
+  ],
+  "properties": {
+    "kind": {
+      "const": "collection-flow"
+    },
+    "callable": {
+      "$ref": "#/$defs/localId"
+    },
+    "receiverSubstitution": {
+      "$ref": "#/$defs/substitution"
+    },
+    "roots": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/rootShape"
+      }
+    },
+    "transfers": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/transfer"
+      }
+    },
+    "invocations": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/invocation"
+      }
+    }
+  },
+  "$defs": {
+    "typeExpression": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/unknownType"
+        },
+        {
+          "$ref": "#/$defs/referenceType"
+        },
+        {
+          "$ref": "#/$defs/parameterType"
+        },
+        {
+          "$ref": "#/$defs/intrinsicType"
+        }
+      ]
+    },
+    "unknownType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "unknown"
+        }
+      }
+    },
+    "referenceType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "symbol"
+      ],
+      "properties": {
+        "kind": {
+          "const": "reference"
+        },
+        "symbol": {
+          "$ref": "#/$defs/localId"
+        },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/typeExpression"
+          }
+        }
+      }
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "parameterType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "symbol"
+      ],
+      "properties": {
+        "kind": {
+          "const": "parameter"
+        },
+        "symbol": {
+          "$ref": "#/$defs/localId"
+        }
+      }
+    },
+    "intrinsicType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "vocabulary",
+        "version",
+        "identifier"
+      ],
+      "properties": {
+        "kind": {
+          "const": "intrinsic"
+        },
+        "vocabulary": {
+          "$ref": "#/$defs/vocabularyIdentifier"
+        },
+        "version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "identifier": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "vocabularyIdentifier": {
+      "type": "string",
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "inputBoundaryRoot": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/inputReceiverRoot"
+        },
+        {
+          "$ref": "#/$defs/inputParameterRoot"
+        },
+        {
+          "$ref": "#/$defs/inputCaptureRoot"
+        }
+      ]
+    },
+    "inputReceiverRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "receiver"
+        }
+      }
+    },
+    "inputParameterRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "position"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "parameter"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "inputCaptureRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "symbol"
+      ],
+      "properties": {
+        "phase": {
+          "const": "input"
+        },
+        "role": {
+          "const": "capture"
+        },
+        "symbol": {
+          "$ref": "#/$defs/localId"
+        }
+      }
+    },
+    "outputBoundaryRoot": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/outputReceiverRoot"
+        },
+        {
+          "$ref": "#/$defs/outputParameterRoot"
+        },
+        {
+          "$ref": "#/$defs/outputCaptureRoot"
+        },
+        {
+          "$ref": "#/$defs/outputResultRoot"
+        },
+        {
+          "$ref": "#/$defs/outputExceptionRoot"
+        }
+      ]
+    },
+    "outputReceiverRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role"
+      ],
+      "properties": {
+        "phase": {
+          "const": "output"
+        },
+        "role": {
+          "const": "receiver"
+        }
+      }
+    },
+    "outputParameterRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "position"
+      ],
+      "properties": {
+        "phase": {
+          "const": "output"
+        },
+        "role": {
+          "const": "parameter"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "outputCaptureRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "symbol"
+      ],
+      "properties": {
+        "phase": {
+          "const": "output"
+        },
+        "role": {
+          "const": "capture"
+        },
+        "symbol": {
+          "$ref": "#/$defs/localId"
+        }
+      }
+    },
+    "outputResultRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role",
+        "position"
+      ],
+      "properties": {
+        "phase": {
+          "const": "output"
+        },
+        "role": {
+          "const": "result"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "outputExceptionRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "role"
+      ],
+      "properties": {
+        "phase": {
+          "const": "output"
+        },
+        "role": {
+          "const": "exception"
+        }
+      }
+    },
+    "limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "diagnostic": {
+          "$ref": "#/$defs/diagnostic"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "other"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "diagnostic"
+            ]
+          }
+        }
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "details": true
+      }
+    },
+    "shape": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "type"
+          ],
+          "properties": {
+            "kind": {
+              "const": "value"
+            },
+            "type": {
+              "$ref": "#/$defs/typeExpression"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "components"
+          ],
+          "properties": {
+            "kind": {
+              "const": "product"
+            },
+            "components": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/shape"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "const": "keyed"
+            },
+            "key": {
+              "$ref": "#/$defs/shape"
+            },
+            "value": {
+              "$ref": "#/$defs/shape"
+            },
+            "entryComponents": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "key",
+                  "value"
+                ]
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "uniqueItems": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "limitation"
+          ],
+          "properties": {
+            "kind": {
+              "const": "unknown"
+            },
+            "limitation": {
+              "$ref": "#/$defs/limitation"
+            }
+          }
+        }
+      ]
+    },
+    "keySelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "position"
+          ],
+          "properties": {
+            "kind": {
+              "const": "parameter"
+            },
+            "position": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "args"
+          ],
+          "properties": {
+            "kind": {
+              "const": "entry"
+            },
+            "args": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "$ref": "#/$defs/keySelector"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "entry-key",
+                "entry-value"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "args"
+          ],
+          "properties": {
+            "kind": {
+              "const": "component"
+            },
+            "args": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "position"
+              ],
+              "properties": {
+                "position": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "schemeVersion",
+        "steps"
+      ],
+      "properties": {
+        "scheme": {
+          "const": "csmi.collection-flow"
+        },
+        "schemeVersion": {
+          "const": "0.1.0"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        }
+      }
+    },
+    "inputLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/inputBoundaryRoot"
+        },
+        "projection": {
+          "$ref": "#/$defs/projection"
+        }
+      }
+    },
+    "outputLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/outputBoundaryRoot"
+        },
+        "projection": {
+          "$ref": "#/$defs/projection"
+        }
+      }
+    },
+    "rootShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "shape"
+      ],
+      "properties": {
+        "root": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/inputBoundaryRoot"
+            },
+            {
+              "$ref": "#/$defs/outputBoundaryRoot"
+            }
+          ]
+        },
+        "shape": {
+          "$ref": "#/$defs/shape"
+        }
+      }
+    },
+    "transfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "destination"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/inputLocation"
+        },
+        "destination": {
+          "$ref": "#/$defs/outputLocation"
+        }
+      }
+    },
+    "argument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "parameter"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/inputLocation"
+        },
+        "parameter": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "callback",
+        "parameters",
+        "arguments",
+        "timing"
+      ],
+      "properties": {
+        "callback": {
+          "$ref": "#/$defs/inputLocation"
+        },
+        "parameters": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/shape"
+          }
+        },
+        "arguments": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/argument"
+          }
+        },
+        "timing": {
+          "const": "during-call"
+        }
+      }
+    },
+    "substitution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "declaration"
+          ],
+          "properties": {
+            "kind": {
+              "const": "receiver-arguments"
+            },
+            "declaration": {
+              "$ref": "#/$defs/localId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "limitation"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "unknown",
+                "unsupported"
+              ]
+            },
+            "limitation": {
+              "$ref": "#/$defs/limitation"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

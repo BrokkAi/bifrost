@@ -1112,6 +1112,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                         members,
                         relations: Vec::new(),
                     },
+                    runtime_values: None,
+                    collection_flows: None,
                 }],
             }),
             diagnostics,

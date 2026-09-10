@@ -1591,6 +1591,25 @@ pub fn parse_python_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+/// Every target a possibly chained assignment binds.
+///
+/// Python's `encrypt = decrypt = process` binds both names, but the grammar
+/// spells it as one `assignment` whose `right` is another `assignment`. Reading
+/// only the outermost `left` declares `encrypt` and silently drops `decrypt`,
+/// so the alias reads as an absent member on the class that defines it.
+fn python_chained_assignment_targets<'tree>(assignment: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut targets = Vec::new();
+    let mut node = assignment;
+    while let Some(left) = node.child_by_field_name("left") {
+        targets.push(left);
+        match node.child_by_field_name("right") {
+            Some(right) if right.kind() == "assignment" => node = right,
+            _ => break,
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod supertype_tests {
     use super::extract_python_supertypes;
@@ -1646,26 +1665,4 @@ mod supertype_tests {
             );
         }
     }
-}
-
-/// Every target a possibly chained assignment binds.
-///
-/// Python's `encrypt = decrypt = process` binds both names, but the grammar
-/// spells it as one `assignment` whose `right` is another `assignment`. Reading
-/// only the outermost `left` declares `encrypt` and silently drops `decrypt`,
-/// so the alias reads as an absent member on the class that defines it.
-fn python_chained_assignment_targets<'tree>(assignment: Node<'tree>) -> Vec<Node<'tree>> {
-    let mut targets = Vec::new();
-    let mut node = assignment;
-    loop {
-        let Some(left) = node.child_by_field_name("left") else {
-            break;
-        };
-        targets.push(left);
-        match node.child_by_field_name("right") {
-            Some(right) if right.kind() == "assignment" => node = right,
-            _ => break,
-        }
-    }
-    targets
 }

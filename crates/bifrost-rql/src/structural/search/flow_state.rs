@@ -356,6 +356,8 @@ pub(super) const STATE_EVENT_AXES: &[FlowStateAxis] =
 pub(super) const FLOW_RELATION_AXES: &[FlowStateAxis] = &[
     FlowStateAxis::ReachingRelation,
     FlowStateAxis::DominanceRelation,
+    FlowStateAxis::PropertyReachingRelation,
+    FlowStateAxis::PropertyDominanceRelation,
     FlowStateAxis::SameEvaluationRelation,
 ];
 
@@ -409,6 +411,22 @@ fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCo
         BindingWithoutEstablishment { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the lowering declares a local binding it never establishes",
+        ),
+        PropertyProviderUnavailable => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "the structured property-reaching provider was unavailable",
+        ),
+        PropertyProviderFailed { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "the structured property-reaching provider returned a typed error",
+        ),
+        PropertyAnalysisPartial { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "the structured property-reaching snapshot was unavailable from a partial outcome",
+        ),
+        PropertyReaching { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "structured property-reaching evidence was incomplete",
         ),
         ControlProjectionRejected { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
@@ -632,7 +650,7 @@ pub(super) fn public_flow_relation(
         target: state_event_ref(&value.procedure_id, value.target(), target_range),
         completeness: axis_completeness_label(
             &value.derivation().completeness,
-            row.relation.axis(),
+            row.relation.axis_for_subject(value.target().subject.kind()),
         ),
         uncovered_axes: uncovered_axes(&value.derivation().completeness),
         generation: row.generation,
@@ -690,7 +708,8 @@ fn uncovered_axes(completeness: &FlowStateCompleteness) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::structural::flow_state::{
-        ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_STATE_EVENT_CLASSES, StateEventClass,
+        ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
+        StateEventClass,
     };
 
     #[test]
@@ -700,12 +719,14 @@ mod tests {
         }
         for relation in ALL_FLOW_RELATIONS {
             assert!(!relation.label().is_empty());
-            assert!(FLOW_STATE_AXES.contains(&relation.axis()));
+            for subject in ALL_FLOW_SUBJECT_KINDS {
+                assert!(FLOW_STATE_AXES.contains(&relation.axis_for_subject(*subject)));
+            }
         }
         for certainty in ALL_FLOW_CERTAINTIES {
             assert!(!certainty.label().is_empty());
         }
-        assert_eq!(FLOW_STATE_AXES.len(), 5);
+        assert_eq!(FLOW_STATE_AXES.len(), 7);
     }
 
     #[test]

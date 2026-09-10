@@ -29,6 +29,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
                 | CodeQueryResultValue::FieldWriteValue { .. }
+                | CodeQueryResultValue::RuntimeKeyedReadValue { .. }
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallResult { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
@@ -345,6 +346,24 @@ impl CodeQueryResult {
                             value.coverage,
                             value.text,
                             value.member_target.fq_name,
+                        ));
+                    }
+                    CodeQueryResultValue::RuntimeKeyedReadValue { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [keyed read; {}; {}; {}] {}.{}[{}] `{}`\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.outcome,
+                            value.proof,
+                            value.completeness,
+                            value.global,
+                            value.container,
+                            value.index.map_or_else(
+                                || value.property.as_deref().unwrap_or("?"),
+                                |_| "index"
+                            ),
+                            value.text,
                         ));
                     }
                     CodeQueryResultValue::DispatchOutcome { value } => {

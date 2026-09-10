@@ -17,10 +17,11 @@ jobs:
   scan:
     name: bifrost code-smells scan
     runs-on: ubuntu-latest
-    # A cold release-mode repository scan is primarily serial. Keep enough
-    # wall-clock budget for the complete report and fail closed on any
-    # incomplete analysis or finding-gate failure.
-    timeout-minutes: 90
+    # A cold release-mode repository scan is primarily serial. Cache-invalidating
+    # analyzer changes can require both sides of the PR diff to be rebuilt, so
+    # keep enough wall-clock budget for the complete report and fail closed on
+    # any incomplete analysis or finding-gate failure.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:

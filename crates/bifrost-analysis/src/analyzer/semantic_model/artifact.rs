@@ -95,6 +95,10 @@ pub struct CompiledShard {
     pub(crate) license: String,
     pub(crate) completeness: Completeness,
     pub(crate) safety: Safety,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_values: Option<RuntimeValuesPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collection_flows: Option<CollectionFlowsPayload>,
     /// The pack-level native C/C++ evidence is repeated in each shard wire
     /// envelope so a shard remains self-describing after extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +112,18 @@ impl CompiledShard {
     }
 
     pub fn record_count(&self) -> usize {
-        self.payload.record_count()
+        self.payload
+            .record_count()
+            .saturating_add(
+                self.runtime_values
+                    .as_ref()
+                    .map_or(0, RuntimeValuesPayload::record_count),
+            )
+            .saturating_add(
+                self.collection_flows
+                    .as_ref()
+                    .map_or(0, CollectionFlowsPayload::record_count),
+            )
     }
 
     pub fn pack_id(&self) -> &str {
@@ -141,6 +156,14 @@ impl CompiledShard {
 
     pub fn cpp_portability(&self) -> Option<&CppPortabilityEvidence> {
         self.cpp_portability.as_ref()
+    }
+
+    pub fn runtime_values(&self) -> Option<&RuntimeValuesPayload> {
+        self.runtime_values.as_ref()
+    }
+
+    pub fn collection_flows(&self) -> Option<&CollectionFlowsPayload> {
+        self.collection_flows.as_ref()
     }
 }
 
@@ -659,6 +682,10 @@ struct WireCompiledShard {
     completeness: Completeness,
     safety: Safety,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_values: Option<RuntimeValuesPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_flows: Option<CollectionFlowsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cpp_portability: Option<CppPortabilityEvidence>,
     payload: CompiledPayload,
 }
@@ -1039,6 +1066,8 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         license: wire.license,
         completeness: wire.completeness,
         safety: wire.safety,
+        runtime_values: wire.runtime_values,
+        collection_flows: wire.collection_flows,
         cpp_portability: wire.cpp_portability,
         payload: wire.payload,
     }
@@ -1198,6 +1227,10 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         completeness: Completeness,
         safety: &'a Safety,
         #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_values: &'a Option<RuntimeValuesPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        collection_flows: &'a Option<CollectionFlowsPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         payload: &'a CompiledPayload,
     }
@@ -1211,6 +1244,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         activation: &shard.activation,
         completeness: shard.completeness,
         safety: &shard.safety,
+        runtime_values: &shard.runtime_values,
+        collection_flows: &shard.collection_flows,
         cpp_portability: &shard.cpp_portability,
         payload: &shard.payload,
     })?;
@@ -1509,6 +1544,8 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
             id: shard.shard_id.clone(),
             activation: shard.activation.clone(),
             payload: authored_payload_from_compiled(&shard.payload),
+            runtime_values: shard.runtime_values.clone(),
+            collection_flows: shard.collection_flows.clone(),
         }],
     }
 }

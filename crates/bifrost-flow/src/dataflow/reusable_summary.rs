@@ -1239,6 +1239,12 @@ pub enum SummaryConcurrencyAtomicOperation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SummaryConcurrencyAccessSelector {
     Field(SummaryLocationKey),
+    /// A statically known property key without a declaration locator.
+    ///
+    /// This is distinct from `Field`: runtime-backed properties such as
+    /// `process.env.KEY` have a stable key but no source declaration to use
+    /// as a locator.
+    Property(String),
     Aggregate,
     ConstantIndex(i128),
     Index(SummaryPort),

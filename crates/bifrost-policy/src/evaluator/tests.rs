@@ -1476,6 +1476,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         source_slice_sha256: Some([7; 32]),
         provenance: Vec::new(),
         decorated_parameter: None,
+        runtime_keyed_read: None,
     };
     let candidate = adapt_match_candidate(
         &policy_id,
@@ -1730,6 +1731,7 @@ fn invalid_owner_candidate_forces_weak_anchor() {
         source_slice_sha256: Some([1; 32]),
         provenance: Vec::new(),
         decorated_parameter: None,
+        runtime_keyed_read: None,
     };
     assert!(matches!(OwnerCandidate::Rejected, OwnerCandidate::Rejected));
     let projected = UnitRowEvidence::project(&evidence);
@@ -1775,6 +1777,7 @@ fn weak_key_is_domain_and_span_separated() {
         source_slice_sha256: None,
         provenance: Vec::new(),
         decorated_parameter: None,
+        runtime_keyed_read: None,
     };
     let path = WorkspaceRelativePath::new("src/app.ts").expect("path");
     let key = |span| weak_finding_key(&UnitRowEvidence::project(&evidence(span)), &path);

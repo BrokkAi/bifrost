@@ -2,9 +2,10 @@ use super::*;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::go::package_identity::{GoModeledNominalType, GoModeledPackageCallResolution};
 use crate::analyzer::languages::package_fq_name;
+use crate::analyzer::semantic::{PropertyReachingLimits, SourceSpan, ValueFlowRelationKind};
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    DefinitionLanguageScope, DispatchExtensibility, RelationalBatchOutcome,
+    DefinitionLanguageScope, DispatchExtensibility, QueryReadIncomplete, RelationalBatchOutcome,
     RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
     SignatureMetadata, StructuredTypeIdentity, go_internal_import_allowed,
 };
@@ -2741,7 +2742,7 @@ fn go_local_binding_type_fqn(
                     result_ordinal,
                 ),
                 GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
-                    analyzer, token, support, file, source, root, range_node,
+                    analyzer, token, support, file, source, root, range_node, name, byte,
                 ),
                 GoLocalBinding::Opaque => None,
             };
@@ -2764,12 +2765,209 @@ enum GoLocalBinding<'tree> {
     Opaque,
 }
 
+/// Structured lexical context for an expression evaluation.
+///
+/// A range expression evaluates before its `:=` binder is established.  The
+/// source-order resolver cannot express that fact by moving the lookup byte,
+/// because the moved byte is only a fabricated proxy for the evaluation.  A
+/// range evaluation instead carries the exact clause identity that must be
+/// excluded while resolving its RHS.  The source span is retained alongside
+/// the tree-sitter identity so a future semantic evidence join can validate
+/// the barrier against the corresponding source mapping.
+#[derive(Clone, Copy, Default)]
+struct GoLexicalEvaluation {
+    range_barrier: Option<GoRangeEvaluationEvidence>,
+}
+
+#[derive(Clone, Copy)]
+struct GoRangeEvaluationEvidence {
+    /// The semantic provider must establish this relation before the barrier
+    /// can be installed.  Keeping the source identity here lets the provider
+    /// join its event mapping without handing flow-internal IDs to this
+    /// resolver.
+    barrier: GoRangeEvaluationBarrier,
+}
+
+#[derive(Clone, Copy)]
+struct GoRangeEvaluationBarrier {
+    node_id: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GoSourceNodeIdentity {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl GoSourceNodeIdentity {
+    fn of(node: Node<'_>) -> Self {
+        Self {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        }
+    }
+
+    fn is_contained_by(self, span: SourceSpan) -> bool {
+        span.start_byte() as usize <= self.start_byte && span.end_byte() as usize >= self.end_byte
+    }
+}
+
+impl GoLexicalEvaluation {
+    fn ordinary() -> Self {
+        Self::default()
+    }
+
+    fn with_range_evidence(evidence: GoRangeEvaluationEvidence) -> Self {
+        Self {
+            range_barrier: Some(evidence),
+        }
+    }
+
+    fn excludes_range_node(self, node: Node<'_>) -> bool {
+        self.range_barrier.is_some_and(|evidence| {
+            let barrier = evidence.barrier;
+            barrier.node_id == node.id()
+                && barrier.start_byte == node.start_byte()
+                && barrier.end_byte == node.end_byte()
+        })
+    }
+}
+
+/// Ask the analysis-owned source relation for permission to suppress this
+/// range binder while resolving its RHS.
+///
+/// Returning `None` is conservative: no lexical barrier is installed and the
+/// caller reports incomplete semantic evidence rather than claiming that
+/// syntax alone proved the evaluation order.
+#[allow(clippy::too_many_arguments)]
+fn go_range_evaluation(
+    analyzer: &dyn IAnalyzer,
+    _token: QueryToken<'_>,
+    support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    _root: Node<'_>,
+    range_node: Node<'_>,
+    right: Node<'_>,
+    binding_name: &str,
+) -> Option<GoLexicalEvaluation> {
+    let references = go_expression_binding_references(support, right, source, binding_name)?;
+    if references.is_empty() {
+        return Some(GoLexicalEvaluation::ordinary());
+    }
+    let left = range_node.child_by_field_name("left")?;
+    let binding_index = go_expression_list_index(support, left, source, binding_name)?;
+    debug_assert_eq!(binding_index, 1, "the range-element route owns binder one");
+    let binding = left.named_child(binding_index)?;
+    if binding.kind() != "identifier" {
+        return None;
+    }
+    let binding = GoSourceNodeIdentity::of(binding);
+    let local_cancellation = CancellationToken::new();
+    let active_cancellation = analyzer.active_query_cancellation();
+    let cancellation = active_cancellation.as_ref().unwrap_or(&local_cancellation);
+    if cancellation.is_cancelled() {
+        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+        return None;
+    }
+    if analyzer.property_reaching_provider().is_none() {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "Go range evaluation provider unavailable".into(),
+        ));
+        return None;
+    }
+    let right_range = Range {
+        start_byte: right.start_byte(),
+        end_byte: right.end_byte(),
+        start_line: right.start_position().row,
+        end_line: right.end_position().row,
+    };
+    let result = analyzer.property_reaching_for_source_range(
+        file,
+        &right_range,
+        PropertyReachingLimits::default(),
+        cancellation,
+    );
+    let proven = result.evaluations().iter().any(|relation| {
+        relation.is_proven_complete()
+            && relation.establishment.kind == ValueFlowRelationKind::Assignment
+            && relation.establishment.procedure == relation.read.procedure
+            && references.iter().any(|reference| {
+                reference.is_contained_by(relation.read.source_locator.anchor().span())
+            })
+            && binding.is_contained_by(relation.establishment.source_locator.anchor().span())
+    });
+    if !result.evaluations_complete() || !proven {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "Go range RHS and binder lack complete same-evaluation evidence".into(),
+        ));
+        return None;
+    }
+    Some(GoLexicalEvaluation::with_range_evidence(
+        GoRangeEvaluationEvidence {
+            barrier: GoRangeEvaluationBarrier {
+                node_id: range_node.id(),
+                start_byte: range_node.start_byte(),
+                end_byte: range_node.end_byte(),
+            },
+        },
+    ))
+}
+
+fn go_expression_binding_references(
+    support: &dyn GoDefinitionProvider,
+    expression: Node<'_>,
+    source: &str,
+    binding_name: &str,
+) -> Option<Vec<GoSourceNodeIdentity>> {
+    let mut stack = vec![expression];
+    let mut references = Vec::new();
+    while let Some(node) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if node.kind() == "identifier" && go_node_text(node, source) == binding_name {
+            references.push(GoSourceNodeIdentity::of(node));
+            continue;
+        }
+        if node.id() != expression.id() && node.kind() == "func_literal" {
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(references)
+}
+
 fn go_nearest_binding_in_scope<'tree>(
     support: &dyn GoDefinitionProvider,
     scope: Node<'tree>,
     source: &str,
     name: &str,
     byte: usize,
+) -> Option<GoLocalBinding<'tree>> {
+    go_nearest_binding_in_scope_with_evaluation(
+        support,
+        scope,
+        source,
+        name,
+        byte,
+        GoLexicalEvaluation::ordinary(),
+    )
+}
+
+fn go_nearest_binding_in_scope_with_evaluation<'tree>(
+    support: &dyn GoDefinitionProvider,
+    scope: Node<'tree>,
+    source: &str,
+    name: &str,
+    byte: usize,
+    evaluation: GoLexicalEvaluation,
 ) -> Option<GoLocalBinding<'tree>> {
     let mut cursor = scope.walk();
     let mut nearest: Option<(usize, GoLocalBinding<'tree>)> = None;
@@ -2778,6 +2976,9 @@ fn go_nearest_binding_in_scope<'tree>(
             return None;
         }
         if child.end_byte() > byte {
+            continue;
+        }
+        if evaluation.excludes_range_node(child) {
             continue;
         }
         let binding = match child.kind() {
@@ -3875,6 +4076,7 @@ enum GoTypeInferenceFrame<'tree> {
         node: Node<'tree>,
         reference_byte: usize,
         result_ordinal: usize,
+        evaluation: GoLexicalEvaluation,
     },
     Field(String),
     Method {
@@ -3901,12 +4103,40 @@ fn go_expression_inferred_type(
     byte: usize,
     result_ordinal: usize,
 ) -> Option<GoInferredType> {
+    go_expression_inferred_type_with_evaluation(
+        analyzer,
+        token,
+        support,
+        file,
+        source,
+        root,
+        expression,
+        byte,
+        result_ordinal,
+        GoLexicalEvaluation::ordinary(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn go_expression_inferred_type_with_evaluation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+    result_ordinal: usize,
+    evaluation: GoLexicalEvaluation,
+) -> Option<GoInferredType> {
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let package = go_package_name(support, file, source, Some(root))?;
     let mut frames = vec![GoTypeInferenceFrame::Expression {
         node: expression,
         reference_byte: byte,
         result_ordinal,
+        evaluation,
     }];
     let mut values = Vec::new();
     let mut active_expressions = HashSet::default();
@@ -3920,6 +4150,7 @@ fn go_expression_inferred_type(
                 node,
                 reference_byte,
                 result_ordinal,
+                evaluation,
             } => {
                 if !active_expressions.insert((node.id(), reference_byte, result_ordinal)) {
                     return None;
@@ -3946,12 +4177,13 @@ fn go_expression_inferred_type(
                             values.push(inferred);
                             continue;
                         }
-                        let binding = go_nearest_visible_binding(
+                        let binding = go_nearest_visible_binding_with_evaluation(
                             support,
                             root,
                             source,
                             name,
                             reference_byte,
+                            evaluation,
                         )?;
                         match binding {
                             GoLocalBinding::Type(type_node) => {
@@ -3970,18 +4202,24 @@ fn go_expression_inferred_type(
                                     node: expression,
                                     reference_byte: expression.start_byte(),
                                     result_ordinal,
+                                    evaluation,
                                 });
                             }
                             GoLocalBinding::RangeElement(range_node) => {
                                 let iterable = range_node
                                     .child_by_field_name("right")
                                     .or_else(|| go_last_named_child(support, range_node))?;
+                                let range_evaluation = go_range_evaluation(
+                                    analyzer, token, support, file, source, root, range_node,
+                                    iterable, name,
+                                )?;
                                 frames.push(GoTypeInferenceFrame::MakeAddressable);
                                 frames.push(GoTypeInferenceFrame::Element);
                                 frames.push(GoTypeInferenceFrame::Expression {
                                     node: iterable,
-                                    reference_byte: iterable.start_byte(),
+                                    reference_byte,
                                     result_ordinal: 0,
+                                    evaluation: range_evaluation,
                                 });
                             }
                             GoLocalBinding::Opaque => return None,
@@ -3997,6 +4235,7 @@ fn go_expression_inferred_type(
                             node: qualifier,
                             reference_byte: reference_byte.min(node.start_byte()),
                             result_ordinal: 0,
+                            evaluation,
                         });
                     }
                     "call_expression" => {
@@ -4015,6 +4254,7 @@ fn go_expression_inferred_type(
                                         root,
                                         node,
                                         reference_byte,
+                                        evaluation,
                                         &package,
                                     )
                                 {
@@ -4039,12 +4279,13 @@ fn go_expression_inferred_type(
                                 )?;
                                 let qualifier_name = go_node_text(qualifier, source);
                                 let qualifier_is_unshadowed = if qualifier.kind() == "identifier" {
-                                    let binding = go_nearest_visible_binding(
+                                    let binding = go_nearest_visible_binding_with_evaluation(
                                         support,
                                         root,
                                         source,
                                         qualifier_name,
                                         node.start_byte(),
+                                        evaluation,
                                     );
                                     if !support.scope_step() {
                                         return None;
@@ -4102,6 +4343,7 @@ fn go_expression_inferred_type(
                                         node: qualifier,
                                         reference_byte: reference_byte.min(node.start_byte()),
                                         result_ordinal: 0,
+                                        evaluation,
                                     });
                                 }
                             }
@@ -4123,6 +4365,7 @@ fn go_expression_inferred_type(
                             node: operand,
                             reference_byte,
                             result_ordinal: 0,
+                            evaluation,
                         });
                     }
                     "parenthesized_expression" => {
@@ -4130,6 +4373,7 @@ fn go_expression_inferred_type(
                             node: go_first_named_child(support, node)?,
                             reference_byte,
                             result_ordinal,
+                            evaluation,
                         });
                     }
                     "unary_expression" => {
@@ -4146,6 +4390,7 @@ fn go_expression_inferred_type(
                             node: operand,
                             reference_byte,
                             result_ordinal: 0,
+                            evaluation,
                         });
                     }
                     _ => return None,
@@ -4291,9 +4536,18 @@ fn go_builtin_new_inferred_type(
     root: Node<'_>,
     call: Node<'_>,
     reference_byte: usize,
+    evaluation: GoLexicalEvaluation,
     package: &str,
 ) -> Option<GoInferredType> {
-    if go_nearest_visible_binding(support, root, source, "new", reference_byte).is_some()
+    if go_nearest_visible_binding_with_evaluation(
+        support,
+        root,
+        source,
+        "new",
+        reference_byte,
+        evaluation,
+    )
+    .is_some()
         || !go_package_member_candidates(support, package, "new").is_empty()
     {
         return None;
@@ -4633,6 +4887,7 @@ fn go_interface_method_owner_type_fqn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_range_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -4641,6 +4896,8 @@ fn go_range_binding_type_fqn(
     source: &str,
     root: Node<'_>,
     range_node: Node<'_>,
+    binding_name: &str,
+    reference_byte: usize,
 ) -> Option<String> {
     if !support.scope_step() {
         return None;
@@ -4648,11 +4905,22 @@ fn go_range_binding_type_fqn(
     let right = range_node
         .child_by_field_name("right")
         .or_else(|| go_last_named_child(support, range_node))?;
+    let range_evaluation = go_range_evaluation(
+        analyzer,
+        token,
+        support,
+        file,
+        source,
+        root,
+        range_node,
+        right,
+        binding_name,
+    )?;
     // Go's range variables enter scope only after the range expression has
-    // been evaluated. Resolve the iterable at its own source position so a
-    // same-named range variable cannot resolve the RHS back to itself and
-    // create an unbounded type-inference cycle.
-    let mut iterable_type = go_expression_inferred_type(
+    // been evaluated. Keep the actual query position and carry a structured
+    // barrier for this exact clause instead of moving the lookup to a
+    // fabricated RHS byte.
+    let mut iterable_type = go_expression_inferred_type_with_evaluation(
         analyzer,
         token,
         support,
@@ -4660,8 +4928,9 @@ fn go_range_binding_type_fqn(
         source,
         root,
         right,
-        right.start_byte(),
+        reference_byte,
         0,
+        range_evaluation,
     )?;
     let GoInferredTypeIdentity::Indexed(identity) = iterable_type.identity else {
         return None;
@@ -4684,14 +4953,37 @@ fn go_nearest_visible_binding<'tree>(
     name: &str,
     byte: usize,
 ) -> Option<GoLocalBinding<'tree>> {
+    go_nearest_visible_binding_with_evaluation(
+        support,
+        root,
+        source,
+        name,
+        byte,
+        GoLexicalEvaluation::ordinary(),
+    )
+}
+
+fn go_nearest_visible_binding_with_evaluation<'tree>(
+    support: &dyn GoDefinitionProvider,
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+    byte: usize,
+    evaluation: GoLexicalEvaluation,
+) -> Option<GoLocalBinding<'tree>> {
     let mut scope = go_smallest_named_node_covering(support, root, byte, byte)?;
     loop {
         if !support.scope_step() {
             return None;
         }
-        if let Some(binding) =
-            go_nearest_binding_in_scope(support, scope, source, name.trim(), byte)
-        {
+        if let Some(binding) = go_nearest_binding_in_scope_with_evaluation(
+            support,
+            scope,
+            source,
+            name.trim(),
+            byte,
+            evaluation,
+        ) {
             return Some(binding);
         }
         scope = scope.parent()?;

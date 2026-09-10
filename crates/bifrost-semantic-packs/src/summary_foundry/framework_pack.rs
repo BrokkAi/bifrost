@@ -544,6 +544,8 @@ impl PackIdentity {
                     members,
                     relations: Vec::new(),
                 },
+                runtime_values: None,
+                collection_flows: None,
             }],
         }
     }

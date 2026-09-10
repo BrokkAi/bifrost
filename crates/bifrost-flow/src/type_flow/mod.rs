@@ -31,7 +31,10 @@ pub use field_slots::{
     FieldSlot, FieldSlotIndex, FieldSlotIndexAcquisitionKind, FieldSlotIndexCache,
     FieldSlotIndexMissReason, active_semantic_model_pack_digest,
 };
-pub use plan::{MemberAccessSite, ProcedureDispatchReadContract, TypeFlowPlan, TypeFlowPlanError};
+pub use plan::{
+    MemberAccessSite, ProcedureDispatchReadContract, ProcedureRefinements, TypeFlowPlan,
+    TypeFlowPlanError,
+};
 pub use report::{TypeFlowReport, solve_type_flow_workspace};
 pub use solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,

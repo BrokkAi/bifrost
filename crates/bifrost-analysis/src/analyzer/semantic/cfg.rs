@@ -212,6 +212,10 @@ impl ProcedureCfgBuilder {
             MemoryLocationKind::Field { member, .. } | MemoryLocationKind::Static { member } => {
                 locator_work(member, 1)
             }
+            MemoryLocationKind::Property { key, .. } => SemanticWork {
+                owned_text_bytes: key.len(),
+                ..SemanticWork::default()
+            },
             MemoryLocationKind::Index { .. }
             | MemoryLocationKind::LexicalCell { .. }
             | MemoryLocationKind::Capture { .. } => SemanticWork::default(),

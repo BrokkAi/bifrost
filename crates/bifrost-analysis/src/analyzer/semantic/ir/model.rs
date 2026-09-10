@@ -640,6 +640,12 @@ pub enum MemoryLocationKind {
         base: ValueId,
         member: SemanticLocator,
     },
+    /// A property whose key is known from syntax but has no declaration
+    /// locator (for example `process.env.DFB_INPUT`).
+    Property {
+        base: ValueId,
+        key: String,
+    },
     Static {
         member: SemanticLocator,
     },
@@ -689,6 +695,7 @@ impl MemoryLocationKind {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Field { .. } => "field",
+            Self::Property { .. } => "property",
             Self::Static { .. } => "static",
             Self::Index { .. } => "index",
             Self::LexicalCell { .. } => "lexical_cell",
@@ -701,6 +708,7 @@ impl MemoryLocationKind {
     pub fn uses_value(&self, value: ValueId) -> bool {
         match self {
             Self::Field { base, .. } => *base == value,
+            Self::Property { base, .. } => *base == value,
             Self::Index { base, index, .. } => *base == value || *index == Some(value),
             Self::LexicalCell { binding } => *binding == value,
             Self::Capture { binding, .. } => *binding == Some(value),
@@ -1403,6 +1411,8 @@ pub enum SemanticGapDischarge {
     RetainedEvaluationOrder,
     RetainedControlTopology,
     CanonicalIndexIdentity,
+    /// An executable property/index load may be interpreted by a runtime model.
+    RuntimeReadBehavior,
     NonRejoiningExceptionalExit,
     ExitOnlyProcedureCompletion,
     /// The adapter modeled every operation effect except the exact impact set
@@ -1511,7 +1521,9 @@ pub enum TransferKind {
     Move { invalidation: MoveInvalidation },
     /// The target holds a converted form of the source's value.
     Conversion { preservation: ValuePreservation },
-    /// The source value is wrapped into a distinct container object.
+    /// The source value is wrapped in an object, separate from primitive storage.
+    /// This does not prove freshness or sharing with another boxing operation;
+    /// allocation and language runtime caches require independent identity proof.
     Boxing,
     /// The contained value is extracted out of a container object.
     Unboxing,
@@ -1719,6 +1731,7 @@ impl ValueUseKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryAccessKind {
     Field,
+    Property,
     Static,
     Index,
     LexicalCell,
@@ -1729,6 +1742,7 @@ impl MemoryAccessKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Field => "field",
+            Self::Property => "property",
             Self::Static => "static",
             Self::Index => "index",
             Self::LexicalCell => "lexical_cell",

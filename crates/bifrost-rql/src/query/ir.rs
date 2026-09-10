@@ -97,6 +97,7 @@ pub enum QueryValueKind {
     JsxAttributeValue,
     ReceiverAnalysis,
     MemberTargetAnalysis,
+    KeyedReadValue,
     ReceiverOutcome,
     ReceiverEvidence,
     /// Exact right-hand operand of a proven static member assignment.
@@ -169,6 +170,7 @@ impl QueryValueKind {
             Self::JsxAttributeValue => "jsx_attribute_value",
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::MemberTargetAnalysis => "member_target_analysis",
+            Self::KeyedReadValue => "keyed_read_value",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::FieldWriteValue => "field_write_value",
@@ -439,6 +441,32 @@ pub struct FieldWriteValueTraversal {
     pub member_target_id: Option<String>,
 }
 
+/// Typed identity constraints for one activation-aware runtime keyed load.
+/// The semantic oracle owns proof and completeness; this is authored selector
+/// data and never a proof shortcut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedReadValueTraversal {
+    pub runtime: String,
+    pub global: String,
+    pub container: String,
+    pub property: Option<String>,
+    pub index: Option<u128>,
+    pub pristine_input: bool,
+}
+
+impl Default for KeyedReadValueTraversal {
+    fn default() -> Self {
+        Self {
+            runtime: "node".to_owned(),
+            global: "process".to_owned(),
+            container: "env".to_owned(),
+            property: None,
+            index: None,
+            pristine_input: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsxElementIdentity {
     Intrinsic,
@@ -546,6 +574,7 @@ pub enum QueryStep {
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
+    KeyedReadValue(KeyedReadValueTraversal),
     FieldWriteValue(FieldWriteValueTraversal),
     ReceiverOutcome,
     ReceiverEvidence,
@@ -1081,6 +1110,7 @@ impl QueryStep {
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
+            Self::KeyedReadValue(_) => QueryStepOp::KeyedReadValue,
             Self::FieldWriteValue(_) => QueryStepOp::FieldWriteValue,
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
@@ -1189,6 +1219,9 @@ impl QueryStep {
             QueryStepOp::PointsTo => Some(Self::PointsTo(ReceiverTraversalFilter::default())),
             QueryStepOp::MemberTargets => {
                 Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
+            }
+            QueryStepOp::KeyedReadValue => {
+                Some(Self::KeyedReadValue(KeyedReadValueTraversal::default()))
             }
             QueryStepOp::FieldWriteValue => {
                 Some(Self::FieldWriteValue(FieldWriteValueTraversal::default()))
@@ -1323,6 +1356,7 @@ impl QueryStep {
                 | QueryValueKind::JsxAttributeValue
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::MemberTargetAnalysis
+                | QueryValueKind::KeyedReadValue
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
                 | QueryValueKind::FieldWriteValue
@@ -1375,6 +1409,9 @@ impl QueryStep {
             (Self::CallInput(_), QueryValueKind::CallSite) => Some(QueryValueKind::ExpressionSite),
             (Self::JsxAttributeValue(_), QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::JsxAttributeValue)
+            }
+            (Self::KeyedReadValue(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::KeyedReadValue)
             }
             (
                 Self::ReceiverTargets(_),
@@ -1633,6 +1670,7 @@ pub(super) fn validate_query_steps(
                 "structural_match, reference_site, expression_site, or occurrence"
             }
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
+            QueryStep::KeyedReadValue(_) => "structural_match",
             QueryStep::FieldWriteValue(_) => "member_target_analysis",
             QueryStep::ReceiverOutcome => "receiver_analysis or member_target_analysis",
             QueryStep::ReceiverEvidence => "receiver_analysis",

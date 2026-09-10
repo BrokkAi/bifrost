@@ -1,6 +1,9 @@
 use super::inverted::{
     ProjectTypes, parse_scala_query_file, scan_edge_file, scan_scala_query_tree,
 };
+use crate::analyzer::relational_frontier::{
+    RelationalFrontierSession, RelationalItemFrontierOutcome,
+};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights,
@@ -9,20 +12,22 @@ use crate::analyzer::usages::inverted_edges::{
     class_range_index_from_declaration_ranges,
     parse_source_and_collect_with_declarations_and_domain,
 };
-use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
-    BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, Range, ScalaAnalyzer,
-    resolve_analyzer,
+    BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
+    RelationalDefinitionFrontier, RelationalFrontierOutcome, ScalaAnalyzer, resolve_analyzer,
+    sort_units,
 };
 use crate::hash::HashMap;
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::BoundedDefinitionLookup;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_jvm::scala::graph::inverted::ScalaProjectTypesSeed;
 use brokk_bifrost_jvm::scala::graph::query::{
     ScalaCatalogBuildError, ScalaFileEligibility, ScalaQueryHitSink, ScalaQueryTargetCatalog,
 };
@@ -135,35 +140,52 @@ pub(crate) struct ScalaQueryResolver<'a> {
     scala: &'a ScalaAnalyzer,
 }
 
-/// The dispatching analyzer, in the shape
-/// [`brokk_bifrost_jvm::scala::graph::query`] asks for.
-///
-/// A borrowed newtype rather than a bare `&dyn IAnalyzer`: a `dyn IAnalyzer`
-/// cannot be unsized to the workspace-source trait object expected by the JVM
-/// graph crate.
-pub(in crate::analyzer::usages) struct ScalaDispatch<'a>(
-    pub(in crate::analyzer::usages) &'a dyn IAnalyzer,
-);
+/// The foreign JVM realm a Scala walk consults for names its own index does
+/// not hold (#1859): the workspace's other JVM languages, read through the
+/// scan's replayable frontier so the realm questions batch in the frontier's
+/// barriers instead of costing one synchronous store read per candidate
+/// spelling.
+struct ForeignJvmRealm<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    languages: &'a [Language],
+    frontier: Arc<dyn RelationalDefinitionFrontier>,
+}
 
-impl ScalaWorkspaceSource for ScalaDispatch<'_> {
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.0.enclosing_code_unit(file, range)
-    }
-
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.0.ranges(code_unit)
-    }
-
+impl ForeignJvmRealm<'_> {
     fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
-        crate::analyzer::AnalyzerDefinitionLookup::new(self.0, Language::None)
-            .by_normalized_fqn(normalized)
+        let mut units = Vec::new();
+        for language in self.languages {
+            let lookup = crate::analyzer::AnalyzerDefinitionLookup::on_frontier(
+                self.analyzer,
+                *language,
+                Arc::clone(&self.frontier),
+            );
+            units.extend(lookup.by_normalized_fqn(normalized));
+        }
+        units
     }
 }
 
+/// The JVM languages other than Scala that this workspace analyzes: the realm
+/// a Java (or Kotlin) target's Scala call sites are typed against.
+pub(in crate::analyzer::usages) fn foreign_jvm_languages(
+    analyzer: &dyn IAnalyzer,
+) -> Vec<Language> {
+    analyzer
+        .languages()
+        .into_iter()
+        .filter(|language| matches!(language, Language::Java | Language::Kotlin))
+        .collect()
+}
+
+/// The walk's view of the workspace during one frontier evaluation: the
+/// per-item `ProjectTypes`, the file being walked, and (for a foreign
+/// target) the realm its untyped names are checked against.
 struct ScalaFrontierDispatch<'a> {
     types: &'a ProjectTypes,
     file: &'a ProjectFile,
     file_scope_range: Range,
+    realm: Option<ForeignJvmRealm<'a>>,
 }
 
 impl ScalaWorkspaceSource for ScalaFrontierDispatch<'_> {
@@ -193,7 +215,239 @@ impl ScalaWorkspaceSource for ScalaFrontierDispatch<'_> {
     }
 
     fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
-        self.types.definitions_by_normalized_fqn(normalized)
+        let mut units = self.types.definitions_by_normalized_fqn(normalized);
+        if let Some(realm) = &self.realm {
+            units.extend(realm.definitions_by_normalized_fqn(normalized));
+            sort_units(&mut units);
+            units.dedup();
+        }
+        units
+    }
+}
+
+/// One Scala file prepared for a frontier scan: what the per-file walk needs
+/// that is built once, outside the replayable evaluation.
+pub(in crate::analyzer::usages) struct PreparedScalaFile {
+    pub(in crate::analyzer::usages) file: ProjectFile,
+    eligibility: ScalaFileEligibility,
+    source: String,
+    tree: tree_sitter::Tree,
+    class_ranges: ClassRangeIndex,
+    line_starts: Vec<usize>,
+}
+
+/// Read, parse and index the files one frontier scan walks. `keep_source` is
+/// the caller's cheap gate on the file text; a file it rejects is not
+/// prepared.
+pub(in crate::analyzer::usages) fn prepare_scala_files(
+    analyzer: &dyn IAnalyzer,
+    scala: &ScalaAnalyzer,
+    files: Vec<(ProjectFile, ScalaFileEligibility)>,
+    cancellation: &crate::CancellationToken,
+    keep_source: impl Fn(&str) -> bool,
+) -> Vec<PreparedScalaFile> {
+    let mut prepared = Vec::with_capacity(files.len());
+    for (file, eligibility) in files {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        if !keep_source(&source) {
+            continue;
+        }
+        let Some(tree) = parse_scala_query_file(scala, &source) else {
+            continue;
+        };
+        let class_ranges = ClassRangeIndex::build(analyzer, &file);
+        let line_starts = compute_line_starts(&source);
+        prepared.push(PreparedScalaFile {
+            file,
+            eligibility,
+            source,
+            tree,
+            class_ranges,
+            line_starts,
+        });
+    }
+    prepared
+}
+
+/// What one file's walk produced, per target.
+pub(in crate::analyzer::usages) struct ScalaFileScan {
+    pub(in crate::analyzer::usages) hits: Vec<BTreeSet<UsageHit>>,
+    pub(in crate::analyzer::usages) observed_hits: BTreeSet<UsageHit>,
+    pub(in crate::analyzer::usages) unproven_hits: BTreeSet<UsageHit>,
+    pub(in crate::analyzer::usages) limit_exceeded: bool,
+}
+
+/// One usage query's Scala frontier: the relational session plus the resolved
+/// seed every later phase builds its per-item `ProjectTypes` from. The Scala
+/// strategy and the Java-target scan of Scala files share it, so a Java
+/// target's Scala call sites are resolved by exactly the walk a Scala
+/// target's are, on the same batched reads.
+pub(in crate::analyzer::usages) struct ScalaFrontierScan<'a> {
+    scala: &'a ScalaAnalyzer,
+    cancellation: &'a crate::CancellationToken,
+    session: RelationalFrontierSession<'a>,
+    resolved_seed: ScalaProjectTypesSeed,
+}
+
+pub(in crate::analyzer::usages) enum ScalaFrontierSeedOutcome<'a> {
+    Ready(ScalaFrontierScan<'a>),
+    Cancelled,
+    Failed(&'static str),
+}
+
+impl<'a> ScalaFrontierScan<'a> {
+    /// The workspace-wide sweep derives the seed's type-namespace structures
+    /// in bounded chunks; per-file facts for the files the query actually
+    /// touches rehydrate lazily through the seed (#3142). The hierarchy pass
+    /// resolves the seed once; the inputs it carried are dropped after.
+    pub(in crate::analyzer::usages) fn seed(
+        scala: &'a ScalaAnalyzer,
+        analyzer: &'a dyn IAnalyzer,
+        cancellation: &'a crate::CancellationToken,
+    ) -> ScalaFrontierSeedOutcome<'a> {
+        let workspace_files = match analyzer.project().analyzable_files(Language::Scala) {
+            Ok(files) => files.into_iter().collect::<Vec<_>>(),
+            Err(_) => {
+                return ScalaFrontierSeedOutcome::Failed(
+                    "the Scala workspace file set is unavailable",
+                );
+            }
+        };
+        let session = RelationalFrontierSession::new(analyzer, cancellation);
+        let unresolved_seed = scala.project_types_query_seed(&workspace_files);
+        let resolved_seed = match session.resolve_owned("scala_hierarchy", |frontier| {
+            scala
+                .build_project_types_from_frontier(frontier, unresolved_seed.clone())
+                .resolved_seed()
+        }) {
+            RelationalFrontierOutcome::Complete(seed) => seed,
+            RelationalFrontierOutcome::Cancelled => return ScalaFrontierSeedOutcome::Cancelled,
+            RelationalFrontierOutcome::Failed(_) => {
+                return ScalaFrontierSeedOutcome::Failed("the Scala hierarchy frontier failed");
+            }
+        };
+        drop(unresolved_seed);
+        ScalaFrontierSeedOutcome::Ready(Self {
+            scala,
+            cancellation,
+            session,
+            resolved_seed,
+        })
+    }
+
+    /// One frontier pass over the resolved seed's `ProjectTypes`.
+    pub(in crate::analyzer::usages) fn resolve_types<T>(
+        &self,
+        phase: &'static str,
+        mut evaluate: impl FnMut(&ProjectTypes) -> T,
+    ) -> RelationalFrontierOutcome<T> {
+        self.session.resolve_owned(phase, |frontier| {
+            let types = self
+                .scala
+                .build_project_types_from_frontier(frontier, self.resolved_seed.clone());
+            evaluate(&types)
+        })
+    }
+
+    /// Warm the scan set's per-file facts in batched reads ahead of the
+    /// parallel walk, so a file's first touch is a memory hit rather than a
+    /// store read on the scan's critical path.
+    pub(in crate::analyzer::usages) fn prefetch_file_facts(&self, files: &[ProjectFile]) {
+        self.resolved_seed.prefetch_file_facts(files);
+    }
+
+    /// Walk every prepared file on the frontier. `realm_languages` is the
+    /// foreign JVM realm a non-Scala target's untyped names are checked
+    /// against (`None` for a Scala target); `keep_unproven` keeps the receiver
+    /// references the walk could not type instead of dropping them.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::analyzer::usages) fn scan(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        prepared: &[PreparedScalaFile],
+        catalog: &ScalaQueryTargetCatalog,
+        target_count: usize,
+        max_usages: usize,
+        realm_languages: Option<&[Language]>,
+        keep_unproven: bool,
+    ) -> RelationalItemFrontierOutcome<ScalaFileScan> {
+        let relevant_names = catalog.relevant_names();
+        crate::profiling::note_with(|| {
+            format!(
+                "scala_query prepared_files={} relevant_names={}",
+                prepared.len(),
+                relevant_names.len()
+            )
+        });
+        self.session
+            .resolve_owned_items("scala_semantic_scan", prepared, |item, frontier| {
+                let types = self.scala.build_project_types_from_frontier(
+                    Arc::clone(&frontier),
+                    self.resolved_seed.clone(),
+                );
+                let dispatch = ScalaFrontierDispatch {
+                    types: &types,
+                    file: &item.file,
+                    file_scope_range: Range {
+                        start_byte: 0,
+                        end_byte: item.source.len(),
+                        start_line: 0,
+                        end_line: item.line_starts.len().saturating_sub(1),
+                    },
+                    realm: realm_languages.map(|languages| ForeignJvmRealm {
+                        analyzer,
+                        languages,
+                        frontier,
+                    }),
+                };
+                let mut hits = vec![BTreeSet::new(); target_count];
+                let mut observed_hits = BTreeSet::new();
+                let mut unproven_hits = BTreeSet::new();
+                let mut sink = ScalaQueryHitSink {
+                    analyzer: &dispatch,
+                    scala: self.scala,
+                    file: &item.file,
+                    source: &item.source,
+                    class_ranges: item.class_ranges.clone(),
+                    line_starts: item.line_starts.clone(),
+                    catalog,
+                    eligibility: &item.eligibility,
+                    hits: &mut hits,
+                    observed_hits: &mut observed_hits,
+                    unproven_hits: keep_unproven.then_some(&mut unproven_hits),
+                    enclosing_cache: HashMap::default(),
+                    relevant_names: relevant_names.clone(),
+                    allow_all_names: false,
+                    max_usages,
+                    limit_exceeded: false,
+                };
+                scan_scala_query_tree(
+                    self.scala,
+                    token,
+                    &types,
+                    &dispatch,
+                    &item.file,
+                    &item.source,
+                    &item.tree,
+                    item.class_ranges.clone(),
+                    &mut sink,
+                    Some(self.cancellation),
+                );
+                let limit_exceeded = sink.limit_exceeded;
+                drop(sink);
+                ScalaFileScan {
+                    hits,
+                    observed_hits,
+                    unproven_hits,
+                    limit_exceeded,
+                }
+            })
     }
 }
 
@@ -225,57 +479,24 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             .collect();
         let uncancelled = crate::CancellationToken::new();
         let cancellation = scan_scope.cancellation().unwrap_or(&uncancelled);
-        let workspace_files = match analyzer.project().analyzable_files(Language::Scala) {
-            Ok(files) => files.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                return GraphUsageOutcome::fallback_safe(
-                    overloads[0].fq_name(),
-                    GraphFailureReason::UnsupportedTargetShape(
-                        "the Scala workspace file set is unavailable",
-                    ),
-                    "ScalaUsageGraphStrategy",
-                );
-            }
-        };
-        let relational_session =
-            crate::analyzer::relational_frontier::RelationalFrontierSession::new(
-                analyzer,
-                cancellation,
-            );
-        // The workspace-wide sweep derives the seed's type-namespace
-        // structures in bounded chunks; per-file facts for the files the
-        // query actually touches rehydrate lazily through the seed (#3142).
-        let unresolved_seed = self.scala.project_types_query_seed(&workspace_files);
-        let resolved_seed = match relational_session.resolve_owned("scala_hierarchy", |frontier| {
-            self.scala
-                .build_project_types_from_frontier(frontier, unresolved_seed.clone())
-                .resolved_seed()
-        }) {
-            crate::analyzer::RelationalFrontierOutcome::Complete(seed) => seed,
-            crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+        let scan = match ScalaFrontierScan::seed(self.scala, analyzer, cancellation) {
+            ScalaFrontierSeedOutcome::Ready(scan) => scan,
+            ScalaFrontierSeedOutcome::Cancelled => {
                 return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
             }
-            crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+            ScalaFrontierSeedOutcome::Failed(reason) => {
                 return GraphUsageOutcome::fallback_safe(
                     overloads[0].fq_name(),
-                    GraphFailureReason::UnsupportedTargetShape(
-                        "the Scala hierarchy frontier failed",
-                    ),
+                    GraphFailureReason::UnsupportedTargetShape(reason),
                     "ScalaUsageGraphStrategy",
                 );
             }
         };
-        // The hierarchy inputs the unresolved seed carried served the pass
-        // above; the catalog and scan phases read through the resolved seed.
-        drop(unresolved_seed);
-        let catalog = match relational_session.resolve_owned("scala_target_catalog", |frontier| {
-            let types = self
-                .scala
-                .build_project_types_from_frontier(frontier, resolved_seed.clone());
+        let catalog = match scan.resolve_types("scala_target_catalog", |types| {
             ScalaQueryTargetCatalog::build(
                 self.scala,
                 token,
-                &types,
+                types,
                 overloads,
                 scan_scope.cancellation(),
             )
@@ -325,96 +546,25 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         }
         let mut files = files.into_iter().collect::<Vec<_>>();
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
-        // Warm the scan set's per-file facts in batched reads ahead of the
-        // parallel walk, so a file's first touch is a memory hit rather than
-        // a store read on the scan's critical path.
         let scan_files: Vec<ProjectFile> = files.iter().map(|(file, _)| file.clone()).collect();
-        resolved_seed.prefetch_file_facts(&scan_files);
-        let mut prepared_files = Vec::with_capacity(files.len());
-        for (file, eligibility) in files {
-            if scan_scope.is_cancelled() {
-                break;
-            }
-            let Some(source) = analyzer.indexed_source(&file) else {
-                continue;
-            };
-            let Some(tree) = parse_scala_query_file(self.scala, &source) else {
-                continue;
-            };
-            let class_ranges = ClassRangeIndex::build(analyzer, &file);
-            let line_starts = compute_line_starts(&source);
-            prepared_files.push((file, eligibility, source, tree, class_ranges, line_starts));
-        }
-        let relevant_names = catalog.relevant_names();
-        crate::profiling::note_with(|| {
-            format!(
-                "scala_query prepared_files={} relevant_names={}",
-                prepared_files.len(),
-                relevant_names.len()
-            )
-        });
-        let file_results = relational_session.resolve_owned_items(
-            "scala_semantic_scan",
+        scan.prefetch_file_facts(&scan_files);
+        let prepared_files =
+            prepare_scala_files(analyzer, self.scala, files, cancellation, |_| true);
+        let file_results = match scan.scan(
+            analyzer,
+            token,
             &prepared_files,
-            |(file, eligibility, source, tree, class_ranges, line_starts), frontier| {
-                let types = self
-                    .scala
-                    .build_project_types_from_frontier(frontier, resolved_seed.clone());
-                let dispatch = ScalaFrontierDispatch {
-                    types: &types,
-                    file,
-                    file_scope_range: Range {
-                        start_byte: 0,
-                        end_byte: source.len(),
-                        start_line: 0,
-                        end_line: line_starts.len().saturating_sub(1),
-                    },
-                };
-                let mut file_hits = vec![BTreeSet::new(); overloads.len()];
-                let mut file_observed_hits = BTreeSet::new();
-                let mut sink = ScalaQueryHitSink {
-                    analyzer: &dispatch,
-                    scala: self.scala,
-                    file,
-                    source,
-                    class_ranges: class_ranges.clone(),
-                    line_starts: line_starts.clone(),
-                    catalog: &catalog,
-                    eligibility,
-                    hits: &mut file_hits,
-                    observed_hits: &mut file_observed_hits,
-                    unproven_hits: None,
-                    enclosing_cache: HashMap::default(),
-                    relevant_names: relevant_names.clone(),
-                    allow_all_names: false,
-                    max_usages,
-                    limit_exceeded: false,
-                };
-                scan_scala_query_tree(
-                    self.scala,
-                    token,
-                    &types,
-                    &dispatch,
-                    file,
-                    source,
-                    tree,
-                    class_ranges.clone(),
-                    &mut sink,
-                    scan_scope.cancellation(),
-                );
-                let file_limit_exceeded = sink.limit_exceeded;
-                drop(sink);
-                (file_hits, file_observed_hits, file_limit_exceeded)
-            },
-        );
-        let file_results = match file_results {
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(
-                results,
-            ) => results.into_iter().map(Some).collect(),
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(
-                results,
-            ) => results,
-            crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(error) => {
+            &catalog,
+            overloads.len(),
+            max_usages,
+            None,
+            false,
+        ) {
+            RelationalItemFrontierOutcome::Complete(results) => {
+                results.into_iter().map(Some).collect()
+            }
+            RelationalItemFrontierOutcome::Cancelled(results) => results,
+            RelationalItemFrontierOutcome::Failed(error) => {
                 crate::profiling::note_with(|| {
                     format!("Scala file frontier failed: {}", error.message())
                 });
@@ -428,14 +578,12 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         let mut hits = vec![BTreeSet::new(); overloads.len()];
         let mut observed_hits = BTreeSet::new();
         let mut limit_exceeded = false;
-        for (file_hits, file_observed_hits, file_limit_exceeded) in
-            file_results.into_iter().flatten()
-        {
-            for (target_hits, file_target_hits) in hits.iter_mut().zip(file_hits) {
+        for file_scan in file_results.into_iter().flatten() {
+            for (target_hits, file_target_hits) in hits.iter_mut().zip(file_scan.hits) {
                 target_hits.extend(file_target_hits);
             }
-            observed_hits.extend(file_observed_hits);
-            limit_exceeded |= file_limit_exceeded;
+            observed_hits.extend(file_scan.observed_hits);
+            limit_exceeded |= file_scan.limit_exceeded;
         }
         // A Scala class is equally nameable from Kotlin source, and the three JVM
         // languages share one candidate space, so find-references on a Scala type

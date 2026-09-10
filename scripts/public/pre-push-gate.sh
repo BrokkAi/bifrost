@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local pre-push validation gate (#1454).
 #
-# Composition matches the documented gate in CLAUDE.md "Rust CI Checks":
+# Composition follows .agents/docs/testing-and-rust-validation.md:
 # fmt, the featureless workspace test suites, and the isolated-target
 # all-features workspace clippy. Two structural changes cut the wall clock
 # roughly in half versus running the same steps by hand:
@@ -22,7 +22,7 @@
 #
 # The all-features clippy needs a PyO3-capable interpreter. If PYO3_PYTHON is
 # not already set and `uv` is available, the clippy leg runs through
-# `uv run --python 3.12 --` per CLAUDE.md; otherwise it uses the ambient
+# `uv run --python 3.12 --` per the testing guide; otherwise it uses the ambient
 # environment and fails loudly if that environment cannot link PyO3.
 
 set -euo pipefail
@@ -38,10 +38,11 @@ fi
 
 # Tests must never download models or spawn semantic indexer threads.
 
-# Let nextest own machine-wide parallelism. Each test process gets one worker
-# in Bifrost-owned and global rayon pools, while nextest runs one test per
-# available core. Callers running a deliberate parallelism test or benchmark
-# can still override either value explicitly.
+# Follow AGENTS.md's test concurrency policy: nextest uses all available
+# logical CPUs by default, with per-test reservations from .config/nextest.toml.
+# Do not add a global nextest cap here. These internal-worker defaults prevent
+# nested pools from multiplying nextest's concurrency; deliberate parallelism
+# tests or benchmarks can still override them explicitly.
 export BIFROST_PARALLELISM="${BIFROST_PARALLELISM:-1}"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 
@@ -102,9 +103,9 @@ clippy_pid=$!
 # the facade suites, the crates' lib tests, and the kept-standalone
 # process-isolation binaries (each test already runs in its own process
 # under nextest, which only strengthens their isolation assumptions).
-step "cargo nextest run --workspace"
+step "cargo nextest run --workspace --max-fail 100"
 nextest_status=0
-cargo nextest run --workspace || nextest_status=$?
+cargo nextest run --workspace --max-fail 100 || nextest_status=$?
 
 step "cargo test --workspace --doc"
 doc_status=0

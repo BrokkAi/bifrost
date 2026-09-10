@@ -79,22 +79,15 @@
 //! A bindings key is
 //! `(caller artifact fingerprint, caller ProcedureId, CallSiteId, target
 //! artifact fingerprint, target ProcedureId, candidate proof, candidate
-//! completeness, OracleCallContext, OracleLimits)`.
+//! completeness, OracleCallContext, OracleLimits, Java conversion environment)`.
 //!
-//! Read `WorkspaceSemanticOracle::call_bindings`
-//! (`analyzer/semantic/workspace_oracle/value_flow.rs`) top to bottom and it
-//! reads exactly six things. The caller's `ProcedureSemantics` -- its gaps, its
-//! call row at `call.id()`, and its values -- which the first three dimensions
-//! pin. The callee's `ProcedureSemantics` -- its gaps, formals, receiver, and
-//! exit ports -- which the next two pin. The `OracleCallContext`, which becomes
-//! the retained bindings' context and which the argument-location contract
-//! checks against. `self.limits()`, which decides through `BindingBuild::
-//! can_retain` whether the answer is `Truncated`, and `Truncated` is published
-//! as `Unproven`, so limits are a genuine verdict input. And the request's
-//! budget and cancellation, excluded by construction as above.
+//! Caller and callee artifacts pin their IR rows; context and limits pin the
+//! bounded mapping contract. Java conversion typing additionally reads current
+//! workspace declarations and activated external type identities (#2850), so
+//! Java binding keys include the full provider behavior identity used by dispatch.
+//! Budget and cancellation outcomes are excluded from publication.
 //!
-//! The sixth thing is the `DispatchCandidate`, and it is worth being exact
-//! about. The candidate's `proof()` and `completeness()` do **not** feed the
+//! The retained `DispatchCandidate` also contributes to cache identity. The candidate's `proof()` and `completeness()` do **not** feed the
 //! verdict: the published outcome is decided from `interrupted`, from
 //! `coverage` (which comes from `build.truncated` and `build.open`), from
 //! `build.has_unproven_relation`, and from `build.gap_quality`, and the
@@ -318,6 +311,7 @@ impl DispatchKey {
 /// `call_bindings` below for why each of those is here.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BindingsKey {
+    conversion_environment: Option<IcfgProviderBehaviorIdentity>,
     caller_artifact: StableDigest,
     caller_procedure: ProcedureId,
     call_site: CallSiteId,
@@ -336,10 +330,16 @@ impl BindingsKey {
         candidate: &DispatchCandidate,
         context: &OracleCallContext,
         limits: OracleLimits,
+        provider_behavior: IcfgProviderBehaviorIdentity,
     ) -> Self {
         let caller = call.procedure();
         let target = candidate.target();
         Self {
+            conversion_environment: (caller.artifact().key().language()
+                == crate::analyzer::semantic::SemanticLanguage::Standard(
+                    crate::analyzer::Language::Java,
+                ))
+            .then_some(provider_behavior),
             caller_artifact: caller.artifact().key().fingerprint(),
             caller_procedure: caller.id(),
             call_site: call.id(),
@@ -741,7 +741,13 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError> {
-        let key = BindingsKey::for_query(call, candidate, context, *self.oracle.limits());
+        let key = BindingsKey::for_query(
+            call,
+            candidate,
+            context,
+            *self.oracle.limits(),
+            self.provider_behavior,
+        );
         let (acquisition, _wait) = self.cache.bindings.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {

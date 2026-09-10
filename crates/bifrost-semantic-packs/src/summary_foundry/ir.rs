@@ -344,6 +344,7 @@ impl FoundryDerivationBoundary {
 #[serde(tag = "selector", rename_all = "snake_case")]
 pub enum FoundrySelector {
     Field { name: String },
+    Property { name: String },
     ExactIndex,
     AnyIndex,
 }
@@ -352,6 +353,7 @@ impl FoundrySelector {
     fn render(&self) -> String {
         match self {
             Self::Field { name } => format!(".Field[{name}]"),
+            Self::Property { name } => format!(".Property[{name}]"),
             Self::ExactIndex => ".ExactIndex".to_owned(),
             Self::AnyIndex => ".Element".to_owned(),
         }

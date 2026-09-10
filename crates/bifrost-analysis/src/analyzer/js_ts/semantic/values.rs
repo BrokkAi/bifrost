@@ -113,46 +113,74 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if is_js_ts_nested_execution_boundary(node, body) {
                 return Ok(WalkControl::SkipChildren);
             }
-            if node.kind() == "variable_declarator"
-                && let Some(name) = node.child_by_field_name("name")
-                && name.kind() == "identifier"
-                && let Some(text) = node_text(self.prepared.source(), name)
+            let binding_pattern = if node.kind() == "variable_declarator" {
+                node.child_by_field_name("name")
+            } else if node.kind() == "array_pattern"
+                && node.parent().is_some_and(|parent| {
+                    simple_for_of_binding(parent).is_some_and(|left| left.id() == node.id())
+                })
+            {
+                Some(node)
+            } else {
+                None
+            };
+            if let Some(name) = binding_pattern
                 && let Some((scope_start, scope_end)) = js_ts_local_scope(node)
             {
-                if self.locals.get(text).is_some_and(|bindings| {
-                    bindings.iter().any(|binding| {
-                        binding.scope_start == scope_start && binding.scope_end == scope_end
+                let names = if name.kind() == "identifier" {
+                    vec![name]
+                } else if name.kind() == "array_pattern"
+                    && name.parent().is_some_and(|for_node| {
+                        simple_for_of_binding(for_node).is_some_and(|left| left.id() == name.id())
                     })
-                }) {
-                    return Ok(WalkControl::SkipChildren);
+                {
+                    pattern_binder_identifiers(name)
+                        .into_iter()
+                        .filter(|binder| binder.kind() == "identifier")
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for name in names {
+                    let Some(text) = node_text(self.prepared.source(), name) else {
+                        continue;
+                    };
+                    if self.locals.get(text).is_some_and(|bindings| {
+                        bindings.iter().any(|binding| {
+                            binding.scope_start == scope_start && binding.scope_end == scope_end
+                        })
+                    }) {
+                        continue;
+                    }
+                    let metadata = self.value_mapping(builder, name)?;
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Local,
+                    )?;
+                    let binding = self
+                        .lexical_bindings
+                        .binding_identifier_ranges_at(text, name.start_byte())
+                        .into_iter()
+                        .find(|range| {
+                            range.start_byte == name.start_byte()
+                                && range.end_byte == name.end_byte()
+                        })
+                        .ok_or_else(|| {
+                            TsLoweringError::Invalid(format!(
+                                "local binding `{text}` has no declaration identity"
+                            ))
+                        })?;
+                    self.locals
+                        .entry(text.into())
+                        .or_default()
+                        .push(LocalBinding {
+                            binding,
+                            scope_start,
+                            scope_end,
+                            value,
+                        });
                 }
-                let metadata = self.value_mapping(builder, name)?;
-                let value = self.session.add_value_with_metadata(
-                    builder,
-                    metadata,
-                    SemanticValueKind::Local,
-                )?;
-                let binding = self
-                    .lexical_bindings
-                    .binding_identifier_ranges_at(text, name.start_byte())
-                    .into_iter()
-                    .find(|range| {
-                        range.start_byte == name.start_byte() && range.end_byte == name.end_byte()
-                    })
-                    .ok_or_else(|| {
-                        TsLoweringError::Invalid(format!(
-                            "local binding `{text}` has no declaration identity"
-                        ))
-                    })?;
-                self.locals
-                    .entry(text.into())
-                    .or_default()
-                    .push(LocalBinding {
-                        binding,
-                        scope_start,
-                        scope_end,
-                        value,
-                    });
             }
             Ok(WalkControl::Continue)
         })
@@ -365,7 +393,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // still an escape: the callee holds the object and may install an
             // accessor or a proxy on it, so it bounds every later access
             // through `escapes_after` instead of invalidating the root.
-            let whole_value_argument = !inside_nested
+            let intrinsic_entries_argument = is_object_entries_argument(
+                self,
+                node,
+                value,
+                field_locators
+                    .get(&candidate.root)
+                    .is_some_and(|fields| !fields.is_empty()),
+            );
+            let whole_value_argument = !intrinsic_entries_argument
+                && !inside_nested
                 && is_whole_value_call_argument(node)
                 && executes_once_within(node, candidate.declaration_parent);
             if whole_value_argument {
@@ -377,7 +414,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 && (is_variable_binding_name(node)
                     || plain_member_base_use(source, node)
                     || alias_use
-                    || is_direct_throw_value(node));
+                    || is_direct_throw_value(node)
+                    || intrinsic_entries_argument);
             if !survives {
                 invalid_roots.insert(candidate.root);
             }
@@ -927,6 +965,60 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(locator)
     }
 
+    pub(super) fn object_entries_iteration(&self, call: Node<'tree>) -> Option<EntryIteration> {
+        if call.kind() != "call_expression"
+            || call.child_by_field_name("optional_chain").is_some()
+            || has_child_kind(call, "optional_chain")
+        {
+            return None;
+        }
+        let statement = call.parent()?;
+        if simple_for_of_binding(statement).is_none()
+            || statement
+                .child_by_field_name("right")
+                .is_none_or(|right| right.id() != call.id())
+        {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        let receiver = static_member_receiver(function, self.prepared.source())?;
+        if receiver.root.kind() != "identifier"
+            || node_text(self.prepared.source(), receiver.root) != Some("Object")
+            || receiver.members.len() != 1
+            || node_text(self.prepared.source(), receiver.members[0]) != Some("entries")
+            || self
+                .lexical_bindings
+                .is_bound_at("Object", receiver.root.start_byte())
+        {
+            return None;
+        }
+        let arguments = call.child_by_field_name("arguments")?;
+        let arguments = named_children(arguments);
+        let [argument] = arguments.as_slice() else {
+            return None;
+        };
+        if argument.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), *argument)?;
+        let value = self.local_at(name, argument.start_byte())?;
+        let plain = self.plain_object_locals.get(&value)?;
+        if !self.established_plain_object_base(call, *argument) {
+            return None;
+        }
+        let mut fields = self
+            .plain_object_fields
+            .get(&plain.root)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        (!fields.is_empty()).then_some(EntryIteration {
+            receiver: plain.root,
+            fields,
+        })
+    }
+
     pub(super) fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
         self.locals
             .get(name)?
@@ -1158,8 +1250,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, TsLoweringError> {
         let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
-        self.session
-            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+        let ast_identity = self
+            .structural_node_index
+            .and_then(|index| index.identity(node));
+        self.session.add_mapping_with_ast_identity(
+            builder,
+            anchor,
+            SourceMappingKind::Exact,
+            ast_identity,
+        )
     }
 
     fn parameter_mapping(
@@ -1201,7 +1300,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), TsLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_gap_with_impacts_and_discharge(
             builder,
             point,
             SemanticGapSubject::MemoryLocation(location),
@@ -1210,6 +1309,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .with(SemanticGapImpact::HeapWrite)
                 .with(SemanticGapImpact::Aliasing),
             SemanticGapKind::Unknown,
+            crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior,
             "field occurrence is structured, but its declaration identity is not yet resolved",
         )?;
         Ok(())
@@ -1221,7 +1321,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         location: MemoryLocationId,
     ) -> Result<(), TsLoweringError> {
-        self.session.add_gap_with_impacts(
+        self.session.add_gap_with_impacts_and_discharge(
             builder,
             point,
             SemanticGapSubject::MemoryLocation(location),
@@ -1230,6 +1330,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .with(SemanticGapImpact::HeapWrite)
                 .with(SemanticGapImpact::Aliasing),
             SemanticGapKind::Unknown,
+            crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior,
             "array index is structured, but its allocation or constant index identity is not proven",
         )?;
         Ok(())
@@ -1464,6 +1565,58 @@ fn is_variable_binding_name(node: Node<'_>) -> bool {
                 .child_by_field_name("name")
                 .is_some_and(|name| name.id() == node.id())
     })
+}
+
+fn is_object_entries_argument(
+    context: &LoweringContext<'_, '_>,
+    node: Node<'_>,
+    candidate_value: ValueId,
+    fields_known: bool,
+) -> bool {
+    if !fields_known || node.kind() != "identifier" {
+        return false;
+    }
+    let Some(arguments) = node.parent() else {
+        return false;
+    };
+    let Some(call) = arguments.parent() else {
+        return false;
+    };
+    if arguments.kind() != "arguments"
+        || call.kind() != "call_expression"
+        || call.child_by_field_name("optional_chain").is_some()
+        || has_child_kind(call, "optional_chain")
+        || named_children(arguments).as_slice() != [node]
+    {
+        return false;
+    }
+    let Some(statement) = call.parent() else {
+        return false;
+    };
+    if simple_for_of_binding(statement).is_none()
+        || statement
+            .child_by_field_name("right")
+            .is_none_or(|right| right.id() != call.id())
+    {
+        return false;
+    }
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let Some(receiver) = static_member_receiver(function, context.prepared.source()) else {
+        return false;
+    };
+    receiver.root.kind() == "identifier"
+        && node_text(context.prepared.source(), receiver.root) == Some("Object")
+        && receiver.members.len() == 1
+        && node_text(context.prepared.source(), receiver.members[0]) == Some("entries")
+        && !context
+            .lexical_bindings
+            .is_bound_at("Object", receiver.root.start_byte())
+        && context.local_at(
+            node_text(context.prepared.source(), node).unwrap_or_default(),
+            node.start_byte(),
+        ) == Some(candidate_value)
 }
 
 pub(super) fn allocation_alias_use(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {

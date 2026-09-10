@@ -890,7 +890,8 @@ mod tests {
                 .flat_map(|point| {
                     point.events.iter().filter_map(|event| match event.effect {
                         SemanticEffect::MemoryLoad { location, .. } => {
-                            let MemoryLocationKind::Field { base, .. } =
+                            let (MemoryLocationKind::Field { base, .. }
+                            | MemoryLocationKind::Property { base, .. }) =
                                 &semantics.memory_location(location)?.kind
                             else {
                                 return None;
@@ -1273,7 +1274,8 @@ func run(value *item) int {
             .flat_map(|point| {
                 point.events.iter().filter_map(|event| match event.effect {
                     SemanticEffect::MemoryLoad { location, .. } => {
-                        let MemoryLocationKind::Field { base, .. } =
+                        let (MemoryLocationKind::Field { base, .. }
+                        | MemoryLocationKind::Property { base, .. }) =
                             &semantics.memory_location(location)?.kind
                         else {
                             return None;
@@ -1325,7 +1327,8 @@ func run() int {
             .flat_map(|point| {
                 point.events.iter().filter_map(|event| match event.effect {
                     SemanticEffect::MemoryLoad { location, .. } => {
-                        let MemoryLocationKind::Field { base, .. } =
+                        let (MemoryLocationKind::Field { base, .. }
+                        | MemoryLocationKind::Property { base, .. }) =
                             &semantics.memory_location(location)?.kind
                         else {
                             return None;

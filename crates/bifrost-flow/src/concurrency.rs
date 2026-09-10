@@ -175,6 +175,9 @@ impl ResolvedConcurrencyLocation {
                     SummaryConcurrencyAccessSelector::Field(_),
                     SummaryConcurrencyAccessSelector::Field(_)
                 ) | (
+                    SummaryConcurrencyAccessSelector::Property(_),
+                    SummaryConcurrencyAccessSelector::Property(_)
+                ) | (
                     SummaryConcurrencyAccessSelector::ConstantIndex(_),
                     SummaryConcurrencyAccessSelector::ConstantIndex(_)
                 )
@@ -335,6 +338,9 @@ pub fn instantiate_summary_access_path(
         let (exact_selector, kind) = match selector {
             SummaryConcurrencyAccessSelector::Field(field) => {
                 (Some(format!("field:{field}")), "field")
+            }
+            SummaryConcurrencyAccessSelector::Property(property) => {
+                (Some(format!("property:{property}")), "property")
             }
             SummaryConcurrencyAccessSelector::Aggregate => {
                 (Some("index:aggregate".to_owned()), "index")
@@ -1159,6 +1165,9 @@ impl ConcurrencyIdentityFact {
     fn project(&mut self, selector: SummaryConcurrencyAccessSelector, kind: &str) {
         let rendered = match &selector {
             SummaryConcurrencyAccessSelector::Field(field) => format!("field:{field}"),
+            SummaryConcurrencyAccessSelector::Property(property) => {
+                format!("property:{property}")
+            }
             SummaryConcurrencyAccessSelector::Aggregate => "index:aggregate".to_owned(),
             SummaryConcurrencyAccessSelector::ConstantIndex(index) => format!("index:{index}"),
             _ => unreachable!("an exact projection requires a resolved selector"),
@@ -4436,6 +4445,42 @@ fn canonicalize_access(
                 }),
             })
         }
+        MemoryLocationKind::Property { base, key } => {
+            let (mut resolved_location, mut reasons) = provider
+                .resolved_location(&context.procedure, point, location, request)?
+                .into_parts();
+            let mut canonical = resolved_location.exact_candidate().cloned();
+            let (base_location, base_reasons) = provider
+                .resolved_value(&context.procedure, point, *base, request)?
+                .into_parts();
+            let base = base_location.exact_candidate().cloned();
+            if base_reasons.is_empty()
+                && let Some(base) = base.as_ref()
+            {
+                let exact = CanonicalConcurrencyLocation::new(
+                    format!("{}/property:{key}", base.identity),
+                    "property",
+                );
+                canonical = Some(exact.clone());
+                resolved_location = base_location;
+                resolved_location.candidates = vec![exact];
+                reasons.clear();
+            } else {
+                reasons.extend(base_reasons);
+            }
+            if canonical.is_none() {
+                reasons.push(ConcurrencyOpenReason::UnknownLocation);
+            }
+            reasons.sort();
+            reasons.dedup();
+            Ok(CanonicalizedAccess {
+                canonical,
+                resolved_location,
+                reasons,
+                index_alias_domain: None,
+                field_alias_domain: None,
+            })
+        }
         MemoryLocationKind::Index {
             base,
             identity,
@@ -4593,6 +4638,11 @@ fn canonicalize_bound_accesses(
                 );
                 (*base, Some(selector), None)
             }
+            MemoryLocationKind::Property { base, key } => (
+                *base,
+                Some(SummaryConcurrencyAccessSelector::Property(key.clone())),
+                None,
+            ),
             MemoryLocationKind::Index {
                 base,
                 constant_index,
@@ -4787,6 +4837,7 @@ fn append_summary_accesses(
                 matches!(
                     selector,
                     SummaryConcurrencyAccessSelector::Aggregate
+                        | SummaryConcurrencyAccessSelector::Property(_)
                         | SummaryConcurrencyAccessSelector::ConstantIndex(_)
                         | SummaryConcurrencyAccessSelector::Index(_)
                         | SummaryConcurrencyAccessSelector::AnyIndex
@@ -4804,6 +4855,7 @@ fn append_summary_accesses(
         };
         let access_kind = match location.selectors().last() {
             Some(SummaryConcurrencyAccessSelector::Field(_)) => MemoryAccessKind::Field,
+            Some(SummaryConcurrencyAccessSelector::Property(_)) => MemoryAccessKind::Property,
             Some(
                 SummaryConcurrencyAccessSelector::Aggregate
                 | SummaryConcurrencyAccessSelector::ConstantIndex(_)
@@ -4933,6 +4985,7 @@ fn bind_summary_access_root(
         matches!(
             selector,
             SummaryConcurrencyAccessSelector::Aggregate
+                | SummaryConcurrencyAccessSelector::Property(_)
                 | SummaryConcurrencyAccessSelector::ConstantIndex(_)
                 | SummaryConcurrencyAccessSelector::Index(_)
                 | SummaryConcurrencyAccessSelector::AnyIndex

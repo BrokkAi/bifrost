@@ -20,12 +20,12 @@ use crate::analyzer::semantic::cfg_algorithms::{
 };
 use crate::analyzer::semantic::{
     CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
-    DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, MemberAccessKind,
-    MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict, ProcedureHandle,
-    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
-    SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind,
-    SemanticWork, SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter,
-    UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
+    DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, LengthDelimitedDigest,
+    MemberAccessKind, MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict,
+    ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
+    SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError,
+    SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan, StableDigest,
+    TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -106,7 +106,6 @@ pub struct TypeFlowPlan {
     local_structure_digests: HashMap<DurableProcedureKey, StableDigest>,
     summary_cuts: HashSet<DurableProcedureKey>,
     field_slot_semantic_budget_exhausted: bool,
-    store_survey_boundary: Option<UnknownReason>,
     provider_failure_observed: bool,
     field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
     refinement_budget_exhausted: bool,
@@ -737,6 +736,100 @@ fn binding_carrier(
     ))
 }
 
+/// Procedure-local refinements derived once for one root's solve.
+///
+/// One root solve builds its plan more than once: a summary-cut build whose
+/// sources still need refinement is discarded and rebuilt in full, and every
+/// feedback iteration rebuilds the plan again. Binding refinement is a pure
+/// function of the procedure's semantic identity, and field refinement of
+/// that identity together with the gaps the procedure's snapshot discharges,
+/// which the local structure digest already records. Deriving them once per
+/// build repeats the work and charges the root's semantic budget for it once
+/// per build: one `uvicorn/config.py` root spent 837k of its 1,000,000
+/// nested-entry budget deriving `Config.__init__` for a plan it then threw
+/// away, leaving too little for the plan it kept (#3163).
+///
+/// Reuse is charged once per ledger rather than once per process. A ledger
+/// that has not yet paid for a reused refinement is charged the work the
+/// derivation measured, so an attempt whose staged charge is rolled back
+/// pays again on the attempt that replaces it.
+#[derive(Debug, Default)]
+pub struct ProcedureRefinements {
+    bindings: HashMap<StableDigest, DerivedRefinement<GuardBindings>>,
+    correlations: HashMap<StableDigest, DerivedRefinement<CorrelationAnalysis>>,
+    fields: HashMap<StableDigest, DerivedRefinement<Vec<FieldLoadRefinement>>>,
+}
+
+#[derive(Debug)]
+struct DerivedRefinement<T> {
+    value: T,
+    work: SemanticWork,
+}
+
+/// Answer one refinement from the cache, deriving it on the first request.
+fn reused_or_derived<T: Clone>(
+    cache: &mut HashMap<StableDigest, DerivedRefinement<T>>,
+    identity: StableDigest,
+    budget: &mut SemanticBudget,
+    derive: impl FnOnce(&mut SemanticBudget) -> Result<T, CorrelationError>,
+) -> Result<T, CorrelationError> {
+    if let Some(derived) = cache.get(&identity) {
+        if !budget.has_charged_artifact(identity) {
+            budget
+                .charge(derived.work)
+                .map_err(CorrelationError::Budget)?;
+            budget.record_charged_artifact(identity);
+        }
+        return Ok(derived.value.clone());
+    }
+    if budget.has_charged_artifact(identity) {
+        // This accounting scope already paid for this exact derivation under
+        // an earlier root whose cache did not outlive it. Deriving it again
+        // must not charge the scope twice, so it runs against a scratch child
+        // ledger that starts at zero and is discarded.
+        let mut scratch = SemanticBudget::new_child(budget.limits(), &budget.scope_snapshot());
+        let value = derive(&mut scratch)?;
+        cache.insert(
+            identity,
+            DerivedRefinement {
+                value: value.clone(),
+                work: scratch.used(),
+            },
+        );
+        return Ok(value);
+    }
+    let before = budget.used();
+    let value = derive(budget)?;
+    let work = budget.used().saturating_sub(before);
+    budget.record_charged_artifact(identity);
+    cache.insert(
+        identity,
+        DerivedRefinement {
+            value: value.clone(),
+            work,
+        },
+    );
+    Ok(value)
+}
+
+/// The identity of one procedure's semantics. The artifact key already fixes
+/// the file's content, the adapter version, the IR version, the configuration,
+/// and the dependency fingerprint, so the key and the procedure's dense id
+/// name one exact lowered procedure.
+fn procedure_semantics_identity(
+    domain: &[u8],
+    procedure: &ProcedureHandle,
+) -> LengthDelimitedDigest {
+    let mut digest = LengthDelimitedDigest::new(domain);
+    digest.push(procedure.artifact().key().fingerprint().as_bytes());
+    digest.push(
+        &u64::try_from(procedure.id().index())
+            .expect("a dense procedure id fits in u64")
+            .to_le_bytes(),
+    );
+    digest
+}
+
 impl TypeFlowPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
@@ -748,6 +841,7 @@ impl TypeFlowPlan {
         limits: ClosureLimits,
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
+        refinements: &mut ProcedureRefinements,
     ) -> Result<Self, TypeFlowPlanError> {
         struct NoSummaryCuts;
         impl ClosureCutDecider for NoSummaryCuts {
@@ -772,6 +866,7 @@ impl TypeFlowPlan {
             limits,
             semantic_budget,
             cancellation,
+            refinements,
             &mut NoSummaryCuts,
         )
     }
@@ -786,6 +881,7 @@ impl TypeFlowPlan {
         limits: ClosureLimits,
         semantic_budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
+        refinements: &mut ProcedureRefinements,
         cuts: &mut C,
     ) -> Result<Self, TypeFlowPlanError> {
         let dispatch_reads = DispatchReadCollector::default();
@@ -841,7 +937,16 @@ impl TypeFlowPlan {
         let mut correlations = Vec::new();
         let mut guard_bindings = HashMap::default();
         for procedure in &closure.procedures {
-            match binding_refinement::derive(procedure, semantic_budget, cancellation) {
+            let bindings = reused_or_derived(
+                &mut refinements.bindings,
+                procedure_semantics_identity(b"bifrost-type-flow-binding-refinement-v1", procedure)
+                    .finish(),
+                semantic_budget,
+                |budget| {
+                    binding_refinement::derive(workspace, adapter, procedure, budget, cancellation)
+                },
+            );
+            match bindings {
                 Ok(bindings) => {
                     guard_bindings.insert(procedure.durable_key(), bindings);
                 }
@@ -850,11 +955,24 @@ impl TypeFlowPlan {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
             }
-            match analyze_correlations(procedure, semantic_budget, Some(cancellation)) {
-                Ok(mut analysis) => {
+            let correlation = reused_or_derived(
+                &mut refinements.correlations,
+                procedure_semantics_identity(b"bifrost-type-flow-correlations-v1", procedure)
+                    .finish(),
+                semantic_budget,
+                |budget| {
+                    let mut analysis = analyze_correlations(procedure, budget, Some(cancellation))?;
+                    // Only an exclusion with an incompatible definition can
+                    // remove a source, so the rest is state the cache would
+                    // carry for nothing.
                     analysis
                         .guard_edge_exclusions
                         .retain(|candidate| !candidate.incompatible_data_defs.is_empty());
+                    Ok(analysis)
+                },
+            );
+            match correlation {
+                Ok(analysis) => {
                     if !analysis.guard_edge_exclusions.is_empty() {
                         correlations.push((procedure.clone(), analysis));
                     }
@@ -865,19 +983,39 @@ impl TypeFlowPlan {
                 }
             }
             let fields = if let Some(class) = adapter.enclosing_class(workspace, procedure) {
-                match field_refinement::derive(
-                    workspace,
-                    adapter,
+                let snapshot = closure
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.value().procedure() == procedure)
+                    .map(|snapshot| snapshot.value());
+                // The enclosing class and the field-slot index are fixed for
+                // one root solve, so the snapshot's local structure -- which
+                // records exactly the gap discharges field refinement reads --
+                // completes the procedure's identity here.
+                let mut identity = procedure_semantics_identity(
+                    b"bifrost-type-flow-field-refinement-v1",
                     procedure,
-                    closure
-                        .snapshots
-                        .iter()
-                        .find(|snapshot| snapshot.value().procedure() == procedure)
-                        .map(|snapshot| snapshot.value()),
-                    &class,
-                    field_slots,
+                );
+                match local_structure_digests.get(&procedure.durable_key()) {
+                    Some(local_structure) => identity.push(local_structure.as_bytes()),
+                    None => identity.push(b"no-snapshot"),
+                }
+                match reused_or_derived(
+                    &mut refinements.fields,
+                    identity.finish(),
                     semantic_budget,
-                    cancellation,
+                    |budget| {
+                        field_refinement::derive(
+                            workspace,
+                            adapter,
+                            procedure,
+                            snapshot,
+                            &class,
+                            field_slots,
+                            budget,
+                            cancellation,
+                        )
+                    },
                 ) {
                     Ok(fields) => fields,
                     Err(CorrelationError::Budget(_)) => {
@@ -1029,7 +1167,6 @@ impl TypeFlowPlan {
             dispatch_reads,
             local_structure_digests,
             summary_cuts,
-            store_survey_boundary: field_slots.dynamic_survey_boundary(),
             field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted()
                 || refinement_budget_exhausted,
             provider_failure_observed,
@@ -1050,10 +1187,6 @@ impl TypeFlowPlan {
         } else {
             None
         }
-    }
-
-    pub(super) fn store_survey_boundary(&self) -> Option<UnknownReason> {
-        self.store_survey_boundary.clone()
     }
 
     pub fn value_flow(&self) -> &ValueFlowPlan {
@@ -1091,6 +1224,36 @@ impl TypeFlowPlan {
 
     pub(crate) fn refinement_budget_exhausted(&self) -> bool {
         self.refinement_budget_exhausted
+    }
+
+    /// The points [`refine_sources`](Self::refine_sources) can ask evidence
+    /// about: the definition points of every correlated guard exclusion, and
+    /// the store point of every field version a load may still observe.
+    pub(super) fn source_refinement_points(&self) -> HashSet<ProgramPointHandle> {
+        let mut points = HashSet::default();
+        for (procedure, analysis) in &self.correlations {
+            for candidate in &analysis.guard_edge_exclusions {
+                for definition in &candidate.all_reaching_data_defs {
+                    points.insert(
+                        procedure
+                            .point_handle(definition.point)
+                            .expect("a definition point is live"),
+                    );
+                }
+            }
+        }
+        for (procedure, field) in &self.field_refinements {
+            for alternative in &field.alternatives {
+                if let FieldVersion::Store { point, .. } = alternative.version {
+                    points.insert(
+                        procedure
+                            .point_handle(point)
+                            .expect("a field store point is live"),
+                    );
+                }
+            }
+        }
+        points
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2215,6 +2378,103 @@ mod tests {
 
     fn test_read(label: &[u8]) -> ReadKey {
         ReadKey::Models(StableDigest::sha256(label))
+    }
+
+    fn nested(entries: usize) -> SemanticWork {
+        SemanticWork {
+            nested_entries: entries,
+            ..SemanticWork::default()
+        }
+    }
+
+    /// One root solve builds its plan several times. Every build after the
+    /// first must reuse the refinement the first build derived, and must not
+    /// charge the ledger for it again (#3163).
+    #[test]
+    fn repeated_refinement_lookups_charge_one_derivation() {
+        let identity = StableDigest::sha256(b"one-refinement");
+        let mut cache = HashMap::default();
+        let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let mut derivations = 0_usize;
+        for _ in 0..5 {
+            let value = reused_or_derived(&mut cache, identity, &mut budget, |budget| {
+                derivations += 1;
+                budget
+                    .charge(nested(400))
+                    .map_err(CorrelationError::Budget)?;
+                Ok(7_u32)
+            })
+            .expect("the refinement derives and then reuses");
+            assert_eq!(value, 7);
+        }
+        assert_eq!(derivations, 1, "one ledger derives the refinement once");
+        assert_eq!(
+            budget.used().nested_entries,
+            400,
+            "five lookups charge one derivation, not five"
+        );
+    }
+
+    /// The near miss: this ledger holds one derivation of this size and no
+    /// more, so charging the same refinement a second time would exhaust it.
+    #[test]
+    fn one_ledger_holds_only_one_derivation_of_this_size() {
+        let mut budget = SemanticBudget::uniform(1_000).expect("a finite budget");
+        for (round, label) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut cache = HashMap::default();
+            let outcome = reused_or_derived(
+                &mut cache,
+                StableDigest::sha256(label),
+                &mut budget,
+                |budget| {
+                    budget
+                        .charge(nested(600))
+                        .map_err(CorrelationError::Budget)?;
+                    Ok(7_u32)
+                },
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                round == 0,
+                "a second derivation of this size does not fit"
+            );
+        }
+    }
+
+    /// A ledger that has not paid for a reused refinement is charged the work
+    /// the derivation measured, so a rolled-back attempt pays again.
+    #[test]
+    fn an_unpaid_ledger_is_charged_for_a_reused_refinement() {
+        let identity = StableDigest::sha256(b"one-refinement");
+        let mut cache = HashMap::default();
+        let mut first = SemanticBudget::uniform(1_000).expect("a finite budget");
+        reused_or_derived(&mut cache, identity, &mut first, |budget| {
+            budget
+                .charge(nested(400))
+                .map_err(CorrelationError::Budget)?;
+            Ok(7_u32)
+        })
+        .expect("the first ledger derives the refinement");
+
+        let mut fresh = SemanticBudget::uniform(1_000).expect("a finite budget");
+        let mut derivations = 0_usize;
+        reused_or_derived(&mut cache, identity, &mut fresh, |budget| {
+            derivations += 1;
+            budget
+                .charge(nested(400))
+                .map_err(CorrelationError::Budget)?;
+            Ok(7_u32)
+        })
+        .expect("the fresh ledger reuses the refinement");
+        assert_eq!(derivations, 0, "the cached value is reused, not rederived");
+        assert_eq!(
+            fresh.used().nested_entries,
+            400,
+            "a ledger that never paid is charged the measured work"
+        );
     }
 
     #[test]

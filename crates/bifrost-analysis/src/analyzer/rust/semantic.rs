@@ -5219,6 +5219,15 @@ fn rust_operation_can_abort(node: Node<'_>) -> bool {
 /// token payload canonicalizes equivalent spellings without interpreting any
 /// surrounding source or macro text.
 fn rust_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
+    rust_integer_literal_parts(source, node).map(|(value, _)| value)
+}
+
+/// Retain the token's type suffix when a consumer must check a contextual
+/// requirement, such as the `usize` type of an array length.
+pub(super) fn rust_integer_literal_parts<'source>(
+    source: &'source str,
+    node: Node<'_>,
+) -> Option<(u128, &'source str)> {
     if node.kind() != "integer_literal" {
         return None;
     }
@@ -5271,7 +5280,7 @@ fn rust_integer_literal_value(source: &str, node: Node<'_>) -> Option<u128> {
     ) {
         return None;
     }
-    Some(value)
+    Some((value, suffix))
 }
 
 fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {

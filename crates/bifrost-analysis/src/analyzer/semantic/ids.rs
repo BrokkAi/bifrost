@@ -189,10 +189,11 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
-/// Revision 25 adds program-point assignment events for every structured
-/// Python assignment target and content-addressed provenance for
-/// resolver-proven per-actual call argument conversions. Revision 23 adds
-/// saved definition-time default argument values, selected
+/// Revision 27 restores call-argument conversion provenance with scoped
+/// completeness while retaining revision 25's structured assignment events.
+/// Revision 26 adds undeclared keyed property memory locations and access
+/// selectors for runtime-global reads. Revision 23 adds saved definition-time
+/// default argument values, selected
 /// by conditional call bindings rather than executed in the callee body.
 /// Revision 20 replaces the fieldless aggregate-copy value-flow marker with
 /// the identity-separating transfer vocabulary (copy, aggregate copy, move
@@ -208,7 +209,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 25;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 27;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1341,10 +1342,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "d8b7799e984f2f3ebc58fe05368d6f241164fe3a317e8ba4b8aa9954e621e61f"
+            "8290bb05a8d713c73571f0cafd76d2b25dc5ecac5a6cb57d508db820a2742ef1"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 25);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 27);
     }
 
     fn digest(label: &str) -> StableDigest {

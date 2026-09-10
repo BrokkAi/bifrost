@@ -1244,6 +1244,26 @@ fn project_procedure_observations(
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<bool, Interruption> {
+    let mut load_points = HashMap::default();
+    for point in procedure.semantics().points() {
+        for event in &point.events {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            staged.charge(SemanticWork {
+                events: 1,
+                ..SemanticWork::default()
+            })?;
+            if let crate::analyzer::semantic::SemanticEffect::MemoryLoad { result, .. } =
+                event.effect
+            {
+                load_points
+                    .entry(result)
+                    .or_insert_with(Vec::new)
+                    .push(point.id);
+            }
+        }
+    }
     let mut candidates_by_span = HashMap::<SourceSpan, CandidateSpan>::default();
     for (index, candidate) in candidates.iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -1333,6 +1353,7 @@ fn project_procedure_observations(
             && append_observations(
                 &exact.indexes,
                 candidates,
+                &load_points,
                 procedure,
                 &point_handle,
                 limit,
@@ -1349,6 +1370,7 @@ fn project_procedure_observations(
             && append_observations(
                 &fallback_candidates,
                 candidates,
+                &load_points,
                 procedure,
                 &point_handle,
                 limit,
@@ -1367,6 +1389,10 @@ fn project_procedure_observations(
 fn append_observations(
     candidate_indexes: &[usize],
     candidates: &[SourceValueCandidate],
+    load_points: &HashMap<
+        crate::analyzer::semantic::ValueId,
+        Vec<crate::analyzer::semantic::ProgramPointId>,
+    >,
     procedure: &crate::analyzer::semantic::ProcedureHandle,
     point: &crate::analyzer::semantic::ProgramPointHandle,
     limit: usize,
@@ -1386,6 +1412,14 @@ fn append_observations(
             .semantics()
             .call_phase_points(candidates[*index].value.id())
             .is_some_and(|points| points.binary_search(&point.id()).is_err())
+        {
+            continue;
+        }
+        // A result is observed after its defining load, not at another
+        // control point with the same expression span.
+        if load_points
+            .get(&candidates[*index].value.id())
+            .is_some_and(|points| !points.contains(&point.id()))
         {
             continue;
         }

@@ -37,13 +37,13 @@ use super::{
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v7";
+    b"bifrost-icfg-provider/workspace-behavior/v8";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v6";
+    b"bifrost-icfg-provider/workspace-read-behavior/v7";
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///
@@ -1610,7 +1610,51 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         if let Some(outcome) = cached.flatten() {
             return Ok(outcome);
         }
-        let outcome = materialize_exit_profile(callee_entry, callee_exit, request)?;
+        let refinements = self
+            .oracle
+            .runtime_refinements_for_procedure(callee_entry.procedure(), request)?;
+        match &refinements {
+            SemanticOutcome::Cancelled { work, .. } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: *work,
+                });
+            }
+            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded: *exceeded,
+                    work: *work,
+                });
+            }
+            _ => {}
+        }
+        let discharged = refinements
+            .available_value()
+            .map(|reads| {
+                reads
+                    .endpoints
+                    .iter()
+                    .flat_map(|endpoint| endpoint.discharged_gaps.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut outcome = materialize_exit_profile_with_runtime_reads(
+            callee_entry,
+            callee_exit,
+            &discharged,
+            request,
+        )?;
+        let work = match &mut outcome {
+            SemanticOutcome::Complete { work, .. }
+            | SemanticOutcome::Unproven { work, .. }
+            | SemanticOutcome::Unknown { work, .. }
+            | SemanticOutcome::Ambiguous { work, .. }
+            | SemanticOutcome::Unsupported { work, .. }
+            | SemanticOutcome::Cancelled { work, .. }
+            | SemanticOutcome::ExceededBudget { work, .. } => work,
+        };
+        *work = work.conservative_add(refinements.work());
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
             self.outcome_cache
                 .exit_profiles
@@ -2585,6 +2629,15 @@ fn materialize_exit_profile(
     callee_exit: &ProgramPointHandle,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+    materialize_exit_profile_with_runtime_reads(callee_entry, callee_exit, &[], request)
+}
+
+fn materialize_exit_profile_with_runtime_reads(
+    callee_entry: &ProgramPointHandle,
+    callee_exit: &ProgramPointHandle,
+    discharged_runtime_reads: &[super::SemanticGapId],
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
@@ -2716,7 +2769,9 @@ fn materialize_exit_profile(
         // evaluation carries its own procedure-level gap into its exit
         // profile and bindings (#1989). It must not weaken this caller's
         // exit profile a second time.
-        if gap.discharge == SemanticGapDischarge::CallResolution {
+        if gap.discharge == SemanticGapDischarge::CallResolution
+            || discharged_runtime_reads.contains(&gap.id)
+        {
             return false;
         }
         let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);

@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/runtime-values/0.1/schema.json",
+  "title": "CSMI runtime exposure and keyed-read value profile 0.1 payloads",
+  "oneOf": [
+    { "$ref": "#/$defs/runtimeGlobalExposure" },
+    { "$ref": "#/$defs/keyedReadBehavior" },
+    { "$ref": "#/$defs/runtimeGlobalBindingEvidence" },
+    { "$ref": "#/$defs/keyedReadObservation" }
+  ],
+  "$defs": {
+    "localId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sourceRange": {
+      "type": "object", "additionalProperties": false,
+      "required": ["resource", "resourceDigest", "startByte", "endByte"],
+      "properties": {
+        "resource": { "$ref": "#/$defs/nonEmpty" },
+        "resourceDigest": { "$ref": "#/$defs/sha256" },
+        "startByte": { "type": "integer", "minimum": 0 },
+        "endByte": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["producer", "method", "inputsDigest"],
+      "properties": {
+        "producer": { "type": "string", "format": "uri" },
+        "method": { "$ref": "#/$defs/nonEmpty" },
+        "inputsDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "scopedIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ownerDigest", "kind", "locatorDigest"],
+      "properties": {
+        "ownerDigest": { "$ref": "#/$defs/sha256" },
+        "kind": { "enum": ["scope", "value", "operation", "point"] },
+        "locatorDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["complete", "partial", "unknown"] },
+        "limitations": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["activation-missing", "activation-conflict", "activation-unsupported", "lexical-binding-indeterminate", "rebinding-indeterminate", "mutation-incomplete", "accessor-or-proxy-incomplete", "materialization-incomplete", "exception-behavior-indeterminate", "dynamic-key", "unsupported-index", "cancelled", "budget-exhausted", "stale-evidence", "ambiguous-owner", "coverage-limited"] } }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "complete" } } }, "then": { "not": { "required": ["limitations"] } } },
+        { "if": { "properties": { "status": { "enum": ["partial", "unknown"] } } }, "then": { "required": ["limitations"] } }
+      ]
+    },
+    "runtimeApplicability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runtimeFamily", "runtimeArtifact", "runtimeArtifactDigest", "realm", "moduleMode", "initializationBoundary"],
+      "properties": {
+        "runtimeFamily": { "$ref": "#/$defs/nonEmpty" },
+        "runtimeArtifact": { "type": "string", "pattern": "^pkg:[^@]+@[^@]+$" },
+        "runtimeArtifactDigest": { "$ref": "#/$defs/sha256" },
+        "platform": { "$ref": "#/$defs/nonEmpty" },
+        "architecture": { "$ref": "#/$defs/nonEmpty" },
+        "realm": { "$ref": "#/$defs/nonEmpty" },
+        "moduleMode": { "$ref": "#/$defs/nonEmpty" },
+        "initializationBoundary": { "$ref": "#/$defs/nonEmpty" },
+        "hostAssumptions": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } }
+      }
+    },
+    "runtimeGlobalExposure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "exposureId", "languages", "bindingName", "runtime", "runtimeProfileDigest", "rootIdentity", "members", "activation", "evidence", "coverage"],
+      "properties": {
+        "kind": { "const": "runtime-global-exposure" },
+        "exposureId": { "$ref": "#/$defs/localId" },
+        "languages": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "bindingName": { "$ref": "#/$defs/nonEmpty" },
+        "runtime": { "$ref": "#/$defs/runtimeApplicability" },
+        "runtimeProfileDigest": { "$ref": "#/$defs/sha256" },
+        "rootIdentity": {
+          "type": "object", "additionalProperties": false,
+          "required": ["scheme", "schemeVersion", "descriptors"],
+          "properties": {
+            "scheme": { "const": "csmi.runtime-global" },
+            "schemeVersion": { "const": "0.1.0" },
+            "descriptors": { "type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{ "type": "object", "additionalProperties": false, "required": ["role", "name"], "properties": { "role": { "const": "runtime" }, "name": { "$ref": "#/$defs/nonEmpty" } } }, { "type": "object", "additionalProperties": false, "required": ["role", "name"], "properties": { "role": { "const": "global" }, "name": { "$ref": "#/$defs/nonEmpty" } } }], "items": false }
+          }
+        },
+        "members": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/localId" } },
+        "activation": { "enum": ["enabled", "disabled", "review-required"] },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "coverage": { "$ref": "#/$defs/coverage" }
+      }
+    },
+    "staticKey": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "property" }, "value": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "index" }, "value": { "type": "integer", "minimum": 0, "maximum": 4294967294 } } }
+      ]
+    },
+    "keyedReadBehavior": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "behaviorId", "exposureId", "containerMember", "acceptedKeys", "normalResult", "exceptionBehavior", "mutationModel", "materialization", "evidence", "coverage"],
+      "properties": {
+        "kind": { "const": "keyed-read-behavior" },
+        "behaviorId": { "$ref": "#/$defs/localId" },
+        "exposureId": { "$ref": "#/$defs/localId" },
+        "containerMember": { "$ref": "#/$defs/localId" },
+        "acceptedKeys": { "enum": ["static-property", "static-index"] },
+        "normalResult": { "enum": ["value-or-undefined", "value"] },
+        "exceptionBehavior": { "enum": ["nonthrowing", "may-throw", "unknown"] },
+        "mutationModel": { "enum": ["pristine-input-until-write", "ordinary-mutable", "unknown"] },
+        "materialization": { "enum": ["eager", "lazy", "host-defined", "unknown"] },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "coverage": { "$ref": "#/$defs/coverage" }
+      }
+    },
+    "activationEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["outcome", "runtimeProfileDigest", "activeSetDigest", "activeExposureIds", "modelDigest", "activationSource", "exposureId"],
+      "properties": {
+        "outcome": { "enum": ["matched", "not-matched", "indeterminate", "conflict", "unsupported"] },
+        "runtimeProfileDigest": { "$ref": "#/$defs/sha256" },
+        "activeSetDigest": { "$ref": "#/$defs/sha256" },
+        "activeExposureIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/localId" } },
+        "modelDigest": { "$ref": "#/$defs/sha256" },
+        "activationSource": { "type": "string", "format": "uri" },
+        "exposureId": { "$ref": "#/$defs/localId" }
+      }
+    },
+    "runtimeGlobalBindingEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "bindingEvidenceId", "exposureId", "activation", "language", "dialect", "rootOccurrence", "scopeIdentity", "lexicalBinding", "rebinding", "evidence", "coverage"],
+      "properties": {
+        "kind": { "const": "runtime-global-binding-evidence" },
+        "bindingEvidenceId": { "$ref": "#/$defs/localId" },
+        "exposureId": { "$ref": "#/$defs/localId" },
+        "activation": { "$ref": "#/$defs/activationEvidence" },
+        "language": { "$ref": "#/$defs/nonEmpty" },
+        "dialect": { "$ref": "#/$defs/nonEmpty" },
+        "rootOccurrence": { "$ref": "#/$defs/sourceRange" },
+        "scopeIdentity": { "$ref": "#/$defs/scopedIdentity" },
+        "lexicalBinding": { "enum": ["absent", "present", "indeterminate"] },
+        "rebinding": { "enum": ["excluded", "present", "indeterminate"] },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "coverage": { "$ref": "#/$defs/coverage" }
+      }
+    },
+    "keyedReadObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "observationId", "bindingEvidenceId", "behaviorId", "baseValue", "key", "sourceForm", "loadOperation", "resultValue", "observationPoint", "phase", "expression", "sourceOrigin", "normalOutcome", "exceptionOutcome", "evidence", "coverage"],
+      "properties": {
+        "kind": { "const": "keyed-read-observation" },
+        "observationId": { "$ref": "#/$defs/localId" },
+        "bindingEvidenceId": { "$ref": "#/$defs/localId" },
+        "behaviorId": { "$ref": "#/$defs/localId" },
+        "baseValue": { "$ref": "#/$defs/scopedIdentity" },
+        "key": { "$ref": "#/$defs/staticKey" },
+        "sourceForm": { "enum": ["dot", "bracket-string", "bracket-number"] },
+        "loadOperation": { "$ref": "#/$defs/scopedIdentity" },
+        "resultValue": { "$ref": "#/$defs/scopedIdentity" },
+        "observationPoint": { "$ref": "#/$defs/scopedIdentity" },
+        "phase": { "enum": ["before-effects", "after-effects", "exceptional"] },
+        "expression": { "$ref": "#/$defs/sourceRange" },
+        "sourceOrigin": { "enum": ["pristine-runtime-input", "mutated", "indeterminate", "not-applicable"] },
+        "normalOutcome": { "enum": ["exact", "partial", "unsupported", "indeterminate"] },
+        "exceptionOutcome": { "enum": ["excluded", "possible", "unsupported", "indeterminate"] },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "coverage": { "$ref": "#/$defs/coverage" }
+      }
+    }
+  }
+}

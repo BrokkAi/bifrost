@@ -262,6 +262,19 @@ pub trait ScalaReferenceSink {
 type PackageTypeEntries = Arc<Vec<(String, CodeUnit)>>;
 type CachedScalaSourceFacts = Arc<ScalaSourceFacts>;
 type ScalaSourceFactsCell = Arc<OnceLock<CachedScalaSourceFacts>>;
+/// Per-file source facts (`stable_owner_ranges`, `case_class_ranges`, ...)
+/// derived by a full tree-sitter parse of the file, shared across every
+/// [`ProjectTypes`] built in one analyzer generation.
+///
+/// `type_is_stable_owner` and `type_accepts_object_roles` consult these for
+/// each candidate declaration, and a usage query builds `ProjectTypes` three
+/// times (hierarchy, catalog, scan). With the cache owned per instance, every
+/// candidate's file was re-parsed from source per instance per query: on
+/// scalaz a single `CofreeZip` scan re-parsed the workspace until it blew the
+/// 600s probe budget, with tree-sitter at ~36% of process CPU. Owning the cache
+/// at the analyzer and threading it through the seed parses each file once
+/// per generation instead.
+pub type ScalaSourceFactsCache = Arc<Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>>;
 pub type CachedCallableAlternatives = Arc<Vec<CallableAlternative>>;
 type CallableAlternativesCell = Arc<OnceLock<CachedCallableAlternatives>>;
 type ExtensionOwnerMemberKey = (String, String);
@@ -351,7 +364,7 @@ pub struct ProjectTypes {
     nested_types_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     nested_objects_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     wildcard_members_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
-    source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
+    source_facts_by_file: ScalaSourceFactsCache,
     file_facts: ScalaFileFactsSource,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     effective_callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
@@ -462,6 +475,7 @@ pub struct ScalaProjectTypesSeed {
     structural_parent_by_unit: Arc<HashMap<CodeUnit, CodeUnit>>,
     scala_trait_fqns: Arc<HashSet<String>>,
     facts: ScalaSeedFileFacts,
+    source_facts: ScalaSourceFactsCache,
 }
 
 /// The workspace-wide type-namespace structures a [`ScalaProjectTypesSeed`]
@@ -531,11 +545,20 @@ impl ScalaProjectTypesSweep {
                 hierarchy_inputs: Some(Arc::new(self.hierarchy_inputs)),
                 facts,
             },
+            source_facts: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }
 
 impl ScalaProjectTypesSeed {
+    /// Share `cache` with every `ProjectTypes` built from this seed, so the
+    /// per-file source facts are parsed once per analyzer generation rather
+    /// than once per query per instance.
+    pub fn with_source_facts_cache(mut self, cache: ScalaSourceFactsCache) -> Self {
+        self.source_facts = cache;
+        self
+    }
+
     /// Warm the per-file facts cells for the files the query is about to
     /// scan. The eager seed already holds every file; the targeted seed
     /// batches the scan set's hydration ahead of the parallel walk so each
@@ -670,6 +693,7 @@ impl ProjectTypes {
             structural_parent_by_unit: Arc::new(derived.structural_parent_by_unit),
             scala_trait_fqns: Arc::new(derived.scala_trait_fqns),
             facts: ScalaSeedFileFacts::Eager(file_states),
+            source_facts: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 
@@ -698,7 +722,7 @@ impl ProjectTypes {
             nested_types_by_owner: Mutex::new(HashMap::default()),
             nested_objects_by_owner: Mutex::new(HashMap::default()),
             wildcard_members_by_owner: Mutex::new(HashMap::default()),
-            source_facts_by_file: Mutex::new(HashMap::default()),
+            source_facts_by_file: Arc::clone(&seed.source_facts),
             file_facts,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
@@ -771,6 +795,7 @@ impl ProjectTypes {
                     facts: Arc::clone(facts),
                 },
             },
+            source_facts: Arc::clone(&self.source_facts_by_file),
         }
     }
 

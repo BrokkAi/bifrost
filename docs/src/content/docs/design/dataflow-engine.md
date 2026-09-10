@@ -162,6 +162,15 @@ sanitizer behavior, while fact topology tracks carriers and sink meetings.
 | Typestate | Finite protocol states and uncertainty over bound subjects; forward and backward execution share semantic edges | Findings retain protocol state, certainty, analysis completion, and witnesses |
 | Class-set type flow | Seeds class atoms and explicit unknown atoms, then reuses the value-flow solver for receiver propagation | Unknown or incomplete class sets remain typed unknown or incomplete results |
 
+Class-set dispatch feedback can close a resolved receiver call's dynamic-dispatch
+remainder when the complete receiver set names exactly the declarations already
+selected by the resolver and all targets materialize with complete evidence.
+The refinement preserves those declarations and their proofs. Partial receiver
+sets, open member lookups, uncovered declarations, and interrupted materialization
+leave the remainder open. Class-qualified calls keep the class-selected callable;
+the explicit receiver argument does not select a different method. Feedback runs
+under the request's existing iteration, work, and cancellation limits.
+
 Python member absence needs more than a declaration lookup: another procedure
 can install an instance attribute. The class-set engine consults the cached
 workspace store survey before accepting declaration-only absence. Attributed

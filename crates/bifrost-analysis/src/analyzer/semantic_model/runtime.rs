@@ -9,11 +9,12 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledClassDecoratorIdentity, CompiledConcurrencyEffect, CompiledConditionalIndirectWrite,
-    CompiledConditionalResultRefinement, CompiledDeclaredEffect, CompiledNormalReturnRefinement,
-    CompiledNormalReturnTypeRefinement, CompiledOperationPrecondition, CompiledPackManifest,
-    CompiledProcedureSummary, CompiledProcedureTarget, CompiledResultContract, CompiledShard,
-    DeclarationGuard, GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger,
+    CollectionFlowsPayload, CompiledClassDecoratorIdentity, CompiledConcurrencyEffect,
+    CompiledConditionalIndirectWrite, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledNormalReturnRefinement, CompiledNormalReturnTypeRefinement,
+    CompiledOperationPrecondition, CompiledPackManifest, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledResultContract, CompiledShard, DeclarationGuard,
+    GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger, RuntimeValuesPayload,
     SemanticModelOverlay, SemanticModelOverlayBuildError, SemanticPackCatalog,
     SemanticPackSelectorQuery, TypeFact,
 };
@@ -29,7 +30,7 @@ use crate::analyzer::store::{
 use crate::analyzer::{IAnalyzer, Language, LanguageDialect};
 use crate::hash::{HashMap, map_with_capacity};
 
-pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 3;
+pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 4;
 
 type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
@@ -275,6 +276,32 @@ impl ResolvedActiveSemanticModels {
 
     pub fn shards(&self) -> &[ActiveSemanticModelShard] {
         &self.shards
+    }
+
+    /// Runtime-value contracts are carried by the same activated shard as
+    /// their selectors and declaration facts.  Keep the shard alongside the
+    /// payload so callers retain activation and provenance evidence.
+    pub fn runtime_values(
+        &self,
+    ) -> impl Iterator<Item = (&RuntimeValuesPayload, &ActiveSemanticModelShard)> {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.shard.runtime_values().map(|payload| (payload, shard)))
+    }
+
+    /// Collection-flow contracts are carried by the same activated shard as
+    /// their selectors and declaration facts. Keeping the shard alongside the
+    /// typed payload preserves activation and provenance evidence for exact
+    /// callable lookup.
+    pub fn collection_flows(
+        &self,
+    ) -> impl Iterator<Item = (&CollectionFlowsPayload, &ActiveSemanticModelShard)> {
+        self.shards.iter().filter_map(|shard| {
+            shard
+                .shard
+                .collection_flows()
+                .map(|payload| (payload, shard))
+        })
     }
 
     pub fn activation_report(&self) -> &SemanticModelActivationReport {
@@ -3722,7 +3749,7 @@ mod active_model_set_identity_tests {
 
     #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
-        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 3);
+        assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 4);
         let mut previous = Sha256::new();
         previous.update(b"bifrost.semantic-model.active-set.v2\0");
         previous.update(2u32.to_be_bytes());

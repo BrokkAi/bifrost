@@ -619,7 +619,7 @@ void test("renders a dispatch-outcome result and refuses to prove an empty targe
     target_count: 3,
     targets_truncated: true,
     semantic_unsupported: "typescript records no dispatch oracle",
-    exceeded_limit: "call_depth"
+    exceeded_limit: "rows"
   };
   assert.equal(queryResultDescription(unsupported), "open · 3 targets (truncated) · 2 call sites");
   const unsupportedTooltip = queryResultTooltip(unsupported);
@@ -627,7 +627,7 @@ void test("renders a dispatch-outcome result and refuses to prove an empty targe
     unsupportedTooltip,
     /Semantic support absent: typescript records no dispatch oracle/
   );
-  assert.match(unsupportedTooltip, /Exceeded budget: call_depth/);
+  assert.match(unsupportedTooltip, /Exceeded budget: rows/);
   assert.doesNotMatch(unsupportedTooltip, /not proven-empty/);
 });
 

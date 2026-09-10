@@ -1662,6 +1662,12 @@ impl IAnalyzer for MultiAnalyzer {
         (!cancellation.is_cancelled()).then_some(declarations)
     }
 
+    fn property_reaching_provider(
+        &self,
+    ) -> Option<&dyn crate::analyzer::semantic::PropertyReachingProvider> {
+        Some(self)
+    }
+
     fn invalidate_cached_file_identities(&self) {
         self.delegates
             .values()

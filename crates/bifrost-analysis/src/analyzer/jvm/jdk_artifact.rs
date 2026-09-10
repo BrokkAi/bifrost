@@ -395,6 +395,8 @@ impl JdkSourceArchivePackProducer {
                     members,
                     relations: Vec::new(),
                 },
+                runtime_values: None,
+                collection_flows: None,
             });
         }
         if record_limit_hit {

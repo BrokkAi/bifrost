@@ -1,5 +1,8 @@
 //! Scala lowering into the language-neutral executable-semantics IR.
 
+use brokk_bifrost_core::analyzer::model::{
+    StructuredTypeIdentity, StructuredTypeIdentityBuilder, StructuredTypeName,
+};
 use brokk_bifrost_jvm::scala::graph::syntax::is_scala_named_argument_assignment;
 use brokk_bifrost_jvm::scala::structural::named_argument_parts;
 use tree_sitter::Node;
@@ -11,15 +14,23 @@ use crate::analyzer::semantic::cfg::{
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
+use crate::analyzer::semantic_model::csmi::{
+    CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowEntryComponent, CsmiCollectionFlowShape,
+    CsmiCollectionFlowSubstitution, CsmiInputBoundaryRoot, CsmiOutputBoundaryRoot,
+};
+use crate::analyzer::semantic_model::{
+    CollectionFlowContract, SemanticModelCallApplication, SemanticModelCallableDisposition,
+    SemanticModelCallableKey, SemanticModelOverlay, SemanticModelOverlayDisposition,
+};
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::tree_walk::{named_children, subtree_contains};
-use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, ScalaAnalyzer};
+use crate::analyzer::{DispatchExtensibility, IAnalyzer, Language, ProjectFile, ScalaAnalyzer};
 use crate::hash::HashMap;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v8";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v9";
 
 /// Bound on the expression nodes examined while proving that a result
 /// expression already carries the callable's declared result type. The
@@ -27,9 +38,34 @@ const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v8";
 /// each return proof walk an unbounded subtree.
 const SCALA_RESULT_IDENTITY_NODE_BUDGET: usize = 64;
 
-impl_program_semantics_provider!(ScalaAnalyzer, ScalaSemanticLowerer);
+impl_program_semantics_provider!(ScalaAnalyzer, |analyzer| ScalaSemanticLowerer::new(
+    analyzer
+));
 
-struct ScalaSemanticLowerer;
+struct ScalaSemanticLowerer {
+    dependencies: DependencyFingerprint,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+}
+
+impl ScalaSemanticLowerer {
+    fn new(analyzer: &ScalaAnalyzer) -> Self {
+        let snapshot = analyzer.active_semantic_model_snapshot();
+        let dependencies = snapshot.as_ref().map_or_else(
+            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            |snapshot| {
+                let mut identity = b"scala-semantic-model-set-v1\0".to_vec();
+                identity
+                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
+                DependencyFingerprint::hash_bytes(&identity)
+            },
+        );
+        Self {
+            dependencies,
+            semantic_model_overlay: snapshot
+                .and_then(|snapshot| snapshot.semantic_model_overlay().cloned()),
+        }
+    }
+}
 
 impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -39,7 +75,7 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"scala-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies: self.dependencies,
         }
     }
 
@@ -76,13 +112,20 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
                 }
             };
 
+        let semantic_model_overlay = self.semantic_model_overlay.clone();
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    spec,
+                    staged_budget,
+                    cancellation,
+                    semantic_model_overlay.clone(),
+                )
             },
         )
     }
@@ -548,12 +591,14 @@ struct CleanupRegion<'tree> {
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     callable: Node<'tree>,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     parameter_types: HashMap<Box<str>, ScalaTypeIdentityId>,
+    parameter_structured_types: HashMap<Box<str>, StructuredTypeIdentity>,
     type_identities: Vec<Arc<[String]>>,
     type_identity_ids: HashMap<Arc<[String]>, ScalaTypeIdentityId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
@@ -578,6 +623,8 @@ struct LocalBinding {
     scope_end: usize,
     value: ValueId,
     type_identity: Option<ScalaTypeIdentityId>,
+    structured_type_identity: Option<StructuredTypeIdentity>,
+    component_index: Option<usize>,
     /// For a binding whose type is `Array[T]`, the identity of `T`. Scala's
     /// arrays are invariant and their element type is exactly the written
     /// type argument, so a selection on `values(i)` resolves against it.
@@ -589,6 +636,7 @@ fn lower_procedure<'tree>(
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), ScalaLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -610,12 +658,14 @@ fn lower_procedure<'tree>(
     let mut context = LoweringContext {
         prepared,
         session,
+        semantic_model_overlay,
         callable: spec.callable,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         parameter_types: HashMap::default(),
+        parameter_structured_types: HashMap::default(),
         type_identities: Vec::new(),
         type_identity_ids: HashMap::default(),
         locals: HashMap::default(),
@@ -832,10 +882,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .then(|| node.child_by_field_name("type"))
                 .flatten()
                 .and_then(|type_node| self.intern_type_identity(type_node));
+            let structured_type_identity = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                .and_then(|type_node| self.structured_type_identity(type_node));
             for name in slot.names {
                 if let Some(type_identity) = type_identity {
                     self.parameter_types
                         .insert(name.clone().into_boxed_str(), type_identity);
+                }
+                if let Some(identity) = structured_type_identity.as_ref() {
+                    self.parameter_structured_types
+                        .insert(name.clone().into_boxed_str(), identity.clone());
                 }
                 self.parameters.insert(name.into_boxed_str(), value);
             }
@@ -919,6 +977,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let type_identity = declared
                     .and_then(|type_node| self.intern_type_identity(type_node))
                     .or_else(|| inferred.map(|identity| self.intern_type_segments(identity)));
+                let structured_type_identity = declared
+                    .and_then(|type_node| self.structured_type_identity(type_node))
+                    .or_else(|| {
+                        initializer.and_then(|node| self.expression_structured_type_identity(node))
+                    });
                 let declared_element = declared.and_then(|type_node| {
                     scala_array_element_type_node(type_node, self.prepared.source())
                 });
@@ -939,8 +1002,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_end,
                         value,
                         type_identity,
+                        structured_type_identity,
                         element_identity,
+                        component_index: None,
                     });
+            }
+            if node.kind() == "enumerator"
+                && let Some(pattern) = enumerator_pattern(node)
+                && pattern.kind() == "tuple_pattern"
+                && let Some((scope_start, scope_end)) = scala_local_scope(node, body)
+            {
+                let visible_from = enumerator_rhs(node)
+                    .map_or_else(|| node.end_byte(), |source| source.end_byte());
+                for (component_index, binder) in
+                    tuple_pattern_bindings(pattern).into_iter().enumerate()
+                {
+                    let Some(name) =
+                        node_text(self.prepared.source(), binder).filter(|name| *name != "_")
+                    else {
+                        continue;
+                    };
+                    let metadata = self.value_mapping(builder, binder)?;
+                    let value = self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::Local,
+                    )?;
+                    self.locals
+                        .entry(name.into())
+                        .or_default()
+                        .push(LocalBinding {
+                            declaration_start: binder.start_byte(),
+                            visible_from,
+                            scope_start,
+                            scope_end,
+                            value,
+                            type_identity: None,
+                            structured_type_identity: None,
+                            element_identity: None,
+                            component_index: Some(component_index),
+                        });
+                }
             }
             // A `case caught: T =>` arm binds the thrown or matched value to
             // `caught` with a written type. Registering it as a local is what
@@ -963,6 +1065,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scala_array_element_type_node(declared, self.prepared.source());
                 let element_identity =
                     declared_element.and_then(|element| self.intern_type_identity(element));
+                let structured_type_identity = self.structured_type_identity(declared);
                 self.locals
                     .entry(name.into())
                     .or_default()
@@ -973,7 +1076,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_end,
                         value,
                         type_identity,
+                        structured_type_identity,
                         element_identity,
+                        component_index: None,
                     });
             }
             Ok(WalkControl::Continue)
@@ -995,6 +1100,62 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn intern_type_identity(&mut self, node: Node<'tree>) -> Option<ScalaTypeIdentityId> {
         let identity = scala_type_identity(node, self.prepared.source())?;
         Some(self.intern_type_segments(identity))
+    }
+
+    /// Retain the parser's generic type shape for modeled collection receivers.
+    /// The legacy `ScalaTypeIdentityId` intentionally stores only nominal
+    /// segments for array/member compatibility; collection contracts need the
+    /// generic arguments to distinguish `Map[K, V]` from a raw or unrelated
+    /// receiver. Unsupported type syntax stays unresolved.
+    fn structured_type_identity(&self, node: Node<'tree>) -> Option<StructuredTypeIdentity> {
+        scala_structured_type_identity(node, self.prepared.source(), self.callable)
+    }
+
+    fn expression_structured_type_identity(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<StructuredTypeIdentity> {
+        let mut current = node;
+        for _ in 0..SCALA_RESULT_IDENTITY_NODE_BUDGET {
+            match current.kind() {
+                "parenthesized_expression" => {
+                    current = first_runtime_named_child(current)?;
+                }
+                "generic_function" => {
+                    return self.structured_type_identity(current);
+                }
+                "identifier" => {
+                    let name = node_text(self.prepared.source(), current)?;
+                    return self
+                        .local_binding_at(name, current.start_byte())
+                        .and_then(|binding| binding.structured_type_identity.clone())
+                        .or_else(|| self.parameter_structured_types.get(name).cloned());
+                }
+                "call_expression" => {
+                    let (function, _) = flattened_call_parts(current).ok()?;
+                    if function.kind() == "generic_function" {
+                        return self.structured_type_identity(function);
+                    }
+                    let callable = normalized_callable_expression(function).ok()?;
+                    if callable.kind() == "identifier" {
+                        return self
+                            .local_binding_at(
+                                node_text(self.prepared.source(), callable)?,
+                                callable.start_byte(),
+                            )
+                            .and_then(|binding| binding.structured_type_identity.clone())
+                            .or_else(|| {
+                                self.parameter_structured_types
+                                    .get(node_text(self.prepared.source(), callable)?)
+                                    .cloned()
+                            });
+                    }
+                    return None;
+                }
+                _ => return self.structured_type_identity(current),
+            }
+        }
+        None
     }
 
     fn intern_type_segments(&mut self, identity: Arc<[String]>) -> ScalaTypeIdentityId {
@@ -2078,6 +2239,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .and_then(|item| enumerator_rhs(*item));
         let decision = self.point(builder, enumerators, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
+        if let Some(first_source) = first_source
+            && let Some((_, value_parameter)) = self.modeled_map_iteration_flow(first_source)
+            && let Some(enumerator) = enumerator_nodes.first()
+            && let Some(pattern) = enumerator_pattern(*enumerator)
+            && pattern.kind() == "tuple_pattern"
+        {
+            let iterable =
+                self.expression_value(builder, first_source, expression_value_kind(first_source))?;
+            let location = self.session.add_memory_location(
+                builder,
+                decision,
+                MemoryLocationKind::Index {
+                    base: iterable,
+                    index: None,
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
+                },
+            )?;
+            let entry = self.source_value(builder, node, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                decision,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result: entry,
+                },
+            )?;
+            // The CSMI invocation proves the callback's ordered entry
+            // component layout. The neutral IR has no product-component
+            // value kind, so retain the proven value component as a local
+            // flow from the aggregate entry; do not copy the entry into the
+            // key binder, which would falsely taint keys from value writes.
+            if let Ok(value_component) = usize::try_from(value_parameter)
+                && let Some(value_binder) = tuple_pattern_bindings(pattern)
+                    .get(value_component)
+                    .and_then(|binder| node_text(self.prepared.source(), *binder))
+                    .and_then(|name| self.local_binding_at(name, body.start_byte()))
+                    .filter(|binding| binding.component_index == Some(value_component))
+            {
+                self.append_effect(
+                    builder,
+                    decision,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: entry,
+                        target: value_binder.value,
+                    },
+                )?;
+            }
+        }
         for (capability, kind, detail) in [
             (
                 SemanticCapability::Calls,
@@ -2398,6 +2610,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     index: Some(index),
                     constant_index: None,
                     identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value: source,
+                },
+            )?;
+            evaluations = vec![base_node, index_node, right];
+        } else if let Some((base_node, index_node)) = self.map_update_access(left)
+            && self.modeled_map_update_flow(base_node).is_some()
+        {
+            // A mutable.Map update is compiler-generated `update(key, value)`
+            // syntax. It is a map backing-store write only after the exact
+            // active model proves the standard-library callable and its
+            // parameter-1 -> receiver.entry-value transfer.
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let base =
+                self.expression_value(builder, base_node, expression_value_kind(base_node))?;
+            let index = self.index_value(builder, index_node)?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index),
+                    constant_index: None,
+                    identity: IndexedLocationIdentity::Aggregate,
                 },
             )?;
             self.append_effect(
@@ -3009,6 +3252,198 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let identity = self.expression_type_identity(base)?;
         (identity.last().map(String::as_str) == Some("Array")).then_some((base, *index))
+    }
+
+    /// The receiver and key of a Scala assignment target that desugars to
+    /// `update`. The assigned value is the assignment's right-hand side. This
+    /// is only a candidate shape; the active semantic-model resolver must
+    /// still prove that the receiver's standard-library declaration owns
+    /// `update`.
+    fn map_update_access(&self, node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+        let (function, argument_lists) = flattened_call_parts(node).ok()?;
+        let [arguments] = argument_lists.as_slice() else {
+            return None;
+        };
+        let actuals = semantic_argument_nodes(*arguments);
+        let [key] = actuals.as_slice() else {
+            return None;
+        };
+        let base = normalized_callable_expression(function).ok()?;
+        if base.kind() != "identifier" {
+            return None;
+        }
+        self.is_parameterized_map(base).then_some((base, *key))
+    }
+
+    fn is_parameterized_map(&self, receiver: Node<'tree>) -> bool {
+        let Some(identity) = self.expression_structured_type_identity(receiver) else {
+            return false;
+        };
+        identity.generic_argument_count() == Some(2)
+            && identity
+                .nominal_name()
+                .is_some_and(|name| name.path().last().map(String::as_str) == Some("Map"))
+    }
+
+    fn modeled_collection_flow(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<&CollectionFlowContract> {
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let identity = self.expression_structured_type_identity(receiver)?;
+        let owner_name = identity.nominal_name()?;
+        // A terminal-only type name can be shadowed by an import or local
+        // declaration. Requiring the explicit qualified path keeps this query
+        // resolver-proven instead of turning a nominal name into identity.
+        if owner_name.path().len() < 2 {
+            return None;
+        }
+        let owner = owner_name.path().join(".");
+        let parameter_count = u32::try_from(parameter_count).ok()?;
+        let matched = overlay.callable_for_application(
+            SemanticModelCallableKey::new(
+                Language::Scala.config_label(),
+                &owner,
+                member,
+                true,
+                parameter_count,
+            ),
+            &SemanticModelCallApplication::positional(parameter_count),
+        );
+        if matched.disposition != SemanticModelCallableDisposition::Unique {
+            return None;
+        }
+        let callable = matched.unique()?;
+        let flows = overlay.collection_flows_for(&callable.id);
+        if flows.disposition != SemanticModelOverlayDisposition::Unique {
+            return None;
+        }
+        let [flow] = flows.records.as_slice() else {
+            return None;
+        };
+        flow.is_complete().then_some(flow)
+    }
+
+    fn modeled_map_update_flow(&self, receiver: Node<'tree>) -> Option<&CollectionFlowContract> {
+        let flow = self.modeled_collection_flow(receiver, "update", 2)?;
+        if matches!(
+            flow.payload.receiver_substitution,
+            Some(
+                CsmiCollectionFlowSubstitution::Unknown { .. }
+                    | CsmiCollectionFlowSubstitution::Unsupported { .. }
+            )
+        ) {
+            return None;
+        }
+        let receiver_is_keyed = flow.payload.roots.iter().any(|root| {
+            matches!(
+                &root.root,
+                CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
+            ) && matches!(root.shape, CsmiCollectionFlowShape::Keyed { .. })
+        });
+        if !receiver_is_keyed {
+            return None;
+        }
+        flow.payload
+            .transfers
+            .iter()
+            .any(|transfer| {
+                matches!(
+                    &transfer.source.root,
+                    CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 1
+                ) && transfer.source.projection.is_none()
+                    && matches!(
+                        transfer.destination.root,
+                        CsmiOutputBoundaryRoot::Receiver(_)
+                    )
+                    && projection_is_entry_component(
+                        transfer.destination.projection.as_ref(),
+                        "parameter",
+                        0,
+                        "entry-value",
+                    )
+            })
+            .then_some(flow)
+    }
+
+    fn modeled_map_iteration_flow(&self, receiver: Node<'tree>) -> Option<(u32, u32)> {
+        let flow = self.modeled_collection_flow(receiver, "foreach", 1)?;
+        if matches!(
+            flow.payload.receiver_substitution,
+            Some(
+                CsmiCollectionFlowSubstitution::Unknown { .. }
+                    | CsmiCollectionFlowSubstitution::Unsupported { .. }
+            )
+        ) {
+            return None;
+        }
+        let receiver_entry_components = flow
+            .payload
+            .roots
+            .iter()
+            .filter_map(|root| {
+                if !matches!(
+                    &root.root,
+                    CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
+                ) {
+                    return None;
+                }
+                match &root.shape {
+                    CsmiCollectionFlowShape::Keyed {
+                        entry_components: Some(components),
+                        ..
+                    } => Some(components),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let [receiver_entry_components] = receiver_entry_components.as_slice() else {
+            return None;
+        };
+        if receiver_entry_components.as_slice()
+            != [
+                CsmiCollectionFlowEntryComponent::Key,
+                CsmiCollectionFlowEntryComponent::Value,
+            ]
+        {
+            return None;
+        }
+        flow.payload.invocations.iter().find_map(|invocation| {
+            let [parameter] = invocation.parameters.as_slice() else {
+                return None;
+            };
+            let CsmiCollectionFlowShape::Product { components } = parameter else {
+                return None;
+            };
+            if components.len() != 2
+                || !components
+                    .iter()
+                    .all(|component| matches!(component, CsmiCollectionFlowShape::Value { .. }))
+            {
+                return None;
+            }
+            if !matches!(
+                &invocation.callback.root,
+                CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 0
+            ) || invocation.callback.projection.is_some()
+            {
+                return None;
+            }
+            let [argument] = invocation.arguments.as_slice() else {
+                return None;
+            };
+            if argument.parameter != 0
+                || !matches!(argument.source.root, CsmiInputBoundaryRoot::Receiver(_))
+                || !projection_is_entry_all(argument.source.projection.as_ref())
+            {
+                return None;
+            }
+            // The keyed shape's ordered entryComponents and the callback's
+            // Product components jointly prove tuple (key, value) layout.
+            Some((0, 1))
+        })
     }
 
     /// The element type of an `Array` element read.
@@ -4290,6 +4725,144 @@ fn scala_type_identity(node: Node<'_>, source: &str) -> Option<Arc<[String]>> {
     (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
 }
 
+enum ScalaStructuredTypeFrame<'tree> {
+    Visit(Node<'tree>),
+    Generic { argument_count: usize },
+}
+
+/// Preserve Scala's nominal generic type shape using only parser fields. This
+/// deliberately accepts the same small, unambiguous subset as the JVM
+/// declaration producer and returns no identity for aliases, refinements,
+/// wildcards, or value-dependent types.
+fn scala_structured_type_identity(
+    node: Node<'_>,
+    source: &str,
+    callable: Node<'_>,
+) -> Option<StructuredTypeIdentity> {
+    let lexical_scope = scala_callable_lexical_scope(callable, source)?;
+    let mut frames = vec![ScalaStructuredTypeFrame::Visit(node)];
+    let mut values = Vec::new();
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    while let Some(frame) = frames.pop() {
+        match frame {
+            ScalaStructuredTypeFrame::Visit(current) => match current.kind() {
+                "identifier"
+                | "type_identifier"
+                | "stable_type_identifier"
+                | "field_expression" => {
+                    values.push(builder.named(scala_structured_named_type(
+                        current,
+                        source,
+                        &lexical_scope,
+                    )?)?);
+                }
+                "generic_type" | "generic_function" => {
+                    let base = current
+                        .child_by_field_name("type")
+                        .or_else(|| current.child_by_field_name("function"))?;
+                    let arguments = current.child_by_field_name("type_arguments")?;
+                    let argument_nodes = named_children(arguments);
+                    if argument_nodes.is_empty() {
+                        return None;
+                    }
+                    frames.push(ScalaStructuredTypeFrame::Generic {
+                        argument_count: argument_nodes.len(),
+                    });
+                    frames.extend(
+                        argument_nodes
+                            .into_iter()
+                            .rev()
+                            .map(ScalaStructuredTypeFrame::Visit),
+                    );
+                    frames.push(ScalaStructuredTypeFrame::Visit(base));
+                }
+                "annotated_type" => {
+                    let types = named_children(current)
+                        .into_iter()
+                        .filter(|child| child.kind() != "annotation")
+                        .collect::<Vec<_>>();
+                    let [base] = types.as_slice() else {
+                        return None;
+                    };
+                    frames.push(ScalaStructuredTypeFrame::Visit(*base));
+                }
+                _ => return None,
+            },
+            ScalaStructuredTypeFrame::Generic { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(builder.generic(base, built)?);
+            }
+        }
+    }
+    (values.len() == 1)
+        .then(|| values.pop())
+        .flatten()
+        .and_then(|root| builder.finish(root))
+}
+
+fn scala_structured_named_type(
+    node: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeName> {
+    let mut path = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => {
+                let segment = node_text(source, current)?.trim();
+                if segment.is_empty() {
+                    return None;
+                }
+                path.push(segment.to_owned());
+            }
+            "stable_identifier" | "stable_type_identifier" | "field_expression" => {
+                let mut children = named_children(current);
+                children.reverse();
+                stack.extend(children);
+            }
+            _ => return None,
+        }
+    }
+    let absolute = path.first().is_some_and(|segment| segment == "_root_");
+    if absolute {
+        path.remove(0);
+    }
+    StructuredTypeName::new(path, lexical_scope.to_vec(), absolute)
+}
+
+fn scala_callable_lexical_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut scope = Vec::new();
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_definition"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "full_enum_case"
+        ) {
+            let name = ancestor.child_by_field_name("name")?;
+            let name = node_text(source, name)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            scope.push(if ancestor.kind() == "object_definition" {
+                format!("{name}$")
+            } else {
+                name.to_owned()
+            });
+        }
+        current = ancestor.parent();
+    }
+    scope.reverse();
+    Some(scope)
+}
+
 fn callable_has_simple_parameter_shape(callable: Node<'_>) -> bool {
     let mut parameter_lists = 0;
     for child in named_children(callable) {
@@ -4716,6 +5289,79 @@ fn case_body_nodes(node: Node<'_>) -> Vec<Node<'_>> {
                 && is_runtime_node(child.kind())
         })
         .collect()
+}
+
+fn enumerator_pattern(enumerator: Node<'_>) -> Option<Node<'_>> {
+    named_children(enumerator).into_iter().find(|child| {
+        matches!(
+            child.kind(),
+            "tuple_pattern" | "identifier" | "typed_pattern"
+        )
+    })
+}
+
+fn tuple_pattern_bindings(pattern: Node<'_>) -> Vec<Node<'_>> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            bindings.push(node);
+            continue;
+        }
+        let mut children = named_children(node);
+        children.reverse();
+        stack.extend(children);
+    }
+    bindings
+}
+
+fn projection_is_entry_all(
+    projection: Option<&crate::analyzer::semantic_model::csmi::CsmiProjection>,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    let [entry] = projection.steps.as_slice() else {
+        return false;
+    };
+    entry.kind == "entry"
+        && entry
+            .args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(|key| key.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("all")
+}
+
+fn projection_is_entry_component(
+    projection: Option<&crate::analyzer::semantic_model::csmi::CsmiProjection>,
+    selector_kind: &str,
+    selector_position: u32,
+    component: &str,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    let [entry, selected_component] = projection.steps.as_slice() else {
+        return false;
+    };
+    entry.kind == "entry"
+        && entry
+            .args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(|key| key.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some(selector_kind)
+        && entry
+            .args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(|key| key.get("position"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(selector_position))
+        && selected_component.kind == component
 }
 
 fn enumerator_rhs(enumerator: Node<'_>) -> Option<Node<'_>> {

@@ -12699,14 +12699,49 @@ fn unit_matches_relational_request<A: LanguageAdapter>(
     if unit.is_file_scope() {
         return false;
     }
+    match &request.query {
+        RelationalDefinitionQuery::Identifier { file } => {
+            let identifier = request
+                .name
+                .tail()
+                .last()
+                .map(|segment| {
+                    crate::analyzer::fq_name::segment_interner()
+                        .resolve(segment)
+                        .0
+                })
+                .expect("RelationalName guarantees a non-empty tail");
+            return unit.identifier() == identifier
+                && file
+                    .as_ref()
+                    .is_none_or(|expected| unit.source() == expected);
+        }
+        RelationalDefinitionQuery::IdentifierPrefix { file } => {
+            let prefix = request
+                .name
+                .tail()
+                .last()
+                .map(|segment| {
+                    crate::analyzer::fq_name::segment_interner()
+                        .resolve(segment)
+                        .0
+                })
+                .expect("RelationalName guarantees a non-empty tail");
+            return unit.identifier().starts_with(prefix)
+                && file
+                    .as_ref()
+                    .is_none_or(|expected| unit.source() == expected);
+        }
+        _ => {}
+    }
     let full = request.name.full_name();
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let name_has_unknown_segments = full.segments().iter().any(|&segment| {
+        interner.resolve(segment).1 == crate::analyzer::fq_name::SegmentKind::Unknown
+    });
     let matches_name = |candidate: &crate::analyzer::FqName| {
-        let interner = crate::analyzer::fq_name::segment_interner();
-        if full.segments().iter().any(|&segment| {
-            interner.resolve(segment).1 == crate::analyzer::fq_name::SegmentKind::Unknown
-        }) {
-            candidate.display_native(adapter.language(), interner)
-                == full.display_native(adapter.language(), interner)
+        if name_has_unknown_segments {
+            candidate.same_native_spelling(&full, adapter.language())
         } else {
             candidate == &full
         }
@@ -12730,37 +12765,9 @@ fn unit_matches_relational_request<A: LanguageAdapter>(
                 || adapter.visibility_containers(unit).iter().any(matches_name))
                 && unit.identifier() == identifier
         }
-        RelationalDefinitionQuery::Identifier { file } => {
-            let identifier = request
-                .name
-                .tail()
-                .last()
-                .map(|segment| {
-                    crate::analyzer::fq_name::segment_interner()
-                        .resolve(segment)
-                        .0
-                })
-                .expect("RelationalName guarantees a non-empty tail");
-            unit.identifier() == identifier
-                && file
-                    .as_ref()
-                    .is_none_or(|expected| unit.source() == expected)
-        }
-        RelationalDefinitionQuery::IdentifierPrefix { file } => {
-            let prefix = request
-                .name
-                .tail()
-                .last()
-                .map(|segment| {
-                    crate::analyzer::fq_name::segment_interner()
-                        .resolve(segment)
-                        .0
-                })
-                .expect("RelationalName guarantees a non-empty tail");
-            unit.identifier().starts_with(prefix)
-                && file
-                    .as_ref()
-                    .is_none_or(|expected| unit.source() == expected)
+        RelationalDefinitionQuery::Identifier { .. }
+        | RelationalDefinitionQuery::IdentifierPrefix { .. } => {
+            unreachable!("identifier queries are handled before full-name matching")
         }
         RelationalDefinitionQuery::PackageTypes { simple_name } => {
             unit.is_class()

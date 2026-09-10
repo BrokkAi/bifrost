@@ -256,6 +256,7 @@ pub(crate) struct ValueFlowCallSummaryRule {
     callee_artifact: SemanticArtifactKey,
     callee_declaration: DeclarationLocator,
     kind: CallFlowRuleKind,
+    transfer: Option<ValueTransfer>,
     source: ValueFlowCarrierKey,
     target: ValueFlowCarrierKey,
     proof: ProofStatus,
@@ -514,6 +515,7 @@ impl ValueFlowCarrierSummaryIdentity {
                 CallFlowRuleKind::NormalReturn => b"normal_return",
                 CallFlowRuleKind::ExceptionalReturn => b"exceptional_return",
             });
+            push_value_transfer(&mut digest, rule.transfer);
             push_summary_carrier(&mut digest, &rule.source, procedure);
             push_summary_carrier(&mut digest, &rule.target, procedure);
             push_proof(&mut digest, &rule.proof);
@@ -1176,10 +1178,11 @@ fn parameter_index_gap_is_refined_by_call_bindings(
                 .mappings()
                 .iter()
                 .filter(|mapping| {
-                    matches!(
-                        mapping.value().formal().kind(),
-                        ProcedurePortKind::Parameter { ordinal: actual } if actual == ordinal
-                    )
+                    mapping.value().preserves_reference_identity()
+                        && matches!(
+                            mapping.value().formal().kind(),
+                            ProcedurePortKind::Parameter { ordinal: actual } if actual == ordinal
+                        )
                 })
                 .map(|mapping| {
                     (
@@ -1391,6 +1394,9 @@ pub(crate) struct CallFlowRule {
     pub call: CallSiteHandle,
     pub callee: ProcedureHandle,
     pub kind: CallFlowRuleKind,
+    /// Optional proven conversion annotation on a value-dependence edge.
+    /// Absence does not prove an identity conversion or transport heap aliases.
+    pub transfer: Option<ValueTransfer>,
     pub source: ValueFlowCarrierId,
     pub target: ValueFlowCarrierId,
     pub proof: ProofStatus,
@@ -2438,6 +2444,7 @@ impl ValueFlowPlan {
         }
         for rule in pending_call_location_rules {
             call_rules.push(CallFlowRule {
+                transfer: None,
                 call: rule.call,
                 callee: rule.callee,
                 kind: rule.kind,
@@ -3010,6 +3017,7 @@ impl ValueFlowPlan {
             rule.call.hash(state);
             rule.callee.hash(state);
             rule.kind.hash(state);
+            rule.transfer.hash(state);
             self.carrier_keys[rule.source.index()].hash(state);
             self.carrier_keys[rule.target.index()].hash(state);
             rule.proof.hash(state);
@@ -4137,6 +4145,7 @@ impl ValueFlowPlan {
                 .or_default()
                 .call_rules
                 .push(ValueFlowCallSummaryRule {
+                    transfer: rule.transfer,
                     call: rule.call.id(),
                     callee_artifact: rule.callee.artifact().key().clone(),
                     callee_declaration: rule.callee.semantics().locator().declaration().clone(),
@@ -5530,6 +5539,104 @@ func run() [1]int {
     }
 
     #[test]
+    fn java_call_conversion_is_retained_in_plan_and_summary_identity() {
+        use crate::analyzer::semantic::DispatchOracle;
+        let project = InlineTestProject::new().file("App.java", "class App { static void take(long value) {} static void go(int value) { take(value); } }").build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("App.java"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("semantics")
+            .available_value()
+            .expect("artifact")
+            .clone();
+        let root = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller");
+        let oracle = workspace.semantic_oracle_provider();
+        let call = root
+            .call_site_handle(root.semantics().call_sites()[0].id)
+            .expect("call");
+        let dispatch = oracle
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("dispatch");
+        let candidates = dispatch
+            .available_value()
+            .expect("dispatch result")
+            .candidates();
+        let [candidate] = candidates else {
+            panic!("one selected target")
+        };
+        let bindings = oracle
+            .call_bindings(
+                &call,
+                candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("bindings");
+        let snapshots = [root.clone(), candidate.target().clone()]
+            .iter()
+            .map(|procedure| {
+                let outcome = oracle
+                    .procedure_relations(
+                        procedure,
+                        &OracleCallContext::empty(),
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("snapshot");
+                ValueFlowInput::new(
+                    outcome.available_value().expect("snapshot value").clone(),
+                    SemanticInputStatus::from_outcome(&outcome),
+                )
+            })
+            .collect();
+        let plan = ValueFlowPlan::try_new(
+            root,
+            snapshots,
+            vec![ValueFlowInput::new(
+                bindings.available_value().expect("bindings value").clone(),
+                SemanticInputStatus::from_outcome(&bindings),
+            )],
+            vec![],
+            vec![],
+        )
+        .expect("plan");
+        let transfer = plan
+            .call_rules
+            .iter()
+            .position(|rule| rule.transfer.is_some())
+            .expect("conversion reaches solver plan");
+        assert!(matches!(
+            plan.call_rules[transfer].transfer,
+            Some(ValueTransfer {
+                kind: crate::analyzer::semantic::TransferKind::Conversion {
+                    preservation: crate::analyzer::semantic::ValuePreservation::Preserving
+                },
+                operation: crate::analyzer::semantic::TransferOperation::CallArgumentConversion(_)
+            })
+        ));
+        let mut changed = plan.clone();
+        changed.call_rules[transfer].transfer = None;
+        assert!(!plan.has_same_propagation_semantics(&changed));
+        assert_ne!(
+            propagation_hash_trace(&plan),
+            propagation_hash_trace(&changed)
+        );
+        assert_ne!(
+            plan.carrier_summary_identities(),
+            changed.carrier_summary_identities()
+        );
+    }
+
+    #[test]
     fn call_argument_conversion_digest_changes_flow_fingerprint_and_order() {
         use crate::analyzer::semantic::{TransferKind, TransferOperation, ValuePreservation};
 
@@ -6205,6 +6312,9 @@ fn append_call_location_rules(
             CallBinding::ArgumentGroup(group) => {
                 for mapping in group.mappings() {
                     let mapping_value = mapping.value();
+                    if !mapping_value.preserves_reference_identity() {
+                        continue;
+                    }
                     let actual = mapping_value.actual();
                     let formal_locations =
                         formal_location_carriers(callee_snapshot, mapping_value.formal());
@@ -6278,6 +6388,7 @@ fn substitute_call_location(
     for selector in formal.path().selectors() {
         selectors.push(match selector {
             AccessSelector::Field(field) => AccessSelector::Field(field.clone()),
+            AccessSelector::Property(property) => AccessSelector::Property(property.clone()),
             AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(value)) => {
                 AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(*value))
             }
@@ -6323,19 +6434,24 @@ fn append_call_rules(
 ) -> Result<(), ValueFlowPlanError> {
     let candidate_proof = bindings.candidate().proof();
     let candidate_completeness = bindings.candidate().completeness();
-    let mut append =
-        |kind, source: ValueFlowCarrier, target: ValueFlowCarrier, proof, completeness| {
-            output.push(CallFlowRule {
-                call: bindings.call().clone(),
-                callee: bindings.callee().clone(),
-                kind,
-                source: *ids.get(&source).ok_or(ValueFlowPlanError::MissingCarrier)?,
-                target: *ids.get(&target).ok_or(ValueFlowPlanError::MissingCarrier)?,
-                proof: merge_call_rule_proof(candidate_proof, proof),
-                completeness: merge_call_rule_completeness(candidate_completeness, completeness),
-            });
-            Ok::<_, ValueFlowPlanError>(())
-        };
+    let mut append = |kind,
+                      source: ValueFlowCarrier,
+                      target: ValueFlowCarrier,
+                      proof,
+                      completeness,
+                      transfer| {
+        output.push(CallFlowRule {
+            call: bindings.call().clone(),
+            callee: bindings.callee().clone(),
+            kind,
+            transfer,
+            source: *ids.get(&source).ok_or(ValueFlowPlanError::MissingCarrier)?,
+            target: *ids.get(&target).ok_or(ValueFlowPlanError::MissingCarrier)?,
+            proof: merge_call_rule_proof(candidate_proof, proof),
+            completeness: merge_call_rule_completeness(candidate_completeness, completeness),
+        });
+        Ok::<_, ValueFlowPlanError>(())
+    };
     for binding in bindings.bindings() {
         match binding {
             CallBinding::Receiver { actual, formal, .. } => append(
@@ -6344,15 +6460,20 @@ fn append_call_rules(
                 ValueFlowCarrier::Port(formal.clone()),
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
+                None,
             )?,
             CallBinding::ArgumentGroup(group) => {
                 for mapping in group.mappings() {
+                    // Exact mapping proves value dependence independently of
+                    // conversion typing. Alias transport is separately gated
+                    // by preserves_reference_identity in location lowering.
                     append(
                         CallFlowRuleKind::Call,
                         argument_carrier(mapping.value().actual())?,
                         ValueFlowCarrier::Port(mapping.value().formal().clone()),
                         mapping.proof().clone(),
                         mapping.completeness().clone(),
+                        mapping.value().transfer(),
                     )?;
                 }
             }
@@ -6362,6 +6483,7 @@ fn append_call_rules(
                 ValueFlowCarrier::Port(formal.clone()),
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
+                None,
             )?,
             CallBinding::NormalReturn { formal, result, .. } => append(
                 CallFlowRuleKind::NormalReturn,
@@ -6369,6 +6491,7 @@ fn append_call_rules(
                 ValueFlowCarrier::Value(result.clone()),
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
+                None,
             )?,
             CallBinding::ExceptionalReturn { formal, result, .. } => append(
                 CallFlowRuleKind::ExceptionalReturn,
@@ -6376,6 +6499,7 @@ fn append_call_rules(
                 ValueFlowCarrier::Value(result.clone()),
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
+                None,
             )?,
         }
     }
@@ -6600,6 +6724,7 @@ fn build_fallback_location_index(
                 | AccessPathRoot::TypeSummary(_)
                 | AccessPathRoot::ModuleObject(_)
                 | AccessPathRoot::External(_)
+                | AccessPathRoot::RuntimeObject(_)
         ) {
             index.bounded_globals.push(id);
         } else if let Some(component) = root_carrier(root)
@@ -6646,7 +6771,8 @@ fn root_carrier(root: &AccessPathRoot) -> Option<ValueFlowCarrier> {
         AccessPathRoot::Static(_)
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => None,
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_) => None,
     }
 }
 
@@ -6793,6 +6919,7 @@ fn same_call_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
                 left_rule.call == right_rule.call
                     && left_rule.callee == right_rule.callee
                     && left_rule.kind == right_rule.kind
+                    && left_rule.transfer == right_rule.transfer
                     && left.carrier_keys[left_rule.source.index()]
                         == right.carrier_keys[right_rule.source.index()]
                     && left.carrier_keys[left_rule.target.index()]
@@ -6851,6 +6978,7 @@ fn compare_call_rules(left: &CallFlowRule, right: &CallFlowRule) -> Ordering {
     compare_calls(&left.call, &right.call)
         .then_with(|| compare_procedures(&left.callee, &right.callee))
         .then_with(|| call_rule_rank(left.kind).cmp(&call_rule_rank(right.kind)))
+        .then_with(|| transfer_rank(left.transfer).cmp(&transfer_rank(right.transfer)))
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.target.cmp(&right.target))
 }
@@ -6862,6 +6990,7 @@ fn merge_duplicate_call_rules(rules: &mut Vec<CallFlowRule>) {
             && previous.call == rule.call
             && previous.callee == rule.callee
             && previous.kind == rule.kind
+            && previous.transfer == rule.transfer
             && previous.source == rule.source
             && previous.target == rule.target
         {

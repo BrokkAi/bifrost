@@ -4,8 +4,9 @@ use crate::analyzer::languages::{language_support, package_fq_name};
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     BoundedDefinitionLookup, CodeUnit, DefinitionLanguageScope, IAnalyzer, Language, ProjectFile,
-    RelationalBatchOutcome, RelationalDefinitionQuery, RelationalDefinitionRequest,
-    RelationalDefinitionValue, sort_units,
+    RelationalBatchOutcome, RelationalDefinitionFrontier, RelationalDefinitionQuery,
+    RelationalDefinitionQuestion, RelationalDefinitionRequest, RelationalDefinitionValue,
+    sort_units,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::{
@@ -131,6 +132,9 @@ pub struct AnalyzerDefinitionLookup<'a> {
     workspace_languages: OnceLock<Vec<Language>>,
     nonempty_workspace_languages: OnceLock<Vec<Language>>,
     memo: Arc<DefinitionLookupMemo>,
+    /// When set, every relational read is a frontier question instead of a
+    /// synchronous store batch; see [`Self::on_frontier`].
+    frontier: Option<Arc<dyn RelationalDefinitionFrontier>>,
 }
 
 impl<'a> AnalyzerDefinitionLookup<'a> {
@@ -142,6 +146,35 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             workspace_languages: OnceLock::new(),
             nonempty_workspace_languages: OnceLock::new(),
             memo: analyzer.definition_lookup_memo().unwrap_or_default(),
+            frontier: None,
+        }
+    }
+
+    /// A lookup that reads through a replayable relational frontier instead
+    /// of issuing its own store batches: the same candidate spellings and
+    /// retention rules as [`Self::new`], but each question is recorded for
+    /// the frontier runner's next barrier and answered on replay. This is how
+    /// a per-file walk that runs inside a frontier evaluation (the Scala
+    /// query walk's foreign-realm questions, #1859) gets one batched read per
+    /// barrier rather than one synchronous read per candidate.
+    ///
+    /// An unanswered question comes back empty until the barrier runs, so
+    /// nothing this lookup computes may be published: it gets a private memo
+    /// and never marks itself publishable. Construct one per question rather
+    /// than reusing it across replays.
+    pub(crate) fn on_frontier(
+        analyzer: &'a dyn IAnalyzer,
+        language: Language,
+        frontier: Arc<dyn RelationalDefinitionFrontier>,
+    ) -> Self {
+        Self {
+            analyzer,
+            language: Mutex::new(language),
+            incomplete: AtomicBool::new(true),
+            workspace_languages: OnceLock::new(),
+            nonempty_workspace_languages: OnceLock::new(),
+            memo: Arc::default(),
+            frontier: Some(frontier),
         }
     }
 
@@ -228,6 +261,18 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     ) -> Vec<RelationalDefinitionValue> {
         if questions.is_empty() {
             return Vec::new();
+        }
+        if let Some(frontier) = &self.frontier {
+            return questions
+                .into_iter()
+                .map(|(name, query)| {
+                    frontier.ask(&RelationalDefinitionQuestion {
+                        language_scope: DefinitionLanguageScope::Language(language),
+                        name,
+                        query,
+                    })
+                })
+                .collect();
         }
         let requests = questions
             .into_iter()

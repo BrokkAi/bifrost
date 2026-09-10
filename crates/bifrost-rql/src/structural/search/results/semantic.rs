@@ -270,6 +270,9 @@ pub enum CodeQueryFlowSelectorSymbol {
     Field {
         field: CodeQueryFlowSymbolSite,
     },
+    Property {
+        key: String,
+    },
     ExactIndex {
         index: Box<CodeQueryFlowCarrierSymbol>,
     },
@@ -310,6 +313,20 @@ pub enum CodeQueryFlowCarrierSymbol {
         id: String,
         root_kind: &'static str,
         site: CodeQueryFlowSymbolSite,
+    },
+    RuntimeObject {
+        id: String,
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: String,
+        active_model_set_hash: String,
+        manifest_digest: String,
+        shard_id: String,
+        behavior_id: String,
+        activation_source: String,
     },
     Location {
         id: String,

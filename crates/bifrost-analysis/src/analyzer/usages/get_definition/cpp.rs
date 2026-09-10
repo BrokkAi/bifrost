@@ -129,19 +129,24 @@ fn declaration_occurrence_at_offset_in_tree(
         .ranges
         .iter()
         .flat_map(|(candidate, ranges)| {
-            ranges.iter().filter_map(|range| {
-                let name_range = code_unit_declaration_name_range_for_range(
-                    source,
-                    tree.root_node(),
-                    candidate,
-                    *range,
-                )?;
-                (offset >= name_range.start_byte && offset < name_range.end_byte).then_some((
-                    name_range.end_byte.saturating_sub(name_range.start_byte),
-                    candidate.clone(),
-                    *range,
-                ))
-            })
+            ranges
+                .iter()
+                // This index was parsed from these exact bytes. A declaration
+                // whose range excludes the offset cannot name this token.
+                .filter(|range| offset >= range.start_byte && offset < range.end_byte)
+                .filter_map(|range| {
+                    let name_range = code_unit_declaration_name_range_for_range(
+                        source,
+                        tree.root_node(),
+                        candidate,
+                        *range,
+                    )?;
+                    (offset >= name_range.start_byte && offset < name_range.end_byte).then_some((
+                        name_range.end_byte.saturating_sub(name_range.start_byte),
+                        candidate.clone(),
+                        *range,
+                    ))
+                })
         })
         .min_by_key(|(length, candidate, _)| (*length, candidate.clone()))
         .map(|(_, candidate, range)| (candidate, range))
@@ -3599,6 +3604,10 @@ fn cpp_incomplete_type_outcome(
             format!(
                 "C++ type candidate resolution could not read indexed syntax for {file}; results are incomplete"
             ),
+        ),
+        QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => no_definition(
+            "analysis_incomplete",
+            format!("C++ type candidate resolution lacked structured semantic evidence: {detail}"),
         ),
         QueryReadIncomplete::StoreFailure(error) => no_definition(
             "analysis_incomplete",

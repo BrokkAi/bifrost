@@ -28,6 +28,505 @@ pub const CSMI_CPP_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/cpp/0.1/schema.json";
 pub const CSMI_CPP_DECLARATION_IDENTITY_SCHEME: &str = "csmi.cpp.declaration";
 pub const CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION: &str = "0.1.0";
+pub const CSMI_RUNTIME_VALUES_PROFILE_ID: &str = "csmi.runtime-values";
+pub const CSMI_RUNTIME_VALUES_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_RUNTIME_VALUES_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/runtime-values/0.1/schema.json";
+pub const CSMI_COLLECTION_FLOW_PROFILE_ID: &str = "csmi.collection-flow";
+pub const CSMI_COLLECTION_FLOW_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_COLLECTION_FLOW_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/collection-flow/0.1/schema.json";
+
+/// Typed payload for the CSMI collection-flow vocabulary.
+///
+/// The profile deliberately reuses core boundary roots and type expressions;
+/// only collection-specific shapes, projections, and callback invocation
+/// evidence are introduced here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCollectionFlowPayload {
+    pub kind: CsmiCollectionFlowKind,
+    pub callable: LocalId,
+    #[serde(
+        rename = "receiverSubstitution",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receiver_substitution: Option<CsmiCollectionFlowSubstitution>,
+    pub roots: Vec<CsmiCollectionFlowRoot>,
+    pub transfers: Vec<CsmiCollectionFlowTransfer>,
+    pub invocations: Vec<CsmiCollectionFlowInvocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiCollectionFlowKind {
+    #[serde(rename = "collection-flow")]
+    CollectionFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiCollectionFlowSubstitution {
+    ReceiverArguments { declaration: LocalId },
+    Unknown { limitation: CsmiProfileLimitation },
+    Unsupported { limitation: CsmiProfileLimitation },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCollectionFlowRoot {
+    pub root: CsmiCollectionFlowBoundaryRoot,
+    pub shape: CsmiCollectionFlowShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiCollectionFlowBoundaryRoot {
+    Input(CsmiInputBoundaryRoot),
+    Output(CsmiOutputBoundaryRoot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiCollectionFlowShape {
+    Value {
+        #[serde(rename = "type")]
+        r#type: CsmiTypeExpression,
+    },
+    Product {
+        components: Vec<CsmiCollectionFlowShape>,
+    },
+    Keyed {
+        key: Box<CsmiCollectionFlowShape>,
+        value: Box<CsmiCollectionFlowShape>,
+        #[serde(
+            rename = "entryComponents",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        entry_components: Option<Vec<CsmiCollectionFlowEntryComponent>>,
+    },
+    Unknown {
+        limitation: CsmiProfileLimitation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCollectionFlowEntryComponent {
+    Key,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCollectionFlowTransfer {
+    pub source: CsmiInputLocation,
+    pub destination: CsmiOutputLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCollectionFlowInvocation {
+    pub callback: CsmiInputLocation,
+    pub parameters: Vec<CsmiCollectionFlowShape>,
+    pub arguments: Vec<CsmiCollectionFlowArgument>,
+    pub timing: CsmiCollectionFlowTiming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiCollectionFlowArgument {
+    pub source: CsmiInputLocation,
+    pub parameter: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiCollectionFlowTiming {
+    DuringCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum CsmiRuntimeValuesPayload {
+    #[serde(rename = "runtime-global-exposure")]
+    RuntimeGlobalExposure(CsmiRuntimeGlobalExposure),
+    #[serde(rename = "keyed-read-behavior")]
+    KeyedReadBehavior(CsmiKeyedReadBehavior),
+    #[serde(rename = "runtime-global-binding-evidence")]
+    RuntimeGlobalBindingEvidence(CsmiRuntimeGlobalBindingEvidence),
+    #[serde(rename = "keyed-read-observation")]
+    KeyedReadObservation(CsmiKeyedReadObservation),
+}
+
+impl CsmiRuntimeValuesPayload {
+    pub fn family(&self) -> &'static str {
+        match self {
+            Self::RuntimeGlobalExposure(_) => "runtime-global-exposures",
+            Self::KeyedReadBehavior(_) => "keyed-read-behaviors",
+            Self::RuntimeGlobalBindingEvidence(_) => "runtime-global-binding-evidence",
+            Self::KeyedReadObservation(_) => "keyed-read-observations",
+        }
+    }
+
+    pub fn record_id(&self) -> &str {
+        match self {
+            Self::RuntimeGlobalExposure(record) => &record.exposure_id,
+            Self::KeyedReadBehavior(record) => &record.behavior_id,
+            Self::RuntimeGlobalBindingEvidence(record) => &record.binding_evidence_id,
+            Self::KeyedReadObservation(record) => &record.observation_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeGlobalExposure {
+    #[serde(rename = "exposureId")]
+    pub exposure_id: LocalId,
+    pub languages: Vec<String>,
+    #[serde(rename = "bindingName")]
+    pub binding_name: String,
+    pub runtime: CsmiRuntimeApplicability,
+    #[serde(rename = "runtimeProfileDigest")]
+    pub runtime_profile_digest: String,
+    #[serde(rename = "rootIdentity")]
+    pub root_identity: CsmiRuntimeRootIdentity,
+    pub members: Vec<LocalId>,
+    pub activation: CsmiRuntimeExposureActivation,
+    pub evidence: CsmiRuntimeEvidence,
+    pub coverage: CsmiRuntimeCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiKeyedReadBehavior {
+    #[serde(rename = "behaviorId")]
+    pub behavior_id: LocalId,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: LocalId,
+    #[serde(rename = "containerMember")]
+    pub container_member: LocalId,
+    #[serde(rename = "acceptedKeys")]
+    pub accepted_keys: CsmiRuntimeAcceptedKeys,
+    #[serde(rename = "normalResult")]
+    pub normal_result: CsmiRuntimeNormalResult,
+    #[serde(rename = "exceptionBehavior")]
+    pub exception_behavior: CsmiRuntimeExceptionBehavior,
+    #[serde(rename = "mutationModel")]
+    pub mutation_model: CsmiRuntimeMutationModel,
+    pub materialization: CsmiRuntimeMaterialization,
+    pub evidence: CsmiRuntimeEvidence,
+    pub coverage: CsmiRuntimeCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeGlobalBindingEvidence {
+    #[serde(rename = "bindingEvidenceId")]
+    pub binding_evidence_id: LocalId,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: LocalId,
+    pub activation: CsmiRuntimeActivationEvidence,
+    pub language: String,
+    pub dialect: String,
+    #[serde(rename = "rootOccurrence")]
+    pub root_occurrence: CsmiRuntimeSourceRange,
+    #[serde(rename = "scopeIdentity")]
+    pub scope_identity: CsmiRuntimeScopedIdentity,
+    #[serde(rename = "lexicalBinding")]
+    pub lexical_binding: CsmiRuntimeLexicalBinding,
+    pub rebinding: CsmiRuntimeRebinding,
+    pub evidence: CsmiRuntimeEvidence,
+    pub coverage: CsmiRuntimeCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiKeyedReadObservation {
+    #[serde(rename = "observationId")]
+    pub observation_id: LocalId,
+    #[serde(rename = "bindingEvidenceId")]
+    pub binding_evidence_id: LocalId,
+    #[serde(rename = "behaviorId")]
+    pub behavior_id: LocalId,
+    #[serde(rename = "baseValue")]
+    pub base_value: CsmiRuntimeScopedIdentity,
+    pub key: CsmiRuntimeStaticKey,
+    #[serde(rename = "sourceForm")]
+    pub source_form: CsmiRuntimeSourceForm,
+    #[serde(rename = "loadOperation")]
+    pub load_operation: CsmiRuntimeScopedIdentity,
+    #[serde(rename = "resultValue")]
+    pub result_value: CsmiRuntimeScopedIdentity,
+    #[serde(rename = "observationPoint")]
+    pub observation_point: CsmiRuntimeScopedIdentity,
+    pub phase: CsmiRuntimeObservationPhase,
+    pub expression: CsmiRuntimeSourceRange,
+    #[serde(rename = "sourceOrigin")]
+    pub source_origin: CsmiRuntimeSourceOrigin,
+    #[serde(rename = "normalOutcome")]
+    pub normal_outcome: CsmiRuntimeNormalOutcome,
+    #[serde(rename = "exceptionOutcome")]
+    pub exception_outcome: CsmiRuntimeExceptionOutcome,
+    pub evidence: CsmiRuntimeEvidence,
+    pub coverage: CsmiRuntimeCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeEvidence {
+    pub producer: AbsoluteUri,
+    pub method: String,
+    #[serde(rename = "inputsDigest")]
+    pub inputs_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeApplicability {
+    #[serde(rename = "runtimeFamily")]
+    pub runtime_family: String,
+    #[serde(rename = "runtimeArtifact")]
+    pub runtime_artifact: String,
+    #[serde(rename = "runtimeArtifactDigest")]
+    pub runtime_artifact_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    pub realm: String,
+    #[serde(rename = "moduleMode")]
+    pub module_mode: String,
+    #[serde(rename = "initializationBoundary")]
+    pub initialization_boundary: String,
+    #[serde(
+        rename = "hostAssumptions",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub host_assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeRootIdentity {
+    pub scheme: String,
+    #[serde(rename = "schemeVersion")]
+    pub scheme_version: String,
+    pub descriptors: Vec<CsmiRuntimeRootDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeRootDescriptor {
+    pub role: CsmiRuntimeRootRole,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeRootRole {
+    Runtime,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeSourceRange {
+    pub resource: String,
+    #[serde(rename = "resourceDigest")]
+    pub resource_digest: String,
+    #[serde(rename = "startByte")]
+    pub start_byte: u64,
+    #[serde(rename = "endByte")]
+    pub end_byte: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeScopedIdentity {
+    #[serde(rename = "ownerDigest")]
+    pub owner_digest: String,
+    pub kind: CsmiRuntimeIdentityKind,
+    #[serde(rename = "locatorDigest")]
+    pub locator_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeIdentityKind {
+    Scope,
+    Value,
+    Operation,
+    Point,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeActivationEvidence {
+    pub outcome: CsmiRuntimeActivationOutcome,
+    #[serde(rename = "runtimeProfileDigest")]
+    pub runtime_profile_digest: String,
+    #[serde(rename = "activeSetDigest")]
+    pub active_set_digest: String,
+    #[serde(rename = "activeExposureIds")]
+    pub active_exposure_ids: Vec<LocalId>,
+    #[serde(rename = "modelDigest")]
+    pub model_digest: String,
+    #[serde(rename = "activationSource")]
+    pub activation_source: AbsoluteUri,
+    #[serde(rename = "exposureId")]
+    pub exposure_id: LocalId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeActivationOutcome {
+    Matched,
+    NotMatched,
+    Indeterminate,
+    Conflict,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiRuntimeCoverage {
+    pub status: CsmiRuntimeCoverageStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<CsmiRuntimeCoverageLimitation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeCoverageStatus {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeCoverageLimitation {
+    ActivationMissing,
+    ActivationConflict,
+    ActivationUnsupported,
+    LexicalBindingIndeterminate,
+    RebindingIndeterminate,
+    MutationIncomplete,
+    AccessorOrProxyIncomplete,
+    MaterializationIncomplete,
+    ExceptionBehaviorIndeterminate,
+    DynamicKey,
+    UnsupportedIndex,
+    Cancelled,
+    BudgetExhausted,
+    StaleEvidence,
+    AmbiguousOwner,
+    CoverageLimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeExposureActivation {
+    Enabled,
+    Disabled,
+    ReviewRequired,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeAcceptedKeys {
+    StaticProperty,
+    StaticIndex,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeNormalResult {
+    ValueOrUndefined,
+    Value,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeExceptionBehavior {
+    Nonthrowing,
+    MayThrow,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeMutationModel {
+    PristineInputUntilWrite,
+    OrdinaryMutable,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeMaterialization {
+    Eager,
+    Lazy,
+    HostDefined,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeLexicalBinding {
+    Absent,
+    Present,
+    Indeterminate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeRebinding {
+    Excluded,
+    Present,
+    Indeterminate,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum CsmiRuntimeStaticKey {
+    Property(String),
+    Index(u32),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeSourceForm {
+    Dot,
+    BracketString,
+    BracketNumber,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeObservationPhase {
+    BeforeEffects,
+    AfterEffects,
+    Exceptional,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeSourceOrigin {
+    PristineRuntimeInput,
+    Mutated,
+    Indeterminate,
+    NotApplicable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeNormalOutcome {
+    Exact,
+    Partial,
+    Unsupported,
+    Indeterminate,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiRuntimeExceptionOutcome {
+    Excluded,
+    Possible,
+    Unsupported,
+    Indeterminate,
+}
 
 pub type LocalId = String;
 pub type AbsoluteUri = String;
@@ -1515,6 +2014,84 @@ mod profile_payload_tests {
         assert_eq!(value["language"], "c++");
         assert_eq!(
             serde_json::from_value::<CsmiCppProfilePayload>(value).expect("payload parses"),
+            payload
+        );
+    }
+
+    #[test]
+    fn collection_flow_payload_round_trips_typed_projection() {
+        let payload = CsmiCollectionFlowPayload {
+            kind: CsmiCollectionFlowKind::CollectionFlow,
+            callable: "normalize".to_owned(),
+            receiver_substitution: None,
+            roots: vec![CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Parameter(
+                    CsmiInputParameterRoot {
+                        phase: CsmiInputPhase::Input,
+                        role: CsmiParameterRootRole::Parameter,
+                        position: 0,
+                    },
+                )),
+                shape: CsmiCollectionFlowShape::Keyed {
+                    key: Box::new(CsmiCollectionFlowShape::Value {
+                        r#type: CsmiTypeExpression::Unknown(CsmiUnknownType {
+                            kind: CsmiUnknownTypeKind::Unknown,
+                        }),
+                    }),
+                    value: Box::new(CsmiCollectionFlowShape::Value {
+                        r#type: CsmiTypeExpression::Unknown(CsmiUnknownType {
+                            kind: CsmiUnknownTypeKind::Unknown,
+                        }),
+                    }),
+                    entry_components: Some(vec![
+                        CsmiCollectionFlowEntryComponent::Key,
+                        CsmiCollectionFlowEntryComponent::Value,
+                    ]),
+                },
+            }],
+            transfers: vec![CsmiCollectionFlowTransfer {
+                source: CsmiInputLocation {
+                    root: CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+                        phase: CsmiInputPhase::Input,
+                        role: CsmiParameterRootRole::Parameter,
+                        position: 0,
+                    }),
+                    projection: Some(CsmiProjection {
+                        scheme: CSMI_COLLECTION_FLOW_PROFILE_ID.to_owned(),
+                        scheme_version: CSMI_COLLECTION_FLOW_PROFILE_VERSION.to_owned(),
+                        steps: vec![
+                            CsmiProjectionStep {
+                                kind: "entry".to_owned(),
+                                args: Some(serde_json::json!({
+                                    "key": {"kind": "all"}
+                                })),
+                            },
+                            CsmiProjectionStep {
+                                kind: "entry-value".to_owned(),
+                                args: None,
+                            },
+                        ],
+                    }),
+                },
+                destination: CsmiOutputLocation {
+                    root: CsmiOutputBoundaryRoot::Result(CsmiOutputResultRoot {
+                        phase: CsmiOutputPhase::Output,
+                        role: CsmiResultRootRole::Result,
+                        position: 0,
+                    }),
+                    projection: None,
+                },
+            }],
+            invocations: Vec::new(),
+        };
+        let value = serde_json::to_value(&payload).expect("payload serializes");
+        assert_eq!(value["kind"], "collection-flow");
+        assert_eq!(
+            value["transfers"][0]["source"]["projection"]["scheme"],
+            CSMI_COLLECTION_FLOW_PROFILE_ID
+        );
+        assert_eq!(
+            serde_json::from_value::<CsmiCollectionFlowPayload>(value).expect("payload parses"),
             payload
         );
     }

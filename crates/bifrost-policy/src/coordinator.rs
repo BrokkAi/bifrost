@@ -2528,11 +2528,24 @@ fn evaluate_prepared_policy_inputs(
         "a policy batch evaluates either its own head units or a caller's base units, never both"
     );
     let head_incremental = supplied_incremental.or(head_incremental_owned.as_ref());
+    // The batch is nested inside the pinned analyzer/model scope and never
+    // crosses a base/head boundary. Evaluation and unit publication stay serial.
+    let subject_batch = workspace.map(|workspace| {
+        super::evaluator::SubjectQueryBatch::new(
+            workspace.analyzer(),
+            registry
+                .policies()
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
+            &per_policy_budget,
+        )
+    });
+    let evaluator = evaluator.with_subject_batch(subject_batch.as_ref());
     let mut fail_closed_gate = false;
     let mut completed_policy_ids = Vec::with_capacity(evaluation_policy_ids.len());
     let mut active_policy_id = None;
     let mut pending_policy_ids = Vec::new();
     let mut deadline_stage = None;
+    let mut policy_evaluation_elapsed = std::time::Duration::ZERO;
     for (policy_index, policy) in registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
@@ -2567,6 +2580,7 @@ fn evaluate_prepared_policy_inputs(
             evaluator.evaluate(policy, &context, &mut evaluation_budget)
         };
         let policy_elapsed = policy_started.elapsed();
+        policy_evaluation_elapsed += policy_elapsed;
         let mut run = match evaluated {
             Ok(run) => run,
             Err(error) => failed_evaluation_run(policy, error.to_string(), &evaluation_budget)?,
@@ -2649,6 +2663,10 @@ fn evaluate_prepared_policy_inputs(
         runs.insert(policy.definition().metadata.id.clone(), run);
     }
     let evaluation_elapsed = evaluation_started.elapsed();
+    brokk_bifrost_analysis::profiling::duration(
+        "policy.coordination_including_diff_base",
+        evaluation_elapsed.saturating_sub(policy_evaluation_elapsed),
+    );
     let report_started = Instant::now();
     if policy_deadline_reached(cancellation)? {
         deadline_stage.get_or_insert(PolicyExecutionStage::ReportConstruction);

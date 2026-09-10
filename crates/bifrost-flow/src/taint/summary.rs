@@ -258,7 +258,7 @@ enum StablePropagationTransfer {
         phase: ValueFlowObservationPhase,
         event_index: u32,
         input: ValueFlowCarrierKey,
-        output: ValueFlowCarrierKey,
+        output: Box<ValueFlowCarrierKey>,
         removed: StableTaintClassSet,
         proven: bool,
         complete: bool,
@@ -273,7 +273,7 @@ enum StablePropagationTransfer {
     LocalTransform {
         point: ProgramPointId,
         input: ValueFlowCarrierKey,
-        output: ValueFlowCarrierKey,
+        output: Box<ValueFlowCarrierKey>,
         function: StableTaintEdgeFunction,
     },
 }
@@ -928,11 +928,12 @@ impl TaintContractSet {
                         .carrier_key(binding.carrier())
                         .ok_or(TaintTransferSummaryError::InvalidPlan)?
                         .clone(),
-                    output: plan
-                        .value_flow()
-                        .carrier_key(binding.output())
-                        .ok_or(TaintTransferSummaryError::InvalidPlan)?
-                        .clone(),
+                    output: Box::new(
+                        plan.value_flow()
+                            .carrier_key(binding.output())
+                            .ok_or(TaintTransferSummaryError::InvalidPlan)?
+                            .clone(),
+                    ),
                     removed: StableTaintClassSet::from_live(binding.removed(), plan.universe())?,
                     proven: binding.is_proven(),
                     complete: binding.is_resolved(),
@@ -978,11 +979,12 @@ impl TaintContractSet {
                         .carrier_key(binding.input())
                         .ok_or(TaintTransferSummaryError::InvalidPlan)?
                         .clone(),
-                    output: plan
-                        .value_flow()
-                        .carrier_key(binding.output())
-                        .ok_or(TaintTransferSummaryError::InvalidPlan)?
-                        .clone(),
+                    output: Box::new(
+                        plan.value_flow()
+                            .carrier_key(binding.output())
+                            .ok_or(TaintTransferSummaryError::InvalidPlan)?
+                            .clone(),
+                    ),
                     function: StableTaintEdgeFunction::from_live(
                         binding.function(),
                         plan.universe(),

@@ -4,14 +4,10 @@
 //! does not establish its type. This query-local relation consumes the selected
 //! declaration and the shared formal layout. It never selects an overload.
 
-mod java;
-mod typescript;
-
-pub use java::ExternalConversionIdentity;
-
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::lexical_definitions::{
     formal_parameter_slots_for_owner_with_nodes, parameter_owner_for_range,
 };
@@ -25,6 +21,151 @@ use crate::analyzer::usages::call_binding::{
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
+use serde::{Deserialize, Serialize};
+
+/// Identity of an external declaration proved by a language resolver.
+///
+/// This stores generic declaration evidence only. The language-specific producer owns
+/// construction and interpretation (for example, Java decides which fully-qualified
+/// names are primitive wrappers); the shared relation never infers meaning from a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalConversionIdentity {
+    fqn: String,
+    provenance: ExternalConversionProvenance,
+    /// Resolver-proven declaration kind retained as generic evidence. Java's
+    /// producer uses this to distinguish a class wrapper from another type.
+    declaration_is_class: bool,
+    /// Identity of the effective external declaration surface. This is
+    /// content scoped; the artifact path in `provenance` remains useful for
+    /// diagnostics but is not the content proof by itself.
+    external_surface_identity: StableDigest,
+    /// Identity of the active semantic-model set, when one participated in
+    /// resolving this declaration. A changed pack set must not reuse an old
+    /// conversion proof.
+    active_model_set_identity: Option<StableDigest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExternalConversionProvenance {
+    SourceJar {
+        artifact_path: std::path::PathBuf,
+        source_path: String,
+    },
+    ClassFile {
+        artifact_path: std::path::PathBuf,
+        class_entry: String,
+    },
+    SemanticPack {
+        pack_id: String,
+        declaration_id: String,
+    },
+}
+
+impl ExternalConversionIdentity {
+    /// Construct an identity from resolver-owned artifact/model evidence.
+    ///
+    /// A semantic-pack declaration is not an exact identity without the active model-set
+    /// digest, so construction refuses to produce one in that case.
+    pub(crate) fn from_provenance(
+        fqn: impl Into<String>,
+        provenance: ExternalConversionProvenance,
+        declaration_is_class: bool,
+        external_surface_identity: StableDigest,
+        active_model_set_identity: Option<StableDigest>,
+    ) -> Option<Self> {
+        if matches!(
+            &provenance,
+            ExternalConversionProvenance::SemanticPack { .. }
+        ) && active_model_set_identity.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            fqn: fqn.into(),
+            provenance,
+            declaration_is_class,
+            external_surface_identity,
+            active_model_set_identity,
+        })
+    }
+
+    pub fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    pub(crate) fn digest(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.java.external-conversion.v1");
+        digest.push(self.fqn.as_bytes());
+        digest.push(if self.declaration_is_class {
+            b"class".as_slice()
+        } else {
+            b"non-class".as_slice()
+        });
+        digest.push(self.external_surface_identity.as_bytes());
+        match self.active_model_set_identity {
+            Some(identity) => {
+                digest.push(b"active-model-set");
+                digest.push(identity.as_bytes());
+            }
+            None => digest.push(b"no-active-model-set"),
+        }
+        match &self.provenance {
+            ExternalConversionProvenance::SourceJar {
+                artifact_path,
+                source_path,
+            } => {
+                digest.push(b"source-jar");
+                digest.push(artifact_path.to_string_lossy().as_bytes());
+                digest.push(source_path.as_bytes());
+            }
+            ExternalConversionProvenance::ClassFile {
+                artifact_path,
+                class_entry,
+            } => {
+                digest.push(b"class-file");
+                digest.push(artifact_path.to_string_lossy().as_bytes());
+                digest.push(class_entry.as_bytes());
+            }
+            ExternalConversionProvenance::SemanticPack {
+                pack_id,
+                declaration_id,
+            } => {
+                digest.push(b"semantic-pack");
+                digest.push(pack_id.as_bytes());
+                digest.push(declaration_id.as_bytes());
+            }
+        }
+        digest.finish()
+    }
+
+    pub(crate) fn declaration_is_class(&self) -> bool {
+        self.declaration_is_class
+    }
+}
+
+/// Language-owned call-argument conversion producer.
+///
+/// The shared relation owns exact call/signature/actual/formal joins and delegates only
+/// owner applicability and one AST-backed actual/formal proof to the selected language.
+pub(crate) trait CallArgumentConversionProver: Send + Sync {
+    /// Validate applicability constraints owned by the formal language syntax.
+    fn validate_owner(&self, _owner: tree_sitter::Node<'_>) -> Result<(), ConversionUnknown> {
+        Ok(())
+    }
+
+    /// Prove one actual-to-formal pair from the language's resolver and AST evidence.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_argument(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: tree_sitter::Node<'_>,
+        source: &str,
+        formal_file: &ProjectFile,
+        formal: tree_sitter::Node<'_>,
+        formal_source: &str,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JavaPrimitive {
@@ -47,11 +188,87 @@ pub enum TypeScriptPrimitive {
     Symbol,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustPrimitive {
+    Bool,
+    Char,
+    Str,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    F32,
+    F64,
+}
+
+/// Structured Rust conversion types. The language producer bounds nesting
+/// before construction; references describe conversion shape, not a proof of
+/// borrow validity or region inference. Nominals retain resolved declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustConversionType {
+    Primitive(RustPrimitive),
+    Declaration(CodeUnit),
+    Reference { mutable: bool, referent: Box<Self> },
+    Array { element: Box<Self>, length: u64 },
+    Slice { element: Box<Self> },
+    Tuple(Vec<Self>),
+    Unit,
+}
+
+impl RustConversionType {
+    fn digest(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.rust.conversion-type.v1");
+        let mut pending = vec![self];
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Self::Primitive(primitive) => {
+                    digest.push(b"primitive");
+                    digest.push(&[*primitive as u8]);
+                }
+                Self::Declaration(unit) => {
+                    digest.push(b"declaration");
+                    digest.push(unit.declaration_id().as_str().as_bytes());
+                }
+                Self::Reference { mutable, referent } => {
+                    digest.push(b"reference");
+                    digest.push(&[u8::from(*mutable)]);
+                    pending.push(referent);
+                }
+                Self::Array { element, length } => {
+                    digest.push(b"array");
+                    digest.push(&length.to_be_bytes());
+                    pending.push(element);
+                }
+                Self::Slice { element } => {
+                    digest.push(b"slice");
+                    pending.push(element);
+                }
+                Self::Tuple(elements) => {
+                    digest.push(b"tuple");
+                    digest.push(&(elements.len() as u64).to_be_bytes());
+                    pending.extend(elements.iter().rev());
+                }
+                Self::Unit => digest.push(b"unit"),
+            }
+        }
+        digest.finish()
+    }
+}
+
 /// Resolved identities, rather than parser-derived names or displayed types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedConversionType {
     JavaPrimitive(JavaPrimitive),
     TypeScriptPrimitive(TypeScriptPrimitive),
+    Rust(RustConversionType),
     Declaration(CodeUnit),
     /// Exact artifact/model declaration identity supplied by the resolver.
     External {
@@ -67,9 +284,26 @@ pub enum ConversionKind {
     JavaUnboxing,
     TypeScriptIdentity,
     TypeScriptStructuralAssignability,
+    RustIdentity,
+    RustDeref,
+    RustUnsizing,
+    RustReborrow,
 }
 
 impl ConversionKind {
+    pub const LABELS: &'static [&'static str] = &[
+        "java_identity",
+        "java_primitive_widening",
+        "java_boxing",
+        "java_unboxing",
+        "typescript_identity",
+        "typescript_structural_assignability",
+        "rust_identity",
+        "rust_deref",
+        "rust_unsizing",
+        "rust_reborrow",
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::JavaIdentity => "java_identity",
@@ -78,11 +312,16 @@ impl ConversionKind {
             Self::JavaUnboxing => "java_unboxing",
             Self::TypeScriptIdentity => "typescript_identity",
             Self::TypeScriptStructuralAssignability => "typescript_structural_assignability",
+            Self::RustIdentity => "rust_identity",
+            Self::RustDeref => "rust_deref",
+            Self::RustUnsizing => "rust_unsizing",
+            Self::RustReborrow => "rust_reborrow",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConversionUnknown {
     UnsupportedLanguage,
     UnresolvedSignature,
@@ -94,6 +333,34 @@ pub enum ConversionUnknown {
     UnsupportedExpression,
     /// Another actual prevents establishing applicability of this signature.
     SignatureApplicability,
+}
+
+impl ConversionUnknown {
+    pub const LABELS: &'static [&'static str] = &[
+        "unsupported_language",
+        "unresolved_signature",
+        "unresolved_source_type",
+        "unresolved_target_type",
+        "ambiguous_binding",
+        "generic_substitution",
+        "unsupported_conversion",
+        "unsupported_expression",
+        "signature_applicability",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedLanguage => "unsupported_language",
+            Self::UnresolvedSignature => "unresolved_signature",
+            Self::UnresolvedSourceType => "unresolved_source_type",
+            Self::UnresolvedTargetType => "unresolved_target_type",
+            Self::AmbiguousBinding => "ambiguous_binding",
+            Self::GenericSubstitution => "generic_substitution",
+            Self::UnsupportedConversion => "unsupported_conversion",
+            Self::UnsupportedExpression => "unsupported_expression",
+            Self::SignatureApplicability => "signature_applicability",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +460,11 @@ impl CallArgumentConversion {
             }
             ConversionKind::JavaIdentity
             | ConversionKind::TypeScriptIdentity
-            | ConversionKind::TypeScriptStructuralAssignability => return None,
+            | ConversionKind::TypeScriptStructuralAssignability
+            | ConversionKind::RustIdentity
+            | ConversionKind::RustDeref
+            | ConversionKind::RustUnsizing
+            | ConversionKind::RustReborrow => return None,
         };
         Some(ValueTransfer {
             kind,
@@ -231,6 +502,10 @@ impl CallArgumentConversion {
                 ResolvedConversionType::TypeScriptPrimitive(primitive) => {
                     digest.push(b"typescript_primitive");
                     digest.push(&[*primitive as u8]);
+                }
+                ResolvedConversionType::Rust(identity) => {
+                    digest.push(b"rust");
+                    digest.push(identity.digest().as_bytes());
                 }
                 ResolvedConversionType::Declaration(unit) => {
                     digest.push(b"declaration");
@@ -288,10 +563,11 @@ impl CallConversionCache {
         signature: Option<&str>,
     ) {
         let language = language_for_file(&report.file);
-        let prerequisite = if !matches!(language, Language::Java | Language::TypeScript) {
-            Err(ConversionUnknown::UnsupportedLanguage)
-        } else {
-            self.prove(analyzer, report, signature, language)
+        let prerequisite = match language_support(language)
+            .and_then(LanguageSupport::call_argument_conversion_prover)
+        {
+            Some(prover) => self.prove(analyzer, report, signature, language, prover),
+            None => Err(ConversionUnknown::UnsupportedLanguage),
         };
         report.conversion_facts = report
             .rows
@@ -330,6 +606,7 @@ impl CallConversionCache {
         report: &CallBindingReport,
         signature: Option<&str>,
         language: Language,
+        prover: &dyn CallArgumentConversionProver,
     ) -> Result<Vec<IndexedConversionProof>, ConversionUnknown> {
         signature.ok_or(ConversionUnknown::UnresolvedSignature)?;
         let target = report
@@ -364,20 +641,7 @@ impl CallConversionCache {
             }
             enclosing = node.parent();
         }
-        if language == Language::TypeScript
-            && let Some(parameters) = owner.child_by_field_name("parameters")
-        {
-            let mut cursor = parameters.walk();
-            if parameters.named_children(&mut cursor).any(|parameter| {
-                parameter
-                    .child_by_field_name("pattern")
-                    .is_some_and(|pattern| pattern.kind() == "this")
-            }) {
-                // An explicit compile-time receiver adds an applicability
-                // constraint that ordinary actual/formal typing cannot prove.
-                return Err(ConversionUnknown::SignatureApplicability);
-            }
-        }
+        prover.validate_owner(owner)?;
         let slots =
             formal_parameter_slots_for_owner_with_nodes(language, owner, &formal_source.source)
                 .ok_or(ConversionUnknown::UnresolvedTargetType)?;
@@ -420,27 +684,15 @@ impl CallConversionCache {
                 {
                     return Err(ConversionUnknown::UnsupportedExpression);
                 }
-                match language {
-                    Language::Java => java::prove_argument(
-                        analyzer,
-                        &report.file,
-                        actual,
-                        &source.source,
-                        target.source(),
-                        *formal,
-                        &formal_source.source,
-                    ),
-                    Language::TypeScript => typescript::prove_argument(
-                        analyzer,
-                        &report.file,
-                        actual,
-                        &source.source,
-                        target.source(),
-                        *formal,
-                        &formal_source.source,
-                    ),
-                    _ => unreachable!("language capability checked before type resolution"),
-                }
+                prover.prove_argument(
+                    analyzer,
+                    &report.file,
+                    actual,
+                    &source.source,
+                    target.source(),
+                    *formal,
+                    &formal_source.source,
+                )
             })();
             proofs.push((index, proof));
         }
@@ -470,7 +722,10 @@ impl CallConversionCache {
 }
 
 /// Presentation is an exact identity join, independent of fact ordering. A
-/// fact for another signature, target, actual or formal cannot label this row.
+/// fact for another signature, target, actual or formal cannot label or explain
+/// this row; an ordinary actual with no matching fact gets typed ambiguous
+/// conversion evidence instead. Receiver, implicit and absent-actual rows do
+/// not have a conversion field to explain.
 pub fn project_conversion_facts(report: &mut CallBindingReport, signature: Option<&str>) {
     let mut by_binding = HashMap::default();
     for fact in &report.conversion_facts {
@@ -491,14 +746,26 @@ pub fn project_conversion_facts(report: &mut CallBindingReport, signature: Optio
         );
     }
     for row in &mut report.rows {
-        row.conversion = by_binding
-            .get(&(
-                row.site_id.as_str(),
-                row.argument_id.as_deref(),
-                row.formal_index,
-            ))
+        let fact = by_binding.get(&(
+            row.site_id.as_str(),
+            row.argument_id.as_deref(),
+            row.formal_index,
+        ));
+        row.conversion = fact
             .and_then(|fact| fact.result.as_ref().ok())
             .map(|proof| proof.kind.label().to_owned());
+        row.conversion_reason = if row.argument_id.is_some()
+            && !matches!(
+                row.binding_kind,
+                Some(CallBindingKind::Receiver | CallBindingKind::Implicit)
+            ) {
+            match fact {
+                Some(fact) => fact.result.as_ref().err().copied(),
+                None => Some(ConversionUnknown::AmbiguousBinding),
+            }
+        } else {
+            None
+        };
     }
 }
 
@@ -531,6 +798,7 @@ mod tests {
                 mapping: CallBindingMapping::Exact,
                 reason: None,
                 conversion: None,
+                conversion_reason: None,
                 range,
                 terminal: false,
             })
@@ -577,11 +845,28 @@ mod tests {
     #[test]
     fn projection_is_order_independent_and_reference_identity_has_no_transfer_barrier() {
         let mut expected = report();
+        expected.conversion_facts[1] = CallArgumentConversion::unknown(
+            &expected.rows[1],
+            expected.target.as_ref(),
+            Some("signature"),
+            ConversionUnknown::UnsupportedExpression,
+        );
         project_conversion_facts(&mut expected, Some("signature"));
         let mut reordered = report();
+        reordered.conversion_facts[1] = CallArgumentConversion::unknown(
+            &reordered.rows[1],
+            reordered.target.as_ref(),
+            Some("signature"),
+            ConversionUnknown::UnsupportedExpression,
+        );
         reordered.conversion_facts.reverse();
         project_conversion_facts(&mut reordered, Some("signature"));
         assert_eq!(expected.rows, reordered.rows);
+        assert_eq!(
+            expected.rows[1].conversion_reason,
+            Some(ConversionUnknown::UnsupportedExpression)
+        );
+        assert_eq!(expected.rows[0].conversion_reason, None);
         let widening = expected.conversion_facts[0]
             .transfer()
             .expect("widening transfer");
@@ -621,8 +906,29 @@ mod tests {
                 changed.rows[0].conversion.is_none(),
                 "dimension {dimension}"
             );
+            assert_eq!(
+                changed.rows[0].conversion_reason,
+                Some(ConversionUnknown::AmbiguousBinding),
+                "dimension {dimension}"
+            );
             assert_eq!(changed.rows[1].conversion.as_deref(), Some("java_identity"));
+            assert_eq!(changed.rows[1].conversion_reason, None);
         }
+    }
+
+    #[test]
+    fn conversion_reason_is_not_applicable_to_receiver_implicit_or_absent_actual_rows() {
+        let mut receiver_report = report();
+        receiver_report.rows[0].binding_kind = Some(CallBindingKind::Receiver);
+        receiver_report.rows[1].argument_id = None;
+        project_conversion_facts(&mut receiver_report, Some("signature"));
+        assert_eq!(receiver_report.rows[0].conversion_reason, None);
+        assert_eq!(receiver_report.rows[1].conversion_reason, None);
+
+        let mut report = report();
+        report.rows[0].binding_kind = Some(CallBindingKind::Implicit);
+        project_conversion_facts(&mut report, Some("signature"));
+        assert_eq!(report.rows[0].conversion_reason, None);
     }
 
     #[test]
@@ -644,5 +950,41 @@ mod tests {
                 preservation: ValuePreservation::Changing
             }
         );
+    }
+
+    #[test]
+    fn conversion_labels_and_unknown_reasons_are_stable() {
+        assert_eq!(
+            ConversionKind::LABELS,
+            &[
+                "java_identity",
+                "java_primitive_widening",
+                "java_boxing",
+                "java_unboxing",
+                "typescript_identity",
+                "typescript_structural_assignability",
+                "rust_identity",
+                "rust_deref",
+                "rust_unsizing",
+                "rust_reborrow",
+            ]
+        );
+        assert_eq!(
+            ConversionUnknown::LABELS,
+            &[
+                "unsupported_language",
+                "unresolved_signature",
+                "unresolved_source_type",
+                "unresolved_target_type",
+                "ambiguous_binding",
+                "generic_substitution",
+                "unsupported_conversion",
+                "unsupported_expression",
+                "signature_applicability",
+            ]
+        );
+        for reason in ConversionUnknown::LABELS {
+            assert!(reason.as_bytes().iter().all(|byte| byte.is_ascii()));
+        }
     }
 }

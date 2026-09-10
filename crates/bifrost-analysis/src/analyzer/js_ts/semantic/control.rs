@@ -1,6 +1,7 @@
 use super::syntax::*;
 use super::values::stable_member_key;
 use super::*;
+use crate::analyzer::semantic::{SemanticGapImpact, SemanticGapImpacts};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_procedure<'tree, 'targets>(
@@ -306,7 +307,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // needs no further resolution.
             if !self.established_plain_object_base(left, object) && !established_array_element_field
             {
-                self.add_field_identity_gap(builder, terminal, location)?;
+                self.session.add_gap_with_impacts(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::FieldMemory,
+                    SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                        .with(SemanticGapImpact::HeapWrite)
+                        .with(SemanticGapImpact::Aliasing),
+                    SemanticGapKind::Unknown,
+                    "field store declaration identity is not yet resolved",
+                )?;
             }
             self.append_effect(
                 builder,
@@ -335,8 +346,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
             if !established_array_base {
-                self.add_index_identity_gap(builder, terminal, location)?;
-                self.implicit_exception_gap(builder, terminal, left)?;
+                self.session.add_gap_with_impacts(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::IndexMemory,
+                    SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                        .with(SemanticGapImpact::HeapWrite)
+                        .with(SemanticGapImpact::Aliasing),
+                    SemanticGapKind::Unknown,
+                    "indexed store allocation identity is not proven",
+                )?;
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    "implicit exceptions from indexed stores are not yet lowered",
+                )?;
             }
             self.append_effect(
                 builder,
@@ -1495,26 +1523,57 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
             let index_value = self.index_value(builder, index)?;
             let result = self.expression_value(builder, node, expression_value_kind(node))?;
-            let location = self.session.add_memory_location(
-                builder,
-                access,
-                MemoryLocationKind::Index {
+            let runtime_key = brokk_bifrost_js_ts::syntax::static_runtime_keyed_access(
+                node,
+                self.lexical_bindings,
+                self.prepared.source(),
+            );
+            let location_kind = match runtime_key.as_ref() {
+                Some(brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessKey::Property(key)) => {
+                    MemoryLocationKind::Property {
+                        base,
+                        key: key.clone(),
+                    }
+                }
+                Some(brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessKey::Index(index)) => {
+                    MemoryLocationKind::Index {
+                        base,
+                        index: Some(index_value),
+                        constant_index: Some(u128::from(*index)),
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    }
+                }
+                None => MemoryLocationKind::Index {
                     base,
                     index: Some(index_value),
                     constant_index: None,
                     identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                 },
-            )?;
+                Some(brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessKey::Dynamic)
+                | Some(brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessKey::Unsupported) => {
+                    unreachable!("runtime keyed access helper only returns static keys")
+                }
+            };
+            let property_access = matches!(&location_kind, MemoryLocationKind::Property { .. });
+            let location = self
+                .session
+                .add_memory_location(builder, access, location_kind)?;
             self.append_effect(
                 builder,
                 access,
                 SemanticEffect::MemoryLoad {
-                    kind: MemoryAccessKind::Index,
+                    kind: if property_access {
+                        MemoryAccessKind::Property
+                    } else {
+                        MemoryAccessKind::Index
+                    },
                     location,
                     result,
                 },
             )?;
-            if !established_array_base {
+            if property_access {
+                self.add_field_identity_gap(builder, access, location)?;
+            } else if !established_array_base {
                 self.add_index_identity_gap(builder, access, location)?;
             }
         } else {
@@ -1528,11 +1587,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             } else {
                 self.plain_object_member_locator(object, property)?
             };
-            let location = self.session.add_memory_location(
-                builder,
-                access,
-                MemoryLocationKind::Field { base, member },
-            )?;
+            let location_kind =
+                if let Some(brokk_bifrost_js_ts::syntax::JsTsRuntimeAccessKey::Property(key)) =
+                    brokk_bifrost_js_ts::syntax::static_runtime_keyed_access(
+                        node,
+                        self.lexical_bindings,
+                        self.prepared.source(),
+                    )
+                {
+                    MemoryLocationKind::Property { base, key }
+                } else {
+                    MemoryLocationKind::Field { base, member }
+                };
+            let access_kind = if matches!(location_kind, MemoryLocationKind::Property { .. }) {
+                MemoryAccessKind::Property
+            } else {
+                MemoryAccessKind::Field
+            };
+            let location = self
+                .session
+                .add_memory_location(builder, access, location_kind)?;
             // A member read in callee position asks the call's own question:
             // which procedure does this property name here. The call site
             // publishes that question itself (its Calls, CallableReferences,
@@ -1551,7 +1625,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 access,
                 SemanticEffect::MemoryLoad {
-                    kind: MemoryAccessKind::Field,
+                    kind: access_kind,
                     location,
                     result,
                 },
@@ -1639,6 +1713,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "implicit exceptions from runtime coercion or operator dispatch are not yet lowered"
             }
         };
+        if matches!(node.kind(), "member_expression" | "subscript_expression") {
+            self.session.add_gap_with_impacts_and_discharge(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                crate::analyzer::semantic::SemanticGapImpacts::NONE,
+                SemanticGapKind::Unsupported,
+                crate::analyzer::semantic::SemanticGapDischarge::RuntimeReadBehavior,
+                detail,
+            )?;
+            return Ok(());
+        }
         self.add_gap(
             builder,
             point,
@@ -1906,12 +1993,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: loop_scope,
         });
-        stack.push(Work::Expression {
-            node: left,
-            entry: left_entry,
-            next: EdgeTarget::normal(body_entry),
-            scope: loop_scope,
-        });
+        let exact_iteration = node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| operator.kind() == "of")
+            .then(|| self.object_entries_iteration(right))
+            .flatten();
+        let exact_entries = if let Some(iteration) = exact_iteration {
+            self.emit_entry_iteration_binding(builder, left, left_entry, iteration)?
+        } else {
+            false
+        };
+        if !exact_entries {
+            stack.push(Work::Expression {
+                node: left,
+                entry: left_entry,
+                next: EdgeTarget::normal(body_entry),
+                scope: loop_scope,
+            });
+        } else {
+            self.edge(builder, left_entry, EdgeTarget::normal(body_entry))?;
+        }
         let is_await = has_child_kind(node, "await");
         let is_using = has_child_kind(node, "using");
         if is_using {
@@ -1964,6 +2065,99 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope: loop_scope,
         });
         Ok(())
+    }
+
+    fn emit_entry_iteration_binding(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        left: Node<'tree>,
+        point: ProgramPointId,
+        iteration: EntryIteration,
+    ) -> Result<bool, TsLoweringError> {
+        let Some(pattern) = (left.kind() == "array_pattern").then_some(left) else {
+            return Ok(false);
+        };
+        let children = named_children(pattern);
+        if pattern.kind() != "array_pattern"
+            || children.len() != 2
+            || children.iter().any(|child| child.kind() != "identifier")
+        {
+            return Ok(false);
+        }
+        let [key, value] = children.as_slice() else {
+            return Ok(false);
+        };
+        let key_name = node_text(self.prepared.source(), *key).ok_or_else(|| {
+            TsLoweringError::Invalid("Object.entries key binder has invalid source range".into())
+        })?;
+        let value_name = node_text(self.prepared.source(), *value).ok_or_else(|| {
+            TsLoweringError::Invalid("Object.entries value binder has invalid source range".into())
+        })?;
+        let key_target = self.local_at(key_name, key.start_byte());
+        let value_target = self.local_at(value_name, value.start_byte());
+        let (Some(key_target), Some(value_target)) = (key_target, value_target) else {
+            return Ok(false);
+        };
+        let key_value = self.value(
+            builder,
+            point,
+            SemanticValueKind::LanguageDefined("object.entries.key".into()),
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: key_target,
+                value: key_value,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::LanguageDefined,
+                source: key_value,
+                target: key_target,
+            },
+        )?;
+        for member in iteration.fields {
+            let temporary = self.value(builder, point, SemanticValueKind::Temporary)?;
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: iteration.receiver,
+                    member,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location,
+                    result: temporary,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::Assignment {
+                    target: value_target,
+                    value: temporary,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: temporary,
+                    target: value_target,
+                },
+            )?;
+        }
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2258,6 +2452,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         chain_skip: Option<EdgeTarget>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
+        if self.object_entries_iteration(node).is_some() {
+            return self.object_entries_intrinsic(builder, node, entry, next, scope, stack);
+        }
         let function = node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("constructor"))
@@ -2500,6 +2697,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.push_chain_expression(stack, function, entry, function_next, scope, chain_skip);
             Ok(())
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn object_entries_intrinsic(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let arguments = required_field(node, "arguments")?;
+        let argument = named_children(arguments)
+            .into_iter()
+            .next()
+            .ok_or_else(|| missing_field(node, "arguments"))?;
+        let invoke = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let argument_value =
+            self.expression_value(builder, argument, expression_value_kind(argument))?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::LanguageDefined,
+                source: argument_value,
+                target: result,
+            },
+        )?;
+        self.edge(builder, invoke, next)?;
+        let argument_entry = self.point(builder, argument, Vec::new())?;
+        self.edge(builder, entry, EdgeTarget::normal(argument_entry))?;
+        stack.push(Work::Expression {
+            node: argument,
+            entry: argument_entry,
+            next: EdgeTarget::normal(invoke),
+            scope,
+        });
+        Ok(())
     }
 
     fn error_constructor_expression(

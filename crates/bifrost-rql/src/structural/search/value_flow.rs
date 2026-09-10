@@ -906,6 +906,32 @@ fn hash_public_carrier_key(digest: &mut LengthDelimitedDigest, root: &ValueFlowC
                 });
                 hash_public_locator(digest, locator);
             }
+            Part::Carrier(ValueFlowCarrierKey::RuntimeObject {
+                runtime_profile_digest,
+                realm,
+                exposure_id,
+                container_member,
+                state_boundary,
+                refinement_identity,
+                active_model_set_hash,
+                manifest_digest,
+                shard_id,
+                behavior_id,
+                activation_source,
+            }) => {
+                digest.push(b"runtime_object");
+                digest.push(runtime_profile_digest.as_bytes());
+                digest.push(realm.as_bytes());
+                digest.push(exposure_id.as_bytes());
+                digest.push(container_member.as_bytes());
+                digest.push(state_boundary.as_bytes());
+                digest.push(refinement_identity.as_bytes());
+                digest.push(active_model_set_hash.as_bytes());
+                digest.push(manifest_digest.as_bytes());
+                digest.push(shard_id.as_bytes());
+                digest.push(behavior_id.as_bytes());
+                digest.push(activation_source.as_bytes());
+            }
             Part::Carrier(ValueFlowCarrierKey::LexicalCell { locator, binding }) => {
                 digest.push(b"lexical_cell");
                 hash_public_locator(digest, locator);
@@ -936,6 +962,10 @@ fn hash_public_carrier_key(digest: &mut LengthDelimitedDigest, root: &ValueFlowC
             Part::Selector(ValueFlowSelectorKey::Field(locator)) => {
                 digest.push(b"field");
                 hash_public_locator(digest, locator);
+            }
+            Part::Selector(ValueFlowSelectorKey::Property(property)) => {
+                digest.push(b"property");
+                digest.push(property.as_bytes());
             }
             Part::Selector(ValueFlowSelectorKey::ExactIndex(index)) => {
                 digest.push(b"exact_index");
@@ -1174,6 +1204,32 @@ pub(super) fn public_carrier_symbol(
                 site: public_symbol_site(workspace, locator),
             }
         }
+        ValueFlowCarrierKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        } => CodeQueryFlowCarrierSymbol::RuntimeObject {
+            id,
+            runtime_profile_digest: runtime_profile_digest.clone(),
+            realm: realm.clone(),
+            exposure_id: exposure_id.clone(),
+            container_member: container_member.clone(),
+            state_boundary: state_boundary.clone(),
+            refinement_identity: refinement_identity.to_string(),
+            active_model_set_hash: active_model_set_hash.clone(),
+            manifest_digest: manifest_digest.clone(),
+            shard_id: shard_id.clone(),
+            behavior_id: behavior_id.clone(),
+            activation_source: activation_source.clone(),
+        },
         ValueFlowCarrierKey::LexicalCell { binding, .. } => {
             CodeQueryFlowCarrierSymbol::ScopedRoot {
                 id,
@@ -1194,6 +1250,9 @@ pub(super) fn public_carrier_symbol(
                     ValueFlowSelectorKey::Field(locator) => CodeQueryFlowSelectorSymbol::Field {
                         field: public_symbol_site(workspace, locator),
                     },
+                    ValueFlowSelectorKey::Property(key) => {
+                        CodeQueryFlowSelectorSymbol::Property { key: key.clone() }
+                    }
                     ValueFlowSelectorKey::ExactIndex(index) => {
                         CodeQueryFlowSelectorSymbol::ExactIndex {
                             index: Box::new(public_carrier_symbol(workspace, index)),

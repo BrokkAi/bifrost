@@ -534,6 +534,9 @@ pub enum QueryReadIncomplete {
     Cancelled,
     /// The structured source needed by a read was unavailable.
     StructureUnavailable(ProjectFile),
+    /// Structured semantic evidence required for a complete answer was
+    /// unavailable or incomplete.
+    SemanticEvidenceUnavailable(Box<str>),
     /// A store failure prevented a read from establishing a complete answer.
     StoreFailure(StoreError),
 }
@@ -1409,6 +1412,33 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         crate::analyzer::RelationalBatchOutcome::Failed(crate::analyzer::RelationalBatchError::new(
             "this analyzer does not provide relational definition lookup",
         ))
+    }
+
+    /// The optional structured property-reaching capability.  A missing
+    /// provider is distinct from a provider returning a complete empty result.
+    fn property_reaching_provider(
+        &self,
+    ) -> Option<&dyn crate::analyzer::semantic::PropertyReachingProvider> {
+        None
+    }
+
+    /// Query structured property and evaluation relations at a source range.
+    /// Implementations acquire the current semantic artifact and value-flow
+    /// snapshot behind this capability, so callers holding only `&dyn
+    /// IAnalyzer` do not need to cross the analysis/flow dependency boundary.
+    fn property_reaching_for_source_range(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+        limits: crate::analyzer::semantic::PropertyReachingLimits,
+        cancellation: &CancellationToken,
+    ) -> crate::analyzer::semantic::PropertySourceQueryResult {
+        self.property_reaching_provider().map_or_else(
+            crate::analyzer::semantic::PropertySourceQueryResult::unsupported,
+            |provider| {
+                provider.property_reaching_for_source_range(file, range, limits, cancellation)
+            },
+        )
     }
 
     /// Execute a relational batch from a compatibility API that has no token
@@ -2475,6 +2505,45 @@ pub(crate) fn capture_nested_reads<T>(
     (result, captured.keys())
 }
 
+/// Capture the dependency reads of a replayable query without changing its
+/// enclosing caller's ledger. Unlike a resolver funnel, the query subsumes no
+/// dependencies: all captured reads, including unattributed crossings, are
+/// forwarded to that caller when execution finishes.
+///
+/// A separate ordinary ledger would become the parent of nested resolver
+/// captures, exposing their implementation reads to the original caller. Link
+/// the capture to that caller explicitly instead. Unrelated concurrent ledgers
+/// continue receiving the original broadcasts and must not receive a second
+/// unattributed charge during forwarding.
+#[doc(hidden)]
+pub fn capture_query_reads<T>(
+    analyzer: &dyn IAnalyzer,
+    query: impl FnOnce() -> T,
+) -> (T, Arc<crate::analyzer::read_ledger::ReadLedger>) {
+    let enclosing = analyzer.current_thread_read_ledger();
+    let captured = Arc::new(crate::analyzer::read_ledger::ReadLedger::new());
+    let result = {
+        let _scope = match &enclosing {
+            Some(enclosing) => AnalyzerQueryScope::with_nested_read_ledger(
+                analyzer,
+                Arc::clone(&captured),
+                Arc::clone(enclosing),
+            ),
+            None => AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&captured)),
+        };
+        query()
+    };
+    if let Some(enclosing) = enclosing {
+        for key in captured.keys() {
+            enclosing.record(key);
+        }
+        for _ in 0..captured.unattributed_reads() {
+            enclosing.record_unattributed();
+        }
+    }
+    (result, captured)
+}
+
 /// Record one funnel key on every active ledger except an explicitly shadowed
 /// enclosing ledger.
 pub(crate) fn record_read_on_active_ledgers(
@@ -2810,7 +2879,8 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
 #[cfg(test)]
 mod read_ledger_scope_tests {
     use super::{
-        AnalyzerQueryContext, record_read_on_active_ledgers, record_unattributed_on_active_ledgers,
+        AnalyzerQueryContext, AnalyzerQueryScope, capture_nested_reads, capture_query_reads,
+        record_read_on_active_ledgers, record_unattributed_on_active_ledgers,
     };
     use crate::analyzer::read_ledger::{ReadKey, ReadLedger};
     use crate::analyzer::semantic::ids::StableDigest;
@@ -2844,6 +2914,42 @@ mod read_ledger_scope_tests {
         assert_eq!(concurrent.unattributed_reads(), 1);
         assert_eq!(captured.keys(), vec![key]);
         assert_eq!(captured.unattributed_reads(), 1);
+    }
+
+    #[test]
+    fn query_capture_preserves_nested_funnel_attribution_without_double_charging() {
+        let project = crate::inline_project::InlineTestProject::with_language(
+            crate::analyzer::Language::Rust,
+        )
+        .file("lib.rs", "fn work() {}")
+        .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let other = Arc::new(ReadLedger::new());
+        let enclosing = Arc::new(ReadLedger::new());
+        let _other_scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&other));
+        let _enclosing_scope =
+            AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&enclosing));
+        let internal = ReadKey::Configuration(StableDigest::sha256(b"implementation"));
+        let published = ReadKey::Configuration(StableDigest::sha256(b"replayable answer"));
+        let (answer, captured) = capture_query_reads(analyzer, || {
+            capture_nested_reads(analyzer, || {
+                analyzer.record_read(internal.clone());
+                analyzer.record_unattributed_read();
+            });
+            analyzer.record_read(published.clone());
+            analyzer.record_unattributed_read();
+            42
+        });
+        assert_eq!(answer, 42);
+        assert_eq!(captured.keys(), vec![published.clone()]);
+        assert_eq!(enclosing.keys(), vec![published.clone()]);
+        assert_eq!(captured.unattributed_reads(), 1);
+        assert_eq!(enclosing.unattributed_reads(), 1);
+        let mut expected = vec![internal, published];
+        expected.sort();
+        assert_eq!(other.keys(), expected);
+        assert_eq!(other.unattributed_reads(), 2);
     }
 }
 

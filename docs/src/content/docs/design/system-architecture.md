@@ -172,6 +172,25 @@ measurements, and work counters describe the run and are excluded from that
 comparison; finding identities, ordering, evidence, diagnostics, completeness,
 and obligations are included.
 
+### Repeated assertion subjects
+
+Within one serial policy batch, assertion policies with identical subject
+queries can share a complete whole-workspace subject selection. Compatibility
+requires the full canonical query, including captures, branch order and
+execution controls, identical query limits, and the same immutable analyzer
+and pinned semantic-model context. This boundary always has an unrestricted
+AST selection. Each policy builds its own selected AST-id set and correlated
+row-family session afterward; those products are not shared across policies.
+
+The batch retains only selections with multiple consumers and bounds their
+combined rows, evidence records and dependency keys by a retention weight.
+Incomplete, diagnostic-bearing, cancelled or unattributed selections are not
+reusable. Each consumer retains its original logical work charges and checks
+cancellation independently. Captured dependency reads are replayed into the
+active ledgers without transferring a producer's ledger to another policy.
+The cache ends with the batch and does not change transactional diff-unit
+publication, policy ordering, or the canonical report.
+
 ### Seed units and dependencies
 
 A seed unit restricts a query's initial file enumeration to one file. It does

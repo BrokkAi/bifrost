@@ -10,6 +10,7 @@
 //! ([`external`]).
 
 pub(crate) mod cache;
+mod call_conversion;
 pub(crate) mod clones;
 pub(crate) mod diagnostics;
 pub(crate) mod external;
@@ -694,6 +695,13 @@ pub(crate) struct TypescriptSupport;
 impl LanguageSupport for TypescriptSupport {
     fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
     }
 
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {

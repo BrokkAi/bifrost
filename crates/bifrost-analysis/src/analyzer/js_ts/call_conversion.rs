@@ -15,18 +15,17 @@ use crate::analyzer::Language;
 use crate::analyzer::ProjectFile;
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::lexical_definitions::{LexicalBindingResolution, resolve_lexical_binding};
-use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
+use crate::analyzer::usages::call_conversion::{
+    ArgumentTypeConversion, CallArgumentConversionProver, ConversionKind, ConversionUnknown,
+    ResolvedConversionType, TypeScriptPrimitive,
+};
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsImportBinder, compute_import_binder_for_root, parse_js_ts_tree, static_property_name,
+    JsTsImportBinder, compute_import_binder, compute_import_binder_for_root, parse_js_ts_tree,
+    static_property_name,
 };
 use brokk_bifrost_js_ts::ts_owners::{ts_named_type_candidates, ts_nodes_for_code_unit};
 use tree_sitter::{Node, Tree};
-
-use super::{
-    ArgumentTypeConversion, ConversionKind, ConversionUnknown, ResolvedConversionType,
-    TypeScriptPrimitive,
-};
 
 const MAX_TYPE_DEPTH: usize = 8;
 
@@ -120,6 +119,51 @@ pub(super) fn prove_argument(
         target: target_type.resolved(),
         kind,
     })
+}
+
+pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: TypescriptCallArgumentConversionProver =
+    TypescriptCallArgumentConversionProver;
+
+pub(crate) struct TypescriptCallArgumentConversionProver;
+
+impl CallArgumentConversionProver for TypescriptCallArgumentConversionProver {
+    fn validate_owner(&self, owner: Node<'_>) -> Result<(), ConversionUnknown> {
+        let Some(parameters) = owner.child_by_field_name("parameters") else {
+            return Ok(());
+        };
+        let mut cursor = parameters.walk();
+        if parameters.named_children(&mut cursor).any(|parameter| {
+            parameter
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.kind() == "this")
+        }) {
+            // An explicit compile-time receiver adds an applicability
+            // constraint that ordinary actual/formal typing cannot prove.
+            return Err(ConversionUnknown::SignatureApplicability);
+        }
+        Ok(())
+    }
+
+    fn prove_argument(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_file: &ProjectFile,
+        formal: Node<'_>,
+        formal_source: &str,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        prove_argument(
+            analyzer,
+            file,
+            actual,
+            source,
+            formal_file,
+            formal,
+            formal_source,
+        )
+    }
 }
 
 fn same_type_identity(source: &TypeScriptType, target: &TypeScriptType) -> bool {
@@ -462,7 +506,7 @@ fn type_from_node_for_shape(
     tree: &Tree,
     node: Node<'_>,
 ) -> Option<TypeScriptType> {
-    let imports = compute_jsts_import_binder(source, tree);
+    let imports = compute_import_binder(source, tree);
     let host = resolve_js_ts_source(analyzer, Language::TypeScript)?;
     let support = AnalyzerDefinitionLookup::new(analyzer, Language::TypeScript);
     let aliases = host.alias_resolver().as_ref();
@@ -518,4 +562,39 @@ fn has_accessibility(node: Node<'_>, expected: &str) -> bool {
     node.named_children(&mut cursor).any(|child| {
         child.kind() == "accessibility_modifier" && has_anonymous_child(child, expected)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_tree(source: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar");
+        parser
+            .parse(source, None)
+            .expect("TypeScript source parses")
+    }
+
+    #[test]
+    fn explicit_this_parameter_is_an_owner_applicability_constraint() {
+        let tree = parse_tree("function take(this: string, value: string): void {}");
+        let owner = tree.root_node().named_child(0).expect("function owner");
+        assert_eq!(
+            CALL_ARGUMENT_CONVERSION_PROVER.validate_owner(owner),
+            Err(ConversionUnknown::SignatureApplicability)
+        );
+    }
+
+    #[test]
+    fn ordinary_typescript_owner_has_no_extra_applicability_constraint() {
+        let tree = parse_tree("function take(value: string): void {}");
+        let owner = tree.root_node().named_child(0).expect("function owner");
+        assert_eq!(
+            CALL_ARGUMENT_CONVERSION_PROVER.validate_owner(owner),
+            Ok(())
+        );
+    }
 }

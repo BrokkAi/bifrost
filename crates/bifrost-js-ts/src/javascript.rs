@@ -742,40 +742,50 @@ fn visit_js_object_literal_properties_for_surface(
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
     surface: JsAssignmentSymbolSurface,
 ) {
-    for index in 0..object.named_child_count() {
-        let Some(child) = object.named_child(index) else {
-            continue;
-        };
-        let Some(name) = js_object_literal_property_name(child, source) else {
-            continue;
-        };
-        let kind = js_object_literal_property_kind(child);
-        let fq = parent
-            .fq()
-            .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(
-            file.clone(),
-            kind,
-            "",
-            format!("{}.{}", parent.short_name(), name),
-            fq,
-        );
-        match surface {
-            JsAssignmentSymbolSurface::Declaration => {
-                parsed.add_code_unit(
-                    code_unit.clone(),
-                    child,
-                    source,
-                    Some(parent.clone()),
-                    Some(top_level.clone()),
-                );
+    let mut pending = vec![(object, parent.clone())];
+    while let Some((object, parent)) = pending.pop() {
+        for index in 0..object.named_child_count() {
+            let Some(child) = object.named_child(index) else {
+                continue;
+            };
+            let Some(name) = js_object_literal_property_name(child, source) else {
+                continue;
+            };
+            let kind = js_object_literal_property_kind(child);
+            let fq = parent
+                .fq()
+                .clone()
+                .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+            let code_unit = CodeUnit::new_fq(
+                file.clone(),
+                kind,
+                "",
+                format!("{}.{}", parent.short_name(), name),
+                fq,
+            );
+            match surface {
+                JsAssignmentSymbolSurface::Declaration => {
+                    parsed.add_code_unit(
+                        code_unit.clone(),
+                        child,
+                        source,
+                        Some(parent.clone()),
+                        Some(top_level.clone()),
+                    );
+                }
+                JsAssignmentSymbolSurface::DefinitionLookupOnly => {
+                    parsed.add_definition_lookup_unit(code_unit.clone(), child, source);
+                }
             }
-            JsAssignmentSymbolSurface::DefinitionLookupOnly => {
-                parsed.add_definition_lookup_unit(code_unit.clone(), child, source);
+            if child.kind() == "pair"
+                && let Some(nested) = child
+                    .child_by_field_name("value")
+                    .and_then(js_object_literal_value)
+            {
+                pending.push((nested, code_unit.clone()));
             }
+            parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
         }
-        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
 }
 
@@ -1446,6 +1456,36 @@ fn visit_js_assignment_declarations(
                     register_js_assignment_parameters(node, source, &mut state);
                 }
                 register_js_assignment_variable(node, parent_kind, source, &mut state);
+                if node.kind() == "variable_declarator"
+                    && state.scopes.len() > 1
+                    && let Some(name) = node
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "identifier")
+                    && let Some(object) = node
+                        .child_by_field_name("value")
+                        .and_then(js_object_literal_value)
+                {
+                    // Local literal keys have the same lookup-only surface as
+                    // properties established by local member assignments.
+                    // Do not publish the local binding as a global declaration.
+                    let name = node_text(name, source);
+                    let owner = CodeUnit::new_fq(
+                        file.clone(),
+                        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                        "",
+                        name,
+                        FqName::new().with_pushed(js_ts_segment(name, SegmentKind::Member)),
+                    );
+                    visit_js_object_literal_properties_for_surface(
+                        file,
+                        source,
+                        object,
+                        &owner,
+                        &owner,
+                        parsed,
+                        JsAssignmentSymbolSurface::DefinitionLookupOnly,
+                    );
+                }
                 if node.kind() == "assignment_expression" {
                     visit_js_assignment_expression(file, source, node, parsed, &state);
                 }

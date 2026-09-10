@@ -8,15 +8,16 @@ use super::model::*;
 use super::pack::{CsmiLogicalPack, InMemoryCsmiResourceResolver};
 use super::validate::{CsmiVocabularySupport, validate_csmi_pack};
 use crate::analyzer::semantic_model::{
-    AuthoredSemanticModelPack, CompiledPayload, CompiledSemanticModelPack, CompiledShard,
-    CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryMoveInvalidation,
+    AuthoredSemanticModelPack, CollectionFlowsPayload, CompiledPayload, CompiledSemanticModelPack,
+    CompiledShard, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryMoveInvalidation,
     CompiledSummaryOutput, CompiledSummaryValuePreservation, CompiledSummaryValueTransferKind,
     CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
     CompilerOptions, Completeness, CppArtifactSelector, CppCanonicalType, CppDescriptorRole,
     CppDigestAlgorithm, CppHeaderClosure, CppIdentityStability, CppLanguage,
     CppPortabilityEvidence, CppPortableSymbolKey, CppReferenceKind, CppResolutionContextRef,
     CppSpecialMemberOperation, CppTypeQualifier, DecodeLimits, ImplicitOperation, MemberFact,
-    MemberKind, TypeCopySemantics, TypeMoveSemantics, TypeRef, compile_pack, decode_shard,
+    MemberKind, RuntimeValuesPayload, TypeCopySemantics, TypeMoveSemantics, TypeRef, compile_pack,
+    decode_shard,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -148,7 +149,18 @@ fn export_semantic_document<'a>(
     artifact: &CsmiArtifactEvidence,
     options: &CsmiExportOptions,
 ) -> Result<(CsmiSemanticDocument, CsmiProvenanceRecord), CsmiExportError> {
+    let shards: Vec<&CompiledShard> = shards.collect();
+    let has_runtime_values = shards.iter().any(|shard| shard.runtime_values().is_some());
+    let has_collection_flows = shards
+        .iter()
+        .any(|shard| shard.collection_flows().is_some());
     if cpp_portability.is_some() {
+        validate_exact_artifact_evidence(artifact)?;
+    } else if has_runtime_values || has_collection_flows {
+        // Runtime profiles select exact versioned runtime distributions, which
+        // may use a non-Maven PURL such as pkg:generic. Keep that evidence
+        // exact without forcing runtime artifacts through the declaration-pack
+        // Maven policy.
         validate_exact_artifact_evidence(artifact)?;
     } else {
         validate_maven_evidence(artifact)?;
@@ -160,7 +172,7 @@ fn export_semantic_document<'a>(
     let mut type_names_by_id = HashMap::new();
     let mut member_facts = Vec::new();
     let mut summary_shards = Vec::new();
-    for shard in shards {
+    for shard in &shards {
         match shard.payload() {
             CompiledPayload::DeclarationFacts {
                 types: shard_types,
@@ -375,6 +387,34 @@ fn export_semantic_document<'a>(
         .collect();
     let mut extension_facts = Vec::new();
     let mut value_transfer_affects = Vec::new();
+    let mut runtime_values_affects = Vec::new();
+    let mut runtime_values_completeness = Vec::new();
+    let mut collection_flow_affects = Vec::new();
+    let mut collection_flow_completeness = Vec::new();
+    for shard in &shards {
+        let Some(runtime_values) = shard.runtime_values() else {
+            continue;
+        };
+        export_runtime_values(
+            runtime_values,
+            options,
+            &mut extension_facts,
+            &mut runtime_values_affects,
+            &mut runtime_values_completeness,
+        )?;
+    }
+    for shard in &shards {
+        let Some(collection_flows) = shard.collection_flows() else {
+            continue;
+        };
+        export_collection_flows(
+            collection_flows,
+            options,
+            &mut extension_facts,
+            &mut collection_flow_affects,
+            &mut collection_flow_completeness,
+        )?;
+    }
     for fact in &types {
         let Some(value_semantics) = &fact.value_semantics else {
             continue;
@@ -642,6 +682,11 @@ fn export_semantic_document<'a>(
         });
     }
     for fact in &extension_facts {
+        if fact.vocabulary != CSMI_VALUE_TRANSFER_PROFILE_ID
+            || fact.version != CSMI_VALUE_TRANSFER_PROFILE_VERSION
+        {
+            continue;
+        }
         completeness_statements.push(CsmiCompletenessStatement {
             vocabulary: Some(CSMI_VALUE_TRANSFER_PROFILE_ID.to_owned()),
             version: Some(CSMI_VALUE_TRANSFER_PROFILE_VERSION.to_owned()),
@@ -653,6 +698,8 @@ fn export_semantic_document<'a>(
             extensions: Vec::new(),
         });
     }
+    completeness_statements.extend(runtime_values_completeness);
+    completeness_statements.extend(collection_flow_completeness);
     let declaration_status = match pack_completeness {
         Completeness::Complete => CsmiCoverageStatus::Complete,
         Completeness::Partial => CsmiCoverageStatus::Partial,
@@ -818,12 +865,52 @@ fn export_semantic_document<'a>(
         invocation_id: pack_provenance.revision.clone(),
         diagnostic: None,
     };
+    let mut provenance_records = vec![record.clone()];
+    let mut retained_runtime_provenance = extension_facts
+        .iter()
+        .filter(|fact| fact.vocabulary == CSMI_RUNTIME_VALUES_PROFILE_ID)
+        .flat_map(|fact| fact.provenance.iter())
+        .chain(
+            completeness_statements
+                .iter()
+                .filter(|statement| {
+                    statement.vocabulary.as_deref() == Some(CSMI_RUNTIME_VALUES_PROFILE_ID)
+                })
+                .flat_map(|statement| statement.provenance.iter()),
+        )
+        .filter(|id| id.as_str() != options.provenance_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    retained_runtime_provenance.extend(
+        extension_facts
+            .iter()
+            .filter(|fact| fact.vocabulary == CSMI_COLLECTION_FLOW_PROFILE_ID)
+            .flat_map(|fact| fact.provenance.iter())
+            .chain(
+                completeness_statements
+                    .iter()
+                    .filter(|statement| {
+                        statement.vocabulary.as_deref() == Some(CSMI_COLLECTION_FLOW_PROFILE_ID)
+                    })
+                    .flat_map(|statement| statement.provenance.iter()),
+            )
+            .filter(|id| id.as_str() != options.provenance_id)
+            .cloned(),
+    );
+    retained_runtime_provenance.sort();
+    retained_runtime_provenance.dedup();
+    provenance_records.extend(retained_runtime_provenance.into_iter().map(|id| {
+        let mut retained = record.clone();
+        retained.id = id;
+        retained.generation_method = CsmiGenerationMethod::Composition;
+        retained
+    }));
     let document = CsmiSemanticDocument {
         document_type: "semantic-document".to_owned(),
         schema: CSMI_SCHEMA_URI.to_owned(),
         semantic_model_version: CSMI_SEMANTIC_MODEL_VERSION.to_owned(),
         serialization_version: CSMI_SERIALIZATION_VERSION.to_owned(),
-        provenance_records: vec![record.clone()],
+        provenance_records,
         default_provenance: Some(options.provenance_id.clone()),
         semantic_models: vec![CsmiSemanticModel {
             artifact_selectors: vec![selector],
@@ -837,6 +924,24 @@ fn export_semantic_document<'a>(
                         schema: CSMI_VALUE_TRANSFER_PROFILE_SCHEMA.to_owned(),
                         requirement: CsmiVocabularyRequirement::Required,
                         affects: value_transfer_affects,
+                    });
+                }
+                if !runtime_values_affects.is_empty() {
+                    uses.push(CsmiVocabularyUse {
+                        identifier: CSMI_RUNTIME_VALUES_PROFILE_ID.to_owned(),
+                        version: CSMI_RUNTIME_VALUES_PROFILE_VERSION.to_owned(),
+                        schema: CSMI_RUNTIME_VALUES_PROFILE_SCHEMA.to_owned(),
+                        requirement: CsmiVocabularyRequirement::Required,
+                        affects: runtime_values_affects,
+                    });
+                }
+                if !collection_flow_affects.is_empty() {
+                    uses.push(CsmiVocabularyUse {
+                        identifier: CSMI_COLLECTION_FLOW_PROFILE_ID.to_owned(),
+                        version: CSMI_COLLECTION_FLOW_PROFILE_VERSION.to_owned(),
+                        schema: CSMI_COLLECTION_FLOW_PROFILE_SCHEMA.to_owned(),
+                        requirement: CsmiVocabularyRequirement::Required,
+                        affects: collection_flow_affects,
                     });
                 }
                 if cpp_portability.is_some() {
@@ -922,6 +1027,16 @@ fn logical_pack(
         CSMI_VALUE_TRANSFER_PROFILE_SCHEMA,
     );
     support.add(
+        CSMI_RUNTIME_VALUES_PROFILE_ID,
+        CSMI_RUNTIME_VALUES_PROFILE_VERSION,
+        CSMI_RUNTIME_VALUES_PROFILE_SCHEMA,
+    );
+    support.add(
+        CSMI_COLLECTION_FLOW_PROFILE_ID,
+        CSMI_COLLECTION_FLOW_PROFILE_VERSION,
+        CSMI_COLLECTION_FLOW_PROFILE_SCHEMA,
+    );
+    support.add(
         CSMI_C_CPP_RESOLUTION_PROFILE_ID,
         CSMI_C_CPP_RESOLUTION_PROFILE_VERSION,
         CSMI_CPP_PROFILE_SCHEMA,
@@ -939,6 +1054,254 @@ fn logical_pack(
         )));
     }
     Ok(pack)
+}
+
+fn export_collection_flows(
+    collection_flows: &CollectionFlowsPayload,
+    options: &CsmiExportOptions,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    for flow in &collection_flows.flows {
+        let scope = json!({"callable": flow.callable});
+        if flow.payload.callable != flow.callable {
+            return Err(CsmiExportError::Identity(format!(
+                "collection-flow payload callable {} does not match native scope {}",
+                flow.payload.callable, flow.callable
+            )));
+        }
+        facts.push(CsmiExtensionFact {
+            vocabulary: CSMI_COLLECTION_FLOW_PROFILE_ID.to_owned(),
+            version: CSMI_COLLECTION_FLOW_PROFILE_VERSION.to_owned(),
+            family: "collection-flows".to_owned(),
+            scope: scope.clone(),
+            payload: serde_json::to_value(&flow.payload)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
+            provenance: if flow.provenance.is_empty() {
+                vec![options.provenance_id.clone()]
+            } else {
+                flow.provenance.clone()
+            },
+            extensions: Vec::new(),
+        });
+        affects.push(CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+            kind: CsmiAffectedFactFamilyKind::FactFamily,
+            family: "collection-flows".to_owned(),
+            scope: scope.clone(),
+        }));
+        let (status, limitations) = match flow.coverage {
+            Some(Completeness::Complete) => (CsmiCoverageStatus::Complete, Vec::new()),
+            Some(Completeness::Partial) | None => (
+                CsmiCoverageStatus::Partial,
+                vec![CsmiLimitation {
+                    kind: "coverage-limited".to_owned(),
+                    diagnostic: None,
+                }],
+            ),
+        };
+        completeness.push(CsmiCompletenessStatement {
+            vocabulary: Some(CSMI_COLLECTION_FLOW_PROFILE_ID.to_owned()),
+            version: Some(CSMI_COLLECTION_FLOW_PROFILE_VERSION.to_owned()),
+            family: "collection-flows".to_owned(),
+            scope,
+            status,
+            limitations,
+            provenance: if flow.provenance.is_empty() {
+                vec![options.provenance_id.clone()]
+            } else {
+                flow.provenance.clone()
+            },
+            extensions: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+fn export_runtime_values(
+    runtime_values: &RuntimeValuesPayload,
+    options: &CsmiExportOptions,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    for record in &runtime_values.exposures {
+        append_runtime_fact(
+            runtime_payload_to_csmi("runtime-global-exposure", record)?,
+            "exposureId",
+            &record.exposure_id,
+            &record.coverage,
+            &record.provenance,
+            &record.extensions,
+            options,
+            facts,
+            affects,
+            completeness,
+        )?;
+    }
+    for record in &runtime_values.behaviors {
+        append_runtime_fact(
+            runtime_payload_to_csmi("keyed-read-behavior", record)?,
+            "behaviorId",
+            &record.behavior_id,
+            &record.coverage,
+            &record.provenance,
+            &record.extensions,
+            options,
+            facts,
+            affects,
+            completeness,
+        )?;
+    }
+    for record in &runtime_values.binding_evidence {
+        append_runtime_fact(
+            runtime_payload_to_csmi("runtime-global-binding-evidence", record)?,
+            "bindingEvidenceId",
+            &record.binding_evidence_id,
+            &record.coverage,
+            &record.provenance,
+            &record.extensions,
+            options,
+            facts,
+            affects,
+            completeness,
+        )?;
+    }
+    for record in &runtime_values.observations {
+        append_runtime_fact(
+            runtime_payload_to_csmi("keyed-read-observation", record)?,
+            "observationId",
+            &record.observation_id,
+            &record.coverage,
+            &record.provenance,
+            &record.extensions,
+            options,
+            facts,
+            affects,
+            completeness,
+        )?;
+    }
+    Ok(())
+}
+
+fn runtime_payload_to_csmi<T: serde::Serialize>(
+    kind: &str,
+    record: &T,
+) -> Result<CsmiRuntimeValuesPayload, CsmiExportError> {
+    let mut value = serde_json::to_value(record)
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        CsmiExportError::Canonical("runtime-values records must serialize as objects".to_owned())
+    })?;
+    object.insert(
+        "kind".to_owned(),
+        serde_json::Value::String(kind.to_owned()),
+    );
+    object.remove("provenance");
+    object.remove("extensions");
+    serde_json::from_value(value).map_err(|error| CsmiExportError::Canonical(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_runtime_fact(
+    payload: CsmiRuntimeValuesPayload,
+    scope_key: &str,
+    record_id: &str,
+    coverage: &crate::analyzer::semantic_model::RuntimeCoverage,
+    provenance: &[String],
+    extensions: &[crate::analyzer::semantic_model::RuntimeValueExtension],
+    options: &CsmiExportOptions,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    let family = payload.family().to_owned();
+    let scope = json!({scope_key: record_id});
+    let payload_value = serde_json::to_value(&payload)
+        .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    let provenance = if provenance.is_empty() {
+        vec![options.provenance_id.clone()]
+    } else {
+        provenance.to_vec()
+    };
+    let extensions = extensions
+        .iter()
+        .map(|extension| CsmiExtensionAttachment {
+            vocabulary: extension.vocabulary.clone(),
+            version: extension.version.clone(),
+            payload: extension.payload.clone(),
+        })
+        .collect();
+    facts.push(CsmiExtensionFact {
+        vocabulary: CSMI_RUNTIME_VALUES_PROFILE_ID.to_owned(),
+        version: CSMI_RUNTIME_VALUES_PROFILE_VERSION.to_owned(),
+        family: family.clone(),
+        scope: scope.clone(),
+        payload: payload_value,
+        provenance: provenance.clone(),
+        extensions,
+    });
+    affects.push(CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+        kind: CsmiAffectedFactFamilyKind::FactFamily,
+        family: family.clone(),
+        scope: scope.clone(),
+    }));
+    let coverage: CsmiRuntimeCoverage = serde_json::from_value(
+        serde_json::to_value(coverage)
+            .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
+    )
+    .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    let limitation_names = coverage
+        .limitations
+        .into_iter()
+        .map(|limitation| csmi_runtime_limitation_name(limitation).to_owned())
+        .collect::<Vec<_>>();
+    completeness.push(CsmiCompletenessStatement {
+        vocabulary: Some(CSMI_RUNTIME_VALUES_PROFILE_ID.to_owned()),
+        version: Some(CSMI_RUNTIME_VALUES_PROFILE_VERSION.to_owned()),
+        family,
+        scope,
+        status: match coverage.status {
+            CsmiRuntimeCoverageStatus::Complete => CsmiCoverageStatus::Complete,
+            CsmiRuntimeCoverageStatus::Partial => CsmiCoverageStatus::Partial,
+            CsmiRuntimeCoverageStatus::Unknown => CsmiCoverageStatus::Unknown,
+        },
+        limitations: limitation_names
+            .into_iter()
+            .map(|kind| CsmiLimitation {
+                kind,
+                diagnostic: None,
+            })
+            .collect(),
+        provenance,
+        extensions: Vec::new(),
+    });
+    Ok(())
+}
+
+fn csmi_runtime_limitation_name(limitation: CsmiRuntimeCoverageLimitation) -> &'static str {
+    match limitation {
+        CsmiRuntimeCoverageLimitation::ActivationMissing => "activation-missing",
+        CsmiRuntimeCoverageLimitation::ActivationConflict => "activation-conflict",
+        CsmiRuntimeCoverageLimitation::ActivationUnsupported => "activation-unsupported",
+        CsmiRuntimeCoverageLimitation::LexicalBindingIndeterminate => {
+            "lexical-binding-indeterminate"
+        }
+        CsmiRuntimeCoverageLimitation::RebindingIndeterminate => "rebinding-indeterminate",
+        CsmiRuntimeCoverageLimitation::MutationIncomplete => "mutation-incomplete",
+        CsmiRuntimeCoverageLimitation::AccessorOrProxyIncomplete => "accessor-or-proxy-incomplete",
+        CsmiRuntimeCoverageLimitation::MaterializationIncomplete => "materialization-incomplete",
+        CsmiRuntimeCoverageLimitation::ExceptionBehaviorIndeterminate => {
+            "exception-behavior-indeterminate"
+        }
+        CsmiRuntimeCoverageLimitation::DynamicKey => "dynamic-key",
+        CsmiRuntimeCoverageLimitation::UnsupportedIndex => "unsupported-index",
+        CsmiRuntimeCoverageLimitation::Cancelled => "cancelled",
+        CsmiRuntimeCoverageLimitation::BudgetExhausted => "budget-exhausted",
+        CsmiRuntimeCoverageLimitation::StaleEvidence => "stale-evidence",
+        CsmiRuntimeCoverageLimitation::AmbiguousOwner => "ambiguous-owner",
+        CsmiRuntimeCoverageLimitation::CoverageLimited => "coverage-limited",
+    }
 }
 
 fn validate_maven_evidence(artifact: &CsmiArtifactEvidence) -> Result<(), CsmiExportError> {

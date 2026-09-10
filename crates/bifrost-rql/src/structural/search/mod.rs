@@ -338,9 +338,9 @@ pub use units::{
     UnitExecutionResult, UnitRow, UnitRowCapture, UnitRowEvidence, UnitRowField, UnitRowIdentities,
     UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance, UnitRowItemProvenanceStep,
     UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowKey, UnitRowProvenance,
-    UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar, execute_code_query_selector_unit,
-    execute_code_query_unit, merge_unit_rows, plan_seed_files, seed_file_order,
-    structural_seed_file_order,
+    UnitRowProvenanceRef, UnitRowProvenanceStep, UnitRowScalar, UnitRowUnknownField,
+    execute_code_query_selector_unit, execute_code_query_unit, merge_unit_rows, plan_seed_files,
+    seed_file_order, structural_seed_file_order,
 };
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
@@ -468,6 +468,7 @@ pub use results::CodeQueryResultRef;
 pub use results::CodeQueryResultValue;
 pub use results::CodeQueryRowField;
 pub use results::CodeQueryRowFieldError;
+pub use results::CodeQueryRowFieldUnknownReason;
 pub use results::CodeQueryRowRef;
 pub use results::CodeQueryRowScalarRef;
 pub use results::CodeQueryRowScalarType;
@@ -963,6 +964,7 @@ enum PipelineValue {
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
     FieldWriteValue(Box<FieldWriteValue>),
+    RuntimeKeyedReadValue(Box<RuntimeKeyedReadValue>),
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
@@ -1020,6 +1022,70 @@ struct MemberSelectionValue {
     completeness: Option<crate::analyzer::usages::get_definition::trace::TraceCompleteness>,
 }
 
+/// One runtime keyed-read endpoint or terminal typed limitation row.
+#[derive(Debug, Clone)]
+struct RuntimeKeyedReadValue {
+    file: ProjectFile,
+    range: Range,
+    endpoint: Option<crate::analyzer::semantic::RuntimeKeyedReadEndpoint>,
+    limitations: Vec<crate::analyzer::semantic::RuntimeReadLimitation>,
+    conclusive_exclusion: bool,
+    ordinal: usize,
+}
+
+impl RuntimeKeyedReadValue {
+    fn id(&self) -> String {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.runtime_keyed_read.v1");
+        digest.push(rel_path_string(&self.file).as_bytes());
+        digest.push(&self.range.start_byte.to_le_bytes());
+        digest.push(&self.range.end_byte.to_le_bytes());
+        digest.push(&self.ordinal.to_le_bytes());
+        if let Some(endpoint) = &self.endpoint {
+            digest.push(endpoint.runtime.as_bytes());
+            digest.push(endpoint.global.as_bytes());
+            digest.push(endpoint.container.as_bytes());
+            digest.push(endpoint.exposure_id.as_bytes());
+            digest.push(endpoint.behavior_id.as_bytes());
+            digest.push(endpoint.refinement_identity.to_string().as_bytes());
+        }
+        digest.finish().to_string()
+    }
+
+    fn key_kind(&self) -> &'static str {
+        match self.endpoint.as_ref().map(|endpoint| &endpoint.key) {
+            Some(crate::analyzer::semantic::RuntimeAccessKey::Property(_)) => "property",
+            Some(crate::analyzer::semantic::RuntimeAccessKey::Index(_)) => "index",
+            None => "unknown",
+        }
+    }
+
+    fn source_origin(&self) -> &'static str {
+        match self
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.source_origin)
+        {
+            Some(crate::analyzer::semantic::RuntimeReadSourceOrigin::PristineRuntimeInput) => {
+                "pristine_runtime_input"
+            }
+            Some(crate::analyzer::semantic::RuntimeReadSourceOrigin::Mutated) => "mutated",
+            Some(crate::analyzer::semantic::RuntimeReadSourceOrigin::Indeterminate) | None => {
+                "indeterminate"
+            }
+        }
+    }
+
+    fn outcome(&self) -> &'static str {
+        if self.endpoint.is_some() {
+            "endpoint"
+        } else if self.conclusive_exclusion {
+            "conclusive_exclusion"
+        } else {
+            "incomplete"
+        }
+    }
+}
+
 impl MemberSelectionValue {
     fn stable_id(&self) -> String {
         use sha2::{Digest, Sha256};
@@ -1069,6 +1135,7 @@ enum PipelineKey {
     ReceiverOutcome(String),
     ReceiverEvidence(String),
     FieldWriteValue(String),
+    RuntimeKeyedReadValue(String),
     CallShape(String),
     CallArgumentGroup(String),
     CallArgument(String),
@@ -1164,6 +1231,7 @@ impl PipelineValue {
             Self::ReceiverOutcome(value) => PipelineKey::ReceiverOutcome(value.site_id.clone()),
             Self::ReceiverEvidence(value) => PipelineKey::ReceiverEvidence(value.id.clone()),
             Self::FieldWriteValue(value) => PipelineKey::FieldWriteValue(value.id()),
+            Self::RuntimeKeyedReadValue(value) => PipelineKey::RuntimeKeyedReadValue(value.id()),
             Self::CallShape(value) => PipelineKey::CallShape(value.report.outcome.site_id.clone()),
             Self::CallArgumentGroup(value) => PipelineKey::CallArgumentGroup(
                 value.shape.report.groups[value.group_index].id.clone(),
@@ -1489,6 +1557,7 @@ enum PipelineTraceValue {
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
     FieldWriteValue(Box<FieldWriteValue>),
+    RuntimeKeyedReadValue(Box<RuntimeKeyedReadValue>),
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
@@ -4098,6 +4167,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Declaration(declaration) => {
@@ -4129,6 +4199,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: stable_owner_candidate_for_unit(&file, &declaration.unit),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Semantic(value) => {
@@ -4155,6 +4226,7 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ReferenceSite(site) => {
             let target_path = rel_path_string(site.target.unit.source());
@@ -4184,6 +4256,7 @@ fn detailed_evidence_for_pipeline_value(
                 }),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallSite(site) => {
@@ -4207,6 +4280,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: stable_owner_candidate_for_unit(file, &site.0.caller),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ExpressionSite(site) => {
@@ -4234,6 +4308,7 @@ fn detailed_evidence_for_pipeline_value(
                 ),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::JsxAttributeValue(value) => {
@@ -4261,6 +4336,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ReceiverAnalysis(value) => {
@@ -4281,6 +4357,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::MemberTargetAnalysis(value) => {
@@ -4299,6 +4376,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ReceiverOutcome(value) => {
@@ -4317,6 +4395,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ReceiverEvidence(value) => {
@@ -4335,6 +4414,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::FieldWriteValue(value) => {
@@ -4368,8 +4448,23 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: candidate,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
+        PipelineValue::RuntimeKeyedReadValue(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::RuntimeKeyedReadValue,
+            key: DetailedCodeQueryKey::RuntimeKeyedReadValue { id: value.id() },
+            file: value.file.clone(),
+            source_slice_sha256: retained_source
+                .and_then(|source| source_slice_sha256(source, &range_byte_span(value.range))),
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+            runtime_keyed_read: value.endpoint.clone(),
+        },
         PipelineValue::CallShape(value) => {
             let outcome = &value.report.outcome;
             DetailedCodeQueryEvidence {
@@ -4386,6 +4481,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallArgumentGroup(value) => {
@@ -4405,6 +4501,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallArgument(value) => {
@@ -4424,6 +4521,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallBinding(value) => {
@@ -4442,6 +4540,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallEffect(value) => {
@@ -4460,6 +4559,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallResultContract(value) => DetailedCodeQueryEvidence {
@@ -4476,6 +4576,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ResultContractUse(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4491,6 +4592,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ResultContractFailureUse(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4506,6 +4608,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::NilnessOperation(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4521,6 +4624,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::SwitchCoverage(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4536,6 +4640,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ConcurrentAccessConflict(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4551,6 +4656,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ClassSetRow(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4565,6 +4671,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::AbsentMemberFinding(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4579,6 +4686,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::DetachedTaskTransfer(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4594,6 +4702,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ProcedureEffect(value) => {
             let row = value.row();
@@ -4611,6 +4720,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::CallableSignature(value) => DetailedCodeQueryEvidence {
@@ -4627,6 +4737,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::SignatureParameter(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4642,6 +4753,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::DecoratedParameter(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4658,6 +4770,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: value.semantic.as_deref().cloned(),
+            runtime_keyed_read: None,
         },
         PipelineValue::CallableApplicability(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4673,6 +4786,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::OverloadSelection(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4688,6 +4802,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::MemberSelection(value) => {
             let row = &value.occurrence;
@@ -4705,6 +4820,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Occurrence(value) => {
@@ -4729,6 +4845,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::LexicalScope(value) => {
@@ -4750,6 +4867,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Binding(value) => {
@@ -4771,6 +4889,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::GenerationSite(value) => {
@@ -4792,6 +4911,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Export(value) => {
@@ -4813,6 +4933,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::DeclarationState(value) => {
@@ -4837,6 +4958,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::StateEvent(value) => {
@@ -4859,6 +4981,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         // A topology row's location is the build file that declares it: the
@@ -4876,6 +4999,7 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::BuildTarget(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4888,6 +5012,7 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::TopologyEdge(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -4900,6 +5025,7 @@ fn detailed_evidence_for_pipeline_value(
             source_slice_sha256: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
@@ -4916,6 +5042,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::Guard(value) => {
@@ -4933,6 +5060,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::RewritePath(value) => {
@@ -4955,6 +5083,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::FlowRelation(value) => {
@@ -4977,6 +5106,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ReferenceEdge(value) => {
@@ -5003,6 +5133,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.site.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::DispatchOutcome(value) => DetailedCodeQueryEvidence {
@@ -5019,6 +5150,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::DispatchTarget(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -5035,6 +5167,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::MemberFamily(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -5050,6 +5183,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::MemberFamilyEdge(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -5066,6 +5200,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         },
         PipelineValue::CandidateHop(value) => {
             let row = &value.occurrence;
@@ -5089,6 +5224,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::ResolutionCandidate(value) => {
@@ -5113,6 +5249,7 @@ fn detailed_evidence_for_pipeline_value(
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::QualifiedPath(value) => {
@@ -5133,6 +5270,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
         PipelineValue::PathSegment(value) => {
@@ -5154,6 +5292,7 @@ fn detailed_evidence_for_pipeline_value(
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
                 decorated_parameter: None,
+                runtime_keyed_read: None,
             }
         }
     }
@@ -5192,6 +5331,7 @@ fn detailed_semantic_evidence(
         stable_owner_candidate: Some(candidate),
         provenance: Vec::new(),
         decorated_parameter: None,
+        runtime_keyed_read: None,
     }
 }
 
@@ -5216,6 +5356,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
         PipelineValue::JsxAttributeValue(value) => Some(&value.seed.file),
         PipelineValue::FieldWriteValue(value) => Some(&value.seed.file),
+        PipelineValue::RuntimeKeyedReadValue(value) => Some(&value.file),
         PipelineValue::CallableSignature(value) => Some(value.file()),
         PipelineValue::SignatureParameter(value) => Some(value.file()),
         PipelineValue::DecoratedParameter(value) => Some(&value.file),
@@ -5369,6 +5510,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
             files.insert(value.seed.file.clone());
             collect_receiver_source_files(&value.analysis, files);
             collect_member_target_source_files(&value.target, files);
+        }
+        PipelineValue::RuntimeKeyedReadValue(value) => {
+            files.insert(value.file.clone());
         }
         PipelineValue::CallShape(value) => {
             files.insert(value.report.outcome.file.clone());
@@ -5534,6 +5678,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.seed.file.clone());
             collect_receiver_source_files(&value.analysis, files);
             collect_member_target_source_files(&value.target, files);
+        }
+        PipelineTraceValue::RuntimeKeyedReadValue(value) => {
+            files.insert(value.file.clone());
         }
         PipelineTraceValue::CallShape(value) => {
             files.insert(value.report.outcome.file.clone());
@@ -5883,6 +6030,18 @@ fn detailed_trace_provenance_ref(
         }
         PipelineTraceValue::FieldWriteValue(value) => {
             detailed_field_write_provenance_ref(value, cache)
+        }
+        PipelineTraceValue::RuntimeKeyedReadValue(value) => {
+            let byte_span = range_byte_span(value.range);
+            DetailedCodeQueryProvenanceRefEvidence {
+                domain: DetailedCodeQueryDomain::RuntimeKeyedReadValue,
+                key: DetailedCodeQueryKey::RuntimeKeyedReadValue { id: value.id() },
+                file: value.file.clone(),
+                byte_span: Some(byte_span.clone()),
+                display_range: cached_display_range(cache, &value.file, value.range),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                source_slice_sha256: cached_source_slice_sha256(cache, &value.file, &byte_span),
+            }
         }
         PipelineTraceValue::CallShape(value) => detailed_call_shape_provenance_ref(
             DetailedCodeQueryDomain::CallShape,
@@ -6929,6 +7088,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::FieldWriteValue(value) => {
             Some(PipelineTraceValue::FieldWriteValue(value.clone()))
+        }
+        PipelineValue::RuntimeKeyedReadValue(value) => {
+            Some(PipelineTraceValue::RuntimeKeyedReadValue(value.clone()))
         }
         PipelineValue::CallShape(value) => Some(PipelineTraceValue::CallShape(value.clone())),
         PipelineValue::CallArgumentGroup(value) => {

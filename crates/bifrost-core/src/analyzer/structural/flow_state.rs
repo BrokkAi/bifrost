@@ -32,8 +32,9 @@ labelled_enum! {
 labelled_enum! {
     /// What a state event is about: a named binding, or a property of one.
     ///
-    /// The subject *identity* is a lowered value (plus a member name for a
-    /// property); this is only the coarse axis a query filters on.
+    /// This is only the coarse axis a query filters on. Binding identity is a
+    /// lowered value; property identity is the structured receiver/path/member
+    /// key owned by the analysis relation rather than this presentation enum.
     FlowSubjectKind, ALL_FLOW_SUBJECT_KINDS {
         Binding => "binding",
         Property => "property",
@@ -66,6 +67,20 @@ impl FlowRelation {
             Self::Reaching => FlowStateAxis::ReachingRelation,
             Self::Dominates => FlowStateAxis::DominanceRelation,
             Self::SameEvaluation => FlowStateAxis::SameEvaluationRelation,
+        }
+    }
+
+    /// The independently answerable axis for a relation whose target has
+    /// `subject`. Property reaching and dominance use structured heap
+    /// identity and therefore keep completeness separate from the analogous
+    /// binding relations.
+    pub const fn axis_for_subject(self, subject: FlowSubjectKind) -> FlowStateAxis {
+        match (self, subject) {
+            (Self::Reaching, FlowSubjectKind::Property) => FlowStateAxis::PropertyReachingRelation,
+            (Self::Dominates, FlowSubjectKind::Property) => {
+                FlowStateAxis::PropertyDominanceRelation
+            }
+            _ => self.axis(),
         }
     }
 }
@@ -136,9 +151,13 @@ flow_state_axes! {
     PropertyEvents => "property_events":
         "Establishment, kill, and read events of object properties of a canonical binding base.",
     ReachingRelation => "reaching_relation":
-        "Reaching-definition rows relating an establishment to a read it can serve.",
+        "Reaching-definition rows relating a binding establishment to a read it can serve.",
     DominanceRelation => "dominance_relation":
-        "Dominance rows stating that every entry-to-read path passes an establishment.",
+        "Dominance rows stating that every entry-to-binding-read path passes an establishment.",
+    PropertyReachingRelation => "property_reaching_relation":
+        "Structured-property reaching rows relating a store to a read it can serve.",
+    PropertyDominanceRelation => "property_dominance_relation":
+        "Structured-property dominance rows stating that every entry-to-read path passes a store.",
     SameEvaluationRelation => "same_evaluation_relation":
         "Same-evaluation rows stating that a read feeds the value an establishment assigns.",
 }
@@ -169,8 +188,10 @@ mod tests {
             assert!(!axis.description().is_empty());
         }
         for relation in ALL_FLOW_RELATIONS {
-            assert!(ALL_FLOW_STATE_AXES.contains(&relation.axis()));
+            for subject in ALL_FLOW_SUBJECT_KINDS {
+                assert!(ALL_FLOW_STATE_AXES.contains(&relation.axis_for_subject(*subject)));
+            }
         }
-        assert_eq!(FlowStateAxis::COUNT, 5);
+        assert_eq!(FlowStateAxis::COUNT, 7);
     }
 }

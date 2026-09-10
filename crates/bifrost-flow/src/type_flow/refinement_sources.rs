@@ -16,17 +16,27 @@ type Carriers = HashMap<ValueFlowCarrierId, Sources>;
 
 pub(super) struct DefinitionSources {
     incoming: HashMap<ProgramPointHandle, Carriers>,
+    queried: HashSet<ProgramPointHandle>,
 }
 
 impl DefinitionSources {
+    /// Index the may-source evidence at the points a consumer can query.
+    ///
+    /// `before` answers one ordered definition boundary, so only the facts
+    /// that reach a queried point can change an answer. Indexing the whole
+    /// solve would carry evidence for thousands of points that nothing reads.
     pub fn new(
         result: &ValueFlowSummaryResult,
+        queried: HashSet<ProgramPointHandle>,
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<Self, CorrelationError> {
         let mut incoming = HashMap::<ProgramPointHandle, Carriers>::default();
         for reached in result.result().reached() {
             check_cancelled(cancellation)?;
+            if !queried.contains(reached.point()) {
+                continue;
+            }
             charge_entries(budget, 1)?;
             let fact = result
                 .result()
@@ -45,7 +55,7 @@ impl DefinitionSources {
                 .and_modify(|uncertain| *uncertain |= !fact.uncertainty().is_empty())
                 .or_insert(!fact.uncertainty().is_empty());
         }
-        Ok(Self { incoming })
+        Ok(Self { incoming, queried })
     }
 
     pub fn before(
@@ -58,6 +68,10 @@ impl DefinitionSources {
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<(ValueFlowSourceId, bool)>>, CorrelationError> {
         check_cancelled(cancellation)?;
+        assert!(
+            self.queried.contains(point),
+            "a source-evidence query names a point this index was built for"
+        );
         let target = plan.carrier_id(carrier);
         let Some(target) = target else {
             return Ok(None);

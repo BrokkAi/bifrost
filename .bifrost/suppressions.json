@@ -159,7 +159,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "b020b38f7714f7b064fa81d230eae351437b6cf952df38aae6069c565e21bbf6",
+      "finding_id": "24d82acc430f311e4a30c144f891f977b0a72a2ca4f313915047f4ba20aa438b",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -171,7 +171,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "967592f916bf770d7d213b465a4b1cc4b2f2cf14f3a1f219a7d4ca926fe3f98d",
+      "finding_id": "8cd9e19cc6683b5d0666e91b75e30608b976fc7eceb8712b7ea816bb22806df7",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -375,7 +375,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "9590be0a96c0c09b251f4898f167b1a5951ddb1b209145f897504cebbc04e8a2",
+      "finding_id": "538927543f1bc07dbffac3ac45d32487b824aebe4a28f862fd90d4e698f2d88d",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -387,7 +387,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "34ea22520ba26ae2bbcbaf8f62c7b059084a1d2772408050dc8ae07ff4d7abb0",
+      "finding_id": "5356583486f7bb15c73be55621bbcf1fc0b53ae21b1ca955608fdfd5d4c14fcd",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "47a5cfadd8bd3a515e0ca77d2cf74cc9d7d0961013fb08b163493482c1354089",
+      "finding_id": "41596add9b6642df0481e9dd139cf3fe5fed9891d27a7e3740ef4f86a7868378",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

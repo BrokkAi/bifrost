@@ -30,17 +30,20 @@ use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
     Dominators, GenKillFacts, ReachingSets, dominators, forward_reachability, reaching_definitions,
 };
+use crate::analyzer::semantic::derive_property_reaching_over_graph;
 use crate::analyzer::semantic::{
     CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CallToReturnModel,
     CallTransferSet, CandidateCoverage, CapabilitySupport, ContentIdentity, ControlContinuation,
     ControlEdgeHandle, ControlEdgeId, ControlEdgeKind, IcfgProvider, LengthDelimitedDigest,
-    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProcedureId,
-    ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactKey, SemanticBudget, SemanticCallSite, SemanticCapabilities,
-    SemanticCapability, SemanticEffect, SemanticGap, SemanticGapDischarge, SemanticGapId,
-    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticRequest,
-    SemanticValueKind, SemanticWork, SourceMappingId, SourceMappingKind, SourceSpan, StableDigest,
-    ValueFlowKind, ValueId, WorkspaceIcfgProvider,
+    MemoryAccessKind, MemoryLocationId, MemoryLocationKind, OracleCallContext, ProcedureHandle,
+    ProcedureId, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
+    PropertyReachCertainty, PropertyReachingIncompleteReason, PropertyReachingLimits,
+    PropertyReachingResult, SemanticArtifact, SemanticArtifactKey, SemanticBudget,
+    SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
+    SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
+    SourceMappingKind, SourceSpan, StableDigest, ValueFlowKind, ValueFlowOracle, ValueId,
+    WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -162,8 +165,11 @@ pub enum FlowSubject {
         value: ValueId,
     },
     Property {
-        /// The binding the IR's own value flow says the field base holds.
+        /// A presentation binding for the field base when one is available.
+        /// Property relation identity is the analysis-owned structured
+        /// receiver/path/member key, not this display projection.
         base: ValueId,
+        /// The source spelling retained for display and filtering only.
         member: Box<str>,
     },
 }
@@ -192,8 +198,10 @@ impl FlowSubject {
         }
     }
 
-    /// The lowered value this subject is identified by: the binding itself, or
-    /// the canonical base a property hangs off.
+    /// The lowered value this public subject presents: the binding itself, or
+    /// the presentation base a property hangs off. Structured property
+    /// relation identity is owned by analysis and is not reconstructed from
+    /// this display value.
     pub const fn value(&self) -> ValueId {
         match self {
             Self::Binding { value } => *value,
@@ -299,6 +307,21 @@ pub enum FlowStateIncompleteReason {
     /// that binding have no establishment to reach them in this artifact and
     /// their absence is unknown, not proven.
     BindingWithoutEstablishment { bindings: usize },
+    /// The structured property provider was not available for an artifact that
+    /// advertises field memory. Property rows cannot be treated as complete.
+    PropertyProviderUnavailable,
+    /// Acquiring the structured property snapshot returned a typed provider
+    /// failure. Binding and control relations derived from the already
+    /// materialized procedure remain independently answerable.
+    PropertyProviderFailed { detail: String },
+    /// The structured property snapshot was unavailable from a partial
+    /// semantic-oracle outcome. This is scoped to property rows and relations.
+    PropertyAnalysisPartial { detail: String },
+    /// The structured property provider retained typed evidence, but one or
+    /// more proof/completeness conditions remained open.
+    PropertyReaching {
+        reason: PropertyReachingIncompleteReason,
+    },
 }
 
 impl FlowStateIncompleteReason {
@@ -317,14 +340,24 @@ impl FlowStateIncompleteReason {
             AxisUnsupported(blocked) => *blocked == axis,
             BudgetExhausted { axis: blocked, .. } => *blocked == axis,
             LoweringGap { capability, .. } => axes_blocked_by(*capability).contains(&axis),
-            PropertyBaseNotCanonical { .. } => axis == FlowStateAxis::PropertyEvents,
-            BindingWithoutEstablishment { .. } => {
-                axis != FlowStateAxis::PropertyEvents && axis != FlowStateAxis::DominanceRelation
-            }
+            PropertyBaseNotCanonical { .. } => property_axes().contains(&axis),
+            BindingWithoutEstablishment { .. } => matches!(
+                axis,
+                FlowStateAxis::BindingEvents
+                    | FlowStateAxis::ReachingRelation
+                    | FlowStateAxis::SameEvaluationRelation
+            ),
+            PropertyProviderUnavailable
+            | PropertyProviderFailed { .. }
+            | PropertyAnalysisPartial { .. } => property_axes().contains(&axis),
+            PropertyReaching { reason } => property_reason_blocks(reason, axis),
             ControlProjectionRejected { .. } | ModeledControlProjectionIncomplete { .. } => {
                 matches!(
                     axis,
-                    FlowStateAxis::ReachingRelation | FlowStateAxis::DominanceRelation
+                    FlowStateAxis::ReachingRelation
+                        | FlowStateAxis::DominanceRelation
+                        | FlowStateAxis::PropertyReachingRelation
+                        | FlowStateAxis::PropertyDominanceRelation
                 )
             }
             NoSemanticProvider
@@ -337,6 +370,56 @@ impl FlowStateIncompleteReason {
     }
 }
 
+/// Keep typed property gaps scoped to the relation family they affect. In
+/// particular, an evaluation-endpoint shortfall must not make complete
+/// property stores appear unavailable, while a missing property location must
+/// not make binding state incomplete.
+fn property_reason_blocks(reason: &PropertyReachingIncompleteReason, axis: FlowStateAxis) -> bool {
+    use PropertyReachingIncompleteReason::*;
+    match reason {
+        EvaluationEndpointUnavailable { .. }
+        | EvaluationEvidenceIncomplete { .. }
+        | EvaluationSourceUnknown => false,
+        Reachability(_)
+        | ReachingDefinitions(_)
+        | ReachingPairs(_)
+        | ReachingPairBudgetExceeded { .. } => axis == FlowStateAxis::PropertyReachingRelation,
+        Dominators(_) => matches!(
+            axis,
+            FlowStateAxis::PropertyReachingRelation | FlowStateAxis::PropertyDominanceRelation
+        ),
+        CandidateCoverage(_) | StoreEvidenceIncomplete { .. } | ReadEvidenceIncomplete { .. } => {
+            matches!(
+                axis,
+                FlowStateAxis::PropertyReachingRelation
+                    | FlowStateAxis::PropertyDominanceRelation
+                    | FlowStateAxis::SameEvaluationRelation
+            )
+        }
+        InputRelationBudgetExceeded { .. }
+        | Cancelled
+        | UnsupportedLocation { .. }
+        | DurableIdentityUnavailable { .. }
+        | SourceMappingUnavailable { .. }
+        | FieldMemoryEndpointUnavailable { .. } => matches!(
+            axis,
+            FlowStateAxis::PropertyEvents
+                | FlowStateAxis::PropertyReachingRelation
+                | FlowStateAxis::PropertyDominanceRelation
+                | FlowStateAxis::SameEvaluationRelation
+        ),
+    }
+}
+
+const fn property_axes() -> &'static [FlowStateAxis] {
+    &[
+        FlowStateAxis::PropertyEvents,
+        FlowStateAxis::PropertyReachingRelation,
+        FlowStateAxis::PropertyDominanceRelation,
+        FlowStateAxis::SameEvaluationRelation,
+    ]
+}
+
 /// Which axes one gap capability blocks.
 ///
 /// Total over the capability registry on purpose: a capability added later
@@ -346,6 +429,8 @@ fn axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
     const CONTROL: &[FlowStateAxis] = &[
         FlowStateAxis::ReachingRelation,
         FlowStateAxis::DominanceRelation,
+        FlowStateAxis::PropertyReachingRelation,
+        FlowStateAxis::PropertyDominanceRelation,
     ];
     const BINDINGS: &[FlowStateAxis] = &[
         FlowStateAxis::BindingEvents,
@@ -353,6 +438,8 @@ fn axes_blocked_by(capability: SemanticCapability) -> &'static [FlowStateAxis] {
     ];
     const PROPERTIES: &[FlowStateAxis] = &[
         FlowStateAxis::PropertyEvents,
+        FlowStateAxis::PropertyReachingRelation,
+        FlowStateAxis::PropertyDominanceRelation,
         FlowStateAxis::SameEvaluationRelation,
     ];
     const EVALUATION: &[FlowStateAxis] = &[FlowStateAxis::SameEvaluationRelation];
@@ -574,7 +661,7 @@ impl FlowStateDerivation {
                 SemanticGapSubject::MemoryLocation(location) => semantics
                     .memory_location(location)
                     .and_then(|memory| match memory.kind {
-                        MemoryLocationKind::Field { .. } => {
+                        MemoryLocationKind::Field { .. } | MemoryLocationKind::Property { .. } => {
                             semantics.point(gap.point).and_then(|point| {
                                 let mut retains_access = false;
                                 let mut stored_values = Vec::new();
@@ -1867,6 +1954,9 @@ impl FlowStateDerivation {
                     // remains blocking here.
                     SemanticGapDischarge::CanonicalIndexIdentity => true,
                     SemanticGapDischarge::ModeledEffectPartition => true,
+                    // Runtime-read discharge belongs to the activation-aware
+                    // refinement, not this raw flow-state completeness proof.
+                    SemanticGapDischarge::RuntimeReadBehavior => true,
                     SemanticGapDischarge::None | SemanticGapDischarge::CallResolution => true,
                 }
         })
@@ -2040,6 +2130,10 @@ impl FlowStateDerivation {
                     FlowStateIncompleteReason::LoweringGap { .. }
                         | FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
                         | FlowStateIncompleteReason::PropertyBaseNotCanonical { .. }
+                        | FlowStateIncompleteReason::PropertyProviderUnavailable
+                        | FlowStateIncompleteReason::PropertyProviderFailed { .. }
+                        | FlowStateIncompleteReason::PropertyAnalysisPartial { .. }
+                        | FlowStateIncompleteReason::PropertyReaching { .. }
                 )
         })
     }
@@ -2075,7 +2169,8 @@ fn result_observation_gap_is_relevant(
         SemanticGapSubject::MemoryLocation(location) => semantics
             .memory_location(location)
             .is_some_and(|memory| match memory.kind {
-                MemoryLocationKind::Field { base, .. } => {
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. } => {
                     relevant_values.contains(&base)
                         && !(retained_read_values.contains(&base)
                             && gap_point_retains_memory_access(semantics, gap, location))
@@ -2095,6 +2190,7 @@ fn result_observation_gap_is_relevant(
                         .memory_location(location)
                         .is_some_and(|location| match location.kind {
                             MemoryLocationKind::Field { base, .. }
+                            | MemoryLocationKind::Property { base, .. }
                             | MemoryLocationKind::Index { base, .. } => {
                                 relevant_values.contains(&base)
                             }
@@ -2209,9 +2305,9 @@ fn capture_gap_may_involve_bindings(
         semantics
             .memory_location(location)
             .is_none_or(|location| match location.kind {
-                MemoryLocationKind::Field { base, .. } | MemoryLocationKind::Index { base, .. } => {
-                    relevant_values.contains(&base)
-                }
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. }
+                | MemoryLocationKind::Index { base, .. } => relevant_values.contains(&base),
                 MemoryLocationKind::LexicalCell { binding } => relevant_values.contains(&binding),
                 // A child capture slot does not identify its parent value.
                 // Static storage has no binding value to confuse with one.
@@ -2326,6 +2422,7 @@ fn address_escape_points(
                         Some(capture.point)
                     }
                     MemoryLocationKind::Field { base, .. }
+                    | MemoryLocationKind::Property { base, .. }
                     | MemoryLocationKind::Index { base, .. }
                         if address_aliases.contains(&base) =>
                     {
@@ -2335,6 +2432,7 @@ fn address_escape_points(
                     | MemoryLocationKind::Capture { .. }
                     | MemoryLocationKind::LexicalCell { .. }
                     | MemoryLocationKind::Field { .. }
+                    | MemoryLocationKind::Property { .. }
                     | MemoryLocationKind::Index { .. } => None,
                 }),
         }
@@ -4629,6 +4727,7 @@ fn flow_state_for_materialized_outcome(
                     |reasons| file_reasons.iter().cloned().chain(reasons).collect(),
                 );
             derive_procedure(
+                workspace,
                 &artifact,
                 procedure,
                 file,
@@ -4640,6 +4739,7 @@ fn flow_state_for_materialized_outcome(
                     .remove(&procedure.id())
                     .unwrap_or_default(),
                 request,
+                budget,
             )
         })
         .collect();
@@ -4773,6 +4873,7 @@ fn is_binding_kind(kind: &SemanticValueKind) -> bool {
 /// One procedure's derivation.
 #[allow(clippy::too_many_arguments)]
 fn derive_procedure(
+    workspace: &WorkspaceAnalyzer,
     artifact: &Arc<SemanticArtifact>,
     procedure: &ProcedureSemantics,
     file: &ProjectFile,
@@ -4782,6 +4883,7 @@ fn derive_procedure(
     file_reasons: &[FlowStateIncompleteReason],
     control_edge_mask: ControlEdgeMask,
     request: &mut FlowStateRequest<'_>,
+    semantic_budget: &mut SemanticBudget,
 ) -> FlowStateDerivation {
     let mut reasons = file_reasons.to_vec();
     collect_capability_reasons(artifact.capabilities(), &mut reasons);
@@ -4796,6 +4898,30 @@ fn derive_procedure(
         .procedure_handle(procedure.id())
         .expect("a validated artifact owns every procedure it lists");
     let procedure_artifact = Arc::downgrade(procedure_handle.artifact());
+    let property_result = if properties_available {
+        match materialize_property_reaching(
+            workspace,
+            &procedure_handle,
+            &control_edge_mask,
+            request,
+            semantic_budget,
+        ) {
+            Ok(result) => {
+                for reason in result.incomplete_reasons() {
+                    reasons.push(FlowStateIncompleteReason::PropertyReaching {
+                        reason: reason.clone(),
+                    });
+                }
+                Some(result)
+            }
+            Err(reason) => {
+                reasons.push(reason);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut builder = EventBuilder {
         procedure: procedure.id(),
         procedure_handle,
@@ -4804,12 +4930,14 @@ fn derive_procedure(
         site_index,
         generation,
         events: Vec::new(),
+        event_keys: Vec::new(),
         uncanonical_accesses: 0,
         properties_available,
     };
-    builder.collect(procedure);
+    builder.collect(procedure, property_result.as_ref());
     let uncanonical_accesses = builder.uncanonical_accesses;
     let mut events = builder.events;
+    let mut event_keys = builder.event_keys;
 
     if uncanonical_accesses > 0 {
         reasons.push(FlowStateIncompleteReason::PropertyBaseNotCanonical {
@@ -4817,12 +4945,15 @@ fn derive_procedure(
         });
     }
     if !properties_available {
-        reasons.push(FlowStateIncompleteReason::AxisUnsupported(
-            FlowStateAxis::PropertyEvents,
-        ));
+        reasons.extend(
+            property_axes()
+                .iter()
+                .copied()
+                .map(FlowStateIncompleteReason::AxisUnsupported),
+        );
     }
 
-    append_kill_events(&mut events);
+    append_kill_events(&mut events, &mut event_keys, property_result.as_ref());
     let unestablished = unestablished_local_bindings(procedure, &events);
     if unestablished > 0 {
         reasons.push(FlowStateIncompleteReason::BindingWithoutEstablishment {
@@ -4834,6 +4965,8 @@ fn derive_procedure(
         procedure,
         &control_edge_mask,
         &events,
+        &event_keys,
+        property_result.as_ref(),
         generation,
         request,
         &mut reasons,
@@ -4868,6 +5001,14 @@ fn collect_capability_reasons(
             SemanticCapability::NormalControlFlow,
             FlowStateAxis::DominanceRelation,
         ),
+        (
+            SemanticCapability::NormalControlFlow,
+            FlowStateAxis::PropertyReachingRelation,
+        ),
+        (
+            SemanticCapability::NormalControlFlow,
+            FlowStateAxis::PropertyDominanceRelation,
+        ),
     ] {
         if capabilities.support(capability) == CapabilitySupport::Unsupported {
             reasons.push(FlowStateIncompleteReason::AxisUnsupported(axes));
@@ -4892,6 +5033,72 @@ fn collect_gap_reasons(
     }
 }
 
+/// Materialize the analysis-owned property relation for one exact procedure.
+///
+/// The value-flow snapshot and its structured location identities are owned by
+/// `bifrost-analysis`; flow-state only chooses the graph view. A request-local
+/// control projection therefore uses the same analysis projection over the
+/// masked graph, rather than rebuilding property identity from bindings or
+/// source spelling.
+fn materialize_property_reaching(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    control_edge_mask: &ControlEdgeMask,
+    request: &FlowStateRequest<'_>,
+    semantic_budget: &mut SemanticBudget,
+) -> Result<PropertyReachingResult, FlowStateIncompleteReason> {
+    let outcome = workspace
+        .semantic_oracle_provider()
+        .procedure_relations(
+            procedure,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(semantic_budget, request.cancellation),
+        )
+        .map_err(|error| FlowStateIncompleteReason::PropertyProviderFailed {
+            detail: error.to_string(),
+        })?;
+    let Some(snapshot) = outcome.available_value() else {
+        return Err(FlowStateIncompleteReason::PropertyAnalysisPartial {
+            detail: format!(
+                "property value-flow snapshot outcome is `{}`",
+                outcome_label(&outcome)
+            ),
+        });
+    };
+    let provider = workspace
+        .analyzer()
+        .property_reaching_provider()
+        .ok_or(FlowStateIncompleteReason::PropertyProviderUnavailable)?;
+    let limits = PropertyReachingLimits {
+        cfg_work: request.cfg_budget.limits(),
+        ..PropertyReachingLimits::default()
+    };
+    let result = if control_edge_mask.is_empty() {
+        provider.property_reaching(snapshot, limits, request.cancellation)
+    } else {
+        let graph = MaskedProcedureGraph::new(procedure.semantics(), control_edge_mask);
+        derive_property_reaching_over_graph(
+            snapshot,
+            &graph,
+            procedure.semantics().entry_point(),
+            limits,
+            request.cancellation,
+        )
+    };
+    Ok(result)
+}
+
+/// The semantic identity of a projected event. This stays parallel to the
+/// public rows instead of widening `StateEventRow`: downstream RQL fixtures
+/// construct those rows directly, while structured property records need the
+/// source mapping and event ordinal to join without consulting spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SemanticEventKey {
+    point: ProgramPointId,
+    event_index: u32,
+    source: SourceMappingId,
+}
+
 struct EventBuilder<'a> {
     procedure: ProcedureId,
     procedure_handle: ProcedureHandle,
@@ -4900,6 +5107,7 @@ struct EventBuilder<'a> {
     site_index: &'a SiteIndex,
     generation: u64,
     events: Vec<StateEventRow>,
+    event_keys: Vec<SemanticEventKey>,
     uncanonical_accesses: usize,
     properties_available: bool,
 }
@@ -4908,10 +5116,28 @@ impl EventBuilder<'_> {
     /// Project every state event of one procedure, in program-point order and
     /// then event order inside a point, so two derivations of one artifact
     /// produce identical rows.
-    fn collect(&mut self, procedure: &ProcedureSemantics) {
+    fn collect(
+        &mut self,
+        procedure: &ProcedureSemantics,
+        property_result: Option<&PropertyReachingResult>,
+    ) {
         let bases = BindingBases::build(procedure);
+        let property_stores = property_result.map_or_else(HashMap::default, |result| {
+            result
+                .stores()
+                .iter()
+                .map(|store| ((store.point.id(), store.event_index), store))
+                .collect::<HashMap<_, _>>()
+        });
+        let property_reads = property_result.map_or_else(HashMap::default, |result| {
+            result
+                .reads()
+                .iter()
+                .map(|read| ((read.point.id(), read.event_index), read))
+                .collect::<HashMap<_, _>>()
+        });
         for point in procedure.points() {
-            for event in point.events.iter() {
+            for (event_index, event) in point.events.iter().enumerate() {
                 let (class, subject, value) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => {
                         let Some(target_value) = procedure.value(*target) else {
@@ -4940,26 +5166,41 @@ impl EventBuilder<'_> {
                         )
                     }
                     SemanticEffect::MemoryStore {
-                        kind: MemoryAccessKind::Field,
+                        kind: MemoryAccessKind::Field | MemoryAccessKind::Property,
                         location,
-                        value,
+                        ..
                     } => {
+                        let Some(store) = property_stores.get(&(point.id, event_index as u32))
+                        else {
+                            continue;
+                        };
+                        assert_eq!(
+                            store.source, event.source,
+                            "a structured property store names its owning semantic event"
+                        );
                         let Some(subject) = self.property_subject(procedure, &bases, *location)
                         else {
                             continue;
                         };
-                        (StateEventClass::Establish, subject, *value)
+                        (StateEventClass::Establish, subject, store.value.id())
                     }
                     SemanticEffect::MemoryLoad {
-                        kind: MemoryAccessKind::Field,
+                        kind: MemoryAccessKind::Field | MemoryAccessKind::Property,
                         location,
-                        result,
+                        ..
                     } => {
+                        let Some(read) = property_reads.get(&(point.id, event_index as u32)) else {
+                            continue;
+                        };
+                        assert_eq!(
+                            read.source, event.source,
+                            "a structured property read names its owning semantic event"
+                        );
                         let Some(subject) = self.property_subject(procedure, &bases, *location)
                         else {
                             continue;
                         };
-                        (StateEventClass::Read, subject, *result)
+                        (StateEventClass::Read, subject, read.value.id())
                     }
                     SemanticEffect::MemoryStore {
                         kind: MemoryAccessKind::LexicalCell | MemoryAccessKind::Capture,
@@ -5034,14 +5275,20 @@ impl EventBuilder<'_> {
                     site,
                     generation: self.generation,
                 });
+                self.event_keys.push(SemanticEventKey {
+                    point: point.id,
+                    event_index: event_index as u32,
+                    source: event.source,
+                });
             }
         }
     }
 
-    /// The property subject of one field access, or `None` when the IR does
-    /// not flow the access base from a binding. A base the IR cannot canonicalize
-    /// has no stable subject identity across two access sites, so it is
-    /// counted and skipped rather than approximated from the source text.
+    /// The source-facing property subject of one field access. This is only a
+    /// presentation projection: structured property relations use the
+    /// analysis-owned durable object/path/member key and never this binding or
+    /// spelling value. A base the IR cannot present as a binding is counted and
+    /// skipped rather than approximated from source order.
     fn property_subject(
         &mut self,
         procedure: &ProcedureSemantics,
@@ -5052,21 +5299,26 @@ impl EventBuilder<'_> {
             return None;
         }
         let location = procedure.memory_location(location)?;
-        let MemoryLocationKind::Field { base, member } = &location.kind else {
-            return None;
+        let (base, member) = match &location.kind {
+            MemoryLocationKind::Field { base, member } => {
+                let span = member.anchor().span();
+                let member: Box<str> = self
+                    .facts
+                    .source()
+                    .get(span.start_byte() as usize..span.end_byte() as usize)?
+                    .into();
+                (*base, member)
+            }
+            MemoryLocationKind::Property { base, key } => (*base, key.clone().into()),
+            _ => return None,
         };
-        let Some(canonical) = bases.canonical(*base) else {
+        let Some(canonical) = bases.canonical(base) else {
             self.uncanonical_accesses = self.uncanonical_accesses.saturating_add(1);
             return None;
         };
-        let span = member.anchor().span();
-        let member = self
-            .facts
-            .source()
-            .get(span.start_byte() as usize..span.end_byte() as usize)?;
         Some(FlowSubject::Property {
             base: canonical,
-            member: member.into(),
+            member,
         })
     }
 
@@ -5133,38 +5385,83 @@ impl BindingBases {
     }
 }
 
-/// A write to a subject that has more than one establishment terminates the
-/// subject's other definitions, so it emits a `Kill` beside its `Establish`.
+/// A binding write with more than one establishment terminates the binding's
+/// other definitions, so it emits a `Kill` beside its `Establish`. Property
+/// kills use only the structured relation's strong-update certificate and
+/// same-location store count; their presentation subject is not consulted.
 ///
 /// The rule is deliberately order-free. The dense program-point index is the
 /// lowering's emission order, not a control-flow order, so "which write came
 /// first" is not derivable without the CFG; what *is* derivable, and what the
 /// gen/kill fixed point below actually uses, is that each write kills every
 /// other definition of its subject.
-fn append_kill_events(events: &mut Vec<StateEventRow>) {
+fn append_kill_events(
+    events: &mut Vec<StateEventRow>,
+    event_keys: &mut Vec<SemanticEventKey>,
+    property_result: Option<&PropertyReachingResult>,
+) {
+    assert_eq!(
+        events.len(),
+        event_keys.len(),
+        "each projected event has one semantic join key"
+    );
+    let strong_property_events = property_result.map_or_else(HashSet::default, |result| {
+        let mut store_counts = HashMap::<_, usize>::default();
+        for store in result.stores() {
+            *store_counts.entry(store.location.clone()).or_default() += 1;
+        }
+        result
+            .stores()
+            .iter()
+            .filter(|store| {
+                store.strong_update
+                    && store_counts
+                        .get(&store.location)
+                        .copied()
+                        .unwrap_or_default()
+                        >= 2
+            })
+            .map(|store| (store.point.id(), store.event_index, store.source))
+            .collect::<HashSet<_>>()
+    });
     let mut establishments: HashMap<FlowSubject, usize> = HashMap::default();
     for event in events.iter() {
-        if event.event_class == StateEventClass::Establish {
+        if event.event_class == StateEventClass::Establish
+            && matches!(&event.subject, FlowSubject::Binding { .. })
+        {
             *establishments.entry(event.subject.clone()).or_insert(0) += 1;
         }
     }
     let mut kills = Vec::new();
-    for event in events.iter() {
+    for (event, key) in events.iter().zip(event_keys.iter()) {
         if event.event_class != StateEventClass::Establish {
             continue;
         }
-        if establishments.get(&event.subject).copied().unwrap_or(0) < 2 {
-            continue;
+        match &event.subject {
+            FlowSubject::Binding { .. } => {
+                if establishments.get(&event.subject).copied().unwrap_or(0) < 2 {
+                    continue;
+                }
+            }
+            FlowSubject::Property { .. } => {
+                if !strong_property_events.contains(&(key.point, key.event_index, key.source)) {
+                    continue;
+                }
+            }
         }
-        kills.push(StateEventRow {
-            event: 0,
-            event_class: StateEventClass::Kill,
-            ..event.clone()
-        });
+        kills.push((
+            StateEventRow {
+                event: 0,
+                event_class: StateEventClass::Kill,
+                ..event.clone()
+            },
+            *key,
+        ));
     }
-    for mut kill in kills {
+    for (mut kill, key) in kills {
         kill.event = events.len();
         events.push(kill);
+        event_keys.push(key);
     }
 }
 
@@ -5190,10 +5487,13 @@ fn unestablished_local_bindings(procedure: &ProcedureSemantics, events: &[StateE
         .count()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_relations(
     procedure: &ProcedureSemantics,
     control_edge_mask: &ControlEdgeMask,
     events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    property_result: Option<&PropertyReachingResult>,
     generation: u64,
     request: &mut FlowStateRequest<'_>,
     reasons: &mut Vec<FlowStateIncompleteReason>,
@@ -5201,12 +5501,28 @@ fn derive_relations(
     let relations = same_evaluation_relations(procedure, events, generation);
     if control_edge_mask.is_empty() {
         return derive_control_relations(
-            procedure, procedure, events, generation, request, reasons, relations,
+            procedure,
+            procedure,
+            events,
+            event_keys,
+            property_result,
+            generation,
+            request,
+            reasons,
+            relations,
         );
     }
     let graph = MaskedProcedureGraph::new(procedure, control_edge_mask);
     derive_control_relations(
-        &graph, procedure, events, generation, request, reasons, relations,
+        &graph,
+        procedure,
+        events,
+        event_keys,
+        property_result,
+        generation,
+        request,
+        reasons,
+        relations,
     )
 }
 
@@ -5215,6 +5531,8 @@ fn derive_control_relations<G>(
     graph: &G,
     procedure: &ProcedureSemantics,
     events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    property_result: Option<&PropertyReachingResult>,
     generation: u64,
     request: &mut FlowStateRequest<'_>,
     reasons: &mut Vec<FlowStateIncompleteReason>,
@@ -5233,6 +5551,12 @@ where
             reasons.push(FlowStateIncompleteReason::AxisUnsupported(
                 FlowStateAxis::ReachingRelation,
             ));
+            reasons.push(FlowStateIncompleteReason::AxisUnsupported(
+                FlowStateAxis::PropertyReachingRelation,
+            ));
+            reasons.push(FlowStateIncompleteReason::AxisUnsupported(
+                FlowStateAxis::PropertyDominanceRelation,
+            ));
             return (relations, None);
         }
     };
@@ -5244,6 +5568,16 @@ where
         Err(error) => {
             push_algorithm_reason(error, FlowStateAxis::ReachingRelation, reasons);
             relations.extend(dominance_relations(graph, events, &dominance, generation));
+            if let Some(property_result) = property_result {
+                relations.extend(property_flow_relations(
+                    graph,
+                    events,
+                    event_keys,
+                    property_result,
+                    &dominance,
+                    generation,
+                ));
+            }
             return (relations, Some(dominance));
         }
     };
@@ -5257,6 +5591,16 @@ where
         generation,
     ));
     relations.extend(dominance_relations(graph, events, &dominance, generation));
+    if let Some(property_result) = property_result {
+        relations.extend(property_flow_relations(
+            graph,
+            events,
+            event_keys,
+            property_result,
+            &dominance,
+            generation,
+        ));
+    }
     (relations, Some(dominance))
 }
 
@@ -5477,7 +5821,9 @@ impl Definitions {
             by_event: HashMap::default(),
         };
         for event in events {
-            if event.event_class != StateEventClass::Establish {
+            if event.event_class != StateEventClass::Establish
+                || matches!(&event.subject, FlowSubject::Property { .. })
+            {
                 continue;
             }
             definitions
@@ -5525,10 +5871,10 @@ where
     G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
 {
     let mut rows = Vec::new();
-    for read in events
-        .iter()
-        .filter(|event| event.event_class == StateEventClass::Read)
-    {
+    for read in events.iter().filter(|event| {
+        event.event_class == StateEventClass::Read
+            && matches!(&event.subject, FlowSubject::Binding { .. })
+    }) {
         let point = read.point.index();
         let live = reaching
             .reaching_in(point)
@@ -5556,6 +5902,144 @@ where
     rows
 }
 
+/// Project analysis-owned property rows into flow-state's presentation
+/// vocabulary. The relation has already been keyed by the durable receiver,
+/// access path, and structured member in `bifrost-analysis`; the `FlowSubject`
+/// on each event is only a source-facing presentation value.
+fn property_flow_relations<G>(
+    graph: &G,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    property_result: &PropertyReachingResult,
+    dominance: &Dominators<ProgramPointId>,
+    generation: u64,
+) -> Vec<FlowRelationRow>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    let mut rows = Vec::new();
+    for relation in property_result.reaching() {
+        let Some(source_event) = property_event_id(
+            events,
+            event_keys,
+            StateEventClass::Establish,
+            relation.store.point.id(),
+            relation.store.event_index,
+            relation.store.source,
+        ) else {
+            continue;
+        };
+        let Some(target_event) = property_event_id(
+            events,
+            event_keys,
+            StateEventClass::Read,
+            relation.read.point.id(),
+            relation.read.event_index,
+            relation.read.source,
+        ) else {
+            continue;
+        };
+        rows.push(FlowRelationRow {
+            relation: FlowRelation::Reaching,
+            certainty: match relation.certainty {
+                PropertyReachCertainty::Exact => FlowCertainty::Exact,
+                PropertyReachCertainty::May => FlowCertainty::May,
+            },
+            source_event,
+            target_event,
+            procedure: relation.read.procedure.id(),
+            generation,
+        });
+    }
+
+    for store in property_result.stores() {
+        let Some(source_event) = property_event_id(
+            events,
+            event_keys,
+            StateEventClass::Establish,
+            store.point.id(),
+            store.event_index,
+            store.source,
+        ) else {
+            continue;
+        };
+        for read in property_result
+            .reads()
+            .iter()
+            .filter(|read| read.location == store.location)
+            .filter(|read| read.point.id() != store.point.id())
+        {
+            if !dominance.dominates(graph, store.point.id(), read.point.id()) {
+                continue;
+            }
+            let Some(target_event) = property_event_id(
+                events,
+                event_keys,
+                StateEventClass::Read,
+                read.point.id(),
+                read.event_index,
+                read.source,
+            ) else {
+                continue;
+            };
+            rows.push(FlowRelationRow {
+                relation: FlowRelation::Dominates,
+                certainty: FlowCertainty::Exact,
+                source_event,
+                target_event,
+                procedure: store.procedure.id(),
+                generation,
+            });
+            if store.strong_update
+                && let Some(kill_event) = property_event_id(
+                    events,
+                    event_keys,
+                    StateEventClass::Kill,
+                    store.point.id(),
+                    store.event_index,
+                    store.source,
+                )
+            {
+                rows.push(FlowRelationRow {
+                    relation: FlowRelation::Dominates,
+                    certainty: FlowCertainty::Exact,
+                    source_event: kill_event,
+                    target_event,
+                    procedure: store.procedure.id(),
+                    generation,
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn property_event_id(
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    event_class: StateEventClass,
+    point: ProgramPointId,
+    event_index: u32,
+    source: SourceMappingId,
+) -> Option<usize> {
+    assert_eq!(
+        events.len(),
+        event_keys.len(),
+        "each projected event has one semantic join key"
+    );
+    events
+        .iter()
+        .zip(event_keys.iter())
+        .find_map(|(event, key)| {
+            (event.event_class == event_class
+                && key.point == point
+                && key.event_index == event_index
+                && key.source == source
+                && matches!(&event.subject, FlowSubject::Property { .. }))
+            .then_some(event.event)
+        })
+}
+
 /// Dominance rows, restricted to write/read pairs of one subject so the row
 /// volume stays bounded by the events the reaching relation already pairs.
 ///
@@ -5578,11 +6062,12 @@ where
         matches!(
             event.event_class,
             StateEventClass::Establish | StateEventClass::Kill
-        )
+        ) && matches!(&event.subject, FlowSubject::Binding { .. })
     }) {
         for read in events
             .iter()
             .filter(|event| event.event_class == StateEventClass::Read)
+            .filter(|event| matches!(&event.subject, FlowSubject::Binding { .. }))
             .filter(|event| event.subject == write.subject)
             .filter(|event| event.point != write.point)
         {
@@ -5668,7 +6153,10 @@ impl EvaluationDependence {
                     } => {
                         if let Some(location) = procedure.memory_location(*location) {
                             match &location.kind {
-                                MemoryLocationKind::Field { base, .. } => record(*result, *base),
+                                MemoryLocationKind::Field { base, .. }
+                                | MemoryLocationKind::Property { base, .. } => {
+                                    record(*result, *base)
+                                }
                                 MemoryLocationKind::Index { base, index, .. } => {
                                     record(*result, *base);
                                     if let Some(index) = index {
@@ -7038,17 +7526,15 @@ func first() int {
         let mut reasons = Vec::new();
         collect_capability_reasons(&capabilities, &mut reasons);
 
-        assert_eq!(reasons.len(), 2, "got {reasons:?}");
-        assert!(
-            reasons.contains(&FlowStateIncompleteReason::AxisUnsupported(
-                FlowStateAxis::ReachingRelation
-            ))
-        );
-        assert!(
-            reasons.contains(&FlowStateIncompleteReason::AxisUnsupported(
-                FlowStateAxis::DominanceRelation
-            ))
-        );
+        assert_eq!(reasons.len(), 4, "got {reasons:?}");
+        for axis in [
+            FlowStateAxis::ReachingRelation,
+            FlowStateAxis::DominanceRelation,
+            FlowStateAxis::PropertyReachingRelation,
+            FlowStateAxis::PropertyDominanceRelation,
+        ] {
+            assert!(reasons.contains(&FlowStateIncompleteReason::AxisUnsupported(axis)));
+        }
     }
 
     fn relation_spellings<'a>(
@@ -7090,6 +7576,13 @@ function afterEstablishment() {
         let derivation = procedure_containing(
             &state,
             |event| matches!(&event.subject, FlowSubject::Property { member, .. } if &**member == "value"),
+        );
+        assert!(
+            derivation.events.iter().all(|event| {
+                event.event_class != StateEventClass::Kill
+                    || !matches!(&event.subject, FlowSubject::Property { .. })
+            }),
+            "a single structured property store must not manufacture a kill"
         );
 
         let reaching = relation_spellings(
@@ -10807,7 +11300,8 @@ function branch(flag) {
         );
         assert!(
             projected_reaching.contains(&("ns.value = 1", "ns.value", FlowCertainty::Exact)),
-            "the retained definition becomes exact: {projected_reaching:?}"
+            "the retained definition becomes exact: {projected_reaching:?}; completeness: {:?}",
+            projected_branch.completeness
         );
         assert!(
             !projected_reaching
@@ -11446,7 +11940,7 @@ function escapingObject(sink) {
         assert!(
             !derivation
                 .completeness
-                .covers(FlowStateAxis::ReachingRelation)
+                .covers(FlowStateAxis::PropertyReachingRelation)
         );
     }
 
@@ -11495,7 +11989,7 @@ function escapingObject(sink) {
             .iter()
             .find(|event| {
                 event.event_class == StateEventClass::Read
-                    && matches!(event.subject, FlowSubject::Binding { .. })
+                    && matches!(&event.subject, FlowSubject::Binding { .. })
                     && spelling(JS_READ_BEFORE_ESTABLISHMENT, event) == "early"
             })
             .expect("the returned binding is read");
@@ -12483,7 +12977,7 @@ end
             derivation
                 .events
                 .iter()
-                .all(|event| matches!(event.subject, FlowSubject::Binding { .. }))
+                .all(|event| matches!(&event.subject, FlowSubject::Binding { .. }))
         );
     }
 

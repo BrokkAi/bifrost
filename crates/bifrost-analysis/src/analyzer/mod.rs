@@ -155,7 +155,7 @@ pub use i_analyzer::AnalyzerStreamingFileScope;
 pub use i_analyzer::{
     AnalyzerBuildTierAccess, AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch,
     QueryReadIncomplete, SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex,
-    WorkspaceFileIndexCell,
+    WorkspaceFileIndexCell, capture_query_reads,
 };
 pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken};
 #[cfg(any(test, feature = "test-support"))]

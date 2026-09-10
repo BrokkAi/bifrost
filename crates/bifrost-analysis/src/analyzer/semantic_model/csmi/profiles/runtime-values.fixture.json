@@ -1,0 +1,225 @@
+{
+  "documentType": "semantic-document",
+  "schema": "https://csmi.brokk.ai/schema/0.1/schema.json",
+  "semanticModelVersion": "0.1",
+  "serializationVersion": "0.1-json",
+  "provenanceRecords": [
+    {
+      "id": "runtime-values-fixture",
+      "producer": {
+        "identifier": "https://csmi.brokk.ai/conformance/runtime-values",
+        "version": "0.1.0"
+      },
+      "generationMethod": "manual-authoring"
+    }
+  ],
+  "defaultProvenance": "runtime-values-fixture",
+  "semanticModels": [
+    {
+      "artifactSelectors": [
+        {
+          "purl": "pkg:generic/nodejs.org/node@22.11.0",
+          "digests": [
+            {
+              "algorithm": "sha-256",
+              "coverage": "official-distribution-archive",
+              "value": "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          ]
+        }
+      ],
+      "vocabularyUses": [
+        {
+          "identifier": "csmi.runtime-values",
+          "version": "0.1.0",
+          "schema": "https://csmi.brokk.ai/schema/profiles/runtime-values/0.1/schema.json",
+          "requirement": "required",
+          "affects": [
+            {
+              "kind": "fact-family",
+              "family": "runtime-global-exposures",
+              "scope": { "exposureId": "node-process-main" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "keyed-read-behaviors",
+              "scope": { "behaviorId": "node-process-env-read" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "runtime-global-binding-evidence",
+              "scope": { "bindingEvidenceId": "js-process-binding" }
+            },
+            {
+              "kind": "fact-family",
+              "family": "keyed-read-observations",
+              "scope": { "observationId": "js-env-dfb-input" }
+            }
+          ]
+        }
+      ],
+      "extensionFacts": [
+        {
+          "vocabulary": "csmi.runtime-values",
+          "version": "0.1.0",
+          "family": "runtime-global-exposures",
+          "scope": { "exposureId": "node-process-main" },
+          "payload": {
+            "kind": "runtime-global-exposure",
+            "exposureId": "node-process-main",
+            "languages": ["javascript", "typescript", "tsx"],
+            "bindingName": "process",
+            "runtime": {
+              "runtimeFamily": "node",
+              "runtimeArtifact": "pkg:generic/nodejs.org/node@22.11.0",
+              "runtimeArtifactDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+              "platform": "linux",
+              "architecture": "x64",
+              "realm": "main",
+              "moduleMode": "commonjs",
+              "initializationBoundary": "pristine-runtime-entry",
+              "hostAssumptions": ["no-preloads", "closed-module-invocation"]
+            },
+            "runtimeProfileDigest": "1212121212121212121212121212121212121212121212121212121212121212",
+            "rootIdentity": {
+              "scheme": "csmi.runtime-global",
+              "schemeVersion": "0.1.0",
+              "descriptors": [
+                { "role": "runtime", "name": "node" },
+                { "role": "global", "name": "process" }
+              ]
+            },
+            "members": ["env", "argv"],
+            "activation": "enabled",
+            "evidence": {
+              "producer": "https://example.test/node-profile-producer",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "2222222222222222222222222222222222222222222222222222222222222222"
+            },
+            "coverage": { "status": "complete" }
+          }
+        },
+        {
+          "vocabulary": "csmi.runtime-values",
+          "version": "0.1.0",
+          "family": "keyed-read-behaviors",
+          "scope": { "behaviorId": "node-process-env-read" },
+          "payload": {
+            "kind": "keyed-read-behavior",
+            "behaviorId": "node-process-env-read",
+            "exposureId": "node-process-main",
+            "containerMember": "env",
+            "acceptedKeys": "static-property",
+            "normalResult": "value-or-undefined",
+            "exceptionBehavior": "unknown",
+            "mutationModel": "pristine-input-until-write",
+            "materialization": "host-defined",
+            "evidence": {
+              "producer": "https://example.test/node-profile-producer",
+              "method": "reviewed-runtime-contract",
+              "inputsDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+            },
+            "coverage": {
+              "status": "partial",
+              "limitations": ["accessor-or-proxy-incomplete"]
+            }
+          }
+        },
+        {
+          "vocabulary": "csmi.runtime-values",
+          "version": "0.1.0",
+          "family": "runtime-global-binding-evidence",
+          "scope": { "bindingEvidenceId": "js-process-binding" },
+          "payload": {
+            "kind": "runtime-global-binding-evidence",
+            "bindingEvidenceId": "js-process-binding",
+            "exposureId": "node-process-main",
+            "activation": {
+              "outcome": "matched",
+              "runtimeProfileDigest": "1212121212121212121212121212121212121212121212121212121212121212",
+              "activeSetDigest": "fa472a4d9b27841a2ac6a1ac566d75ed97e1d0f95058464b9538e7049cd67be6",
+              "activeExposureIds": ["node-process-main"],
+              "modelDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+              "activationSource": "https://example.test/activation/node-main",
+              "exposureId": "node-process-main"
+            },
+            "language": "javascript",
+            "dialect": "javascript",
+            "rootOccurrence": {
+              "resource": "probe.js",
+              "resourceDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "startByte": 65,
+              "endByte": 72
+            },
+            "scopeIdentity": {
+              "ownerDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "kind": "scope",
+              "locatorDigest": "3131313131313131313131313131313131313131313131313131313131313131"
+            },
+            "lexicalBinding": "absent",
+            "rebinding": "excluded",
+            "evidence": {
+              "producer": "https://example.test/js-analyzer",
+              "method": "resolver-binder-and-reachable-write-proof",
+              "inputsDigest": "1414141414141414141414141414141414141414141414141414141414141414"
+            },
+            "coverage": { "status": "complete" }
+          }
+        },
+        {
+          "vocabulary": "csmi.runtime-values",
+          "version": "0.1.0",
+          "family": "keyed-read-observations",
+          "scope": { "observationId": "js-env-dfb-input" },
+          "payload": {
+            "kind": "keyed-read-observation",
+            "observationId": "js-env-dfb-input",
+            "bindingEvidenceId": "js-process-binding",
+            "behaviorId": "node-process-env-read",
+            "baseValue": {
+              "ownerDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "kind": "value",
+              "locatorDigest": "3232323232323232323232323232323232323232323232323232323232323232"
+            },
+            "key": { "kind": "property", "value": "DFB_INPUT" },
+            "sourceForm": "dot",
+            "loadOperation": {
+              "ownerDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "kind": "operation",
+              "locatorDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+            },
+            "resultValue": {
+              "ownerDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "kind": "value",
+              "locatorDigest": "3232323232323232323232323232323232323232323232323232323232323232"
+            },
+            "observationPoint": {
+              "ownerDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "kind": "point",
+              "locatorDigest": "3434343434343434343434343434343434343434343434343434343434343434"
+            },
+            "phase": "after-effects",
+            "expression": {
+              "resource": "probe.js",
+              "resourceDigest": "2020202020202020202020202020202020202020202020202020202020202020",
+              "startByte": 65,
+              "endByte": 86
+            },
+            "sourceOrigin": "pristine-runtime-input",
+            "normalOutcome": "exact",
+            "exceptionOutcome": "indeterminate",
+            "evidence": {
+              "producer": "https://example.test/js-analyzer",
+              "method": "resolver-binder-operation-join",
+              "inputsDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+            },
+            "coverage": {
+              "status": "partial",
+              "limitations": ["exception-behavior-indeterminate"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

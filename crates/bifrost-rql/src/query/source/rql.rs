@@ -602,6 +602,7 @@ fn validate_wrapper(
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             validate_receiver_wrapper(form, args, query, analysis)
         }
+        RqlForm::KeyedReadValue => validate_keyed_read_value_wrapper(args, query, analysis),
         RqlForm::OccurrencesOf | RqlForm::OccurrencesIn => {
             validate_occurrence_options(form, &args[..args.len().saturating_sub(1)], analysis);
         }
@@ -964,6 +965,137 @@ fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysi
                 form.label()
             ),
         ),
+    }
+}
+
+fn validate_keyed_read_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "keyed-read-value expects option/value pairs followed by a query",
+        );
+        return;
+    }
+    let accepted = QueryStepOp::KeyedReadValue
+        .options()
+        .iter()
+        .flat_map(|option| option.rql_labels().iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut seen = HashSet::new();
+    let mut property = false;
+    let mut index = false;
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "keyed-read-value option names must be keywords",
+            );
+            continue;
+        };
+        let Some(option) = QueryStepOp::KeyedReadValue.option_for_rql_label(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                format!("unknown keyed-read-value option '{label}'; expected {accepted}"),
+            );
+            continue;
+        };
+        if !seen.insert(option.field()) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate property '{}'", option.field().label()),
+            );
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            option.field().signature(),
+            option.field().description(),
+        );
+        match option.field() {
+            QueryStepField::Runtime => {
+                if pair[1].as_symbol().or_else(|| pair[1].as_string()) != Some("node") {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "runtime must be node",
+                    );
+                }
+            }
+            QueryStepField::Global => {
+                if pair[1].as_symbol().or_else(|| pair[1].as_string()) != Some("process") {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "global must be process",
+                    );
+                }
+            }
+            QueryStepField::Container => {
+                if !matches!(
+                    pair[1].as_symbol().or_else(|| pair[1].as_string()),
+                    Some("env") | Some("argv")
+                ) {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "container must be env or argv",
+                    );
+                }
+            }
+            QueryStepField::Property => {
+                property = true;
+                if pair[1]
+                    .as_symbol()
+                    .or_else(|| pair[1].as_string())
+                    .is_none()
+                {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "property must be a name",
+                    );
+                }
+            }
+            QueryStepField::Index => {
+                index = true;
+                if !matches!(pair[1].kind, ExprKind::Number(_)) {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "index must be a non-negative integer",
+                    );
+                }
+            }
+            QueryStepField::SourceOrigin => {
+                if pair[1].as_symbol().or_else(|| pair[1].as_string()) != Some("pristine_input") {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "source-origin must be pristine_input",
+                    );
+                }
+            }
+            _ => unreachable!("keyed-read-value registry contains only its options"),
+        }
+    }
+    if property == index {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "keyed-read-value requires exactly one of :property or :index",
+        );
+    }
+    if args.is_empty() {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "keyed-read-value expects a query",
+        );
     }
 }
 
@@ -2162,6 +2294,10 @@ fn validate_property_value(
         | super::schema::ValueShape::ExportFormList
         | super::schema::ValueShape::ExportNameList
         | super::schema::ValueShape::DeclarationOriginList
+        | super::schema::ValueShape::RuntimeFamily
+        | super::schema::ValueShape::RuntimeGlobal
+        | super::schema::ValueShape::RuntimeContainer
+        | super::schema::ValueShape::RuntimeSourceOrigin
         | super::schema::ValueShape::JsxElementIdentity => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }

@@ -515,6 +515,8 @@ impl TypeScriptDeclarationPackProducer {
                 members,
                 relations: Vec::new(),
             },
+            runtime_values: None,
+            collection_flows: None,
         }];
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
@@ -850,6 +852,8 @@ impl TypeScriptDeclarationPackProducer {
                     members,
                     relations: Vec::new(),
                 },
+                runtime_values: None,
+                collection_flows: None,
             });
         }
         shards.sort_unstable_by(|left, right| left.id.cmp(&right.id));
@@ -2249,6 +2253,8 @@ fn finish_typescript_production(
             members,
             relations: Vec::new(),
         },
+        runtime_values: None,
+        collection_flows: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),

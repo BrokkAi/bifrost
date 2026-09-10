@@ -114,10 +114,9 @@ macro_rules! define_work_dimensions {
                 $(Self::$variant),+
             ];
 
-            /// Every dimension label, in declaration order: the value domain
-            /// the `exceeded_limit` row fields publish (issue #2515). Every
-            /// dimension enum publishes it; only the semantic one is read
-            /// today.
+            /// Every internal dimension label, in declaration order. Public
+            /// diagnostic vocabularies may project these dimensions onto a
+            /// smaller set of lanes.
             #[allow(dead_code)]
             pub const LABELS: &'static [&'static str] = &[$(stringify!($field)),+];
 

@@ -220,7 +220,7 @@ impl CodeQueryDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeQueryExecutionLimits {
     pub max_scanned_files: usize,
     pub max_scanned_source_bytes: usize,

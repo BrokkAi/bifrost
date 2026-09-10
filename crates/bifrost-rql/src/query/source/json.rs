@@ -1,3 +1,4 @@
+use super::schema::{RuntimeContainer, RuntimeFamily, RuntimeGlobal, RuntimeSourceOrigin};
 use super::*;
 
 pub(super) fn analyze_json_with_schema_registry(
@@ -1299,6 +1300,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             op_label,
             Some("receiver_targets" | "points_to" | "member_targets")
         );
+        let keyed_read_value_step = op_label == Some("keyed_read_value");
         let typestate_step = op_label == Some("typestate");
         let value_flow_step = op_label == Some("value_flow");
         let taint_step = op_label == Some("taint");
@@ -1325,6 +1327,12 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_jsx_identity = false;
         let mut seen_jsx_element_name = false;
         let mut seen_jsx_property_name = false;
+        let mut seen_runtime = false;
+        let mut seen_global = false;
+        let mut seen_container = false;
+        let mut seen_property = false;
+        let mut seen_index = false;
+        let mut seen_source_origin = false;
         let mut seen_capture = false;
         let mut seen_protocol_ref = false;
         let mut seen_plan_ref = false;
@@ -1529,6 +1537,96 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                             require_json_string(child, analysis);
                         }
                         _ => unreachable!("jsx field matched above"),
+                    }
+                    continue;
+                }
+            }
+            if keyed_read_value_step {
+                let keyed_field = matches!(
+                    field,
+                    Some(
+                        QueryStepField::Runtime
+                            | QueryStepField::Global
+                            | QueryStepField::Container
+                            | QueryStepField::Property
+                            | QueryStepField::Index
+                            | QueryStepField::SourceOrigin
+                    )
+                );
+                if keyed_field {
+                    let field = field.expect("keyed-read-value field matched above");
+                    analysis.add_help(key.range(), field.signature(), field.description());
+                    let seen = match field {
+                        QueryStepField::Runtime => &mut seen_runtime,
+                        QueryStepField::Global => &mut seen_global,
+                        QueryStepField::Container => &mut seen_container,
+                        QueryStepField::Property => &mut seen_property,
+                        QueryStepField::Index => &mut seen_index,
+                        QueryStepField::SourceOrigin => &mut seen_source_origin,
+                        _ => unreachable!("keyed-read-value field matched above"),
+                    };
+                    if *seen {
+                        analysis.error(
+                            key.range(),
+                            "duplicate-property",
+                            format!("duplicate property '{}'", field.label()),
+                        );
+                    }
+                    *seen = true;
+                    match field {
+                        QueryStepField::Runtime => validate_json_reference_scalar(
+                            child,
+                            "runtime",
+                            RuntimeFamily::from_label,
+                            analysis,
+                        ),
+                        QueryStepField::Global => validate_json_reference_scalar(
+                            child,
+                            "global",
+                            RuntimeGlobal::from_label,
+                            analysis,
+                        ),
+                        QueryStepField::Container => validate_json_reference_scalar(
+                            child,
+                            "container",
+                            RuntimeContainer::from_label,
+                            analysis,
+                        ),
+                        QueryStepField::SourceOrigin => validate_json_reference_scalar(
+                            child,
+                            "source_origin",
+                            RuntimeSourceOrigin::from_label,
+                            analysis,
+                        ),
+                        QueryStepField::Property => {
+                            let Some(property) = child.as_string() else {
+                                require_json_string(child, analysis);
+                                continue;
+                            };
+                            if property.len() > MAX_BINDING_NAME_LENGTH {
+                                analysis.error(
+                                    child.range(),
+                                    "wrong-value-shape",
+                                    format!(
+                                        "property must be at most {MAX_BINDING_NAME_LENGTH} bytes"
+                                    ),
+                                );
+                            }
+                        }
+                        QueryStepField::Index => {
+                            let valid = child
+                                .as_number()
+                                .and_then(serde_json::Number::as_u64)
+                                .is_some_and(|index| index <= u64::from(u32::MAX - 1));
+                            if !valid {
+                                analysis.error(
+                                    child.range(),
+                                    "wrong-value-shape",
+                                    "index must be a non-negative integer at most 4294967294",
+                                );
+                            }
+                        }
+                        _ => unreachable!("keyed-read-value field matched above"),
                     }
                     continue;
                 }
@@ -1962,6 +2060,20 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 continue;
             };
             analysis.add_help(child.range(), step.label(), step.description());
+        }
+        if keyed_read_value_step {
+            if seen_property == seen_index {
+                analysis.error(
+                    step.range(),
+                    "wrong-value-shape",
+                    "keyed_read_value requires exactly one of property or index",
+                );
+            }
+            if seen_container {
+                // Decode owns the final env/property and argv/index cross-check;
+                // retain this source-side requirement as a schema diagnostic
+                // only when one of the two key forms is structurally present.
+            }
         }
         if seen_depth && seen_transitive {
             analysis.error(

@@ -47,6 +47,57 @@ define_work_dimensions! {
     OwnedTextBytes => owned_text_bytes = 32 * 1024 * 1024,
 }
 
+/// Public semantic budget categories used by diagnostics and extension
+/// results. Internal ledger dimensions intentionally project onto this small,
+/// stable vocabulary.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SemanticBudgetLane {
+    Source,
+    Rows,
+    RetainedBytes,
+    Steps,
+    Files,
+}
+
+impl SemanticBudgetLane {
+    pub const LABELS: &'static [&'static str] =
+        &["source", "rows", "retained_bytes", "steps", "files"];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Rows => "rows",
+            Self::RetainedBytes => "retained_bytes",
+            Self::Steps => "steps",
+            Self::Files => "files",
+        }
+    }
+}
+
+impl SemanticBudgetDimension {
+    pub const fn public_lane(self) -> SemanticBudgetLane {
+        match self {
+            Self::SourceBytes => SemanticBudgetLane::Source,
+            Self::Procedures
+            | Self::Blocks
+            | Self::ProgramPoints
+            | Self::Values
+            | Self::Allocations
+            | Self::CallSites
+            | Self::MemoryLocations
+            | Self::Captures
+            | Self::SourceMappings
+            | Self::Evidence
+            | Self::Gaps
+            | Self::Events
+            | Self::ControlEdges
+            | Self::NestedEntries => SemanticBudgetLane::Rows,
+            Self::OwnedTextBytes => SemanticBudgetLane::RetainedBytes,
+        }
+    }
+}
+
 impl SemanticWork {
     /// Add work conservatively, using a uniformly maximal sentinel if any
     /// dimension overflows.
@@ -147,7 +198,7 @@ impl fmt::Display for InvalidSemanticBudget {
         write!(
             formatter,
             "semantic budget limit `{}` must be positive",
-            self.dimension.label()
+            self.dimension.public_lane().label()
         )
     }
 }
@@ -180,7 +231,7 @@ impl fmt::Display for SemanticBudgetExceeded {
         write!(
             formatter,
             "semantic work `{}` attempted {} against limit {}",
-            self.dimension.label(),
+            self.dimension.public_lane().label(),
             self.attempted,
             self.limit
         )
@@ -1500,6 +1551,91 @@ mod tests {
         assert_eq!(defaults.control_edges, 2_000_000);
         assert_eq!(defaults.nested_entries, 8_000_000);
         assert_eq!(defaults.owned_text_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn public_budget_lanes_have_stable_labels_and_cover_every_dimension() {
+        assert_eq!(
+            SemanticBudgetLane::LABELS,
+            &["source", "rows", "retained_bytes", "steps", "files"]
+        );
+        assert_eq!(SemanticBudgetLane::Source.label(), "source");
+        assert_eq!(SemanticBudgetLane::Rows.label(), "rows");
+        assert_eq!(SemanticBudgetLane::RetainedBytes.label(), "retained_bytes");
+        assert_eq!(SemanticBudgetLane::Steps.label(), "steps");
+        assert_eq!(SemanticBudgetLane::Files.label(), "files");
+
+        let expected = [
+            (
+                SemanticBudgetDimension::SourceBytes,
+                SemanticBudgetLane::Source,
+            ),
+            (
+                SemanticBudgetDimension::Procedures,
+                SemanticBudgetLane::Rows,
+            ),
+            (SemanticBudgetDimension::Blocks, SemanticBudgetLane::Rows),
+            (
+                SemanticBudgetDimension::ProgramPoints,
+                SemanticBudgetLane::Rows,
+            ),
+            (SemanticBudgetDimension::Values, SemanticBudgetLane::Rows),
+            (
+                SemanticBudgetDimension::Allocations,
+                SemanticBudgetLane::Rows,
+            ),
+            (SemanticBudgetDimension::CallSites, SemanticBudgetLane::Rows),
+            (
+                SemanticBudgetDimension::MemoryLocations,
+                SemanticBudgetLane::Rows,
+            ),
+            (SemanticBudgetDimension::Captures, SemanticBudgetLane::Rows),
+            (
+                SemanticBudgetDimension::SourceMappings,
+                SemanticBudgetLane::Rows,
+            ),
+            (SemanticBudgetDimension::Evidence, SemanticBudgetLane::Rows),
+            (SemanticBudgetDimension::Gaps, SemanticBudgetLane::Rows),
+            (SemanticBudgetDimension::Events, SemanticBudgetLane::Rows),
+            (
+                SemanticBudgetDimension::ControlEdges,
+                SemanticBudgetLane::Rows,
+            ),
+            (
+                SemanticBudgetDimension::NestedEntries,
+                SemanticBudgetLane::Rows,
+            ),
+            (
+                SemanticBudgetDimension::OwnedTextBytes,
+                SemanticBudgetLane::RetainedBytes,
+            ),
+        ];
+        for (dimension, lane) in expected {
+            assert_eq!(dimension.public_lane(), lane, "{}", dimension.label());
+        }
+    }
+
+    #[test]
+    fn budget_error_display_uses_public_lane_labels() {
+        let mut limits = SemanticWork::default_limits();
+        limits.owned_text_bytes = 0;
+        let invalid = SemanticBudget::new(limits).unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "semantic budget limit `retained_bytes` must be positive"
+        );
+
+        let mut budget = SemanticBudget::uniform(1).unwrap();
+        let exceeded = budget
+            .charge(SemanticWork {
+                program_points: 2,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            exceeded.to_string(),
+            "semantic work `rows` attempted 2 against limit 1"
+        );
     }
 
     #[test]

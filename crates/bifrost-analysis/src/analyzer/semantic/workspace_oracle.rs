@@ -1,9 +1,15 @@
 //! Workspace-backed implementations of the language-neutral semantic oracles.
 
 mod common;
+mod conversions;
 mod dispatch;
 mod heap;
+mod runtime_values;
 mod source;
+pub use runtime_values::{
+    RuntimeAccessKey, RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult,
+    RuntimeReadLimitation, RuntimeReadSourceOrigin,
+};
 mod value_flow;
 
 #[doc(hidden)]
@@ -55,6 +61,7 @@ use super::{DispatchHints, OracleLimits};
 #[derive(Clone)]
 pub struct WorkspaceSemanticOracle<'a> {
     workspace: &'a WorkspaceAnalyzer,
+    runtime_reads: runtime_values::RuntimeReadCache,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
@@ -132,6 +139,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     ) -> Self {
         Self {
             workspace,
+            runtime_reads: runtime_values::runtime_read_cache(),
             limits,
             hierarchy_expansion,
             semantic_model_overlay,

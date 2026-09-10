@@ -1067,20 +1067,6 @@ impl FieldSlotIndex {
         self.digest
     }
 
-    pub(super) fn dynamic_survey_boundary(&self) -> Option<UnknownReason> {
-        self.store_survey.dynamic_effects.iter().find_map(|write| {
-            write.evidence.reason.clone().filter(|reason| {
-                matches!(
-                    reason,
-                    UnknownReason::SemanticBudget
-                        | UnknownReason::SolverBudget
-                        | UnknownReason::IncompleteRoot
-                        | UnknownReason::Truncated
-                )
-            })
-        })
-    }
-
     pub const fn semantic_budget_exhausted(&self) -> bool {
         self.semantic_budget_exhaustion.is_some() || self.transient_resolver_budget
     }
@@ -1514,8 +1500,14 @@ fn collect_procedure(
                     let location = semantics
                         .memory_location(location)
                         .expect("a memory-store location is retained");
-                    let MemoryLocationKind::Field { base, .. } = location.kind else {
-                        continue;
+                    let base = match location.kind {
+                        MemoryLocationKind::Field { base, .. } => base,
+                        // Property locations have a stable key but no
+                        // declaration-backed class slot. Keep them out of
+                        // this index rather than manufacturing a field
+                        // locator from the key.
+                        MemoryLocationKind::Property { .. } => continue,
+                        _ => continue,
                     };
                     let Some(member) = adapter.accessed_member(
                         workspace,
@@ -1578,8 +1570,12 @@ fn collect_procedure(
                     let location = semantics
                         .memory_location(location)
                         .expect("a memory-load location is retained");
-                    let MemoryLocationKind::Field { base, .. } = location.kind else {
-                        continue;
+                    let base = match location.kind {
+                        MemoryLocationKind::Field { base, .. } => base,
+                        // See the store path above: keyed properties are
+                        // handled by their own runtime/value-flow carrier.
+                        MemoryLocationKind::Property { .. } => continue,
+                        _ => continue,
                     };
                     let Some(class) = enclosing_class
                         .clone()

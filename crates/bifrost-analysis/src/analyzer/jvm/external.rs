@@ -1326,6 +1326,8 @@ fn merge_java_dependency_packs(
             id,
             activation,
             payload,
+            runtime_values,
+            collection_flows,
         } = shard;
         let (secondary_types, secondary_members, secondary_relations) = match payload {
             AuthoredPayload::DeclarationFacts {
@@ -1339,6 +1341,8 @@ fn merge_java_dependency_packs(
                         id,
                         activation,
                         payload,
+                        runtime_values,
+                        collection_flows,
                     });
                 }
                 continue;
@@ -1358,6 +1362,8 @@ fn merge_java_dependency_packs(
                         members: Vec::new(),
                         relations: Vec::new(),
                     },
+                    runtime_values: None,
+                    collection_flows: None,
                 });
                 index
             });
@@ -4715,6 +4721,8 @@ mod tests {
                         members: Vec::new(),
                         relations: Vec::new(),
                     },
+                    runtime_values: None,
+                    collection_flows: None,
                 },
             );
         }

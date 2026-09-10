@@ -43,6 +43,10 @@ use brokk_bifrost_js_ts::type_text::{
 };
 use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module;
 
+use crate::analyzer::QueryReadIncomplete;
+use crate::analyzer::semantic::{
+    PropertyReachingLimits, PropertySourceQueryResult, PropertyStoreRecord,
+};
 use crate::analyzer::semantic_model::{
     SemanticModelCallableKey, SemanticModelOverlay, SemanticModelOverlayDisposition,
     SemanticModelSymbol, TypeRef,
@@ -990,8 +994,7 @@ pub(super) fn resolve_js_ts(
             } else {
                 Vec::new()
             };
-        if language == Language::JavaScript
-            && !imported_receiver_binding
+        if !imported_receiver_binding
             && let Some(local_candidates) = focused.and_then(|node| {
                 jsts_exact_local_dotted_candidates(
                     dotted_lookup,
@@ -1001,13 +1004,7 @@ pub(super) fn resolve_js_ts(
                 )
             })
         {
-            if !local_candidates.is_empty() {
-                return js_ts_candidates_outcome(analyzer, local_candidates);
-            }
-            return no_definition(
-                "no_indexed_definition",
-                format!("`{reference}` did not resolve to an indexed JS/TS definition"),
-            );
+            return jsts_local_dotted_outcome(analyzer, reference, local_candidates);
         }
         let mut lexical_finds = JsTsMemberFinds::default();
         let lexical_member_candidates = if language == Language::TypeScript {
@@ -1081,8 +1078,7 @@ pub(super) fn resolve_js_ts(
                 } else {
                     jsts_value_space_candidates(host, candidates)
                 };
-                if language == Language::JavaScript
-                    && !imported_receiver_binding
+                if !imported_receiver_binding
                     && let Some(local_candidates) = focused.and_then(|node| {
                         jsts_exact_local_dotted_candidates(
                             dotted_lookup,
@@ -1092,13 +1088,7 @@ pub(super) fn resolve_js_ts(
                         )
                     })
                 {
-                    if !local_candidates.is_empty() {
-                        return js_ts_candidates_outcome(analyzer, local_candidates);
-                    }
-                    return no_definition(
-                        "no_indexed_definition",
-                        format!("`{reference}` did not resolve to an indexed JS/TS definition"),
-                    );
+                    return jsts_local_dotted_outcome(analyzer, reference, local_candidates);
                 }
                 return js_ts_candidates_outcome(analyzer, candidates);
             }
@@ -2159,17 +2149,53 @@ impl JstsDottedLookup<'_, '_> {
     }
 }
 
-/// Proves an exact same-file member chain from its AST definitions.
+struct JstsLocalDottedCandidates {
+    candidates: Vec<CodeUnit>,
+    incomplete: bool,
+}
+
+fn jsts_local_dotted_outcome(
+    analyzer: &dyn IAnalyzer,
+    reference: &str,
+    local: JstsLocalDottedCandidates,
+) -> DefinitionLookupOutcome {
+    let mut outcome = if local.candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+        )
+    } else {
+        js_ts_candidates_outcome(analyzer, local.candidates)
+    };
+    if local.incomplete {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            format!("property reaching for `{reference}`").into_boxed_str(),
+        ));
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "analysis_incomplete".to_string(),
+            message: format!(
+                "structured property reaching evidence for `{reference}` was incomplete; candidates require retained control-flow evidence"
+            ),
+        });
+    }
+    outcome
+}
+
+/// Resolves an exact same-file property read from structured stores and CFG
+/// reaching relations.
 ///
-/// A bound receiver must keep the same lexical identity. An unbound receiver
-/// must keep the same complete chain and fallback scope. Both forms require a
-/// definition before the reference, so an unsupported shape fails closed.
+/// Source spans only join a CodeUnit's tree-sitter property definition to the
+/// semantic event lowered from that source. They never decide which event
+/// executes first. When property, receiver, alias, or CFG evidence is
+/// incomplete, same-receiver lexical candidates require retained CFG paths and the
+/// caller publishes typed incompleteness instead of treating missing rows as a
+/// clean negative.
 fn jsts_exact_local_dotted_candidates(
     ctx: JstsDottedLookup<'_, '_>,
     lexical_bindings: &JsTsLexicalBindingIndex,
     focused: Node<'_>,
     hinted_candidates: &[CodeUnit],
-) -> Option<Vec<CodeUnit>> {
+) -> Option<JstsLocalDottedCandidates> {
     let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte);
     let (reference_receiver, property) =
         jsts_focused_reference_receiver_property(focused, ctx.source)?;
@@ -2185,16 +2211,20 @@ fn jsts_exact_local_dotted_candidates(
             .filter(|candidate| candidate.source() == ctx.file)
             .cloned(),
     );
+    candidates.extend(
+        ctx.support
+            .file_identifier(ctx.file, target_member)
+            .into_iter()
+            .filter(|candidate| candidate.source() == ctx.file),
+    );
+    if ctx.value_position {
+        candidates = jsts_value_space_candidates(ctx.host, candidates);
+    }
     sort_units(&mut candidates);
     candidates.dedup();
     let candidates_with_definitions: Vec<_> = candidates
         .into_iter()
         .filter_map(|candidate| {
-            // Only a definition on this reference's own receiver root says
-            // anything about this reference. A same-named property minted on
-            // another root -- `state.cache = { key }` against a read of
-            // `cache.key` -- leaves this chain unmodelled, so the strategy has
-            // to decline rather than fail the reference closed.
             let definitions: Vec<_> = direct_property_definitions(
                 ctx.root,
                 ctx.source,
@@ -2202,7 +2232,6 @@ fn jsts_exact_local_dotted_candidates(
                 target_member,
             )
             .into_iter()
-            .filter(|definition| slice(definition.receiver.root, ctx.source) == ctx.receiver)
             .collect();
             (!definitions.is_empty()).then_some((candidate, definitions))
         })
@@ -2210,32 +2239,37 @@ fn jsts_exact_local_dotted_candidates(
     if candidates_with_definitions.is_empty() {
         return None;
     }
-    let definition_may_follow_reference = binding_scope.is_some_and(|binding_scope| {
-        jsts_enclosing_function_or_program_scope(ctx.root, ctx.before_byte).is_some_and(
-            |execution_scope| {
-                execution_scope.kind() != "program"
-                    && lexical_bindings.binding_scope_at(ctx.receiver, execution_scope.start_byte())
-                        == Some(binding_scope)
-                    && !lexical_bindings
-                        .binding_identifier_ranges_at(ctx.receiver, ctx.before_byte)
-                        .iter()
-                        .any(|range| {
-                            execution_scope.start_byte() <= range.start_byte
-                                && range.end_byte <= execution_scope.end_byte()
-                        })
-            },
-        )
-    });
     let reference_fallback_scope = binding_scope
         .is_none()
         .then(|| jsts_reference_fallback_scope(focused, ctx.root));
-    let candidates = candidates_with_definitions
+    let property_range = Range {
+        start_byte: property.start_byte(),
+        end_byte: property.end_byte(),
+        start_line: property.start_position().row,
+        end_line: property.end_position().row,
+    };
+    let local_cancellation = CancellationToken::new();
+    let active_cancellation = ctx.analyzer.active_query_cancellation();
+    let evidence = ctx.analyzer.property_reaching_provider().map(|_| {
+        ctx.analyzer.property_reaching_for_source_range(
+            ctx.file,
+            &property_range,
+            PropertyReachingLimits::default(),
+            active_cancellation.as_ref().unwrap_or(&local_cancellation),
+        )
+    });
+    let evidence_complete = evidence
+        .as_ref()
+        .is_some_and(PropertySourceQueryResult::properties_complete);
+    let mut has_local_definition = false;
+    let candidates: Vec<CodeUnit> = candidates_with_definitions
         .into_iter()
         .filter_map(|(candidate, definitions)| {
             definitions
                 .into_iter()
                 .any(|definition| {
-                    definition.receiver.members.len() == reference_receiver.members.len()
+                    let same_receiver = slice(definition.receiver.root, ctx.source) == ctx.receiver
+                        && definition.receiver.members.len() == reference_receiver.members.len()
                         && definition
                             .receiver
                             .members
@@ -2263,43 +2297,188 @@ fn jsts_exact_local_dotted_candidates(
                                         ctx.root,
                                     )) == reference_fallback_scope
                             }
-                        }
-                        && (definition.property_range.end_byte <= ctx.before_byte
-                            || (definition_may_follow_reference
-                                && jsts_is_object_literal_property_definition(
-                                    ctx.root,
-                                    &definition.property_range,
-                                )))
+                        };
+                    has_local_definition |= same_receiver;
+                    jsts_property_definition_reaches(&definition.property_range, evidence.as_ref())
+                        || (!evidence_complete
+                            && same_receiver
+                            && (jsts_property_is_binding_literal_declaration(
+                                definition.receiver.root,
+                            ) || evidence.as_ref().is_some_and(|evidence| {
+                                evidence.candidate_store_can_reach(&Range {
+                                    start_byte: definition.establishment.start_byte(),
+                                    end_byte: definition.establishment.end_byte(),
+                                    start_line: definition.establishment.start_position().row,
+                                    end_line: definition.establishment.end_position().row,
+                                })
+                            }) || jsts_program_sequence_proves_reaching(
+                                definition.establishment,
+                                focused,
+                            )))
                 })
                 .then_some(candidate)
         })
         .collect();
-    Some(candidates)
+    if !evidence_complete && candidates.is_empty() && !has_local_definition {
+        ctx.analyzer
+            .record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                format!("property reaching for `{}.{target_member}`", ctx.receiver)
+                    .into_boxed_str(),
+            ));
+        return None;
+    }
+    Some(JstsLocalDottedCandidates {
+        candidates,
+        incomplete: !evidence_complete,
+    })
 }
 
-/// Whether a direct property definition is part of an object literal rather
-/// than a later assignment. A nested function or method can capture an outer
-/// binding whose object literal is initialized later in source order; an
-/// assignment after a read in the same execution scope remains order-sensitive.
-fn jsts_is_object_literal_property_definition(root: Node<'_>, range: &Range) -> bool {
-    let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
-    else {
+fn jsts_property_definition_reaches(
+    definition: &Range,
+    evidence: Option<&PropertySourceQueryResult>,
+) -> bool {
+    evidence.is_some_and(|evidence| {
+        evidence.matches().iter().any(|result| {
+            result
+                .reaching()
+                .iter()
+                .any(|relation| jsts_property_definition_matches_store(definition, &relation.store))
+        })
+    })
+}
+
+/// An object-literal key bound by a variable declarator is a declaration of
+/// that binding's initial shape, not a later mutation store. Definition lookup
+/// may therefore retain it when heap reaching is incomplete, just as it retains
+/// the lexical declaration itself. Assignment-bound literals do not satisfy
+/// this shape and still require execution evidence.
+fn jsts_property_is_binding_literal_declaration(receiver_root: Node<'_>) -> bool {
+    receiver_root.parent().is_some_and(|declarator| {
+        declarator.kind() == "variable_declarator"
+            && declarator
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == receiver_root.id())
+    })
+}
+
+/// Prove the small part of program-scope execution order that tree-sitter
+/// represents exhaustively without adding a semantic module procedure. A
+/// direct eager program statement completes before a later program statement;
+/// a store below conditional control or either node below a deferred function
+/// or class body is deliberately left incomplete.
+fn jsts_program_sequence_proves_reaching(establishment: Node<'_>, focused: Node<'_>) -> bool {
+    let Some(establishment_site) = jsts_program_site(establishment) else {
         return false;
     };
-    while !matches!(
-        node.kind(),
-        "pair" | "shorthand_property_identifier" | "method_definition"
-    ) {
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        if matches!(parent.kind(), "assignment_expression" | "program") {
-            return false;
-        }
-        node = parent;
+    let Some(read_site) = jsts_program_site(focused) else {
+        return false;
+    };
+    if establishment_site.program.id() != read_site.program.id()
+        || establishment_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_deferred_evaluation_boundary(ancestor.kind()))
+        || read_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_deferred_evaluation_boundary(ancestor.kind()))
+        || establishment_site
+            .ancestors
+            .iter()
+            .any(|ancestor| jsts_conditional_program_establishment(ancestor.kind()))
+    {
+        return false;
     }
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "object")
+    let mut establishment_ordinal = None;
+    let mut read_ordinal = None;
+    let mut cursor = establishment_site.program.walk();
+    for (ordinal, child) in establishment_site
+        .program
+        .named_children(&mut cursor)
+        .enumerate()
+    {
+        if child.id() == establishment_site.child.id() {
+            establishment_ordinal = Some(ordinal);
+        }
+        if child.id() == read_site.child.id() {
+            read_ordinal = Some(ordinal);
+        }
+    }
+    matches!(
+        (establishment_ordinal, read_ordinal),
+        (Some(establishment), Some(read)) if establishment < read
+    )
+}
+
+struct JstsProgramSite<'tree> {
+    program: Node<'tree>,
+    child: Node<'tree>,
+    ancestors: Vec<Node<'tree>>,
+}
+
+fn jsts_program_site(node: Node<'_>) -> Option<JstsProgramSite<'_>> {
+    let mut child = node;
+    let mut ancestors = Vec::new();
+    while let Some(parent) = child.parent() {
+        if parent.kind() == "program" {
+            return Some(JstsProgramSite {
+                program: parent,
+                child,
+                ancestors,
+            });
+        }
+        ancestors.push(parent);
+        child = parent;
+    }
+    None
+}
+
+fn jsts_deferred_evaluation_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+            | "class_declaration"
+            | "class"
+            | "class_body"
+            | "field_definition"
+            | "public_field_definition"
+            | "class_static_block"
+    )
+}
+
+fn jsts_conditional_program_establishment(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_block"
+            | "if_statement"
+            | "switch_statement"
+            | "switch_body"
+            | "switch_case"
+            | "switch_default"
+            | "for_statement"
+            | "for_in_statement"
+            | "while_statement"
+            | "do_statement"
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "ternary_expression"
+            | "binary_expression"
+            | "assignment_pattern"
+            | "augmented_assignment_expression"
+    )
+}
+
+fn jsts_property_definition_matches_store(definition: &Range, store: &PropertyStoreRecord) -> bool {
+    let source = store.source_locator.anchor().span();
+    source.start_byte() as usize <= definition.start_byte
+        && source.end_byte() as usize >= definition.end_byte
 }
 
 /// Keeps only declaration candidates that share the reference receiver's

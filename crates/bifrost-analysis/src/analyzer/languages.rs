@@ -121,6 +121,17 @@ pub(crate) trait LanguageSupport: Send + Sync {
         analyzer: &'a dyn IAnalyzer,
     ) -> Option<&'a dyn ForwardQueryProvider>;
 
+    /// Language-owned producer for resolver-proven actual-to-formal call
+    /// conversion facts. The shared call-conversion relation supplies the
+    /// exact call/signature/actual/formal join and invokes this capability for
+    /// owner applicability and AST-backed type proof.
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        None
+    }
+
     /// Whether this language's saved callable-default metadata is complete and
     /// closed for the analyzer generation. `None` leaves default-argument
     /// binding unproven because the language has no such capability or the
@@ -1107,6 +1118,23 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
             assert_eq!(support_of(language).language(), language);
         }
         assert!(language_support(Language::None).is_none());
+    }
+
+    #[test]
+    fn call_conversion_producers_are_registered_only_by_their_owners() {
+        for language in ANALYZABLE {
+            let registered = support_of(language)
+                .call_argument_conversion_prover()
+                .is_some();
+            assert_eq!(
+                registered,
+                matches!(
+                    language,
+                    Language::Java | Language::TypeScript | Language::Rust
+                ),
+                "call conversion capability registration for {language:?}"
+            );
+        }
     }
 
     /// The receiver query gate admits exactly the languages reporting this capability,

@@ -425,6 +425,11 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryFieldWriteValue>,
     },
+    #[serde(rename = "keyed_read_value")]
+    RuntimeKeyedReadValue {
+        #[serde(flatten)]
+        value: Box<CodeQueryRuntimeKeyedReadValue>,
+    },
     CallShape {
         #[serde(flatten)]
         value: Box<CodeQueryCallShape>,

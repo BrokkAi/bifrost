@@ -261,6 +261,42 @@ pub struct CodeQueryFieldWriteValue {
     pub coverage: &'static str,
 }
 
+/// One exact activation-aware runtime keyed read. Endpoint rows carry the
+/// oracle's proof and completeness independently; a terminal row retains
+/// typed exclusion or incompleteness when no endpoint can be published.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryRuntimeKeyedReadValue {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub text: String,
+    pub runtime: String,
+    pub global: String,
+    pub container: String,
+    pub key_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u64>,
+    pub source_origin: &'static str,
+    pub outcome: &'static str,
+    pub proof: &'static str,
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_model_set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refinement_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<&'static str>,
+    pub conclusive_exclusion: bool,
+    pub terminal: bool,
+}
+
 /// The mandatory terminal row for one receiver/value analysis site. Evidence
 /// rows may be empty, but this row always states why and whether that absence
 /// is exhaustive.
@@ -835,10 +871,15 @@ pub struct CodeQueryCallBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_kind: Option<&'static str>,
     /// The conversion or coercion the language applies to this actual before it
-    /// reaches the formal, in the publishing language's own vocabulary. Absent
-    /// on every row Bifrost mints today: no adapter establishes the fact yet.
+    /// reaches the formal, in the publishing language's own vocabulary.
+    /// Missing proof is distinguished from inapplicability by conversion_status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<String>,
+    /// Whether conversion typing is proven, unknown, or not applicable to a
+    /// row with no ordinary source actual (such as a receiver or default).
+    pub conversion_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversion_reason: Option<crate::analyzer::usages::call_conversion::ConversionUnknown>,
     /// `exact`, `ambiguous`, `incomplete`, or `unsupported`.
     pub mapping: &'static str,
     /// The typed reason this row is not `exact`. An exact row states none.

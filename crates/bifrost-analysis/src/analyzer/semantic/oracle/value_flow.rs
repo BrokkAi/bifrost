@@ -263,7 +263,8 @@ impl MemoryAccessChains {
             };
             let base = match row.kind {
                 MemoryLocationKind::Index { .. } => return true,
-                MemoryLocationKind::Field { base, .. } => base,
+                MemoryLocationKind::Field { base, .. }
+                | MemoryLocationKind::Property { base, .. } => base,
                 MemoryLocationKind::Static { .. }
                 | MemoryLocationKind::LexicalCell { .. }
                 | MemoryLocationKind::Capture { .. } => return false,
@@ -382,6 +383,7 @@ fn structured_value_origin_matches_root(
             AccessPathRoot::Static(_)
             | AccessPathRoot::TypeSummary(_)
             | AccessPathRoot::ModuleObject(_)
+            | AccessPathRoot::RuntimeObject(_)
             | AccessPathRoot::External(_)
             | AccessPathRoot::CallResult(_)
             | AccessPathRoot::LexicalCell(_)

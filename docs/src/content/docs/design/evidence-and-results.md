@@ -46,6 +46,13 @@ Policy and extension surfaces may use wire labels such as `frontier_bounded`,
 semantic distinctions. A transport error remains distinct from an analysis
 outcome.
 
+Public semantic budget failures name a coarse lane: `source`, `rows`,
+`retained_bytes`, `steps`, or `files`. The internal ledger can refine its
+accounting without changing this vocabulary. In dispatch outcome rows,
+`exceeded_limit` is optional: an unavailable lane does not turn budget exhaustion
+into a complete result. Lane projection preserves the typed outcome, candidate
+coverage, proof, and completeness.
+
 ## Scope is part of the claim
 
 Completeness is scoped to the request that produced the result. Relevant scope
@@ -61,6 +68,27 @@ includes:
 
 For example, a complete three-file search supports a three-file absence claim.
 A procedure-local CFG query supports only that procedure-local claim.
+
+Completeness also follows the fields a consumer uses. An exact call binding
+establishes which actual argument maps to which formal parameter; it need not
+establish the conversion between their types. Binding rows report conversion
+proof separately as `proven`, `unknown`, or `not_applicable`, with a typed reason
+when unknown. A conversion-dependent field read preserves that unknown through
+cached rows and relational evaluation. It cannot become an ordinary null that
+proves absence. A selector that uses only the exact binding identity does not
+inherit unrelated conversion uncertainty.
+
+Rust call conversions use exact annotated types and selected bindings to prove
+identity and supported builtin reference adjustments: dereferencing,
+mutable-to-shared reborrowing, and array-reference-to-slice unsizing. These
+adjustments retain operation provenance without asserting an identity-breaking
+value conversion. Their proof concerns conversion typing, not borrow validity;
+unresolved lifetime, generic, or user-defined coercion obligations stay unknown.
+
+The same separation applies to Java flow: an exact argument mapping establishes
+value dependence even when the conversion annotation is unknown. That does not
+establish reference identity. Unknown conversions cannot transport heap aliases,
+and proven unboxing retains its possible exceptional boundary.
 
 ## Positive evidence and authoritative absence
 

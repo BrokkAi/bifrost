@@ -4,16 +4,21 @@
 //! workspace heap. A saved read names the version it observed; a later store
 //! or an effect that may run user code prevents its guard from refining a new
 //! version. Alternatives meet by union, including the no-store entry path.
+//!
+//! Only two questions read a value's origins: whether the base of a field
+//! access is the receiver, and what a guard's subject was read from. Origins
+//! are therefore carried for those values and for the values that copy into
+//! one. Every other value would carry state that nothing reads.
 
 use std::collections::VecDeque;
 
 use super::correlations::CorrelationError;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CancellationToken, ClassAtom, ClassIdentity, GuardPredicate, MemberAccessQuery,
-    MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProgramPointId, SemanticBudget,
-    SemanticEffect, SemanticGapImpact, SemanticValueKind, SemanticWork, TypeFlowAdapter,
-    ValueFlowSnapshot, ValueId,
+    CancellationToken, ClassAtom, ClassIdentity, GuardFact, GuardPredicate, MemberAccessQuery,
+    MemoryLocationId, MemoryLocationKind, ProcedureHandle, ProcedureSemantics, ProgramPointId,
+    SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticValueKind, SemanticWork,
+    TypeFlowAdapter, ValueFlowSnapshot, ValueId,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -64,10 +69,11 @@ impl State {
         &mut self,
         source: ValueId,
         target: ValueId,
+        tracked: &HashSet<ValueId>,
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<(), CorrelationError> {
-        if source == target {
+        if source == target || !tracked.contains(&target) {
             return Ok(());
         }
         if self.origins.contains_key(&source) {
@@ -177,10 +183,17 @@ impl State {
 
 struct FieldAccesses {
     members: Vec<Box<str>>,
+    /// The values whose origins a query can observe. See [`tracked_values`].
+    tracked: HashSet<ValueId>,
     receiver_truthiness_is_pure: bool,
     truthiness_is_pure: Vec<bool>,
     pure_reads: HashSet<(usize, MemoryLocationId)>,
     locations: HashMap<MemoryLocationId, (usize, ValueId)>,
+    /// The state slot that carries each member's versions.  A member this
+    /// procedure only stores has no slot: nothing reads a version back, so
+    /// carrying its versions costs state that no answer depends on.
+    version_slots: Vec<Option<usize>>,
+    version_slot_count: usize,
 }
 
 impl FieldAccesses {
@@ -197,9 +210,13 @@ impl FieldAccesses {
         let mut locations = HashMap::default();
         let mut known = HashMap::<Box<str>, Option<usize>>::default();
         let mut location_members = Vec::<(MemoryLocationId, Box<str>)>::new();
+        let mut queried = HashSet::default();
         for location in procedure.semantics().memory_locations() {
             check_cancelled(cancellation)?;
             charge_entries(budget, 1)?;
+            if let MemoryLocationKind::Field { base, .. } = location.kind {
+                queried.insert(base);
+            }
             let Some(member) =
                 adapter.accessed_member(workspace, procedure, MemberAccessQuery::Load(location))
             else {
@@ -266,14 +283,108 @@ impl FieldAccesses {
                 }
             }
         }
+        let tracked = tracked_values(procedure.semantics(), queried, budget, cancellation)?;
+        let mut version_slots = vec![None; members.len()];
+        let mut version_slot_count = 0;
+        for point in procedure.semantics().points() {
+            check_cancelled(cancellation)?;
+            charge_entries(budget, point.events.len().saturating_add(1))?;
+            for event in &point.events {
+                let SemanticEffect::MemoryLoad { location, .. } = event.effect else {
+                    continue;
+                };
+                let Some(&(field, _)) = locations.get(&location) else {
+                    continue;
+                };
+                if version_slots[field].is_none() {
+                    version_slots[field] = Some(version_slot_count);
+                    version_slot_count += 1;
+                }
+            }
+        }
         Ok(Self {
             members,
+            tracked,
             receiver_truthiness_is_pure: adapter.truthiness_is_pure(workspace, class),
             truthiness_is_pure,
             pure_reads,
             locations,
+            version_slots,
+            version_slot_count,
         })
     }
+}
+
+/// The value one guard fact reads origins from, when it has one.
+fn guard_origin_subject(guard: &GuardFact) -> Option<ValueId> {
+    match guard.predicate {
+        GuardPredicate::Truthy { value }
+        | GuardPredicate::InstanceOf { value, .. }
+        | GuardPredicate::HasMember { value, .. } => Some(value),
+        GuardPredicate::NullComparison { .. } => guard.subject,
+        _ => None,
+    }
+}
+
+/// The values whose origins a query can observe, and the values that copy
+/// into one.
+///
+/// A field access reads the origins of its base to decide whether the base is
+/// the receiver, and an edge refinement reads the origins of its guard's
+/// subject. Those bases and subjects are the only origins any answer depends
+/// on. The transfer function reads a copy's source to write its target, so
+/// the closure over copy events adds every value that can supply one of them.
+/// The closure ignores CFG order on purpose: taking every copy event in the
+/// procedure over-covers any one path through it.
+fn tracked_values(
+    semantics: &ProcedureSemantics,
+    mut queried: HashSet<ValueId>,
+    budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<HashSet<ValueId>, CorrelationError> {
+    for guard in semantics.guard_facts() {
+        check_cancelled(cancellation)?;
+        charge_entries(budget, 1)?;
+        if let Some(subject) = guard_origin_subject(guard) {
+            queried.insert(subject);
+        }
+    }
+    let mut sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
+    for point in semantics.points() {
+        check_cancelled(cancellation)?;
+        charge_entries(budget, point.events.len().saturating_add(1))?;
+        for event in &point.events {
+            let (source, target) = match event.effect {
+                SemanticEffect::Assignment { target, value } => (value, target),
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind,
+                } if kind.preserves_runtime_class() => (source, target),
+                _ => continue,
+            };
+            if source == target {
+                continue;
+            }
+            sources_of.entry(target).or_default().push(source);
+        }
+    }
+    let mut tracked = queried.clone();
+    let mut pending = queried.into_iter().collect::<Vec<_>>();
+    while let Some(target) = pending.pop() {
+        check_cancelled(cancellation)?;
+        charge_entries(budget, 1)?;
+        let Some(sources) = sources_of.get(&target) else {
+            continue;
+        };
+        charge_entries(budget, sources.len())?;
+        for &source in sources {
+            if tracked.insert(source) {
+                pending.push(source);
+            }
+        }
+    }
+    Ok(tracked)
 }
 
 fn transfer(
@@ -298,7 +409,7 @@ fn transfer(
         charge_entries(budget, 1)?;
         match event.effect {
             SemanticEffect::Assignment { target, value } => {
-                state.copy(value, target, budget, cancellation)?;
+                state.copy(value, target, &accesses.tracked, budget, cancellation)?;
             }
             SemanticEffect::ValueFlow {
                 source,
@@ -306,7 +417,7 @@ fn transfer(
                 kind,
             } => {
                 if kind.preserves_runtime_class() {
-                    state.copy(source, target, budget, cancellation)?;
+                    state.copy(source, target, &accesses.tracked, budget, cancellation)?;
                 } else {
                     state.origins.remove(&target);
                 }
@@ -317,19 +428,23 @@ fn transfer(
                 if let Some(&(field, base)) = accesses.locations.get(&location)
                     && state.is_receiver(base)
                 {
-                    charge_entries(budget, state.fields[field].len().saturating_add(1))?;
-                    let alternatives = state.fields[field].clone();
-                    charge_entries(budget, alternatives.len().saturating_add(1))?;
-                    state.origins.insert(
-                        result,
-                        alternatives
-                            .iter()
-                            .map(|alternative| Origin::Read {
-                                field,
-                                version: alternative.version,
-                            })
-                            .collect(),
-                    );
+                    let slot = accesses.version_slots[field]
+                        .expect("a loaded member carries version state");
+                    charge_entries(budget, state.fields[slot].len().saturating_add(1))?;
+                    let alternatives = state.fields[slot].clone();
+                    if accesses.tracked.contains(&result) {
+                        charge_entries(budget, alternatives.len().saturating_add(1))?;
+                        state.origins.insert(
+                            result,
+                            alternatives
+                                .iter()
+                                .map(|alternative| Origin::Read {
+                                    field,
+                                    version: alternative.version,
+                                })
+                                .collect(),
+                        );
+                    }
                     charge_entries(budget, 1)?;
                     loads.push(FieldLoadRefinement {
                         point,
@@ -361,23 +476,29 @@ fn transfer(
                 if let Some(&(field, base)) = accesses.locations.get(&location)
                     && state.is_receiver(base)
                 {
-                    // Static store IDs recur in loops. Invalidate saved reads
-                    // before installing the new epoch, even at the same store.
-                    state.origins.retain(|_, origins| {
-                        !origins.iter().any(|origin| {
-                            matches!(origin, Origin::Read { field: candidate, .. } if *candidate == field)
-                        })
-                    });
-                    check_cancelled(cancellation)?;
-                    charge_entries(budget, 1)?;
-                    state.fields[field] = vec![FieldAlternative {
-                        version: FieldVersion::Store {
-                            point,
-                            event: event_index,
-                            value,
-                        },
-                        guards: Vec::new(),
-                    }];
+                    // A member with no version state was never loaded here, so
+                    // no saved read names it and no later load reads the epoch
+                    // this store would install.
+                    if let Some(slot) = accesses.version_slots[field] {
+                        // Static store IDs recur in loops. Invalidate saved
+                        // reads before installing the new epoch, even at the
+                        // same store.
+                        state.origins.retain(|_, origins| {
+                            !origins.iter().any(|origin| {
+                                matches!(origin, Origin::Read { field: candidate, .. } if *candidate == field)
+                            })
+                        });
+                        check_cancelled(cancellation)?;
+                        charge_entries(budget, 1)?;
+                        state.fields[slot] = vec![FieldAlternative {
+                            version: FieldVersion::Store {
+                                point,
+                                event: event_index,
+                                value,
+                            },
+                            guards: Vec::new(),
+                        }];
+                    }
                 } else {
                     state.open(point, event_index, budget, cancellation)?;
                 }
@@ -427,13 +548,7 @@ fn refine_edge(
         } else {
             continue;
         };
-        let subject = match guard.predicate {
-            GuardPredicate::Truthy { value }
-            | GuardPredicate::InstanceOf { value, .. }
-            | GuardPredicate::HasMember { value, .. } => Some(value),
-            GuardPredicate::NullComparison { .. } => guard.subject,
-            _ => None,
-        };
+        let subject = guard_origin_subject(guard);
         let origins = subject.and_then(|subject| state.origins.get(&subject));
         if matches!(guard.predicate, GuardPredicate::Truthy { .. })
             && !origins.is_some_and(|origins| {
@@ -462,7 +577,8 @@ fn refine_edge(
             continue;
         };
         let field = *field;
-        for alternative in &mut state.fields[field] {
+        let slot = accesses.version_slots[field].expect("a read member carries version state");
+        for alternative in &mut state.fields[slot] {
             check_cancelled(cancellation)?;
             if origins.contains(&Origin::Read {
                 field,
@@ -529,13 +645,17 @@ pub(super) fn derive(
         budget,
         cancellation,
     )?;
-    if accesses.members.is_empty() {
+    if accesses.version_slot_count == 0 {
+        // Without a loaded plain member this analysis has no load to refine.
         return Ok(Vec::new());
     }
     let semantics = procedure.semantics();
     let mut origins = HashMap::default();
     for value in semantics.values() {
         check_cancelled(cancellation)?;
+        if !accesses.tracked.contains(&value.id) {
+            continue;
+        }
         if matches!(value.kind, SemanticValueKind::Receiver { .. }) {
             charge_entries(budget, 1)?;
             origins.insert(value.id, HashSet::from_iter([Origin::Receiver]));
@@ -544,7 +664,7 @@ pub(super) fn derive(
             origins.insert(value.id, HashSet::from_iter([Origin::PureTruthiness]));
         }
     }
-    charge_entries(budget, accesses.members.len().saturating_add(1))?;
+    charge_entries(budget, accesses.version_slot_count.saturating_add(1))?;
     let initial = State {
         origins,
         fields: vec![
@@ -552,7 +672,7 @@ pub(super) fn derive(
                 version: FieldVersion::Entry,
                 guards: Vec::new(),
             }];
-            accesses.members.len()
+            accesses.version_slot_count
         ],
     };
     let point_count = semantics.points().len();
@@ -633,4 +753,98 @@ pub(super) fn derive(
         }
     }
     Ok(loads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic::{
+        CancellationToken, SemanticBudget, SemanticRequest, type_flow_adapter,
+    };
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+    use crate::type_flow::FieldSlotIndex;
+
+    const SOURCE: &str = concat!(
+        "class Box:\n",
+        "    def __init__(self, first, second):\n",
+        "        self.first = first\n",
+        "        self.second = second\n",
+        "\n",
+        "    def read(self, value):\n",
+        "        self.first = value\n",
+        "        return self.first\n",
+    );
+
+    fn derive_named(name: &str) -> Vec<FieldLoadRefinement> {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("the fixture materializes")
+            .available_value()
+            .cloned()
+            .expect("the fixture stays available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap_or_else(|| panic!("the fixture declares `{name}`"));
+        let adapter = type_flow_adapter(Language::Python).expect("Python has a type-flow adapter");
+        let field_slots = FieldSlotIndex::build(&workspace, adapter, &mut budget, &cancellation)
+            .expect("the fixture's field slots build");
+        let class = adapter
+            .enclosing_class(&workspace, &procedure)
+            .expect("the fixture's methods have an enclosing class");
+        derive(
+            &workspace,
+            adapter,
+            &procedure,
+            None,
+            &class,
+            &field_slots,
+            &mut budget,
+            &cancellation,
+        )
+        .expect("field refinement completes within the default budget")
+    }
+
+    #[test]
+    fn a_member_the_procedure_only_stores_carries_no_version_state() {
+        assert!(
+            derive_named("__init__").is_empty(),
+            "a procedure that reads back no member has no load to refine"
+        );
+    }
+
+    #[test]
+    fn a_member_the_procedure_loads_still_carries_version_state() {
+        let loads = derive_named("read");
+        assert!(
+            loads
+                .iter()
+                .any(|load| load.member.as_ref() == "first" && !load.alternatives.is_empty()),
+            "the load of `first` names the versions it could have observed: {loads:#?}"
+        );
+        assert!(
+            loads.iter().all(|load| load.member.as_ref() != "second"),
+            "a member this procedure never loads produces no refinement: {loads:#?}"
+        );
+    }
 }

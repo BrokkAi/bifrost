@@ -41,7 +41,9 @@ use crate::value_flow::{
 
 use super::FieldSlotIndex;
 use super::field_slots::{MemberStoreEvidence, class_order};
-use super::plan::{MemberAccessSite, TypeFlowPlan, TypeFlowPlanError, uncovered_reason};
+use super::plan::{
+    MemberAccessSite, ProcedureRefinements, TypeFlowPlan, TypeFlowPlanError, uncovered_reason,
+};
 use super::refinement_sources::DefinitionSources;
 use super::summary::{
     ClassSetAcquisitionCuts, PreparedClassSetSummaries, TypeFlowSummaryProfile,
@@ -338,6 +340,9 @@ pub fn solve_type_flow_for_root(
     // or feedback iteration must not erase a root probe that already fell back
     // without charging solver work.
     let mut root_summary_observation_rejections = 0usize;
+    // Every plan attempt in this solve rederives the same procedure-local
+    // refinements. Hold them across attempts so the work is performed once.
+    let mut refinements = ProcedureRefinements::default();
     for iteration in 0..feedback_limits.max_iterations() {
         // A feedback pass is a speculative refinement of the preceding
         // result. Stage its semantic charges so an exhausted refinement can
@@ -375,6 +380,7 @@ pub fn solve_type_flow_for_root(
                     limits,
                     &mut iteration_budget,
                     request.cancellation,
+                    &mut refinements,
                     &mut acquisition_cuts,
                 )
             } else {
@@ -387,6 +393,7 @@ pub fn solve_type_flow_for_root(
                     limits,
                     &mut iteration_budget,
                     request.cancellation,
+                    &mut refinements,
                 )
             };
             let plan_cache_writes = discovery_provider.take_retained_writes();
@@ -437,6 +444,7 @@ pub fn solve_type_flow_for_root(
                     }
                     let refinement = DefinitionSources::new(
                         &preliminary,
+                        plan.source_refinement_points(),
                         &mut iteration_budget,
                         request.cancellation,
                     )
@@ -468,7 +476,7 @@ pub fn solve_type_flow_for_root(
                     }
                 }
             }
-            if plan.refinement_budget_exhausted() || plan.store_survey_boundary().is_some() {
+            if plan.refinement_budget_exhausted() {
                 let result = solve_value_flow_with_summaries(
                     root,
                     &provider,
@@ -817,6 +825,8 @@ fn dispatch_hint_flags(
     receiver_set_complete: bool,
 ) -> (bool, bool) {
     let exhaustive = receiver_set_complete
+        && receiver_class_count > 0
+        && declarations.len() == receiver_class_count
         && declarations
             .iter()
             .all(|(_, hit)| hit.dispatch_coverage == CandidateCoverage::Exhaustive);
@@ -832,9 +842,11 @@ fn interpret(
     result: &ValueFlowSummaryResult,
 ) -> TypeFlowRootResult {
     let termination = result.result().termination();
-    let complete = termination.is_fixed_point()
-        && !plan.refinement_budget_exhausted()
-        && plan.store_survey_boundary().is_none();
+    // A dynamic-write survey boundary is carried per slot: a write that
+    // carries a reason affects every class, so `member_store_evidence` answers
+    // `Unknown` wherever it could apply. It is not a property of this root and
+    // must not decide completion.
+    let complete = termination.is_fixed_point() && !plan.refinement_budget_exhausted();
     let semantic_budget_exhausted = plan.field_slot_semantic_budget_exhausted()
         || plan
             .value_flow()
@@ -886,17 +898,13 @@ fn interpret(
                 }
             }
         };
-        if let Some(reason) = plan.store_survey_boundary() {
-            push_reason(&mut set.unknown, reason);
-            set.status = ClassSetStatus::Inconclusive;
-        }
         if plan.refinement_budget_exhausted() {
             push_reason(&mut set.unknown, UnknownReason::SemanticBudget);
             set.status = ClassSetStatus::Inconclusive;
         }
         class_sets.push(set);
     }
-    if plan.refinement_budget_exhausted() || plan.store_survey_boundary().is_some() {
+    if plan.refinement_budget_exhausted() {
         findings.clear();
     }
     let mut distinct_findings: Vec<AbsentMemberFinding> = Vec::new();
@@ -1196,6 +1204,22 @@ mod retry_tests {
         )];
 
         assert_eq!(dispatch_hint_flags(&declarations, 1, true), (false, false));
+    }
+
+    #[test]
+    fn every_receiver_class_needs_a_dispatch_declaration() {
+        let declaration =
+            MemberDeclaration::External(ExternalMemberDeclaration::new([Box::from("method-run")]));
+        let declarations = [(
+            ClassIdentity::External {
+                qualified_name: "pkg.Widget".into(),
+                symbol_id: "class-widget".into(),
+            },
+            MemberLookupHit::new(declaration, CandidateCoverage::Exhaustive),
+        )];
+        assert_eq!(dispatch_hint_flags(&declarations, 1, true), (true, true));
+        assert_eq!(dispatch_hint_flags(&declarations, 2, true), (false, false));
+        assert_eq!(dispatch_hint_flags(&[], 0, true), (false, false));
     }
 
     #[test]

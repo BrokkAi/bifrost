@@ -187,6 +187,14 @@ pub enum CodeQueryResultRef {
         completeness: &'static str,
         coverage: &'static str,
     },
+    RuntimeKeyedReadValue {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        proof: &'static str,
+        completeness: &'static str,
+    },
     DispatchOutcome {
         id: String,
         site_id: String,
@@ -615,6 +623,7 @@ impl CodeQueryResultRef {
             Self::ReceiverOutcome { .. } => "receiver_outcome",
             Self::ReceiverEvidence { .. } => "receiver_evidence",
             Self::FieldWriteValue { .. } => "field_write_value",
+            Self::RuntimeKeyedReadValue { .. } => "keyed_read_value",
             Self::DispatchOutcome { .. } => "dispatch_outcome",
             Self::DispatchTarget { .. } => "dispatch_target",
             Self::MemberFamily { .. } => "member_family",
@@ -689,6 +698,7 @@ impl CodeQueryResultRef {
             | Self::ReceiverOutcome { path, .. }
             | Self::ReceiverEvidence { path, .. }
             | Self::FieldWriteValue { path, .. }
+            | Self::RuntimeKeyedReadValue { path, .. }
             | Self::DispatchOutcome { path, .. }
             | Self::DispatchTarget { path, .. }
             | Self::MemberFamily { path, .. }

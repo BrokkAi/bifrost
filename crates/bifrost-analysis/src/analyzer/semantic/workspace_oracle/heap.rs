@@ -40,6 +40,7 @@ struct ObjectDraft {
     evidence: Vec<EvidenceHandle>,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    runtime_read: Option<crate::analyzer::semantic::RuntimeReadRelationEvidence>,
 }
 
 fn transfer_stops_identity_trace(
@@ -123,6 +124,13 @@ fn candidate_cardinality_for_root(root: &AccessPathRoot) -> ObjectCardinality {
         | AccessPathRoot::Allocation(_)
         | AccessPathRoot::ModuleObject(_)
         | AccessPathRoot::External(_) => ObjectCardinality::Unknown,
+        AccessPathRoot::RuntimeObject(root) => {
+            if root.singleton_proven() {
+                ObjectCardinality::Singleton
+            } else {
+                ObjectCardinality::Unknown
+            }
+        }
     }
 }
 
@@ -208,7 +216,8 @@ fn root_evidence(
         AccessPathRoot::Static(_)
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => Some(procedure.semantics().evidence()),
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_) => Some(procedure.semantics().evidence()),
     };
     Ok(vec![evidence_handle(
         procedure,
@@ -489,7 +498,8 @@ fn location_capabilities_are_open(access: &AccessPathAtPoint) -> bool {
             .selectors()
             .iter()
             .any(|selector| match selector {
-                crate::analyzer::semantic::AccessSelector::Field(_) => {
+                crate::analyzer::semantic::AccessSelector::Field(_)
+                | crate::analyzer::semantic::AccessSelector::Property(_) => {
                     !capabilities.is_available(SemanticCapability::FieldMemory)
                 }
                 crate::analyzer::semantic::AccessSelector::Index(_) => {
@@ -633,6 +643,7 @@ fn push_object_with_quality(
             evidence,
             proof: quality.0,
             completeness: quality.1,
+            runtime_read: None,
         });
     }
 }
@@ -707,6 +718,7 @@ fn symbolic_object(
         evidence,
         proof: quality.0,
         completeness: quality.1,
+        runtime_read: None,
     })
 }
 
@@ -814,6 +826,7 @@ fn allocation_object_draft(
         evidence,
         proof: quality.0,
         completeness: quality.1,
+        runtime_read: None,
     })
 }
 
@@ -1089,6 +1102,24 @@ fn resolve_objects(
             ..SemanticWork::default()
         })
         .map_err(InterruptionOrProvider::Interruption)?;
+    let runtime_outcome = oracle
+        .runtime_refinements_for_procedure(procedure, &mut staged.request(cancellation))
+        .map_err(InterruptionOrProvider::Provider)?;
+    staged.work = staged.work.conservative_add(runtime_outcome.work());
+    match &runtime_outcome {
+        SemanticOutcome::Cancelled { .. } => {
+            return Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled,
+            ));
+        }
+        SemanticOutcome::ExceededBudget { exceeded, .. } => {
+            return Err(InterruptionOrProvider::Interruption(Interruption::Budget(
+                *exceeded,
+            )));
+        }
+        _ => {}
+    }
+    let runtime_reads = runtime_outcome.available_value();
     let gaps_open = heap_gaps_are_open(procedure, staged, cancellation, |gap| {
         gap.subject == SemanticGapSubject::Procedure
     })
@@ -1169,7 +1200,8 @@ fn resolve_objects(
                         "semantic gap event has a stale gap ID",
                     ))
                 })?;
-                if gap_can_open_heap(procedure, gap, &mut abort_user_code)
+                if !runtime_reads.is_some_and(|reads| reads.discharges(gap.id))
+                    && gap_can_open_heap(procedure, gap, &mut abort_user_code)
                     && traced_gap_affects_value(procedure, gap, state.value, staged, cancellation)?
                     && !call_result_materialization_owns_gap(procedure, gap, state.value)
                     && !constructor_allocation_identity_discharges_gap(
@@ -1314,7 +1346,17 @@ fn resolve_objects(
                 event.effect,
                 SemanticEffect::MemoryLoad { result, .. } if result == state.value
             ) {
-                open = true;
+                let endpoint = runtime_reads.and_then(|reads| {
+                    reads.endpoints.iter().find(|endpoint| {
+                        [&endpoint.observation, &endpoint.container_observation]
+                            .into_iter()
+                            .any(|observation| {
+                                observation.value().id() == state.value
+                                    && observation.point().id() == state.point
+                            })
+                    })
+                });
+                open |= endpoint.is_none();
                 let value = value_handle(procedure, state.value)
                     .map_err(InterruptionOrProvider::Provider)?;
                 let evidence = dedup_evidence(
@@ -1323,14 +1365,47 @@ fn resolve_objects(
                             .map_err(InterruptionOrProvider::Provider)?,
                     )),
                 );
-                let draft = symbolic_object(procedure, value, evidence)
-                    .map_err(InterruptionOrProvider::Provider)?;
+                let object = if let Some(endpoint) = endpoint.filter(|endpoint| {
+                    endpoint.container_observation.value().id() == state.value
+                        && endpoint.container_observation.point().id() == state.point
+                }) {
+                    AbstractObject::new(
+                        AbstractObjectIdentity::RuntimeObject(endpoint.runtime_object.clone()),
+                        ObjectCardinality::Singleton,
+                    )
+                    .map_err(|error| {
+                        InterruptionOrProvider::Provider(internal_contract(
+                            "invalid runtime object",
+                            error,
+                        ))
+                    })?
+                } else {
+                    symbolic_object(procedure, value, evidence.clone())
+                        .map_err(InterruptionOrProvider::Provider)?
+                        .object
+                };
                 push_trace_object(
                     &mut drafts,
-                    draft.object,
-                    draft.evidence,
+                    object.clone(),
+                    evidence,
                     &state.alternative_quality,
                 );
+                if let Some(endpoint) = endpoint {
+                    let draft = drafts
+                        .iter_mut()
+                        .find(|draft| draft.object == object)
+                        .expect("inserted runtime value");
+                    draft.runtime_read =
+                        Some(crate::analyzer::semantic::RuntimeReadRelationEvidence {
+                            refinement_identity: endpoint.refinement_identity,
+                            active_model_set_hash: endpoint.active_model_set_hash.clone(),
+                            runtime_profile_digest: endpoint.runtime_profile_digest.clone(),
+                            manifest_digest: endpoint.manifest_digest.clone(),
+                            shard_id: endpoint.shard_id.clone(),
+                            exposure_id: endpoint.exposure_id.clone(),
+                            behavior_id: endpoint.behavior_id.clone(),
+                        });
+                }
                 producer = Some((state.value, index, Vec::new()));
                 break;
             }
@@ -1485,6 +1560,10 @@ fn materialize_points_to(
         .iter()
         .map(|draft| {
             OracleRelationRecord::new(OracleRelationKind::PointsTo, draft.evidence.clone(), limits)
+                .map(|record| match &draft.runtime_read {
+                    Some(evidence) => record.with_runtime_read(evidence.clone()),
+                    None => record,
+                })
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| internal_contract("could not create points-to provenance", error))?;
@@ -1547,7 +1626,8 @@ fn resolve_locations(
         | AccessPathRoot::CaptureSlot(_)
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => None,
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_) => None,
     } {
         let value = ValueAtPoint::new(
             value,
@@ -1604,6 +1684,7 @@ fn resolve_locations(
                 | AccessPathRoot::TypeSummary(_)
                 | AccessPathRoot::ModuleObject(_)
                 | AccessPathRoot::External(_)
+                | AccessPathRoot::RuntimeObject(_)
         ) {
             quality = (
                 ProofStatus::Unproven(
@@ -1631,6 +1712,7 @@ fn resolve_locations(
                 evidence,
                 proof: quality.0,
                 completeness: quality.1,
+                runtime_read: None,
             }],
             coverage: if open {
                 CandidateCoverage::Open
@@ -1814,6 +1896,9 @@ fn paths_structurally_disjoint(left: &AbstractLocation, right: &AbstractLocation
                 (
                     crate::analyzer::semantic::AccessSelector::Field(_),
                     crate::analyzer::semantic::AccessSelector::Field(_)
+                ) | (
+                    crate::analyzer::semantic::AccessSelector::Property(_),
+                    crate::analyzer::semantic::AccessSelector::Property(_)
                 )
             )
         })
@@ -2164,6 +2249,7 @@ fn mapped_formals_for_actual(
                         .iter()
                         .filter(|mapping| {
                             mapping.value().actual().value().id() == actual
+                                && mapping.value().preserves_reference_identity()
                                 && mapping.is_proven_complete()
                         })
                         .map(|mapping| mapping.value().formal().clone()),

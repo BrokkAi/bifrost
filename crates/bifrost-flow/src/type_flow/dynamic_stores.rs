@@ -2,15 +2,16 @@
 
 use super::correlations::CorrelationError;
 use super::field_slots::FieldSlotIndex;
-use super::plan::{TypeFlowPlan, TypeFlowPlanError};
+use super::plan::{ProcedureRefinements, TypeFlowPlan, TypeFlowPlanError};
 use super::refinement_sources::DefinitionSources;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, ProcedureHandle, SemanticBudget,
-    SemanticEffect, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason, ValueId,
-    WorkspaceIcfgProvider,
+    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, ProcedureHandle, ProgramPointId,
+    SemanticBudget, SemanticEffect, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason,
+    ValueId, WorkspaceIcfgProvider,
 };
 use crate::dataflow::{DataflowRequest, SolverBudget};
+use crate::hash::HashSet;
 use crate::value_flow::{
     ClosureLimits, ValueFlowCache, ValueFlowCarrier, WorkspaceValueFlowProvider,
     solve_value_flow_with_summaries,
@@ -73,6 +74,47 @@ impl ScopedDynamicWrite {
     }
 }
 
+/// The program point and event index at which a dynamic write is observed.
+///
+/// A write lowered as a call is observed at that call's invoke event; one
+/// lowered as a store is observed at the first store inside its source span.
+fn observation_point(write: &PendingDynamicWrite) -> Option<(ProgramPointId, usize)> {
+    let semantics = write.procedure.semantics();
+    let call = semantics.call_sites().iter().find_map(|call| {
+        (semantics.source_mapping(call.source)?.locator.anchor().span() == write.site.span).then(
+            || {
+                (
+                    call.point,
+                    semantics
+                        .point(call.point)
+                        .expect("live call point")
+                        .events
+                        .iter()
+                        .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
+                        .expect("a call owns its invoke event"),
+                )
+            },
+        )
+    });
+    call.or_else(|| {
+        semantics.points().iter().find_map(|point| {
+            point.events.iter().enumerate().find_map(|(index, event)| {
+                if !matches!(event.effect, SemanticEffect::MemoryStore { .. }) {
+                    return None;
+                }
+                let span = semantics
+                    .source_mapping(event.source)?
+                    .locator
+                    .anchor()
+                    .span();
+                (write.site.span.start_byte() <= span.start_byte()
+                    && span.end_byte() <= write.site.span.end_byte())
+                .then_some((point.id, index))
+            })
+        })
+    })
+}
+
 /// Each workspace procedure is an entry context, just as in the public
 /// workspace solve. Root-parameter unknowns supply no concrete workspace
 /// callers; their actual arguments are observed in the callers' closures.
@@ -104,9 +146,29 @@ pub(super) fn survey(
             },
         })
         .collect::<Vec<_>>();
+    // A write whose receiver reaches a root parameter takes its identity from
+    // an actual argument supplied by some caller. A root whose survey failed
+    // may have carried that caller, so such a write cannot be trusted as
+    // bounded once any root failed. A receiver built in place, or the
+    // enclosing procedure's own `self`, is bounded by the surveyed root alone.
+    let mut caller_dependent = vec![false; writes.len()];
+    // The first reason a root's own survey could not be completed. It scopes
+    // to the writes that could depend on the roots it did not observe, never
+    // to every write in the workspace.
+    let mut survey_failure: Option<UnknownReason> = None;
+    // The surveyed roots overlap, and they share one ledger, so one procedure's
+    // refinements are derived and charged once for the whole survey.
+    let mut refinements = ProcedureRefinements::default();
     for root in procedures {
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
+        }
+        // Every write is already open; no further root can narrow one.
+        if effects
+            .iter()
+            .all(|effect| effect.evidence.reason.is_some())
+        {
+            break;
         }
         let plan = match TypeFlowPlan::build(
             workspace,
@@ -119,25 +181,26 @@ pub(super) fn survey(
             },
             budget,
             cancellation,
+            &mut refinements,
         ) {
             Ok(plan) => plan,
             Err(TypeFlowPlanError::Cancelled) => return Err(TypeFlowPlanError::Cancelled),
-            // A failed discovery may have omitted a path to any surveyed write.
+            // A failed discovery may have omitted a path to a surveyed write.
+            // Record it and survey the remaining roots; the writes this root
+            // could have reached are opened once every root has been seen.
             Err(_) => {
                 if cancellation.is_cancelled() {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
-                for effect in &mut effects {
-                    effect.evidence.reason = Some(UnknownReason::IncompleteRoot);
-                }
-                break;
+                survey_failure.get_or_insert(UnknownReason::IncompleteRoot);
+                mark_unsurveyed(writes, root, &mut caller_dependent);
+                continue;
             }
         };
         if let Some(reason) = plan.discovery_boundary() {
-            for effect in &mut effects {
-                effect.evidence.reason = Some(reason.clone());
-            }
-            break;
+            survey_failure.get_or_insert(reason);
+            mark_unsurveyed(writes, root, &mut caller_dependent);
+            continue;
         }
         if !writes
             .iter()
@@ -158,61 +221,58 @@ pub(super) fn survey(
                 if cancellation.is_cancelled() {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
-                for effect in &mut effects {
-                    effect.evidence.reason = Some(UnknownReason::IncompleteRoot);
-                }
-                break;
+                survey_failure.get_or_insert(UnknownReason::IncompleteRoot);
+                mark_unsurveyed(writes, root, &mut caller_dependent);
+                continue;
             }
         };
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
         }
         if !result.result().termination().is_fixed_point() {
-            for effect in &mut effects {
-                effect.evidence.reason = Some(UnknownReason::SolverBudget);
-            }
-            break;
+            survey_failure.get_or_insert(UnknownReason::SolverBudget);
+            mark_unsurveyed(writes, root, &mut caller_dependent);
+            continue;
         }
-        let evidence = match DefinitionSources::new(&result, budget, cancellation) {
+        // The evidence index is built for exactly the points this survey asks
+        // about, so the observation each write resolves to is settled first.
+        let observations = writes
+            .iter()
+            .zip(&effects)
+            .map(|(write, effect)| {
+                (plan.value_flow().has_snapshot(&write.procedure)
+                    && effect.evidence.reason.is_none())
+                .then(|| observation_point(write))
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        let mut queried = HashSet::default();
+        for (write, observation) in writes.iter().zip(&observations) {
+            if let Some((point, _)) = observation {
+                queried.insert(
+                    write
+                        .procedure
+                        .point_handle(*point)
+                        .expect("write point is live"),
+                );
+            }
+        }
+        let evidence = match DefinitionSources::new(&result, queried, budget, cancellation) {
             Ok(evidence) => evidence,
             Err(CorrelationError::Cancelled { .. }) => return Err(TypeFlowPlanError::Cancelled),
             Err(CorrelationError::Budget(_)) => {
-                for effect in &mut effects {
-                    effect.evidence.reason = Some(UnknownReason::SemanticBudget);
-                }
-                break;
+                survey_failure.get_or_insert(UnknownReason::SemanticBudget);
+                mark_unsurveyed(writes, root, &mut caller_dependent);
+                continue;
             }
         };
-        for (write, effect) in writes.iter().zip(&mut effects) {
+        for (index, (write, effect)) in writes.iter().zip(&mut effects).enumerate() {
             if !plan.value_flow().has_snapshot(&write.procedure) || effect.evidence.reason.is_some()
             {
                 continue;
             }
-            let semantics = write.procedure.semantics();
-            let observation = semantics.call_sites().iter().find_map(|call| {
-                (semantics.source_mapping(call.source)?.locator.anchor().span() == write.site.span)
-                    .then(|| (call.point, semantics.point(call.point).expect("live call point").events.iter()
-                        .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
-                        .expect("a call owns its invoke event")))
-            });
-            let observation = observation.or_else(|| {
-                semantics.points().iter().find_map(|point| {
-                    point.events.iter().enumerate().find_map(|(index, event)| {
-                        if !matches!(event.effect, SemanticEffect::MemoryStore { .. }) {
-                            return None;
-                        }
-                        let span = semantics
-                            .source_mapping(event.source)?
-                            .locator
-                            .anchor()
-                            .span();
-                        (write.site.span.start_byte() <= span.start_byte()
-                            && span.end_byte() <= write.site.span.end_byte())
-                        .then_some((point.id, index))
-                    })
-                })
-            });
-            let (Some(receiver), Some((point, event))) = (write.receiver, observation) else {
+            let (Some(receiver), Some((point, event))) = (write.receiver, observations[index])
+            else {
                 effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);
                 continue;
             };
@@ -279,7 +339,12 @@ pub(super) fn survey(
                             effect.evidence.reason = Some(UnknownReason::SelfReceiver);
                         }
                     }
-                    ClassAtom::Unknown(UnknownReason::RootParameter) => {}
+                    // The identity comes from an actual argument at some
+                    // caller of this root, observed when that caller is itself
+                    // surveyed as a root.
+                    ClassAtom::Unknown(UnknownReason::RootParameter) => {
+                        caller_dependent[index] = true;
+                    }
                     ClassAtom::Unknown(UnknownReason::OpenTypeBound) => {
                         // Preserve the declared bound even if a guard excluded
                         // its concrete atom. Constructor replacement bounds
@@ -309,10 +374,34 @@ pub(super) fn survey(
             }
         }
     }
+    if let Some(reason) = survey_failure {
+        for (index, effect) in effects.iter_mut().enumerate() {
+            if effect.evidence.reason.is_none()
+                && (effect.classes.is_empty() || caller_dependent[index])
+            {
+                effect.evidence.reason = Some(reason.clone());
+            }
+        }
+    }
     for effect in &mut effects {
         effect.classes.sort_by(super::field_slots::class_order);
     }
     Ok(effects)
+}
+
+/// A write in a root whose own survey failed was never observed at its own
+/// entry, where its receiver parameters read as root parameters. Treat it as
+/// caller-dependent so the recorded failure opens it.
+fn mark_unsurveyed(
+    writes: &[PendingDynamicWrite],
+    root: &ProcedureHandle,
+    caller_dependent: &mut [bool],
+) {
+    for (index, write) in writes.iter().enumerate() {
+        if write.procedure.durable_key() == root.durable_key() {
+            caller_dependent[index] = true;
+        }
+    }
 }
 
 fn add_bound(

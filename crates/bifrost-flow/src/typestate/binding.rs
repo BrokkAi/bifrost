@@ -127,6 +127,19 @@ pub enum TypestateObjectKey {
     TypeSummary(SemanticLocator),
     ModuleObject(SemanticLocator),
     External(SemanticLocator),
+    RuntimeObject {
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: crate::analyzer::semantic::StableDigest,
+        active_model_set_hash: String,
+        manifest_digest: String,
+        shard_id: String,
+        behavior_id: String,
+        activation_source: String,
+    },
 }
 
 impl TypestateObjectKey {
@@ -1426,6 +1439,7 @@ fn visit_access_path_root_artifacts(
         | AccessPathRoot::TypeSummary(locator)
         | AccessPathRoot::ModuleObject(locator)
         | AccessPathRoot::External(locator) => visit(locator.scope().key()),
+        AccessPathRoot::RuntimeObject(_) => {}
     }
 }
 
@@ -1478,6 +1492,7 @@ fn visit_access_path_root_artifact_values(
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
         | AccessPathRoot::External(_) => {}
+        AccessPathRoot::RuntimeObject(_) => {}
     }
 }
 
@@ -1668,6 +1683,31 @@ fn typestate_object_key(object: &AbstractObject) -> TypestateObjectKey {
             TypestateObjectKey::ModuleObject(locator)
         }
         DurableObjectIdentity::External { locator } => TypestateObjectKey::External(locator),
+        DurableObjectIdentity::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        } => TypestateObjectKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        },
     }
 }
 
@@ -2426,6 +2466,19 @@ enum CanonicalObjectKey<'a> {
     External {
         identity: CanonicalLocator<'a>,
     },
+    RuntimeObject {
+        runtime_profile_digest: &'a str,
+        realm: &'a str,
+        exposure_id: &'a str,
+        container_member: &'a str,
+        state_boundary: &'a str,
+        refinement_identity: crate::analyzer::semantic::StableDigest,
+        active_model_set_hash: &'a str,
+        manifest_digest: &'a str,
+        shard_id: &'a str,
+        behavior_id: &'a str,
+        activation_source: &'a str,
+    },
 }
 
 #[derive(Serialize)]
@@ -2668,6 +2721,31 @@ fn canonical_object_key(key: &TypestateObjectKey) -> CanonicalObjectKey<'_> {
         },
         TypestateObjectKey::External(identity) => CanonicalObjectKey::External {
             identity: canonical_locator(identity),
+        },
+        TypestateObjectKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+        } => CanonicalObjectKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity: *refinement_identity,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
         },
     }
 }

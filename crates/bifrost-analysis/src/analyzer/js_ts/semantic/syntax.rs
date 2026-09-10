@@ -481,9 +481,10 @@ pub(super) fn missing_field(node: Node<'_>, field: &str) -> TsLoweringError {
 }
 
 pub(super) fn js_ts_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
-    let is_var = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "variable_declaration");
+    let is_var = node.parent().is_some_and(|parent| {
+        parent.kind() == "variable_declaration"
+            || (parent.kind() == "for_in_statement" && has_child_kind(parent, "var"))
+    });
     let mut current = node.parent();
     while let Some(parent) = current {
         let is_scope = if is_var {
@@ -611,6 +612,25 @@ pub(super) fn is_runtime_leaf(kind: &str) -> bool {
 pub(super) fn has_child_kind(node: Node<'_>, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|child| child.kind() == kind)
+}
+
+pub(super) fn simple_for_of_binding(statement: Node<'_>) -> Option<Node<'_>> {
+    if statement.kind() != "for_in_statement"
+        || statement
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "of")
+        || !["const", "let", "var"]
+            .into_iter()
+            .any(|kind| has_child_kind(statement, kind))
+    {
+        return None;
+    }
+    let pattern = statement.child_by_field_name("left")?;
+    let binders = named_children(pattern);
+    (pattern.kind() == "array_pattern"
+        && binders.len() == 2
+        && binders.iter().all(|binder| binder.kind() == "identifier"))
+    .then_some(pattern)
 }
 
 pub(super) fn short_circuit_operator(node: Node<'_>) -> Option<&'static str> {

@@ -8,11 +8,13 @@ use url::Url;
 use super::{
     ActivePackExtractionGap, ActiveSemanticModelShard, AsciiTransform, CaptureBinding,
     CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness, EmbeddedTypeFact,
-    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, ImplicitOperation, Locator,
-    MemberFact, MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
-    RuleEmission, RuleTrigger, SemanticModelActivationStatus, SemanticModelMatchDisposition,
-    Signature, StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
+    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, ImplicitOperation,
+    KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind, ReceiverFact,
+    RelationFact, RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
+    RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValuesPayload,
+    SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
+    StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
+    TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
     Visibility,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
@@ -621,6 +623,51 @@ pub struct SemanticModelOverlay {
     symbols_by_owner: HashMap<String, Vec<usize>>,
     relations_from: HashMap<String, Vec<usize>>,
     relations_to: HashMap<String, Vec<usize>>,
+    runtime_values: Vec<RuntimeValueContracts>,
+    collection_flows: Vec<CollectionFlowContract>,
+    collection_flows_by_callable: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Debug)]
+pub struct RuntimeValueContracts {
+    pub provenance: SemanticModelProvenance,
+    pub payload: RuntimeValuesPayload,
+}
+
+impl RuntimeValueContracts {
+    pub fn exposures(&self) -> &[RuntimeGlobalExposure] {
+        &self.payload.exposures
+    }
+
+    pub fn behaviors(&self) -> &[KeyedReadBehavior] {
+        &self.payload.behaviors
+    }
+
+    pub fn binding_evidence(&self) -> &[RuntimeGlobalBindingEvidence] {
+        &self.payload.binding_evidence
+    }
+
+    pub fn observations(&self) -> &[KeyedReadObservation] {
+        &self.payload.observations
+    }
+}
+
+/// One typed collection-flow fact retained with the activation evidence of the
+/// shard that published it.
+#[derive(Debug)]
+pub struct CollectionFlowContract {
+    pub provenance: SemanticModelProvenance,
+    pub callable: String,
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload,
+    pub coverage: Option<Completeness>,
+}
+
+impl CollectionFlowContract {
+    pub fn is_complete(&self) -> bool {
+        self.coverage == Some(Completeness::Complete)
+            && self.provenance.completeness == SemanticModelCompleteness::Complete
+            && !self.provenance.ambiguous
+    }
 }
 
 fn extraction_gap_index(gaps: &[ActivePackExtractionGap]) -> HashMap<String, usize> {
@@ -655,15 +702,50 @@ impl SemanticModelOverlay {
                 symbols_by_owner: HashMap::default(),
                 relations_from: HashMap::default(),
                 relations_to: HashMap::default(),
+                runtime_values: Vec::new(),
+                collection_flows: Vec::new(),
+                collection_flows_by_callable: HashMap::default(),
             });
         }
         let mut type_ids = Vec::new();
         let mut member_ids = Vec::new();
         let mut relation_ids = Vec::new();
+        let mut runtime_values = Vec::new();
+        let mut collection_flows = Vec::new();
         let mut declaration_surface_languages: Vec<String> = Vec::new();
         for shard in active.shards() {
             if cancellation.is_cancelled() {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            if let Some(payload) = shard.shard.runtime_values() {
+                runtime_values.push(RuntimeValueContracts {
+                    provenance: provenance(
+                        active,
+                        shard,
+                        "runtime-values",
+                        &model_location(shard, "runtime-values", "runtime-values"),
+                        None,
+                        false,
+                    ),
+                    payload: payload.clone(),
+                });
+            }
+            if let Some(payload) = shard.shard.collection_flows() {
+                for flow in &payload.flows {
+                    collection_flows.push(CollectionFlowContract {
+                        provenance: provenance(
+                            active,
+                            shard,
+                            &flow.callable,
+                            &model_location(shard, "collection-flow", &flow.callable),
+                            None,
+                            false,
+                        ),
+                        callable: flow.callable.clone(),
+                        payload: flow.payload.clone(),
+                        coverage: flow.coverage,
+                    });
+                }
             }
             if shard.shard.payload().declaration_facts().is_some()
                 && !declaration_surface_languages.contains(&shard.manifest.language)
@@ -793,6 +875,13 @@ impl SemanticModelOverlay {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
+        let mut collection_flows_by_callable = HashMap::default();
+        for (index, flow) in collection_flows.iter().enumerate() {
+            collection_flows_by_callable
+                .entry(flow.callable.clone())
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
         let mut overlay = Self {
             active_model_set_hash: active.active_model_set_hash().to_string(),
             extraction_gaps: active.extraction_gaps().to_vec(),
@@ -807,6 +896,9 @@ impl SemanticModelOverlay {
             symbols_by_owner: HashMap::default(),
             relations_from: HashMap::default(),
             relations_to: HashMap::default(),
+            runtime_values,
+            collection_flows,
+            collection_flows_by_callable,
         };
         overlay.rebuild_indexes(cancellation)?;
         if active
@@ -856,6 +948,47 @@ impl SemanticModelOverlay {
 
     pub fn relations(&self) -> &[SemanticModelRelation] {
         &self.relations
+    }
+
+    /// Runtime-value contracts retained from the same immutable active-model
+    /// publication as declaration symbols. Callers must inspect each record's
+    /// typed coverage and activation evidence before claiming an exact read.
+    pub fn runtime_value_contracts(&self) -> &[RuntimeValueContracts] {
+        &self.runtime_values
+    }
+
+    pub fn collection_flow_contracts(&self) -> &[CollectionFlowContract] {
+        &self.collection_flows
+    }
+
+    pub fn collection_flows_for(
+        &self,
+        callable: &str,
+    ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
+        self.collection_flow_match(self.collection_flows_by_callable.get(callable))
+    }
+
+    pub fn runtime_exposures(
+        &self,
+        binding_name: &str,
+        language: &str,
+    ) -> Vec<(&RuntimeGlobalExposure, &SemanticModelProvenance)> {
+        self.runtime_values
+            .iter()
+            .flat_map(|contracts| {
+                contracts
+                    .exposures()
+                    .iter()
+                    .filter(move |exposure| {
+                        exposure.binding_name == binding_name
+                            && exposure
+                                .languages
+                                .iter()
+                                .any(|candidate| candidate == language)
+                    })
+                    .map(move |exposure| (exposure, &contracts.provenance))
+            })
+            .collect()
     }
 
     pub fn symbols_with_id(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
@@ -1839,6 +1972,28 @@ impl SemanticModelOverlay {
         SemanticModelOverlayMatch {
             disposition: disposition(&records, |record| record.provenance.ambiguous),
             records,
+        }
+    }
+
+    fn collection_flow_match(
+        &self,
+        posting: Option<&Vec<usize>>,
+    ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
+        let records = posting
+            .into_iter()
+            .flatten()
+            .map(|index| &self.collection_flows[*index])
+            .collect::<Vec<_>>();
+        let disposition = if records.is_empty() {
+            SemanticModelOverlayDisposition::Empty
+        } else if records.len() > 1 || records.iter().any(|record| record.provenance.ambiguous) {
+            SemanticModelOverlayDisposition::Conflict
+        } else {
+            SemanticModelOverlayDisposition::Unique
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
         }
     }
 
@@ -5017,11 +5172,75 @@ mod tests {
             symbols_by_owner: HashMap::default(),
             relations_from: HashMap::default(),
             relations_to: HashMap::default(),
+            runtime_values: Vec::new(),
+            collection_flows: Vec::new(),
+            collection_flows_by_callable: HashMap::default(),
         };
         overlay
             .rebuild_indexes(&crate::CancellationToken::default())
             .expect("indexes build");
         overlay
+    }
+
+    fn collection_flow_contract(
+        callable: &str,
+        completeness: SemanticModelCompleteness,
+        ambiguous: bool,
+    ) -> CollectionFlowContract {
+        let mut provenance = provenance(completeness);
+        provenance.ambiguous = ambiguous;
+        CollectionFlowContract {
+            provenance,
+            callable: callable.to_owned(),
+            payload: crate::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload {
+                kind: crate::analyzer::semantic_model::csmi::CsmiCollectionFlowKind::CollectionFlow,
+                callable: callable.to_owned(),
+                receiver_substitution: None,
+                roots: Vec::new(),
+                transfers: Vec::new(),
+                invocations: Vec::new(),
+            },
+            coverage: Some(Completeness::Complete),
+        }
+    }
+
+    #[test]
+    fn collection_flow_lookup_preserves_typed_contract_and_conflicts() {
+        let contract = collection_flow_contract(
+            "callable.normalize",
+            SemanticModelCompleteness::Complete,
+            false,
+        );
+        let mut overlay = overlay(Vec::new(), Vec::new());
+        overlay.collection_flows.push(contract);
+        overlay
+            .collection_flows_by_callable
+            .insert("callable.normalize".to_owned(), vec![0]);
+
+        let unique = overlay.collection_flows_for("callable.normalize");
+        assert_eq!(unique.disposition, SemanticModelOverlayDisposition::Unique);
+        assert_eq!(unique.records.len(), 1);
+        assert!(unique.records[0].is_complete());
+        assert_eq!(unique.records[0].payload.callable, "callable.normalize");
+        assert_eq!(
+            overlay.collection_flows_for("missing").disposition,
+            SemanticModelOverlayDisposition::Empty
+        );
+
+        overlay.collection_flows.push(collection_flow_contract(
+            "callable.normalize",
+            SemanticModelCompleteness::Complete,
+            false,
+        ));
+        overlay
+            .collection_flows_by_callable
+            .insert("callable.normalize".to_owned(), vec![0, 1]);
+        let conflict = overlay.collection_flows_for("callable.normalize");
+        assert_eq!(
+            conflict.disposition,
+            SemanticModelOverlayDisposition::Conflict
+        );
+        assert_eq!(conflict.records.len(), 2);
     }
 
     fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProvenance {

@@ -965,30 +965,9 @@ pub(super) fn call_binding_expansions(
         None
     };
     bindings.populate_conversions(analyzer, &mut report, conversion_signature);
-    let unknown_conversions: Vec<_> = report
-        .conversion_facts
-        .iter()
-        // Receiver/default/terminal rows have no source actual to convert.
-        // Their completeness is owned by the binder below.
-        .filter(|fact| fact.argument_id.is_some())
-        .filter_map(|fact| {
-            fact.result
-                .as_ref()
-                .err()
-                .map(|reason| (&fact.argument_id, reason))
-        })
-        .collect();
-    if !unknown_conversions.is_empty() {
-        diagnostics.push(CodeQueryDiagnostic {
-            code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-            impact: CodeQueryDiagnosticImpact::Incomplete,
-            branch: Vec::new(),
-            language: crate::analyzer::common::language_for_file(&file).config_label(),
-            message: format!(
-                "call_bindings conversion typing is incomplete: {unknown_conversions:?}"
-            ),
-        });
-    }
+    // Conversion proof is independent of exact argument mapping. Its typed
+    // uncertainty travels on the conversion field and is charged only when a
+    // consumer reads that field, not when a policy selects the binding itself.
     let report = Arc::new(report);
     // The owner identity is meaningful only when this call's shared binder
     // emitted an exact receiver/implicit row. In particular, do not attach a

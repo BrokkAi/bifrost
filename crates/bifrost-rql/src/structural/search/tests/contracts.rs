@@ -614,6 +614,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             source_slice_sha256: Some([u8::try_from(index).unwrap(); 32]),
             provenance: Vec::new(),
             decorated_parameter: None,
+            runtime_keyed_read: None,
         }
     };
     let detailed = DetailedCodeQueryResult {

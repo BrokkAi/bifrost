@@ -2366,6 +2366,30 @@ fn object_key_heap_bytes(key: &TypestateObjectKey) -> usize {
         | TypestateObjectKey::CaptureSlot { procedure, .. } => {
             semantic_locator_heap_bytes(procedure)
         }
+        TypestateObjectKey::RuntimeObject {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            active_model_set_hash,
+            manifest_digest,
+            shard_id,
+            behavior_id,
+            activation_source,
+            ..
+        } => runtime_profile_digest
+            .len()
+            .saturating_add(realm.len())
+            .saturating_add(exposure_id.len())
+            .saturating_add(container_member.len())
+            .saturating_add(state_boundary.len())
+            .saturating_add(active_model_set_hash.len())
+            .saturating_add(manifest_digest.len())
+            .saturating_add(shard_id.len())
+            .saturating_add(behavior_id.len())
+            .saturating_add(activation_source.len())
+            .saturating_add(std::mem::size_of::<crate::analyzer::semantic::StableDigest>()),
     }
 }
 

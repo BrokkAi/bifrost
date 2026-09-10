@@ -4,6 +4,7 @@ use crate::analyzer::identifier::validate_identifier;
 use crate::workspace_document::has_portable_windows_path_prefix;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +201,19 @@ impl Validator {
                 self.procedure_ids
                     .extend(summaries.iter().map(|summary| summary.id.clone()));
             }
+            if let Some(runtime_values) = &shard.runtime_values {
+                self.runtime_values(
+                    &format!("$.shards[{}/runtime_values]", shard.id),
+                    runtime_values,
+                    &shard.activation,
+                );
+            }
+            if let Some(collection_flows) = &shard.collection_flows {
+                self.collection_flows(
+                    &format!("$.shards[{}/collection_flows]", shard.id),
+                    collection_flows,
+                );
+            }
         }
         if let Some(evidence) = &pack.cpp_portability {
             self.cpp_portability(evidence);
@@ -223,7 +237,21 @@ impl Validator {
                     &pack.compatibility.toolchains,
                 );
             }
-            let records = shard.payload.record_count();
+            let records = shard
+                .payload
+                .record_count()
+                .saturating_add(
+                    shard
+                        .runtime_values
+                        .as_ref()
+                        .map_or(0, RuntimeValuesPayload::record_count),
+                )
+                .saturating_add(
+                    shard
+                        .collection_flows
+                        .as_ref()
+                        .map_or(0, CollectionFlowsPayload::record_count),
+                );
             if records == 0 {
                 self.error(
                     "shard.empty_payload",
@@ -912,6 +940,662 @@ impl Validator {
                     self.procedure_summary(&format!("{path}.summaries[{index}]"), summary);
                 }
             }
+        }
+    }
+
+    fn collection_flows(&mut self, path: &str, payload: &CollectionFlowsPayload) {
+        let mut callables = HashSet::new();
+        for (index, flow) in payload.flows.iter().enumerate() {
+            let current = format!("{path}.flows[{index}]");
+            self.stable_reference(&format!("{current}.callable"), &flow.callable);
+            if !callables.insert(flow.callable.as_str()) {
+                self.error(
+                    "collection_flow.duplicate_callable",
+                    &current,
+                    "collection-flow payload contains duplicate callable facts",
+                );
+            }
+            if flow.payload.kind
+                != crate::analyzer::semantic_model::csmi::CsmiCollectionFlowKind::CollectionFlow
+            {
+                self.error(
+                    "collection_flow.kind",
+                    format!("{current}.payload.kind"),
+                    "collection-flow payload kind must be collection-flow",
+                );
+            }
+            if flow.payload.callable != flow.callable {
+                self.error(
+                    "collection_flow.callable_scope",
+                    format!("{current}.payload.callable"),
+                    "payload callable must equal its native fact scope",
+                );
+            }
+        }
+    }
+
+    fn runtime_values(
+        &mut self,
+        path: &str,
+        payload: &RuntimeValuesPayload,
+        activation: &[ActivationSelector],
+    ) {
+        let mut exposure_ids = HashSet::new();
+        for (index, exposure) in payload.exposures.iter().enumerate() {
+            let current = format!("{path}.exposures[{index}]");
+            self.stable_reference(&format!("{current}.exposure_id"), &exposure.exposure_id);
+            if !exposure_ids.insert(exposure.exposure_id.as_str()) {
+                self.error(
+                    "runtime.duplicate_exposure",
+                    &current,
+                    "duplicate exposure id",
+                );
+            }
+            if exposure.languages.is_empty() || exposure.members.is_empty() {
+                self.error(
+                    "runtime.exposure_shape",
+                    &current,
+                    "runtime exposure requires languages and members",
+                );
+            }
+            self.unique_names(&format!("{current}.languages"), &exposure.languages);
+            self.stable_component(&format!("{current}.binding_name"), &exposure.binding_name);
+            self.runtime_applicability(&format!("{current}.runtime"), &exposure.runtime);
+            self.runtime_digest(
+                &format!("{current}.runtime_profile_digest"),
+                &exposure.runtime_profile_digest,
+            );
+            if !activation.iter().any(|selector| {
+                runtime_artifact_matches_selector(&exposure.runtime, selector)
+                    && selector
+                        .configurations
+                        .contains(&exposure.runtime_profile_digest)
+            }) {
+                self.error(
+                    "runtime.activation_profile_unbound",
+                    &current,
+                    "runtime artifact, digest, and profile digest must be bound by one activation selector",
+                );
+            }
+            self.runtime_root_identity(
+                &format!("{current}.root_identity"),
+                &exposure.root_identity,
+                &exposure.runtime.runtime_family,
+                &exposure.binding_name,
+            );
+            self.runtime_unique_references(&format!("{current}.members"), &exposure.members);
+            self.runtime_evidence(&format!("{current}.evidence"), &exposure.evidence);
+            self.runtime_extensions(&format!("{current}.extensions"), &exposure.extensions);
+            self.runtime_coverage(&format!("{current}.coverage"), &exposure.coverage);
+        }
+        let exposures: HashMap<&str, &RuntimeGlobalExposure> = payload
+            .exposures
+            .iter()
+            .map(|record| (record.exposure_id.as_str(), record))
+            .collect();
+        let mut behavior_ids = HashSet::new();
+        for (index, behavior) in payload.behaviors.iter().enumerate() {
+            let current = format!("{path}.behaviors[{index}]");
+            self.stable_reference(&format!("{current}.behavior_id"), &behavior.behavior_id);
+            if !behavior_ids.insert(behavior.behavior_id.as_str()) {
+                self.error(
+                    "runtime.duplicate_behavior",
+                    &current,
+                    "duplicate behavior id",
+                );
+            }
+            let exposure = exposures.get(behavior.exposure_id.as_str()).copied();
+            if self.validate_references && exposure.is_none() {
+                self.error(
+                    "runtime.unknown_exposure",
+                    format!("{current}.exposure_id"),
+                    "behavior references an unknown exposure",
+                );
+            }
+            if let Some(exposure) = exposure
+                && !exposure
+                    .members
+                    .iter()
+                    .any(|member| member == &behavior.container_member)
+            {
+                self.error(
+                    "runtime.unknown_container_member",
+                    format!("{current}.container_member"),
+                    "behavior container member is not published by its exposure",
+                );
+            }
+            self.stable_reference(&format!("{current}.exposure_id"), &behavior.exposure_id);
+            self.stable_reference(
+                &format!("{current}.container_member"),
+                &behavior.container_member,
+            );
+            self.runtime_evidence(&format!("{current}.evidence"), &behavior.evidence);
+            self.runtime_extensions(&format!("{current}.extensions"), &behavior.extensions);
+            if behavior.coverage.status == RuntimeCoverageStatus::Complete
+                && (behavior.exception_behavior == RuntimeExceptionBehavior::Unknown
+                    || behavior.mutation_model == RuntimeMutationModel::Unknown
+                    || behavior.materialization == RuntimeMaterialization::Unknown)
+            {
+                self.error(
+                    "runtime.complete_behavior_unknown",
+                    &current,
+                    "complete behavior requires interpreted exception, mutation, and materialization semantics",
+                );
+            }
+            self.runtime_coverage(&format!("{current}.coverage"), &behavior.coverage);
+        }
+        let mut enabled_exposure_ids = payload
+            .exposures
+            .iter()
+            .filter(|exposure| exposure.activation == RuntimeExposureActivation::Enabled)
+            .map(|exposure| exposure.exposure_id.clone())
+            .collect::<Vec<_>>();
+        enabled_exposure_ids.sort_unstable();
+        let expected_active_set_digest = runtime_active_set_digest(&enabled_exposure_ids);
+        for (index, evidence) in payload.binding_evidence.iter().enumerate() {
+            let current = format!("{path}.binding_evidence[{index}]");
+            self.stable_reference(
+                &format!("{current}.binding_evidence_id"),
+                &evidence.binding_evidence_id,
+            );
+            if !payload
+                .binding_evidence
+                .iter()
+                .take(index)
+                .all(|previous| previous.binding_evidence_id != evidence.binding_evidence_id)
+            {
+                self.error(
+                    "runtime.duplicate_binding_evidence",
+                    &current,
+                    "duplicate binding evidence id",
+                );
+            }
+            let exposure = exposures.get(evidence.exposure_id.as_str()).copied();
+            if self.validate_references && exposure.is_none() {
+                self.error(
+                    "runtime.unknown_exposure",
+                    format!("{current}.exposure_id"),
+                    "binding evidence references an unknown exposure",
+                );
+            }
+            self.stable_reference(&format!("{current}.exposure_id"), &evidence.exposure_id);
+            self.runtime_activation(
+                &format!("{current}.activation"),
+                &evidence.activation,
+                exposure,
+                &enabled_exposure_ids,
+                &expected_active_set_digest,
+            );
+            self.text(&format!("{current}.language"), &evidence.language);
+            self.text(&format!("{current}.dialect"), &evidence.dialect);
+            self.runtime_source_range(
+                &format!("{current}.root_occurrence"),
+                &evidence.root_occurrence,
+            );
+            self.runtime_identity(
+                &format!("{current}.scope_identity"),
+                &evidence.scope_identity,
+                RuntimeIdentityKind::Scope,
+            );
+            self.runtime_evidence(&format!("{current}.evidence"), &evidence.evidence);
+            self.runtime_extensions(&format!("{current}.extensions"), &evidence.extensions);
+            if evidence.coverage.status == RuntimeCoverageStatus::Complete
+                && !(evidence.activation.outcome == RuntimeActivationOutcome::Matched
+                    && evidence.lexical_binding == RuntimeLexicalBinding::Absent
+                    && evidence.rebinding == RuntimeRebinding::Excluded)
+                && !(evidence.activation.outcome == RuntimeActivationOutcome::NotMatched
+                    && evidence.lexical_binding == RuntimeLexicalBinding::Present)
+            {
+                self.error(
+                    "runtime.complete_binding_proof",
+                    &current,
+                    "complete binding evidence requires a matched global or conclusive lexical exclusion",
+                );
+            }
+            self.runtime_coverage(&format!("{current}.coverage"), &evidence.coverage);
+        }
+        let behaviors: HashSet<&str> = payload
+            .behaviors
+            .iter()
+            .map(|record| record.behavior_id.as_str())
+            .collect();
+        let binding: HashSet<&str> = payload
+            .binding_evidence
+            .iter()
+            .map(|record| record.binding_evidence_id.as_str())
+            .collect();
+        for (index, observation) in payload.observations.iter().enumerate() {
+            let current = format!("{path}.observations[{index}]");
+            self.stable_reference(
+                &format!("{current}.observation_id"),
+                &observation.observation_id,
+            );
+            if !payload
+                .observations
+                .iter()
+                .take(index)
+                .all(|previous| previous.observation_id != observation.observation_id)
+            {
+                self.error(
+                    "runtime.duplicate_observation",
+                    &current,
+                    "duplicate observation id",
+                );
+            }
+            if self.validate_references && !behaviors.contains(observation.behavior_id.as_str()) {
+                self.error(
+                    "runtime.unknown_behavior",
+                    format!("{current}.behavior_id"),
+                    "observation references an unknown behavior",
+                );
+            }
+            if self.validate_references
+                && !binding.contains(observation.binding_evidence_id.as_str())
+            {
+                self.error(
+                    "runtime.unknown_binding_evidence",
+                    format!("{current}.binding_evidence_id"),
+                    "observation references unknown binding evidence",
+                );
+            }
+            self.stable_reference(&format!("{current}.behavior_id"), &observation.behavior_id);
+            self.stable_reference(
+                &format!("{current}.binding_evidence_id"),
+                &observation.binding_evidence_id,
+            );
+            let binding_record = payload
+                .binding_evidence
+                .iter()
+                .find(|binding| binding.binding_evidence_id == observation.binding_evidence_id);
+            let behavior_record = payload
+                .behaviors
+                .iter()
+                .find(|behavior| behavior.behavior_id == observation.behavior_id);
+            if let (Some(binding), Some(behavior)) = (binding_record, behavior_record) {
+                if binding.exposure_id != behavior.exposure_id {
+                    self.error(
+                        "runtime.observation_exposure",
+                        &current,
+                        "observation binding and behavior must resolve in one exposure",
+                    );
+                }
+                if let Some(exposure) = exposures.get(binding.exposure_id.as_str())
+                    && behavior.container_member.is_empty()
+                {
+                    self.error(
+                        "runtime.empty_container_member",
+                        &current,
+                        format!(
+                            "exposure {} has an empty behavior container member",
+                            exposure.exposure_id
+                        ),
+                    );
+                }
+                if binding.activation.runtime_profile_digest
+                    != exposures
+                        .get(binding.exposure_id.as_str())
+                        .map_or("", |exposure| exposure.runtime_profile_digest.as_str())
+                {
+                    self.error(
+                        "runtime.activation_profile_mismatch",
+                        &current,
+                        "binding activation profile must match the exposure profile",
+                    );
+                }
+                if observation.source_origin == RuntimeSourceOrigin::PristineRuntimeInput
+                    && (behavior.mutation_model != RuntimeMutationModel::PristineInputUntilWrite
+                        || binding.rebinding != RuntimeRebinding::Excluded
+                        || binding.coverage.status != RuntimeCoverageStatus::Complete)
+                {
+                    self.error(
+                        "runtime.pristine_origin_without_proof",
+                        &current,
+                        "pristine origin requires complete binding and mutation proof",
+                    );
+                }
+                if observation.coverage.status == RuntimeCoverageStatus::Complete
+                    && behavior.coverage.status != RuntimeCoverageStatus::Complete
+                {
+                    self.error(
+                        "runtime.complete_observation_without_behavior",
+                        &current,
+                        "complete observation requires complete behavior coverage",
+                    );
+                }
+            }
+            self.runtime_identity(
+                &format!("{current}.base_value"),
+                &observation.base_value,
+                RuntimeIdentityKind::Value,
+            );
+            self.runtime_identity(
+                &format!("{current}.load_operation"),
+                &observation.load_operation,
+                RuntimeIdentityKind::Operation,
+            );
+            self.runtime_identity(
+                &format!("{current}.result_value"),
+                &observation.result_value,
+                RuntimeIdentityKind::Value,
+            );
+            self.runtime_identity(
+                &format!("{current}.observation_point"),
+                &observation.observation_point,
+                RuntimeIdentityKind::Point,
+            );
+            self.runtime_source_range(&format!("{current}.expression"), &observation.expression);
+            if observation.expression.resource_digest
+                != binding_record.map_or("", |binding| {
+                    binding.root_occurrence.resource_digest.as_str()
+                })
+            {
+                self.error(
+                    "runtime.observation_source_mismatch",
+                    &current,
+                    "observation expression must use the binding source artifact",
+                );
+            }
+            match (&observation.key, observation.source_form) {
+                (
+                    RuntimeStaticKey::Property { value },
+                    RuntimeSourceForm::Dot | RuntimeSourceForm::BracketString,
+                ) => {
+                    self.text(&format!("{current}.key.value"), value);
+                }
+                (RuntimeStaticKey::Index { .. }, RuntimeSourceForm::BracketNumber) => {}
+                _ => self.error(
+                    "runtime.key_form_mismatch",
+                    format!("{current}.key"),
+                    "source form must agree with the static key kind",
+                ),
+            }
+            if observation.normal_outcome == RuntimeNormalOutcome::Exact
+                && observation.phase != RuntimeObservationPhase::AfterEffects
+            {
+                self.error(
+                    "runtime.exact_before_effects",
+                    format!("{current}.phase"),
+                    "an exact normal load result must be observed after effects",
+                );
+            }
+            if observation.coverage.status == RuntimeCoverageStatus::Complete
+                && (observation.normal_outcome != RuntimeNormalOutcome::Exact
+                    || !matches!(
+                        observation.exception_outcome,
+                        RuntimeExceptionOutcome::Excluded | RuntimeExceptionOutcome::Possible
+                    )
+                    || observation.source_origin == RuntimeSourceOrigin::Indeterminate)
+            {
+                self.error(
+                    "runtime.complete_observation_outcomes",
+                    &current,
+                    "complete observation requires exact normal, interpreted exceptional, and determined origin outcomes",
+                );
+            }
+            self.runtime_evidence(&format!("{current}.evidence"), &observation.evidence);
+            self.runtime_extensions(&format!("{current}.extensions"), &observation.extensions);
+            self.runtime_coverage(&format!("{current}.coverage"), &observation.coverage);
+        }
+    }
+
+    fn runtime_applicability(&mut self, path: &str, runtime: &RuntimeApplicability) {
+        for (field, value) in [
+            ("runtime_family", runtime.runtime_family.as_str()),
+            ("runtime_artifact", runtime.runtime_artifact.as_str()),
+            ("realm", runtime.realm.as_str()),
+            ("module_mode", runtime.module_mode.as_str()),
+            (
+                "initialization_boundary",
+                runtime.initialization_boundary.as_str(),
+            ),
+        ] {
+            self.text(&format!("{path}.{field}"), value);
+        }
+        if !runtime.runtime_artifact.starts_with("pkg:")
+            || runtime
+                .runtime_artifact
+                .split_once('@')
+                .is_none_or(|(_, version)| version.is_empty())
+        {
+            self.error(
+                "runtime.invalid_artifact",
+                format!("{path}.runtime_artifact"),
+                "runtime artifact must be an exact versioned PURL",
+            );
+        }
+        self.runtime_digest(
+            &format!("{path}.runtime_artifact_digest"),
+            &runtime.runtime_artifact_digest,
+        );
+        if let Some(platform) = &runtime.platform {
+            self.text(&format!("{path}.platform"), platform);
+        }
+        if let Some(architecture) = &runtime.architecture {
+            self.text(&format!("{path}.architecture"), architecture);
+        }
+        for (index, assumption) in runtime.host_assumptions.iter().enumerate() {
+            self.text(&format!("{path}.host_assumptions[{index}]"), assumption);
+        }
+        let mut assumptions = HashSet::new();
+        for (index, assumption) in runtime.host_assumptions.iter().enumerate() {
+            if !assumptions.insert(assumption) {
+                self.error(
+                    "runtime.duplicate_host_assumption",
+                    format!("{path}.host_assumptions[{index}]"),
+                    "host assumptions must be unique",
+                );
+            }
+        }
+    }
+
+    fn runtime_root_identity(
+        &mut self,
+        path: &str,
+        identity: &RuntimeRootIdentity,
+        runtime_family: &str,
+        binding_name: &str,
+    ) {
+        self.text(&format!("{path}.scheme"), &identity.scheme);
+        self.text(&format!("{path}.scheme_version"), &identity.scheme_version);
+        if identity.scheme != "csmi.runtime-global" || identity.scheme_version != "0.1.0" {
+            self.error(
+                "runtime.root_identity_scheme",
+                path,
+                "runtime root identity must use csmi.runtime-global 0.1.0",
+            );
+        }
+        if identity.descriptors.len() != 2 {
+            self.error(
+                "runtime.root_identity_shape",
+                format!("{path}.descriptors"),
+                "runtime root identity requires runtime and global descriptors",
+            );
+            return;
+        }
+        let expected = [
+            (RuntimeRootRole::Runtime, runtime_family),
+            (RuntimeRootRole::Global, binding_name),
+        ];
+        for (index, (descriptor, (role, name))) in
+            identity.descriptors.iter().zip(expected).enumerate()
+        {
+            self.text(
+                &format!("{path}.descriptors[{index}].name"),
+                &descriptor.name,
+            );
+            if descriptor.role != role || descriptor.name != name {
+                self.error(
+                    "runtime.root_identity_descriptor",
+                    format!("{path}.descriptors[{index}]"),
+                    "runtime root descriptor does not identify the published runtime and global",
+                );
+            }
+        }
+    }
+
+    fn runtime_evidence(&mut self, path: &str, evidence: &RuntimeEvidence) {
+        self.text(&format!("{path}.producer"), &evidence.producer);
+        self.text(&format!("{path}.method"), &evidence.method);
+        self.runtime_digest(&format!("{path}.inputs_digest"), &evidence.inputs_digest);
+    }
+
+    fn runtime_source_range(&mut self, path: &str, range: &RuntimeSourceRange) {
+        self.text(&format!("{path}.resource"), &range.resource);
+        self.runtime_digest(&format!("{path}.resource_digest"), &range.resource_digest);
+        if range.end_byte <= range.start_byte {
+            self.error(
+                "runtime.empty_source_range",
+                path,
+                "runtime source ranges must be non-empty",
+            );
+        }
+    }
+
+    fn runtime_identity(
+        &mut self,
+        path: &str,
+        identity: &RuntimeScopedIdentity,
+        expected_kind: RuntimeIdentityKind,
+    ) {
+        self.runtime_digest(&format!("{path}.owner_digest"), &identity.owner_digest);
+        self.runtime_digest(&format!("{path}.locator_digest"), &identity.locator_digest);
+        if identity.kind != expected_kind {
+            self.error(
+                "runtime.identity_kind",
+                format!("{path}.kind"),
+                "runtime identity kind does not match its field",
+            );
+        }
+    }
+
+    fn runtime_activation(
+        &mut self,
+        path: &str,
+        activation: &RuntimeActivationEvidence,
+        exposure: Option<&RuntimeGlobalExposure>,
+        enabled_exposure_ids: &[String],
+        expected_active_set_digest: &str,
+    ) {
+        self.runtime_digest(
+            &format!("{path}.runtime_profile_digest"),
+            &activation.runtime_profile_digest,
+        );
+        self.runtime_digest(
+            &format!("{path}.active_set_digest"),
+            &activation.active_set_digest,
+        );
+        self.runtime_digest(&format!("{path}.model_digest"), &activation.model_digest);
+        self.text(
+            &format!("{path}.activation_source"),
+            &activation.activation_source,
+        );
+        self.stable_reference(&format!("{path}.exposure_id"), &activation.exposure_id);
+        let mut active_ids = HashSet::new();
+        for (index, id) in activation.active_exposure_ids.iter().enumerate() {
+            self.stable_reference(&format!("{path}.active_exposure_ids[{index}]"), id);
+            if !active_ids.insert(id) {
+                self.error(
+                    "runtime.duplicate_active_exposure",
+                    format!("{path}.active_exposure_ids[{index}]"),
+                    "active exposure ids must be unique",
+                );
+            }
+        }
+        if activation.active_exposure_ids != enabled_exposure_ids
+            || activation.active_set_digest != expected_active_set_digest
+        {
+            self.error(
+                "runtime.active_set_mismatch",
+                path,
+                "activation evidence must name the enabled exposures and their canonical digest",
+            );
+        }
+        if let Some(exposure) = exposure {
+            if activation.exposure_id != exposure.exposure_id
+                || activation.runtime_profile_digest != exposure.runtime_profile_digest
+                || activation.model_digest != exposure.evidence.inputs_digest
+            {
+                self.error(
+                    "runtime.activation_join",
+                    path,
+                    "activation evidence must join its exposure profile, model, and identity",
+                );
+            }
+            if activation.outcome == RuntimeActivationOutcome::Matched
+                && (exposure.activation != RuntimeExposureActivation::Enabled
+                    || enabled_exposure_ids.len() != 1)
+            {
+                self.error(
+                    "runtime.matched_activation",
+                    path,
+                    "matched activation requires one unique enabled exposure",
+                );
+            }
+        }
+    }
+
+    fn runtime_extensions(&mut self, path: &str, extensions: &[RuntimeValueExtension]) {
+        for (index, extension) in extensions.iter().enumerate() {
+            let current = format!("{path}[{index}]");
+            self.stable_component(&format!("{current}.vocabulary"), &extension.vocabulary);
+            self.version(&format!("{current}.version"), &extension.version);
+            match serde_json::to_vec(&extension.payload) {
+                Ok(value) if value.len() <= self.limits.max_text_bytes => {}
+                Ok(_) => self.error(
+                    "limit.runtime_extension_bytes",
+                    format!("{current}.payload"),
+                    format!(
+                        "runtime extension payload exceeds {} bytes",
+                        self.limits.max_text_bytes
+                    ),
+                ),
+                Err(error) => self.error(
+                    "runtime.extension_payload",
+                    format!("{current}.payload"),
+                    format!("runtime extension payload is not serializable: {error}"),
+                ),
+            }
+        }
+    }
+
+    fn runtime_unique_references(&mut self, path: &str, values: &[String]) {
+        let mut seen = HashSet::new();
+        for (index, value) in values.iter().enumerate() {
+            self.stable_reference(&format!("{path}[{index}]"), value);
+            if !seen.insert(value) {
+                self.error(
+                    "runtime.duplicate_reference",
+                    format!("{path}[{index}]"),
+                    "runtime references must be unique",
+                );
+            }
+        }
+    }
+
+    fn runtime_digest(&mut self, path: &str, value: &str) {
+        if !is_lower_sha256(value) {
+            self.error(
+                "runtime.invalid_digest",
+                path,
+                "runtime digest must be 64 lowercase hexadecimal characters",
+            );
+        }
+    }
+
+    fn runtime_coverage(&mut self, path: &str, coverage: &RuntimeCoverage) {
+        if coverage.status == RuntimeCoverageStatus::Complete && !coverage.limitations.is_empty() {
+            self.error(
+                "runtime.complete_with_limitations",
+                path,
+                "complete runtime coverage cannot retain limitations",
+            );
+        }
+        if coverage.status != RuntimeCoverageStatus::Complete && coverage.limitations.is_empty() {
+            self.error(
+                "runtime.incomplete_without_limitation",
+                path,
+                "incomplete runtime coverage requires a typed limitation",
+            );
         }
     }
 
@@ -3251,6 +3935,39 @@ impl Validator {
         self.diagnostics
             .push(Diagnostic::error(code, path, message));
     }
+}
+
+fn runtime_active_set_digest(exposure_ids: &[String]) -> String {
+    let encoded = serde_json::to_vec(exposure_ids)
+        .expect("runtime exposure identifiers are always JSON serializable");
+    let mut digest = Sha256::new();
+    digest.update(encoded);
+    format!("{:x}", digest.finalize())
+}
+
+fn runtime_artifact_matches_selector(
+    runtime: &RuntimeApplicability,
+    selector: &ActivationSelector,
+) -> bool {
+    if selector.artifact_sha256.as_deref() != Some(runtime.runtime_artifact_digest.as_str()) {
+        return false;
+    }
+    let Some(package) = selector.package.as_ref() else {
+        return false;
+    };
+    if package.version.is_none() && package.name == runtime.runtime_artifact {
+        return true;
+    }
+    let Some(raw) = runtime.runtime_artifact.strip_prefix("pkg:maven/") else {
+        return false;
+    };
+    let Some((coordinate, version)) = raw.split_once('@') else {
+        return false;
+    };
+    let Some((group, artifact)) = coordinate.rsplit_once('/') else {
+        return false;
+    };
+    package.name == format!("{group}:{artifact}") && package.version.as_deref() == Some(version)
 }
 
 fn cpp_signature_matches_operation(

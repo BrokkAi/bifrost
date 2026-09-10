@@ -1,4 +1,5 @@
 use super::super::ids::ProgramPointId;
+use super::super::ir::ValueTransfer;
 use super::super::ir::{
     ArgumentDomain, CallArgumentExpansion, CallSiteHandle, CallerReceiverBinding,
     FormalMultiplicity, ProcedureHandle, ProcedureReceiverBinding, ProofStatus, SemanticValueKind,
@@ -14,6 +15,7 @@ use super::relation::{
     CandidateCoverage, EvidenceBacked, OracleCandidate, OracleRelationHandle, OracleRelationKind,
     OracleRelationOwner, collect_bounded, validate_retained_relation_arenas,
 };
+use crate::analyzer::usages::call_conversion::ConversionUnknown;
 
 /// The caller-side endpoint used by one argument binding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,6 +80,7 @@ pub struct CallArgumentMapping {
     actual: CallArgumentEndpoint,
     formal: ProcedurePortHandle,
     mode: CallPassingMode,
+    conversion: Option<Result<Option<ValueTransfer>, ConversionUnknown>>,
 }
 
 impl CallArgumentMapping {
@@ -94,7 +97,36 @@ impl CallArgumentMapping {
             actual,
             formal,
             mode,
+            conversion: None,
         }
+    }
+
+    /// Conversion typing is independent of argument binding and runtime safety.
+    pub(crate) fn with_conversion(
+        mut self,
+        conversion: Result<Option<ValueTransfer>, ConversionUnknown>,
+    ) -> Self {
+        self.conversion = Some(conversion);
+        self
+    }
+
+    /// None means this adapter has no conversion producer. A successful None
+    /// proves no identity-separating adjustment; Err retains missing evidence
+    /// independently of the actual/formal binding's proof and completeness.
+    pub fn conversion(&self) -> Option<Result<Option<ValueTransfer>, ConversionUnknown>> {
+        self.conversion
+    }
+
+    /// A proven identity-separating transfer, when available. Absence is not
+    /// proof of identity: inspect `conversion()` for typed unknown evidence,
+    /// or `preserves_reference_identity()` before transporting heap aliases.
+    pub fn transfer(&self) -> Option<ValueTransfer> {
+        self.conversion.and_then(Result::ok).flatten()
+    }
+
+    /// A conversion barrier or unknown adjustment cannot transport heap aliases.
+    pub fn preserves_reference_identity(&self) -> bool {
+        matches!(self.conversion, None | Some(Ok(None)))
     }
 
     pub const fn source_index(&self) -> u32 {

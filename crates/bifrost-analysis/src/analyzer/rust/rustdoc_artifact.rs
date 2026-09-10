@@ -516,6 +516,8 @@ fn merge_source_set_productions(
                 members,
                 relations,
             },
+            runtime_values: None,
+            collection_flows: None,
         }],
     });
     ArtifactProduction {
@@ -2151,6 +2153,8 @@ fn finish(
                     members,
                     relations,
                 },
+                runtime_values: None,
+                collection_flows: None,
             }],
         }),
         completeness,

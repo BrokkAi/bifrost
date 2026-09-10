@@ -114,6 +114,8 @@ pub fn compile_pack(
             license: normalized.license.clone(),
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
+            runtime_values: shard.runtime_values.clone(),
+            collection_flows: shard.collection_flows.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
                 .map_err(artifact_diagnostic)?,
@@ -251,6 +253,25 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
             selector.configurations.dedup();
         }
         shard.activation.sort_by_key(selector_sort_key);
+        if let Some(runtime_values) = &mut shard.runtime_values {
+            runtime_values
+                .exposures
+                .sort_by(|left, right| left.exposure_id.cmp(&right.exposure_id));
+            runtime_values
+                .behaviors
+                .sort_by(|left, right| left.behavior_id.cmp(&right.behavior_id));
+            runtime_values
+                .binding_evidence
+                .sort_by(|left, right| left.binding_evidence_id.cmp(&right.binding_evidence_id));
+            runtime_values
+                .observations
+                .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        }
+        if let Some(collection_flows) = &mut shard.collection_flows {
+            collection_flows
+                .flows
+                .sort_by(|left, right| left.callable.cmp(&right.callable));
+        }
         match &mut shard.payload {
             AuthoredPayload::DeclarationFacts {
                 types,

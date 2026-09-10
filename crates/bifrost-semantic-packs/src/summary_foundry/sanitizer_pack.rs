@@ -770,6 +770,8 @@ impl PackIdentity {
                 id: format!("sanitizers.{}", self.ecosystem),
                 activation: vec![self.activation.clone()],
                 payload: AuthoredPayload::ProcedureSummaries { summaries },
+                runtime_values: None,
+                collection_flows: None,
             }],
         }
     }

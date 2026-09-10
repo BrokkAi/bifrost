@@ -2,7 +2,9 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::super::ids::{MemoryLocationId, SemanticLocator, SemanticRole, SourceMappingId};
+use super::super::ids::{
+    MemoryLocationId, SemanticLocator, SemanticRole, SourceMappingId, StableDigest,
+};
 use super::super::ir::{
     AllocationHandle, CallSiteHandle, EvidenceCompleteness, ExecutionTiming, FormalMultiplicity,
     MemoryLocationHandle, MemoryLocationKind, ProcedureHandle, ProgramPointHandle, ProofStatus,
@@ -26,6 +28,300 @@ pub enum ObjectCardinality {
     Summary,
     /// The provider cannot establish either property.
     Unknown,
+}
+
+/// The activation evidence captured when a runtime object root is minted.
+/// Runtime objects are valid only when the model selection that owns them is
+/// retained with the root; a profile or exposure name by itself is not proof.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RuntimeObjectActivation {
+    active_model_set_hash: String,
+    runtime_profile_digest: String,
+    manifest_digest: String,
+    shard_id: String,
+    exposure_id: String,
+    behavior_id: String,
+    activation_source: String,
+}
+
+impl RuntimeObjectActivation {
+    pub(crate) fn captured(
+        active_model_set_hash: String,
+        runtime_profile_digest: String,
+        manifest_digest: String,
+        shard_id: String,
+        exposure_id: String,
+        behavior_id: String,
+        activation_source: String,
+    ) -> Result<Self, OracleContractError> {
+        let fields = [
+            ("active model set hash", active_model_set_hash.as_str()),
+            ("runtime profile digest", runtime_profile_digest.as_str()),
+            ("manifest digest", manifest_digest.as_str()),
+            ("shard id", shard_id.as_str()),
+            ("exposure id", exposure_id.as_str()),
+            ("behavior id", behavior_id.as_str()),
+            ("activation source", activation_source.as_str()),
+        ];
+        if let Some((field, _)) = fields.into_iter().find(|(_, value)| value.is_empty()) {
+            return Err(OracleContractError::InvalidAccessRoot(match field {
+                "active model set hash" => "runtime activation has an empty active-model hash",
+                "runtime profile digest" => "runtime activation has an empty profile digest",
+                "manifest digest" => "runtime activation has an empty manifest digest",
+                "shard id" => "runtime activation has an empty shard id",
+                "exposure id" => "runtime activation has an empty exposure id",
+                "behavior id" => "runtime activation has an empty behavior id",
+                "activation source" => "runtime activation has an empty source",
+                _ => unreachable!("all runtime activation fields are listed"),
+            }));
+        }
+        Ok(Self {
+            active_model_set_hash,
+            runtime_profile_digest,
+            manifest_digest,
+            shard_id,
+            exposure_id,
+            behavior_id,
+            activation_source,
+        })
+    }
+
+    pub(crate) fn runtime_profile_digest(&self) -> &str {
+        &self.runtime_profile_digest
+    }
+
+    pub(crate) fn exposure_id(&self) -> &str {
+        &self.exposure_id
+    }
+}
+
+/// A typed abstract root for one activated runtime container. It deliberately
+/// carries activation ownership and state identity instead of impersonating a
+/// source allocation or a declaration-backed field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeObjectRoot {
+    runtime_profile_digest: String,
+    realm: String,
+    exposure_id: String,
+    container_member: String,
+    state_boundary: String,
+    refinement_identity: StableDigest,
+    activation: RuntimeObjectActivation,
+    singleton_proven: bool,
+}
+
+struct RuntimeObjectCapturedParts {
+    runtime_profile_digest: String,
+    realm: String,
+    exposure_id: String,
+    container_member: String,
+    state_boundary: String,
+    refinement_identity: StableDigest,
+    activation: RuntimeObjectActivation,
+}
+
+impl RuntimeObjectRoot {
+    #[cfg(test)]
+    pub(crate) fn captured(
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: StableDigest,
+        activation: RuntimeObjectActivation,
+    ) -> Result<Self, OracleContractError> {
+        Self::from_captured_parts(
+            RuntimeObjectCapturedParts {
+                runtime_profile_digest,
+                realm,
+                exposure_id,
+                container_member,
+                state_boundary,
+                refinement_identity,
+                activation,
+            },
+            false,
+        )
+    }
+
+    pub(crate) fn captured_single_realm(
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: StableDigest,
+        activation: RuntimeObjectActivation,
+    ) -> Result<Self, OracleContractError> {
+        Self::from_captured_parts(
+            RuntimeObjectCapturedParts {
+                runtime_profile_digest,
+                realm,
+                exposure_id,
+                container_member,
+                state_boundary,
+                refinement_identity,
+                activation,
+            },
+            true,
+        )
+    }
+
+    fn from_captured_parts(
+        parts: RuntimeObjectCapturedParts,
+        singleton_proven: bool,
+    ) -> Result<Self, OracleContractError> {
+        let RuntimeObjectCapturedParts {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            activation,
+        } = parts;
+        if runtime_profile_digest.is_empty()
+            || realm.is_empty()
+            || exposure_id.is_empty()
+            || container_member.is_empty()
+            || state_boundary.is_empty()
+        {
+            return Err(OracleContractError::InvalidAccessRoot(
+                "runtime object root has an empty identity field",
+            ));
+        }
+        if activation.exposure_id() != exposure_id
+            || activation.runtime_profile_digest() != runtime_profile_digest
+        {
+            return Err(OracleContractError::InvalidAccessRoot(
+                "runtime object root and activation identify different exposure/profile",
+            ));
+        }
+        Ok(Self {
+            runtime_profile_digest,
+            realm,
+            exposure_id,
+            container_member,
+            state_boundary,
+            refinement_identity,
+            activation,
+            singleton_proven,
+        })
+    }
+
+    pub fn runtime_profile_digest(&self) -> &str {
+        &self.runtime_profile_digest
+    }
+
+    pub fn realm(&self) -> &str {
+        &self.realm
+    }
+
+    pub fn exposure_id(&self) -> &str {
+        &self.exposure_id
+    }
+
+    pub fn container_member(&self) -> &str {
+        &self.container_member
+    }
+
+    pub fn state_boundary(&self) -> &str {
+        &self.state_boundary
+    }
+
+    pub const fn refinement_identity(&self) -> StableDigest {
+        self.refinement_identity
+    }
+
+    pub const fn singleton_proven(&self) -> bool {
+        self.singleton_proven
+    }
+}
+
+#[cfg(test)]
+mod runtime_object_tests {
+    use super::*;
+
+    fn activation() -> RuntimeObjectActivation {
+        RuntimeObjectActivation::captured(
+            "models".into(),
+            "node".into(),
+            "manifest".into(),
+            "shard".into(),
+            "process".into(),
+            "env".into(),
+            "fixture".into(),
+        )
+        .expect("complete activation evidence")
+    }
+
+    #[test]
+    fn runtime_root_requires_matching_activation_and_preserves_unknown_cardinality() {
+        let root = RuntimeObjectRoot::captured(
+            "node".into(),
+            "main".into(),
+            "process".into(),
+            "env".into(),
+            "entry".into(),
+            StableDigest::sha256("read"),
+            activation(),
+        )
+        .expect("runtime object root");
+        assert!(!root.singleton_proven());
+        assert!(
+            AbstractObject::new(
+                AccessPathRoot::RuntimeObject(root.clone()),
+                ObjectCardinality::Singleton,
+            )
+            .is_err()
+        );
+        assert!(
+            AbstractObject::new(
+                AccessPathRoot::RuntimeObject(root),
+                ObjectCardinality::Unknown,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn runtime_root_rejects_profile_or_exposure_mismatch() {
+        let result = RuntimeObjectRoot::captured(
+            "other-profile".into(),
+            "main".into(),
+            "process".into(),
+            "env".into(),
+            "entry".into(),
+            StableDigest::sha256("read"),
+            activation(),
+        );
+        assert!(matches!(
+            result,
+            Err(OracleContractError::InvalidAccessRoot(_))
+        ));
+    }
+
+    #[test]
+    fn runtime_root_single_realm_constructor_allows_singleton() {
+        let root = RuntimeObjectRoot::captured_single_realm(
+            "node".into(),
+            "main".into(),
+            "process".into(),
+            "env".into(),
+            "entry".into(),
+            StableDigest::sha256("read"),
+            activation(),
+        )
+        .expect("single-realm runtime object root");
+        assert!(
+            AbstractObject::new(
+                AccessPathRoot::RuntimeObject(root),
+                ObjectCardinality::Singleton,
+            )
+            .is_ok()
+        );
+    }
 }
 /// A recent-call suffix retained by a bounded oracle query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -529,6 +825,7 @@ pub enum AccessPathRoot {
     TypeSummary(ScopedSemanticLocator),
     ModuleObject(ScopedSemanticLocator),
     External(ScopedSemanticLocator),
+    RuntimeObject(RuntimeObjectRoot),
 }
 
 impl AccessPathRoot {
@@ -540,9 +837,11 @@ impl AccessPathRoot {
             Self::ProcedurePort(port) | Self::CaptureSlot(port) => Some(port.procedure()),
             Self::Allocation(allocation) => Some(allocation.procedure()),
             Self::LexicalCell(location) => Some(location.procedure()),
-            Self::Static(_) | Self::TypeSummary(_) | Self::ModuleObject(_) | Self::External(_) => {
-                None
-            }
+            Self::Static(_)
+            | Self::TypeSummary(_)
+            | Self::ModuleObject(_)
+            | Self::External(_)
+            | Self::RuntimeObject(_) => None,
         }
     }
 
@@ -587,7 +886,8 @@ impl AccessPathRoot {
             | Self::CaptureSlot(_)
             | Self::TypeSummary(_)
             | Self::ModuleObject(_)
-            | Self::External(_) => {}
+            | Self::External(_)
+            | Self::RuntimeObject(_) => {}
         }
         Ok(())
     }
@@ -610,6 +910,7 @@ impl AccessPathRoot {
             | Self::TypeSummary(locator)
             | Self::ModuleObject(locator)
             | Self::External(locator) => locator.validate_at(procedure),
+            Self::RuntimeObject(_) => Ok(()),
         }
     }
 }
@@ -630,6 +931,7 @@ pub enum IndexSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AccessSelector {
     Field(ScopedSemanticLocator),
+    Property(String),
     Index(IndexSelector),
 }
 
@@ -734,6 +1036,7 @@ impl AccessPath {
         for selector in &self.selectors {
             match selector {
                 AccessSelector::Field(field) => field.validate_at(procedure)?,
+                AccessSelector::Property(_) => {}
                 AccessSelector::Index(IndexSelector::Exact(index)) => {
                     require_same_procedure(index.procedure(), procedure)?;
                 }
@@ -751,7 +1054,8 @@ impl AccessPath {
             | AccessPathRoot::ProcedurePort(_)
             | AccessPathRoot::Allocation(_)
             | AccessPathRoot::LexicalCell(_)
-            | AccessPathRoot::CaptureSlot(_) => {}
+            | AccessPathRoot::CaptureSlot(_)
+            | AccessPathRoot::RuntimeObject(_) => {}
         }
         Ok(())
     }
@@ -976,6 +1280,19 @@ pub enum DurableObjectIdentity {
     External {
         locator: SemanticLocator,
     },
+    RuntimeObject {
+        runtime_profile_digest: String,
+        realm: String,
+        exposure_id: String,
+        container_member: String,
+        state_boundary: String,
+        refinement_identity: StableDigest,
+        active_model_set_hash: String,
+        manifest_digest: String,
+        shard_id: String,
+        behavior_id: String,
+        activation_source: String,
+    },
 }
 
 impl AccessPathRoot {
@@ -1038,6 +1355,19 @@ impl AccessPathRoot {
             Self::External(locator) => DurableObjectIdentity::External {
                 locator: locator.locator().clone(),
             },
+            Self::RuntimeObject(root) => DurableObjectIdentity::RuntimeObject {
+                runtime_profile_digest: root.runtime_profile_digest.clone(),
+                realm: root.realm.clone(),
+                exposure_id: root.exposure_id.clone(),
+                container_member: root.container_member.clone(),
+                state_boundary: root.state_boundary.clone(),
+                refinement_identity: root.refinement_identity,
+                active_model_set_hash: root.activation.active_model_set_hash.clone(),
+                manifest_digest: root.activation.manifest_digest.clone(),
+                shard_id: root.activation.shard_id.clone(),
+                behavior_id: root.activation.behavior_id.clone(),
+                activation_source: root.activation.activation_source.clone(),
+            },
         })
     }
 }
@@ -1088,6 +1418,14 @@ impl AbstractObject {
         {
             return Err(OracleContractError::InvalidObjectCardinality(
                 "external objects cannot claim singleton cardinality",
+            ));
+        }
+        if let AbstractObjectIdentity::RuntimeObject(root) = &identity
+            && cardinality == ObjectCardinality::Singleton
+            && !root.singleton_proven()
+        {
+            return Err(OracleContractError::InvalidObjectCardinality(
+                "runtime objects require a proven single runtime realm for singleton cardinality",
             ));
         }
         Ok(Self {
@@ -1431,6 +1769,18 @@ fn access_path_matches_memory_location(
                     Some(AccessSelector::Field(field)) if field.locator() == member
                 )
         }),
+        MemoryLocationKind::Property {
+            base: expected_base,
+            key: expected_key,
+        } => base.is_some_and(|base| {
+            base.value().id() == *expected_base
+                && path.selectors().len() == 1
+                && access_root_matches_value(path.root(), base.value())
+                && matches!(
+                    path.selectors().first(),
+                    Some(AccessSelector::Property(actual)) if actual == expected_key
+                )
+        }),
         MemoryLocationKind::Static { member } => {
             base.is_none()
                 && path.selectors().is_empty()
@@ -1538,7 +1888,8 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
         | AccessPathRoot::CaptureSlot(_)
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => false,
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_) => false,
     }
 }
 /// A dispatch arm that cannot enter a materialized workspace procedure.

@@ -15,21 +15,22 @@ use super::{
 };
 use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
 use crate::analyzer::semantic::workspace_oracle::{
-    PreparedSourceDispatchSession, ProcedureRangeLookupStatus,
-    procedures_for_definition_with_limits, procedures_for_source_ranges,
+    PreparedSourceDispatchSession, ProcedureRangeLookupStatus, RuntimeKeyedReadFilter,
+    RuntimeKeyedReadResult, procedures_for_definition_with_limits, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
     AllocationSite, BasicBlock, CallSiteHandle, CapabilitySupport, CaptureBinding, ContentIdentity,
     ControlEdge, ControlEdgeHandle, ControlEdgeId, DeclarationSegmentKind, DispatchBoundaryKind,
-    Evidence, EvidenceCompleteness, ExecutionTiming, HeapOracle, LengthDelimitedDigest,
-    MemoryLocation, ObservationPhase, OracleCallContext, ProcedureHandle, ProcedureSemantics,
-    ProgramPoint, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactLeaseChild, SemanticArtifactLeaseError, SemanticArtifactLeaseLiveReservation,
-    SemanticArtifactLeaseSet, SemanticArtifactLeaseSnapshot, SemanticArtifactLeaseWindow,
-    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticCallSite,
-    SemanticCapability, SemanticEvent, SemanticExecutionBudget, SemanticExecutionBudgetSnapshot,
-    SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
-    SourceMapping, ValueAtPoint, ValueHandle, ValueId, WorkspaceIcfgProvider,
+    DispatchHints, Evidence, EvidenceCompleteness, ExecutionTiming, HeapOracle,
+    LengthDelimitedDigest, MemoryLocation, ObservationPhase, OracleCallContext, ProcedureHandle,
+    ProcedureSemantics, ProgramPoint, ProgramPointHandle, ProgramPointId, ProofStatus,
+    SemanticArtifact, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
+    SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseSet, SemanticArtifactLeaseSnapshot,
+    SemanticArtifactLeaseWindow, SemanticBudget, SemanticBudgetDimension,
+    SemanticBudgetScopeSnapshot, SemanticCallSite, SemanticCapability, SemanticEvent,
+    SemanticExecutionBudget, SemanticExecutionBudgetSnapshot, SemanticGap, SemanticLocator,
+    SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork, SourceMapping, ValueAtPoint,
+    ValueHandle, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, SemanticModelOverlay};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
@@ -279,6 +280,34 @@ pub(super) struct SemanticQueryContext<'a> {
 }
 
 impl<'a> SemanticQueryContext<'a> {
+    /// Resolve one exact runtime keyed read through the workspace oracle while
+    /// charging this query's shared semantic budget and cancellation token.
+    pub(super) fn runtime_keyed_read_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+        filter: &RuntimeKeyedReadFilter,
+    ) -> Result<
+        SemanticOutcome<RuntimeKeyedReadResult>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let artifact_collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &artifact_collector {
+            request = request.with_artifact_collector(collector);
+        }
+        crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
+            self.workspace,
+            self.active_semantic_model_snapshot.as_deref(),
+            DispatchHints::empty(),
+        )
+        .runtime_keyed_read_at_source(file, range, filter, &mut request)
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
@@ -784,7 +813,7 @@ impl<'a> SemanticQueryContext<'a> {
         };
         let exceeded_limit = outcome
             .budget_exceeded()
-            .map(|exceeded| exceeded.dimension().label());
+            .map(|exceeded| exceeded.dimension().public_lane().label());
         if let Some(exceeded) = outcome.budget_exceeded() {
             self.budget_exhausted = true;
             self.push_diagnostic(

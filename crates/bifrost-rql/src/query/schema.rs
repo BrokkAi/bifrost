@@ -72,6 +72,70 @@ pub fn resolve_rql_schema_version(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFamily {
+    Node,
+}
+
+impl RuntimeFamily {
+    pub const fn label(self) -> &'static str {
+        "node"
+    }
+    pub fn from_label(label: &str) -> Option<Self> {
+        (label == Self::Node.label()).then_some(Self::Node)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeGlobal {
+    Process,
+}
+
+impl RuntimeGlobal {
+    pub const fn label(self) -> &'static str {
+        "process"
+    }
+    pub fn from_label(label: &str) -> Option<Self> {
+        (label == Self::Process.label()).then_some(Self::Process)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeContainer {
+    Env,
+    Argv,
+}
+
+impl RuntimeContainer {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Argv => "argv",
+        }
+    }
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "env" => Some(Self::Env),
+            "argv" => Some(Self::Argv),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSourceOrigin {
+    PristineInput,
+}
+
+impl RuntimeSourceOrigin {
+    pub const fn label(self) -> &'static str {
+        "pristine_input"
+    }
+    pub fn from_label(label: &str) -> Option<Self> {
+        (label == Self::PristineInput.label()).then_some(Self::PristineInput)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
     QueryList,
@@ -138,6 +202,10 @@ pub enum ValueShape {
     ControlRelationKindList,
     ControlExitPartitionList,
     JsxElementIdentity,
+    RuntimeFamily,
+    RuntimeGlobal,
+    RuntimeContainer,
+    RuntimeSourceOrigin,
 }
 
 impl ValueShape {
@@ -214,6 +282,10 @@ impl ValueShape {
             Self::ControlRelationKindList => "one or more control relations",
             Self::ControlExitPartitionList => "one or more control exit partitions",
             Self::JsxElementIdentity => "intrinsic, component, or unknown",
+            Self::RuntimeFamily => "a supported runtime family",
+            Self::RuntimeGlobal => "a supported runtime global binding",
+            Self::RuntimeContainer => "a supported runtime container member",
+            Self::RuntimeSourceOrigin => "a supported runtime source-origin contract",
         }
     }
 
@@ -547,6 +619,7 @@ query_step_ops! {
     ReceiverTargets { shape: DerivedValue, label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { shape: DerivedValue, label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { shape: DerivedValue, label: "member_targets", signature: "structural_match|reference_site|occurrence -> member_target_analysis", description: "Resolve exact static member identities together with the receiver owner and model provenance used by bounded structured receiver analysis." }
+    KeyedReadValue { shape: DerivedValue, label: "keyed_read_value", signature: "structural_match -> keyed_read_value", description: "Resolve a runtime-global keyed load to its exact executable value observation under the active runtime model, retaining incomplete and exclusion evidence.", semantic: [Procedures, ProgramPoints, ValueFlow] }
     FieldWriteValue { shape: RowLocal, label: "field_write_value", signature: "member_target_analysis -> field_write_value", description: "Project the exact right-hand expression of a simple assignment whose static member and receiver identities were proven by member_targets, optionally retaining only exact receiver/member identities." }
     ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "receiver_analysis|member_target_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver or member-target analysis." }
     ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
@@ -772,6 +845,7 @@ macro_rules! rql_forms {
                     | Self::ReceiverTargets
                     | Self::PointsTo
                     | Self::MemberTargets
+                    | Self::KeyedReadValue
                     | Self::FieldWriteValue
                     | Self::ReceiverOutcome
                     | Self::ReceiverEvidence
@@ -1212,6 +1286,14 @@ rql_forms! {
         signature: "(member-targets [:capture name] query)",
         description: (QueryStepOp::MemberTargets),
         step: MemberTargets,
+    }
+    KeyedReadValue {
+        labels: ["keyed-read-value", "keyed_read_value"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(keyed-read-value :runtime node :global process :container env|argv [:property name | :index number] [:source-origin pristine_input] query)",
+        description: (QueryStepOp::KeyedReadValue),
+        step: KeyedReadValue,
     }
     FieldWriteValue {
         labels: ["field-write-value", "field_write_value"],
@@ -2045,6 +2127,12 @@ json_fields! {
     Identity { label: "identity", shape: JsxElementIdentity, signature: "\"identity\": \"intrinsic\" | \"component\" | \"unknown\"", description: "Restrict JSX value rows to one semantic element identity." }
     ElementName { label: "element_name", shape: String, signature: "\"element_name\": \"name\"", description: "Restrict JSX value rows to one exact unqualified element tag name." }
     PropertyName { label: "property_name", shape: String, signature: "\"property_name\": \"name\"", description: "Restrict JSX value rows to one exact JSX attribute or object-property name." }
+    Runtime { label: "runtime", shape: RuntimeFamily, signature: "\"runtime\": \"node\"", description: "Select the modeled runtime family." }
+    Global { label: "global", shape: RuntimeGlobal, signature: "\"global\": \"process\"", description: "Select the modeled global binding." }
+    Container { label: "container", shape: RuntimeContainer, signature: "\"container\": \"env\" | \"argv\"", description: "Select the modeled container member." }
+    Property { label: "property", shape: String, signature: "\"property\": \"name\"", description: "Select one exact static property key." }
+    Index { label: "index", shape: NonNegativeInteger, signature: "\"index\": non-negative integer", description: "Select one exact non-negative array index." }
+    SourceOrigin { label: "source_origin", shape: RuntimeSourceOrigin, signature: "\"source_origin\": \"pristine_input\"", description: "Require the modeled pristine runtime-input origin." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
     ReceiverIdentityId { label: "receiver_identity_id", shape: String, signature: "\"receiver_identity_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven receiver identity equals this exact analyzer or semantic-model identity." }
     MemberTargetId { label: "member_target_id", shape: String, signature: "\"member_target_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven static member identity equals this exact analyzer or semantic-model identity." }
@@ -2187,6 +2275,17 @@ const FIELD_WRITE_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(
         QueryStepField::MemberTargetId,
         &[":member-target-id", ":member_target_id"],
+    ),
+];
+const KEYED_READ_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::required(QueryStepField::Runtime, &[":runtime"]),
+    QueryStepOption::required(QueryStepField::Global, &[":global"]),
+    QueryStepOption::required(QueryStepField::Container, &[":container"]),
+    QueryStepOption::optional(QueryStepField::Property, &[":property"]),
+    QueryStepOption::optional(QueryStepField::Index, &[":index"]),
+    QueryStepOption::optional(
+        QueryStepField::SourceOrigin,
+        &[":source-origin", ":source_origin"],
     ),
 ];
 const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
@@ -2366,6 +2465,7 @@ impl QueryStepOp {
             Self::Taint => TAINT_STEP_OPTIONS,
             Self::JsxAttributeValue => JSX_ATTRIBUTE_VALUE_STEP_OPTIONS,
             Self::FieldWriteValue => FIELD_WRITE_VALUE_STEP_OPTIONS,
+            Self::KeyedReadValue => KEYED_READ_VALUE_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,

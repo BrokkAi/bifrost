@@ -167,6 +167,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 AccessPathRoot::CallResult(_)
                     | AccessPathRoot::ProcedurePort(_)
                     | AccessPathRoot::CaptureSlot(_)
+                    | AccessPathRoot::RuntimeObject(_)
             ) {
                 exhaustive = false;
                 continue;
@@ -957,6 +958,10 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
                 AccessPathRoot::Value(value_handle(procedure, *base)?),
                 vec![AccessSelector::Field(scoped(member.clone())?)],
             ),
+            MemoryLocationKind::Property { base, key } => (
+                AccessPathRoot::Value(value_handle(procedure, *base)?),
+                vec![AccessSelector::Property(key.clone())],
+            ),
             MemoryLocationKind::Index {
                 base,
                 index,
@@ -1638,6 +1643,7 @@ fn exact_path_identity(path: &AccessPath) -> Option<String> {
     };
     match selector {
         AccessSelector::Field(field) => Some(field_step_selector(field.locator())),
+        AccessSelector::Property(property) => Some(format!("property:{property}")),
         AccessSelector::Index(IndexSelector::Constant(index)) => Some(format!("index:{index}")),
         AccessSelector::Index(IndexSelector::Exact(_) | IndexSelector::Any) => None,
     }

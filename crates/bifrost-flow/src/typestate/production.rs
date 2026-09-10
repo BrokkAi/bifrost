@@ -1445,6 +1445,10 @@ fn direct_concurrency_path_from(
                         ));
                         cursor = DirectPathCursor::Value(*base);
                     }
+                    MemoryLocationKind::Property { base, key } => {
+                        selectors.push(SummaryConcurrencyAccessSelector::Property(key.clone()));
+                        cursor = DirectPathCursor::Value(*base);
+                    }
                     MemoryLocationKind::Index {
                         base,
                         index,

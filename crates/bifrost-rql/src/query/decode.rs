@@ -5,10 +5,10 @@ use super::ir::{
     ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter,
     EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance,
     FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
-    HierarchyTraversal, JsxAttributeValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH,
-    MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
-    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadValueTraversal, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
     MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
     OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
@@ -1304,6 +1304,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let call_input = matches!(step, QueryStep::CallInput(_));
         let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
         let field_write_value = matches!(step, QueryStep::FieldWriteValue(_));
+        let keyed_read_value = matches!(step, QueryStep::KeyedReadValue(_));
         let receiver = matches!(
             step,
             QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
@@ -1348,6 +1349,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 ) if jsx_attribute_value => {}
                 Some(QueryStepField::ReceiverIdentityId | QueryStepField::MemberTargetId)
                     if field_write_value => {}
+                Some(
+                    QueryStepField::Runtime
+                    | QueryStepField::Global
+                    | QueryStepField::Container
+                    | QueryStepField::Property
+                    | QueryStepField::Index
+                    | QueryStepField::SourceOrigin,
+                ) if keyed_read_value => {}
                 Some(QueryStepField::Capture) if receiver => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
@@ -1417,6 +1426,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Capture
                     | QueryStepField::ReceiverIdentityId
                     | QueryStepField::MemberTargetId
+                    | QueryStepField::Runtime
+                    | QueryStepField::Global
+                    | QueryStepField::Container
+                    | QueryStepField::Property
+                    | QueryStepField::Index
+                    | QueryStepField::SourceOrigin
                     | QueryStepField::ProtocolRef
                     | QueryStepField::PlanRef
                     | QueryStepField::TaintRef
@@ -1811,6 +1826,95 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::FieldWriteValue(FieldWriteValueTraversal {
                 receiver_identity_id: decode_identity("receiver_identity_id")?,
                 member_target_id: decode_identity("member_target_id")?,
+            });
+        } else if keyed_read_value {
+            let required_string = |field: &str| -> Result<String, QueryError> {
+                let path = child_path(&entry_path, field);
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        QueryError::new(path, "required field must be a non-empty string")
+                    })
+            };
+            let runtime = required_string("runtime")?;
+            if runtime != "node" {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "runtime"),
+                    "runtime must be node",
+                ));
+            }
+            let global = required_string("global")?;
+            if global != "process" {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "global"),
+                    "global must be process",
+                ));
+            }
+            let container = required_string("container")?;
+            if !matches!(container.as_str(), "env" | "argv") {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "container"),
+                    "container must be env or argv",
+                ));
+            }
+            let property = object
+                .get("property")
+                .map(|value| {
+                    let path = child_path(&entry_path, "property");
+                    value
+                        .as_str()
+                        .filter(|value| value.len() <= MAX_BINDING_NAME_LENGTH)
+                        .map(str::to_owned)
+                        .ok_or_else(|| QueryError::new(path, "property must be a bounded string"))
+                })
+                .transpose()?;
+            let index = object
+                .get("index")
+                .map(|value| {
+                    let path = child_path(&entry_path, "index");
+                    value.as_u64().map(u128::from).ok_or_else(|| {
+                        QueryError::new(path, "index must be a non-negative integer")
+                    })
+                })
+                .transpose()?;
+            if property.is_some() == index.is_some() {
+                return Err(QueryError::new(
+                    &entry_path,
+                    "keyed_read_value requires exactly one of property or index",
+                ));
+            }
+            if (container == "env") != property.is_some() {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "container"),
+                    "env requires property and argv requires index",
+                ));
+            }
+            if container == "argv" && index.is_some_and(|index| index > u128::from(u32::MAX - 1)) {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "index"),
+                    "argv index must be at most 4294967294",
+                ));
+            }
+            let pristine_input = match object.get("source_origin") {
+                None => false,
+                Some(value) if value.as_str() == Some("pristine_input") => true,
+                Some(_) => {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "source_origin"),
+                        "source_origin must be pristine_input",
+                    ));
+                }
+            };
+            step = QueryStep::KeyedReadValue(KeyedReadValueTraversal {
+                runtime,
+                global,
+                container,
+                property,
+                index,
+                pristine_input,
             });
         } else if receiver {
             let capture = object

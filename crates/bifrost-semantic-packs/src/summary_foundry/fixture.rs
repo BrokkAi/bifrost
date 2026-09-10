@@ -578,6 +578,8 @@ fn pack_source(
                     class_decorator_identity: None,
                 }],
             },
+            runtime_values: None,
+            collection_flows: None,
         }],
     };
     let mut rendered =

@@ -1,4 +1,8 @@
 use super::*;
+
+use crate::analyzer::semantic::{
+    RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult, SemanticOutcome,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> {
@@ -22,6 +26,29 @@ fn semantic_artifact_window_file<'a>(
         };
     }
     result_contract_artifact_file(value)
+}
+
+/// Join a semantic runtime endpoint back to the exact structural seed that
+/// requested it. Runtime model evidence is never accepted on equal byte
+/// ranges alone: the endpoint must carry the same source-content identity and
+/// its normalized node identity must be the exact candidate seed. The
+/// executable expression can extend beyond that seed for indexed reads.
+fn keyed_endpoint_matches_seed(seed: &SeedMatch, endpoint: &RuntimeKeyedReadEndpoint) -> bool {
+    if endpoint.structural_identity.content() != seed.facts.source_identity()
+        || endpoint.file != seed.file
+        || !same_byte_span(
+            endpoint.candidate_anchor,
+            seed.facts.node(seed.fact_match.node).range,
+        )
+    {
+        return false;
+    }
+
+    endpoint.structural_identity.node_id() == seed.fact_match.node
+}
+
+fn same_byte_span(left: crate::analyzer::Range, right: crate::analyzer::Range) -> bool {
+    left.start_byte == right.start_byte && left.end_byte == right.end_byte
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -107,6 +134,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ReceiverOutcome(_)
                     | PipelineValue::ReceiverEvidence(_)
                     | PipelineValue::FieldWriteValue(_)
+                    | PipelineValue::RuntimeKeyedReadValue(_)
                     | PipelineValue::CallShape(_)
                     | PipelineValue::CallArgumentGroup(_)
                     | PipelineValue::CallArgument(_)
@@ -200,6 +228,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ReceiverOutcome(_)
                                 | PipelineValue::ReceiverEvidence(_)
                                 | PipelineValue::FieldWriteValue(_)
+                                | PipelineValue::RuntimeKeyedReadValue(_)
                                 | PipelineValue::CallShape(_)
                                 | PipelineValue::CallArgumentGroup(_)
                                 | PipelineValue::CallArgument(_)
@@ -305,6 +334,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ReceiverOutcome(_)
                         | PipelineValue::ReceiverEvidence(_)
                         | PipelineValue::FieldWriteValue(_)
+                        | PipelineValue::RuntimeKeyedReadValue(_)
                         | PipelineValue::CallShape(_)
                         | PipelineValue::CallArgumentGroup(_)
                         | PipelineValue::CallArgument(_)
@@ -1201,6 +1231,137 @@ pub(super) fn apply_pipeline_step(
             }
         }
         let mut row_exhausted = false;
+        if let (PipelineValue::StructuralMatch(seed), QueryStep::KeyedReadValue(filter)) =
+            (&row.value, step)
+        {
+            let range = seed.facts.node(seed.fact_match.node).range;
+            let request_filter = RuntimeKeyedReadFilter {
+                runtime: filter.runtime.clone(),
+                global: filter.global.clone(),
+                container: filter.container.clone(),
+                property: filter.property.clone(),
+                index: filter.index,
+                pristine_input: filter.pristine_input,
+            };
+            let (result, interrupted) = match semantic.as_mut() {
+                None => {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message:
+                            "keyed_read_value requires WorkspaceAnalyzer-backed semantic services"
+                                .to_owned(),
+                    });
+                    (RuntimeKeyedReadResult::default(), true)
+                }
+                Some(semantic) => {
+                    match semantic.runtime_keyed_read_at_source(&seed.file, range, &request_filter)
+                    {
+                        Ok(outcome) => match outcome {
+                            SemanticOutcome::Complete { value, .. } => (value, false),
+                            SemanticOutcome::Unproven { partial: value, .. } => (value, true),
+                            SemanticOutcome::Cancelled { partial, .. }
+                            | SemanticOutcome::ExceededBudget { partial, .. } => {
+                                (partial.unwrap_or_default(), true)
+                            }
+                            SemanticOutcome::Ambiguous { candidates, .. } => (candidates, true),
+                            SemanticOutcome::Unknown { partial, .. }
+                            | SemanticOutcome::Unsupported { partial, .. } => {
+                                (partial.unwrap_or_default(), true)
+                            }
+                        },
+                        Err(error) => {
+                            // Provider errors are operational failures, rather than an
+                            // impossible state. Retain the mandatory terminal row and
+                            // route the typed failure through the normal diagnostic and
+                            // truncation plumbing so it cannot be mistaken for a clean
+                            // empty keyed-read relation.
+                            diagnostics.push(CodeQueryDiagnostic {
+                                code: CodeQueryDiagnosticCode::SemanticProviderFailed,
+                                impact: CodeQueryDiagnosticImpact::Incomplete,
+                                branch: Vec::new(),
+                                language: "workspace",
+                                message: format!("runtime keyed-read analysis failed: {error}"),
+                            });
+                            (RuntimeKeyedReadResult::default(), true)
+                        }
+                    }
+                }
+            };
+            let terminal_required =
+                interrupted || result.conclusive_exclusion || !result.limitations.is_empty();
+            let mut expansions = result
+                .endpoints
+                .into_iter()
+                .filter(|endpoint| keyed_endpoint_matches_seed(seed, endpoint))
+                .enumerate()
+                .map(|(ordinal, endpoint)| PipelineExpansion {
+                    value: PipelineValue::RuntimeKeyedReadValue(Box::new(RuntimeKeyedReadValue {
+                        file: seed.file.clone(),
+                        range: endpoint.expression,
+                        endpoint: Some(endpoint),
+                        limitations: result.limitations.clone(),
+                        conclusive_exclusion: result.conclusive_exclusion,
+                        ordinal,
+                    })),
+                    trace: vec![],
+                    budgeted: false,
+                })
+                .collect::<Vec<_>>();
+            if expansions.is_empty() && terminal_required {
+                expansions.push(PipelineExpansion {
+                    value: PipelineValue::RuntimeKeyedReadValue(Box::new(RuntimeKeyedReadValue {
+                        file: seed.file.clone(),
+                        range,
+                        endpoint: None,
+                        limitations: result.limitations,
+                        conclusive_exclusion: result.conclusive_exclusion,
+                        ordinal: 0,
+                    })),
+                    trace: vec![],
+                    budgeted: false,
+                });
+            }
+            if expansions.is_empty() {
+                continue;
+            }
+            for expansion in expansions {
+                // This derived relation is handled before the generic
+                // expansion loop below, so apply the same row and output
+                // caps here. A keyed read may produce one endpoint per
+                // source observation; allowing it to bypass either cap
+                // makes a policy query appear complete after exhausting the
+                // shared pipeline budget.
+                if output.len() >= max_step_outputs {
+                    exhausted = true;
+                    break 'rows;
+                }
+                if budget.pipeline_rows >= max_pipeline_rows {
+                    exhausted = true;
+                    break 'rows;
+                }
+                budget.pipeline_rows = budget.pipeline_rows.saturating_add(1);
+                insert_pipeline_row(
+                    &mut output,
+                    &mut indexes,
+                    expansion.value,
+                    row.traces
+                        .iter()
+                        .cloned()
+                        .map(|trace| advance_pipeline_trace(trace, step, &expansion.trace))
+                        .collect(),
+                    row.provenance_truncated,
+                );
+            }
+            row_exhausted |= interrupted;
+            if row_exhausted {
+                exhausted = true;
+                break 'rows;
+            }
+            continue;
+        }
         if let (
             PipelineValue::StructuralMatch(_),
             QueryStep::ReceiverTargets(filter)

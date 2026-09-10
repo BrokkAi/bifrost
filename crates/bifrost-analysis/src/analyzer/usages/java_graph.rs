@@ -416,18 +416,21 @@ impl GraphUsageAnalyzer for JavaUsageGraphStrategy {
 /// under Java's own arity rules, and a receiver that cannot be typed lands in
 /// the unproven channel. What stays here is the downcast that produces the
 /// scan's `ScalaSource`.
+///
+/// `false` when the Scala frontier failed, so the Scala half of the answer is
+/// incomplete.
 pub(in crate::analyzer::usages) fn scan_scala_files_for_java_target(
     analyzer: &dyn IAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
     state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
     cancellation: Option<&crate::cancellation::CancellationToken>,
-) {
+) -> bool {
     let Some(scala) = resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer) else {
-        return;
+        return true;
     };
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-        return;
+        return true;
     };
     scan_scala_files_for_foreign_target(
         analyzer,
@@ -437,12 +440,15 @@ pub(in crate::analyzer::usages) fn scan_scala_files_for_java_target(
         spec,
         state,
         cancellation,
-    );
+    )
 }
 
 /// One foreign catalog for the Java (or other JVM-language) target family,
-/// then the ordinary per-file Scala query scan with a hit sink that also keeps
-/// unproven receiver references.
+/// then the ordinary per-file Scala query scan on the query's relational
+/// frontier, with a hit sink that also keeps unproven receiver references.
+/// The walk's realm questions -- is this spelling a Java or Kotlin class? --
+/// go through the same frontier, so they batch in its barriers instead of
+/// costing one synchronous store read per candidate spelling.
 fn scan_scala_files_for_foreign_target(
     analyzer: &dyn IAnalyzer,
     scala: &crate::analyzer::ScalaAnalyzer,
@@ -451,10 +457,12 @@ fn scan_scala_files_for_foreign_target(
     spec: &TargetSpec,
     state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
     cancellation: Option<&crate::cancellation::CancellationToken>,
-) {
-    use brokk_bifrost_jvm::scala::graph::query::{
-        ScalaFileEligibility, ScalaQueryHitSink, ScalaQueryTargetCatalog,
+) -> bool {
+    use crate::analyzer::relational_frontier::RelationalItemFrontierOutcome;
+    use crate::analyzer::usages::scala_graph::shared::{
+        ScalaFrontierScan, ScalaFrontierSeedOutcome, foreign_jvm_languages, prepare_scala_files,
     };
+    use brokk_bifrost_jvm::scala::graph::query::{ScalaFileEligibility, ScalaQueryTargetCatalog};
 
     // Subtype receivers (#1859): a receiver typed as a descendant of the Java
     // owner dispatches to the inherited member, so the catalog's owner set is
@@ -473,67 +481,68 @@ fn scan_scala_files_for_foreign_target(
         }
     }
     let catalog = ScalaQueryTargetCatalog::build_foreign_jvm(spec, java, &receiver_owners);
-    let scala_types = scala.project_types();
-    let relevant_names = catalog.relevant_names();
-    let dispatch = crate::analyzer::usages::scala_graph::shared::ScalaDispatch(analyzer);
-    let eligibility = ScalaFileEligibility::All;
     let member_name = spec.member_name.as_str();
     let owner_name = spec.owner.identifier();
-    let mut files: Vec<ProjectFile> = candidate_files
+    let mut files: Vec<(ProjectFile, ScalaFileEligibility)> = candidate_files
         .iter()
         .filter(|file| crate::analyzer::usages::common::language_for_file(file) == Language::Scala)
         .cloned()
+        .map(|file| (file, ScalaFileEligibility::All))
         .collect();
-    files.sort();
-    let mut observed_hits = std::collections::BTreeSet::new();
-    for file in &files {
-        if *state.limit_exceeded || cancellation.is_some_and(|token| token.is_cancelled()) {
-            break;
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let uncancelled = crate::cancellation::CancellationToken::new();
+    let cancellation = cancellation.unwrap_or(&uncancelled);
+    let scan = match ScalaFrontierScan::seed(scala, analyzer, cancellation) {
+        ScalaFrontierSeedOutcome::Ready(scan) => scan,
+        ScalaFrontierSeedOutcome::Cancelled => return true,
+        ScalaFrontierSeedOutcome::Failed(reason) => {
+            crate::profiling::note_with(|| {
+                format!("Scala scan for a JVM target skipped: {reason}")
+            });
+            return false;
         }
-        let Some(source) = analyzer.indexed_source(file) else {
-            continue;
-        };
-        // The retired scanner's cheap gate: a file that spells neither the
-        // member nor its owner cannot reference the target.
-        if !source.contains(member_name) && !source.contains(owner_name) {
-            continue;
+    };
+    // The retired scanner's cheap gate: a file that spells neither the
+    // member nor its owner cannot reference the target.
+    let prepared = prepare_scala_files(analyzer, scala, files, cancellation, |source| {
+        source.contains(member_name) || source.contains(owner_name)
+    });
+    let scan_files: Vec<ProjectFile> = prepared.iter().map(|file| file.file.clone()).collect();
+    scan.prefetch_file_facts(&scan_files);
+    let realm_languages = foreign_jvm_languages(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let results = match scan.scan(
+        analyzer,
+        scope.token(),
+        &prepared,
+        &catalog,
+        1,
+        state.max_usages,
+        Some(&realm_languages),
+        true,
+    ) {
+        RelationalItemFrontierOutcome::Complete(results) => {
+            results.into_iter().map(Some).collect::<Vec<_>>()
         }
-        let mut sink = ScalaQueryHitSink {
-            analyzer: &dispatch,
-            scala,
-            file,
-            source: &source,
-            class_ranges: crate::analyzer::usages::inverted_edges::ClassRangeIndex::build(
-                analyzer, file,
-            ),
-            line_starts: crate::text_utils::compute_line_starts(&source),
-            catalog: &catalog,
-            eligibility: &eligibility,
-            hits: std::slice::from_mut(&mut *state.hits),
-            observed_hits: &mut observed_hits,
-            unproven_hits: Some(&mut *state.unproven_hits),
-            enclosing_cache: crate::hash::HashMap::default(),
-            relevant_names: relevant_names.clone(),
-            allow_all_names: false,
-            max_usages: state.max_usages,
-            limit_exceeded: false,
-        };
-        let scope = AnalyzerQueryScope::new(analyzer);
-        brokk_bifrost_jvm::scala::graph::inverted::scan_scala_query_file(
-            scala,
-            scope.token(),
-            &scala_types,
-            analyzer,
-            &dispatch,
-            file,
-            &source,
-            &mut sink,
-            cancellation,
-        );
-        if sink.limit_exceeded {
-            *state.limit_exceeded = true;
+        RelationalItemFrontierOutcome::Cancelled(results) => results,
+        RelationalItemFrontierOutcome::Failed(error) => {
+            crate::profiling::note_with(|| {
+                format!(
+                    "Scala file frontier failed for a JVM target: {}",
+                    error.message()
+                )
+            });
+            return false;
         }
+    };
+    for file_scan in results.into_iter().flatten() {
+        for target_hits in file_scan.hits {
+            state.hits.extend(target_hits);
+        }
+        state.unproven_hits.extend(file_scan.unproven_hits);
+        *state.limit_exceeded |= file_scan.limit_exceeded;
     }
+    true
 }
 
 /// The whole-workspace inverted pass: the shared driver's parallel fan-out plus

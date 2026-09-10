@@ -3594,6 +3594,18 @@ fn failure_use_origin(
     let mut relevant_values = HashSet::default();
     relevant_values.insert(candidate.operand);
     let mut relevant_locations = HashSet::default();
+    let mut needs_binding_events = reads.iter().any(|event| {
+        matches!(
+            &event.subject,
+            crate::structural::flow_state::FlowSubject::Binding { .. }
+        )
+    });
+    let mut needs_property_events = reads.iter().any(|event| {
+        matches!(
+            &event.subject,
+            crate::structural::flow_state::FlowSubject::Property { .. }
+        )
+    });
     for point in semantics.points() {
         for event in &point.events {
             match event.effect {
@@ -3611,21 +3623,35 @@ fn failure_use_origin(
                     structured_origin_count = structured_origin_count.saturating_add(1);
                     relevant_points.insert(point.id);
                     relevant_values.insert(source);
+                    needs_binding_events = true;
                 }
                 SemanticEffect::MemoryLoad {
-                    location, result, ..
+                    kind,
+                    location,
+                    result,
                 } if result == candidate.operand => {
                     structured_origin_count = structured_origin_count.saturating_add(1);
                     relevant_points.insert(point.id);
                     relevant_locations.insert(location);
+                    match kind {
+                        // A keyed property load publishes a property flow
+                        // subject exactly as a field load does.
+                        MemoryAccessKind::Field
+                        | MemoryAccessKind::Property
+                        | MemoryAccessKind::Static
+                        | MemoryAccessKind::Index => needs_property_events = true,
+                        MemoryAccessKind::LexicalCell | MemoryAccessKind::Capture => {
+                            needs_binding_events = true;
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     }
     let hard_event_hole = derivation.completeness.reasons().iter().any(|reason| {
-        (reason.blocks(FlowStateAxis::BindingEvents)
-            || reason.blocks(FlowStateAxis::PropertyEvents))
+        ((needs_binding_events && reason.blocks(FlowStateAxis::BindingEvents))
+            || (needs_property_events && reason.blocks(FlowStateAxis::PropertyEvents)))
             && !matches!(
                 reason,
                 FlowStateIncompleteReason::LoweringGap { .. }

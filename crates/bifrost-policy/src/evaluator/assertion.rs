@@ -3,6 +3,10 @@ use brokk_bifrost_rql::structural::CodeQueryRowScalarRef;
 use brokk_bifrost_rql::structural::edges::EdgeProvenance;
 use brokk_bifrost_rql::structural::search::{DetailedCodeQueryResult, MergedUnitRows};
 use std::collections::HashSet;
+use std::rc::Rc;
+
+mod subject_batch;
+pub(crate) use subject_batch::SubjectQueryBatch;
 
 use crate::definition::PolicyAssertId;
 use crate::relational::{RelationalPlanIr, lower_occurrence_assert, validate_plan_ir};
@@ -456,6 +460,7 @@ pub(super) fn evaluate_assertion_policy(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     if let Some(plan) = &spec.relational {
         // A relational plan is sliced by its own bindings, and records its own
@@ -477,6 +482,7 @@ pub(super) fn evaluate_assertion_policy(
             context,
             budget,
             active_semantic_model_snapshot,
+            subject_batch,
         );
     };
     let mut attempt = UnitAttempt::default();
@@ -500,6 +506,7 @@ pub(super) fn evaluate_assertion_policy(
                 context,
                 budget,
                 active_semantic_model_snapshot,
+                subject_batch,
             ),
             Some(reason),
         ),
@@ -576,14 +583,22 @@ fn sliced_assertion_run(
         workspace_files: &workspace_files,
     };
     let mut reuse = UnitReuse::new(policy, incremental, budget);
-    let subject_units = sliced_query_units(
-        policy,
-        subject_query,
-        &mut reuse,
-        &execution,
-        SeedPartition::seed,
-        attempt,
-    )?;
+    let subject_units = {
+        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+            format!("policy.subject_query[{}]", policy.definition().metadata.id)
+        });
+        sliced_query_units(
+            policy,
+            subject_query,
+            &mut reuse,
+            &execution,
+            SeedPartition::seed,
+            attempt,
+        )?
+    };
+    let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+        format!("policy.row_family[{}]", policy.definition().metadata.id)
+    });
     let rows = ExecutedQueryRows::of_merged(subject_units.merged);
     let run = match assertion_run(policy, spec, &rows, context) {
         Ok(run) => run,
@@ -750,13 +765,27 @@ fn whole_assertion_run(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    subject_batch: Option<&SubjectQueryBatch<'_>>,
 ) -> Result<PolicyRun, PolicyRunError> {
-    let rows = ExecutedQueryRows::of_detailed(execute_code_query_detailed_eager_index(
-        context.analyzer,
-        subject_query,
-        budget.query_limits(),
-        context.cancellation,
-    ));
+    let rows = {
+        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+            format!("policy.subject_query[{}]", policy.definition().metadata.id)
+        });
+        match subject_batch {
+            Some(batch) => batch.execute(subject_query, context, budget),
+            None => Rc::new(ExecutedQueryRows::of_detailed(
+                execute_code_query_detailed_eager_index(
+                    context.analyzer,
+                    subject_query,
+                    budget.query_limits(),
+                    context.cancellation,
+                ),
+            )),
+        }
+    };
+    let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+        format!("policy.row_family[{}]", policy.definition().metadata.id)
+    });
     let run = match assertion_run(policy, spec, &rows, context) {
         Ok(run) => run,
         Err(refusal) => return refusal.into_run(policy, budget),
@@ -2208,7 +2237,21 @@ fn evaluate_relational_assertion_policy(
     }
 
     let Some(incremental) = context.incremental else {
-        let executed = whole_relational_bindings(&binding_queries, context, budget);
+        let executed = {
+            let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+                format!(
+                    "policy.relational_bindings[{}]",
+                    policy.definition().metadata.id
+                )
+            });
+            whole_relational_bindings(&binding_queries, context, budget)
+        };
+        let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
+            format!(
+                "policy.relational_evaluation[{}]",
+                policy.definition().metadata.id
+            )
+        });
         return relational_run(policy, plan, &binding_index_by_name, &executed, budget);
     };
     let mut attempt = UnitAttempt::default();
@@ -3188,6 +3231,7 @@ fn evaluate_lowered_occurrence_assert<'rows>(
                     value: UnitRowScalar::StableId((*ast_id).into()),
                 },
             ],
+            unknown_fields: Vec::new(),
             terminal: None,
             provenance: Vec::new(),
             provenance_truncated: false,

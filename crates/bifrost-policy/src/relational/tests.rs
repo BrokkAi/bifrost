@@ -10,15 +10,21 @@
 use std::str::FromStr;
 
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryCallShapeArgument, CodeQueryResultItem, DetailedCodeQueryDomain, UnitRowItem,
+    CodeQueryCallShapeArgument, CodeQueryResultItem, CodeQueryRowFieldUnknownReason,
+    DetailedCodeQueryDomain, UnitRowField, UnitRowItem, UnitRowScalar, UnitRowUnknownField,
 };
 use brokk_bifrost_rql::structural::{CodeQueryRange, CodeQueryResultValue};
+
+use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
 
 use crate::definition::{AssertCardinality, PolicyAssertId, RowBindingName, RowLiteral};
 use crate::finding::PolicyIncompleteReason;
 
 use super::coverage::{RelationCoverage, RelationalInput, RelationalObligationKind};
-use super::eval::{RelationalAssertionEvaluation, RelationalViolationRow, evaluate_plan_ir};
+use super::eval::{
+    RelationalAssertionEvaluation, RelationalViolationRow, evaluate_plan_ir,
+    evaluate_row_selector_ir,
+};
 use super::ir::{
     IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp, IrEquiKey, IrJoinKind,
     IrLimits, IrOperand, IrPredicate, IrRelation, IrRelationId, IrRelationOp, RelationalPlanIr,
@@ -61,6 +67,83 @@ fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool
         provenance: Vec::new(),
         provenance_truncated: false,
     })
+}
+
+/// One call-binding row with the small field surface the evaluator tests.
+/// Fields not read by a plan need not be projected, while an unavailable
+/// registered field is carried separately so it cannot become `None`.
+fn call_binding(
+    site: &str,
+    id: &str,
+    index: Option<usize>,
+    terminal: Option<bool>,
+    conversion: Option<&str>,
+    unknown_field: Option<&str>,
+) -> UnitRowItem {
+    let mut fields = vec![
+        UnitRowField {
+            name: "id".into(),
+            value: UnitRowScalar::StableId(id.into()),
+        },
+        UnitRowField {
+            name: "site_id".into(),
+            value: UnitRowScalar::StableId(site.into()),
+        },
+        UnitRowField {
+            name: "mapping".into(),
+            value: UnitRowScalar::ConstrainedEnum("exact".into()),
+        },
+    ];
+    if let Some(index) = index {
+        fields.push(UnitRowField {
+            name: "actual_index".into(),
+            value: UnitRowScalar::Integer(index as u64),
+        });
+    }
+    if let Some(terminal) = terminal {
+        fields.push(UnitRowField {
+            name: "terminal".into(),
+            value: UnitRowScalar::Boolean(terminal),
+        });
+    }
+    if let Some(conversion) = conversion {
+        fields.push(UnitRowField {
+            name: "conversion".into(),
+            value: UnitRowScalar::ConstrainedEnum(conversion.into()),
+        });
+    }
+    let unknown_fields = unknown_field
+        .map(|name| {
+            vec![UnitRowUnknownField {
+                name: name.into(),
+                reason: CodeQueryRowFieldUnknownReason::CallConversion(
+                    ConversionUnknown::UnsupportedConversion,
+                ),
+            }]
+        })
+        .unwrap_or_default();
+    UnitRowItem {
+        domain: DetailedCodeQueryDomain::CallBinding,
+        path: "app.ts".into(),
+        range: None,
+        fields,
+        unknown_fields,
+        terminal: None,
+        provenance: Vec::new(),
+        provenance_truncated: false,
+    }
+}
+
+fn call_binding_source(id: usize, name: &str) -> IrRelation {
+    IrRelation {
+        id: IrRelationId(id),
+        name: name.to_string(),
+        op: IrRelationOp::Source {
+            binding: binding(name),
+            domain: DetailedCodeQueryDomain::CallBinding,
+        },
+        schema: domain_schema(name, DetailedCodeQueryDomain::CallBinding),
+    }
 }
 
 fn source(id: usize, name: &str) -> IrRelation {
@@ -352,6 +435,455 @@ fn an_unsupported_relation_blocks_the_clean_verdict_with_a_capability_reason() {
         evaluation.unmet_obligations[0].reasons,
         vec![PolicyIncompleteReason::CapabilityIncomplete]
     );
+}
+
+fn conversion_filter_plan(
+    predicate: IrPredicate,
+    cardinality: AssertCardinality,
+) -> RelationalPlanIr {
+    let calls = call_binding_source(0, "calls");
+    let filtered = filter(1, "filtered", &calls, vec![predicate]);
+    let grouped = group(
+        2,
+        "by-site",
+        &filtered,
+        vec![column("calls", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("conversion", &grouped, "calls", cardinality);
+    plan(vec![calls, filtered, grouped], vec![assertion])
+}
+
+fn call_count_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
+    let calls = call_binding_source(0, "calls");
+    let grouped = group(
+        1,
+        "by-site",
+        &calls,
+        vec![column("calls", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("call-count", &grouped, "calls", cardinality);
+    plan(vec![calls, grouped], vec![assertion])
+}
+
+fn mapping_filter_plan(cardinality: AssertCardinality) -> RelationalPlanIr {
+    let calls = call_binding_source(0, "calls");
+    let filtered = filter(
+        1,
+        "mapped",
+        &calls,
+        vec![IrPredicate::Compare {
+            left: column("calls", "mapping"),
+            op: IrCompareOp::Eq,
+            right: IrOperand::Literal(RowLiteral::ConstrainedEnum("exact".to_string())),
+        }],
+    );
+    let grouped = group(
+        2,
+        "by-site",
+        &filtered,
+        vec![column("calls", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("mapping-count", &grouped, "calls", cardinality);
+    plan(vec![calls, filtered, grouped], vec![assertion])
+}
+
+fn conversion_join_plan(kind: IrJoinKind, cardinality: AssertCardinality) -> RelationalPlanIr {
+    let left = call_binding_source(0, "left");
+    let right = call_binding_source(1, "right");
+    let joined = join(
+        2,
+        &left,
+        &right,
+        kind,
+        vec![IrEquiKey {
+            left: column("left", "conversion"),
+            right: column("right", "conversion"),
+        }],
+    );
+    let grouped = group(
+        3,
+        "by-site",
+        &joined,
+        vec![column("left", "site_id")],
+        vec![fold("by-site", "calls", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("conversion-join", &grouped, "calls", cardinality);
+    plan(vec![left, right, joined, grouped], vec![assertion])
+}
+
+fn conversion_aggregate_plan(
+    op: IrAggregateOp,
+    value: &str,
+    cardinality: AssertCardinality,
+) -> RelationalPlanIr {
+    let calls = call_binding_source(0, "calls");
+    let grouped = group(
+        1,
+        "by-site",
+        &calls,
+        vec![column("calls", "site_id")],
+        vec![fold("by-site", "value", op, Some(column("calls", value)))],
+    );
+    let assertion = assertion("conversion-aggregate", &grouped, "value", cardinality);
+    plan(vec![calls, grouped], vec![assertion])
+}
+
+// ---------------------------------------------------------------------------
+// Field-scoped unknown evidence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unrelated_unknown_conversion_does_not_degrade_mapping_or_count() {
+    let plan = call_count_plan(AssertCardinality::AtMost(1));
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding(
+            "site",
+            "known",
+            Some(1),
+            Some(false),
+            Some("typescript_identity"),
+            None,
+        ),
+    ];
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
+    assert!(evaluation.unmet_obligations.is_empty());
+    assert!(evaluation.exhaustive);
+}
+
+#[test]
+fn mapping_only_filter_remains_exhaustive_with_unknown_conversion() {
+    let plan = mapping_filter_plan(AssertCardinality::AtMost(1));
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding(
+            "site",
+            "known",
+            Some(1),
+            Some(false),
+            Some("typescript_identity"),
+            None,
+        ),
+    ];
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 2)]);
+    assert!(evaluation.unmet_obligations.is_empty());
+    assert!(evaluation.exhaustive);
+}
+
+#[test]
+fn conversion_equality_does_not_treat_unknown_as_a_known_value() {
+    let plan = conversion_filter_plan(
+        IrPredicate::Compare {
+            left: column("calls", "conversion"),
+            op: IrCompareOp::Eq,
+            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
+                "typescript_identity".to_string(),
+            )),
+        },
+        AssertCardinality::AtMost(0),
+    );
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding(
+            "site",
+            "known",
+            Some(1),
+            Some(false),
+            Some("typescript_identity"),
+            None,
+        ),
+    ];
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert!(!evaluation.exhaustive);
+}
+
+#[test]
+fn conversion_filter_row_selector_retains_known_rows_with_partial_coverage() {
+    let calls = call_binding_source(0, "calls");
+    let filtered = filter(
+        1,
+        "filtered",
+        &calls,
+        vec![IrPredicate::Compare {
+            left: column("calls", "conversion"),
+            op: IrCompareOp::Eq,
+            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
+                "typescript_identity".to_string(),
+            )),
+        }],
+    );
+    let plan = plan(vec![calls, filtered], Vec::new());
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding(
+            "site",
+            "known",
+            Some(1),
+            Some(false),
+            Some("typescript_identity"),
+            None,
+        ),
+    ];
+    let input_binding = binding("calls");
+    let inputs = vec![RelationalInput {
+        binding: &input_binding,
+        rows: &rows,
+        coverage: RelationCoverage::Exhaustive,
+    }];
+    let selection = evaluate_row_selector_ir(
+        &plan,
+        IrRelationId(1),
+        IrRelationId(0),
+        &input_binding,
+        &inputs,
+    )
+    .expect("row selector evaluates");
+    assert_eq!(
+        selection.selected_rows,
+        vec![RelationalViolationRow {
+            binding: input_binding,
+            row: 1,
+        }]
+    );
+    assert!(!selection.selected_coverage.is_exhaustive());
+}
+
+#[test]
+fn conversion_null_tests_do_not_treat_unknown_as_absent() {
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding("site", "absent", Some(1), Some(false), None, None),
+    ];
+    let is_null = conversion_filter_plan(
+        IrPredicate::IsNull {
+            column: column("calls", "conversion"),
+            negated: false,
+        },
+        AssertCardinality::AtMost(0),
+    );
+    let evaluation = evaluate(&is_null, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert!(!evaluation.exhaustive);
+
+    let is_not_null = conversion_filter_plan(
+        IrPredicate::IsNull {
+            column: column("calls", "conversion"),
+            negated: true,
+        },
+        AssertCardinality::AtMost(1),
+    );
+    let evaluation = evaluate(
+        &is_not_null,
+        &[("calls", &rows, RelationCoverage::Exhaustive)],
+    );
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
+    );
+    assert!(!evaluation.exhaustive);
+}
+
+#[test]
+fn conversion_join_drops_unknown_keys_without_matching_nulls() {
+    let plan = conversion_join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
+    let left = vec![call_binding(
+        "site",
+        "unknown-left",
+        Some(0),
+        Some(false),
+        None,
+        Some("conversion"),
+    )];
+    let right = vec![call_binding(
+        "site",
+        "absent-right",
+        Some(0),
+        Some(false),
+        None,
+        None,
+    )];
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("left", &left, RelationCoverage::Exhaustive),
+            ("right", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage
+    );
+    assert!(!evaluation.exhaustive);
+}
+
+#[test]
+fn conversion_anti_join_does_not_publish_unwitnessed_unmatched_rows() {
+    let plan = conversion_join_plan(IrJoinKind::Anti, AssertCardinality::AtMost(0));
+    let left = vec![call_binding(
+        "site",
+        "known-left",
+        Some(0),
+        Some(false),
+        Some("typescript_identity"),
+        None,
+    )];
+    let right = vec![call_binding(
+        "site",
+        "unknown-right",
+        Some(0),
+        Some(false),
+        None,
+        Some("conversion"),
+    )];
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("left", &left, RelationCoverage::Exhaustive),
+            ("right", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert!(!evaluation.exhaustive);
+}
+
+#[test]
+fn unknown_value_blocks_all_min_max_and_all_aggregate_witnesses() {
+    let all =
+        conversion_aggregate_plan(IrAggregateOp::All, "terminal", AssertCardinality::AtMost(0));
+    let all_rows = vec![
+        call_binding("site", "known", Some(0), Some(true), None, None),
+        call_binding("site", "unknown", None, None, None, Some("terminal")),
+    ];
+    let all_evaluation = evaluate(&all, &[("calls", &all_rows, RelationCoverage::Exhaustive)]);
+    assert!(all_evaluation.violations.is_empty());
+    assert_eq!(all_evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        all_evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+
+    for op in [IrAggregateOp::Min, IrAggregateOp::Max] {
+        let plan = conversion_aggregate_plan(op, "actual_index", AssertCardinality::AtMost(0));
+        let rows = vec![
+            call_binding("site", "known", Some(5), Some(false), None, None),
+            call_binding(
+                "site",
+                "unknown",
+                None,
+                Some(false),
+                None,
+                Some("actual_index"),
+            ),
+        ];
+        let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+        assert!(evaluation.violations.is_empty(), "{op:?}");
+        assert_eq!(evaluation.unmet_obligations.len(), 1, "{op:?}");
+        assert_eq!(
+            evaluation.unmet_obligations[0].kind,
+            RelationalObligationKind::VerdictRequiresWitnessedRows,
+            "{op:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_conversion_count_clean_upper_bound_is_inconclusive() {
+    let plan = conversion_filter_plan(
+        IrPredicate::Compare {
+            left: column("calls", "conversion"),
+            op: IrCompareOp::Eq,
+            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
+                "typescript_identity".to_string(),
+            )),
+        },
+        AssertCardinality::AtMost(1),
+    );
+    let rows = vec![
+        call_binding(
+            "site",
+            "unknown",
+            Some(0),
+            Some(false),
+            None,
+            Some("conversion"),
+        ),
+        call_binding(
+            "site",
+            "known",
+            Some(1),
+            Some(false),
+            Some("typescript_identity"),
+            None,
+        ),
+    ];
+    let evaluation = evaluate(&plan, &[("calls", &rows, RelationCoverage::Exhaustive)]);
+    assert!(evaluation.violations.is_empty());
+    assert_eq!(evaluation.unmet_obligations.len(), 1);
+    assert_eq!(
+        evaluation.unmet_obligations[0].kind,
+        RelationalObligationKind::VerdictRequiresWitnessedRows
+    );
+    assert!(!evaluation.exhaustive);
 }
 
 // ---------------------------------------------------------------------------

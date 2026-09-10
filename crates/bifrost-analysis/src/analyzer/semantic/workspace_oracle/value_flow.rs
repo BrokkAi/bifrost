@@ -1,7 +1,9 @@
 //! Bounded value-flow and candidate-specific call-binding materialization.
 //!
 //! The implementation projects validated semantic IR rows into neutral oracle
-//! relations. It never reparses source or matches declarations by text,
+//! relations. Java argument conversions delegate to the shared resolver-owned
+//! producer through `conversions.rs`; no type interpretation lives here.
+//! The remaining projection never reparses source or matches declarations by text,
 //! except for one narrow, explicitly named discharge predicate
 //! ([`super::external_constant_field_read_discharges_gap`], #2538) composed
 //! into the two gap sweeps below: it delegates to `dispatch.rs`'s own
@@ -872,7 +874,9 @@ pub fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
         return true;
     }
     let location_capability = |kind: &MemoryLocationKind| match kind {
-        MemoryLocationKind::Field { .. } => SemanticCapability::FieldMemory,
+        MemoryLocationKind::Field { .. } | MemoryLocationKind::Property { .. } => {
+            SemanticCapability::FieldMemory
+        }
         MemoryLocationKind::Static { .. } => SemanticCapability::StaticMemory,
         MemoryLocationKind::Index { .. } => SemanticCapability::IndexMemory,
         MemoryLocationKind::LexicalCell { .. } => SemanticCapability::LocalFlow,
@@ -1408,7 +1412,9 @@ fn proven_complete(evidence: &[EvidenceHandle]) -> bool {
 
 fn location_value_reads(location: &MemoryLocationKind) -> usize {
     match location {
-        MemoryLocationKind::Field { .. } | MemoryLocationKind::LexicalCell { .. } => 1,
+        MemoryLocationKind::Field { .. }
+        | MemoryLocationKind::Property { .. }
+        | MemoryLocationKind::LexicalCell { .. } => 1,
         MemoryLocationKind::Index { index: Some(_), .. } => 2,
         MemoryLocationKind::Index { index: None, .. }
         | MemoryLocationKind::Static { .. }
@@ -1446,6 +1452,7 @@ enum AccessPathRootDraft {
 #[derive(Debug)]
 enum AccessSelectorDraft {
     Field(SemanticLocator),
+    Property(String),
     Index {
         value: Option<ValueId>,
         constant: Option<u128>,
@@ -1996,7 +2003,9 @@ fn resolve_access_path_with_choice<'location>(
             .ok_or_else(|| SemanticProviderError::internal("memory location handle is stale"))?;
         let selector_count = usize::from(matches!(
             kind,
-            MemoryLocationKind::Field { .. } | MemoryLocationKind::Index { .. }
+            MemoryLocationKind::Field { .. }
+                | MemoryLocationKind::Property { .. }
+                | MemoryLocationKind::Index { .. }
         ));
         let step_work = SemanticWork {
             values: location_value_reads(kind),
@@ -2012,6 +2021,15 @@ fn resolve_access_path_with_choice<'location>(
             "access-path cycles are stopped before revisiting a location"
         );
         let base = match kind {
+            MemoryLocationKind::Property { base, key } => {
+                retain_selector(
+                    &mut selectors,
+                    AccessSelectorDraft::Property(key.clone()),
+                    selector_limit,
+                    &mut summarized,
+                );
+                *base
+            }
             MemoryLocationKind::Field { base, member } => {
                 retain_selector(
                     &mut selectors,
@@ -2168,7 +2186,8 @@ fn alternative_choice_plans<'location>(
                 };
                 let Some(base) = (match kind {
                     MemoryLocationKind::Field { base, .. }
-                    | MemoryLocationKind::Index { base, .. } => Some(*base),
+                    | MemoryLocationKind::Index { base, .. }
+                    | MemoryLocationKind::Property { base, .. } => Some(*base),
                     MemoryLocationKind::Static { .. }
                     | MemoryLocationKind::LexicalCell { .. }
                     | MemoryLocationKind::Capture { .. } => None,
@@ -2227,7 +2246,8 @@ fn location_has_unproven_exact_index(location: &AbstractLocation) -> bool {
                 .is_some_and(|value| value.kind.is_constant()),
             AccessSelector::Index(IndexSelector::Constant(_))
             | AccessSelector::Index(IndexSelector::Any)
-            | AccessSelector::Field(_) => false,
+            | AccessSelector::Field(_)
+            | AccessSelector::Property(_) => false,
         })
 }
 
@@ -2268,7 +2288,8 @@ fn access_root_endpoint(
         AccessPathRoot::Static(_)
         | AccessPathRoot::TypeSummary(_)
         | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => None,
+        | AccessPathRoot::External(_)
+        | AccessPathRoot::RuntimeObject(_) => None,
     };
     if let Some(value) = value {
         return Ok(ValueFlowEndpoint::Value(value));
@@ -2547,6 +2568,7 @@ fn materialize_abstract_location(
         .selectors
         .into_iter()
         .map(|selector| match selector {
+            AccessSelectorDraft::Property(key) => Ok(AccessSelector::Property(key)),
             AccessSelectorDraft::Field(member) => {
                 ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member)
                     .map(AccessSelector::Field)
@@ -3228,6 +3250,18 @@ impl WorkspaceSemanticOracle<'_> {
                 .map_err(|error| internal_contract("invalid store locator", error))
         };
         let (base, root, selectors) = match &row.kind {
+            MemoryLocationKind::Property { base, key } => {
+                if !bases.is_locally_allocated(*base) {
+                    return Ok(false);
+                }
+                (
+                    Some(*base),
+                    AccessPathRoot::Value(
+                        value_handle(procedure, *base).map_err(StrongUpdateStop::Provider)?,
+                    ),
+                    vec![AccessSelector::Property(key.clone())],
+                )
+            }
             MemoryLocationKind::Field { base, member } => {
                 if !bases.is_locally_allocated(*base) {
                     return Ok(false);
@@ -3379,6 +3413,19 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         }
         let mut interrupted = None;
 
+        let runtime_outcome = self.runtime_refinements_for_procedure(
+            procedure,
+            &mut staged.request(request.cancellation),
+        )?;
+        staged.work = staged.work.conservative_add(runtime_outcome.work());
+        match &runtime_outcome {
+            SemanticOutcome::Cancelled { .. } => interrupted = Some(Interruption::Cancelled),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                interrupted = Some(Interruption::Budget(*exceeded))
+            }
+            _ => {}
+        }
+        let runtime_reads = runtime_outcome.available_value();
         let mut open = value_flow_capabilities_are_open(procedure);
         let mut gap_quality = None;
         // Shared by the canonical-index base certificate and store strong
@@ -3430,6 +3477,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         false
                     };
                 let relevant = impacts_value_flow
+                    && !runtime_reads.is_some_and(|reads| reads.discharges(gap.id))
                     && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
                     && !constructor_call_gap_is_discharged(procedure.semantics(), gap)
                     && !canonical_index_identity_discharged
@@ -4570,6 +4618,17 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
             }
         }
+        let runtime_outcome = self
+            .runtime_refinements_for_procedure(callee, &mut staged.request(request.cancellation))?;
+        staged.work = staged.work.conservative_add(runtime_outcome.work());
+        match &runtime_outcome {
+            SemanticOutcome::Cancelled { .. } => interrupted = Some(Interruption::Cancelled),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                interrupted = Some(Interruption::Budget(*exceeded))
+            }
+            _ => {}
+        }
+        let runtime_reads = runtime_outcome.available_value();
         let callee_abort_user_code = abort_paths_run_user_code(callee.semantics());
         for gap in callee.semantics().gaps() {
             if interrupted.is_some() {
@@ -4591,6 +4650,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             // return-transfer gaps can weaken the binding itself.
             let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
                 || gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+                && !runtime_reads.is_some_and(|reads| reads.discharges(gap.id))
                 && call_target_refinement_call(callee.semantics(), gap).is_none()
                 && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code)
                 && !super::external_constant_field_read_discharges_gap(
@@ -4776,6 +4836,46 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             }
         }
 
+        let java_conversions = if !call_row.arguments.is_empty()
+            && call.procedure().artifact().key().language()
+                == crate::analyzer::semantic::SemanticLanguage::Standard(
+                    crate::analyzer::Language::Java,
+                ) {
+            let outcome = self.java_call_conversions(
+                call,
+                candidate,
+                &mut staged.request(request.cancellation),
+            )?;
+            staged.work = staged.work.conservative_add(outcome.work());
+            match outcome {
+                SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                    return interrupted_call_bindings(
+                        call,
+                        candidate,
+                        context,
+                        build,
+                        Interruption::Budget(exceeded),
+                        staged.work,
+                        *self.limits(),
+                    );
+                }
+                SemanticOutcome::Cancelled { .. } => {
+                    return interrupted_call_bindings(
+                        call,
+                        candidate,
+                        context,
+                        build,
+                        Interruption::Cancelled,
+                        staged.work,
+                        *self.limits(),
+                    );
+                }
+                outcome => Some(outcome.available_value().cloned().unwrap_or_default()),
+            }
+        } else {
+            None
+        };
+
         let mut formal_cursor = 0usize;
         let mut positional_width_unknown = false;
         // A source that did not receive a retained mapping may still supply any
@@ -4939,18 +5039,57 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     None => ProcedurePortHandle::receiver(callee.clone()),
                 }
                 .map_err(|error| internal_contract("invalid callee argument port", error))?;
-                Some((
-                    mapping_evidence,
-                    CallArgumentMapping::new(
-                        source_index as u32,
-                        member,
-                        CallArgumentEndpoint::Value(actual),
-                        formal,
-                        CallPassingMode::Value,
-                    ),
-                    proof,
-                    completeness,
-                ))
+                let mut mapping = CallArgumentMapping::new(
+                    source_index as u32,
+                    member,
+                    CallArgumentEndpoint::Value(actual.clone()),
+                    formal,
+                    CallPassingMode::Value,
+                );
+                let mut completeness = completeness;
+                if let Some(conversions) = &java_conversions {
+                    use crate::analyzer::usages::call_conversion::ConversionUnknown;
+                    let value = call
+                        .procedure()
+                        .semantics()
+                        .value(actual.id())
+                        .expect("live actual");
+                    let source = call
+                        .procedure()
+                        .semantics()
+                        .source_mapping(value.source)
+                        .expect("actual source");
+                    let span = source.locator.anchor().span();
+                    let mut exact = conversions.iter().filter(|conversion| {
+                        Some(conversion.formal as u32) == ordinal
+                            && conversion.range.start_byte == span.start_byte() as usize
+                            && conversion.range.end_byte == span.end_byte() as usize
+                    });
+                    let conversion = exact
+                        .next()
+                        .map(|conversion| conversion.transfer)
+                        .unwrap_or(Err(ConversionUnknown::UnresolvedSignature));
+                    assert!(
+                        exact.next().is_none(),
+                        "one conversion for an exact actual/formal pair"
+                    );
+                    // Typing proves extraction of the primitive on normal
+                    // completion, not that the wrapper is non-null.
+                    if matches!(
+                        conversion,
+                        Ok(Some(ValueTransfer {
+                            kind: crate::analyzer::semantic::TransferKind::Unboxing,
+                            ..
+                        }))
+                    ) {
+                        completeness = EvidenceCompleteness::Partial(
+                            "unboxing may throw for a null wrapper".into(),
+                        );
+                        build.open = true;
+                    }
+                    mapping = mapping.with_conversion(conversion);
+                }
+                Some((mapping_evidence, mapping, proof, completeness))
             } else {
                 build.open = true;
                 argument_binding_uncertain = true;

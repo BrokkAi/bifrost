@@ -51,7 +51,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 560 classes, `int`, `float` and `types.NoneType` among them, had no
 /// ancestry, so no consumer could resolve their surface or exclude them from
 /// an `isinstance` guard.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 15;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 16;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

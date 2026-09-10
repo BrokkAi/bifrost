@@ -1673,12 +1673,11 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
     }
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
-        // v17 combines #3124 program-point refinement, #3131 named unmodeled-
-        // guard remainders and #3129 scoped dynamic writes, retaining workspace
-        // guard summaries and exact builtin identities after AST shadow checks.
+        // Keep cached class sets in step with program-point refinement,
+        // guard remainders, scoped writes, and open builtin call results.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-exact-class-polarity-v30",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-exact-class-polarity-v31",
         )
         .expect("adapter name is non-empty")
     }
@@ -1894,6 +1893,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let span = mapping.locator.anchor().span();
         let seed = resolve_class_at_span(workspace, file.clone(), span, &prepared);
+        if let ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) = &seed
+            && matches!(qualified_name.as_ref(), "builtins.super" | "builtins.type")
+        {
+            // `super()` returns a proxy bound to the enclosing class and
+            // `type(value)` returns a class object. Neither result has the
+            // instance member surface declared by the builtin class itself.
+            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        }
         if matches!(seed, ClassSeed::Class(_))
             && callee_reads_a_value(workspace, &file, &prepared, span)
         {
@@ -2533,6 +2540,74 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::ConstantEquality { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
         }
+    }
+
+    /// Python names one actual argument in each of the two constrained call
+    /// shapes: an ordinary method call whose return contract constrains an
+    /// argument, and an ordinary one-argument predicate call whose result an
+    /// opaque guard tests. Both take only direct positional arguments.
+    fn refinement_subjects(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+    ) -> Vec<ValueId> {
+        let semantics = procedure.semantics();
+        let snapshot = workspace.analyzer().active_semantic_model_snapshot();
+        let opaque_guard_subjects = semantics
+            .guard_facts()
+            .iter()
+            .filter(|guard| matches!(guard.predicate, GuardPredicate::Opaque { .. }))
+            .filter_map(|guard| guard.subject)
+            .collect::<std::collections::HashSet<_>>();
+        let mut subjects = Vec::new();
+        for call in semantics.call_sites() {
+            if !matches!(
+                call.invocation_mode,
+                crate::analyzer::semantic::CallInvocationMode::Ordinary
+            ) || call.arguments.iter().any(|argument| {
+                argument.keyword.is_some()
+                    || !matches!(
+                        argument.expansion,
+                        crate::analyzer::semantic::CallArgumentExpansion::Direct(
+                            crate::analyzer::semantic::ArgumentDomain::Positional
+                        )
+                    )
+            }) {
+                continue;
+            }
+            if call.receiver.is_some() {
+                // Only a member a loaded semantic model refines can produce a
+                // return contract, which is the first thing
+                // `normal_return_type_constraints` establishes.
+                let Some(snapshot) = snapshot.as_ref() else {
+                    continue;
+                };
+                let (Ok(arity), Some(member)) = (
+                    u32::try_from(call.arguments.len()),
+                    self.accessed_member(workspace, procedure, MemberAccessQuery::Call(call)),
+                ) else {
+                    continue;
+                };
+                if snapshot
+                    .active_models()
+                    .has_normal_return_type_refinement_candidate(
+                        Language::Python.config_label(),
+                        &member,
+                        true,
+                        arity,
+                    )
+                {
+                    subjects.extend(call.arguments.iter().map(|argument| argument.value));
+                }
+            } else if let [argument] = call.arguments.as_ref()
+                && call
+                    .result
+                    .is_some_and(|result| opaque_guard_subjects.contains(&result))
+            {
+                subjects.push(argument.value);
+            }
+        }
+        subjects
     }
 
     fn call_guard_narrowing(

@@ -168,6 +168,8 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
                         members,
                         relations: Vec::new(),
                     },
+                    runtime_values: None,
+                    collection_flows: None,
                 }],
             }),
             diagnostics,
@@ -287,6 +289,8 @@ impl GoModulePackProducer {
                         members,
                         relations: Vec::new(),
                     },
+                    runtime_values: None,
+                    collection_flows: None,
                 }],
             }),
             completeness,
@@ -2685,6 +2689,8 @@ var privateValue int
                     members,
                     relations: Vec::new(),
                 },
+                runtime_values: None,
+                collection_flows: None,
             }],
         };
         compile_pack(&pack, &CompilerOptions::default()).unwrap();

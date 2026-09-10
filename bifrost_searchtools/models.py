@@ -3406,6 +3406,78 @@ class CodeQueryFieldWriteValue:
 
 
 @dataclass(frozen=True)
+class CodeQueryRuntimeKeyedReadValue:
+    """One activation-aware runtime keyed read and its proof state.
+
+    Endpoint rows carry the exact runtime observation. Terminal rows retain
+    the typed exclusion or incompleteness evidence when no endpoint can be
+    published.
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    text: str
+    runtime: str
+    global_name: str
+    container: str
+    key_kind: str
+    source_origin: str
+    outcome: str
+    proof: str
+    completeness: str
+    conclusive_exclusion: bool
+    terminal: bool
+    property: str | None = None
+    index: int | None = None
+    active_model_set_hash: str | None = None
+    refinement_identity: str | None = None
+    exposure_id: str | None = None
+    behavior_id: str | None = None
+    limitations: list[str] = field(default_factory=list)
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryRuntimeKeyedReadValue:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            text=data["text"],
+            runtime=data["runtime"],
+            global_name=data["global"],
+            container=data["container"],
+            key_kind=data["key_kind"],
+            source_origin=data["source_origin"],
+            outcome=data["outcome"],
+            proof=data["proof"],
+            completeness=data["completeness"],
+            conclusive_exclusion=bool(data["conclusive_exclusion"]),
+            terminal=bool(data["terminal"]),
+            property=data.get("property"),
+            index=_optional_int(data, "index"),
+            active_model_set_hash=data.get("active_model_set_hash"),
+            refinement_identity=data.get("refinement_identity"),
+            exposure_id=data.get("exposure_id"),
+            behavior_id=data.get("behavior_id"),
+            limitations=list(data.get("limitations", [])),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        key = self.property if self.property is not None else self.index
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[keyed read value; {self.outcome}; {self.proof}/{self.completeness}] "
+            f"{self.runtime}.{self.global_name}.{self.container}[{key}]"
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryCallShape:
     """The mandatory structured outcome row for one exact call site.
 
@@ -5366,6 +5438,7 @@ CodeQueryResultItem = (
     | CodeQueryReceiverOutcome
     | CodeQueryReceiverEvidence
     | CodeQueryFieldWriteValue
+    | CodeQueryRuntimeKeyedReadValue
     | CodeQueryCallShape
     | CodeQueryCallResult
     | CodeQueryCallArgumentGroup
@@ -5435,6 +5508,7 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "receiver_outcome": CodeQueryReceiverOutcome,
     "receiver_evidence": CodeQueryReceiverEvidence,
     "field_write_value": CodeQueryFieldWriteValue,
+    "keyed_read_value": CodeQueryRuntimeKeyedReadValue,
     "call_shape": CodeQueryCallShape,
     "call_result": CodeQueryCallResult,
     "call_argument_group": CodeQueryCallArgumentGroup,

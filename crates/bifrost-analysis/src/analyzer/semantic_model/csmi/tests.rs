@@ -5,12 +5,13 @@ use crate::analyzer::semantic_model::{
     AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget, AuthoredSemanticModelPack,
     AuthoredShard, AuthoredSummaryEffect, AuthoredSummaryExitKind, AuthoredSummaryInput,
     AuthoredSummaryOutput, AuthoredSummaryTransfer, CatalogCoordinate, CatalogOptions,
-    CompilerOptions, Completeness, ImplicitOperation, Locator, MemberKind,
-    ProcedureSummaryTargetKey, SemanticModelActivationEvidence, SemanticModelActivationRequest,
+    CompilerOptions, Completeness, DecodeLimits, ImplicitOperation, Locator, MemberKind,
+    ProcedureSummaryTargetKey, RuntimeSourceForm, RuntimeStaticKey,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
     SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferOperation,
     TypeCopySemantics, TypeFact, TypeKind, TypeValueSemantics, Visibility, compile_pack,
-    resolve_active_semantic_models,
+    decode_shard, resolve_active_semantic_models,
 };
 use semver::Version;
 use serde_json::{Value, json};
@@ -38,6 +39,7 @@ const VALID_CPP_BASIC_STRING_COPY: &[u8] = include_bytes!(
 const VALID_CPP_COPY_CONSTRUCTOR: &[u8] = include_bytes!(
     "../../../../../../schemas/csmi/0.1/profiles/cpp/0.1/fixtures/valid/copy-constructor.json"
 );
+const VALID_RUNTIME_VALUES: &[u8] = include_bytes!("profiles/runtime-values.fixture.json");
 const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../../../../testdata/semantic-model-packs/declarations-v1.json");
 const GENERATOR_RULES_JSON: &[u8] =
@@ -190,6 +192,262 @@ fn pinned_profile_fixture_matrix_matches_structural_schemas() {
 
 fn artifact_digest() -> String {
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned()
+}
+
+fn runtime_values_profile_support() -> CsmiVocabularySupport {
+    CsmiVocabularySupport::support(
+        CSMI_RUNTIME_VALUES_PROFILE_ID,
+        CSMI_RUNTIME_VALUES_PROFILE_VERSION,
+        CSMI_RUNTIME_VALUES_PROFILE_SCHEMA,
+    )
+}
+
+fn runtime_values_fixture_pack() -> CsmiLogicalPack {
+    let semantic_bytes =
+        canonical_json_bytes(VALID_RUNTIME_VALUES).expect("runtime-values fixture canonicalizes");
+    let path = "models/runtime-values.csmi.json".to_owned();
+    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), semantic_bytes.clone())])
+        .expect("runtime-values fixture resource path is valid");
+    CsmiLogicalPack::new(
+        CsmiPackManifest {
+            document_type: "pack-manifest".to_owned(),
+            schema: CSMI_SCHEMA_URI.to_owned(),
+            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
+            assembler: CsmiProducerIdentity {
+                identifier: "https://example.org/tools/csmi-pack".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            license: "Apache-2.0".to_owned(),
+            created_at: None,
+            resources: vec![CsmiResourceDescriptor {
+                path,
+                role: CsmiResourceRole::SemanticDocument,
+                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
+                size: semantic_bytes.len() as u64,
+                digest: CsmiContentDigest {
+                    algorithm: CsmiContentDigestAlgorithm::Sha256,
+                    value: sha256_hex(&semantic_bytes),
+                },
+                license: None,
+                schema_identifier: None,
+                license_reference: None,
+            }],
+            derived_from: Vec::new(),
+        },
+        resources,
+    )
+}
+
+fn runtime_values_fixture_with<F>(mutate: F) -> CsmiLogicalPack
+where
+    F: FnOnce(&mut Value),
+{
+    let mut value: Value =
+        serde_json::from_slice(VALID_RUNTIME_VALUES).expect("runtime-values fixture is JSON");
+    mutate(&mut value);
+    let bytes = canonical_json_value(&value).expect("mutated runtime-values fixture canonicalizes");
+    let path = "models/runtime-values.csmi.json".to_owned();
+    let resources = InMemoryCsmiResourceResolver::new([(path.clone(), bytes.clone())])
+        .expect("runtime-values fixture resource path is valid");
+    CsmiLogicalPack::new(
+        CsmiPackManifest {
+            document_type: "pack-manifest".to_owned(),
+            schema: CSMI_SCHEMA_URI.to_owned(),
+            pack_format_version: CSMI_PACK_FORMAT_VERSION.to_owned(),
+            assembler: CsmiProducerIdentity {
+                identifier: "https://example.org/tools/csmi-pack".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            license: "Apache-2.0".to_owned(),
+            created_at: None,
+            resources: vec![CsmiResourceDescriptor {
+                path,
+                role: CsmiResourceRole::SemanticDocument,
+                media_type: CSMI_SEMANTIC_DOCUMENT_MEDIA_TYPE.to_owned(),
+                size: bytes.len() as u64,
+                digest: CsmiContentDigest {
+                    algorithm: CsmiContentDigestAlgorithm::Sha256,
+                    value: sha256_hex(&bytes),
+                },
+                license: None,
+                schema_identifier: None,
+                license_reference: None,
+            }],
+            derived_from: Vec::new(),
+        },
+        resources,
+    )
+}
+
+#[test]
+fn runtime_values_fixture_validates_imports_and_retains_all_four_families() {
+    let support = runtime_values_profile_support();
+    let bytes = canonical_json_bytes(VALID_RUNTIME_VALUES).expect("fixture canonicalizes");
+    let validation = validate_csmi_document(&bytes, &support);
+    assert!(
+        validation.valid(),
+        "runtime-values fixture diagnostics: {:#?}",
+        validation.diagnostics
+    );
+    assert!(validation.interpretable);
+    assert_eq!(validation.profiles.len(), 1);
+    assert!(validation.profiles[0].semantically_supported);
+
+    let imported = import_logical_csmi_pack_for_language(
+        &runtime_values_fixture_pack(),
+        &support,
+        &CompilerOptions::default(),
+        "javascript",
+    )
+    .expect("runtime-values fixture imports");
+    let runtime = imported.pack.shards[0]
+        .runtime_values
+        .as_ref()
+        .expect("runtime-values payload is retained on the declaration shard");
+    assert_eq!(runtime.exposures.len(), 1);
+    assert_eq!(runtime.behaviors.len(), 1);
+    assert_eq!(runtime.binding_evidence.len(), 1);
+    assert_eq!(runtime.observations.len(), 1);
+    assert_eq!(
+        runtime.exposures[0].provenance,
+        vec!["runtime-values-fixture".to_owned()]
+    );
+    assert_eq!(runtime.observations[0].source_form, RuntimeSourceForm::Dot);
+    assert_eq!(
+        runtime.observations[0].key,
+        RuntimeStaticKey::Property {
+            value: "DFB_INPUT".to_owned()
+        }
+    );
+
+    let compiled = imported
+        .compile(&CompilerOptions::default())
+        .expect("imported runtime-values fixture compiles");
+    let decoded = decode_shard(
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .expect("compiled runtime-values shard decodes");
+    assert_eq!(decoded.runtime_values(), Some(runtime));
+
+    let artifact = CsmiArtifactEvidence::new(
+        "pkg:generic/nodejs.org/node@22.11.0",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    )
+    .with_coverage("official-distribution-archive");
+    let exported = export_csmi_pack(&compiled, &artifact, &CsmiExportOptions::default())
+        .expect("runtime-values fixture exports");
+    let reimported = import_logical_csmi_pack_for_language(
+        &exported,
+        &support,
+        &CompilerOptions::default(),
+        "javascript",
+    )
+    .expect("exported runtime-values fixture reimports");
+    assert_eq!(
+        reimported.pack.shards[0].runtime_values, imported.pack.shards[0].runtime_values,
+        "all four runtime-values families survive export/import"
+    );
+}
+
+#[test]
+fn runtime_values_import_selects_an_explicit_supported_language() {
+    let support = runtime_values_profile_support();
+    let error = import_logical_csmi_pack(
+        &runtime_values_fixture_pack(),
+        &support,
+        &CompilerOptions::default(),
+    )
+    .expect_err("multi-language runtime imports require an explicit target");
+    assert!(matches!(
+        error,
+        CsmiImportError::Unsupported { path, .. } if path == "runtime-global-exposure.languages"
+    ));
+
+    for (requested, expected_pack_language) in [
+        ("javascript", "javascript"),
+        ("typescript", "typescript"),
+        ("tsx", "typescript"),
+    ] {
+        let imported = import_logical_csmi_pack_for_language(
+            &runtime_values_fixture_pack(),
+            &support,
+            &CompilerOptions::default(),
+            requested,
+        )
+        .expect("explicit runtime language is accepted");
+        assert_eq!(imported.pack.language, expected_pack_language);
+        let runtime = imported.pack.shards[0]
+            .runtime_values
+            .as_ref()
+            .expect("runtime payload remains attached to the imported shard");
+        assert_eq!(
+            runtime.exposures[0].languages,
+            vec![
+                "javascript".to_owned(),
+                "typescript".to_owned(),
+                "tsx".to_owned()
+            ]
+        );
+    }
+
+    let error = import_logical_csmi_pack_for_language(
+        &runtime_values_fixture_pack(),
+        &support,
+        &CompilerOptions::default(),
+        "python",
+    )
+    .expect_err("a target language outside the exposure must be rejected");
+    assert!(matches!(
+        error,
+        CsmiImportError::Unsupported { path, .. } if path == "import.target_language"
+    ));
+}
+
+#[test]
+fn runtime_values_import_rejects_dangling_and_mismatched_semantics() {
+    let support = runtime_values_profile_support();
+    type RuntimeFixtureMutation = (&'static str, Box<dyn Fn(&mut Value)>);
+    let cases: [RuntimeFixtureMutation; 4] = [
+        (
+            "dangling behavior reference",
+            Box::new(|value| {
+                value["semanticModels"][0]["extensionFacts"][3]["payload"]["behaviorId"] =
+                    json!("missing-behavior");
+            }),
+        ),
+        (
+            "owner digest mismatch",
+            Box::new(|value| {
+                value["semanticModels"][0]["extensionFacts"][3]["payload"]["baseValue"]["ownerDigest"] =
+                    json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            }),
+        ),
+        (
+            "activation profile mismatch",
+            Box::new(|value| {
+                value["semanticModels"][0]["extensionFacts"][2]["payload"]["activation"]["runtimeProfileDigest"] =
+                    json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            }),
+        ),
+        (
+            "exact observation before effects",
+            Box::new(|value| {
+                value["semanticModels"][0]["extensionFacts"][3]["payload"]["phase"] =
+                    json!("before-effects");
+            }),
+        ),
+    ];
+    for (name, mutate) in cases {
+        let pack = runtime_values_fixture_with(mutate);
+        let error =
+            import_logical_csmi_pack(&pack, &support, &CompilerOptions::default()).expect_err(name);
+        assert!(
+            matches!(error, CsmiImportError::InvalidPack(_)),
+            "{name} returned the wrong error: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -905,6 +1163,8 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                 class_decorator_identity: None,
             }],
         },
+        runtime_values: None,
+        collection_flows: None,
     });
     pack
 }

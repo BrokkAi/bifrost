@@ -1,10 +1,14 @@
 //! Structural and semantic conformance checks for CSMI v0.1.
 
-use super::canonical::{canonical_digest, canonical_pack_manifest, canonical_semantic_document};
+use super::canonical::{
+    canonical_digest, canonical_json, canonical_pack_manifest, canonical_semantic_document,
+    sha256_hex,
+};
 use super::model::*;
 use super::pack::{
     CsmiResourceError, CsmiResourceResolver, validate_resource_path, verify_resources,
 };
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -29,6 +33,8 @@ const JVM_BINARY_IDENTITY_SCHEMA_JSON: &str =
     include_str!("profiles/jvm-binary-identity.schema.json");
 const JAVA_JVM_MAPPING_SCHEMA_JSON: &str = include_str!("profiles/java-jvm-mapping.schema.json");
 const JVM_COMPATIBILITY_SCHEMA_JSON: &str = include_str!("profiles/jvm-compatibility.schema.json");
+const RUNTIME_VALUES_SCHEMA_JSON: &str = include_str!("profiles/runtime-values.schema.json");
+const COLLECTION_FLOW_SCHEMA_JSON: &str = include_str!("profiles/collection-flow.schema.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsmiDiagnosticSeverity {
@@ -369,6 +375,25 @@ struct KnownProfile {
 }
 
 const KNOWN_PROFILES: &[KnownProfile] = &[
+    KnownProfile {
+        identifier: CSMI_COLLECTION_FLOW_PROFILE_ID,
+        version: CSMI_COLLECTION_FLOW_PROFILE_VERSION,
+        schema: CSMI_COLLECTION_FLOW_PROFILE_SCHEMA,
+        schema_json: COLLECTION_FLOW_SCHEMA_JSON,
+        payload_definitions: &["$root"],
+    },
+    KnownProfile {
+        identifier: CSMI_RUNTIME_VALUES_PROFILE_ID,
+        version: CSMI_RUNTIME_VALUES_PROFILE_VERSION,
+        schema: CSMI_RUNTIME_VALUES_PROFILE_SCHEMA,
+        schema_json: RUNTIME_VALUES_SCHEMA_JSON,
+        payload_definitions: &[
+            "runtimeGlobalExposure",
+            "keyedReadBehavior",
+            "runtimeGlobalBindingEvidence",
+            "keyedReadObservation",
+        ],
+    },
     KnownProfile {
         identifier: "csmi.javascript-typescript",
         version: "0.1.0",
@@ -2401,6 +2426,1206 @@ fn validate_model(
         diagnostics,
     ) {
         valid = false;
+    }
+    if !validate_runtime_values_semantics(model, &prefix, diagnostics) {
+        valid = false;
+    }
+    if !validate_collection_flow_semantics(
+        model,
+        &prefix,
+        &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    valid
+}
+
+fn validate_collection_flow_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let uses: Vec<(usize, &CsmiVocabularyUse)> = model
+        .vocabulary_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.identifier == CSMI_COLLECTION_FLOW_PROFILE_ID)
+        .collect();
+    let facts: Vec<(usize, &CsmiExtensionFact)> = model
+        .extension_facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| fact.vocabulary == CSMI_COLLECTION_FLOW_PROFILE_ID)
+        .collect();
+    if facts.is_empty() && uses.is_empty() {
+        return true;
+    }
+    let mut valid = true;
+    let exact_use = uses.iter().filter(|(_, use_)| {
+        use_.version == CSMI_COLLECTION_FLOW_PROFILE_VERSION
+            && use_.schema == CSMI_COLLECTION_FLOW_PROFILE_SCHEMA
+    });
+    let mut affects = HashSet::new();
+    for (index, use_) in &uses {
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.version != CSMI_COLLECTION_FLOW_PROFILE_VERSION
+            || use_.schema != CSMI_COLLECTION_FLOW_PROFILE_SCHEMA
+        {
+            continue;
+        }
+        if use_.requirement != CsmiVocabularyRequirement::Required {
+            error(
+                diagnostics,
+                "semantic.collection_flow_required_use",
+                format!("{path}.requirement"),
+                "collection-flow facts require an exact required vocabulary use",
+            );
+            valid = false;
+        }
+        for (affect_index, affect) in use_.affects.iter().enumerate() {
+            let affect_path = format!("{path}.affects[{affect_index}]");
+            let CsmiAffectedUnit::FactFamily(family) = affect else {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_affect_kind",
+                    affect_path,
+                    "collection-flow affects must identify a fact family",
+                );
+                valid = false;
+                continue;
+            };
+            if family.kind != CsmiAffectedFactFamilyKind::FactFamily
+                || family.family != "collection-flows"
+                || family
+                    .scope
+                    .get("callable")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_affect_scope",
+                    affect_path,
+                    "collection-flow affects must use family collection-flows and a callable scope",
+                );
+                valid = false;
+                continue;
+            }
+            affects.insert(canonical_scope(&family.scope));
+        }
+    }
+    if facts
+        .iter()
+        .any(|(_, fact)| fact.version != CSMI_COLLECTION_FLOW_PROFILE_VERSION)
+        || exact_use.count() == 0
+    {
+        return false;
+    }
+    let mut fact_scopes = HashSet::new();
+    for (index, fact) in facts {
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        if fact.version != CSMI_COLLECTION_FLOW_PROFILE_VERSION {
+            error(
+                diagnostics,
+                "semantic.collection_flow_version",
+                format!("{path}.version"),
+                "collection-flow fact version must be exactly 0.1.0",
+            );
+            valid = false;
+            continue;
+        }
+        if fact.family != "collection-flows" {
+            error(
+                diagnostics,
+                "semantic.collection_flow_family",
+                format!("{path}.family"),
+                "collection-flow facts must use family collection-flows",
+            );
+            valid = false;
+        }
+        let Some(callable) = fact.scope.get("callable").and_then(Value::as_str) else {
+            error(
+                diagnostics,
+                "semantic.collection_flow_scope",
+                format!("{path}.scope.callable"),
+                "collection-flow scope requires one callable",
+            );
+            valid = false;
+            continue;
+        };
+        let scope = serde_json::json!({"callable": callable});
+        if fact.scope != scope || !fact_scopes.insert(canonical_scope(&fact.scope)) {
+            error(
+                diagnostics,
+                "semantic.collection_flow_scope",
+                format!("{path}.scope"),
+                "collection-flow scope must be exactly {callable} and unique",
+            );
+            valid = false;
+        }
+        if !symbols.contains(callable)
+            || !matches!(
+                declaration_categories.get(callable),
+                Some(CsmiDeclarationCategory::Callable)
+            )
+            || !callable_declarations.contains_key(callable)
+        {
+            error(
+                diagnostics,
+                "semantic.collection_flow_callable",
+                format!("{path}.scope.callable"),
+                "collection-flow callable must name a local callable declaration",
+            );
+            valid = false;
+            continue;
+        }
+        let payload: CsmiCollectionFlowPayload = match serde_json::from_value(fact.payload.clone())
+        {
+            Ok(payload) => payload,
+            Err(error_value) => {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_payload",
+                    format!("{path}.payload"),
+                    error_value.to_string(),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        if payload.kind != CsmiCollectionFlowKind::CollectionFlow || payload.callable != callable {
+            error(
+                diagnostics,
+                "semantic.collection_flow_payload_scope",
+                format!("{path}.payload.callable"),
+                "payload kind and callable must match the fact scope",
+            );
+            valid = false;
+        }
+        let shape = callable_declarations[callable];
+        if !validate_collection_flow_payload(
+            &payload,
+            shape,
+            model,
+            symbols,
+            &format!("{path}.payload"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !affects.contains(&canonical_scope(&scope)) {
+            error(
+                diagnostics,
+                "semantic.collection_flow_missing_affect",
+                format!("{path}.scope"),
+                "collection-flow fact scope must be listed in vocabularyUses.affects",
+            );
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_collection_flow_payload(
+    payload: &CsmiCollectionFlowPayload,
+    callable: &CsmiCallableShape,
+    model: &CsmiSemanticModel,
+    symbols: &HashSet<String>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    let mut root_shapes = HashMap::new();
+    for (index, root) in payload.roots.iter().enumerate() {
+        let root_path = format!("{path}.roots[{index}]");
+        let key = serde_json::to_string(&root.root).expect("CSMI roots are serializable");
+        if root_shapes.insert(key, &root.shape).is_some() {
+            error(
+                diagnostics,
+                "semantic.collection_flow_duplicate_root",
+                format!("{root_path}.root"),
+                "collection-flow roots must be unique",
+            );
+            valid = false;
+        }
+        if !validate_collection_flow_shape(
+            &root.shape,
+            symbols,
+            &format!("{root_path}.shape"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+    }
+    if !validate_collection_flow_receiver_substitution(
+        payload.receiver_substitution.as_ref(),
+        callable,
+        model,
+        &format!("{path}.receiverSubstitution"),
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    for (index, transfer) in payload.transfers.iter().enumerate() {
+        let transfer_path = format!("{path}.transfers[{index}]");
+        if !validate_input_location(
+            &transfer.source,
+            callable,
+            symbols,
+            &format!("{transfer_path}.source"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !validate_output_location(
+            &transfer.destination,
+            callable,
+            symbols,
+            &format!("{transfer_path}.destination"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !validate_collection_flow_location(
+            &transfer.source.root,
+            transfer.source.projection.as_ref(),
+            &root_shapes,
+            callable,
+            &format!("{transfer_path}.source"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !validate_collection_flow_location(
+            &transfer.destination.root,
+            transfer.destination.projection.as_ref(),
+            &root_shapes,
+            callable,
+            &format!("{transfer_path}.destination"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+    }
+    for (index, invocation) in payload.invocations.iter().enumerate() {
+        let invocation_path = format!("{path}.invocations[{index}]");
+        if !validate_input_location(
+            &invocation.callback,
+            callable,
+            symbols,
+            &format!("{invocation_path}.callback"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !validate_collection_flow_location(
+            &invocation.callback.root,
+            invocation.callback.projection.as_ref(),
+            &root_shapes,
+            callable,
+            &format!("{invocation_path}.callback"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        for (parameter_index, parameter) in invocation.parameters.iter().enumerate() {
+            if !validate_collection_flow_shape(
+                parameter,
+                symbols,
+                &format!("{invocation_path}.parameters[{parameter_index}]"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+        }
+        if invocation.arguments.len() != invocation.parameters.len() {
+            error(
+                diagnostics,
+                "semantic.collection_flow_callback_arity",
+                format!("{invocation_path}.arguments"),
+                "callback arguments must match the declared callback parameter arity",
+            );
+            valid = false;
+        }
+        let mut argument_parameters = HashSet::new();
+        for (argument_index, argument) in invocation.arguments.iter().enumerate() {
+            let argument_path = format!("{invocation_path}.arguments[{argument_index}]");
+            if argument.parameter as usize >= invocation.parameters.len()
+                || !argument_parameters.insert(argument.parameter)
+            {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_callback_parameter",
+                    format!("{argument_path}.parameter"),
+                    "callback argument parameter must be unique and within the declared arity",
+                );
+                valid = false;
+            }
+            if !validate_input_location(
+                &argument.source,
+                callable,
+                symbols,
+                &format!("{argument_path}.source"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+            if !validate_collection_flow_location(
+                &argument.source.root,
+                argument.source.projection.as_ref(),
+                &root_shapes,
+                callable,
+                &format!("{argument_path}.source"),
+                diagnostics,
+            ) {
+                valid = false;
+            }
+        }
+    }
+    valid
+}
+
+fn validate_collection_flow_shape(
+    shape: &CsmiCollectionFlowShape,
+    symbols: &HashSet<String>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match shape {
+        CsmiCollectionFlowShape::Value { r#type } => {
+            validate_type_expression(r#type, symbols, &format!("{path}.type"), diagnostics)
+        }
+        CsmiCollectionFlowShape::Product { components } => {
+            let mut valid = !components.is_empty();
+            if components.is_empty() {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_product_shape",
+                    path,
+                    "product shapes require at least one component",
+                );
+            }
+            for (index, component) in components.iter().enumerate() {
+                if !validate_collection_flow_shape(
+                    component,
+                    symbols,
+                    &format!("{path}.components[{index}]"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+            }
+            valid
+        }
+        CsmiCollectionFlowShape::Keyed {
+            key,
+            value,
+            entry_components,
+        } => {
+            let mut valid =
+                validate_collection_flow_shape(key, symbols, &format!("{path}.key"), diagnostics)
+                    && validate_collection_flow_shape(
+                        value,
+                        symbols,
+                        &format!("{path}.value"),
+                        diagnostics,
+                    );
+            if let Some(components) = entry_components {
+                let expected = [
+                    CsmiCollectionFlowEntryComponent::Key,
+                    CsmiCollectionFlowEntryComponent::Value,
+                ];
+                if components.as_slice() != expected {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_entry_components",
+                        format!("{path}.entryComponents"),
+                        "entryComponents must be exactly [key, value]",
+                    );
+                    valid = false;
+                }
+            }
+            valid
+        }
+        CsmiCollectionFlowShape::Unknown { limitation } => {
+            validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+        }
+    }
+}
+
+fn validate_collection_flow_receiver_substitution(
+    substitution: Option<&CsmiCollectionFlowSubstitution>,
+    callable: &CsmiCallableShape,
+    model: &CsmiSemanticModel,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let Some(substitution) = substitution else {
+        return true;
+    };
+    match substitution {
+        CsmiCollectionFlowSubstitution::Unknown { limitation }
+        | CsmiCollectionFlowSubstitution::Unsupported { limitation } => {
+            validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+        }
+        CsmiCollectionFlowSubstitution::ReceiverArguments { declaration } => {
+            let Some(declaration_record) = model
+                .declarations
+                .iter()
+                .find(|candidate| candidate.symbol == *declaration)
+            else {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_receiver_declaration",
+                    format!("{path}.declaration"),
+                    "receiver substitution declaration must be local",
+                );
+                return false;
+            };
+            if !matches!(
+                declaration_record.category,
+                CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias
+            ) {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_receiver_declaration",
+                    format!("{path}.declaration"),
+                    "receiver substitution declaration must be a type declaration",
+                );
+                return false;
+            }
+            let Some(receiver_type) = callable
+                .receiver
+                .as_ref()
+                .and_then(|receiver| receiver.receiver_type.as_ref())
+            else {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_receiver_shape",
+                    path,
+                    "receiver-arguments substitution requires a typed receiver",
+                );
+                return false;
+            };
+            let CsmiTypeExpression::Reference(receiver_reference) = receiver_type else {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_receiver_shape",
+                    format!("{path}.declaration"),
+                    "receiver type must reference the substituted declaration",
+                );
+                return false;
+            };
+            let mut valid = receiver_reference.symbol == *declaration;
+            let parameters = &declaration_record.generic_parameters;
+            if receiver_reference.arguments.len() != parameters.len() {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_receiver_arguments",
+                    format!("{path}.declaration"),
+                    "receiver type arguments must cover every declaration generic parameter",
+                );
+                valid = false;
+            }
+            for (index, parameter) in parameters.iter().enumerate() {
+                if parameter.position != index as u32
+                    || !matches!(
+                        receiver_reference.arguments.get(index),
+                        Some(CsmiTypeExpression::Parameter(argument))
+                            if argument.symbol == parameter.symbol
+                    )
+                {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_receiver_arguments",
+                        format!("{path}.declaration"),
+                        "receiver generic arguments must preserve declaration order",
+                    );
+                    valid = false;
+                }
+            }
+            valid
+        }
+    }
+}
+
+fn validate_collection_flow_location(
+    root: &impl Serialize,
+    projection: Option<&CsmiProjection>,
+    root_shapes: &HashMap<String, &CsmiCollectionFlowShape>,
+    callable: &CsmiCallableShape,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let key = serde_json::to_string(root).expect("CSMI roots are serializable");
+    let Some(shape) = root_shapes.get(&key) else {
+        error(
+            diagnostics,
+            "semantic.collection_flow_missing_shape",
+            format!("{path}.root"),
+            "collection-flow location root must have a declared shape",
+        );
+        return false;
+    };
+    let Some(projection) = projection else {
+        return true;
+    };
+    let mut valid = projection.scheme == CSMI_COLLECTION_FLOW_PROFILE_ID
+        && projection.scheme_version == CSMI_COLLECTION_FLOW_PROFILE_VERSION
+        && !projection.steps.is_empty();
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.collection_flow_projection_identity",
+            format!("{path}.projection"),
+            "projection must use the exact collection-flow scheme and a non-empty step list",
+        );
+    }
+    let mut current = (*shape).clone();
+    let mut entry_projection = false;
+    for (index, step) in projection.steps.iter().enumerate() {
+        let step_path = format!("{path}.projection.steps[{index}]");
+        match step.kind.as_str() {
+            "entry" => {
+                let Some(args) = step.args.as_ref().and_then(Value::as_object) else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_args",
+                        &step_path,
+                        "entry projection requires key selector arguments",
+                    );
+                    valid = false;
+                    continue;
+                };
+                let Some(selector) = args.get("key").and_then(Value::as_object) else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_args",
+                        &step_path,
+                        "entry projection requires a key selector",
+                    );
+                    valid = false;
+                    continue;
+                };
+                match selector.get("kind").and_then(Value::as_str) {
+                    Some("all") => {}
+                    Some("parameter") => {
+                        let Some(position) = selector.get("position").and_then(Value::as_u64)
+                        else {
+                            error(
+                                diagnostics,
+                                "semantic.collection_flow_projection_args",
+                                &step_path,
+                                "parameter key selector requires a non-negative position",
+                            );
+                            valid = false;
+                            continue;
+                        };
+                        if position as usize >= callable.parameters.len() {
+                            error(
+                                diagnostics,
+                                "semantic.collection_flow_projection_args",
+                                &step_path,
+                                "parameter key selector is outside the callable shape",
+                            );
+                            valid = false;
+                        }
+                    }
+                    _ => {
+                        error(
+                            diagnostics,
+                            "semantic.collection_flow_projection_args",
+                            &step_path,
+                            "entry selector must be all or parameter",
+                        );
+                        valid = false;
+                    }
+                }
+                let CsmiCollectionFlowShape::Keyed { key, value, .. } = &current else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_shape",
+                        &step_path,
+                        "entry projection requires a keyed shape",
+                    );
+                    valid = false;
+                    continue;
+                };
+                current = CsmiCollectionFlowShape::Product {
+                    components: vec![(**key).clone(), (**value).clone()],
+                };
+                entry_projection = true;
+            }
+            "entry-key" | "entry-value" => {
+                if !entry_projection {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_shape",
+                        &step_path,
+                        "entry-key and entry-value require a preceding entry projection",
+                    );
+                    valid = false;
+                    continue;
+                }
+                let CsmiCollectionFlowShape::Product { components } = &current else {
+                    valid = false;
+                    continue;
+                };
+                if components.len() != 2 {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_shape",
+                        &step_path,
+                        "entry projection must produce a two-component product",
+                    );
+                    valid = false;
+                    continue;
+                }
+                current = components[usize::from(step.kind == "entry-value")].clone();
+                entry_projection = false;
+            }
+            "component" => {
+                let Some(position) = step
+                    .args
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|args| args.get("position"))
+                    .and_then(Value::as_u64)
+                else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_args",
+                        &step_path,
+                        "component projection requires a non-negative position",
+                    );
+                    valid = false;
+                    continue;
+                };
+                let CsmiCollectionFlowShape::Product { components } = &current else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_shape",
+                        &step_path,
+                        "component projection requires a product shape",
+                    );
+                    valid = false;
+                    continue;
+                };
+                let Some(component) = components.get(position as usize) else {
+                    error(
+                        diagnostics,
+                        "semantic.collection_flow_projection_args",
+                        &step_path,
+                        "component position is outside the product shape",
+                    );
+                    valid = false;
+                    continue;
+                };
+                current = component.clone();
+                entry_projection = false;
+            }
+            _ => {
+                error(
+                    diagnostics,
+                    "semantic.collection_flow_projection_kind",
+                    &step_path,
+                    "unsupported collection-flow projection step",
+                );
+                valid = false;
+            }
+        }
+    }
+    valid
+}
+
+fn validate_runtime_values_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let runtime_uses: Vec<(usize, &CsmiVocabularyUse)> = model
+        .vocabulary_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.identifier == CSMI_RUNTIME_VALUES_PROFILE_ID)
+        .collect();
+    let runtime_fact_count = model
+        .extension_facts
+        .iter()
+        .filter(|fact| fact.vocabulary == CSMI_RUNTIME_VALUES_PROFILE_ID)
+        .count();
+    let mut valid = true;
+    if runtime_fact_count > 0 && runtime_uses.len() != 1 {
+        error(
+            diagnostics,
+            "semantic.runtime_values_use_count",
+            format!("{prefix}.vocabularyUses"),
+            "runtime-values facts require exactly one vocabulary use",
+        );
+        valid = false;
+    }
+    let mut affected = HashSet::new();
+    for (index, use_) in &runtime_uses {
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.version != CSMI_RUNTIME_VALUES_PROFILE_VERSION
+            || use_.schema != CSMI_RUNTIME_VALUES_PROFILE_SCHEMA
+        {
+            continue;
+        }
+        if use_.requirement != CsmiVocabularyRequirement::Required {
+            error(
+                diagnostics,
+                "semantic.runtime_values_required_use",
+                format!("{path}.requirement"),
+                "csmi.runtime-values uses affecting runtime facts must be required",
+            );
+            valid = false;
+        }
+        for (affect_index, affect) in use_.affects.iter().enumerate() {
+            let affect_path = format!("{path}.affects[{affect_index}]");
+            let CsmiAffectedUnit::FactFamily(family) = affect else {
+                error(
+                    diagnostics,
+                    "semantic.runtime_values_affect_kind",
+                    affect_path,
+                    "runtime-values affects must identify a fact family",
+                );
+                valid = false;
+                continue;
+            };
+            if family.kind != CsmiAffectedFactFamilyKind::FactFamily
+                || !matches!(
+                    family.family.as_str(),
+                    "runtime-global-exposures"
+                        | "keyed-read-behaviors"
+                        | "runtime-global-binding-evidence"
+                        | "keyed-read-observations"
+                )
+            {
+                error(
+                    diagnostics,
+                    "semantic.runtime_values_affect_family",
+                    affect_path,
+                    "runtime-values affects must use one of the four profile families",
+                );
+                valid = false;
+                continue;
+            }
+            affected.insert((family.family.clone(), canonical_scope(&family.scope)));
+        }
+    }
+
+    let mut exposures: HashMap<String, CsmiRuntimeGlobalExposure> = HashMap::new();
+    let mut behaviors: HashMap<String, CsmiKeyedReadBehavior> = HashMap::new();
+    let mut bindings: HashMap<String, CsmiRuntimeGlobalBindingEvidence> = HashMap::new();
+    let mut observations: HashMap<String, CsmiKeyedReadObservation> = HashMap::new();
+    let mut fact_keys = HashSet::new();
+    for (index, fact) in model.extension_facts.iter().enumerate() {
+        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID
+            || fact.version != CSMI_RUNTIME_VALUES_PROFILE_VERSION
+        {
+            continue;
+        }
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        let payload = match serde_json::from_value::<CsmiRuntimeValuesPayload>(fact.payload.clone())
+        {
+            Ok(payload) => payload,
+            Err(cause) => {
+                error(
+                    diagnostics,
+                    "semantic.runtime_values_payload",
+                    format!("{path}.payload"),
+                    cause.to_string(),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        let (family, identity, expected_scope) = match &payload {
+            CsmiRuntimeValuesPayload::RuntimeGlobalExposure(record) => (
+                "runtime-global-exposures",
+                record.exposure_id.clone(),
+                serde_json::json!({"exposureId": record.exposure_id}),
+            ),
+            CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => (
+                "keyed-read-behaviors",
+                record.behavior_id.clone(),
+                serde_json::json!({"behaviorId": record.behavior_id}),
+            ),
+            CsmiRuntimeValuesPayload::RuntimeGlobalBindingEvidence(record) => (
+                "runtime-global-binding-evidence",
+                record.binding_evidence_id.clone(),
+                serde_json::json!({"bindingEvidenceId": record.binding_evidence_id}),
+            ),
+            CsmiRuntimeValuesPayload::KeyedReadObservation(record) => (
+                "keyed-read-observations",
+                record.observation_id.clone(),
+                serde_json::json!({"observationId": record.observation_id}),
+            ),
+        };
+        let fact_key = (family.to_owned(), canonical_scope(&expected_scope));
+        if !fact_keys.insert(fact_key.clone()) {
+            error(
+                diagnostics,
+                "semantic.runtime_values_duplicate",
+                &path,
+                format!("duplicate {family} identity {identity}"),
+            );
+            valid = false;
+        }
+        if fact.family != family || fact.scope != expected_scope {
+            error(
+                diagnostics,
+                "semantic.runtime_values_fact_scope",
+                format!("{path}.scope"),
+                "runtime-values family and scope must repeat the payload kind and identity",
+            );
+            valid = false;
+        }
+        if !affected.contains(&fact_key) {
+            error(
+                diagnostics,
+                "semantic.runtime_values_unaffected_fact",
+                format!("{path}.scope"),
+                "runtime-values fact scope is missing from vocabularyUses.affects",
+            );
+            valid = false;
+        }
+        match payload {
+            CsmiRuntimeValuesPayload::RuntimeGlobalExposure(record) => {
+                if !model.artifact_selectors.iter().any(|selector| {
+                    selector.purl == record.runtime.runtime_artifact
+                        && selector.digests.iter().any(|digest| {
+                            digest.algorithm == CsmiDigestAlgorithm::Sha256
+                                && digest.value == record.runtime.runtime_artifact_digest
+                        })
+                }) {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_artifact",
+                        format!("{path}.payload.runtime"),
+                        "runtime artifact and digest must match a model artifact selector",
+                    );
+                    valid = false;
+                }
+                if record.coverage.status == CsmiRuntimeCoverageStatus::Complete
+                    && !record.coverage.limitations.is_empty()
+                {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_complete_limitation",
+                        format!("{path}.payload.coverage"),
+                        "complete runtime coverage cannot carry limitations",
+                    );
+                    valid = false;
+                }
+                if exposures
+                    .insert(record.exposure_id.clone(), record)
+                    .is_some()
+                {
+                    valid = false;
+                }
+            }
+            CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => {
+                if record.coverage.status == CsmiRuntimeCoverageStatus::Complete
+                    && (record.exception_behavior == CsmiRuntimeExceptionBehavior::Unknown
+                        || record.mutation_model == CsmiRuntimeMutationModel::Unknown
+                        || record.materialization == CsmiRuntimeMaterialization::Unknown)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_complete_behavior",
+                        format!("{path}.payload"),
+                        "complete behavior requires interpreted exception, mutation, and materialization semantics",
+                    );
+                    valid = false;
+                }
+                if behaviors
+                    .insert(record.behavior_id.clone(), record)
+                    .is_some()
+                {
+                    valid = false;
+                }
+            }
+            CsmiRuntimeValuesPayload::RuntimeGlobalBindingEvidence(record) => {
+                if record.root_occurrence.end_byte <= record.root_occurrence.start_byte {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_empty_range",
+                        format!("{path}.payload.rootOccurrence"),
+                        "rootOccurrence must have a non-empty source range",
+                    );
+                    valid = false;
+                }
+                if record.coverage.status == CsmiRuntimeCoverageStatus::Complete {
+                    let exact = record.activation.outcome == CsmiRuntimeActivationOutcome::Matched
+                        && record.lexical_binding == CsmiRuntimeLexicalBinding::Absent
+                        && record.rebinding == CsmiRuntimeRebinding::Excluded;
+                    let excluded = record.activation.outcome
+                        == CsmiRuntimeActivationOutcome::NotMatched
+                        && record.lexical_binding == CsmiRuntimeLexicalBinding::Present;
+                    if !exact && !excluded {
+                        error(
+                            diagnostics,
+                            "semantic.runtime_values_binding_proof",
+                            format!("{path}.payload"),
+                            "complete binding evidence requires a matched global or conclusive lexical exclusion",
+                        );
+                        valid = false;
+                    }
+                }
+                if bindings
+                    .insert(record.binding_evidence_id.clone(), record)
+                    .is_some()
+                {
+                    valid = false;
+                }
+            }
+            CsmiRuntimeValuesPayload::KeyedReadObservation(record) => {
+                if record.expression.end_byte <= record.expression.start_byte {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_empty_range",
+                        format!("{path}.payload.expression"),
+                        "expression must have a non-empty source range",
+                    );
+                    valid = false;
+                }
+                let key_is_property = matches!(&record.key, CsmiRuntimeStaticKey::Property(_));
+                let key_is_index = matches!(&record.key, CsmiRuntimeStaticKey::Index(_));
+                if (record.source_form == CsmiRuntimeSourceForm::Dot && !key_is_property)
+                    || (record.source_form == CsmiRuntimeSourceForm::BracketString
+                        && !key_is_property)
+                    || (record.source_form == CsmiRuntimeSourceForm::BracketNumber && !key_is_index)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_key_form",
+                        format!("{path}.payload"),
+                        "source form must agree with the static property or index key",
+                    );
+                    valid = false;
+                }
+                if record.normal_outcome == CsmiRuntimeNormalOutcome::Exact
+                    && record.phase != CsmiRuntimeObservationPhase::AfterEffects
+                {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_exact_phase",
+                        format!("{path}.payload.phase"),
+                        "an exact normal load result must be observed after effects",
+                    );
+                    valid = false;
+                }
+                if record.coverage.status == CsmiRuntimeCoverageStatus::Complete
+                    && (record.normal_outcome != CsmiRuntimeNormalOutcome::Exact
+                        || !matches!(
+                            record.exception_outcome,
+                            CsmiRuntimeExceptionOutcome::Excluded
+                                | CsmiRuntimeExceptionOutcome::Possible
+                        )
+                        || record.source_origin == CsmiRuntimeSourceOrigin::Indeterminate)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.runtime_values_complete_observation",
+                        format!("{path}.payload"),
+                        "complete observation requires exact normal, interpreted exceptional, and determined origin outcomes",
+                    );
+                    valid = false;
+                }
+                if observations
+                    .insert(record.observation_id.clone(), record)
+                    .is_some()
+                {
+                    valid = false;
+                }
+            }
+        }
+    }
+    for (family, scope) in &affected {
+        if !fact_keys.contains(&(family.clone(), scope.clone())) {
+            error(
+                diagnostics,
+                "semantic.runtime_values_missing_fact",
+                format!("{prefix}.vocabularyUses"),
+                "runtime-values affects must identify an extension fact",
+            );
+            valid = false;
+        }
+    }
+
+    let mut enabled_exposures: Vec<String> = exposures
+        .values()
+        .filter(|record| record.activation == CsmiRuntimeExposureActivation::Enabled)
+        .map(|record| record.exposure_id.clone())
+        .collect();
+    enabled_exposures.sort();
+    let expected_active_set_digest = canonical_json(&enabled_exposures)
+        .map(|bytes| sha256_hex(&bytes))
+        .expect("a sorted runtime exposure id list is canonical JSON");
+    for (id, behavior) in &behaviors {
+        let Some(exposure) = exposures.get(&behavior.exposure_id) else {
+            error(
+                diagnostics,
+                "semantic.runtime_values_unknown_exposure",
+                format!("{prefix}.extensionFacts.behaviors.{id}.exposureId"),
+                "behavior references an unknown exposure",
+            );
+            valid = false;
+            continue;
+        };
+        if !exposure
+            .members
+            .iter()
+            .any(|member| member == &behavior.container_member)
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_unknown_member",
+                format!("{prefix}.extensionFacts.behaviors.{id}.containerMember"),
+                "behavior containerMember must be a member of its exposure",
+            );
+            valid = false;
+        }
+    }
+    for (id, binding) in &bindings {
+        let Some(exposure) = exposures.get(&binding.exposure_id) else {
+            error(
+                diagnostics,
+                "semantic.runtime_values_unknown_exposure",
+                format!("{prefix}.extensionFacts.bindings.{id}.exposureId"),
+                "binding evidence references an unknown exposure",
+            );
+            valid = false;
+            continue;
+        };
+        if binding.activation.exposure_id != binding.exposure_id
+            || binding.activation.runtime_profile_digest != exposure.runtime_profile_digest
+            || binding.activation.model_digest != exposure.evidence.inputs_digest
+            || binding.activation.active_exposure_ids != enabled_exposures
+            || binding.activation.active_set_digest != expected_active_set_digest
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_activation_join",
+                format!("{prefix}.extensionFacts.bindings.{id}.activation"),
+                "activation evidence must join its exposure profile, model, and enabled exposure set",
+            );
+            valid = false;
+        }
+        if binding.activation.outcome == CsmiRuntimeActivationOutcome::Matched
+            && (exposure.activation != CsmiRuntimeExposureActivation::Enabled
+                || enabled_exposures.len() != 1)
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_activation_outcome",
+                format!("{prefix}.extensionFacts.bindings.{id}.activation.outcome"),
+                "matched activation requires one unique enabled exposure",
+            );
+            valid = false;
+        }
+    }
+    for (id, observation) in &observations {
+        let (Some(binding), Some(behavior)) = (
+            bindings.get(&observation.binding_evidence_id),
+            behaviors.get(&observation.behavior_id),
+        ) else {
+            error(
+                diagnostics,
+                "semantic.runtime_values_observation_join",
+                format!("{prefix}.extensionFacts.observations.{id}"),
+                "observation references must resolve to binding evidence and behavior",
+            );
+            valid = false;
+            continue;
+        };
+        if binding.exposure_id != behavior.exposure_id {
+            error(
+                diagnostics,
+                "semantic.runtime_values_observation_exposure",
+                format!("{prefix}.extensionFacts.observations.{id}"),
+                "observation binding and behavior must resolve in one exposure",
+            );
+            valid = false;
+        }
+        let accepted = match &observation.key {
+            CsmiRuntimeStaticKey::Property(_) => CsmiRuntimeAcceptedKeys::StaticProperty,
+            CsmiRuntimeStaticKey::Index(_) => CsmiRuntimeAcceptedKeys::StaticIndex,
+        };
+        if behavior.accepted_keys != accepted {
+            error(
+                diagnostics,
+                "semantic.runtime_values_behavior_key",
+                format!("{prefix}.extensionFacts.observations.{id}.key"),
+                "observation key must be accepted by its behavior",
+            );
+            valid = false;
+        }
+        if observation.expression.resource_digest != binding.root_occurrence.resource_digest {
+            error(
+                diagnostics,
+                "semantic.runtime_values_source_join",
+                format!("{prefix}.extensionFacts.observations.{id}.expression.resourceDigest"),
+                "binding and observation source artifacts must match",
+            );
+            valid = false;
+        }
+        let source_digest = observation.expression.resource_digest.as_str();
+        if [
+            &observation.base_value.owner_digest,
+            &observation.load_operation.owner_digest,
+            &observation.result_value.owner_digest,
+            &observation.observation_point.owner_digest,
+        ]
+        .iter()
+        .any(|digest| digest.as_str() != source_digest)
+            || observation.base_value.kind != CsmiRuntimeIdentityKind::Value
+            || observation.load_operation.kind != CsmiRuntimeIdentityKind::Operation
+            || observation.result_value.kind != CsmiRuntimeIdentityKind::Value
+            || observation.observation_point.kind != CsmiRuntimeIdentityKind::Point
+            || binding.scope_identity.kind != CsmiRuntimeIdentityKind::Scope
+            || binding.scope_identity.owner_digest != binding.root_occurrence.resource_digest
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_identity_join",
+                format!("{prefix}.extensionFacts.observations.{id}"),
+                "runtime operation, value, point, and scope identities must retain their source owner and kinds",
+            );
+            valid = false;
+        }
+        if observation.source_origin == CsmiRuntimeSourceOrigin::PristineRuntimeInput
+            && (behavior.mutation_model != CsmiRuntimeMutationModel::PristineInputUntilWrite
+                || binding.rebinding != CsmiRuntimeRebinding::Excluded
+                || binding.coverage.status != CsmiRuntimeCoverageStatus::Complete)
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_pristine_origin",
+                format!("{prefix}.extensionFacts.observations.{id}.sourceOrigin"),
+                "pristine origin requires complete binding and mutation proof",
+            );
+            valid = false;
+        }
+        if observation.coverage.status == CsmiRuntimeCoverageStatus::Complete
+            && behavior.coverage.status != CsmiRuntimeCoverageStatus::Complete
+        {
+            error(
+                diagnostics,
+                "semantic.runtime_values_complete_behavior",
+                format!("{prefix}.extensionFacts.observations.{id}.coverage"),
+                "complete observation requires complete behavior coverage",
+            );
+            valid = false;
+        }
     }
     valid
 }

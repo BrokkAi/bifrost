@@ -1619,10 +1619,8 @@ impl WorkspaceAnalyzer {
             return Ok(None);
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
-        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
-            return Ok(None);
-        };
-        let Some(snapshot) = provider.current_artifact_source(&file, usize::MAX)? else {
+        let Some(snapshot) = self.current_program_semantics_artifact_source(&file, usize::MAX)?
+        else {
             return Ok(None);
         };
         if snapshot.key() != key {
@@ -1728,6 +1726,39 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    fn program_semantics_provider_context_for_file(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+    ) -> Option<(
+        &dyn crate::analyzer::IAnalyzer,
+        &dyn crate::analyzer::semantic::ProgramSemanticsProvider,
+    )> {
+        let Self::Multi(analyzer) = self else {
+            return None;
+        };
+        let delegate = analyzer.delegate_for_file(file)?;
+        Some((delegate.analyzer(), delegate.program_semantics_provider()))
+    }
+
+    pub(crate) fn current_program_semantics_artifact_source(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<
+        Option<crate::analyzer::semantic::SemanticArtifactSourceSnapshot>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let active = self.analyzer().active_semantic_model_snapshot();
+        let Some((delegate, provider)) = self.program_semantics_provider_context_for_file(file)
+        else {
+            return Ok(None);
+        };
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            delegate, active,
+        );
+        provider.current_artifact_source(file, max_source_bytes)
+    }
+
     /// The public fingerprint of the semantic artifact this workspace would
     /// derive for `file` right now, without materializing it.
     ///
@@ -1743,11 +1774,8 @@ impl WorkspaceAnalyzer {
         Option<crate::analyzer::semantic::ids::StableDigest>,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        let Some(provider) = self.program_semantics_provider_for_file(file) else {
-            return Ok(None);
-        };
-        Ok(provider
-            .current_artifact_source(file, max_source_bytes)?
+        Ok(self
+            .current_program_semantics_artifact_source(file, max_source_bytes)?
             .map(|current| current.key().public_fingerprint()))
     }
 
@@ -1775,11 +1803,11 @@ impl WorkspaceAnalyzer {
             return Ok(Some((false, 0)));
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
-        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
+        if self.program_semantics_provider_for_file(&file).is_none() {
             return Ok(Some((false, 0)));
-        };
-        Ok(provider
-            .current_artifact_source(&file, max_source_bytes)?
+        }
+        Ok(self
+            .current_program_semantics_artifact_source(&file, max_source_bytes)?
             .map(|current| (current.key() == key, current.source().len())))
     }
 
@@ -1795,13 +1823,18 @@ impl WorkspaceAnalyzer {
         >,
         crate::analyzer::semantic::SemanticProviderError,
     > {
-        let Some(provider) = self.program_semantics_provider_for_file(file) else {
+        let active = self.analyzer().active_semantic_model_snapshot();
+        let Some((delegate, provider)) = self.program_semantics_provider_context_for_file(file)
+        else {
             return Ok(crate::analyzer::semantic::SemanticOutcome::Unsupported {
                 capability: crate::analyzer::semantic::SemanticCapability::Procedures,
                 partial: None,
                 work: crate::analyzer::semantic::SemanticWork::default(),
             });
         };
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            delegate, active,
+        );
         provider.materialize(file, request)
     }
 

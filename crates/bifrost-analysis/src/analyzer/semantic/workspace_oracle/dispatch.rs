@@ -650,6 +650,47 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             self.workspace.analyzer(),
             lookup.targets,
         ));
+        // A resolved receiver call can still have a DynamicDispatch gap. A
+        // complete receiver set answers that gap only when its declarations
+        // agree with the resolver's targets. Keep those targets and their
+        // proofs: feedback must not redirect an already selected callable.
+        // Receiverless calls (including class-qualified Python calls) have a
+        // different callable-identity contract and cannot use this discharge.
+        let resolved_receiver_hint = self
+            .dispatch_hints()
+            .for_call(call.procedure(), call.id())
+            .filter(|hints| {
+                hints.exhaustive()
+                    && !hints.hints().is_empty()
+                    && semantic_call.receiver.is_some()
+                    && lookup.status == Some(DefinitionLookupStatus::Resolved)
+                    && !lookup.truncated
+                    && boundaries.is_empty()
+                    && !target_groups.is_empty()
+                    && call_dispatch_gap.is_some_and(|gap| {
+                        gap.subject == SemanticGapSubject::CallSite(call.id())
+                            && gap.capability == SemanticCapability::DynamicDispatch
+                            && matches!(
+                                gap.kind,
+                                SemanticGapKind::Unknown | SemanticGapKind::Unproven
+                            )
+                    })
+            })
+            .filter(|hints| {
+                let resolved = target_groups
+                    .iter()
+                    .map(|group| &group.representative)
+                    .collect::<HashSet<_>>();
+                let propagated = hints
+                    .hints()
+                    .iter()
+                    .map(|hint| match hint.declaration() {
+                        MemberDeclaration::Workspace(declaration) => Some(declaration),
+                        MemberDeclaration::External(_) => None,
+                    })
+                    .collect::<Option<HashSet<_>>>();
+                propagated.is_some_and(|declarations| declarations == resolved)
+            });
         let displaceable_heuristic_external_boundaries = boundaries
             .iter()
             .filter(|boundary| {
@@ -1181,26 +1222,38 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
-        let hint_refinement_complete = hinted_dispatch.is_some_and(|hint_set| {
-            hint_set.exhaustive()
-                && hinted_arms_materialized
-                && materialization_exceeded.is_none()
-                && !final_candidates_truncated
-                && !request.cancellation.is_cancelled()
-                && boundaries.iter().all(|boundary| {
-                    boundary.kind == DispatchBoundaryKind::Unresolved
-                        || displaceable_heuristic_external_boundaries.contains(boundary)
-                        || matches!(
-                            &boundary.kind,
-                            DispatchBoundaryKind::External(Some(target))
-                                if hinted_external_targets.contains(target)
-                                    && matches!(
-                                        boundary.completeness,
-                                        EvidenceCompleteness::Complete
-                                    )
-                        )
-                })
-        });
+        let resolved_receiver_refined = resolved_receiver_hint.is_some()
+            && materialization_quality == DispatchQuality::Complete
+            && materialization_exceeded.is_none()
+            && !final_candidates_truncated
+            && !request.cancellation.is_cancelled()
+            && boundaries.is_empty()
+            && !candidates.is_empty()
+            && candidates.iter().all(|candidate| {
+                matches!(candidate.proof, ProofStatus::Proven)
+                    && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+            });
+        let hint_refinement_complete = resolved_receiver_refined
+            || hinted_dispatch.is_some_and(|hint_set| {
+                hint_set.exhaustive()
+                    && hinted_arms_materialized
+                    && materialization_exceeded.is_none()
+                    && !final_candidates_truncated
+                    && !request.cancellation.is_cancelled()
+                    && boundaries.iter().all(|boundary| {
+                        boundary.kind == DispatchBoundaryKind::Unresolved
+                            || displaceable_heuristic_external_boundaries.contains(boundary)
+                            || matches!(
+                                &boundary.kind,
+                                DispatchBoundaryKind::External(Some(target))
+                                    if hinted_external_targets.contains(target)
+                                        && matches!(
+                                            boundary.completeness,
+                                            EvidenceCompleteness::Complete
+                                        )
+                            )
+                    })
+            });
         if hint_refinement_complete {
             boundaries.retain(|boundary| {
                 boundary.kind != DispatchBoundaryKind::Unresolved
@@ -2737,12 +2790,17 @@ pub(crate) fn exact_source_for_procedure(
         ));
     }
     let file = ProjectFile::new(root.to_path_buf(), key.path().as_path());
-    let Some(provider) = workspace.program_semantics_provider_for_file(&file) else {
+    if workspace
+        .program_semantics_provider_for_file(&file)
+        .is_none()
+    {
         return Err(SemanticProviderError::invalid_identity(
             "call-site artifact has no semantic provider in the current analyzer generation",
         ));
-    };
-    let Some(snapshot) = provider.current_artifact_source(&file, max_source_bytes)? else {
+    }
+    let Some(snapshot) =
+        workspace.current_program_semantics_artifact_source(&file, max_source_bytes)?
+    else {
         return Ok(None);
     };
     if snapshot.key() != key {
@@ -4407,6 +4465,88 @@ mod tests {
             matches!(outcome, SemanticModelRuntimeOutcome::Ready { .. }),
             "external summary fixture activates: {outcome:#?}"
         );
+    }
+
+    #[test]
+    fn resolved_receiver_feedback_requires_complete_matching_declarations() {
+        let (fixture, call) = semantic_call_fixture_for_language(
+            Language::Python,
+            "resolved.py",
+            "class Maker:\n    def text(self):\n        return 'a'\n    def other(self):\n        return 'b'\n\ndef caller(maker: Maker):\n    return maker.text()\n",
+        );
+        let cancellation = CancellationToken::default();
+        let ordinary = WorkspaceIcfgProvider::new(&fixture.analyzer);
+        let baseline = ordinary
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .expect("ordinary dispatch");
+        let baseline_result = baseline.available_value().expect("resolved method");
+        assert_eq!(
+            baseline_result.candidates().len(),
+            1,
+            "{baseline_result:#?}"
+        );
+        assert!(
+            baseline_result
+                .boundaries()
+                .iter()
+                .any(|boundary| boundary.kind == DispatchBoundaryKind::Unresolved)
+        );
+
+        for (member, exhaustive, expected) in [
+            ("text", true, CandidateCoverage::Exhaustive),
+            ("text", false, CandidateCoverage::Open),
+            ("other", true, CandidateCoverage::Open),
+        ] {
+            let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
+                &fixture.analyzer,
+                None,
+                python_workspace_member_hints(
+                    &fixture,
+                    &call,
+                    "resolved.py",
+                    "Maker",
+                    member,
+                    exhaustive,
+                ),
+            );
+            let outcome = provider
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                )
+                .expect("hinted dispatch");
+            let result = outcome.available_value().expect("hinted result");
+            assert_eq!(
+                result.coverage(),
+                expected,
+                "{member}, {exhaustive}: {result:#?}"
+            );
+            assert_eq!(
+                dispatch_target_shape(&outcome),
+                dispatch_target_shape(&baseline),
+                "feedback preserves the resolver-selected method"
+            );
+            assert_eq!(
+                result.boundaries().is_empty(),
+                exhaustive && member == "text"
+            );
+
+            let cancelled = CancellationToken::default();
+            cancelled.cancel();
+            let outcome = provider
+                .resolve_call(
+                    &call,
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancelled),
+                )
+                .expect("cancelled hinted dispatch");
+            assert!(
+                matches!(outcome, SemanticOutcome::Cancelled { .. }),
+                "{outcome:#?}"
+            );
+        }
     }
 
     #[test]

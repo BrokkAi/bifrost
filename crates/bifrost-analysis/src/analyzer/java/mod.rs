@@ -1,5 +1,6 @@
 mod adapter;
 mod cache;
+mod call_conversion;
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -1099,6 +1100,13 @@ pub(crate) struct JavaSupport;
 impl LanguageSupport for JavaSupport {
     fn language(&self) -> Language {
         Language::Java
+    }
+
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
     }
 
     /// Answers from `JavaAnalyzer::resolve_member_name_with_external` -- the

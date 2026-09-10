@@ -221,6 +221,8 @@ pub struct CallBindingRow {
     /// signature applicability or adapter capability leave this value absent.
     /// Conversion completeness is independent of actual/formal mapping.
     pub conversion: Option<String>,
+    /// Missing conversion evidence, projected through the same exact join as its label.
+    pub conversion_reason: Option<super::call_conversion::ConversionUnknown>,
     /// The actual's own span, or the whole call's span for a terminal row.
     pub range: Range,
     /// Whether this row states the call's status instead of one bound pair.
@@ -534,6 +536,7 @@ pub fn call_binding_report(
                 mapping,
                 reason,
                 conversion: None,
+                conversion_reason: None,
                 range: argument.range,
                 terminal: false,
             });
@@ -582,6 +585,7 @@ pub fn call_binding_report(
                 mapping: CallBindingMapping::Exact,
                 reason: None,
                 conversion: None,
+                conversion_reason: None,
                 range: default_range,
                 terminal: false,
             });
@@ -665,6 +669,7 @@ fn receiver_row(
         mapping,
         reason,
         conversion: None,
+        conversion_reason: None,
         range,
         terminal: false,
     })
@@ -720,6 +725,7 @@ fn terminal_row(
         mapping,
         reason,
         conversion: None,
+        conversion_reason: None,
         range,
         terminal: true,
     }

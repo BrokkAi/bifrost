@@ -1,7 +1,3 @@
-use super::{
-    ArgumentTypeConversion, ConversionKind, ConversionUnknown, JavaPrimitive,
-    ResolvedConversionType,
-};
 use crate::analyzer::java::JavaAnalyzer;
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::external::{
@@ -9,7 +5,12 @@ use crate::analyzer::jvm::external::{
 };
 use crate::analyzer::lexical_definitions::{LexicalBindingResolution, resolve_lexical_binding};
 use crate::analyzer::multi_analyzer::resolve_analyzer;
-use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
+use crate::analyzer::semantic::StableDigest;
+use crate::analyzer::usages::call_conversion::{
+    ArgumentTypeConversion, CallArgumentConversionProver, ConversionKind, ConversionUnknown,
+    ExternalConversionIdentity, ExternalConversionProvenance, JavaPrimitive,
+    ResolvedConversionType,
+};
 use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::get_definition::java::{
     JavaResolutionSession, java_type_from_node_with_context,
@@ -23,139 +24,6 @@ use brokk_bifrost_jvm::java::declarations::node_text;
 use brokk_bifrost_jvm::java::graph::return_type::java_type_name_components;
 use brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope;
 use tree_sitter::Node;
-
-/// Identity of an external Java declaration proved by the JVM resolver.
-///
-/// The fully-qualified name alone is insufficient: two artifacts or semantic
-/// packs can publish the same name with different declarations. Keep the
-/// resolver's artifact/model provenance in the identity so an exact reference
-/// conversion cannot silently cross that boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalConversionIdentity {
-    fqn: String,
-    provenance: ExternalConversionProvenance,
-    wrapper: Option<JavaPrimitive>,
-    /// Identity of the effective external declaration surface. This is
-    /// content scoped; the artifact path in `provenance` remains useful for
-    /// diagnostics but is not the content proof by itself.
-    external_surface_identity: StableDigest,
-    /// Identity of the active semantic-model set, when one participated in
-    /// resolving this declaration. A changed pack set must not reuse an old
-    /// conversion proof.
-    active_model_set_identity: Option<StableDigest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ExternalConversionProvenance {
-    SourceJar {
-        artifact_path: std::path::PathBuf,
-        source_path: String,
-    },
-    ClassFile {
-        artifact_path: std::path::PathBuf,
-        class_entry: String,
-    },
-    SemanticPack {
-        pack_id: String,
-        declaration_id: String,
-    },
-}
-
-impl ExternalConversionIdentity {
-    pub(crate) fn from_resolved(
-        external: &JvmExternalType,
-        external_surface_identity: StableDigest,
-        active_model_set_identity: Option<StableDigest>,
-    ) -> Option<Self> {
-        let provenance = match external.source() {
-            JvmExternalDeclarationSource::SourceJar {
-                artifact_path,
-                source_path,
-            } => ExternalConversionProvenance::SourceJar {
-                artifact_path: artifact_path.clone(),
-                source_path: source_path.clone(),
-            },
-            JvmExternalDeclarationSource::ClassFile {
-                artifact_path,
-                class_entry,
-            } => ExternalConversionProvenance::ClassFile {
-                artifact_path: artifact_path.clone(),
-                class_entry: class_entry.clone(),
-            },
-            JvmExternalDeclarationSource::SemanticPack {
-                pack_id,
-                declaration_id,
-            } => ExternalConversionProvenance::SemanticPack {
-                pack_id: pack_id.clone(),
-                declaration_id: declaration_id.clone(),
-            },
-        };
-        if matches!(
-            &provenance,
-            ExternalConversionProvenance::SemanticPack { .. }
-        ) && active_model_set_identity.is_none()
-        {
-            return None;
-        }
-        Some(Self {
-            wrapper: (external.kind() == JvmExternalTypeKind::Class)
-                .then(|| wrapper_for(external.fqn()))
-                .flatten(),
-            fqn: external.fqn().to_owned(),
-            provenance,
-            external_surface_identity,
-            active_model_set_identity,
-        })
-    }
-
-    pub fn fqn(&self) -> &str {
-        &self.fqn
-    }
-
-    pub fn wrapper(&self) -> Option<JavaPrimitive> {
-        self.wrapper
-    }
-
-    pub fn digest(&self) -> StableDigest {
-        let mut digest = LengthDelimitedDigest::new(b"bifrost.java.external-conversion.v1");
-        digest.push(self.fqn.as_bytes());
-        digest.push(self.external_surface_identity.as_bytes());
-        match self.active_model_set_identity {
-            Some(identity) => {
-                digest.push(b"active-model-set");
-                digest.push(identity.as_bytes());
-            }
-            None => digest.push(b"no-active-model-set"),
-        }
-        match &self.provenance {
-            ExternalConversionProvenance::SourceJar {
-                artifact_path,
-                source_path,
-            } => {
-                digest.push(b"source-jar");
-                digest.push(artifact_path.to_string_lossy().as_bytes());
-                digest.push(source_path.as_bytes());
-            }
-            ExternalConversionProvenance::ClassFile {
-                artifact_path,
-                class_entry,
-            } => {
-                digest.push(b"class-file");
-                digest.push(artifact_path.to_string_lossy().as_bytes());
-                digest.push(class_entry.as_bytes());
-            }
-            ExternalConversionProvenance::SemanticPack {
-                pack_id,
-                declaration_id,
-            } => {
-                digest.push(b"semantic-pack");
-                digest.push(pack_id.as_bytes());
-                digest.push(declaration_id.as_bytes());
-            }
-        }
-        digest.finish()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeResolutionFailure {
@@ -224,6 +92,34 @@ pub(super) fn prove_argument(
     let source_type = resolve_actual_type(java, token, packs, file, actual, source)?;
 
     classify_conversion(source_type, target)
+}
+
+pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: JavaCallArgumentConversionProver =
+    JavaCallArgumentConversionProver;
+
+pub(crate) struct JavaCallArgumentConversionProver;
+
+impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
+    fn prove_argument(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_file: &ProjectFile,
+        formal: Node<'_>,
+        formal_source: &str,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        prove_argument(
+            analyzer,
+            file,
+            actual,
+            source,
+            formal_file,
+            formal,
+            formal_source,
+        )
+    }
 }
 
 fn resolve_formal_type(
@@ -426,11 +322,11 @@ fn classify_conversion(
         (
             ResolvedConversionType::JavaPrimitive(source),
             ResolvedConversionType::External { identity },
-        ) if identity.wrapper() == Some(*source) => ConversionKind::JavaBoxing,
+        ) if java_wrapper_for(identity) == Some(*source) => ConversionKind::JavaBoxing,
         (
             ResolvedConversionType::External { identity },
             ResolvedConversionType::JavaPrimitive(target),
-        ) if identity.wrapper() == Some(*target) => ConversionKind::JavaUnboxing,
+        ) if java_wrapper_for(identity) == Some(*target) => ConversionKind::JavaUnboxing,
         (
             ResolvedConversionType::Declaration(source),
             ResolvedConversionType::Declaration(target),
@@ -458,8 +354,33 @@ fn external_identity(
         .dispatch_behavior_identity();
     let active_model_set_identity =
         packs.map(|overlay| StableDigest::sha256(overlay.active_model_set_hash().as_bytes()));
-    ExternalConversionIdentity::from_resolved(
-        external,
+    let provenance = match external.source() {
+        JvmExternalDeclarationSource::SourceJar {
+            artifact_path,
+            source_path,
+        } => ExternalConversionProvenance::SourceJar {
+            artifact_path: artifact_path.clone(),
+            source_path: source_path.clone(),
+        },
+        JvmExternalDeclarationSource::ClassFile {
+            artifact_path,
+            class_entry,
+        } => ExternalConversionProvenance::ClassFile {
+            artifact_path: artifact_path.clone(),
+            class_entry: class_entry.clone(),
+        },
+        JvmExternalDeclarationSource::SemanticPack {
+            pack_id,
+            declaration_id,
+        } => ExternalConversionProvenance::SemanticPack {
+            pack_id: pack_id.clone(),
+            declaration_id: declaration_id.clone(),
+        },
+    };
+    ExternalConversionIdentity::from_provenance(
+        external.fqn(),
+        provenance,
+        external.kind() == JvmExternalTypeKind::Class,
         external_surface_identity,
         active_model_set_identity,
     )
@@ -578,6 +499,13 @@ fn wrapper_for(identity: &str) -> Option<JavaPrimitive> {
     }
 }
 
+fn java_wrapper_for(identity: &ExternalConversionIdentity) -> Option<JavaPrimitive> {
+    identity
+        .declaration_is_class()
+        .then(|| wrapper_for(identity.fqn()))
+        .flatten()
+}
+
 fn primitive_literal(node: Node<'_>) -> Option<JavaPrimitive> {
     match node.kind() {
         "true" | "false" | "boolean_literal" => Some(JavaPrimitive::Boolean),
@@ -663,4 +591,58 @@ fn root_of(node: Node<'_>) -> Node<'_> {
         root = parent;
     }
     root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
+        ExternalConversionIdentity::from_provenance(
+            fqn,
+            ExternalConversionProvenance::SemanticPack {
+                pack_id: "test-pack".to_owned(),
+                declaration_id: fqn.to_owned(),
+            },
+            declaration_is_class,
+            StableDigest::sha256(b"test-surface"),
+            Some(StableDigest::sha256(b"test-models")),
+        )
+        .expect("semantic-pack identities require active model evidence")
+    }
+
+    #[test]
+    fn wrapper_interpretation_requires_resolver_class_evidence() {
+        assert_eq!(
+            java_wrapper_for(&external("java.lang.Integer", true)),
+            Some(JavaPrimitive::Int)
+        );
+        assert_eq!(
+            java_wrapper_for(&external("java.lang.Integer", false)),
+            None,
+            "a matching name without class evidence is not a wrapper"
+        );
+        assert_eq!(
+            java_wrapper_for(&external("example.Integer", true)),
+            None,
+            "a user type with a similar short name is not a wrapper"
+        );
+    }
+
+    #[test]
+    fn semantic_pack_identity_requires_active_model_set() {
+        assert!(
+            ExternalConversionIdentity::from_provenance(
+                "java.lang.Integer",
+                ExternalConversionProvenance::SemanticPack {
+                    pack_id: "test-pack".to_owned(),
+                    declaration_id: "integer".to_owned(),
+                },
+                true,
+                StableDigest::sha256(b"test-surface"),
+                None,
+            )
+            .is_none()
+        );
+    }
 }

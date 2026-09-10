@@ -1705,6 +1705,8 @@ fn finish(
             members,
             relations: Vec::new(),
         },
+        runtime_values: None,
+        collection_flows: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(digest.to_owned()),

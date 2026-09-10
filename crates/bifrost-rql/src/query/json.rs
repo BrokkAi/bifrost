@@ -964,6 +964,20 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("member_target_id".to_string(), json!(member_target_id));
             }
         }
+        QueryStep::KeyedReadValue(filter) => {
+            object.insert("runtime".to_string(), json!(filter.runtime));
+            object.insert("global".to_string(), json!(filter.global));
+            object.insert("container".to_string(), json!(filter.container));
+            if let Some(property) = &filter.property {
+                object.insert("property".to_string(), json!(property));
+            }
+            if let Some(index) = filter.index {
+                object.insert("index".to_string(), json!(index));
+            }
+            if filter.pristine_input {
+                object.insert("source_origin".to_string(), json!("pristine_input"));
+            }
+        }
     }
     Value::Object(object)
 }

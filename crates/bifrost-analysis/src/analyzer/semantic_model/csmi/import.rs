@@ -9,22 +9,23 @@ use super::validate::{CsmiVocabularySupport, validate_csmi_pack};
 use crate::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryExitKind, AuthoredSummaryInput,
-    AuthoredSummaryOutput, AuthoredSummaryTransfer, Compatibility, CompilerOptions, Completeness,
-    CppArtifactDigest, CppArtifactSelector, CppCallableKind, CppCallableSignature,
-    CppCanonicalType, CppDescriptorRole, CppDigestAlgorithm, CppDirectHeader,
-    CppFundamentalTypeName, CppHeaderClosure, CppIdentityStability, CppLanguage,
+    AuthoredSummaryOutput, AuthoredSummaryTransfer, CollectionFlowFact, CollectionFlowsPayload,
+    Compatibility, CompilerOptions, Completeness, CppArtifactDigest, CppArtifactSelector,
+    CppCallableKind, CppCallableSignature, CppCanonicalType, CppDescriptorRole, CppDigestAlgorithm,
+    CppDirectHeader, CppFundamentalTypeName, CppHeaderClosure, CppIdentityStability, CppLanguage,
     CppPortabilityEvidence, CppPortableSymbolKey, CppPortableSymbolRecord, CppReferenceKind,
     CppResolutionContextRecord, CppResolutionContextRef, CppSpecialMemberEvidence,
     CppSpecialMemberOperation, CppSymbolDescriptor, CppTypeAliasEvidence, CppTypeQualifier,
-    ImplicitOperation, Locator, MemberFact, MemberKind, NameSelector, Parameter,
-    ParameterPassingMode, Producer, Provenance, ReceiverFact, Safety, Signature,
-    SummaryMoveInvalidation, SummaryValuePreservation, SummaryValueTransfer,
-    SummaryValueTransferKind, SummaryValueTransferLimitation, SummaryValueTransferLimitationKind,
-    SummaryValueTransferOperation, TypeCopySemantics, TypeFact, TypeKind, TypeMoveSemantics,
-    TypeRef, TypeValueSemantics, Visibility, compile_pack,
+    ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
+    NameSelector, Parameter, ParameterPassingMode, Producer, Provenance, ReceiverFact,
+    RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValueExtension,
+    RuntimeValuesPayload, Safety, Signature, SummaryMoveInvalidation, SummaryValuePreservation,
+    SummaryValueTransfer, SummaryValueTransferKind, SummaryValueTransferLimitation,
+    SummaryValueTransferLimitationKind, SummaryValueTransferOperation, TypeCopySemantics, TypeFact,
+    TypeKind, TypeMoveSemantics, TypeRef, TypeValueSemantics, Visibility, compile_pack,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsmiImportError {
@@ -95,6 +96,38 @@ pub fn import_csmi_pack(
     support: &CsmiVocabularySupport,
     compiler_options: &CompilerOptions,
 ) -> Result<CsmiImportedPack, CsmiImportReport> {
+    import_csmi_pack_with_language(manifest_bytes, resources, support, compiler_options, None)
+}
+
+/// Import a CSMI pack into the one native language selected by the caller.
+///
+/// A CSMI runtime exposure may apply to several source languages, while one
+/// Bifrost semantic-model pack has one manifest language. Runtime-only
+/// documents that name more than one language therefore require this explicit
+/// target instead of silently becoming a Java or C++ pack.
+pub fn import_csmi_pack_for_language(
+    manifest_bytes: &[u8],
+    resources: &dyn CsmiResourceResolver,
+    support: &CsmiVocabularySupport,
+    compiler_options: &CompilerOptions,
+    language: &str,
+) -> Result<CsmiImportedPack, CsmiImportReport> {
+    import_csmi_pack_with_language(
+        manifest_bytes,
+        resources,
+        support,
+        compiler_options,
+        Some(language),
+    )
+}
+
+fn import_csmi_pack_with_language(
+    manifest_bytes: &[u8],
+    resources: &dyn CsmiResourceResolver,
+    support: &CsmiVocabularySupport,
+    compiler_options: &CompilerOptions,
+    requested_language: Option<&str>,
+) -> Result<CsmiImportedPack, CsmiImportReport> {
     let validation = validate_csmi_pack(manifest_bytes, resources, support);
     if !validation.valid() {
         return Err(CsmiImportError::InvalidPack(validation.diagnostics));
@@ -127,7 +160,7 @@ pub fn import_csmi_pack(
         &super::canonical::canonical_semantic_document(semantic)
             .map_err(|error| CsmiImportError::Identity(error.to_string()))?,
     );
-    let pack = import_semantic_document(semantic, manifest, &pack_digest)?;
+    let pack = import_semantic_document(semantic, manifest, &pack_digest, requested_language)?;
     // Compile once on the normal Bifrost path so an imported pack cannot be
     // returned with hidden invalid state. The caller may compile again with a
     // different, explicitly bounded policy.
@@ -146,16 +179,43 @@ pub fn import_logical_csmi_pack(
     support: &CsmiVocabularySupport,
     compiler_options: &CompilerOptions,
 ) -> Result<CsmiImportedPack, CsmiImportReport> {
+    import_logical_csmi_pack_with_language(pack, support, compiler_options, None)
+}
+
+/// Convenience wrapper for importing a multi-language runtime document into
+/// one explicit native-language pack.
+pub fn import_logical_csmi_pack_for_language(
+    pack: &CsmiLogicalPack,
+    support: &CsmiVocabularySupport,
+    compiler_options: &CompilerOptions,
+    language: &str,
+) -> Result<CsmiImportedPack, CsmiImportReport> {
+    import_logical_csmi_pack_with_language(pack, support, compiler_options, Some(language))
+}
+
+fn import_logical_csmi_pack_with_language(
+    pack: &CsmiLogicalPack,
+    support: &CsmiVocabularySupport,
+    compiler_options: &CompilerOptions,
+    requested_language: Option<&str>,
+) -> Result<CsmiImportedPack, CsmiImportReport> {
     let manifest = pack
         .canonical_manifest_bytes()
         .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
-    import_csmi_pack(&manifest, &pack.resources, support, compiler_options)
+    import_csmi_pack_with_language(
+        &manifest,
+        &pack.resources,
+        support,
+        compiler_options,
+        requested_language,
+    )
 }
 
 fn import_semantic_document(
     document: &CsmiSemanticDocument,
     manifest: &CsmiPackManifest,
     pack_digest: &str,
+    requested_language: Option<&str>,
 ) -> Result<AuthoredSemanticModelPack, CsmiImportError> {
     let model = match document.semantic_models.as_slice() {
         [model] => model,
@@ -169,24 +229,35 @@ fn import_semantic_document(
             });
         }
     };
-    let cpp_identity = model.symbols.iter().all(|symbol| {
-        symbol.scheme == CSMI_CPP_DECLARATION_IDENTITY_SCHEME
-            && symbol.scheme_version == CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
-            && symbol.stability == CsmiStability::Portable
-    });
-    let jvm_identity = model.symbols.iter().all(|symbol| {
-        symbol.scheme == JVM_IDENTITY_SCHEME && symbol.scheme_version == JVM_IDENTITY_VERSION
-    });
-    if !cpp_identity && !jvm_identity {
+    let runtime_values = import_runtime_values(model, document.default_provenance.as_deref())?;
+    let collection_flows = import_collection_flows(model, document.default_provenance.as_deref())?;
+    let has_declaration_identity = !model.symbols.is_empty()
+        || !model.declarations.is_empty()
+        || !model.procedure_summaries.is_empty();
+    let runtime_only = runtime_values.is_some() && !has_declaration_identity;
+    let cpp_identity = !runtime_only
+        && !model.symbols.is_empty()
+        && model.symbols.iter().all(|symbol| {
+            symbol.scheme == CSMI_CPP_DECLARATION_IDENTITY_SCHEME
+                && symbol.scheme_version == CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
+                && symbol.stability == CsmiStability::Portable
+        });
+    let jvm_identity = !runtime_only
+        && !model.symbols.is_empty()
+        && model.symbols.iter().all(|symbol| {
+            symbol.scheme == JVM_IDENTITY_SCHEME && symbol.scheme_version == JVM_IDENTITY_VERSION
+        });
+    if !cpp_identity && !jvm_identity && !runtime_only {
         return Err(CsmiImportError::Unsupported {
             path: "symbols".to_owned(),
             semantic: "all symbols must use one supported exact identity scheme".to_owned(),
         });
     }
+    let runtime_profile_digests = runtime_profile_digests(model)?;
     let selectors = model
         .artifact_selectors
         .iter()
-        .map(selector_from_csmi)
+        .map(|selector| selector_from_csmi(selector, &runtime_profile_digests))
         .collect::<Result<Vec<_>, _>>()?;
     let cpp_native_ids = if cpp_identity {
         model
@@ -440,10 +511,29 @@ fn import_semantic_document(
             member.implicit_operation = Some(operation);
         }
     }
-    let (language, ecosystem) = if cpp_identity {
-        ("cpp".to_owned(), "cpp-headers".to_owned())
+    let runtime_identity = runtime_values
+        .as_ref()
+        .map(|payload| runtime_pack_identity(payload, requested_language))
+        .transpose()?;
+    let declaration_identity = if cpp_identity {
+        Some(("cpp".to_owned(), "cpp-headers".to_owned()))
+    } else if jvm_identity {
+        Some(("java".to_owned(), "maven".to_owned()))
     } else {
-        ("java".to_owned(), "maven".to_owned())
+        None
+    };
+    let (language, ecosystem) = match (declaration_identity, runtime_identity) {
+        (Some(declaration), Some(runtime)) if declaration != runtime => {
+            return Err(CsmiImportError::Unsupported {
+                path: "semanticModels[0].extensionFacts".to_owned(),
+                semantic: format!(
+                    "runtime values resolve to {}/{} and cannot share a {}/{} declaration pack",
+                    runtime.0, runtime.1, declaration.0, declaration.1
+                ),
+            });
+        }
+        (Some(declaration), _) | (None, Some(declaration)) => declaration,
+        (None, None) => unreachable!("unsupported declaration identity was rejected above"),
     };
     let shard = AuthoredShard {
         id: format!("csmi.{pack_digest}.summaries"),
@@ -453,11 +543,15 @@ fn import_semantic_document(
             members,
             relations: Vec::new(),
         },
+        runtime_values,
+        collection_flows,
     };
     let summary_shard = AuthoredShard {
         id: format!("csmi.{pack_digest}.procedure-summaries"),
         activation: shard.activation.clone(),
         payload: AuthoredPayload::ProcedureSummaries { summaries },
+        runtime_values: None,
+        collection_flows: None,
     };
     Ok(AuthoredSemanticModelPack {
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
@@ -485,6 +579,247 @@ fn import_semantic_document(
             vec![shard, summary_shard]
         },
     })
+}
+
+/// Import the four runtime-values families as one lossless native payload.
+/// The profile records deliberately have the same JSON member names and enum
+/// vocabulary as the native model; serde conversion keeps this boundary typed
+/// without treating producer-local handles as Bifrost declaration IDs.
+fn import_runtime_values(
+    model: &CsmiSemanticModel,
+    default_provenance: Option<&str>,
+) -> Result<Option<RuntimeValuesPayload>, CsmiImportError> {
+    let mut payload = RuntimeValuesPayload {
+        exposures: Vec::new(),
+        behaviors: Vec::new(),
+        binding_evidence: Vec::new(),
+        observations: Vec::new(),
+    };
+    for fact in &model.extension_facts {
+        if fact.vocabulary != CSMI_RUNTIME_VALUES_PROFILE_ID
+            || fact.version != CSMI_RUNTIME_VALUES_PROFILE_VERSION
+        {
+            continue;
+        }
+        let wire: CsmiRuntimeValuesPayload =
+            serde_json::from_value(fact.payload.clone()).map_err(|error| {
+                CsmiImportError::Unsupported {
+                    path: format!("extensionFacts.{}.payload", fact.family),
+                    semantic: error.to_string(),
+                }
+            })?;
+        if wire.family() != fact.family {
+            return Err(CsmiImportError::Unsupported {
+                path: format!("extensionFacts.{}.family", fact.family),
+                semantic: format!("payload kind belongs to {}", wire.family()),
+            });
+        }
+        match wire {
+            CsmiRuntimeValuesPayload::RuntimeGlobalExposure(record) => {
+                let mut native: RuntimeGlobalExposure = native_runtime_record(record)?;
+                native.provenance = runtime_provenance(fact, default_provenance);
+                native.extensions = runtime_extensions(&fact.extensions);
+                payload.exposures.push(native);
+            }
+            CsmiRuntimeValuesPayload::KeyedReadBehavior(record) => {
+                let mut native: KeyedReadBehavior = native_runtime_record(record)?;
+                native.provenance = runtime_provenance(fact, default_provenance);
+                native.extensions = runtime_extensions(&fact.extensions);
+                payload.behaviors.push(native);
+            }
+            CsmiRuntimeValuesPayload::RuntimeGlobalBindingEvidence(record) => {
+                let mut native: RuntimeGlobalBindingEvidence = native_runtime_record(record)?;
+                native.provenance = runtime_provenance(fact, default_provenance);
+                native.extensions = runtime_extensions(&fact.extensions);
+                payload.binding_evidence.push(native);
+            }
+            CsmiRuntimeValuesPayload::KeyedReadObservation(record) => {
+                let mut native: KeyedReadObservation = native_runtime_record(record)?;
+                native.provenance = runtime_provenance(fact, default_provenance);
+                native.extensions = runtime_extensions(&fact.extensions);
+                payload.observations.push(native);
+            }
+        }
+    }
+    Ok((payload.record_count() > 0).then_some(payload))
+}
+
+fn import_collection_flows(
+    model: &CsmiSemanticModel,
+    default_provenance: Option<&str>,
+) -> Result<Option<CollectionFlowsPayload>, CsmiImportError> {
+    let mut flows = Vec::new();
+    for fact in &model.extension_facts {
+        if fact.vocabulary != CSMI_COLLECTION_FLOW_PROFILE_ID
+            || fact.version != CSMI_COLLECTION_FLOW_PROFILE_VERSION
+        {
+            continue;
+        }
+        if fact.family != "collection-flows" {
+            return Err(CsmiImportError::Unsupported {
+                path: "extensionFacts.family".to_owned(),
+                semantic: "collection-flow facts must use family collection-flows".to_owned(),
+            });
+        }
+        let callable = fact
+            .scope
+            .get("callable")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CsmiImportError::Identity("collection-flow fact scope has no callable".to_owned())
+            })?;
+        let payload: CsmiCollectionFlowPayload = serde_json::from_value(fact.payload.clone())
+            .map_err(|error| CsmiImportError::Unsupported {
+                path: "extensionFacts.payload".to_owned(),
+                semantic: error.to_string(),
+            })?;
+        if payload.callable != callable {
+            return Err(CsmiImportError::Identity(
+                "collection-flow payload callable does not match fact scope".to_owned(),
+            ));
+        }
+        flows.push(CollectionFlowFact {
+            callable: callable.to_owned(),
+            payload,
+            coverage: model
+                .completeness_statements
+                .iter()
+                .find(|statement| {
+                    statement.vocabulary.as_deref() == Some(CSMI_COLLECTION_FLOW_PROFILE_ID)
+                        && statement.version.as_deref()
+                            == Some(CSMI_COLLECTION_FLOW_PROFILE_VERSION)
+                        && statement.family == "collection-flows"
+                        && statement.scope.get("callable").and_then(Value::as_str) == Some(callable)
+                })
+                .map(|statement| match statement.status {
+                    CsmiCoverageStatus::Complete => Completeness::Complete,
+                    CsmiCoverageStatus::Unknown | CsmiCoverageStatus::Partial => {
+                        Completeness::Partial
+                    }
+                }),
+            provenance: if fact.provenance.is_empty() {
+                default_provenance.map(str::to_owned).into_iter().collect()
+            } else {
+                fact.provenance.clone()
+            },
+        });
+    }
+    Ok((!flows.is_empty()).then_some(CollectionFlowsPayload { flows }))
+}
+
+fn runtime_provenance(fact: &CsmiExtensionFact, default_provenance: Option<&str>) -> Vec<String> {
+    if fact.provenance.is_empty() {
+        default_provenance.map(str::to_owned).into_iter().collect()
+    } else {
+        fact.provenance.clone()
+    }
+}
+
+fn runtime_pack_identity(
+    payload: &RuntimeValuesPayload,
+    requested_language: Option<&str>,
+) -> Result<(String, String), CsmiImportError> {
+    let mut languages = BTreeSet::new();
+    for exposure in &payload.exposures {
+        for language in &exposure.languages {
+            let normalized = crate::analyzer::LanguageDialect::from_config_label(language)
+                .map(|dialect| dialect.semantic_pack_label().to_owned())
+                .ok_or_else(|| CsmiImportError::Unsupported {
+                    path: "runtime-global-exposure.languages".to_owned(),
+                    semantic: format!("unsupported Bifrost runtime language {language:?}"),
+                })?;
+            languages.insert(normalized);
+        }
+    }
+    let language = match requested_language {
+        Some(requested) => crate::analyzer::LanguageDialect::from_config_label(requested)
+            .map(|dialect| dialect.semantic_pack_label().to_owned())
+            .ok_or_else(|| CsmiImportError::Unsupported {
+                path: "import.target_language".to_owned(),
+                semantic: format!("unsupported Bifrost import language {requested:?}"),
+            })
+            .and_then(|normalized| {
+                if languages.contains(&normalized) {
+                    Ok(normalized)
+                } else {
+                    Err(CsmiImportError::Unsupported {
+                        path: "import.target_language".to_owned(),
+                        semantic: format!(
+                            "runtime exposure does not apply to requested language {requested:?}"
+                        ),
+                    })
+                }
+            })?,
+        None if languages.len() == 1 => languages
+            .into_iter()
+            .next()
+            .expect("one runtime language exists"),
+        None => {
+            return Err(CsmiImportError::Unsupported {
+                path: "runtime-global-exposure.languages".to_owned(),
+                semantic: "a multi-language runtime document requires an explicit import target"
+                    .to_owned(),
+            });
+        }
+    };
+    if payload
+        .exposures
+        .iter()
+        .any(|exposure| exposure.runtime.runtime_family != "node")
+    {
+        return Err(CsmiImportError::Unsupported {
+            path: "runtime-global-exposure.runtime.runtimeFamily".to_owned(),
+            semantic: "runtime import currently has an explicit Node/npm activation mapping"
+                .to_owned(),
+        });
+    }
+    Ok((language, "npm".to_owned()))
+}
+
+fn runtime_profile_digests(model: &CsmiSemanticModel) -> Result<Vec<String>, CsmiImportError> {
+    let mut digests = model
+        .extension_facts
+        .iter()
+        .filter(|fact| {
+            fact.vocabulary == CSMI_RUNTIME_VALUES_PROFILE_ID
+                && fact.version == CSMI_RUNTIME_VALUES_PROFILE_VERSION
+                && fact.family == "runtime-global-exposures"
+        })
+        .map(|fact| {
+            let payload: CsmiRuntimeValuesPayload = serde_json::from_value(fact.payload.clone())
+                .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+            let CsmiRuntimeValuesPayload::RuntimeGlobalExposure(exposure) = payload else {
+                return Err(CsmiImportError::Identity(
+                    "runtime exposure family payload has the wrong kind".to_owned(),
+                ));
+            };
+            Ok(exposure.runtime_profile_digest)
+        })
+        .collect::<Result<Vec<_>, CsmiImportError>>()?;
+    digests.sort_unstable();
+    digests.dedup();
+    Ok(digests)
+}
+
+fn runtime_extensions(extensions: &[CsmiExtensionAttachment]) -> Vec<RuntimeValueExtension> {
+    extensions
+        .iter()
+        .map(|extension| RuntimeValueExtension {
+            vocabulary: extension.vocabulary.clone(),
+            version: extension.version.clone(),
+            payload: extension.payload.clone(),
+        })
+        .collect()
+}
+
+fn native_runtime_record<T, W>(record: W) -> Result<T, CsmiImportError>
+where
+    T: serde::de::DeserializeOwned,
+    W: serde::Serialize,
+{
+    let value = serde_json::to_value(record)
+        .map_err(|error| CsmiImportError::Identity(error.to_string()))?;
+    serde_json::from_value(value).map_err(|error| CsmiImportError::Identity(error.to_string()))
 }
 
 fn summaries_empty(shard: &AuthoredShard) -> bool {
@@ -868,6 +1203,7 @@ fn cpp_context_ref(value: CsmiCppResolutionContext) -> CppResolutionContextRef {
 
 fn selector_from_csmi(
     selector: &CsmiArtifactSelector,
+    runtime_profile_digests: &[String],
 ) -> Result<ActivationSelector, CsmiImportError> {
     if !selector.purl.starts_with("pkg:maven/") {
         if selector.version_range.is_some() {
@@ -893,7 +1229,7 @@ fn selector_from_csmi(
             module: None,
             toolchain: None,
             targets: Vec::new(),
-            configurations: Vec::new(),
+            configurations: runtime_profile_digests.to_vec(),
             artifact_sha256: Some(sha256.value.clone()),
         });
     }
@@ -936,7 +1272,7 @@ fn selector_from_csmi(
         module: None,
         toolchain: None,
         targets: Vec::new(),
-        configurations: Vec::new(),
+        configurations: runtime_profile_digests.to_vec(),
         artifact_sha256: digest,
     })
 }

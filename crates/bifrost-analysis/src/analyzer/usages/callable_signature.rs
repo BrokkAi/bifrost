@@ -120,6 +120,17 @@ pub struct CallableSignatureReport {
     pub parameters: Vec<SignatureParameterRow>,
 }
 
+/// Canonical source declaration-site identity shared by signature consumers.
+/// Byte ranges distinguish overload sites; line numbering is presentation only.
+pub fn declaration_site_id(unit: &CodeUnit, range: crate::analyzer::Range) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.callable_signature_site.v1");
+    digest.push(crate::path_utils::rel_path_string(unit.source()).as_bytes());
+    digest.push(unit.fq_name().as_bytes());
+    digest.push(&range.start_byte.to_le_bytes());
+    digest.push(&range.end_byte.to_le_bytes());
+    digest.finish().to_string()
+}
+
 /// Project every persisted signature entry of `unit` into rows.
 ///
 /// `declaration_id` is the caller's canonical identity digest for the

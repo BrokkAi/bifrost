@@ -2197,7 +2197,7 @@ fn semantic_completion<T>(outcome: &SemanticOutcome<T>) -> ExtensionCompletion {
         },
         SemanticOutcome::Unproven { .. } => ExtensionCompletion::Unproven,
         SemanticOutcome::ExceededBudget { exceeded, .. } => ExtensionCompletion::ExceededBudget {
-            dimension: exceeded.dimension().label().into(),
+            dimension: exceeded.dimension().public_lane().label().into(),
         },
         SemanticOutcome::Cancelled { .. } => ExtensionCompletion::Cancelled,
     }

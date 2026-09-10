@@ -897,11 +897,32 @@
             "$ref": "#/$defs/ActivationSelector"
           }
         },
+        "collection_flows": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CollectionFlowsPayload"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "type": "string"
         },
         "payload": {
           "$ref": "#/$defs/AuthoredPayload"
+        },
+        "runtime_values": {
+          "description": "Runtime-global and keyed-read contracts are a shard companion rather\nthan declarations. Keeping them beside the activation selectors makes\nthe active snapshot own the same applicability and provenance boundary.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeValuesPayload"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1504,6 +1525,49 @@
         "receive",
         "send"
       ]
+    },
+    "CollectionFlowFact": {
+      "type": "object",
+      "properties": {
+        "callable": {
+          "type": "string"
+        },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Completeness"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": true,
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "callable",
+        "payload"
+      ]
+    },
+    "CollectionFlowsPayload": {
+      "description": "Typed native companion for the CSMI collection-flow vocabulary. Collection\nflow is kept beside the declaration payload because it has the same shard\nactivation, provenance, and cache identity as all other authored facts.",
+      "type": "object",
+      "properties": {
+        "flows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CollectionFlowFact"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "Compatibility": {
       "type": "object",
@@ -2418,6 +2482,150 @@
         }
       ]
     },
+    "KeyedReadBehavior": {
+      "type": "object",
+      "properties": {
+        "acceptedKeys": {
+          "$ref": "#/$defs/RuntimeAcceptedKeys"
+        },
+        "behaviorId": {
+          "type": "string"
+        },
+        "containerMember": {
+          "type": "string"
+        },
+        "coverage": {
+          "$ref": "#/$defs/RuntimeCoverage"
+        },
+        "evidence": {
+          "$ref": "#/$defs/RuntimeEvidence"
+        },
+        "exceptionBehavior": {
+          "$ref": "#/$defs/RuntimeExceptionBehavior"
+        },
+        "exposureId": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeValueExtension"
+          }
+        },
+        "materialization": {
+          "$ref": "#/$defs/RuntimeMaterialization"
+        },
+        "mutationModel": {
+          "$ref": "#/$defs/RuntimeMutationModel"
+        },
+        "normalResult": {
+          "$ref": "#/$defs/RuntimeNormalResult"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "behaviorId",
+        "exposureId",
+        "containerMember",
+        "acceptedKeys",
+        "normalResult",
+        "exceptionBehavior",
+        "mutationModel",
+        "materialization",
+        "evidence",
+        "coverage"
+      ]
+    },
+    "KeyedReadObservation": {
+      "type": "object",
+      "properties": {
+        "baseValue": {
+          "$ref": "#/$defs/RuntimeScopedIdentity"
+        },
+        "behaviorId": {
+          "type": "string"
+        },
+        "bindingEvidenceId": {
+          "type": "string"
+        },
+        "coverage": {
+          "$ref": "#/$defs/RuntimeCoverage"
+        },
+        "evidence": {
+          "$ref": "#/$defs/RuntimeEvidence"
+        },
+        "exceptionOutcome": {
+          "$ref": "#/$defs/RuntimeExceptionOutcome"
+        },
+        "expression": {
+          "$ref": "#/$defs/RuntimeSourceRange"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeValueExtension"
+          }
+        },
+        "key": {
+          "$ref": "#/$defs/RuntimeStaticKey"
+        },
+        "loadOperation": {
+          "$ref": "#/$defs/RuntimeScopedIdentity"
+        },
+        "normalOutcome": {
+          "$ref": "#/$defs/RuntimeNormalOutcome"
+        },
+        "observationId": {
+          "type": "string"
+        },
+        "observationPoint": {
+          "$ref": "#/$defs/RuntimeScopedIdentity"
+        },
+        "phase": {
+          "$ref": "#/$defs/RuntimeObservationPhase"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resultValue": {
+          "$ref": "#/$defs/RuntimeScopedIdentity"
+        },
+        "sourceForm": {
+          "$ref": "#/$defs/RuntimeSourceForm"
+        },
+        "sourceOrigin": {
+          "$ref": "#/$defs/RuntimeSourceOrigin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "observationId",
+        "bindingEvidenceId",
+        "behaviorId",
+        "baseValue",
+        "key",
+        "sourceForm",
+        "loadOperation",
+        "resultValue",
+        "observationPoint",
+        "phase",
+        "expression",
+        "sourceOrigin",
+        "normalOutcome",
+        "exceptionOutcome",
+        "evidence",
+        "coverage"
+      ]
+    },
     "Locator": {
       "oneOf": [
         {
@@ -2963,6 +3171,597 @@
           ]
         }
       ]
+    },
+    "RuntimeAcceptedKeys": {
+      "type": "string",
+      "enum": [
+        "static-property",
+        "static-index"
+      ]
+    },
+    "RuntimeActivationEvidence": {
+      "type": "object",
+      "properties": {
+        "activationSource": {
+          "type": "string"
+        },
+        "activeExposureIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activeSetDigest": {
+          "type": "string"
+        },
+        "exposureId": {
+          "type": "string"
+        },
+        "modelDigest": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/RuntimeActivationOutcome"
+        },
+        "runtimeProfileDigest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "runtimeProfileDigest",
+        "activeSetDigest",
+        "activeExposureIds",
+        "modelDigest",
+        "activationSource",
+        "exposureId"
+      ]
+    },
+    "RuntimeActivationOutcome": {
+      "type": "string",
+      "enum": [
+        "matched",
+        "not-matched",
+        "indeterminate",
+        "conflict",
+        "unsupported"
+      ]
+    },
+    "RuntimeApplicability": {
+      "type": "object",
+      "properties": {
+        "architecture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostAssumptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "initializationBoundary": {
+          "type": "string"
+        },
+        "moduleMode": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "realm": {
+          "type": "string"
+        },
+        "runtimeArtifact": {
+          "type": "string"
+        },
+        "runtimeArtifactDigest": {
+          "type": "string"
+        },
+        "runtimeFamily": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtimeFamily",
+        "runtimeArtifact",
+        "runtimeArtifactDigest",
+        "realm",
+        "moduleMode",
+        "initializationBoundary"
+      ]
+    },
+    "RuntimeCoverage": {
+      "type": "object",
+      "properties": {
+        "limitations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeCoverageLimitation"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/RuntimeCoverageStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ]
+    },
+    "RuntimeCoverageLimitation": {
+      "type": "string",
+      "enum": [
+        "activation-missing",
+        "activation-conflict",
+        "activation-unsupported",
+        "lexical-binding-indeterminate",
+        "rebinding-indeterminate",
+        "mutation-incomplete",
+        "accessor-or-proxy-incomplete",
+        "materialization-incomplete",
+        "exception-behavior-indeterminate",
+        "dynamic-key",
+        "unsupported-index",
+        "cancelled",
+        "budget-exhausted",
+        "stale-evidence",
+        "ambiguous-owner",
+        "coverage-limited"
+      ]
+    },
+    "RuntimeCoverageStatus": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "unknown"
+      ]
+    },
+    "RuntimeEvidence": {
+      "type": "object",
+      "properties": {
+        "inputsDigest": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "producer": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "producer",
+        "method",
+        "inputsDigest"
+      ]
+    },
+    "RuntimeExceptionBehavior": {
+      "type": "string",
+      "enum": [
+        "nonthrowing",
+        "may-throw",
+        "unknown"
+      ]
+    },
+    "RuntimeExceptionOutcome": {
+      "type": "string",
+      "enum": [
+        "excluded",
+        "possible",
+        "unsupported",
+        "indeterminate"
+      ]
+    },
+    "RuntimeExposureActivation": {
+      "type": "string",
+      "enum": [
+        "enabled",
+        "disabled",
+        "review-required"
+      ]
+    },
+    "RuntimeGlobalBindingEvidence": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/RuntimeActivationEvidence"
+        },
+        "bindingEvidenceId": {
+          "type": "string"
+        },
+        "coverage": {
+          "$ref": "#/$defs/RuntimeCoverage"
+        },
+        "dialect": {
+          "type": "string"
+        },
+        "evidence": {
+          "$ref": "#/$defs/RuntimeEvidence"
+        },
+        "exposureId": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeValueExtension"
+          }
+        },
+        "language": {
+          "type": "string"
+        },
+        "lexicalBinding": {
+          "$ref": "#/$defs/RuntimeLexicalBinding"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rebinding": {
+          "$ref": "#/$defs/RuntimeRebinding"
+        },
+        "rootOccurrence": {
+          "$ref": "#/$defs/RuntimeSourceRange"
+        },
+        "scopeIdentity": {
+          "$ref": "#/$defs/RuntimeScopedIdentity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "bindingEvidenceId",
+        "exposureId",
+        "activation",
+        "language",
+        "dialect",
+        "rootOccurrence",
+        "scopeIdentity",
+        "lexicalBinding",
+        "rebinding",
+        "evidence",
+        "coverage"
+      ]
+    },
+    "RuntimeGlobalExposure": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/RuntimeExposureActivation"
+        },
+        "bindingName": {
+          "type": "string"
+        },
+        "coverage": {
+          "$ref": "#/$defs/RuntimeCoverage"
+        },
+        "evidence": {
+          "$ref": "#/$defs/RuntimeEvidence"
+        },
+        "exposureId": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeValueExtension"
+          }
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rootIdentity": {
+          "$ref": "#/$defs/RuntimeRootIdentity"
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeApplicability"
+        },
+        "runtimeProfileDigest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "exposureId",
+        "languages",
+        "bindingName",
+        "runtime",
+        "runtimeProfileDigest",
+        "rootIdentity",
+        "members",
+        "activation",
+        "evidence",
+        "coverage"
+      ]
+    },
+    "RuntimeIdentityKind": {
+      "type": "string",
+      "enum": [
+        "scope",
+        "value",
+        "operation",
+        "point"
+      ]
+    },
+    "RuntimeLexicalBinding": {
+      "type": "string",
+      "enum": [
+        "absent",
+        "present",
+        "indeterminate"
+      ]
+    },
+    "RuntimeMaterialization": {
+      "type": "string",
+      "enum": [
+        "eager",
+        "lazy",
+        "host-defined",
+        "unknown"
+      ]
+    },
+    "RuntimeMutationModel": {
+      "type": "string",
+      "enum": [
+        "pristine-input-until-write",
+        "ordinary-mutable",
+        "unknown"
+      ]
+    },
+    "RuntimeNormalOutcome": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "partial",
+        "unsupported",
+        "indeterminate"
+      ]
+    },
+    "RuntimeNormalResult": {
+      "type": "string",
+      "enum": [
+        "value-or-undefined",
+        "value"
+      ]
+    },
+    "RuntimeObservationPhase": {
+      "type": "string",
+      "enum": [
+        "before-effects",
+        "after-effects",
+        "exceptional"
+      ]
+    },
+    "RuntimeRebinding": {
+      "type": "string",
+      "enum": [
+        "excluded",
+        "present",
+        "indeterminate"
+      ]
+    },
+    "RuntimeRootDescriptor": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/RuntimeRootRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "name"
+      ]
+    },
+    "RuntimeRootIdentity": {
+      "type": "object",
+      "properties": {
+        "descriptors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeRootDescriptor"
+          }
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "schemeVersion": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "schemeVersion",
+        "descriptors"
+      ]
+    },
+    "RuntimeRootRole": {
+      "type": "string",
+      "enum": [
+        "runtime",
+        "global"
+      ]
+    },
+    "RuntimeScopedIdentity": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RuntimeIdentityKind"
+        },
+        "locatorDigest": {
+          "type": "string"
+        },
+        "ownerDigest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ownerDigest",
+        "kind",
+        "locatorDigest"
+      ]
+    },
+    "RuntimeSourceForm": {
+      "type": "string",
+      "enum": [
+        "dot",
+        "bracket-string",
+        "bracket-number"
+      ]
+    },
+    "RuntimeSourceOrigin": {
+      "type": "string",
+      "enum": [
+        "pristine-runtime-input",
+        "mutated",
+        "indeterminate",
+        "not-applicable"
+      ]
+    },
+    "RuntimeSourceRange": {
+      "type": "object",
+      "properties": {
+        "endByte": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "resource": {
+          "type": "string"
+        },
+        "resourceDigest": {
+          "type": "string"
+        },
+        "startByte": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource",
+        "resourceDigest",
+        "startByte",
+        "endByte"
+      ]
+    },
+    "RuntimeStaticKey": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "property"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "index"
+            },
+            "value": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "RuntimeValueExtension": {
+      "type": "object",
+      "properties": {
+        "payload": true,
+        "version": {
+          "type": "string"
+        },
+        "vocabulary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vocabulary",
+        "version",
+        "payload"
+      ]
+    },
+    "RuntimeValuesPayload": {
+      "type": "object",
+      "properties": {
+        "behaviors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeyedReadBehavior"
+          }
+        },
+        "binding_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeGlobalBindingEvidence"
+          }
+        },
+        "exposures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeGlobalExposure"
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeyedReadObservation"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "Safety": {
       "type": "object",

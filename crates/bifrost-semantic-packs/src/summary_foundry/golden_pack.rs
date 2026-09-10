@@ -839,6 +839,8 @@ fn build_pack(
                 artifact_sha256: None,
             }],
             payload: AuthoredPayload::ProcedureSummaries { summaries },
+            runtime_values: None,
+            collection_flows: None,
         }],
     }
 }

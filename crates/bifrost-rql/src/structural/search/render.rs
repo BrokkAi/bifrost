@@ -1,3 +1,4 @@
+use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::*;
 
 use brokk_bifrost_core::analyzer::model::CallableArity;
@@ -96,6 +97,11 @@ pub(super) fn render_pipeline_item(
         PipelineValue::FieldWriteValue(value) => CodeQueryResultValue::FieldWriteValue {
             value: Box::new(render_field_write_value(analyzer, &value, detail, cache)),
         },
+        PipelineValue::RuntimeKeyedReadValue(value) => {
+            CodeQueryResultValue::RuntimeKeyedReadValue {
+                value: Box::new(render_runtime_keyed_read_value(analyzer, &value, cache)),
+            }
+        }
         PipelineValue::CallShape(value) => CodeQueryResultValue::CallShape {
             value: Box::new(render_call_shape(analyzer, &value, cache)),
         },
@@ -290,6 +296,9 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::FieldWriteValue(value) => {
                         render_field_write_value_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::RuntimeKeyedReadValue(value) => {
+                        render_runtime_keyed_read_value_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::CallShape(value) => {
                         let rendered = render_call_shape(analyzer, value, cache);
@@ -806,6 +815,22 @@ pub(super) fn render_field_write_value_ref(
         proof: rendered.proof,
         completeness: rendered.completeness,
         coverage: rendered.coverage,
+    }
+}
+
+pub(super) fn render_runtime_keyed_read_value_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &RuntimeKeyedReadValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_runtime_keyed_read_value(analyzer, value, cache);
+    CodeQueryResultRef::RuntimeKeyedReadValue {
+        id: rendered.id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        proof: rendered.proof,
+        completeness: rendered.completeness,
     }
 }
 
@@ -2391,6 +2416,100 @@ pub(super) fn render_field_write_value(
     }
 }
 
+pub(super) fn render_runtime_keyed_read_value(
+    analyzer: &dyn IAnalyzer,
+    value: &RuntimeKeyedReadValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryRuntimeKeyedReadValue {
+    let endpoint = value.endpoint.as_ref();
+    let range = endpoint.map_or(value.range, |endpoint| endpoint.expression);
+    let text = cache
+        .source_snapshot(&value.file)
+        .and_then(|source| source.get(range.start_byte..range.end_byte))
+        .map(snippet)
+        .unwrap_or_default();
+    let (
+        runtime,
+        global,
+        container,
+        property,
+        index,
+        proof,
+        completeness,
+        active_model_set_hash,
+        refinement_identity,
+        exposure_id,
+        behavior_id,
+    ) = endpoint.map_or_else(
+        || {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                None,
+                "unproven",
+                "partial",
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+        |endpoint| {
+            let (property, index) = match &endpoint.key {
+                crate::analyzer::semantic::RuntimeAccessKey::Property(property) => {
+                    (Some(property.clone()), None)
+                }
+                crate::analyzer::semantic::RuntimeAccessKey::Index(index) => {
+                    (None, u64::try_from(*index).ok())
+                }
+            };
+            (
+                endpoint.runtime.clone(),
+                endpoint.global.clone(),
+                endpoint.container.clone(),
+                property,
+                index,
+                endpoint.proof.label(),
+                endpoint.completeness.label(),
+                Some(endpoint.active_model_set_hash.clone()),
+                Some(endpoint.refinement_identity.to_string()),
+                Some(endpoint.exposure_id.clone()),
+                Some(endpoint.behavior_id.clone()),
+            )
+        },
+    );
+    CodeQueryRuntimeKeyedReadValue {
+        id: value.id(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &range, cache),
+        text,
+        runtime,
+        global,
+        container,
+        key_kind: value.key_kind(),
+        property,
+        index,
+        source_origin: value.source_origin(),
+        outcome: value.outcome(),
+        proof,
+        completeness,
+        active_model_set_hash,
+        refinement_identity,
+        exposure_id,
+        behavior_id,
+        limitations: value
+            .limitations
+            .iter()
+            .map(|limitation| limitation.label())
+            .collect(),
+        conclusive_exclusion: value.conclusive_exclusion,
+        terminal: endpoint.is_none(),
+    }
+}
+
 fn model_symbol_kind_label(
     kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
 ) -> &'static str {
@@ -2545,6 +2664,19 @@ pub(super) fn render_call_binding(
 ) -> CodeQueryCallBinding {
     let report = &value.site.report;
     let row = value.row();
+    let conversion_applicable = row.argument_id.is_some()
+        && !matches!(
+            row.binding_kind,
+            Some(
+                crate::analyzer::usages::call_binding::CallBindingKind::Receiver
+                    | crate::analyzer::usages::call_binding::CallBindingKind::Implicit
+            )
+        );
+    let conversion_reason = row.conversion_reason;
+    assert!(
+        !conversion_applicable || row.conversion.is_some() != conversion_reason.is_some(),
+        "each ordinary actual has either a conversion proof or a typed unknown"
+    );
     let provenance = value.site.semantic_model_provenance.as_deref();
     let summary = value.site.selector.summary_provenance.as_deref();
     CodeQueryCallBinding {
@@ -2611,6 +2743,14 @@ pub(super) fn render_call_binding(
         formal_name: row.formal_name.clone(),
         binding_kind: row.binding_kind.map(|kind| kind.label()),
         conversion: row.conversion.clone(),
+        conversion_status: if !conversion_applicable {
+            "not_applicable"
+        } else if conversion_reason.is_some() {
+            "unknown"
+        } else {
+            "proven"
+        },
+        conversion_reason,
         mapping: row.mapping.label(),
         reason: row.reason.map(|reason| reason.label()),
         coverage: report.coverage.label(),

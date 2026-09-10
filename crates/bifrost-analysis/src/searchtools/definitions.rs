@@ -118,6 +118,11 @@ fn record_query_read_incomplete(
                 "indexed syntax was unavailable for {file:?}; definition results are incomplete"
             ),
         ),
+        QueryReadIncomplete::SemanticEvidenceUnavailable(detail) => (
+            "analysis_incomplete",
+            DefinitionLookupIncompleteReason::AnalysisFailure,
+            format!("structured semantic evidence was incomplete: {detail}"),
+        ),
         QueryReadIncomplete::StoreFailure(error) => (
             "analysis_incomplete",
             DefinitionLookupIncompleteReason::AnalysisFailure,

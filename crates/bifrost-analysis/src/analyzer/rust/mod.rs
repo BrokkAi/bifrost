@@ -1,5 +1,6 @@
 mod adapter;
 mod cache;
+mod call_conversion;
 mod cargo_routes;
 mod clones;
 pub(crate) mod crate_identity;
@@ -1496,6 +1497,13 @@ fn expand_rust_imported_external_callee(
 impl LanguageSupport for RustSupport {
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
     }
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
