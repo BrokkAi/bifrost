@@ -236,7 +236,7 @@ fn raw_taint_projection(
     let sink_identity = StableSemanticIdentity::analyzer_declaration_id(
         "typescript",
         WorkspaceRelativePath::new("app.ts").unwrap(),
-        format!("function:{sink_key}"),
+        format!("decl:v1:{:x}", sha2::Sha256::digest(sink_key.as_bytes())),
     )
     .unwrap();
     let anchor = TaintFindingAnchor::strong(
@@ -1075,6 +1075,7 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         branch: Vec::new(),
         language: "workspace",
         message: "broad query".to_string(),
+        exhausted_roots: Vec::new(),
     };
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
     assert!(incomplete_reasons(&CodeQueryCompletion::Complete, false).is_empty());
@@ -1132,6 +1133,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         branch: Vec::new(),
         language: "workspace",
         message: "x".repeat(4_097),
+        exhausted_roots: Vec::new(),
     };
     let valid = CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous,
@@ -1139,6 +1141,7 @@ fn rejected_query_diagnostic_marks_truncation_without_hiding_later_valid_diagnos
         branch: Vec::new(),
         language: "typescript",
         message: "later valid diagnostic".to_string(),
+        exhausted_roots: Vec::new(),
     };
 
     let adapted = adapt_query_diagnostics(&[rejected, valid], 1);
@@ -1428,6 +1431,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         end_line: 2,
         signature: None,
         id: id.map(str::to_string),
+        site_id: id.map(|id| format!("{id}:0-1")),
         node_range: Some(call_range),
         semantic_model: None,
     };
@@ -1466,10 +1470,9 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
             caller: None,
             callee: Some(DetailedCodeQueryIdentityCandidate {
                 file,
-                candidate: CodeQueryStableOwnerCandidate {
+                candidate: CodeQueryStableOwnerCandidate::Declaration {
                     namespace: "typescript".to_string(),
-                    derivation: CodeQueryStableOwnerDerivation::AnalyzerDeclarationId,
-                    semantic_key: "function:target".to_string(),
+                    id: format!("decl:v1:{}", "0".repeat(64)),
                 },
             }),
         },
@@ -1515,7 +1518,7 @@ fn strong_fingerprint_ignores_preceding_coordinates_but_tracks_selected_bytes() 
     let owner = StableSemanticIdentity::analyzer_declaration_id(
         "typescript",
         path.clone(),
-        "function:target(payload: string)",
+        format!("decl:v1:{}", "3".repeat(64)),
     )
     .expect("owner");
     let anchor = |hash, ordinal| {
@@ -1698,6 +1701,7 @@ fn advisory_ambiguity_only_lowers_findings_from_the_affected_set_branch() {
         branch: vec![0],
         language: "typescript",
         message: "branch-local ambiguity".to_string(),
+        exhausted_roots: Vec::new(),
     };
 
     let projected = |branch| UnitRowProvenance::project(&provenance(branch));
@@ -1722,7 +1726,7 @@ fn invalid_owner_candidate_forces_weak_anchor() {
         byte_span: Some(0..4),
         identities: DetailedCodeQueryProvenanceIdentities::Primary(None),
         stable_owner_candidate: Some(
-            brokk_bifrost_rql::structural::search::CodeQueryStableOwnerCandidate {
+            brokk_bifrost_rql::structural::search::CodeQueryStableOwnerCandidate::Derived {
                 namespace: "INVALID".to_string(),
                 derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
                 semantic_key: "call:sink".to_string(),

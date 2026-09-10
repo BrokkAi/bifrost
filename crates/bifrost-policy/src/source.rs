@@ -11,11 +11,14 @@ use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
-use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
+use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
-use brokk_bifrost_rql::query::sexp::{code_query_from_expr, validate_policy_selector_expr};
+use brokk_bifrost_rql::query::sexp::{
+    QueryExprErrorOrigin, code_query_from_expr_with_scope, validate_policy_selector_expr,
+};
 use brokk_bifrost_rql::schema::{
-    reference_kind_from_label, resolve_rql_schema_version, usage_kind_from_label,
+    expand_language_labels, reference_kind_from_label, resolve_rql_schema_version,
+    usage_kind_from_label,
 };
 use brokk_bifrost_rql::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 use brokk_bifrost_rql::structural::materialization::{DeclarationOrigin, GenerationKind};
@@ -179,12 +182,23 @@ pub struct PolicySourceMapEntry {
     pub range: Range<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnresolvedPolicySelectorReference {
     pub path: String,
     pub authored_schema_version: Option<u32>,
+    pub(crate) context: PolicySelectorContext,
     pub workspace_path: WorkspaceRelativePath,
     pub range: Range<usize>,
+}
+
+/// Analysis-wide shared selector scope decoded from one `(analysis ...)` record.
+/// Exprs stay spanned so normalization errors can point back at the exact
+/// analysis label or glob the author wrote.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PolicySelectorContext {
+    pub(crate) languages: Vec<Expr>,
+    pub(crate) where_globs: Vec<Expr>,
+    pub(crate) schema_version: Option<(u32, Range<usize>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -723,15 +737,15 @@ fn completion_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceCom
                         return completion_in_expr(item, byte_offset);
                     }
                     let partial = item.as_symbol()?;
-                    if !partial.starts_with(':') || !":schema-version".starts_with(partial) {
+                    if !partial.starts_with(':') {
                         return None;
                     }
                     let record = single_record_for_head(head)?;
-                    return schema_version_completion(record, items, item.range.clone());
+                    return keyword_completion(record, items, partial, item.range.clone());
                 }
             }
             let record = single_record_for_head(head)?;
-            schema_version_completion(record, items, byte_offset..byte_offset)
+            keyword_completion(record, items, ":", byte_offset..byte_offset)
         }
         ExprKind::String(_) | ExprKind::Symbol(_) | ExprKind::Number(_) => None,
     }
@@ -768,10 +782,64 @@ fn schema_version_completion(
     })
 }
 
+fn keyword_completion(
+    record: PolicyRecord,
+    items: &[Expr],
+    partial: &str,
+    range: Range<usize>,
+) -> Option<PolicySourceCompletion> {
+    let present = |label: &str| items.iter().any(|item| item.as_symbol() == Some(label));
+    let matching = super::schema::fields_for_record(record)
+        .filter(|field| {
+            matches!(
+                field.field,
+                PolicyField::PolicySchemaVersion
+                    | PolicyField::EndpointSchemaVersion
+                    | PolicyField::RqlSchemaVersion
+                    | PolicyField::RqlFileSchemaVersion
+                    | PolicyField::AnalysisLanguages
+                    | PolicyField::AnalysisWhereGlobs
+                    | PolicyField::AnalysisRqlSchemaVersion
+            )
+        })
+        .filter_map(|field| {
+            let keyword = field.signature.split_whitespace().next()?;
+            (keyword.starts_with(partial) && !present(keyword)).then_some((keyword, field))
+        })
+        .collect::<Vec<_>>();
+    let [(label, descriptor)] = matching.as_slice() else {
+        return None;
+    };
+    let completion = |label: &'static str, new_text: String, range: Range<usize>| {
+        Some(PolicySourceCompletion {
+            range,
+            label,
+            new_text,
+            signature: descriptor.signature,
+            description: help_description(descriptor.description, record, items),
+        })
+    };
+    match *label {
+        ":schema-version" => schema_version_completion(record, items, range),
+        ":languages" => completion(":languages", ":languages []".to_string(), range),
+        ":where" => completion(":where", ":where []".to_string(), range),
+        ":rql-schema-version" => {
+            let version = resolve_rql_schema_version(None).ok()?.version;
+            completion(
+                ":rql-schema-version",
+                format!(":rql-schema-version {version}"),
+                range,
+            )
+        }
+        _ => None,
+    }
+}
+
 struct Decoder {
     identity: PolicySourceIdentity,
     source_map: Vec<PolicySourceMapEntry>,
     unresolved_file_selectors: Vec<UnresolvedPolicySelectorReference>,
+    selector_context: PolicySelectorContext,
     local_taint_entry_ids: HashSet<String>,
     classification_combination_refs: Vec<(FindingCombinationId, Range<usize>)>,
     classification_expectation_refs: Vec<(TypestateExpectationId, Range<usize>)>,
@@ -795,6 +863,7 @@ impl Decoder {
             identity,
             source_map: Vec::new(),
             unresolved_file_selectors: Vec::new(),
+            selector_context: PolicySelectorContext::default(),
             local_taint_entry_ids: HashSet::new(),
             classification_combination_refs: Vec::new(),
             classification_expectation_refs: Vec::new(),
@@ -1116,6 +1185,17 @@ impl Decoder {
         let fields =
             RecordCursor::parse(expr, PolicyRecord::Analysis, DecodeContext::policy(kind))?;
         self.map(format!("{path}/type"), fields.required("type"));
+        let context = decode_selector_context(&fields)?;
+        if let Some(field) = fields.get("languages") {
+            self.map(format!("{path}/languages"), field);
+        }
+        if let Some(field) = fields.get("where") {
+            self.map(format!("{path}/where"), field);
+        }
+        if let Some(field) = fields.get("rql-schema-version") {
+            self.map(format!("{path}/rql_schema_version"), field);
+        }
+        self.selector_context = context;
         // Every analysis kind may declare it, so it is decoded once here
         // rather than in each kind's own decoder.
         let on_unknown = fields
@@ -1146,6 +1226,7 @@ impl Decoder {
                 spec: self.decode_flow_analysis(&fields, path)?,
             },
         };
+        self.selector_context = PolicySelectorContext::default();
         Ok(DecodedAnalysis {
             analysis,
             on_unknown,
@@ -1234,7 +1315,7 @@ impl Decoder {
                 ],
                 "relational assertion plan entry",
             )? {
-                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, None)?),
+                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry)?),
                 PolicyRecord::Filter => {
                     derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
                 }
@@ -1301,21 +1382,14 @@ impl Decoder {
         })
     }
 
-    fn decode_row_binding(
-        &mut self,
-        expr: &Expr,
-        selector_base: Option<&str>,
-    ) -> Result<RowBinding, PolicySourceError> {
+    fn decode_row_binding(&mut self, expr: &Expr) -> Result<RowBinding, PolicySourceError> {
         let fields = RecordCursor::parse(
             expr,
             PolicyRecord::Bind,
             DecodeContext::policy(PolicyAnalysisKind::Assertion),
         )?;
         let name = parse_identifier(fields.required("name"), "row binding name")?;
-        let selector_path = selector_base.map_or_else(
-            || relational_binding_selector_path(&name),
-            |base| row_selector_binding_selector_path(base, &name),
-        );
+        let selector_path = relational_binding_selector_path(&name);
         let source = match (fields.get("query"), fields.get("from"), fields.get("step")) {
             (Some(query), None, None) => RowBindingSource::Query(self.decode_selector(
                 query,
@@ -3271,20 +3345,15 @@ impl Decoder {
         expr: &Expr,
     ) -> Result<PolicySemanticEvent, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Typestate);
-        let (record, normal) = match select_record(
+        let record = select_record(
             expr,
             &[
                 PolicyRecord::NormalProcedureExit,
                 PolicyRecord::ExceptionalProcedureExit,
+                PolicyRecord::SuspensionBoundary,
             ],
             "semantic event",
-        )? {
-            PolicyRecord::NormalProcedureExit => (PolicyRecord::NormalProcedureExit, true),
-            PolicyRecord::ExceptionalProcedureExit => {
-                (PolicyRecord::ExceptionalProcedureExit, false)
-            }
-            record => unreachable!("semantic event selector returned {record:?}"),
-        };
+        )?;
         let fields = RecordCursor::parse(expr, record, context)?;
         match expect_atom(
             fields.required("scope"),
@@ -3294,14 +3363,19 @@ impl Decoder {
             PolicyAtomValue::ExitAnalysisRoot => {}
             value => unreachable!("ExitScope registry returned {value:?}"),
         }
-        Ok(if normal {
-            PolicySemanticEvent::NormalProcedureExit {
+        Ok(match record {
+            PolicyRecord::NormalProcedureExit => PolicySemanticEvent::NormalProcedureExit {
                 scope: TypestateExitScope::AnalysisRoot,
+            },
+            PolicyRecord::ExceptionalProcedureExit => {
+                PolicySemanticEvent::ExceptionalProcedureExit {
+                    scope: TypestateExitScope::AnalysisRoot,
+                }
             }
-        } else {
-            PolicySemanticEvent::ExceptionalProcedureExit {
+            PolicyRecord::SuspensionBoundary => PolicySemanticEvent::SuspensionBoundary {
                 scope: TypestateExitScope::AnalysisRoot,
-            }
+            },
+            record => unreachable!("semantic event selector returned {record:?}"),
         })
     }
 
@@ -3913,28 +3987,67 @@ impl Decoder {
     ) -> Result<PolicySelector, PolicySourceError> {
         match select_record(
             expr,
-            &[
-                PolicyRecord::Rql,
-                PolicyRecord::RqlFile,
-                PolicyRecord::RowSelector,
-            ],
+            &[PolicyRecord::Rql, PolicyRecord::RqlFile],
             "policy selector",
         )? {
             PolicyRecord::Rql => {
                 let fields = RecordCursor::parse(expr, PolicyRecord::Rql, context)?;
                 let authored_version = fields
                     .get("schema-version")
-                    .map(|value| expect_u32(value, "RQL schema version", false))
+                    .map(|value| {
+                        expect_u32(value, "RQL schema version", false)
+                            .map(|version| (version, value.range.clone()))
+                    })
                     .transpose()?;
-                let schema = resolve_rql_schema_version(authored_version).map_err(|error| {
-                    source_error(
-                        "unsupported-rql-schema-version",
-                        fields
-                            .get("schema-version")
-                            .map_or_else(|| expr.range.clone(), |value| value.range.clone()),
-                        error.to_string(),
-                    )
-                })?;
+                let analysis_pin = self.selector_context.schema_version.clone();
+                if let (Some((authored, authored_range)), Some((analysis_version, analysis_range))) =
+                    (&authored_version, &analysis_pin)
+                    && authored != analysis_version
+                {
+                    let mut diagnostic = source_error(
+                            "conflicting-rql-schema-version",
+                            authored_range.clone(),
+                            format!(
+                                "inline selector pins RQL schema version `{authored}`, but the analysis pins `{analysis_version}`"
+                            ),
+                        )
+                        .diagnostic;
+                    diagnostic.related.push(PolicySourceRelatedDiagnostic {
+                        source: self.identity.clone(),
+                        range: analysis_range.clone(),
+                        message: format!("analysis pins RQL schema version `{analysis_version}`"),
+                    });
+                    return Err(PolicySourceError { diagnostic });
+                }
+                let (schema, schema_version_range) = match (&authored_version, &analysis_pin) {
+                    (Some((authored, authored_range)), _) => (
+                        resolve_rql_schema_version(Some(*authored)).map_err(|error| {
+                            source_error(
+                                "unsupported-rql-schema-version",
+                                authored_range.clone(),
+                                error.to_string(),
+                            )
+                        })?,
+                        authored_range.clone(),
+                    ),
+                    (None, Some((analysis_version, analysis_range))) => (
+                        SchemaVersionResolution {
+                            version: *analysis_version,
+                            origin: SchemaVersionOrigin::Explicit,
+                        },
+                        analysis_range.clone(),
+                    ),
+                    (None, None) => (
+                        resolve_rql_schema_version(None).map_err(|error| {
+                            source_error(
+                                "unsupported-rql-schema-version",
+                                expr.range.clone(),
+                                error.to_string(),
+                            )
+                        })?,
+                        expr.range.clone(),
+                    ),
+                };
                 let query_expr = fields.positional(0).expect("required positional RQL query");
                 validate_policy_selector_expr(query_expr).map_err(|error| {
                     source_error(
@@ -3943,17 +4056,43 @@ impl Decoder {
                         error.message,
                     )
                 })?;
-                let query = code_query_from_expr(query_expr, schema).map_err(|error| {
+                let query = code_query_from_expr_with_scope(
+                    query_expr,
+                    schema,
+                    &self.selector_context.languages,
+                    &self.selector_context.where_globs,
+                )
+                .map_err(|error| {
                     let message = error.to_string();
-                    source_error("invalid-inline-rql", error.range, message)
+                    match shared_scope_error_target(&self.selector_context, &error) {
+                        Some((field, field_range)) => {
+                            let mut diagnostic =
+                                source_error("invalid-shared-selector-scope", field_range, message)
+                                    .diagnostic;
+                            diagnostic.related.push(PolicySourceRelatedDiagnostic {
+                                source: self.identity.clone(),
+                                range: expr.range.clone(),
+                                message: format!("inline selector scoped by analysis {field}"),
+                            });
+                            PolicySourceError { diagnostic }
+                        }
+                        None => source_error("invalid-inline-rql", error.range, message),
+                    }
                 })?;
                 self.map(
                     format!("{path}/schema_version"),
-                    fields.get("schema-version").unwrap_or(expr),
+                    fields.get("schema-version").unwrap_or(&Expr {
+                        kind: ExprKind::Number(schema.version as u64),
+                        range: schema_version_range,
+                    }),
                 );
                 self.map(format!("{path}/query"), query_expr);
                 debug_assert!(self.selector_paths.insert(path.to_string()));
-                Ok(PolicySelector::Inline { schema, query })
+                Ok(PolicySelector::Inline {
+                    schema,
+                    query,
+                    resolved_locators: Vec::new(),
+                })
             }
             PolicyRecord::RqlFile => {
                 let fields = RecordCursor::parse(expr, PolicyRecord::RqlFile, context)?;
@@ -3961,6 +4100,23 @@ impl Decoder {
                     .get("schema-version")
                     .map(|value| expect_u32(value, "RQL schema version", false))
                     .transpose()?;
+                if let (Some(wrapper), Some((analysis, analysis_range))) = (
+                    authored_schema_version,
+                    self.selector_context.schema_version.as_ref(),
+                ) && wrapper != *analysis
+                {
+                    let mut diagnostic = source_error(
+                        "conflicting-rql-schema-version",
+                        fields.required("schema-version").range.clone(),
+                        format!("rql-file wrapper pins RQL schema version `{wrapper}`, but the analysis pins `{analysis}`"),
+                    ).diagnostic;
+                    diagnostic.related.push(PolicySourceRelatedDiagnostic {
+                        source: self.identity.clone(),
+                        range: analysis_range.clone(),
+                        message: format!("analysis pins RQL schema version `{analysis}`"),
+                    });
+                    return Err(PolicySourceError { diagnostic });
+                }
                 if let Some(version) = authored_schema_version {
                     resolve_rql_schema_version(Some(version)).map_err(|error| {
                         source_error(
@@ -3990,6 +4146,7 @@ impl Decoder {
                     .push(UnresolvedPolicySelectorReference {
                         path: path.to_string(),
                         authored_schema_version,
+                        context: self.selector_context.clone(),
                         workspace_path: workspace_path.clone(),
                         range: expr.range.clone(),
                     });
@@ -3997,78 +4154,16 @@ impl Decoder {
                 debug_assert!(self.selector_paths.insert(path.to_string()));
                 Ok(PolicySelector::File {
                     authored_schema_version,
+                    analysis_schema_version: self
+                        .selector_context
+                        .schema_version
+                        .as_ref()
+                        .map(|(version, _)| *version),
                     path: workspace_path,
                 })
             }
-            PolicyRecord::RowSelector => self.decode_row_selector(expr, context, path),
             record => unreachable!("selector returned {record:?}"),
         }
-    }
-
-    /// Decode an endpoint row selector using the shared typed relational
-    /// records. The nested records are assertion-owned vocabulary, while the
-    /// selector wrapper itself is legal only in taint and flow contexts.
-    fn decode_row_selector(
-        &mut self,
-        expr: &Expr,
-        context: DecodeContext,
-        path: &str,
-    ) -> Result<PolicySelector, PolicySourceError> {
-        let fields = RecordCursor::parse(expr, PolicyRecord::RowSelector, context)?;
-        let output = parse_identifier(fields.required("output"), "row selector output")?;
-        self.map(format!("{path}/output"), fields.required("output"));
-
-        let mut bindings = Vec::new();
-        let mut derivations = Vec::new();
-        let mut joins = Vec::new();
-        for (index, entry) in fields.variadic().iter().enumerate() {
-            let entry_path = format!("{path}/entries/{index}");
-            self.map(entry_path, entry);
-            match select_record(
-                entry,
-                &[
-                    PolicyRecord::Bind,
-                    PolicyRecord::Filter,
-                    PolicyRecord::Project,
-                    PolicyRecord::Join,
-                    PolicyRecord::CallArgument,
-                    PolicyRecord::Call,
-                ],
-                "row selector entry",
-            )? {
-                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, Some(path))?),
-                PolicyRecord::Filter => {
-                    derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
-                }
-                PolicyRecord::Project => {
-                    derivations.push(RowDerivation::Project(decode_row_projection(entry)?));
-                }
-                PolicyRecord::Join => joins.push(decode_row_join(entry)?),
-                PolicyRecord::CallArgument => {
-                    derivations.push(RowDerivation::Filter(decode_call_argument(entry)?));
-                }
-                PolicyRecord::Call => {
-                    derivations.push(RowDerivation::Filter(decode_call(entry)?));
-                }
-                other => unreachable!("row selector registry returned {other:?}"),
-            }
-        }
-
-        let plan = RowSelectorPlan {
-            bindings,
-            derivations,
-            joins,
-            output,
-        };
-        crate::relational::validate_row_selector_plan(&plan).map_err(|error| {
-            source_error(
-                "invalid-row-selector-plan",
-                expr.range.clone(),
-                error.to_string(),
-            )
-        })?;
-        debug_assert!(self.selector_paths.insert(path.to_string()));
-        Ok(PolicySelector::Rows { plan })
     }
 
     fn decode_endpoint_binding(
@@ -4377,7 +4472,6 @@ fn relational_error_range(
     match error {
         Error::DuplicateBinding { name }
         | Error::ForwardBinding { binding: name, .. }
-        | Error::NestedRowSelector { binding: name }
         | Error::DeferredSelectorDomain { binding: name }
         | Error::ExpansionDomainUnavailable { binding: name, .. }
         | Error::InvalidQuery { binding: name, .. }
@@ -4481,7 +4575,7 @@ fn relational_error_range(
                 RowDerivation::Filter(filter) => filter.source_range.clone(),
                 RowDerivation::Project(projection) => projection.source_range.clone(),
             }),
-        Error::InvalidRowSelectorOutput { .. } | Error::ZeroLimit { .. } | Error::EmptyPlan => None,
+        Error::ZeroLimit { .. } | Error::EmptyPlan => None,
     }
 }
 
@@ -5398,6 +5492,113 @@ fn schema_analysis_kind(analysis: PolicyAnalysisType) -> PolicyAnalysisKind {
     }
 }
 
+fn decode_selector_context(
+    fields: &RecordCursor<'_>,
+) -> Result<PolicySelectorContext, PolicySourceError> {
+    let languages = match fields.get("languages") {
+        Some(field) => decode_selector_language_atoms(field)?,
+        None => Vec::new(),
+    };
+    let where_globs = match fields.get("where") {
+        Some(field) => decode_selector_where_atoms(field)?,
+        None => Vec::new(),
+    };
+    let schema_version = match fields.get("rql-schema-version") {
+        Some(field) => {
+            let version = expect_u32(field, "RQL schema version", false)?;
+            resolve_rql_schema_version(Some(version)).map_err(|error| {
+                source_error(
+                    "unsupported-rql-schema-version",
+                    field.range.clone(),
+                    error.to_string(),
+                )
+            })?;
+            Some((version, field.range.clone()))
+        }
+        None => None,
+    };
+    Ok(PolicySelectorContext {
+        languages,
+        where_globs,
+        schema_version,
+    })
+}
+
+fn decode_selector_language_atoms(field: &Expr) -> Result<Vec<Expr>, PolicySourceError> {
+    let entries = expect_vector(field, "analysis languages", 1, MAX_STRING_VECTOR_ENTRIES)?;
+    let mut labels = Vec::with_capacity(entries.len());
+    for atom in entries {
+        let label = atom
+            .as_symbol()
+            .or_else(|| atom.as_string())
+            .ok_or_else(|| {
+                source_error(
+                    "invalid-value-shape",
+                    atom.range.clone(),
+                    "language label must be a bare label or string",
+                )
+            })?;
+        validate_text(label, MAX_HUMAN_NAME_BYTES).map_err(|message| {
+            source_error(
+                "invalid-string",
+                atom.range.clone(),
+                format!("language label {message}"),
+            )
+        })?;
+        expand_language_labels(&[label]).map_err(|error| {
+            source_error(
+                "invalid-language-label",
+                atom.range.clone(),
+                format!("unknown analyzer language `{label}`: {error}"),
+            )
+        })?;
+        labels.push(atom.clone());
+    }
+    Ok(labels)
+}
+
+fn decode_selector_where_atoms(field: &Expr) -> Result<Vec<Expr>, PolicySourceError> {
+    let entries = expect_vector(field, "analysis where globs", 1, MAX_STRING_VECTOR_ENTRIES)?;
+    let mut globs = Vec::with_capacity(entries.len());
+    for atom in entries {
+        let text = expect_string(atom, "where glob", MAX_DISPLAY_TEXT_BYTES)?;
+        brokk_bifrost_rql::compile_path_glob(&text).map_err(|message| {
+            source_error("invalid-shared-selector-scope", atom.range.clone(), message)
+        })?;
+        globs.push(atom.clone());
+    }
+    Ok(globs)
+}
+
+/// Attribute a normalization error that points outside the selector text to
+/// the shared analysis scope field that caused it. Shared-scope errors carry
+/// an explicit origin and field path; local errors stay ordinary inline-query
+/// errors.
+fn shared_scope_error_target(
+    context: &PolicySelectorContext,
+    error: &brokk_bifrost_rql::query::sexp::QueryExprError,
+) -> Option<(&'static str, Range<usize>)> {
+    if error.origin != QueryExprErrorOrigin::SharedScope {
+        return None;
+    }
+    let group_span = |atoms: &[Expr]| -> Option<Range<usize>> {
+        let first = atoms.first()?;
+        let last = atoms.last()?;
+        Some(first.range.start..last.range.end)
+    };
+    let field = if error.path.ends_with("languages") || error.path.starts_with("languages[") {
+        "languages"
+    } else if error.path.ends_with("where") || error.path.starts_with("where[") {
+        "where"
+    } else {
+        return None;
+    };
+    match field {
+        "languages" => group_span(&context.languages).map(|range| ("languages", range)),
+        _ => group_span(&context.where_globs).map(|range| ("where", range)),
+    }
+}
+
 fn decode_analysis_type(expr: &Expr) -> Result<PolicyAnalysisType, PolicySourceError> {
     match expect_atom(expr, AtomDomain::AnalysisType, "analysis type")? {
         PolicyAtomValue::AnalysisMatch => Ok(PolicyAnalysisType::Match),
@@ -5614,6 +5815,7 @@ fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
         predicates,
         evidence: None,
         call_locator: None,
+        receiver_constraint: None,
         resolved_locators: Vec::new(),
         source_range: Some(expr.range.clone()),
     })
@@ -5713,6 +5915,7 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
         ],
         evidence: None,
         call_locator: None,
+        receiver_constraint: None,
         resolved_locators: Vec::new(),
         source_range: Some(expr.range.clone()),
     })
@@ -5729,6 +5932,79 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
 /// leaving runtime dispatch as an independent axis for the taint solver and
 /// summaries. The pack may remain globally partial when the selected callable
 /// family carries its narrower completeness proof.
+fn decode_receiver_type(
+    expr: &Expr,
+) -> Result<(Option<String>, Option<ReceiverTypeLocator>), PolicySourceError> {
+    fn identity(expr: &Expr, what: &str) -> Result<String, PolicySourceError> {
+        match &expr.kind {
+            ExprKind::String(value) | ExprKind::Symbol(value) => {
+                if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
+                    Err(source_error(
+                        "invalid-call-receiver-type-id",
+                        expr.range.clone(),
+                        format!(
+                            "call receiver semantic-model type identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
+                        ),
+                    ))
+                } else {
+                    Ok(value.clone())
+                }
+            }
+            _ => Err(source_error(
+                "invalid-call-receiver-type-id",
+                expr.range.clone(),
+                format!("call {what} requires a stable identity or quoted qualified locator"),
+            )),
+        }
+    }
+
+    match &expr.kind {
+        ExprKind::String(_) => {
+            let receiver_type = identity(expr, ":receiver-type")?;
+            let locator = PolicyLocator {
+                value: receiver_type.clone(),
+                range: expr.range.clone(),
+            };
+            Ok((
+                Some(receiver_type.clone()),
+                Some(ReceiverTypeLocator {
+                    locator,
+                    constraint: ReceiverTypeConstraintKind::Exact,
+                }),
+            ))
+        }
+        ExprKind::Symbol(_) => {
+            identity(expr, ":receiver-type").map(|receiver_type| (Some(receiver_type), None))
+        }
+        ExprKind::List(items) if items.len() == 2 => {
+            if items[0].as_symbol() != Some("assignable-to") {
+                return Err(source_error(
+                    "invalid-call-receiver-type-id",
+                    expr.range.clone(),
+                    "call :receiver-type family must use (assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)",
+                ));
+            }
+            let receiver_type = identity(&items[1], "receiver family")?;
+            let locator = PolicyLocator {
+                value: receiver_type.clone(),
+                range: items[1].range.clone(),
+            };
+            Ok((
+                Some(receiver_type),
+                Some(ReceiverTypeLocator {
+                    locator,
+                    constraint: ReceiverTypeConstraintKind::AssignableTo,
+                }),
+            ))
+        }
+        _ => Err(source_error(
+            "invalid-call-receiver-type-id",
+            expr.range.clone(),
+            "call :receiver-type requires a stable identity, quoted qualified locator, or (assignable-to ...)",
+        )),
+    }
+}
+
 fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -5768,41 +6044,12 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             ));
         }
     };
-    let (receiver_type_id, receiver_locator) = fields.get("receiver-type").map_or(
-        Ok((None, None)),
-        |receiver_type_expr| {
-        match &receiver_type_expr.kind {
-            ExprKind::String(value) => {
-                if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
-                    return Err(source_error(
-                        "invalid-call-receiver-type-id",
-                        receiver_type_expr.range.clone(),
-                        format!(
-                            "call receiver semantic-model type identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
-                        ),
-                    ));
-                }
-                Ok((
-                    Some(value.clone()),
-                    Some(PolicyLocator {
-                        value: value.clone(),
-                        range: receiver_type_expr.range.clone(),
-                    }),
-                ))
-            }
-            ExprKind::Symbol(value)
-                if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES =>
-            {
-                Ok((Some(value.clone()), None))
-            }
-            _ => Err(source_error(
-                "invalid-call-receiver-type-id",
-                receiver_type_expr.range.clone(),
-                "call :receiver-type requires a stable identity or quoted qualified locator",
-            )),
-        }
-    },
-    )?;
+    let (receiver_type_id, receiver_type) = fields
+        .get("receiver-type")
+        .map(decode_receiver_type)
+        .transpose()?
+        .unwrap_or((None, None));
+    let receiver_constraint = receiver_type.as_ref().map(|receiver| receiver.constraint);
     let proof_expr = fields.required("proof");
     let proof = expect_token(proof_expr, "call proof")?;
     if !matches!(proof, "exact" | "declared") {
@@ -5874,22 +6121,33 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
         Some(RowFilterEvidence::DeclaredCall)
     };
     if let Some(receiver_type_id) = receiver_type_id {
-        predicates.push(RowPredicate {
-            field: field("receiver_type_id"),
-            op: RowPredicateOp::Eq,
-            operand: RowPredicateOperand::Literal(RowLiteral::String(receiver_type_id)),
-            source_range: Some(expr.range.clone()),
-        });
-        predicates.push(not_null("receiver_type_id"));
+        if receiver_constraint != Some(ReceiverTypeConstraintKind::AssignableTo) {
+            predicates.push(RowPredicate {
+                field: field("receiver_type_id"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::String(receiver_type_id)),
+                source_range: Some(expr.range.clone()),
+            });
+            predicates.push(not_null("receiver_type_id"));
+        } else {
+            predicates.push(RowPredicate {
+                field: field("receiver_type_id"),
+                op: RowPredicateOp::In,
+                operand: RowPredicateOperand::ResolvedIdentitySet(Vec::new()),
+                source_range: Some(expr.range.clone()),
+            });
+        }
     }
+    let receiver_has_locator = receiver_type.is_some();
     Ok(RowFilter {
         over: over.clone(),
         predicates,
         evidence,
-        call_locator: (target_locator.is_some() || receiver_locator.is_some()).then_some({
+        receiver_constraint,
+        call_locator: (target_locator.is_some() || receiver_has_locator).then_some({
             CallLocator {
                 target: target_locator,
-                receiver_type: receiver_locator,
+                receiver_type,
             }
         }),
         resolved_locators: Vec::new(),
@@ -7435,6 +7693,7 @@ mod tests {
                 RowPredicateOperand::Literal(_) => "literal",
                 RowPredicateOperand::Field(_) => "field",
                 RowPredicateOperand::Set(_) => "set",
+                RowPredicateOperand::ResolvedIdentitySet(_) => "resolved-identities",
                 RowPredicateOperand::None => "none",
             };
             assert_eq!(&actual, operand, "{spelling}");
@@ -7723,19 +7982,6 @@ mod tests {
                 (bind :name calls :query
                   (rql (call-bindings (call-shape (call :callee "run")))))
                 {entry}))"#
-        )
-    }
-
-    fn row_selector_endpoint(entries: &str) -> String {
-        format!(
-            r#"(endpoint
-              :id "test.row-selector" :name "Row selector"
-              :display-name "Exact argument" :role source :categories [input.user]
-              :selector (row-selector :output calls
-                (bind :name calls :query
-                  (rql (call-bindings (call-shape (call :callee "execute")))))
-                {entries})
-              :binding (argument :name "sql"))"#
         )
     }
 
@@ -8086,9 +8332,49 @@ mod tests {
         assert_eq!(target.value, "Widget.create");
         assert_eq!(&source[target.range.clone()], "\"Widget.create\"");
         let receiver = locator.receiver_type.as_ref().expect("receiver locator");
-        assert_eq!(receiver.value, "Widget");
-        assert_eq!(&source[receiver.range.clone()], "\"Widget\"");
+        assert_eq!(receiver.constraint, ReceiverTypeConstraintKind::Exact);
+        assert_eq!(receiver.locator.value, "Widget");
+        assert_eq!(&source[receiver.locator.range.clone()], "\"Widget\"");
         assert!(filter.resolved_locators.is_empty());
+    }
+
+    #[test]
+    fn assignable_call_receiver_is_a_typed_unresolved_family() {
+        let source = exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact
+                 :receiver-type (assignable-to "pkg.Base"))"#,
+        );
+        let parsed = parse(&source).unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call must lower to a filter")
+        };
+        assert_eq!(
+            filter.receiver_constraint,
+            Some(ReceiverTypeConstraintKind::AssignableTo)
+        );
+        let locator = filter.call_locator.as_ref().expect("pending locator");
+        let receiver = locator.receiver_type.as_ref().expect("receiver locator");
+        assert_eq!(
+            receiver.constraint,
+            ReceiverTypeConstraintKind::AssignableTo
+        );
+        assert_eq!(receiver.locator.value, "pkg.Base");
+        assert_eq!(&source[receiver.locator.range.clone()], "\"pkg.Base\"");
+        assert_eq!(
+            filter.predicates.last().unwrap().field.field,
+            "receiver_type_id"
+        );
+        assert!(matches!(
+            &filter.predicates.last().unwrap().operand,
+            RowPredicateOperand::ResolvedIdentitySet(identities) if identities.is_empty()
+        ));
     }
 
     #[test]
@@ -8157,7 +8443,7 @@ mod tests {
             .expect("registered call record has hover help");
         assert_eq!(
             record_help.signature,
-            "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE])"
+            "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)])"
         );
         let field_help = rqlp_source_help_at(&source, source.find(":resolves-to").unwrap() + 3)
             .expect("registered resolves-to field has hover help");
@@ -8174,7 +8460,7 @@ mod tests {
         .expect("registered receiver-type field has hover help");
         assert_eq!(
             receiver_type_help.signature,
-            ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE"
+            ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)"
         );
     }
 
@@ -8190,219 +8476,34 @@ mod tests {
     }
 
     #[test]
-    fn row_selector_call_sugar_is_the_typed_relational_plan() {
-        let sugar = parse(&row_selector_endpoint(
-            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact
-                 :receiver-type type.java-sql-statement)
-               (call-argument :over calls :formal-name "sql")"#,
-        ))
-        .unwrap();
-        let typed = parse(&row_selector_endpoint(
-            r#"(filter :over calls :where
-                 ((calls.model_id eq "java.sql.Statement.execute")
-                  (calls.semantic_target_id is-not-null)
-                  (calls.formal_layout_id is-not-null)
-                  (calls.selector_exact eq true)
-                  (calls.receiver_type_id eq "type.java-sql-statement")
-                  (calls.receiver_type_id is-not-null)))
-               (filter :over calls :where
-                 ((calls.formal_name eq "sql")
-                  (calls.mapping eq exact)
-                  (calls.coverage eq exhaustive)
-                  (calls.terminal eq false)
-                  (calls.argument_id is-not-null)))"#,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
-            serde_json::to_vec(&typed.document.to_normalized_authored_json()).unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_vec(
-                &sugar
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-            serde_json::to_vec(
-                &typed
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-
-        let plan = |document: &RqlpDocument| match document {
-            RqlpDocument::Endpoint { definition } => match &definition.selector {
-                PolicySelector::Rows { plan } => plan.clone(),
-                _ => panic!("expected row selector"),
-            },
-            _ => panic!("expected endpoint"),
-        };
-        let sugar = crate::resolved::ResolvedPolicySelector::try_new_rows(
-            PolicySelectorPath::new("/endpoint/selector").unwrap(),
-            plan(&sugar.document),
-            crate::resolved::SelectorOrigin::Document {
-                source: PolicySourceIdentity::new("sugar.rqlp"),
-            },
+    fn endpoint_call_binding_selector_is_an_rql_pipeline() {
+        let parsed = parse(
+            r#"(endpoint
+              :id "test.call-binding" :name "Call binding"
+              :display-name "Exact argument" :role source :categories [input.user]
+              :selector (rql :schema-version 1
+                (call-argument :formal-index 0
+                  (resolved-call :resolves-to member.statement.execute :proof exact
+                    :receiver-type type.statement
+                    (call-bindings (call-shape (call :callee "execute"))))))
+              :binding (argument :index 0))"#,
         )
-        .unwrap();
-        let typed = crate::resolved::ResolvedPolicySelector::try_new_rows(
-            PolicySelectorPath::new("/endpoint/selector").unwrap(),
-            plan(&typed.document),
-            crate::resolved::SelectorOrigin::Document {
-                source: PolicySourceIdentity::new("typed.rqlp"),
-            },
-        )
-        .unwrap();
-        assert_eq!(sugar.semantic_hash, typed.semantic_hash);
-        assert_eq!(
-            serde_json::to_vec(&crate::canonical_loaded::resolved_selector_to_json(&sugar))
-                .unwrap(),
-            serde_json::to_vec(&crate::canonical_loaded::resolved_selector_to_json(&typed))
-                .unwrap(),
-        );
-    }
-
-    #[test]
-    fn row_selector_formal_index_sugar_retains_exact_call_identity() {
-        let parsed = parse(&row_selector_endpoint(
-            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
-               (call-argument :over calls :formal-index 0)"#,
-        ))
         .unwrap();
         let RqlpDocument::Endpoint { definition } = parsed.document else {
             panic!("expected endpoint")
         };
-        let PolicySelector::Rows { plan } = definition.selector else {
-            panic!("expected row selector")
+        let PolicySelector::Inline { query, .. } = definition.selector else {
+            panic!("expected RQL selector")
         };
-        assert_eq!(plan.output.as_str(), "calls");
-        assert_eq!(plan.bindings.len(), 1);
-        assert_eq!(plan.derivations.len(), 2);
-    }
-
-    #[test]
-    fn row_selector_formal_index_sugar_equals_the_typed_filter() {
-        let sugar = parse(&row_selector_endpoint(
-            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
-               (call-argument :over calls :formal-index 0)"#,
-        ))
-        .unwrap();
-        let typed = parse(&row_selector_endpoint(
-            r#"(filter :over calls :where
-                 ((calls.model_id eq "java.sql.Statement.execute")
-                  (calls.semantic_target_id is-not-null)
-                  (calls.formal_layout_id is-not-null)
-                  (calls.selector_exact eq true)))
-               (filter :over calls :where
-                 ((calls.formal_index eq 0)
-                  (calls.mapping eq exact)
-                  (calls.coverage eq exhaustive)
-                  (calls.terminal eq false)
-                  (calls.argument_id is-not-null)))"#,
-        ))
-        .unwrap();
-        assert_eq!(
-            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
-            serde_json::to_vec(&typed.document.to_normalized_authored_json()).unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_vec(
-                &sugar
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-            serde_json::to_vec(
-                &typed
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-    }
-
-    #[test]
-    fn row_selector_projection_cannot_discard_call_site_identity() {
-        let source = row_selector_endpoint(
-            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
-               (call-argument :over calls :formal-name "sql")
-               (project :name selected :from calls :columns (calls.formal_name))"#,
-        )
-        .replace(":output calls", ":output selected");
-        let error = parse(&source).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-row-selector-plan");
-        assert!(
-            error.message.contains("call-binding field"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn row_selector_preserves_joins_but_rejects_two_exposed_call_identities() {
-        let accepted = parse(&row_selector_endpoint(
-            r#"(bind :name peer :query
-                 (rql (call-bindings (call-shape (call :callee "execute")))))
-               (call :over calls :resolves-to java.sql.Statement.execute :proof exact)
-               (call-argument :over calls :formal-name "sql")
-               (join :left calls :right peer :kind semi :on ((site_id site_id)))"#,
-        ))
-        .unwrap();
-        let RqlpDocument::Endpoint { definition } = accepted.document else {
-            panic!("expected endpoint")
-        };
-        let PolicySelector::Rows { plan } = definition.selector else {
-            panic!("expected row selector")
-        };
-        assert_eq!(plan.joins.len(), 1);
-        assert_eq!(plan.joins[0].kind, RowJoinKind::Semi);
-        let resolved = crate::resolved::ResolvedPolicySelector::try_new_rows(
-            PolicySelectorPath::new("/endpoint/selector").unwrap(),
-            plan,
-            crate::resolved::SelectorOrigin::Document {
-                source: PolicySourceIdentity::new("join.rqlp"),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            resolved
-                .query_bindings()
-                .into_iter()
-                .map(|binding| (binding.name.as_str(), binding.path))
-                .collect::<Vec<_>>(),
+        assert!(matches!(
+            query.plan.steps.as_slice(),
             [
-                (
-                    "calls",
-                    "/endpoint/selector/bindings/calls/query".to_owned(),
-                ),
-                ("peer", "/endpoint/selector/bindings/peer/query".to_owned(),),
+                brokk_bifrost_rql::structural::QueryStep::CallShape,
+                brokk_bifrost_rql::structural::QueryStep::CallBindings,
+                brokk_bifrost_rql::structural::QueryStep::ResolvedCall(_),
+                brokk_bifrost_rql::structural::QueryStep::CallArgument(_),
             ]
-        );
-
-        let ambiguous = parse(&row_selector_endpoint(
-            r#"(bind :name peer :query
-                 (rql (call-bindings (call-shape (call :callee "execute")))))
-               (call :over calls :resolves-to java.sql.Statement.execute :proof exact)
-               (call-argument :over calls :formal-name "sql")
-               (join :left calls :right peer :on ((site_id site_id)))"#,
-        ))
-        .unwrap_err();
-        assert_eq!(ambiguous.diagnostic.code, "invalid-row-selector-plan");
-        assert!(
-            ambiguous
-                .diagnostic
-                .message
-                .contains("ambiguous call-binding identities"),
-            "{}",
-            ambiguous.diagnostic.message
-        );
+        ));
     }
 
     /// The Milestone 4 sugar: it must add no evaluation rule of its own, so
@@ -8694,6 +8795,126 @@ mod tests {
     }
 
     #[test]
+    fn shared_analysis_scope_decodes_with_source_maps_and_inherited_pin() {
+        let source = r#"(policy :id "shared.scope" :name "Shared scope" :message "m" :severity warning :analysis (analysis :type match :languages [jvm java] :where ["src/**"] :rql-schema-version 1 :selector (rql (call :callee (name "eval")))))"#;
+        let parsed = parse(source).unwrap();
+        let entry_range = |path: &str| {
+            parsed
+                .source_map()
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing source map entry {path}"))
+                .range
+                .clone()
+        };
+        entry_range("/analysis/languages");
+        entry_range("/analysis/where");
+        let pin_range = entry_range("/analysis/rql_schema_version");
+        let RqlpDocument::Policy { definition } = parsed.document() else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Match { spec } = &definition.analysis else {
+            panic!("expected match analysis")
+        };
+        let PolicySelector::Inline { schema, .. } = &spec.selector else {
+            panic!("expected inline selector")
+        };
+        assert_eq!(schema.version, 1);
+        assert_eq!(schema.origin, SchemaVersionOrigin::Explicit);
+        assert_eq!(entry_range("/analysis/selector/schema_version"), pin_range);
+    }
+
+    #[test]
+    fn rql_file_references_carry_shared_context_and_analysis_pin() {
+        let source = r#"(policy :id "shared.file" :name "Shared file" :message "m" :severity warning :analysis (analysis :type match :languages [jvm] :where ["src/**"] :rql-schema-version 1 :selector (rql-file :path "queries/rule.rql")))"#;
+        let parsed = parse(source).unwrap();
+        let reference = &parsed.unresolved_file_selectors()[0];
+        assert_eq!(reference.authored_schema_version, None);
+        assert_eq!(
+            reference.context.schema_version.as_ref().map(|(v, _)| *v),
+            Some(1)
+        );
+        assert_eq!(reference.context.languages.len(), 1);
+        assert_eq!(reference.context.where_globs.len(), 1);
+    }
+
+    #[test]
+    fn inline_pin_conflicting_with_analysis_pin_reports_conflict_with_related_range() {
+        let source = r#"(policy :id "shared.conflict" :name "Conflict" :message "m" :severity warning :analysis (analysis :type match :rql-schema-version 1 :selector (rql :schema-version 3 (call :callee (name "eval")))))"#;
+        let error = parse(source).unwrap_err();
+        assert_eq!(error.diagnostic.code, "conflicting-rql-schema-version");
+        let related = &error.diagnostic.related[0];
+        assert_eq!(
+            related.range.start,
+            source.find(":rql-schema-version 1").unwrap() + ":rql-schema-version ".len()
+        );
+    }
+
+    #[test]
+    fn shared_scope_conflicts_and_bad_globs_point_to_analysis_values() {
+        let template = r#"(policy :id "shared.errors" :name "Errors" :message "m" :severity warning :analysis (analysis :type match :languages [jvm] :where ["src/**"] :selector (rql (union (call) (language python (call))))))"#;
+        let diagnostic = parse(template).unwrap_err().diagnostic;
+        assert_eq!(diagnostic.code, "invalid-shared-selector-scope");
+        assert_eq!(&template[diagnostic.range], "jvm");
+        assert!(diagnostic.message.contains("union[1].languages"));
+        assert_eq!(diagnostic.related.len(), 1);
+        let invalid_glob = template.replace("src/**", "[").replace("python", "java");
+        let diagnostic = parse(&invalid_glob).unwrap_err().diagnostic;
+        assert_eq!(diagnostic.code, "invalid-shared-selector-scope");
+        assert_eq!(&invalid_glob[diagnostic.range], r#""[""#);
+    }
+
+    #[test]
+    fn file_wrapper_pin_conflict_is_reported_before_unsupported_pin() {
+        let source = r#"(policy :id "shared.file-conflict" :name "Conflict" :message "m" :severity warning :analysis (analysis :type match :rql-schema-version 1 :selector (rql-file :schema-version 3 :path "query.rql")))"#;
+        let diagnostic = parse(source).unwrap_err().diagnostic;
+        assert_eq!(diagnostic.code, "conflicting-rql-schema-version");
+        assert_eq!(&source[diagnostic.range], "3");
+        assert_eq!(&source[diagnostic.related[0].range.clone()], "1");
+    }
+    #[test]
+    fn analysis_rql_pin_must_be_supported() {
+        let source = r#"(policy :id "shared.unsupported" :name "Unsupported" :message "m" :severity warning :analysis (analysis :type match :rql-schema-version 99 :selector (rql (call :callee (name "eval")))))"#;
+        let error = parse(source).unwrap_err();
+        assert_eq!(error.diagnostic.code, "unsupported-rql-schema-version");
+    }
+
+    #[test]
+    fn shared_language_labels_must_expand() {
+        let source = r#"(policy :id "shared.lang" :name "Lang" :message "m" :severity warning :analysis (analysis :type match :languages [notalang] :selector (rql (call :callee (name "eval")))))"#;
+        let error = parse(source).unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-language-label");
+    }
+
+    #[test]
+    fn shared_scope_fields_carry_hover_help() {
+        let source = r#"(policy :id "shared.hover" :name "Hover" :message "m" :severity warning :analysis (analysis :type match :languages [jvm] :rql-schema-version 1 :selector (rql (call :callee (name "eval")))))"#;
+        let help = rqlp_source_help_at(source, source.find(":rql-schema-version").unwrap() + 2)
+            .expect("registered field has hover help");
+        assert_eq!(help.signature, ":rql-schema-version N");
+        let help = rqlp_source_help_at(source, source.find(":languages").unwrap() + 2)
+            .expect("registered field has hover help");
+        assert_eq!(help.signature, ":languages [LANGUAGE...]");
+        assert!(help.description.contains("js-ts"), "{}", help.description);
+    }
+
+    #[test]
+    fn shared_scope_fields_complete_from_partials() {
+        let prefix = r#"(policy :id "shared.complete" :name "Complete" :message "m" :severity warning :analysis (analysis :type match "#;
+        let suffix = r#" :selector (rql (call :callee (name "eval")))))"#;
+        let complete = |partial: &str| {
+            let source = format!("{prefix}{partial}{suffix}");
+            let offset = source.find(partial).unwrap() + partial.len() - 1;
+            rqlp_source_completion_at(&source, offset)
+                .unwrap_or_else(|| panic!("partial {partial} did not complete"))
+                .label
+        };
+        assert_eq!(complete(":lang"), ":languages");
+        assert_eq!(complete(":whe"), ":where");
+        assert_eq!(complete(":rql-s"), ":rql-schema-version");
+    }
+
+    #[test]
     fn decodes_exact_match_policy_and_infers_compatible_versions() {
         let parsed = parse(
             r#"(policy
@@ -8716,7 +8937,7 @@ mod tests {
         let PolicyAnalysis::Match { spec } = definition.analysis else {
             panic!("expected match policy")
         };
-        let PolicySelector::Inline { schema, query } = spec.selector else {
+        let PolicySelector::Inline { schema, query, .. } = spec.selector else {
             panic!("expected inline selector")
         };
         let compatible_rql_version = resolve_rql_schema_version(None).unwrap().version;
@@ -8922,6 +9143,68 @@ mod tests {
         assert_eq!(spec.automaton.events.len(), 1);
         assert_eq!(spec.automaton.transitions.len(), 1);
         assert_eq!(spec.automaton.terminal_expectations.len(), 1);
+    }
+
+    #[test]
+    fn decodes_suspension_boundary_with_exact_range_and_hover() {
+        let source = r#"(policy
+              :id "bifrost.test.suspension"
+              :name "Suspension"
+              :message "M"
+              :severity error
+              :analysis
+                (analysis
+                  :type typestate
+                  :mode may
+                  :subjects (subject-set)
+                  :uncertainty (uncertainty :escape inconclusive)
+                  :automaton
+                    (automaton
+                      :states [open closed]
+                      :initial open
+                      :accepting-states [closed]
+                      :error-states [open]
+                      :events [(event :id suspend
+                                :on (suspension-boundary :scope analysis-root))]
+                      :transitions [(transition :from open :on suspend :to closed)])))"#;
+        let parsed = parse(source).expect("suspension boundary parses");
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Typestate { spec } = definition.analysis else {
+            panic!("expected typestate policy")
+        };
+        let [event] = spec.automaton.events.as_slice() else {
+            panic!("expected one typestate event")
+        };
+        assert!(matches!(
+            &event.trigger,
+            TypestateEventTrigger::SemanticEvent {
+                event: PolicySemanticEvent::SuspensionBoundary {
+                    scope: TypestateExitScope::AnalysisRoot
+                }
+            }
+        ));
+
+        let record_offset = source.find("suspension-boundary").unwrap() + 2;
+        let record_help = rqlp_source_help_at(source, record_offset)
+            .expect("suspension boundary record has hover help");
+        assert_eq!(
+            record_help.signature,
+            "(suspension-boundary :scope analysis-root)"
+        );
+        let scope_offset = source.find(":scope").unwrap() + 2;
+        let scope_help = rqlp_source_help_at(source, scope_offset)
+            .expect("suspension boundary scope has hover help");
+        assert_eq!(&source[scope_help.range], ":scope");
+        assert_eq!(scope_help.signature, ":scope analysis-root");
+
+        let invalid = source.replace("analysis-root", "procedure-root");
+        let error = parse(&invalid)
+            .expect_err("only analysis-root is supported")
+            .diagnostic;
+        assert_eq!(error.code, "invalid-enum-value");
+        assert_eq!(&invalid[error.range], "procedure-root");
     }
 
     #[test]

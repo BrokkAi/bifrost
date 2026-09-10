@@ -21,10 +21,7 @@ use crate::definition::{AssertCardinality, PolicyAssertId, RowBindingName, RowLi
 use crate::finding::PolicyIncompleteReason;
 
 use super::coverage::{RelationCoverage, RelationalInput, RelationalObligationKind};
-use super::eval::{
-    RelationalAssertionEvaluation, RelationalViolationRow, evaluate_plan_ir,
-    evaluate_row_selector_ir,
-};
+use super::eval::{RelationalAssertionEvaluation, RelationalViolationRow, evaluate_plan_ir};
 use super::ir::{
     IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp, IrEquiKey, IrJoinKind,
     IrLimits, IrOperand, IrPredicate, IrRelation, IrRelationId, IrRelationOp, RelationalPlanIr,
@@ -126,6 +123,7 @@ fn call_binding(
         domain: DetailedCodeQueryDomain::CallBinding,
         path: "app.ts".into(),
         range: None,
+        evidence: None,
         fields,
         unknown_fields,
         terminal: None,
@@ -627,64 +625,6 @@ fn conversion_equality_does_not_treat_unknown_as_a_known_value() {
         RelationalObligationKind::VerdictRequiresWitnessedRows
     );
     assert!(!evaluation.exhaustive);
-}
-
-#[test]
-fn conversion_filter_row_selector_retains_known_rows_with_partial_coverage() {
-    let calls = call_binding_source(0, "calls");
-    let filtered = filter(
-        1,
-        "filtered",
-        &calls,
-        vec![IrPredicate::Compare {
-            left: column("calls", "conversion"),
-            op: IrCompareOp::Eq,
-            right: IrOperand::Literal(RowLiteral::ConstrainedEnum(
-                "typescript_identity".to_string(),
-            )),
-        }],
-    );
-    let plan = plan(vec![calls, filtered], Vec::new());
-    let rows = vec![
-        call_binding(
-            "site",
-            "unknown",
-            Some(0),
-            Some(false),
-            None,
-            Some("conversion"),
-        ),
-        call_binding(
-            "site",
-            "known",
-            Some(1),
-            Some(false),
-            Some("typescript_identity"),
-            None,
-        ),
-    ];
-    let input_binding = binding("calls");
-    let inputs = vec![RelationalInput {
-        binding: &input_binding,
-        rows: &rows,
-        coverage: RelationCoverage::Exhaustive,
-    }];
-    let selection = evaluate_row_selector_ir(
-        &plan,
-        IrRelationId(1),
-        IrRelationId(0),
-        &input_binding,
-        &inputs,
-    )
-    .expect("row selector evaluates");
-    assert_eq!(
-        selection.selected_rows,
-        vec![RelationalViolationRow {
-            binding: input_binding,
-            row: 1,
-        }]
-    );
-    assert!(!selection.selected_coverage.is_exhaustive());
 }
 
 #[test]

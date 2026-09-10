@@ -75,7 +75,9 @@ workspace generation:
 ```
 
 `value-flow` runs the registered plan and returns `flow_endpoint` rows with
-`reached`, `not_reached`, or `inconclusive` status. `witness` projects only the
+`reached`, `not_reached`, or `inconclusive` reachability. A separate public
+`status` and optional `reason` preserve whether semantic construction, solver
+propagation, or the enclosing query completed or stopped. `witness` projects only the
 source-backed paths retained by that solve. The registered `taint` step is
 narrower still: it projects an existing production taint report and cannot load
 a policy or invoke the solver.
@@ -102,8 +104,8 @@ Data-flow results keep these dimensions separate:
 
 - may reachability from any must claim;
 - exact evidence from ambiguous or best-effort evidence;
-- complete execution from cancellation, unsupported semantics, or budget
-  exhaustion;
+- a single flow status, with a reason, for completion, cancellation,
+  unsupported semantics, or budget exhaustion;
 - stable endpoint and source identities from run-local graph identities; and
 - retained witnesses from omitted or truncated witness alternatives.
 

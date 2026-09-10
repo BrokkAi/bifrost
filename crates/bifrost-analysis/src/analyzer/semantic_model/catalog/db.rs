@@ -39,8 +39,11 @@ pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, Cat
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW
         }
     };
-    let mut connection = Connection::open_with_flags(&path, flags)
-        .map_err(|error| CatalogError::sqlite("open catalog", error))?;
+    let mut connection = {
+        let _scope = crate::profiling::scope("semantic_pack.catalog.sqlite_open");
+        Connection::open_with_flags(&path, flags)
+            .map_err(|error| CatalogError::sqlite("open catalog", error))?
+    };
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| CatalogError::sqlite("configure busy timeout", error))?;
@@ -53,11 +56,17 @@ pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, Cat
             supported: CURRENT_CATALOG_VERSION,
         });
     }
-    match mode {
-        CatalogOpenMode::ReadWrite => configure_writer(&mut connection)?,
-        CatalogOpenMode::ReadOnly => configure_reader(&connection)?,
+    {
+        let _scope = crate::profiling::scope("semantic_pack.catalog.configure");
+        match mode {
+            CatalogOpenMode::ReadWrite => configure_writer(&mut connection)?,
+            CatalogOpenMode::ReadOnly => configure_reader(&connection)?,
+        }
     }
-    migrate(&mut connection, mode)?;
+    {
+        let _scope = crate::profiling::scope("semantic_pack.catalog.migrate");
+        migrate(&mut connection, mode)?;
+    }
     Ok(connection)
 }
 

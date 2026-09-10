@@ -1,16 +1,18 @@
-use super::ir::{CodeQuery, CodeQueryResultDetail, MAX_DECORATOR_BINDING_FILTER_LENGTH};
+use super::ir::{
+    CallIdentity, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
+    MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep, ResolvedCallReceiverType,
+};
 use super::schema::{
     BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, DECORATOR_BINDING_STEP_OPTIONS,
-    QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS,
-    ScopeFilterField, binding_option_for_rql_label, candidate_option_for_rql_label,
-    declaration_state_option_for_rql_label, export_field_for_rql_label,
-    generation_site_field_for_rql_label, occurrence_option_for_rql_label,
-    resolve_rql_schema_version,
+    QueryStepField, QueryStepOp, ReceiverTypeConstraintForm, RqlForm, RqlFormClass, RqlProperty,
+    SCOPE_SEED_RQL_LABELS, ScopeFilterField, binding_option_for_rql_label,
+    candidate_option_for_rql_label, declaration_state_option_for_rql_label,
+    export_field_for_rql_label, generation_site_field_for_rql_label,
+    occurrence_option_for_rql_label, resolve_rql_schema_version,
 };
 #[cfg(test)]
 use crate::sexp::MAX_SEXP_DEPTH;
 use crate::sexp::{Expr, ExprKind, ParseError, ParsedSexp, parse_sexp};
-use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
 use brokk_bifrost_core::schema_version::SchemaVersionResolution;
 use serde_json::{Map, Number, Value, json};
@@ -74,7 +76,16 @@ pub struct QueryExprError {
     pub path: String,
     pub range: Range<usize>,
     pub message: String,
+    pub origin: QueryExprErrorOrigin,
     kind: QueryExprErrorKind,
+}
+
+/// Whether a diagnostic names local selector structure or a scope supplied by
+/// the embedding. Ranges always remain in the local expression/document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryExprErrorOrigin {
+    Local,
+    SharedScope,
 }
 
 #[derive(Debug)]
@@ -145,6 +156,7 @@ pub(crate) fn query_expr_to_json(expr: &Expr) -> Result<Value, QueryExprError> {
             path,
             range: error.range,
             message: error.message,
+            origin: QueryExprErrorOrigin::Local,
             kind: QueryExprErrorKind::Lowering,
         }
     })
@@ -159,19 +171,118 @@ pub fn code_query_from_expr(
     schema: SchemaVersionResolution,
 ) -> Result<CodeQuery, QueryExprError> {
     let mut value = query_expr_to_json(expr)?;
-    let object = value
-        .as_object_mut()
-        .expect("RQL lowering always produces a query object");
+    let Some(object) = value.as_object_mut() else {
+        panic!("RQL lowering always produces a query object");
+    };
     object.insert("schema_version".to_string(), json!(schema.version));
-    CodeQuery::from_json(&value).map_err(|error| {
+    let mut query = CodeQuery::from_json(&value).map_err(|error| {
         let range = super::source::query_expr_range_for_path(expr, &error.path);
         QueryExprError {
             path: error.path,
             range,
             message: error.message,
+            origin: QueryExprErrorOrigin::Local,
             kind: QueryExprErrorKind::Semantic,
         }
-    })
+    })?;
+    annotate_call_identity_ranges(&mut query.plan, expr, "");
+    Ok(query)
+}
+
+fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &str) {
+    if let CodeQueryPlanSource::Set { op, branches } = &mut plan.source {
+        for (index, branch) in branches.iter_mut().enumerate() {
+            let branch_path = if path.is_empty() {
+                format!("{}[{index}]", op.label())
+            } else {
+                format!("{path}.{}[{index}]", op.label())
+            };
+            annotate_call_identity_ranges(branch, expr, &branch_path);
+        }
+    }
+    let steps_path = if path.is_empty() {
+        "steps".to_owned()
+    } else {
+        format!("{path}.steps")
+    };
+    for (index, step) in plan.steps.iter_mut().enumerate() {
+        let QueryStep::ResolvedCall(filter) = step else {
+            continue;
+        };
+        annotate_call_identity_range(
+            &mut filter.resolves_to,
+            expr,
+            &format!("{steps_path}[{index}].resolves_to"),
+        );
+        if let Some(receiver_type) = &mut filter.receiver_type {
+            let path_suffix =
+                if matches!(receiver_type, ResolvedCallReceiverType::AssignableTo { .. }) {
+                    ".assignable_to"
+                } else {
+                    ""
+                };
+            annotate_call_identity_range(
+                receiver_type.root_mut(),
+                expr,
+                &format!("{steps_path}[{index}].receiver_type{path_suffix}"),
+            );
+        }
+    }
+}
+
+fn annotate_call_identity_range(identity: &mut CallIdentity, expr: &Expr, path: &str) {
+    if let CallIdentity::Qualified { source_range, .. } = identity {
+        *source_range = Some(super::source::query_expr_range_for_path(expr, path));
+    }
+}
+
+/// Lower a local selector with embedding-owned language and path context.
+///
+/// Shared expressions are structured `Expr` values and are never spliced into
+/// source text. Scope-conflict ranges point into `expr` so callers can
+/// attribute them to the referenced selector even when shared atoms come from
+/// another document.
+pub fn code_query_from_expr_with_scope(
+    expr: &Expr,
+    schema: SchemaVersionResolution,
+    languages: &[Expr],
+    where_globs: &[Expr],
+) -> Result<CodeQuery, QueryExprError> {
+    let mut query = code_query_from_expr(expr, schema)?;
+    let shared_globs = where_globs
+        .iter()
+        .map(string_arg)
+        .collect::<LowerResult<Vec<_>>>()
+        .map_err(|error| shared_scope_error(expr, "where", error))?;
+    let shared_scope = super::decode::decode_path_scope(&array_of_strings(shared_globs), "where")
+        .map_err(|error| {
+        shared_scope_error(expr, &error.path, lower_error(expr, error.message))
+    })?;
+    let shared_labels =
+        language_args(languages).map_err(|error| shared_scope_error(expr, "languages", error))?;
+    let shared_languages =
+        super::decode::decode_languages(&array_of_strings(shared_labels), "languages").map_err(
+            |error| shared_scope_error(expr, &error.path, lower_error(expr, error.message)),
+        )?;
+    super::decode::conjoin_plan_scope(
+        &mut query.plan,
+        Some(&shared_scope),
+        Some(&shared_languages),
+        "",
+    )
+    .map_err(|error| shared_scope_error(expr, &error.path, lower_error(expr, error.message)))?;
+    Ok(query)
+}
+
+fn shared_scope_error(expr: &Expr, path: &str, error: QueryLowerError) -> QueryExprError {
+    let range = super::source::query_expr_range_for_path(expr, path);
+    QueryExprError {
+        path: path.to_string(),
+        range,
+        message: error.message,
+        origin: QueryExprErrorOrigin::SharedScope,
+        kind: QueryExprErrorKind::Semantic,
+    }
 }
 
 /// Reject query output controls that an embedding must own itself.
@@ -209,6 +320,7 @@ pub fn validate_policy_selector_expr(expr: &Expr) -> Result<(), QueryExprError> 
                 message: format!(
                     "policy selectors cannot author `{authored_label}`; policy evaluation owns query output controls"
                 ),
+                origin: QueryExprErrorOrigin::Local,
                 kind: QueryExprErrorKind::Semantic,
             });
         }
@@ -250,7 +362,9 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .iter()
                 .map(string_arg)
                 .collect::<Result<Vec<_>, _>>()?;
-            insert_unique(&mut query, "where", array_of_strings(globs)).at(expr)?;
+            let scope = combine_scope_values(query.get("where").cloned(), array_of_strings(globs))
+                .at(expr)?;
+            query.insert("where".to_string(), scope);
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Language => {
@@ -261,11 +375,11 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 ));
             }
             let mut query = query_object(&items[items.len() - 1])?;
-            let labels = items[1..items.len() - 1]
-                .iter()
-                .map(language_arg)
-                .collect::<Result<Vec<_>, _>>()?;
-            insert_unique(&mut query, "languages", array_of_strings(labels)).at(expr)?;
+            let labels = language_args(&items[1..items.len() - 1])?;
+            let languages =
+                combine_language_values(query.get("languages").cloned(), array_of_strings(labels))
+                    .at(expr)?;
+            query.insert("languages".to_string(), languages);
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Limit => {
@@ -697,6 +811,76 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::ResolvedCall => {
+            if items.len() < 6 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!(
+                        "({head} ...) expects :resolves-to, :proof, an optional :receiver-type, and a query"
+                    ),
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::ResolvedCall.label().to_string()),
+            );
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
+                let option = QueryStepOp::ResolvedCall
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| lower_error(&pair[0], format!("unknown {head} option {key}")))?;
+                let value = match option.field() {
+                    QueryStepField::ResolvesTo => call_identity_value(&pair[1], head)?,
+                    QueryStepField::ReceiverType => receiver_type_value(&pair[1], head)?,
+                    QueryStepField::CallProof => {
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_"))
+                    }
+                    _ => unreachable!("resolved-call registry contains only its three options"),
+                };
+                if step
+                    .insert(option.field().label().to_string(), value)
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            append_step(expr, &items[items.len() - 1], step)
+        }
+        RqlForm::CallArgument => {
+            if items.len() != 4 {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects one formal selector followed by a query"),
+                ));
+            }
+            let key = items[1].as_symbol().ok_or_else(|| {
+                lower_error(&items[1], format!("({head} ...) selector must be a symbol"))
+            })?;
+            let option = QueryStepOp::CallArgument
+                .option_for_rql_label(key)
+                .ok_or_else(|| lower_error(&items[1], format!("unknown {head} option {key}")))?;
+            let value = match option.field() {
+                QueryStepField::FormalName => Value::String(symbol_or_string(&items[2])?),
+                QueryStepField::FormalIndex => number_value(&items[2], head)?,
+                _ => unreachable!("call-argument registry contains only its two options"),
+            };
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::CallArgument.label().to_string()),
+            );
+            step.insert(option.field().label().to_string(), value);
+            append_step(expr, &items[3], step)
         }
         RqlForm::JsxAttributeValue => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
@@ -1838,6 +2022,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
+        | RqlForm::ResolvedCall
+        | RqlForm::CallArgument
         | RqlForm::CallEffects
         | RqlForm::ResultContractCalls
         | RqlForm::CallResultContracts
@@ -2100,11 +2286,28 @@ fn kind_label(expr: &Expr) -> LowerResult<String> {
     }
 }
 
-fn language_arg(expr: &Expr) -> LowerResult<String> {
-    let label = symbol_or_string(expr)?;
-    Language::from_config_label(&label)
-        .map(|language| language.config_label().to_string())
-        .ok_or_else(|| lower_error(expr, format!("unknown language label `{label}`")))
+fn language_args(exprs: &[Expr]) -> LowerResult<Vec<String>> {
+    if exprs.len() > super::ir::MAX_LANGUAGE_FILTERS {
+        return Err(lower_error(
+            &exprs[super::ir::MAX_LANGUAGE_FILTERS],
+            format!(
+                "at most {} language filters are allowed",
+                super::ir::MAX_LANGUAGE_FILTERS
+            ),
+        ));
+    }
+    let mut labels = Vec::new();
+    for expr in exprs {
+        let label = symbol_or_string(expr)?;
+        let expanded = super::schema::expand_language_labels(&[label.as_str()]).at(expr)?;
+        for language in expanded {
+            let label = language.config_label().to_string();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    Ok(labels)
 }
 
 fn result_detail_arg(expr: &Expr) -> LowerResult<String> {
@@ -2121,6 +2324,92 @@ fn string_arg(expr: &Expr) -> LowerResult<String> {
             format!("expected string, got {}", describe_expr(expr)),
         )
     })
+}
+
+fn combine_scope_values(existing: Option<Value>, outer_group: Value) -> Result<Value, String> {
+    if outer_group.as_array().is_some_and(Vec::is_empty) {
+        return Ok(existing.unwrap_or_else(|| Value::Array(Vec::new())));
+    }
+    let mut groups = match existing {
+        None => Vec::new(),
+        Some(value) => scope_value_groups(&value)?,
+    };
+    groups.push(scope_group_value(&outer_group)?);
+    let mut unique = Vec::with_capacity(groups.len());
+    for group in groups {
+        if !unique.contains(&group) {
+            unique.push(group);
+        }
+    }
+    let mut groups = unique;
+    if groups.len() == 1 {
+        return Ok(groups.remove(0));
+    }
+    Ok(Value::Array(groups))
+}
+
+fn scope_value_groups(value: &Value) -> Result<Vec<Value>, String> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "where scope must be an array".to_string())?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if entries.iter().all(Value::is_string) {
+        return Ok(vec![value.clone()]);
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.is_array() {
+                Ok(entry.clone())
+            } else {
+                Err("where groups must be arrays of glob strings".to_string())
+            }
+        })
+        .collect()
+}
+
+fn scope_group_value(value: &Value) -> Result<Value, String> {
+    if value.is_array() {
+        Ok(value.clone())
+    } else {
+        Err("where scope must be an array".to_string())
+    }
+}
+
+fn combine_language_values(existing: Option<Value>, shared: Value) -> Result<Value, String> {
+    let local_labels = language_labels(&existing.unwrap_or_else(|| Value::Array(Vec::new())))?;
+    let shared_labels = language_labels(&shared)?;
+    let local = super::schema::expand_language_labels(
+        &local_labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    let shared = super::schema::expand_language_labels(
+        &shared_labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    let combined =
+        super::ir::intersect_language_scopes(&local, &shared).map_err(|error| error.to_string())?;
+    Ok(array_of_strings(
+        combined
+            .into_iter()
+            .map(|language| language.config_label().to_string())
+            .collect(),
+    ))
+}
+
+fn language_labels(value: &Value) -> Result<Vec<String>, String> {
+    let labels = value
+        .as_array()
+        .ok_or_else(|| "languages scope must be an array".to_string())?;
+    labels
+        .iter()
+        .map(|label| {
+            label
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "language labels must be strings".to_string())
+        })
+        .collect()
 }
 
 /// Lower the tail of an `(arity ...)` predicate to its JSON value: a single
@@ -2221,6 +2510,61 @@ fn symbol_or_string(expr: &Expr) -> LowerResult<String> {
         })
 }
 
+fn call_identity_value(expr: &Expr, context: &str) -> LowerResult<Value> {
+    let (kind, value) = match &expr.kind {
+        ExprKind::Symbol(value) => ("stable", value),
+        ExprKind::String(value) => ("qualified", value),
+        _ => {
+            return Err(lower_error(
+                expr,
+                format!(
+                    "({context} ...) identity must be a stable symbol or quoted qualified locator"
+                ),
+            ));
+        }
+    };
+    if value.is_empty() {
+        return Err(lower_error(expr, "call identity must not be empty"));
+    }
+    let mut identity = Map::new();
+    identity.insert(kind.to_owned(), Value::String(value.clone()));
+    Ok(Value::Object(identity))
+}
+
+fn receiver_type_value(expr: &Expr, context: &str) -> LowerResult<Value> {
+    let ExprKind::List(items) = &expr.kind else {
+        return call_identity_value(expr, context);
+    };
+    if items.len() != 2 {
+        return Err(lower_error(
+            expr,
+            format!(
+                "({context} ...) receiver family must use {}",
+                ReceiverTypeConstraintForm::AssignableTo.signature()
+            ),
+        ));
+    }
+    let Some(head) = items[0].as_symbol() else {
+        return Err(lower_error(
+            &items[0],
+            "receiver family constraint must start with assignable-to",
+        ));
+    };
+    let Some(form) = ReceiverTypeConstraintForm::from_rql_label(head) else {
+        return Err(lower_error(
+            &items[0],
+            "receiver family constraint must start with assignable-to",
+        ));
+    };
+    let mut constraint = Map::new();
+    constraint.insert(
+        form.canonical_label().to_owned(),
+        call_identity_value(&items[1], context)?,
+    );
+    constraint.insert("resolved_identities".to_owned(), Value::Array(Vec::new()));
+    Ok(Value::Object(constraint))
+}
+
 fn number_value(expr: &Expr, context: &str) -> LowerResult<Value> {
     expr.as_number()
         .map(|value| Value::Number(Number::from(value)))
@@ -2287,7 +2631,10 @@ mod tests {
     use serde_json::json;
 
     fn canonical(input: &str) -> Value {
-        CodeQuery::from_sexp(input).unwrap().to_canonical_json()
+        let canonical = CodeQuery::from_sexp(input).unwrap().to_canonical_json();
+        let decoded = CodeQuery::from_json(&canonical).expect("generated machine serialization");
+        assert_eq!(decoded.to_canonical_json(), canonical, "{input}");
+        canonical
     }
 
     fn canonical_json(value: Value) -> Value {
@@ -2652,6 +2999,202 @@ mod tests {
         for invalid in [
             r#"(callers :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
             r#"(callees :proof proven :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+        ] {
+            assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn call_binding_selectors_lower_to_typed_pipeline_steps() {
+        let version = rql_schema_resolution().version;
+        assert_eq!(
+            canonical(
+                r#"(call-argument :formal-name "sql"
+                      (resolved-call :resolves-to member.statement.execute :proof exact
+                        :receiver-type type.statement
+                        (call-bindings (call-shape (call :callee (name "execute"))))))"#,
+            ),
+            json!({
+                "match": { "kind": "call", "callee": { "name": "execute" } },
+                "steps": [
+                    { "op": "call_shape" },
+                    { "op": "call_bindings" },
+                    {
+                        "op": "resolved_call",
+                        "resolves_to": { "stable": "member.statement.execute" },
+                        "call_proof": "exact",
+                        "receiver_type": { "stable": "type.statement" },
+                    },
+                    { "op": "call_argument", "formal_name": "sql" },
+                ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+
+        let source = r#"(resolved-call :resolves-to "Widget.create" :proof exact
+                          (call-bindings (call-shape (call :callee "create"))))"#;
+        let query = CodeQuery::from_sexp(source).unwrap();
+        let QueryStep::ResolvedCall(filter) = &query.plan.steps[2] else {
+            panic!("expected resolved-call step")
+        };
+        let CallIdentity::Qualified { source_range, .. } = &filter.resolves_to else {
+            panic!("quoted identity must remain a qualified locator")
+        };
+        let range = source_range
+            .clone()
+            .expect("RQL locator keeps its source range");
+        assert_eq!(&source[range], "\"Widget.create\"");
+
+        let mut resolved = query;
+        let QueryStep::ResolvedCall(filter) = &mut resolved.plan.steps[2] else {
+            panic!("expected resolved-call step")
+        };
+        let CallIdentity::Qualified {
+            resolved: identity, ..
+        } = &mut filter.resolves_to
+        else {
+            panic!("quoted identity must remain a qualified locator")
+        };
+        *identity = Some(crate::query::ResolvedCallIdentity {
+            kind: crate::query::ResolvedCallIdentityKind::ActiveSemanticModel,
+            identity: "model.callable.widget.create".to_owned(),
+        });
+        let canonical = resolved.to_canonical_json();
+        assert_eq!(
+            canonical["steps"][2]["resolves_to"],
+            json!({ "active_semantic_model": "model.callable.widget.create" })
+        );
+        let decoded = CodeQuery::from_json(&canonical).unwrap();
+        assert_eq!(decoded.to_canonical_json(), canonical);
+        let QueryStep::ResolvedCall(filter) = &decoded.plan.steps[2] else {
+            panic!("expected resolved-call step")
+        };
+        let CallIdentity::Qualified {
+            resolved: Some(identity),
+            ..
+        } = &filter.resolves_to
+        else {
+            panic!("canonical identity must retain its resolved domain")
+        };
+        assert_eq!(
+            identity.kind,
+            crate::query::ResolvedCallIdentityKind::ActiveSemanticModel
+        );
+
+        let union_source = r#"(union
+          (resolved-call :resolves-to "Widget.create" :proof exact
+            (call-bindings (call-shape (call :callee "create"))))
+          (resolved-call :resolves-to "Other.create" :proof exact
+            (call-bindings (call-shape (call :callee "create")))))"#;
+        let union = CodeQuery::from_sexp(union_source).unwrap();
+        let CodeQueryPlanSource::Set { branches, .. } = &union.plan.source else {
+            panic!("expected a union plan")
+        };
+        for (branch, expected) in branches.iter().zip(["Widget.create", "Other.create"]) {
+            let QueryStep::ResolvedCall(filter) = &branch.steps[2] else {
+                panic!("expected resolved-call step")
+            };
+            let CallIdentity::Qualified {
+                source_range: Some(range),
+                ..
+            } = &filter.resolves_to
+            else {
+                panic!("qualified union locator must retain its source range")
+            };
+            assert_eq!(&union_source[range.clone()], format!("\"{expected}\""));
+        }
+    }
+
+    #[test]
+    fn assignable_receiver_family_has_typed_canonical_json_and_source_range() {
+        let source = r#"(resolved-call :resolves-to "Child.sink" :proof exact
+          :receiver-type (assignable-to "Base")
+          (call-bindings (call-shape (call :callee "sink"))))"#;
+        let mut query = CodeQuery::from_sexp(source).unwrap();
+        let QueryStep::ResolvedCall(filter) = &mut query.plan.steps[2] else {
+            panic!("expected resolved-call step")
+        };
+        let Some(ResolvedCallReceiverType::AssignableTo {
+            root,
+            resolved_identities,
+        }) = &mut filter.receiver_type
+        else {
+            panic!("expected assignable receiver family")
+        };
+        let CallIdentity::Qualified {
+            source_range,
+            resolved,
+            ..
+        } = root
+        else {
+            panic!("quoted family root must remain a qualified locator")
+        };
+        let range = source_range.clone().expect("family root source range");
+        assert_eq!(&source[range], "\"Base\"");
+        *resolved = Some(crate::query::ResolvedCallIdentity {
+            kind: crate::query::ResolvedCallIdentityKind::WorkspaceDeclaration,
+            identity: "decl:v1:base".to_owned(),
+        });
+        *resolved_identities = vec!["decl:v1:base".to_owned(), "decl:v1:child".to_owned()];
+
+        let canonical = query.to_canonical_json();
+        assert_eq!(
+            canonical["steps"][2]["receiver_type"],
+            json!({
+                "assignable_to": { "workspace_declaration": "decl:v1:base" },
+                "resolved_identities": ["decl:v1:base", "decl:v1:child"],
+            })
+        );
+        assert_eq!(
+            CodeQuery::from_json(&canonical)
+                .unwrap()
+                .to_canonical_json(),
+            canonical
+        );
+        assert_eq!(
+            canonical,
+            canonical_json(json!({
+                "match": { "kind": "call", "callee": { "name": "sink" } },
+                "steps": [
+                    { "op": "call_shape" },
+                    { "op": "call_bindings" },
+                    {
+                        "op": "resolved_call",
+                        "resolves_to": { "qualified": "Child.sink" },
+                        "call_proof": "exact",
+                        "receiver_type": {
+                            "assignable_to": { "workspace_declaration": "decl:v1:base" },
+                            "resolved_identities": ["decl:v1:base", "decl:v1:child"],
+                        },
+                    },
+                ],
+            }))
+        );
+
+        let alias = source.replace("assignable-to", "assignable_to");
+        let alias_canonical = CodeQuery::from_sexp(&alias).unwrap().to_canonical_json();
+        assert_eq!(
+            alias_canonical["steps"][2]["receiver_type"],
+            json!({
+                "assignable_to": { "qualified": "Base" },
+                "resolved_identities": [],
+            })
+        );
+    }
+
+    #[test]
+    fn call_binding_selectors_reject_incomplete_or_mistyped_contracts() {
+        for invalid in [
+            r#"(resolved-call :resolves-to member.statement.execute
+                  (call-bindings (call-shape (call))))"#,
+            r#"(resolved-call :resolves-to member.statement.execute :proof guessed
+                  (call-bindings (call-shape (call))))"#,
+            r#"(call-argument :formal-name "sql" :formal-index 0
+                  (call-bindings (call-shape (call))))"#,
+            r#"(call-argument :formal-index 0 (call-shape (call)))"#,
         ] {
             assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
         }

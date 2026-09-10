@@ -1968,10 +1968,14 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let mut secondary_diagnostics = Vec::new();
-    let suppression_load = suppression_preflight.map_or_else(
-        || load_policy_suppressions_from_root(read_root, options.suppressions()),
-        PolicySuppressionPreflight::into_outcome,
-    );
+    let suppression_load = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("policy.registration.suppression_preflight");
+        suppression_preflight.map_or_else(
+            || load_policy_suppressions_from_root(read_root, options.suppressions()),
+            PolicySuppressionPreflight::into_outcome,
+        )
+    };
     for failure in &suppression_load.failures {
         secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::SuppressionLoadFailed,
@@ -1983,7 +1987,8 @@ fn evaluate_prepared_policy_inputs(
     }
     let suppression_document = suppression_load.document;
     let suppression_sources = suppression_load.sources;
-    let (scope_document, scope_document_state) =
+    let (scope_document, scope_document_state) = {
+        let _scope = brokk_bifrost_analysis::profiling::scope("policy.registration.scope_document");
         match load_policy_scope_from_root(read_root, options.scope()) {
             Ok(Some(document)) => (Some(document), PolicyScopeDocumentState::Loaded),
             Ok(None) => (None, PolicyScopeDocumentState::NotFound),
@@ -1999,22 +2004,27 @@ fn evaluate_prepared_policy_inputs(
                 )?);
                 (None, PolicyScopeDocumentState::Invalid)
             }
-        };
+        }
+    };
     // A malformed baseline document is loud: its diagnostic alone makes the
     // run unreliable, so a broken bulk acceptance can never look clean.
-    let baseline_document = match load_policy_baseline_from_root(read_root, options.baseline()) {
-        Ok(document) => document,
-        Err(error) => {
-            secondary_diagnostics.push(report_diagnostic(
-                PolicyReportDiagnosticCode::BaselineLoadFailed,
-                format!("failed to load the policy baseline: {error}"),
-                Some(PolicySourceIdentity::new(
-                    options.baseline().source().relative_path(),
-                )),
-                None,
-                Vec::new(),
-            )?);
-            None
+    let baseline_document = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("policy.registration.baseline_document");
+        match load_policy_baseline_from_root(read_root, options.baseline()) {
+            Ok(document) => document,
+            Err(error) => {
+                secondary_diagnostics.push(report_diagnostic(
+                    PolicyReportDiagnosticCode::BaselineLoadFailed,
+                    format!("failed to load the policy baseline: {error}"),
+                    Some(PolicySourceIdentity::new(
+                        options.baseline().source().relative_path(),
+                    )),
+                    None,
+                    Vec::new(),
+                )?);
+                None
+            }
         }
     };
     // The workspace packs document opts this evaluation into dependency and
@@ -2022,19 +2032,22 @@ fn evaluate_prepared_policy_inputs(
     // its diagnostic makes the run unreliable rather than silently evaluating
     // without the configured packs.
     let mut packs_load_failure = None;
-    let packs_config = match load_workspace_packs_config(read_root) {
-        Ok(config) => config,
-        Err(error) => {
-            let failure = format!("failed to load the workspace packs document: {error}");
-            secondary_diagnostics.push(report_diagnostic(
-                PolicyReportDiagnosticCode::PacksLoadFailed,
-                failure.clone(),
-                Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
-                None,
-                Vec::new(),
-            )?);
-            packs_load_failure = Some(failure);
-            None
+    let packs_config = {
+        let _scope = brokk_bifrost_analysis::profiling::scope("policy.registration.packs_document");
+        match load_workspace_packs_config(read_root) {
+            Ok(config) => config,
+            Err(error) => {
+                let failure = format!("failed to load the workspace packs document: {error}");
+                secondary_diagnostics.push(report_diagnostic(
+                    PolicyReportDiagnosticCode::PacksLoadFailed,
+                    failure.clone(),
+                    Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
+                    None,
+                    Vec::new(),
+                )?);
+                packs_load_failure = Some(failure);
+                None
+            }
         }
     };
     if policy_deadline_reached(cancellation)? {
@@ -2052,17 +2065,21 @@ fn evaluate_prepared_policy_inputs(
             None,
         );
     }
-    let catalogs = Arc::new(
-        TaintCatalogRegistry::new_for_workspace(
-            root.to_path_buf(),
-            CatalogRegistryLimits::default(),
+    let catalogs = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("policy.registration.catalog_registry");
+        Arc::new(
+            TaintCatalogRegistry::new_for_workspace(
+                root.to_path_buf(),
+                CatalogRegistryLimits::default(),
+            )
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to initialize policy catalog registry: {error}"
+                ))
+            })?,
         )
-        .map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to initialize policy catalog registry: {error}"
-            ))
-        })?,
-    );
+    };
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
@@ -2078,14 +2095,17 @@ fn evaluate_prepared_policy_inputs(
             None,
         );
     }
-    let mut registry = PolicyRegistry::new_for_workspace(
-        root.to_path_buf(),
-        catalogs,
-        registry_limits,
-    )
-    .map_err(|error| {
-        PolicyCoordinatorError::new(format!("failed to initialize policy registry: {error}"))
-    })?;
+    let mut registry = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("policy.registration.policy_registry");
+        PolicyRegistry::new_for_workspace(root.to_path_buf(), catalogs, registry_limits).map_err(
+            |error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to initialize policy registry: {error}"
+                ))
+            },
+        )?
+    };
 
     // Qualified policy locators need the same analyzer snapshot and active
     // model publication that evaluation will use. Prepare both before closing
@@ -2107,7 +2127,9 @@ fn evaluate_prepared_policy_inputs(
         // not hand us its own analyzer: the `--policy-file` CLI, the MCP
         // workspace-less arm, and any LSP request that arrives before the
         // server's workspace is ready.
-        Some(
+        Some({
+            let _scope =
+                brokk_bifrost_analysis::profiling::scope("policy.registration.owned_analyzer");
             WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config()).map_err(
                 |error| {
                     PolicyCoordinatorError::new(format!(
@@ -2115,8 +2137,8 @@ fn evaluate_prepared_policy_inputs(
                         root.display()
                     ))
                 },
-            )?,
-        )
+            )?
+        })
     } else {
         None
     };
@@ -2125,23 +2147,27 @@ fn evaluate_prepared_policy_inputs(
         workspace.is_some_and(|workspace| !workspace.analyzer().analyzed_files().is_empty());
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
-    let workspace_activation = match owned_analyzer.as_ref() {
-        Some(_) if packs_load_failure.is_some() => Some(None),
-        Some(analyzer_workspace) => {
-            match activate_owned_policy_workspace(
-                root,
-                analyzer_workspace,
-                packs_config.as_ref(),
-                semantic_cancellation,
-            ) {
-                Ok(activation) => Some(activation),
-                Err(error) => {
-                    secondary_diagnostics.push(workspace_activation_diagnostic(&error)?);
-                    None
+    let workspace_activation = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("policy.registration.workspace_activation");
+        match owned_analyzer.as_ref() {
+            Some(_) if packs_load_failure.is_some() => Some(None),
+            Some(analyzer_workspace) => {
+                match activate_owned_policy_workspace(
+                    root,
+                    analyzer_workspace,
+                    packs_config.as_ref(),
+                    semantic_cancellation,
+                ) {
+                    Ok(activation) => Some(activation),
+                    Err(error) => {
+                        secondary_diagnostics.push(workspace_activation_diagnostic(&error)?);
+                        None
+                    }
                 }
             }
+            None => None,
         }
-        None => None,
     };
     let document_semantic_model_snapshot = ready_policy_semantic_model_snapshot(
         workspace_activation
@@ -2229,17 +2255,22 @@ fn evaluate_prepared_policy_inputs(
                 "pending policy input changed during stable registration",
             ));
         };
-        let registration = match workspace {
-            Some(workspace) => registry
-                .register_policy_bytes_with_analyzer(
-                    prepared.source.clone(),
-                    prepared.bytes.as_bytes(),
-                    workspace.analyzer(),
-                )
-                .map(|policy| policy.definition().metadata.id.clone()),
-            None => registry
-                .register_policy_bytes(prepared.source.clone(), prepared.bytes.as_bytes())
-                .map(|policy| policy.definition().metadata.id.clone()),
+        let registration = {
+            let _scope = brokk_bifrost_analysis::profiling::scope_with(|| {
+                format!("policy.registration.policy[{}]", prepared.policy_id)
+            });
+            match workspace {
+                Some(workspace) => registry
+                    .register_policy_bytes_with_analyzer(
+                        prepared.source.clone(),
+                        prepared.bytes.as_bytes(),
+                        workspace.analyzer(),
+                    )
+                    .map(|policy| policy.definition().metadata.id.clone()),
+                None => registry
+                    .register_policy_bytes(prepared.source.clone(), prepared.bytes.as_bytes())
+                    .map(|policy| policy.definition().metadata.id.clone()),
+            }
         };
         match registration {
             Ok(policy_id) => {
@@ -4426,16 +4457,8 @@ fn explicit_version_diagnostics(
     }
 
     for selector in policy.resolved_selectors() {
-        let schemas = selector.as_query().map_or_else(
-            || {
-                selector
-                    .query_bindings()
-                    .into_iter()
-                    .map(|binding| (binding.path, binding.schema_resolution))
-                    .collect::<Vec<_>>()
-            },
-            |(schema, _)| vec![(selector.path.as_str().to_owned(), *schema)],
-        );
+        let (schema, _) = selector.as_query().expect("selectors are RQL queries");
+        let schemas = [(selector.path.as_str().to_owned(), *schema)];
         for (path, resolution) in schemas {
             if resolution.origin != SchemaVersionOrigin::ImplicitCompatible {
                 continue;

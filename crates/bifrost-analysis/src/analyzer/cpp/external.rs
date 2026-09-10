@@ -1114,6 +1114,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             diagnostics,

@@ -7976,7 +7976,7 @@ where
     /// and only `reconcile_claimed_files` puts an unclaimed-extension file in
     /// it. `live` is a parameter rather than a fresh snapshot because every
     /// caller is walking one already.
-    fn adapter_owns_file(&self, file: &ProjectFile, live: &LiveSnapshot) -> bool {
+    pub(crate) fn adapter_owns_file(&self, file: &ProjectFile, live: &LiveSnapshot) -> bool {
         if crate::analyzer::common::language_for_file(file) == self.adapter.language() {
             return true;
         }

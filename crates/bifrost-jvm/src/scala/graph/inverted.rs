@@ -559,6 +559,27 @@ impl ScalaProjectTypesSeed {
         self
     }
 
+    /// The same resolved seed reading its per-file facts through `facts`.
+    /// A resolved seed is workspace-derived and shared across queries; the
+    /// provider is what each query hydrates lazily and keeps to itself.
+    pub fn with_file_facts_provider(mut self, facts: Arc<dyn ScalaFileFactsProvider>) -> Self {
+        self.facts = ScalaSeedFileFacts::Targeted {
+            hierarchy_inputs: None,
+            facts,
+        };
+        self
+    }
+
+    /// The same resolved seed reading its per-file facts from a whole-
+    /// workspace map a consumer already holds.
+    pub fn with_eager_file_facts(
+        mut self,
+        file_states: Arc<HashMap<ProjectFile, ScalaFileFacts>>,
+    ) -> Self {
+        self.facts = ScalaSeedFileFacts::Eager(file_states);
+        self
+    }
+
     /// Warm the per-file facts cells for the files the query is about to
     /// scan. The eager seed already holds every file; the targeted seed
     /// batches the scan set's hydration ahead of the parallel walk so each

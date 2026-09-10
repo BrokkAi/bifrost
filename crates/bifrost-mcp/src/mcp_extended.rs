@@ -824,8 +824,11 @@ fn query_plan_properties(
         "where": {
             "type": "array",
             "maxItems": MAX_WHERE_GLOBS,
-            "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH },
-            "description": "Optional project-relative path globs limiting which files are searched. Absolute paths/globs inside the active workspace are normalized before execution."
+            "oneOf": [
+                { "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH } },
+                { "minItems": 1, "items": { "type": "array", "minItems": 1, "maxItems": MAX_WHERE_GLOBS, "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH } } }
+            ],
+            "description": "Optional project-relative path scope. A flat list is OR; a list of non-empty lists is AND between groups and OR within each group. The total glob budget applies across groups. Absolute paths/globs inside the active workspace are normalized before execution."
         },
         "languages": {
             "type": "array",

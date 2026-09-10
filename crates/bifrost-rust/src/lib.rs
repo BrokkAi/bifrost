@@ -38,6 +38,7 @@ pub mod ownership;
 pub mod proof;
 pub mod queries;
 pub mod structural;
+pub mod syntax;
 pub mod test_detection;
 pub mod usage;
 pub mod usage_includes;

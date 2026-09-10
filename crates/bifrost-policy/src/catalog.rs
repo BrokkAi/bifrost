@@ -1167,7 +1167,7 @@ fn validate_selector(
     id: &TaintEntryId,
     selector: &PolicySelector,
 ) -> Result<(), CatalogRegistryError> {
-    let PolicySelector::Inline { schema, query } = selector else {
+    let PolicySelector::Inline { schema, query, .. } = selector else {
         return Err(CatalogRegistryError::InvalidSelector {
             id: id.clone(),
             message: "catalog selectors must be inline".to_string(),
@@ -1698,11 +1698,12 @@ fn decode_selector(
             origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::Explicit,
         },
         query,
+        resolved_locators: Vec::new(),
     })
 }
 
 fn encode_selector(selector: &PolicySelector) -> SelectorWire {
-    let PolicySelector::Inline { schema, query } = selector else {
+    let PolicySelector::Inline { schema, query, .. } = selector else {
         unreachable!("catalog validation rejects file selectors")
     };
     SelectorWire {
@@ -2117,6 +2118,7 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
+            resolved_locators: Vec::new(),
         }
     }
 

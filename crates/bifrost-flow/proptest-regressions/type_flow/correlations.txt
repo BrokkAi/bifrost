@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a2f8b501a2e0de9912b087a99ff3e3b72a2ff94044e710751b13689fe289745e # shrinks to (successors, carried) = ([[], [ProgramPointId(1)]], [true, true])

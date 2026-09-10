@@ -11,6 +11,7 @@ use crate::imports::{
     RustImportBindingName, rust_import_binding_name, rust_import_body,
     rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
+use crate::syntax::{outer_attributes, unwrap_attributes};
 
 /// Re-exported from core, where the persisted `rust_import_targets` row shape
 /// that carries it lives. Kept spelled here because every reader of a cfg
@@ -19,8 +20,7 @@ pub use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
 
 pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
     let mut condition = RustCfgCondition::Always;
-    let mut sibling = node.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
+    for attribute_item in outer_attributes(node) {
         if attribute_item.kind() != "attribute_item" {
             break;
         }
@@ -39,7 +39,6 @@ pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
                 .and_then(|arguments| rust_cfg_argument_condition(arguments, source))
                 .unwrap_or(RustCfgCondition::Unknown);
         }
-        sibling = attribute_item.prev_named_sibling();
     }
     condition
 }
@@ -390,7 +389,8 @@ fn rust_use_statements(root: Node<'_>, source: &str) -> Arc<Vec<RustUseStatement
     // statements the visibility filter rejects, so filtering this complete
     // index reproduces the pruned walk's output exactly.
     let mut stack = vec![(root, None, None)];
-    while let Some((node, mod_range, scope_range)) = stack.pop() {
+    while let Some((raw_node, mod_range, scope_range)) = stack.pop() {
+        let node = unwrap_attributes(raw_node);
         if node.kind() == "use_declaration" {
             statements.push(RustUseStatement {
                 imports: rust_imports_from_use_declaration(node, source),
@@ -645,11 +645,12 @@ impl RustLexicalScopeIndex {
             functions: Vec::new(),
         };
         let mut stack = vec![(root, None, None, false, root.start_byte(), root.end_byte())];
-        while let Some((node, function, module, associated_type, scope_start, scope_end)) =
+        while let Some((raw_node, function, module, associated_type, scope_start, scope_end)) =
             stack.pop()
         {
             let mut child_function = function;
             let mut child_module = module;
+            let node = unwrap_attributes(raw_node);
             let child_associated_type = match node.kind() {
                 "impl_item" | "trait_item" => true,
                 "function_item" | "mod_item" | "source_file" => false,
@@ -812,6 +813,12 @@ impl RustLexicalScopeIndex {
         };
         let mut cursor = parameters.walk();
         for parameter in parameters.named_children(&mut cursor) {
+            if matches!(
+                parameter.kind(),
+                "attributes" | "line_comment" | "block_comment"
+            ) {
+                continue;
+            }
             let pattern = parameter
                 .child_by_field_name("pattern")
                 .unwrap_or(parameter);
@@ -1207,6 +1214,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parameter_attributes_do_not_create_lexical_bindings() {
+        let source = "fn f(#[Marker] actual: u8, neighbor: u8) { use_value(actual, neighbor); }";
+        let tree = super::parse_rust_tree_uncached(source).expect("Rust tree");
+        assert!(!tree.root_node().has_error());
+        let index = super::RustLexicalScopeIndex::new(tree.root_node(), source);
+        let position = source.find("use_value").expect("body call");
+        assert!(index.name_bound_at("actual", position));
+        assert!(index.name_bound_at("neighbor", position));
+        assert!(!index.name_bound_at("Marker", position));
+    }
+
+    #[test]
     fn visible_use_collection_only_descends_into_the_reference_scope_chain() {
         let mut source = String::from(
             r#"
@@ -1278,12 +1297,12 @@ fn apply_from_stdin() -> u8 { 1 }
         let use_declaration = declarations
             .iter()
             .copied()
-            .find(|node| node.kind() == "use_declaration")
+            .find(|node| unwrap_attributes(*node).kind() == "use_declaration")
             .expect("use declaration");
         let function = declarations
             .iter()
             .copied()
-            .find(|node| node.kind() == "function_item")
+            .find(|node| unwrap_attributes(*node).kind() == "function_item")
             .expect("function declaration");
 
         assert_eq!(

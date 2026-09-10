@@ -660,15 +660,7 @@ fn ensure_private_history_file(path: &PathBuf) -> io::Result<()> {
 }
 
 fn parse_query_input(line: &str) -> Result<Value, String> {
-    if line.trim_start().starts_with('{') {
-        let value =
-            serde_json::from_str(line).map_err(|error| format!("invalid JSON query: {error}"))?;
-        CodeQuery::from_json(&value)
-            .map(|query| query.to_canonical_json())
-            .map_err(|error| error.to_string())
-    } else {
-        CodeQuery::from_sexp(line).map(|query| query.to_canonical_json())
-    }
+    CodeQuery::from_sexp(line).map(|query| query.to_canonical_json())
 }
 
 fn should_colorize_repl() -> bool {
@@ -703,17 +695,28 @@ fn query_summary_text(query: &CodeQuery) -> String {
 
 /// The `where`/`languages` prefix every non-structural seed summarises the same
 /// way, so the three seeds do not drift apart in the REPL banner.
+fn path_scope_summary(scope: &brokk_bifrost::rql::QueryPathScope) -> String {
+    scope
+        .groups()
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 fn environment_seed_scope_summary(
-    where_globs: &[glob::Pattern],
+    where_globs: &brokk_bifrost::rql::QueryPathScope,
     languages: &[brokk_bifrost::analyzer::Language],
 ) -> Vec<String> {
     let mut parts = Vec::new();
     if !where_globs.is_empty() {
-        let globs = where_globs
-            .iter()
-            .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let globs = path_scope_summary(where_globs);
         parts.push(format!("where {globs}"));
     }
     if !languages.is_empty() {
@@ -732,12 +735,7 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
         CodeQueryPlanSource::Seed(seed) => {
             let mut parts = vec![format!("{} query", pattern_summary(&seed.root))];
             if !seed.where_globs.is_empty() {
-                let globs = seed
-                    .where_globs
-                    .iter()
-                    .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let globs = path_scope_summary(&seed.where_globs);
                 parts.push(format!("where {globs}"));
             }
             if !seed.languages.is_empty() {
@@ -763,12 +761,7 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
         CodeQueryPlanSource::Occurrences(seed) => {
             let mut parts = vec!["occurrence query".to_string()];
             if !seed.where_globs.is_empty() {
-                let globs = seed
-                    .where_globs
-                    .iter()
-                    .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let globs = path_scope_summary(&seed.where_globs);
                 parts.push(format!("where {globs}"));
             }
             if !seed.languages.is_empty() {
@@ -1056,14 +1049,15 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     let path = sanitize_terminal_text(&value.path);
                     let id = sanitize_terminal_text(&value.id);
                     out.push_str(&format!(
-                        "{}:{}:{}\n  {} {} {} ({})\n",
+                        "{}:{}:{}\n  {} {} {} (proof={}; completeness={})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
                         value.range.start_line,
                         value.range.start_column,
                         paint(Style::new().fg(Color::Blue), "procedure:", use_color),
                         value.procedure_kind,
                         paint(Style::new().bold(), &id, use_color),
-                        value.evidence.status_label(),
+                        value.evidence.proof.label(),
+                        value.evidence.completeness.label(),
                     ));
                 }
                 CodeQueryResultValue::ProgramPoint { value } => {
@@ -1073,14 +1067,15 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         .boundary
                         .map_or("interior", |boundary| boundary.label());
                     out.push_str(&format!(
-                        "{}:{}:{}\n  {} {} {} ({}; {} event{})\n",
+                        "{}:{}:{}\n  {} {} {} (proof={}; completeness={}; {} event{})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
                         value.range.start_line,
                         value.range.start_column,
                         paint(Style::new().fg(Color::Blue), "program point:", use_color),
                         boundary,
                         paint(Style::new().bold(), &id, use_color),
-                        value.evidence.status_label(),
+                        value.evidence.proof.label(),
+                        value.evidence.completeness.label(),
                         value.event_count,
                         if value.event_count == 1 { "" } else { "s" },
                     ));
@@ -1090,7 +1085,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     let source = sanitize_terminal_text(&value.source.id);
                     let target = sanitize_terminal_text(&value.target.id);
                     out.push_str(&format!(
-                        "{}:{}:{}\n  {} {} {} -> {} ({})\n",
+                        "{}:{}:{}\n  {} {} {} -> {} (proof={}; completeness={})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
                         value.range.start_line,
                         value.range.start_column,
@@ -1098,7 +1093,8 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.edge_kind,
                         paint(Style::new().bold(), &source, use_color),
                         paint(Style::new().bold(), &target, use_color),
-                        value.evidence.status_label(),
+                        value.evidence.proof.label(),
+                        value.evidence.completeness.label(),
                     ));
                 }
                 CodeQueryResultValue::TypestateFinding { value } => {
@@ -1241,7 +1237,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     let path = sanitize_terminal_text(&value.path);
                     let id = sanitize_terminal_text(&value.id);
                     out.push_str(&format!(
-                        "{}:{}:{}\n  {} {} ({:?}; {:?}; {:?}{})\n",
+                        "{}:{}:{}\n  {} {} ({:?}; {:?}; {}{})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
                         value.range.start_line,
                         value.range.start_column,
@@ -1249,7 +1245,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         paint(Style::new().bold(), &id, use_color),
                         value.reachability,
                         value.certainty,
-                        value.completion,
+                        value.status.label(),
                         if value.ambiguous { "; ambiguous" } else { "" },
                     ));
                 }
@@ -2526,7 +2522,10 @@ row domains."
             .map(|example| format!("  {:<10} {}  {}", example.name, example.query, example.doc)),
     );
     lines.push(String::new());
-    lines.push("JSON objects are accepted too; use :json to print canonical JSON.".to_string());
+    lines.push(
+        "Author queries in RQL; use :json to generate canonical JSON for machine clients."
+            .to_string(),
+    );
     lines.join("\n")
 }
 
@@ -2847,6 +2846,23 @@ mod tests {
     }
 
     #[test]
+    fn code_query_repl_keeps_json_as_generated_output_only() {
+        let mut session = ReplSession::new();
+        session.process_line("(call)", None);
+        let (_, generated) = session.process_line(":json", None);
+        let canonical: Value = serde_json::from_str(&generated).expect("generated JSON");
+        let decoded = CodeQuery::from_json(&canonical).expect("machine decoding");
+        assert_eq!(decoded.to_canonical_json(), canonical);
+        let (_, rejected) = session.process_line(&generated, None);
+        assert!(rejected.starts_with("error:"), "{rejected}");
+        let (_, retained) = session.process_line(":json", None);
+        assert_eq!(
+            retained, generated,
+            "invalid source must not replace the current query"
+        );
+    }
+
+    #[test]
     fn code_query_repl_sanitizes_loaded_query_summary() {
         let mut session = ReplSession::new();
         let (_flow, output) =
@@ -3107,8 +3123,10 @@ mod tests {
     #[test]
     fn code_query_repl_examples_all_parse() {
         for example in EXAMPLES {
-            parse_query_input(example.query)
+            let canonical = parse_query_input(example.query)
                 .unwrap_or_else(|error| panic!("example `{}` should parse: {error}", example.name));
+            let decoded = CodeQuery::from_json(&canonical).expect("generated machine JSON");
+            assert_eq!(decoded.to_canonical_json(), canonical, "{}", example.name);
         }
     }
 

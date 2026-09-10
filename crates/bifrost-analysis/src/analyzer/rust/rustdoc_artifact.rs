@@ -9,12 +9,23 @@ use serde::Deserialize;
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+use crate::analyzer::semantic_model::csmi::{
+    CSMI_COLLECTION_FLOW_PROFILE_ID, CSMI_COLLECTION_FLOW_PROFILE_VERSION,
+    CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowEntryComponent, CsmiCollectionFlowKind,
+    CsmiCollectionFlowPayload, CsmiCollectionFlowRoot, CsmiCollectionFlowShape,
+    CsmiCollectionFlowTransfer, CsmiInputBoundaryRoot, CsmiInputLocation, CsmiInputParameterRoot,
+    CsmiInputPhase, CsmiInputReceiverRoot, CsmiOutputBoundaryRoot, CsmiOutputLocation,
+    CsmiOutputPhase, CsmiOutputReceiverRoot, CsmiParameterRootRole, CsmiParameterType,
+    CsmiParameterTypeKind, CsmiProjection, CsmiProjectionStep, CsmiReceiverRootRole,
+    CsmiTypeExpression,
+};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
-    AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
-    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
-    ProducerDiagnostic, ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature,
+    AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, CollectionFlowFact,
+    CollectionFlowsPayload, Completeness, ExactArtifact, ExternalArtifactKind,
+    ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator, MemberFact,
+    MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, ReceiverFact, RelationFact, RelationKind, Signature,
     SuppressedDiagnostics, TypeFact, TypeIdentity, TypeKind, TypeRef, TypeRefReferenceKind,
     Visibility, WildcardVariance, admit_into_full_diagnostics, member_declaration_id,
     read_exact_artifact_while, type_declaration_id,
@@ -23,6 +34,8 @@ use crate::hash::{HashMap, HashSet};
 
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
 const RUSTDOC_FORMAT_VERSION: u32 = 61;
+const RUST_STD_CRATE_NAME: &str = "std";
+const RUST_STD_HASHMAP_NAME: &str = "std.collections.HashMap";
 const MAX_MODEL_NAME_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_MODEL_NAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -518,6 +531,7 @@ fn merge_source_set_productions(
             },
             runtime_values: None,
             collection_flows: None,
+            deferred_yields: None,
         }],
     });
     ArtifactProduction {
@@ -894,10 +908,33 @@ fn produce_document(
         let Some(name) = item.name.as_deref() else {
             continue;
         };
-        let mut signature = member_signature(item, document, &type_ids, limits, &mut diagnostics);
-        if member_kind == MemberKind::Method
+        let has_receiver = matches!(&item.inner, ItemEnum::Function(function)
+        if function.sig.inputs.iter().any(|(name, _)| {
+            name == "self" || name.ends_with(" self")
+        }));
+        let owner_type_parameters = type_item_by_name
+            .get(&owner_name)
+            .and_then(|owner| type_position.get(owner))
+            .map(|position| types[*position].type_parameters.as_slice())
+            .unwrap_or_default();
+        let mut signature = member_signature(
+            item,
+            document,
+            &type_ids,
+            owner_type_parameters,
+            limits,
+            &mut diagnostics,
+        );
+        if has_receiver
+            && let ItemEnum::Function(function) = &item.inner
             && let Some(signature) = signature.as_mut()
         {
+            let mut raw_inputs = function.sig.inputs.iter();
+            signature.parameters.retain(|_| {
+                raw_inputs
+                    .next()
+                    .is_some_and(|(name, _)| !(name == "self" || name.ends_with(" self")))
+            });
             for parameter in &mut signature.parameters {
                 replace_self_type(
                     &mut parameter.r#type,
@@ -910,14 +947,7 @@ fn produce_document(
                 replace_self_type(returns, &owner_item_id, 0, limits.max_signature_depth);
             }
         }
-        let is_static = match &item.inner {
-            ItemEnum::Function(function) => !function
-                .sig
-                .inputs
-                .iter()
-                .any(|(name, _)| name == "self" || name.ends_with(" self")),
-            _ => true,
-        };
+        let is_static = !has_receiver;
         let parameter_types = signature
             .as_ref()
             .map(|signature| {
@@ -977,7 +1007,7 @@ fn produce_document(
             implicit_operation: None,
             callable_family_complete: false,
             signature,
-            receiver: None,
+            receiver: has_receiver.then_some(ReceiverFact { pointer: false }),
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
@@ -1341,6 +1371,7 @@ fn member_signature(
     item: &Item,
     document: &RustdocCrate,
     type_ids: &HashMap<Id, String>,
+    owner_type_parameters: &[String],
     limits: &ArtifactProducerLimits,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<Signature> {
@@ -1352,17 +1383,29 @@ fn member_signature(
                 .iter()
                 .map(|(name, ty)| Parameter {
                     name: rust_parameter_name(name),
-                    r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
+                    r#type: member_type_ref(
+                        ty,
+                        document,
+                        type_ids,
+                        owner_type_parameters,
+                        limits,
+                        diagnostics,
+                    ),
                     optional: false,
                     variadic: false,
                     passing_mode: Default::default(),
                 })
                 .collect(),
-            function
-                .sig
-                .output
-                .as_ref()
-                .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, 0)),
+            function.sig.output.as_ref().map(|ty| {
+                member_type_ref(
+                    ty,
+                    document,
+                    type_ids,
+                    owner_type_parameters,
+                    limits,
+                    diagnostics,
+                )
+            }),
             generic_names(&function.generics),
         ),
         ItemEnum::StructField(ty)
@@ -1422,6 +1465,24 @@ fn member_signature(
         parameters,
         returns,
     })
+}
+
+fn member_type_ref(
+    ty: &Type,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    owner_type_parameters: &[String],
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> TypeRef {
+    if let Type::Generic(name) = ty
+        && owner_type_parameters
+            .iter()
+            .any(|parameter| parameter == name)
+    {
+        return TypeRef::TypeParameter { name: name.clone() };
+    }
+    rust_type_ref(ty, document, type_ids, limits, diagnostics, 0)
 }
 
 fn replace_self_type(ty: &mut TypeRef, owner: &str, depth: usize, max_depth: usize) {
@@ -2126,6 +2187,7 @@ fn finish(
     } else {
         Completeness::Partial
     };
+    let collection_flows = collection_flow_facts(&types, &members);
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack: Some(AuthoredSemanticModelPack {
@@ -2154,13 +2216,169 @@ fn finish(
                     relations,
                 },
                 runtime_values: None,
-                collection_flows: None,
+                collection_flows,
+                deferred_yields: None,
             }],
         }),
         completeness,
         diagnostics,
         suppressed_diagnostics,
     }
+}
+
+fn collection_flow_facts(
+    types: &[TypeFact],
+    members: &[MemberFact],
+) -> Option<CollectionFlowsPayload> {
+    let map = types.iter().find(|fact| {
+        fact.name == RUST_STD_HASHMAP_NAME
+            && fact.type_kind == TypeKind::Struct
+            && fact.type_parameters.as_slice() == ["K", "V"]
+    })?;
+    let keyed_shape = CsmiCollectionFlowShape::Keyed {
+        key: Box::new(parameter_shape("type-parameter.K")),
+        value: Box::new(parameter_shape("type-parameter.V")),
+        entry_components: Some(vec![
+            CsmiCollectionFlowEntryComponent::Key,
+            CsmiCollectionFlowEntryComponent::Value,
+        ]),
+    };
+    let mut flows = Vec::new();
+    for member in members.iter().filter(|member| {
+        member.owner == map.id
+            && member.member_kind == MemberKind::Method
+            && !member.is_static
+            && member.signature.is_some()
+    }) {
+        let signature = member.signature.as_ref()?;
+        let arguments = &signature.parameters;
+        let payload = match member.name.as_str() {
+            "insert"
+                if arguments.len() == 2
+                    && is_type_parameter(&arguments[0].r#type, "K")
+                    && is_type_parameter(&arguments[1].r#type, "V") =>
+            {
+                hashmap_insert_flow(member, keyed_shape.clone())
+            }
+            _ => continue,
+        };
+        flows.push(CollectionFlowFact {
+            callable: member.id.clone(),
+            payload,
+            coverage: Some(Completeness::Complete),
+            provenance: vec![format!(
+                "rustdoc:{RUST_STD_CRATE_NAME}:{RUST_STD_HASHMAP_NAME}"
+            )],
+        });
+    }
+    flows.sort_unstable_by(|left, right| left.callable.cmp(&right.callable));
+    (!flows.is_empty()).then_some(CollectionFlowsPayload { flows })
+}
+
+fn parameter_shape(symbol: &str) -> CsmiCollectionFlowShape {
+    CsmiCollectionFlowShape::Value {
+        r#type: CsmiTypeExpression::Parameter(CsmiParameterType {
+            kind: CsmiParameterTypeKind::Parameter,
+            symbol: symbol.to_owned(),
+        }),
+    }
+}
+
+fn input_receiver_root() -> CsmiInputBoundaryRoot {
+    CsmiInputBoundaryRoot::Receiver(CsmiInputReceiverRoot {
+        phase: CsmiInputPhase::Input,
+        role: CsmiReceiverRootRole::Receiver,
+    })
+}
+
+fn output_receiver_root() -> CsmiOutputBoundaryRoot {
+    CsmiOutputBoundaryRoot::Receiver(CsmiOutputReceiverRoot {
+        phase: CsmiOutputPhase::Output,
+        role: CsmiReceiverRootRole::Receiver,
+    })
+}
+
+fn input_parameter(position: u32) -> CsmiInputBoundaryRoot {
+    CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot {
+        phase: CsmiInputPhase::Input,
+        role: CsmiParameterRootRole::Parameter,
+        position,
+    })
+}
+
+fn entry_projection(parameter_position: u32) -> CsmiProjection {
+    CsmiProjection {
+        scheme: CSMI_COLLECTION_FLOW_PROFILE_ID.to_owned(),
+        scheme_version: CSMI_COLLECTION_FLOW_PROFILE_VERSION.to_owned(),
+        steps: vec![CsmiProjectionStep {
+            kind: "entry".to_owned(),
+            args: Some(serde_json::json!({
+                "key": {"kind": "parameter", "position": parameter_position}
+            })),
+        }],
+    }
+}
+
+fn hashmap_insert_flow(
+    member: &MemberFact,
+    receiver_shape: CsmiCollectionFlowShape,
+) -> CsmiCollectionFlowPayload {
+    let key_position = 0;
+    let mut value_projection = entry_projection(key_position);
+    value_projection.steps.push(CsmiProjectionStep {
+        kind: "entry-value".to_owned(),
+        args: None,
+    });
+    CsmiCollectionFlowPayload {
+        kind: CsmiCollectionFlowKind::CollectionFlow,
+        callable: member.id.clone(),
+        receiver_substitution: None,
+        roots: vec![
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_receiver_root()),
+                shape: receiver_shape.clone(),
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_parameter(0)),
+                shape: parameter_shape("type-parameter.K"),
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Input(input_parameter(1)),
+                shape: parameter_shape("type-parameter.V"),
+            },
+            CsmiCollectionFlowRoot {
+                root: CsmiCollectionFlowBoundaryRoot::Output(output_receiver_root()),
+                shape: receiver_shape,
+            },
+        ],
+        transfers: vec![
+            CsmiCollectionFlowTransfer {
+                source: CsmiInputLocation {
+                    root: input_parameter(0),
+                    projection: None,
+                },
+                destination: CsmiOutputLocation {
+                    root: output_receiver_root(),
+                    projection: Some(entry_projection(key_position)),
+                },
+            },
+            CsmiCollectionFlowTransfer {
+                source: CsmiInputLocation {
+                    root: input_parameter(1),
+                    projection: None,
+                },
+                destination: CsmiOutputLocation {
+                    root: output_receiver_root(),
+                    projection: Some(value_projection),
+                },
+            },
+        ],
+        invocations: Vec::new(),
+    }
+}
+
+fn is_type_parameter(ty: &TypeRef, parameter: &str) -> bool {
+    matches!(ty, TypeRef::TypeParameter { name } if name == parameter)
 }
 
 fn failed(
@@ -2246,6 +2464,321 @@ mod tests {
             has_body: true,
             default_unstable: None,
         }
+    }
+
+    fn typed_path(id: Id, path: &str, arguments: Vec<Type>) -> Type {
+        Type::ResolvedPath(RustdocPath {
+            path: path.to_owned(),
+            id,
+            args: Some(Box::new(GenericArgs::AngleBracketed {
+                args: arguments.into_iter().map(GenericArg::Type).collect(),
+                constraints: Vec::new(),
+            })),
+        })
+    }
+
+    fn rust_generic(name: &str) -> GenericParamDef {
+        GenericParamDef {
+            name: name.to_owned(),
+            kind: GenericParamDefKind::Type {
+                bounds: Vec::new(),
+                default: None,
+                is_synthetic: false,
+            },
+        }
+    }
+
+    fn hashmap_document(crate_name: &str) -> RustdocCrate {
+        let key = Type::Generic("K".to_owned());
+        let value = Type::Generic("V".to_owned());
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            Id(0),
+            item(
+                0,
+                Some(crate_name),
+                RustVisibility::Default,
+                ItemEnum::Module(Module {
+                    is_crate: true,
+                    items: vec![Id(1)],
+                    is_stripped: false,
+                }),
+            ),
+        );
+        index.insert(
+            Id(1),
+            item(
+                1,
+                Some("HashMap"),
+                RustVisibility::Public,
+                ItemEnum::Struct(Struct {
+                    kind: StructKind::Unit,
+                    generics: Generics {
+                        params: vec![rust_generic("K"), rust_generic("V")],
+                        where_predicates: Vec::new(),
+                    },
+                    impls: vec![Id(2)],
+                }),
+            ),
+        );
+        index.insert(
+            Id(2),
+            item(
+                2,
+                None,
+                RustVisibility::Default,
+                ItemEnum::Impl(Impl {
+                    is_unsafe: false,
+                    generics: Generics {
+                        params: vec![rust_generic("K"), rust_generic("V")],
+                        where_predicates: Vec::new(),
+                    },
+                    provided_trait_methods: Vec::new(),
+                    trait_: None,
+                    for_: typed_path(
+                        Id(1),
+                        &format!("{crate_name}::collections::HashMap"),
+                        vec![key.clone(), value.clone()],
+                    ),
+                    items: vec![Id(3), Id(4), Id(5)],
+                    is_negative: false,
+                    is_synthetic: false,
+                    blanket_impl: None,
+                }),
+            ),
+        );
+        index.insert(
+            Id(3),
+            item(
+                3,
+                Some("insert"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(
+                    vec![
+                        ("self".to_owned(), Type::Generic("Self".to_owned())),
+                        ("key".to_owned(), key.clone()),
+                        ("value".to_owned(), value.clone()),
+                    ],
+                    Some(typed_path(
+                        Id(100),
+                        &format!("{crate_name}::option::Option"),
+                        vec![value.clone()],
+                    )),
+                    generics(),
+                )),
+            ),
+        );
+        index.insert(
+            Id(4),
+            item(
+                4,
+                Some("get"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(
+                    vec![
+                        ("self".to_owned(), Type::Generic("Self".to_owned())),
+                        (
+                            "key".to_owned(),
+                            Type::BorrowedRef {
+                                lifetime: None,
+                                is_mutable: false,
+                                type_: Box::new(key.clone()),
+                            },
+                        ),
+                    ],
+                    Some(typed_path(
+                        Id(100),
+                        &format!("{crate_name}::option::Option"),
+                        vec![Type::BorrowedRef {
+                            lifetime: None,
+                            is_mutable: false,
+                            type_: Box::new(value.clone()),
+                        }],
+                    )),
+                    generics(),
+                )),
+            ),
+        );
+        index.insert(
+            Id(5),
+            item(
+                5,
+                Some("get_mut"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(
+                    vec![
+                        ("self".to_owned(), Type::Generic("Self".to_owned())),
+                        (
+                            "key".to_owned(),
+                            Type::BorrowedRef {
+                                lifetime: None,
+                                is_mutable: false,
+                                type_: Box::new(key),
+                            },
+                        ),
+                    ],
+                    Some(typed_path(
+                        Id(100),
+                        &format!("{crate_name}::option::Option"),
+                        vec![Type::BorrowedRef {
+                            lifetime: None,
+                            is_mutable: true,
+                            type_: Box::new(value),
+                        }],
+                    )),
+                    generics(),
+                )),
+            ),
+        );
+        let paths = [1, 3, 4, 5]
+            .into_iter()
+            .zip([
+                &format!("{crate_name}::collections::HashMap"),
+                &format!("{crate_name}::collections::HashMap::insert"),
+                &format!("{crate_name}::collections::HashMap::get"),
+                &format!("{crate_name}::collections::HashMap::get_mut"),
+            ])
+            .map(|(id, item_path)| {
+                let kind = if id == 1 {
+                    ItemKind::Struct
+                } else {
+                    ItemKind::Function
+                };
+                (
+                    Id(id),
+                    ItemSummary {
+                        crate_id: 0,
+                        path: item_path.split("::").map(str::to_owned).collect(),
+                        kind,
+                    },
+                )
+            })
+            .collect();
+        RustdocCrate {
+            root: Id(0),
+            crate_version: Some("1.0.0".to_owned()),
+            includes_private: false,
+            index,
+            paths,
+            external_crates: std::collections::HashMap::new(),
+            target: Target {
+                triple: "x86_64-unknown-linux-gnu".to_owned(),
+                target_features: Vec::new(),
+            },
+            format_version: RUSTDOC_FORMAT_VERSION,
+        }
+    }
+
+    fn hashmap_request(path: std::path::PathBuf, crate_name: &str) -> ArtifactProductionRequest {
+        let mut request = request(path);
+        request.pack_id = format!("cargo.{crate_name}");
+        request.activation[0].package = Some(NameSelector {
+            name: crate_name.to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        request
+    }
+
+    fn hashmap_production() -> ArtifactProduction {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&hashmap_document("std")).unwrap(),
+        )
+        .unwrap();
+        produce(
+            &hashmap_request(file.path().to_path_buf(), "std"),
+            &ArtifactProducerLimits::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn rustdoc_produces_exact_std_hashmap_collection_flows() {
+        let production = hashmap_production();
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production.pack.expect("std rustdoc produces a pack");
+        let (types, members) = match &pack.shards[0].payload {
+            AuthoredPayload::DeclarationFacts { types, members, .. } => (types, members),
+            _ => panic!("Rust rustdoc produces declarations"),
+        };
+        let flows = pack.shards[0].collection_flows.as_ref().unwrap_or_else(|| {
+            panic!("std HashMap has collection flows; types={types:#?}; members={members:#?}")
+        });
+        assert_eq!(flows.flows.len(), 1);
+        let flow = |name: &str| {
+            let member = members
+                .iter()
+                .find(|member| member.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            flows
+                .flows
+                .iter()
+                .find(|flow| flow.callable == member.id)
+                .unwrap_or_else(|| panic!("missing flow for {name}"))
+        };
+        let insert_member = members
+            .iter()
+            .find(|member| member.name == "insert")
+            .expect("missing insert member");
+        let insert = flow("insert");
+        assert_eq!(insert.payload.transfers.len(), 2);
+        assert!(insert_member.receiver.is_some());
+        assert_eq!(
+            insert_member.signature.as_ref().unwrap().parameters.len(),
+            2
+        );
+        assert!(matches!(
+            &insert_member.signature.as_ref().unwrap().parameters[0].r#type,
+            TypeRef::TypeParameter { name } if name == "K"
+        ));
+        assert!(matches!(
+            insert.payload.transfers[0].source.root,
+            CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot { position: 0, .. })
+        ));
+        assert!(matches!(
+            insert.payload.transfers[1].source.root,
+            CsmiInputBoundaryRoot::Parameter(CsmiInputParameterRoot { position: 1, .. })
+        ));
+        assert!(matches!(
+            insert.payload.transfers[0].destination.root,
+            CsmiOutputBoundaryRoot::Receiver(_)
+        ));
+        assert!(
+            insert.payload.transfers[0]
+                .destination
+                .projection
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .any(|step| step.kind == "entry")
+        );
+        assert!(!flows.flows.iter().any(|flow| {
+            members
+                .iter()
+                .filter(|member| matches!(member.name.as_str(), "get" | "get_mut"))
+                .any(|member| flow.callable == member.id)
+        }));
+    }
+
+    #[test]
+    fn non_std_hashmap_does_not_inherit_std_flows() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&hashmap_document("notstd")).unwrap(),
+        )
+        .unwrap();
+        let production = produce(
+            &hashmap_request(file.path().to_path_buf(), "notstd"),
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        let pack = production
+            .pack
+            .expect("non-std rustdoc produces declarations");
+        assert!(pack.shards[0].collection_flows.is_none());
     }
 
     fn document(blanket_impl: bool) -> RustdocCrate {

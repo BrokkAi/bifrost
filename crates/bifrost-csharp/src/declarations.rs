@@ -1642,3 +1642,84 @@ public enum Colour { Red }
         );
     }
 }
+
+#[cfg(test)]
+mod grammar_regression_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn static_local_function_preserves_declaration_and_following_call() {
+        let source = "class Example { void Run() { static void Local(int value) {} Local(1); } }";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let class = tree.root_node().named_child(0).expect("class");
+        let members = class.child_by_field_name("body").expect("class body");
+        let method = members.named_child(0).expect("method");
+        let body = method.child_by_field_name("body").expect("method body");
+        assert_eq!(body.named_child_count(), 2);
+        let local = body.named_child(0).expect("local function");
+        assert_eq!(local.kind(), "local_function_statement");
+        let name = local.child_by_field_name("name").expect("declaration name");
+        assert_eq!(name.utf8_text(source.as_bytes()).unwrap(), "Local");
+        let statement = body.named_child(1).expect("following statement");
+        let call = statement.named_child(0).expect("following call");
+        assert_eq!(call.kind(), "invocation_expression");
+        let function = call.child_by_field_name("function").expect("call target");
+        assert_eq!(function.utf8_text(source.as_bytes()).unwrap(), "Local");
+    }
+
+    /// C# permits `async` as an identifier outside modifier positions. A parser
+    /// recovery at the invocation used to swallow the following member (#3073).
+    #[test]
+    fn contextual_async_argument_preserves_following_members() {
+        let source = r#"readonly struct ArrayConverterCore {
+    int F(params object[] xs) => 0;
+    int Write(bool async, int ct) {
+        F(async, ct).ToString();
+        return 0;
+    }
+    int After() => 1;
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "published Brokk grammar must parse without recovery:\n{}",
+            tree.root_node().to_sexp()
+        );
+
+        let file = ProjectFile::new(
+            std::env::current_dir().expect("test working directory must be available"),
+            "ArrayConverterCore.cs",
+        );
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let mut declarations = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.short_name().to_string())
+            .collect::<Vec<_>>();
+        declarations.sort();
+        assert_eq!(
+            declarations,
+            [
+                "ArrayConverterCore",
+                "ArrayConverterCore.After",
+                "ArrayConverterCore.F",
+                "ArrayConverterCore.Write",
+            ]
+        );
+    }
+}

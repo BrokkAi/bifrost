@@ -173,6 +173,7 @@ impl TaintQueryState {
             branch: Vec::new(),
             language: "all",
             message,
+            exhausted_roots: Vec::new(),
         });
     }
 }

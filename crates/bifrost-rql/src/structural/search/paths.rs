@@ -117,6 +117,7 @@ impl PathTraversalCache {
                         language.config_label(),
                         axis.label()
                     ),
+                    exhausted_roots: Vec::new(),
                 });
                 continue;
             }
@@ -139,6 +140,7 @@ impl PathTraversalCache {
                         .join(", "),
                     axis.label()
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
     }

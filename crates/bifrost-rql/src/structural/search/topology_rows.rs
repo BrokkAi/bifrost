@@ -157,6 +157,7 @@ impl TopologyTraversalCache {
             // sources.
             language: Language::None.config_label(),
             message,
+            exhausted_roots: Vec::new(),
         });
     }
 }

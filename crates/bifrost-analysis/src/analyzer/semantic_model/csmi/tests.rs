@@ -1165,6 +1165,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
         },
         runtime_values: None,
         collection_flows: None,
+        deferred_yields: None,
     });
     pack
 }

@@ -598,6 +598,8 @@ fn validate_wrapper(
             validate_call_wrapper(form, args, query, analysis)
         }
         RqlForm::CallInput => validate_call_input_wrapper(args, query, analysis),
+        RqlForm::ResolvedCall => validate_resolved_call_wrapper(args, query, path, analysis),
+        RqlForm::CallArgument => validate_call_argument_wrapper(args, query, path, analysis),
         RqlForm::JsxAttributeValue => validate_jsx_attribute_value_wrapper(args, query, analysis),
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             validate_receiver_wrapper(form, args, query, analysis)
@@ -1482,6 +1484,213 @@ fn validate_call_input_wrapper(args: &[Expr], query: &Expr, analysis: &mut Analy
     }
 }
 
+fn validate_resolved_call_wrapper(
+    args: &[Expr],
+    query: &Expr,
+    path: &str,
+    analysis: &mut Analysis,
+) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if options.len() < 4 || !options.len().is_multiple_of(2) {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "resolved-call expects :resolves-to, :proof, an optional :receiver-type, and a query",
+        );
+        return;
+    }
+    let steps = query_to_json(query)
+        .ok()
+        .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+        .unwrap_or(0);
+    let step_path = format!("{}[{steps}]", rql_query_child_path(path, "steps"));
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "resolved-call option names must be keywords",
+            );
+            continue;
+        };
+        let Some(option) = QueryStepOp::ResolvedCall.option_for_rql_label(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "resolved-call accepts only :resolves-to, :proof, and :receiver-type",
+            );
+            continue;
+        };
+        if !seen.insert(option.field()) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate resolved-call option {label}"),
+            );
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            option.field().signature(),
+            option.field().description(),
+        );
+        analysis.path(
+            format!("{step_path}.{}", option.field().label()),
+            pair[1].range.clone(),
+        );
+        match option.field() {
+            QueryStepField::ResolvesTo => {
+                let valid = match &pair[1].kind {
+                    ExprKind::String(value) | ExprKind::Symbol(value) => {
+                        !value.is_empty() && value.len() <= MAX_STRING_PREDICATE_LENGTH
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "call identity must be a non-empty bounded stable symbol or quoted qualified locator",
+                    );
+                }
+            }
+            QueryStepField::ReceiverType => match &pair[1].kind {
+                ExprKind::String(value) | ExprKind::Symbol(value)
+                    if !value.is_empty() && value.len() <= MAX_STRING_PREDICATE_LENGTH => {}
+                ExprKind::List(items) if items.len() == 2 => {
+                    let form = items[0]
+                        .as_symbol()
+                        .and_then(ReceiverTypeConstraintForm::from_rql_label);
+                    if let Some(form) = form {
+                        analysis.add_help(
+                            items[0].range.clone(),
+                            form.signature(),
+                            form.description(),
+                        );
+                    } else {
+                        analysis.error(
+                            items[0].range.clone(),
+                            "unknown-value",
+                            "receiver family constraint must use assignable-to",
+                        );
+                    }
+                    analysis.path(
+                        format!("{step_path}.receiver_type.assignable_to"),
+                        items[1].range.clone(),
+                    );
+                    if !matches!(
+                        &items[1].kind,
+                        ExprKind::String(value) | ExprKind::Symbol(value)
+                            if !value.is_empty()
+                                && value.len() <= MAX_STRING_PREDICATE_LENGTH
+                    ) {
+                        analysis.error(
+                            items[1].range.clone(),
+                            "wrong-value-shape",
+                            "assignable-to root must be a non-empty bounded stable symbol or quoted qualified locator",
+                        );
+                    }
+                }
+                _ => analysis.error(
+                    pair[1].range.clone(),
+                    "wrong-value-shape",
+                    "receiver type must be an exact call identity or (assignable-to identity)",
+                ),
+            },
+            QueryStepField::CallProof => {
+                if !matches!(pair[1].as_symbol(), Some("exact" | "declared")) {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "resolved-call proof must be exact or declared",
+                    );
+                }
+            }
+            _ => unreachable!("resolved-call registry contains only its three options"),
+        }
+    }
+    for required in [QueryStepField::ResolvesTo, QueryStepField::CallProof] {
+        if !seen.contains(&required) {
+            analysis.error(
+                query.range.clone(),
+                "missing-property",
+                format!("resolved-call requires {}", required.signature()),
+            );
+        }
+    }
+}
+
+fn validate_call_argument_wrapper(
+    args: &[Expr],
+    query: &Expr,
+    path: &str,
+    analysis: &mut Analysis,
+) {
+    if args.len() != 3 {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "call-argument expects one formal selector followed by a query",
+        );
+        return;
+    }
+    let Some(label) = args[0].as_symbol() else {
+        analysis.error(
+            args[0].range.clone(),
+            "unknown-property",
+            "call-argument selector must be a keyword",
+        );
+        return;
+    };
+    let Some(option) = QueryStepOp::CallArgument.option_for_rql_label(label) else {
+        analysis.error(
+            args[0].range.clone(),
+            "unknown-property",
+            "call-argument requires :formal-name or :formal-index",
+        );
+        return;
+    };
+    let steps = query_to_json(query)
+        .ok()
+        .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+        .unwrap_or(0);
+    analysis.path(
+        format!(
+            "{}[{steps}].{}",
+            rql_query_child_path(path, "steps"),
+            option.field().label()
+        ),
+        args[1].range.clone(),
+    );
+    analysis.add_help(
+        args[0].range.clone(),
+        option.field().signature(),
+        option.field().description(),
+    );
+    match option.field() {
+        QueryStepField::FormalName => match &args[1].kind {
+            ExprKind::String(name) | ExprKind::Symbol(name) => {
+                validate_parameter_name(name, args[1].range.clone(), analysis);
+            }
+            _ => analysis.error(
+                args[1].range.clone(),
+                "wrong-value-shape",
+                "formal name must be a string or symbol",
+            ),
+        },
+        QueryStepField::FormalIndex => {
+            if !matches!(args[1].kind, ExprKind::Number(_)) {
+                analysis.error(
+                    args[1].range.clone(),
+                    "wrong-value-shape",
+                    "formal index must be a non-negative integer",
+                );
+            }
+        }
+        _ => unreachable!("call-argument registry contains only its two options"),
+    }
+}
+
 fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
     let options = &args[..args.len().saturating_sub(1)];
     if !options.len().is_multiple_of(2) {
@@ -2245,6 +2454,7 @@ fn validate_property_value(
         | super::schema::ValueShape::QueryList
         | super::schema::ValueShape::QuerySteps
         | super::schema::ValueShape::StringList
+        | super::schema::ValueShape::PathScope
         | super::schema::ValueShape::StringPredicate
         | super::schema::ValueShape::RegexPredicate
         | super::schema::ValueShape::LanguageList
@@ -2298,6 +2508,9 @@ fn validate_property_value(
         | super::schema::ValueShape::RuntimeGlobal
         | super::schema::ValueShape::RuntimeContainer
         | super::schema::ValueShape::RuntimeSourceOrigin
+        | super::schema::ValueShape::CallIdentity
+        | super::schema::ValueShape::ReceiverTypeConstraint
+        | super::schema::ValueShape::CallProof
         | super::schema::ValueShape::JsxElementIdentity => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -2644,27 +2857,19 @@ fn validate_kind_value(value: &Expr, path: &str, analysis: &mut Analysis) {
 
 fn validate_language(value: &Expr, analysis: &mut Analysis) {
     match &value.kind {
-        ExprKind::Symbol(label) => {
-            if let Some(language) = Language::from_config_label(label) {
+        ExprKind::Symbol(label) | ExprKind::String(label) => {
+            if let Some(family) = super::schema::LANGUAGE_FAMILIES
+                .iter()
+                .find(|family| family.label == label)
+            {
+                analysis.add_help(value.range.clone(), family.signature, family.description);
+            } else if let Some(language) = Language::from_config_label(label) {
                 analysis.add_help(
                     value.range.clone(),
                     language.config_label(),
                     "Restrict structural matching to this analyzer language.",
                 );
             } else {
-                add_spelling_error(
-                    analysis,
-                    value.range.clone(),
-                    "invalid-language",
-                    format!("unknown language label '{label}'"),
-                    label,
-                    language_candidates(),
-                    |suggestion| replacement_for_rql_label(value, suggestion),
-                );
-            }
-        }
-        ExprKind::String(label) => {
-            if Language::from_config_label(label).is_none() {
                 add_spelling_error(
                     analysis,
                     value.range.clone(),

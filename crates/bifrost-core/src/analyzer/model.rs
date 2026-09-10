@@ -3025,6 +3025,28 @@ impl fmt::Display for DeclarationId {
     }
 }
 
+/// Stable identity of one exact source site for a declaration.
+///
+/// A declaration can have more than one indexed range (for example a header
+/// declaration and a definition). The analyzer declaration identity names the
+/// declaration; the half-open byte span names one of its sites. Display names,
+/// source lines, and columns are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeclarationSiteId(String);
+
+impl DeclarationSiteId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DeclarationSiteId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl CodeUnit {
     /// Compute this declaration's versioned, process-independent identity.
     pub fn declaration_id(&self) -> DeclarationId {
@@ -3079,6 +3101,15 @@ impl CodeUnit {
             },
         );
         DeclarationId(format!("decl:v1:{}", lower_hex_string(&hasher.finish())))
+    }
+
+    /// Name one exact site of this declaration by its identity and byte span.
+    pub fn declaration_site_id(&self, start_byte: usize, end_byte: usize) -> DeclarationSiteId {
+        assert!(
+            start_byte <= end_byte,
+            "a declaration site must be a valid half-open byte span"
+        );
+        DeclarationSiteId(format!("{}:{start_byte}-{end_byte}", self.declaration_id()))
     }
 
     pub fn new(
@@ -5264,6 +5295,28 @@ mod declaration_id_tests {
         let type_unit = CodeUnit::from_fq(file, CodeUnitType::Class, type_tail, 1, None, false);
         assert_eq!(package_unit.fq_name(), type_unit.fq_name());
         assert_ne!(package_unit.declaration_id(), type_unit.declaration_id());
+    }
+
+    #[test]
+    fn declaration_site_id_is_the_declaration_id_plus_exact_byte_span() {
+        let unit = CodeUnit::with_signature(
+            ProjectFile::new(root("workspace"), "src/Widget.java"),
+            CodeUnitType::Function,
+            "example.Widget",
+            "run",
+            Some("(int)".to_string()),
+            false,
+        );
+        let declaration_id = unit.declaration_id();
+
+        assert_eq!(
+            unit.declaration_site_id(12, 47).as_str(),
+            format!("{declaration_id}:12-47")
+        );
+        assert_ne!(
+            unit.declaration_site_id(12, 47),
+            unit.declaration_site_id(52, 87)
+        );
     }
 }
 

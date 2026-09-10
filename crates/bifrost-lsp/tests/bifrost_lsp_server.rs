@@ -606,16 +606,12 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
         "unexpected query response: {response}"
     );
 
-    let json_response = server.request(
-        "bifrost/queryCode",
-        json!({"query": r#"{"match":{"kind":"class"}}"#}),
-    );
-    assert!(json_response["error"].is_null(), "{json_response}");
-    assert_eq!(json_response["result"]["mode"], "results");
-    assert_eq!(
-        json_response["result"]["results"].as_array().unwrap().len(),
-        2
-    );
+    let machine_query = brokk_bifrost_rql::CodeQuery::from_source("(class)")
+        .unwrap()
+        .to_canonical_json()
+        .to_string();
+    let rejected = server.request("bifrost/queryCode", json!({"query": machine_query}));
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
     let text = response["result"]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("expected text result, got {response}"));
@@ -724,7 +720,7 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     assert!(
         invalid["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("Failed to parse query source")),
+            .is_some_and(|message| message.contains("Failed to parse RQL query source")),
         "expected source parse error, got {invalid}"
     );
 }
@@ -990,7 +986,7 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
     let root = temp.path().canonicalize().expect("canonical root");
     let mut server = LspServer::start(&root);
 
-    for query in ["", "(call", "(call :callee", "{\"match\":"] {
+    for query in ["", "(call", "(call :callee"] {
         let response = server.request("bifrost/validateQuery", json!({"query": query}));
         assert_eq!(response["result"]["diagnostics"], json!([]), "{response}");
     }
@@ -1005,18 +1001,36 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
     assert_eq!(diagnostics[0]["range"]["end"]["character"], wat_utf16 + 4);
     assert_eq!(diagnostics[0]["source"], "Bifrost RQL");
 
-    let json_query = r#"{"match":{"kind":"banana","capture":3}}"#;
-    let response = server.request("bifrost/validateQuery", json!({"query": json_query}));
+    let machine_query = brokk_bifrost_rql::CodeQuery::from_source("(call)")
+        .unwrap()
+        .to_canonical_json()
+        .to_string();
+    let rejected = server.request("bifrost/validateQuery", json!({"query": machine_query}));
+    assert!(
+        !rejected["result"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{rejected}"
+    );
+    let no_json_hover = server.request(
+        "bifrost/queryHover",
+        json!({"query": machine_query, "position": {"line": 0, "character": 2}}),
+    );
+    assert!(no_json_hover["result"].is_null(), "{no_json_hover}");
+
+    let invalid_query = "(call :name 7 :capture 3)";
+    let response = server.request("bifrost/validateQuery", json!({"query": invalid_query}));
     assert_eq!(
         response["result"]["diagnostics"].as_array().unwrap().len(),
         2
     );
 
-    let malformed_json = r#"{"note":"😀","λ":1,]"#;
-    let response = server.request("bifrost/validateQuery", json!({"query": malformed_json}));
+    let malformed_rql = "(call :name \"😀\" ]";
+    let response = server.request("bifrost/validateQuery", json!({"query": malformed_rql}));
     let diagnostic = &response["result"]["diagnostics"][0];
-    let bad_byte = malformed_json.find(']').unwrap();
-    let bad_utf16 = malformed_json[..bad_byte].encode_utf16().count() as u64;
+    let bad_byte = malformed_rql.find(']').unwrap();
+    let bad_utf16 = malformed_rql[..bad_byte].encode_utf16().count() as u64;
     assert_eq!(diagnostic["range"]["start"]["character"], bad_utf16);
     assert_eq!(diagnostic["range"]["end"]["character"], bad_utf16 + 1);
 
@@ -1039,20 +1053,20 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
     );
     assert!(no_hover["result"].is_null(), "{no_hover}");
 
-    let partial_json = r#"{"match":{"kind":"#;
+    let partial_rql = "(call :callee";
     let partial_hover = server.request(
         "bifrost/queryHover",
         json!({
-            "query": partial_json,
+            "query": partial_rql,
             "position": {"line": 0, "character": 11}
         }),
     );
-    assert_eq!(partial_hover["result"]["range"]["start"]["character"], 10);
-    assert_eq!(partial_hover["result"]["range"]["end"]["character"], 16);
+    assert_eq!(partial_hover["result"]["range"]["start"]["character"], 6);
+    assert_eq!(partial_hover["result"]["range"]["end"]["character"], 13);
     assert!(
         partial_hover["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("normalized node kinds")),
+            .is_some_and(|value| value.contains("callee")),
         "{partial_hover}"
     );
 }
@@ -2370,7 +2384,7 @@ fn bifrost_lsp_server_returns_current_rql_quick_fixes() {
         "the range must use UTF-16 positions after an emoji: {actions}"
     );
 
-    let wrapping = r#"{"where":"src/**/*.rs","match":{"kind":"call"}}"#;
+    let wrapping = "(call :args (call))";
     server.notify(
         "textDocument/didChange",
         json!({

@@ -248,4 +248,77 @@ def drive(car: Car):
             );
         }
     }
+
+    /// A subscripted annotation names its outer class, never a type argument.
+    ///
+    /// `-> Generator[Result, None, None]` on a generator method used to
+    /// resolve to `Result`, so a call to it was treated as returning the
+    /// yielded class and every generator member read after it was reported
+    /// absent. Only `Optional[X]` and a union name their arguments.
+    #[test]
+    fn a_subscripted_annotation_resolves_to_its_outer_class_not_its_arguments() {
+        const PRELUDE: &str = concat!(
+            "from typing import (\n",
+            "    AsyncGenerator,\n",
+            "    Awaitable,\n",
+            "    Coroutine,\n",
+            "    Generator,\n",
+            "    Iterable,\n",
+            "    Iterator,\n",
+            "    Optional,\n",
+            "    Union,\n",
+            ")\n",
+            "\n",
+            "\n",
+            "class Result:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Other:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+            "class Box:\n",
+            "    pass\n",
+            "\n",
+            "\n",
+        );
+        for (annotation, expected) in [
+            ("Result", vec!["app.Result"]),
+            ("Optional[Result]", vec!["app.Result"]),
+            ("Union[Result, None]", vec!["app.Result"]),
+            ("Result | None", vec!["app.Result"]),
+            ("Box[Result]", vec!["app.Box"]),
+            ("Generator[Result, None, None]", vec![]),
+            ("Iterator[Result]", vec![]),
+            ("Iterable[Result]", vec![]),
+            ("AsyncGenerator[Result, None]", vec![]),
+            ("Awaitable[Result]", vec![]),
+            ("Coroutine[None, None, Result]", vec![]),
+            ("list[Result]", vec![]),
+            ("dict[str, Result]", vec![]),
+            ("Union[Result, Other]", vec![]),
+        ] {
+            let source = format!(
+                "{PRELUDE}class Client:\n    def make(self) -> {annotation}:\n        raise NotImplementedError\n\n    def caller(self):\n        return self.make()\n"
+            );
+            let start = source.rfind("make").expect("call site");
+            let result = resolve(
+                &[("app.py", source.as_str())],
+                "app.py",
+                start,
+                "make".len(),
+                INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            );
+            assert_eq!(
+                result
+                    .types
+                    .iter()
+                    .map(|ty| ty.fqn.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "-> {annotation}: {result:#?}",
+            );
+        }
+    }
 }

@@ -79,10 +79,11 @@ use brokk_bifrost_analysis::searchtools::session_subset;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
 use brokk_bifrost_rql::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, FieldWriteValueTraversal, HierarchyTraversal, PathFilter, Pattern, QueryError,
-    QueryStep, ReferenceTraversalFilter, SetOperator,
+    CallArgumentSelector, CallIdentity, CallInputSelector, CallSiteTraversalFilter,
+    CallTraversalFilter, CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQueryResultDetail, CodeQuerySeed, FieldWriteValueTraversal, HierarchyTraversal, PathFilter,
+    Pattern, QueryError, QueryStep, ReferenceTraversalFilter, ResolvedCallFilter,
+    ResolvedCallIdentityKind, ResolvedCallProof, SetOperator,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -408,22 +409,22 @@ pub use results::CodeQueryDispatchTarget;
 pub use results::CodeQueryEnumDomain;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
+pub use results::CodeQueryExhaustedCharge;
+pub use results::CodeQueryExhaustedRoot;
 pub use results::CodeQueryExport;
 pub use results::CodeQueryExpressionSite;
 pub use results::CodeQueryFieldWriteValue;
 pub use results::CodeQueryFile;
 pub use results::CodeQueryFlowCarrierSymbol;
 pub use results::CodeQueryFlowCertainty;
-pub use results::CodeQueryFlowCompletion;
 pub use results::CodeQueryFlowDeclarationSegment;
 pub use results::CodeQueryFlowEndpoint;
 pub use results::CodeQueryFlowEvent;
 pub use results::CodeQueryFlowFactSymbol;
-pub use results::CodeQueryFlowMustStatus;
 pub use results::CodeQueryFlowPortSymbol;
 pub use results::CodeQueryFlowReachability;
 pub use results::CodeQueryFlowSelectorSymbol;
-pub use results::CodeQueryFlowSolverTermination;
+pub use results::CodeQueryFlowStatus;
 pub use results::CodeQueryFlowSymbolSite;
 pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
@@ -514,6 +515,7 @@ pub(crate) use results::DetailedCodeQueryProvenanceStepEvidence;
 pub use results::DetailedCodeQueryResult;
 pub(crate) use results::UnionExecutionStrategy;
 pub use results::code_query_completion;
+pub use results::render_exhausted_roots;
 pub use results::{CodeQueryFlowRelation, CodeQueryStateEvent, CodeQueryStateEventRef};
 pub use results::{CodeQueryRewritePath, CodeQueryRewriteStep};
 
@@ -643,31 +645,14 @@ impl DeclarationValue {
             .unwrap_or_else(|| self.unit.kind().display_lowercase())
     }
 
-    /// The label a *stable declaration id* carries.
-    ///
-    /// One declaration has to have one identity on every route that reaches
-    /// it, because cross-domain joins are stated over that identity: #1478
-    /// Milestone 3 documents an applicability row's `candidate_id` as joining
-    /// to the `callable_signature` row's `declaration_id` of the very callable
-    /// it judged, and one side of that join arrives from a resolver trace while
-    /// the other arrives from a declaration seed.
-    ///
-    /// [`Self::kind_label`] cannot serve that purpose. It refines only where a
-    /// seed's own span matched the declaration exactly, so it answers `method`
-    /// for a declaration a `(method ...)` seed reached and `function` for the
-    /// same declaration reached from a trace candidate or an enclosing-decl
-    /// projection, and a join over the two matches nothing.
-    ///
-    /// This derivation reads the declaration instead of the route that found
-    /// it: `CodeUnitType` coarsens every callable to `Function`, and the
-    /// declaration's own owner segment recovers the member leaf that coarsening
-    /// erased, so every route agrees on one label for one declaration.
-    fn identity_kind_label(&self) -> &'static str {
-        if self.unit.is_callable() && self.unit.owner_is_type_scope() {
-            NormalizedKind::Method.label()
-        } else {
-            self.unit.kind().display_lowercase()
-        }
+    fn declaration_id(&self) -> String {
+        self.unit.declaration_id().to_string()
+    }
+
+    fn site_id(&self) -> String {
+        self.unit
+            .declaration_site_id(self.range.start_byte, self.range.end_byte)
+            .to_string()
     }
 }
 
@@ -3766,6 +3751,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
             branch: Vec::new(),
             language: "workspace",
             message: "workspace content changed after structural posting selection; retry the query for a coherent snapshot".to_string(),
+        exhausted_roots: Vec::new(),
         });
     }
     if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
@@ -3871,6 +3857,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
                 branch: Vec::new(),
                 language: "workspace",
                 message: "source generation changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
+            exhausted_roots: Vec::new(),
             });
         }
     }
@@ -3917,7 +3904,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         session_subset: session_subset(analyzer),
         diagnostics,
     };
-    result.cap_flow_completion_by_run();
+    result.cap_flow_status_by_run();
     let detailed = DetailedCodeQueryResult {
         result,
         work,
@@ -4172,7 +4159,6 @@ fn detailed_evidence_for_pipeline_value(
         }
         PipelineValue::Declaration(declaration) => {
             let file = declaration.unit.source().clone();
-            let path = rel_path_string(&file);
             let kind = declaration.kind_label();
             let fq_name = declaration.unit.fq_name();
             let byte_span = range_byte_span(declaration.range);
@@ -4182,12 +4168,7 @@ fn detailed_evidence_for_pipeline_value(
                 key: DetailedCodeQueryKey::Declaration {
                     kind: kind.to_string(),
                     fq_name: fq_name.clone(),
-                    analyzer_id: Some(declaration_id(
-                        &path,
-                        declaration.identity_kind_label(),
-                        &fq_name,
-                        declaration.range,
-                    )),
+                    analyzer_id: Some(declaration.declaration_id()),
                 },
                 file: file.clone(),
                 source_slice_sha256: retained_source
@@ -4229,19 +4210,13 @@ fn detailed_evidence_for_pipeline_value(
             runtime_keyed_read: None,
         },
         PipelineValue::ReferenceSite(site) => {
-            let target_path = rel_path_string(site.target.unit.source());
             let target_fq_name = site.target.unit.fq_name();
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
                 result_index,
                 domain: DetailedCodeQueryDomain::ReferenceSite,
                 key: DetailedCodeQueryKey::ReferenceSite {
-                    target_id: Some(declaration_id(
-                        &target_path,
-                        site.target.identity_kind_label(),
-                        &target_fq_name,
-                        site.target.range,
-                    )),
+                    target_id: Some(site.target.declaration_id()),
                     target_fq_name,
                 },
                 file: site.file.clone(),
@@ -4712,6 +4687,7 @@ fn detailed_evidence_for_pipeline_value(
                 key: DetailedCodeQueryKey::ProcedureEffect {
                     id: row.id.clone(),
                     procedure_id: row.procedure_declaration_id.clone(),
+                    site_id: value.subject.declaration.site_id(),
                 },
                 file: value.file().clone(),
                 source_slice_sha256: None,
@@ -4728,7 +4704,8 @@ fn detailed_evidence_for_pipeline_value(
             domain: DetailedCodeQueryDomain::CallableSignature,
             key: DetailedCodeQueryKey::CallableSignature {
                 id: value.report.signature.id.clone(),
-                declaration_id: callable_signature::declaration_site_id(&value.declaration),
+                declaration_id: value.declaration.declaration_id(),
+                site_id: value.declaration.site_id(),
             },
             file: value.file().clone(),
             source_slice_sha256: None,
@@ -5309,7 +5286,7 @@ fn detailed_semantic_evidence(
     wire_id: String,
     retained_source: Option<&str>,
 ) -> DetailedCodeQueryEvidence {
-    let candidate = CodeQueryStableOwnerCandidate {
+    let candidate = CodeQueryStableOwnerCandidate::Derived {
         namespace: language.to_string(),
         derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
         semantic_key: wire_id,
@@ -5477,6 +5454,7 @@ fn retain_held_source_snapshot(
                 "conflicting analyzer-generation source snapshots for {} prevent exact result evidence",
                 rel_path_string(file)
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     true
@@ -6200,6 +6178,7 @@ fn detailed_trace_provenance_ref(
                 DetailedCodeQueryKey::ProcedureEffect {
                     id: row.id.clone(),
                     procedure_id: row.procedure_declaration_id.clone(),
+                    site_id: value.subject.declaration.site_id(),
                 },
                 value.file(),
                 value.subject.declaration.range,
@@ -6324,7 +6303,8 @@ fn detailed_trace_provenance_ref(
             DetailedCodeQueryDomain::CallableSignature,
             DetailedCodeQueryKey::CallableSignature {
                 id: value.report.signature.id.clone(),
-                declaration_id: callable_signature::declaration_site_id(&value.declaration),
+                declaration_id: value.declaration.declaration_id(),
+                site_id: value.declaration.site_id(),
             },
             value.file(),
             value.declaration.range,
@@ -6553,7 +6533,7 @@ fn detailed_semantic_provenance_ref(
     wire_id: String,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
-    let candidate = CodeQueryStableOwnerCandidate {
+    let candidate = CodeQueryStableOwnerCandidate::Derived {
         namespace: language.to_string(),
         derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
         semantic_key: wire_id,
@@ -6589,7 +6569,6 @@ fn detailed_declaration_provenance_ref(
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let file = declaration.unit.source().clone();
-    let path = rel_path_string(&file);
     let kind = declaration.kind_label();
     let fq_name = declaration.unit.fq_name();
     let byte_span = range_byte_span(declaration.range);
@@ -6598,12 +6577,7 @@ fn detailed_declaration_provenance_ref(
         key: DetailedCodeQueryKey::Declaration {
             kind: kind.to_string(),
             fq_name: fq_name.clone(),
-            analyzer_id: Some(declaration_id(
-                &path,
-                declaration.identity_kind_label(),
-                &fq_name,
-                declaration.range,
-            )),
+            analyzer_id: Some(declaration.declaration_id()),
         },
         file: file.clone(),
         source_slice_sha256: cached_source_slice_sha256(cache, &file, &byte_span),
@@ -6619,18 +6593,12 @@ fn detailed_reference_provenance_ref(
     site: &ReferenceSiteValue,
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
-    let target_path = rel_path_string(site.target.unit.source());
     let target_fq_name = site.target.unit.fq_name();
     let byte_span = range_byte_span(site.range);
     DetailedCodeQueryProvenanceRefEvidence {
         domain: DetailedCodeQueryDomain::ReferenceSite,
         key: DetailedCodeQueryKey::ReferenceSite {
-            target_id: Some(declaration_id(
-                &target_path,
-                site.target.identity_kind_label(),
-                &target_fq_name,
-                site.target.range,
-            )),
+            target_id: Some(site.target.declaration_id()),
             target_fq_name,
         },
         file: site.file.clone(),
@@ -6953,17 +6921,11 @@ fn stable_identity_candidate_for_unit(unit: &CodeUnit) -> Option<CodeQueryStable
     if unit.is_synthetic() || unit.is_file_scope() || unit.is_anonymous() {
         return None;
     }
-    let kind = unit.kind().display_lowercase();
-    let mut semantic_key = format!("{kind}:{}", unit.fq_name());
-    if let Some(signature) = unit.signature() {
-        semantic_key.push_str(signature);
-    }
-    Some(CodeQueryStableOwnerCandidate {
+    Some(CodeQueryStableOwnerCandidate::Declaration {
         namespace: crate::analyzer::common::language_for_file(unit.source())
             .config_label()
             .to_string(),
-        derivation: CodeQueryStableOwnerDerivation::AnalyzerDeclarationId,
-        semantic_key,
+        id: unit.declaration_id().to_string(),
     })
 }
 
@@ -6993,7 +6955,7 @@ fn canonical_ast_candidate_for_node(
     }
     segments.reverse();
     let semantic_key = bounded_canonical_ast_key(&segments)?;
-    Some(CodeQueryStableOwnerCandidate {
+    Some(CodeQueryStableOwnerCandidate::Derived {
         namespace: seed.language.config_label().to_string(),
         derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
         semantic_key,

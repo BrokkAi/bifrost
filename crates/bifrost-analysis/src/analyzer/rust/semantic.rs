@@ -12,6 +12,7 @@ use brokk_bifrost_rust::ownership::{
     rust_dereference_operand, rust_node_is_in_unsafe_context, rust_reference_expression_value,
     rust_reference_is_mutable, rust_reference_type_referent,
 };
+use brokk_bifrost_rust::syntax::unwrap_attributes;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
@@ -21,18 +22,58 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::lowering::formal_multiplicity;
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
+use crate::analyzer::semantic_model::csmi::{
+    CsmiCollectionFlowBoundaryRoot, CsmiCollectionFlowShape, CsmiCollectionFlowSubstitution,
+    CsmiCollectionFlowTransfer, CsmiInputBoundaryRoot, CsmiOutputBoundaryRoot, CsmiProjection,
+};
+use crate::analyzer::semantic_model::{
+    CollectionFlowContract, DeferredYieldContract, SemanticModelCallApplication,
+    SemanticModelCallableKey, SemanticModelOverlay, SemanticModelOverlayDisposition,
+};
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, RustAnalyzer};
+use crate::analyzer::{DispatchExtensibility, IAnalyzer, Language, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v10";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v12";
 const RUST_REPEAT_ARRAY_ELEMENT_CAP: u128 = 1024;
+/// Bound on the reference levels peeled from a method receiver while
+/// recovering the written type the call auto-derefs through. Real receiver
+/// chains are short, and the bound keeps a pathological chain from walking
+/// unbounded.
+const RUST_RECEIVER_DEREFERENCE_BOUND: usize = 8;
+/// Bound on the parentheses and borrows peeled from a keyed call's key
+/// argument while recovering the place whose value names the key.
+const RUST_KEY_PLACE_UNWRAP_BOUND: usize = 8;
 
-impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
+impl_program_semantics_provider!(RustAnalyzer, |analyzer| RustSemanticLowerer::new(analyzer));
 
-struct RustSemanticLowerer;
+struct RustSemanticLowerer {
+    dependencies: DependencyFingerprint,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+}
+
+impl RustSemanticLowerer {
+    fn new(analyzer: &RustAnalyzer) -> Self {
+        let snapshot = analyzer.active_semantic_model_snapshot();
+        let dependencies = snapshot.as_ref().map_or_else(
+            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            |snapshot| {
+                let mut identity = b"rust-semantic-model-set-v1\0".to_vec();
+                identity
+                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
+                DependencyFingerprint::hash_bytes(&identity)
+            },
+        );
+        Self {
+            dependencies,
+            semantic_model_overlay: snapshot
+                .and_then(|snapshot| snapshot.semantic_model_overlay().cloned()),
+        }
+    }
+}
 
 impl ProgramSemanticsLowerer for RustSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -42,7 +83,7 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"rust-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies: self.dependencies,
         }
     }
 
@@ -85,6 +126,7 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
         // about its own functions' return types, its struct declarations, and
         // which of those structs run no destructor.
         let facts = rust_file_facts(prepared);
+        let semantic_model_overlay = self.semantic_model_overlay.clone();
 
         lower_procedure_batch(
             &specs,
@@ -99,6 +141,7 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
                     spec,
                     staged_budget,
                     cancellation,
+                    semantic_model_overlay.clone(),
                 )
             },
         )
@@ -592,6 +635,7 @@ struct LoweringContext<'tree, 'targets> {
     parameter_cleanup_required: bool,
     receiver: Option<ValueId>,
     next_cleanup_region: usize,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
 }
 
 /// The shape a value provably holds, as far as one file can state it.
@@ -638,6 +682,7 @@ fn lower_procedure<'tree>(
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), RustLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -673,6 +718,7 @@ fn lower_procedure<'tree>(
         parameter_cleanup_required: rust_parameters_may_require_drop(spec.callable),
         receiver: None,
         next_cleanup_region: 0,
+        semantic_model_overlay,
     };
     context.emit_procedure_inputs(&mut builder, spec.callable)?;
     let body_scope = if context.parameter_cleanup_required {
@@ -1045,6 +1091,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn binding_value(&self, node: Node<'_>) -> Option<ValueId> {
+        let node = unwrap_attributes(node);
         let name = node_text(self.source, node)?;
         match node.kind() {
             "self" => self.receiver,
@@ -1066,6 +1113,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut current = node;
         let mut operations = Vec::new();
         let mut ty = loop {
+            current = unwrap_attributes(current);
             match current.kind() {
                 "parenthesized_expression" => current = first_named_child(current)?,
                 "identifier" | "self" => {
@@ -1135,6 +1183,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn expression_ownership(&self, node: Node<'tree>) -> RustOwnershipClass {
+        let node = unwrap_attributes(node);
         if let Some(ty) = self.expression_type(node) {
             return match ty {
                 RustValueType::Declared(ty) => self.ownership.classify_type(ty),
@@ -1324,6 +1373,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn transfer_source_value(&self, node: Node<'tree>) -> Option<ValueId> {
         let mut current = node;
         loop {
+            current = unwrap_attributes(current);
             match current.kind() {
                 "parenthesized_expression" => current = first_named_child(current)?,
                 "identifier" | "self" => return self.binding_value(current),
@@ -1449,6 +1499,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut selectors = Vec::new();
         let mut current = node;
         let root = loop {
+            current = unwrap_attributes(current);
             match current.kind() {
                 "identifier" | "self" => {
                     let name = node_text(self.source, current)?;
@@ -1539,6 +1590,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// not an `Index` or `IndexMut` implementation. Any other place keeps the
     /// `Calls` gap that says an implicit trait method may run here.
     fn place_access_is_language_defined(&self, place: Node<'_>) -> bool {
+        let place = unwrap_attributes(place);
         match place.kind() {
             "field_expression" => place
                 .child_by_field_name("value")
@@ -1757,6 +1809,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn is_place(&self, node: Node<'_>) -> bool {
         let mut current = node;
         loop {
+            current = unwrap_attributes(current);
             match current.kind() {
                 "identifier" | "self" => {
                     let Some(name) = node_text(self.source, current) else {
@@ -1807,6 +1860,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn expression_is_definitely_non_dropping(&self, node: Node<'_>) -> bool {
         let mut pending = vec![node];
         while let Some(node) = pending.pop() {
+            let node = unwrap_attributes(node);
             if matches!(expression_value_kind(node), SemanticValueKind::Constant) {
                 continue;
             }
@@ -1932,6 +1986,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// other target -- a dereference, a destructuring pattern, a name this
     /// procedure does not bind -- keeps them.
     fn assignment_replaces_droppable_value(&self, left: Node<'_>) -> bool {
+        let left = unwrap_attributes(left);
         match left.kind() {
             "identifier" => {
                 let Some(name) = node_text(self.source, left) else {
@@ -1974,6 +2029,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
         kind: SemanticValueKind,
     ) -> Result<ValueId, RustLoweringError> {
+        let node = unwrap_attributes(node);
         if let Some(value) = self.expression_values.get(&node.id()) {
             return Ok(*value);
         }
@@ -2045,6 +2101,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.session.cancellation().is_cancelled() {
             return Err(RustLoweringError::Cancelled(Box::default()));
         }
+        let work = match work {
+            Work::Statement {
+                node,
+                entry,
+                next,
+                scope,
+            } => Work::Statement {
+                node: unwrap_attributes(node),
+                entry,
+                next,
+                scope,
+            },
+            Work::Expression {
+                node,
+                entry,
+                next,
+                scope,
+            } => Work::Expression {
+                node: unwrap_attributes(node),
+                entry,
+                next,
+                scope,
+            },
+            Work::Condition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            } => Work::Condition {
+                node: unwrap_attributes(node),
+                entry,
+                when_true,
+                when_false,
+                scope,
+            },
+        };
         match work {
             Work::Statement {
                 node,
@@ -2264,7 +2357,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "static_item"
             | "empty_statement"
             | "attribute_item"
-            | "inner_attribute_item" => self.edge(builder, entry, next),
+            | "inner_attribute_item"
+            | "attributes" => self.edge(builder, entry, next),
             _ if is_rust_expression(node.kind()) => {
                 stack.push(Work::Expression {
                     node,
@@ -3221,10 +3315,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let access = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base_value = self.expression_value(builder, *base, expression_value_kind(*base))?;
-        let indexed = self.index_value(builder, *index_node)?;
-        let (index, constant_index) = indexed.map_or((None, None), |(value, constant_index)| {
-            (Some(value), Some(constant_index))
-        });
+        // A keyed collection read on a receiver whose exact type and complete
+        // active contract are proven names its own aggregate location; an
+        // array or unproven base keeps the element-identity proof below.
+        let keyed_lookup = self.modeled_hashmap_lookup_flow(*base, "index").is_some();
+        let (index, constant_index, identity) = if keyed_lookup {
+            let key = Some(self.keyed_place_value(builder, *index_node)?);
+            (
+                key,
+                None,
+                crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+            )
+        } else {
+            let indexed = self.index_value(builder, *index_node)?;
+            let (index, constant_index) = indexed
+                .map_or((None, None), |(value, constant_index)| {
+                    (Some(value), Some(constant_index))
+                });
+            (
+                index,
+                constant_index,
+                crate::analyzer::semantic::IndexedLocationIdentity::Element,
+            )
+        };
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -3232,10 +3345,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 base: base_value,
                 index,
                 constant_index,
-                identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                identity,
             },
         )?;
-        if index.is_none() {
+        if !keyed_lookup && index.is_none() {
             self.add_dynamic_index_gap(builder, access, location)?;
         }
         self.append_effect(
@@ -3247,7 +3360,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 result,
             },
         )?;
-        if !self.place_access_is_language_defined(node) {
+        if !keyed_lookup && !self.place_access_is_language_defined(node) {
             self.add_gap(
                 builder,
                 access,
@@ -4153,6 +4266,335 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A receiver-method `insert` or `get` whose receiver type, callable,
+    /// and complete active contract are proven lowers to the keyed memory
+    /// access the contract describes instead of an unmodeled external call.
+    /// Anything else returns `None` and keeps the generic call lowering with
+    /// its gaps.
+    #[allow(clippy::too_many_arguments)]
+    fn modeled_hashmap_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<Option<()>, RustLoweringError> {
+        let function = match node.child_by_field_name("function") {
+            // A turbofish changes generic applicability, which this consumer
+            // does not model; the generic call lowering keeps its gaps.
+            Some(function) if function.kind() == "field_expression" => function,
+            _ => return Ok(None),
+        };
+        let member = match function
+            .child_by_field_name("field")
+            .and_then(|field| node_text(self.source, field))
+        {
+            Some(member @ ("insert" | "get")) => member,
+            _ => return Ok(None),
+        };
+        let receiver = match function.child_by_field_name("value") {
+            Some(receiver) => receiver,
+            None => return Ok(None),
+        };
+        let arguments = call_arguments(node);
+        match (member, arguments.as_slice()) {
+            ("insert", [key, value]) => {
+                if self.modeled_hashmap_insert_flow(receiver).is_none() {
+                    return Ok(None);
+                }
+                self.lower_modeled_hashmap_insert(
+                    builder, node, receiver, *key, *value, entry, next, scope, stack,
+                )
+                .map(Some)
+            }
+            ("get", [key]) => {
+                if self.modeled_hashmap_lookup_flow(receiver, "get").is_none() {
+                    return Ok(None);
+                }
+                self.lower_modeled_hashmap_get(
+                    builder, node, receiver, *key, entry, next, scope, stack,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `map.insert(key, value)` as the contract describes it: the previous
+    /// entry under the key is the call's result, and the inserted value is
+    /// stored under that key in the receiver's contents.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_modeled_hashmap_insert(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        receiver: Node<'tree>,
+        key_node: Node<'tree>,
+        value_node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let access = self.point(builder, node, Vec::new())?;
+        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+        let key = self.keyed_place_value(builder, key_node)?;
+        let value =
+            self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Index {
+                base,
+                index: Some(key),
+                constant_index: None,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryStore {
+                kind: MemoryAccessKind::Index,
+                location,
+                value,
+            },
+        )?;
+        self.add_gap(
+            builder,
+            access,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "HashMap::insert may abort on allocation failure; that abort edge is not lowered",
+        )?;
+        self.edge(builder, access, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[receiver, key_node, value_node],
+            EdgeTarget::normal(access),
+            scope,
+            stack,
+        )
+    }
+
+    /// `map.get(key)` as the contract describes it: the entry value under the
+    /// key is the call's result. `get` is infallible, so unlike the index
+    /// form this publishes no abort gap.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_modeled_hashmap_get(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        receiver: Node<'tree>,
+        key_node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let access = self.point(builder, node, Vec::new())?;
+        let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+        let key = self.keyed_place_value(builder, key_node)?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Index {
+                base,
+                index: Some(key),
+                constant_index: None,
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Index,
+                location,
+                result,
+            },
+        )?;
+        self.edge(builder, access, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[receiver, key_node],
+            EdgeTarget::normal(access),
+            scope,
+            stack,
+        )
+    }
+
+    /// The exact active collection-flow contract for one receiver method, or
+    /// nothing when the receiver's type identity, the callable, or the flow
+    /// record is not proven. The overlay callable match must be unique, the
+    /// collection-flow record must be the only record for that callable, and
+    /// the record must carry complete coverage and provenance.
+    fn modeled_collection_flow(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<&CollectionFlowContract> {
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let callable = self.modeled_receiver_callable(receiver, member, parameter_count)?;
+        let flows = overlay.collection_flows_for(&callable.id);
+        if flows.disposition != SemanticModelOverlayDisposition::Unique {
+            return None;
+        }
+        let [flow] = flows.records.as_slice() else {
+            return None;
+        };
+        flow.is_complete().then_some(flow)
+    }
+
+    /// Resolve a written receiver type and exact active callable before
+    /// interpreting any profile attached to it.
+    fn modeled_receiver_callable(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        parameter_count: usize,
+    ) -> Option<&crate::analyzer::semantic_model::SemanticModelSymbol> {
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let segments = self.receiver_qualified_type_identity(receiver)?;
+        if segments.len() < 2 {
+            return None;
+        }
+        let owner = segments.join(".");
+        let parameter_count = u32::try_from(parameter_count).ok()?;
+        overlay
+            .callable_for_application(
+                SemanticModelCallableKey::new(
+                    Language::Rust.config_label(),
+                    &owner,
+                    member,
+                    true,
+                    parameter_count,
+                ),
+                &SemanticModelCallApplication::positional(parameter_count),
+            )
+            .unique()
+    }
+
+    /// Keep a deferred factory distinct from a during-call transfer. The
+    /// eligible contract alone cannot establish the concrete result-to-resume
+    /// handle relation or Rust item/lifetime adaptation.
+    fn modeled_deferred_factory(&self, node: Node<'tree>) -> Option<&DeferredYieldContract> {
+        let function = node.child_by_field_name("function")?;
+        if function.kind() != "field_expression" {
+            return None;
+        }
+        let receiver = function.child_by_field_name("value")?;
+        let member = node_text(self.source, function.child_by_field_name("field")?)?;
+        let callable =
+            self.modeled_receiver_callable(receiver, member, call_arguments(node).len())?;
+        let overlay = self.semantic_model_overlay.as_deref()?;
+        let mut contracts = overlay
+            .deferred_yield_contracts()
+            .iter()
+            .filter(|contract| {
+                contract.factory == callable.id
+                    && contract.provenance.pack_digest == callable.provenance.pack_digest
+            });
+        let contract = contracts.next()?;
+        if contracts.next().is_some() || !contract.is_complete() {
+            return None;
+        }
+        let matched =
+            overlay.deferred_yields_for(&contract.factory, &contract.resume, &contract.handle_type);
+        (matched.disposition == SemanticModelOverlayDisposition::Unique).then_some(contract)
+    }
+
+    /// The qualified type path the receiver's written type proves, through
+    /// the same-file `use` bindings when the written name is terminal-only.
+    /// A terminal name this file shadows or binds ambiguously stays
+    /// unresolved.
+    fn receiver_qualified_type_identity(&self, receiver: Node<'tree>) -> Option<Vec<Box<str>>> {
+        let mut ty = self.expression_type(receiver)?;
+        for _ in 0..RUST_RECEIVER_DEREFERENCE_BOUND {
+            match self.dereferenced_type(ty) {
+                Some(inner) => ty = inner,
+                None => break,
+            }
+        }
+        let RustValueType::Declared(ty) = ty else {
+            return None;
+        };
+        let mut segments = rust_nominal_type_path(ty, self.source)?
+            .into_iter()
+            .map(Box::<str>::from)
+            .collect::<Vec<_>>();
+        if segments.len() == 1 {
+            let [terminal] = segments.as_slice() else {
+                return None;
+            };
+            segments = self.use_binding_identity(terminal)?.clone();
+        }
+        Some(segments)
+    }
+
+    fn use_binding_identity(&self, terminal: &str) -> Option<&Vec<Box<str>>> {
+        if self.facts.shadowed_type_names.contains(terminal) {
+            return None;
+        }
+        self.facts.use_bindings.get(terminal)?.as_ref()
+    }
+
+    /// The value that names a keyed location's key. `key` and `&key`
+    /// address the same key value, so a key argument that names a proven
+    /// local or parameter keys on that value; any other shape keeps the
+    /// expression's own value. A clone is a fresh value and deliberately
+    /// keys on nothing its source keys on.
+    fn keyed_place_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        key_node: Node<'tree>,
+    ) -> Result<ValueId, RustLoweringError> {
+        if let Some(place) = rust_keyed_place_node(key_node)
+            && let Some(value) = self.binding_value(place)
+        {
+            return Ok(value);
+        }
+        self.expression_value(builder, key_node, expression_value_kind(key_node))
+    }
+
+    fn modeled_hashmap_insert_flow(
+        &self,
+        receiver: Node<'tree>,
+    ) -> Option<&CollectionFlowContract> {
+        let flow = self.modeled_collection_flow(receiver, "insert", 2)?;
+        if !receiver_substitution_is_proven(flow) || !receiver_root_is_keyed(flow) {
+            return None;
+        }
+        flow.payload
+            .transfers
+            .iter()
+            .any(transfer_stores_parameter_value_into_receiver)
+            .then_some(flow)
+    }
+
+    fn modeled_hashmap_lookup_flow(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+    ) -> Option<&CollectionFlowContract> {
+        let flow = self.modeled_collection_flow(receiver, member, 1)?;
+        if !receiver_substitution_is_proven(flow) || !receiver_root_is_keyed(flow) {
+            return None;
+        }
+        flow.payload
+            .transfers
+            .iter()
+            .any(transfer_reads_keyed_entry_value_to_result)
+            .then_some(flow)
+    }
+
     fn call_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -4162,7 +4604,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
+        if self
+            .modeled_hashmap_call(builder, node, entry, next, scope, stack)?
+            .is_some()
+        {
+            return Ok(());
+        }
         let invoke = self.point(builder, node, Vec::new())?;
+        if self.modeled_deferred_factory(node).is_some() {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::Point,
+                SemanticCapability::DeferredExecution,
+                SemanticGapKind::Unsupported,
+                "active deferred-yield factory requires concrete handle-flow, item adaptation, and lifetime proof before later resume; construction is not an eager item transfer",
+            )?;
+        }
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let function = required_field(node, "function")?;
@@ -4373,7 +4831,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let entries = children
             .iter()
-            .map(|child| self.point(builder, execution_node(*child), Vec::new()))
+            .map(|child| {
+                self.point(
+                    builder,
+                    execution_node(unwrap_attributes(*child)),
+                    Vec::new(),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
         for index in (0..children.len()).rev() {
@@ -4406,7 +4870,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let entries = children
             .iter()
-            .map(|child| self.point(builder, *child, Vec::new()))
+            .map(|child| self.point(builder, unwrap_attributes(*child), Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(entries[0]))?;
         for index in (0..children.len()).rev() {
@@ -4552,7 +5016,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, RustLoweringError> {
-        self.session.add_node_mapping(builder, node)
+        self.session
+            .add_node_mapping(builder, unwrap_attributes(node))
     }
 
     fn value_mapping(
@@ -4560,6 +5025,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
     ) -> Result<PointMetadata, RustLoweringError> {
+        let node = unwrap_attributes(node);
         let range = node.byte_range();
         let occurrence = self.session.next_source_occurrence(range.start, range.end);
         let anchor = source_anchor(node, occurrence).map_err(RustLoweringError::Invalid)?;
@@ -4796,6 +5262,7 @@ fn is_rust_nested_execution_boundary(node: Node<'_>) -> bool {
 }
 
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    let node = unwrap_attributes(node);
     match node.kind() {
         "closure_expression" | "async_block" | "gen_block" => SemanticValueKind::Callable,
         kind if kind.ends_with("_literal")
@@ -4810,6 +5277,7 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
 /// Whether this expression's lowering already publishes where its value came
 /// from, so a tail-expression return needs no value-refinement gap.
 fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
+    let node = unwrap_attributes(node);
     matches!(
         node.kind(),
         "call_expression"
@@ -4965,6 +5433,13 @@ struct RustFileFacts<'tree> {
     /// every field is a primitive or another such struct, the struct takes no
     /// type parameters, and this file states no `impl Drop` for it.
     plain_structs: HashSet<Box<str>>,
+    /// Qualified paths this file's top-level `use` items bind, keyed by the
+    /// bound terminal name. `None` marks a name bound by more than one item,
+    /// which no longer proves one path.
+    use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>>,
+    /// Type-namespace names this file declares, which may shadow a `use`
+    /// binding; a name here resolves through no import.
+    shadowed_type_names: HashSet<Box<str>>,
 }
 
 fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<'tree> {
@@ -4979,6 +5454,8 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
     let mut declared_fields: HashMap<Box<str>, Vec<Node<'_>>> = HashMap::default();
     let mut disqualified: HashSet<Box<str>> = HashSet::default();
     let mut every_struct_drops = false;
+    let mut use_bindings: HashMap<Box<str>, Option<Vec<Box<str>>>> = HashMap::default();
+    let mut shadowed_type_names: HashSet<Box<str>> = HashSet::default();
     let mut stack = vec![prepared.tree().root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -5076,9 +5553,51 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
                     }
                 }
             }
+            "use_declaration" => {
+                // Only file-scope imports bind for these procedures; a `use`
+                // inside a nested module keeps its own scope, and resolving
+                // it by hand would guess a scope this prescan does not own.
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+                    && let Some(clause) = node.named_child(0)
+                    && let Some(bindings) = rust_use_clause_bindings(clause, source)
+                {
+                    for (terminal, segments) in bindings {
+                        if segments.len() < 2 {
+                            continue;
+                        }
+                        match use_bindings.entry(terminal) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(Some(segments));
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if entry.get().as_deref() != Some(segments.as_slice()) {
+                                    entry.insert(None);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "enum_item" | "mod_item" | "trait_item" | "type_item" | "union_item" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(source, name))
+                {
+                    shadowed_type_names.insert(name.into());
+                }
+            }
             _ => {}
         }
         stack.extend(named_children(node));
+    }
+
+    // A type-namespace item declared anywhere in this file may shadow a
+    // same-named `use` binding for the procedures that see it; fail closed
+    // rather than picking a scope by hand.
+    for name in &shadowed_type_names {
+        use_bindings.remove(name);
     }
 
     // A struct is plain when every field is a primitive or another plain
@@ -5118,7 +5637,199 @@ fn rust_file_facts<'tree>(prepared: &'tree PreparedSyntaxTree) -> RustFileFacts<
         non_dropping_return_functions,
         struct_fields,
         plain_structs,
+        use_bindings,
+        shadowed_type_names,
     }
+}
+
+/// The explicit terminal bindings one top-level `use` clause makes, as
+/// `(bound name, qualified segments)` pairs. `None` marks a clause shape this
+/// prescan does not model, such as an alias or a wildcard, and no binding may
+/// be inferred for it.
+type RustUseBinding = (Box<str>, Vec<Box<str>>);
+
+fn rust_use_clause_bindings(clause: Node<'_>, source: &str) -> Option<Vec<RustUseBinding>> {
+    match clause.kind() {
+        "identifier" => {
+            let name = node_text(source, clause)?;
+            Some(vec![(name.into(), vec![name.into()])])
+        }
+        "scoped_identifier" => {
+            let segments = rust_use_path_segments(clause, source)?;
+            let terminal = segments.last()?.clone();
+            Some(vec![(terminal, segments)])
+        }
+        "scoped_use_list" => {
+            let prefix = clause
+                .child_by_field_name("path")
+                .and_then(|path| rust_use_path_segments(path, source))
+                .unwrap_or_default();
+            let list = clause.child_by_field_name("list")?;
+            rust_use_list_bindings(list, prefix, source)
+        }
+        "use_list" => rust_use_list_bindings(clause, Vec::new(), source),
+        _ => None,
+    }
+}
+
+fn rust_use_list_bindings(
+    list: Node<'_>,
+    prefix: Vec<Box<str>>,
+    source: &str,
+) -> Option<Vec<RustUseBinding>> {
+    let mut bindings = Vec::new();
+    for child in named_children(list) {
+        match child.kind() {
+            "identifier" => {
+                let name = node_text(source, child)?;
+                let mut segments = prefix.clone();
+                segments.push(name.into());
+                bindings.push((name.into(), segments));
+            }
+            // `use a::{self}` binds the module itself, not a type this
+            // consumer models.
+            "self" => {}
+            "scoped_identifier" => {
+                let segments = rust_use_path_segments(child, source)?;
+                let terminal = segments.last()?.clone();
+                bindings.push((terminal, segments));
+            }
+            "scoped_use_list" => {
+                let mut nested_prefix = prefix.clone();
+                nested_prefix.extend(rust_use_path_segments(
+                    child.child_by_field_name("path")?,
+                    source,
+                )?);
+                bindings.extend(rust_use_list_bindings(
+                    child.child_by_field_name("list")?,
+                    nested_prefix,
+                    source,
+                )?);
+            }
+            "use_list" => {
+                bindings.extend(rust_use_list_bindings(child, prefix.clone(), source)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(bindings)
+}
+
+fn rust_use_path_segments(node: Node<'_>, source: &str) -> Option<Vec<Box<str>>> {
+    match node.kind() {
+        "identifier" | "crate" | "self" | "super" => Some(vec![node_text(source, node)?.into()]),
+        "scoped_identifier" => {
+            let mut segments = rust_use_path_segments(node.child_by_field_name("path")?, source)?;
+            segments.push(node_text(source, node.child_by_field_name("name")?)?.into());
+            Some(segments)
+        }
+        _ => None,
+    }
+}
+
+/// Whether one CSMI projection selects one named component of the keyed
+/// entry chosen by the given boundary selector.
+fn projection_is_entry_component(
+    projection: Option<&CsmiProjection>,
+    selector_kind: &str,
+    selector_position: u32,
+    component: &str,
+) -> bool {
+    let Some(projection) = projection else {
+        return false;
+    };
+    let [entry, selected_component] = projection.steps.as_slice() else {
+        return false;
+    };
+    entry.kind == "entry"
+        && entry
+            .args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(|key| key.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some(selector_kind)
+        && entry
+            .args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(|key| key.get("position"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(selector_position))
+        && selected_component.kind == component
+}
+
+fn receiver_substitution_is_proven(flow: &CollectionFlowContract) -> bool {
+    !matches!(
+        flow.payload.receiver_substitution,
+        Some(
+            CsmiCollectionFlowSubstitution::Unknown { .. }
+                | CsmiCollectionFlowSubstitution::Unsupported { .. }
+        )
+    )
+}
+
+fn receiver_root_is_keyed(flow: &CollectionFlowContract) -> bool {
+    flow.payload.roots.iter().any(|root| {
+        matches!(
+            &root.root,
+            CsmiCollectionFlowBoundaryRoot::Input(CsmiInputBoundaryRoot::Receiver(_))
+        ) && matches!(root.shape, CsmiCollectionFlowShape::Keyed { .. })
+    })
+}
+
+/// The transfer that reads the keyed entry chosen by the call's key
+/// argument into the callable's normal result, which is what `get` returns
+/// and what `insert` returns as the previous entry.
+fn transfer_reads_keyed_entry_value_to_result(transfer: &CsmiCollectionFlowTransfer) -> bool {
+    matches!(&transfer.source.root, CsmiInputBoundaryRoot::Receiver(_))
+        && projection_is_entry_component(
+            transfer.source.projection.as_ref(),
+            "parameter",
+            0,
+            "entry-value",
+        )
+        && matches!(
+            &transfer.destination.root,
+            CsmiOutputBoundaryRoot::Result(_)
+        )
+        && transfer.destination.projection.is_none()
+}
+
+/// The transfer that stores the call's second argument under the keyed
+/// entry the first argument names, which is what `insert` proves. The
+/// complete contract proves nothing else about insert's return; its absence
+/// is the model's claim that the return carries no keyed-entry flow.
+fn transfer_stores_parameter_value_into_receiver(transfer: &CsmiCollectionFlowTransfer) -> bool {
+    matches!(
+        &transfer.source.root,
+        CsmiInputBoundaryRoot::Parameter(parameter) if parameter.position == 1
+    ) && transfer.source.projection.is_none()
+        && matches!(
+            &transfer.destination.root,
+            CsmiOutputBoundaryRoot::Receiver(_)
+        )
+        && projection_is_entry_component(
+            transfer.destination.projection.as_ref(),
+            "parameter",
+            0,
+            "entry-value",
+        )
+}
+
+/// The place node a keyed call's key argument names, after peeling the
+/// parentheses and borrows that are only calling convention. `None` keeps
+/// the argument's own expression value.
+fn rust_keyed_place_node<'tree>(key_node: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = key_node;
+    for _ in 0..RUST_KEY_PLACE_UNWRAP_BOUND {
+        match current.kind() {
+            "parenthesized_expression" => current = first_named_child(current)?,
+            "reference_expression" => current = rust_reference_expression_value(current)?,
+            _ => return Some(current),
+        }
+    }
+    None
 }
 
 /// Whether iterating this expression yields elements that own no `Drop`.
@@ -5308,6 +6019,7 @@ fn rust_array_initializer_elements(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let node = unwrap_attributes(node);
     match node.kind() {
         "binary_expression" | "assignment_expression" | "compound_assignment_expr" => [
             node.child_by_field_name("left"),
@@ -5315,24 +6027,45 @@ fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
         ]
         .into_iter()
         .flatten()
+        .map(unwrap_attributes)
         .collect(),
-        "field_expression" | "reference_expression" | "type_cast_expression" => {
-            node.child_by_field_name("value").into_iter().collect()
-        }
-        "let_condition" => node.child_by_field_name("value").into_iter().collect(),
+        "field_expression" | "reference_expression" | "type_cast_expression" => node
+            .child_by_field_name("value")
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
+        "let_condition" => node
+            .child_by_field_name("value")
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
         "unary_expression"
         | "parenthesized_expression"
         | "await_expression"
         | "try_expression"
         | "yield_expression"
-        | "return_expression" => first_named_child(node).into_iter().collect(),
-        "generic_function" => node.child_by_field_name("function").into_iter().collect(),
+        | "return_expression" => first_named_child(node)
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
+        "generic_function" => node
+            .child_by_field_name("function")
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
         "struct_expression" => node
             .child_by_field_name("body")
             .map(runtime_expression_children)
             .unwrap_or_default(),
-        "field_initializer" => node.child_by_field_name("value").into_iter().collect(),
-        "base_field_initializer" => first_named_child(node).into_iter().collect(),
+        "field_initializer" => node
+            .child_by_field_name("value")
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
+        "base_field_initializer" => first_named_child(node)
+            .into_iter()
+            .map(unwrap_attributes)
+            .collect(),
         "index_expression"
         | "array_expression"
         | "tuple_expression"
@@ -5348,6 +6081,7 @@ fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn execution_node(node: Node<'_>) -> Node<'_> {
+    let node = unwrap_attributes(node);
     if node.kind() == "expression_statement" {
         first_named_child(node)
             .filter(|expression| {
@@ -5531,6 +6265,7 @@ fn is_compile_time_syntax(kind: &str) -> bool {
                 | "where_clause"
                 | "attribute_item"
                 | "inner_attribute_item"
+                | "attributes"
                 | "visibility_modifier"
         )
 }
@@ -5539,13 +6274,16 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| !is_comment_kind(child.kind()))
+        .filter(|child| child.kind() != "attributes")
+        .map(unwrap_attributes)
         .collect()
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find(|child| !is_comment_kind(child.kind()))
+        .find(|child| !is_comment_kind(child.kind()) && child.kind() != "attributes")
+        .map(unwrap_attributes)
 }
 
 fn is_comment_kind(kind: &str) -> bool {
@@ -5554,6 +6292,7 @@ fn is_comment_kind(kind: &str) -> bool {
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RustLoweringError> {
     node.child_by_field_name(field)
+        .map(unwrap_attributes)
         .ok_or_else(|| missing_field(node, field))
 }
 
@@ -5576,3 +6315,86 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         _ => "unsupported completion",
     }
 }
+
+#[cfg(test)]
+mod grouped_attribute_ast_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar");
+        let tree = parser.parse(source, None).expect("Rust tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "fixture must parse without recovery:\n{}",
+            tree.root_node().to_sexp()
+        );
+        tree
+    }
+
+    #[test]
+    fn adapter_children_replace_attribute_wrappers_with_their_items() {
+        let source = concat!(
+            "#[derive(Debug)]\n",
+            "fn annotated() {\n",
+            "    #[cfg(any())]\n",
+            "    mod inner {}\n",
+            "    #[allow(unused)]\n",
+            "    let value = 1;\n",
+            "}\n",
+        );
+        let tree = parse(source);
+        let root_children = named_children(tree.root_node());
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0].kind(), "function_item");
+
+        let body = root_children[0]
+            .child_by_field_name("body")
+            .expect("function body");
+        let body_children = named_children(body)
+            .into_iter()
+            .map(|node| node.kind().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(body_children, ["mod_item", "let_declaration"]);
+    }
+
+    #[test]
+    fn an_attributed_tail_expression_is_lowered_as_its_value() {
+        let source = "#[cfg(any())] fn f() -> i32 { #[cfg(any())] 1 }\n";
+        let tree = parse(source);
+        let function = named_children(tree.root_node())
+            .into_iter()
+            .next()
+            .expect("function item");
+        let body = function.child_by_field_name("body").expect("function body");
+        let tail = block_tail_expression(body).expect("attributed tail value");
+        assert_eq!(tail.kind(), "integer_literal");
+    }
+
+    #[test]
+    fn grouped_attributes_are_not_array_elements() {
+        let source = "fn f() { let values = [#[allow(dead_code)] 1]; }\n";
+        let tree = parse(source);
+        let function = named_children(tree.root_node())
+            .into_iter()
+            .next()
+            .expect("function item");
+        let body = function.child_by_field_name("body").expect("function body");
+        let let_declaration = named_children(body)
+            .into_iter()
+            .find(|node| node.kind() == "let_declaration")
+            .expect("let declaration");
+        let array = let_declaration
+            .child_by_field_name("value")
+            .expect("array initializer");
+        let elements = rust_array_initializer_elements(array);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].kind(), "integer_literal");
+    }
+}
+
+#[cfg(test)]
+mod hashmap_consumer_tests;

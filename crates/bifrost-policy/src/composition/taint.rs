@@ -845,6 +845,7 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_sexp(&format!(r#"(call :callee (name "{name}"))"#)).unwrap(),
+            resolved_locators: Vec::new(),
         }
     }
 

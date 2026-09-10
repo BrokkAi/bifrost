@@ -337,7 +337,7 @@ void test("renders and navigates procedure-local CFG results", () => {
   assert.match(queryResultTooltip(procedure), /artifact-a/);
   assert.deepEqual(queryResultRange(procedure), range);
   assert.equal(queryResultLabel(point), "entry");
-  assert.equal(queryResultDescription(point), "2 events · proven/complete");
+  assert.equal(queryResultDescription(point), "2 events · proof=proven; completeness=complete");
   assert.equal(queryResultIcon(point), "debug-breakpoint");
   assert.match(queryResultTooltip(point), /procedure-a/);
   assert.deepEqual(queryResultRange(point), range);
@@ -857,7 +857,7 @@ void test("renders typestate findings and exposes navigable witness steps", () =
     observed_state: "closed",
     language: finding.language,
     range,
-    quality: { proof: "proven", completeness: "complete" },
+    evidence: { proof: "proven", completeness: "complete" },
     steps: [
       {
         kind: { type: "edge", edge_kind: "normal" },
@@ -943,11 +943,9 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
     },
     reachability: "reached",
     certainty: "may",
-    must: "not_established",
     ambiguous: true,
-    completion: "budget_exhausted",
-    semantic_status: "ambiguous",
-    solver_termination: "budget_exhausted",
+    status: "solver_budget_exhausted",
+    reason: "reached-state budget exhausted",
     language: "typescript",
     range,
     retained_witnesses: 1,
@@ -964,7 +962,7 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
     witness_index: 0,
     language: endpoint.language,
     range,
-    quality: { proof: "unproven", completeness: "partial" },
+    evidence: { proof: "unproven", completeness: "partial" },
     steps: [
       {
         kind: { type: "end_summary_gap", return_kind: "normal" },
@@ -993,11 +991,12 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
   assert.equal(queryResultLabel(endpoint), "reached: sink-a");
   assert.equal(
     queryResultDescription(endpoint),
-    "may · budget_exhausted · embedding:request-to-sink"
+    "may · solver_budget_exhausted · embedding:request-to-sink"
   );
   assert.equal(queryResultIcon(endpoint), "target");
   assert.match(queryResultTooltip(endpoint), /ambiguous: yes/);
-  assert.match(queryResultTooltip(endpoint), /must: not_established/);
+  assert.match(queryResultTooltip(endpoint), /Status: solver_budget_exhausted/);
+  assert.match(queryResultTooltip(endpoint), /Reason: reached-state budget exhausted/);
   assert.deepEqual(queryResultRange(endpoint), range);
 
   assert.equal(queryResultIcon(witness), "debug-alt");

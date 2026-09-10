@@ -183,16 +183,32 @@ pub(crate) fn resolved_policy_to_json(
         Value::Array(sorted_manifests(match_manifests)?),
     );
     object.insert("precedence".to_string(), precedence_to_json(precedence));
-    let locator_resolutions = super::locator::resolved_locator_metadata(definition);
+    let mut locator_resolutions = super::locator::resolved_locator_metadata(definition)
+        .into_iter()
+        .map(super::canonical::resolved_locator_to_json)
+        .collect::<Vec<_>>();
+    locator_resolutions.extend(
+        selectors
+            .iter()
+            // Inline selectors owned by this policy are already present in
+            // `definition`. Referenced files and composed dependencies are
+            // not, so their sidecars must be added from the resolved closure.
+            .filter(|selector| {
+                matches!(
+                    selector.origin,
+                    SelectorOrigin::ReferencedFile { .. } | SelectorOrigin::Catalog { .. }
+                ) || selector
+                    .path
+                    .as_str()
+                    .starts_with("/dependencies/match-endpoints/")
+            })
+            .flat_map(|selector| &selector.resolved_locators)
+            .map(super::canonical::resolved_locator_to_json),
+    );
     if !locator_resolutions.is_empty() {
         object.insert(
             "resolved_locators".to_string(),
-            Value::Array(
-                locator_resolutions
-                    .into_iter()
-                    .map(super::canonical::resolved_locator_to_json)
-                    .collect(),
-            ),
+            Value::Array(locator_resolutions),
         );
     }
     Ok(value)
@@ -725,9 +741,6 @@ pub(crate) fn resolved_selector_to_json(selector: &ResolvedPolicySelector) -> Va
             "schema_version": schema_resolution.version,
             "query": query.to_canonical_query_plan_json(),
         }),
-        ResolvedPolicySelectorKind::Rows { plan } => {
-            super::canonical::row_selector_plan_to_json(plan)
-        }
     }
 }
 
@@ -799,22 +812,6 @@ fn insert_selector_schemas(value: &mut Value, schemas: &ResolvedEndpointSelector
             object.insert(
                 "selector_schema_version".to_owned(),
                 json!(resolution.version),
-            );
-        }
-        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-            object.insert(
-                "selector_schemas".to_owned(),
-                Value::Array(
-                    bindings
-                        .iter()
-                        .map(|binding| {
-                            json!({
-                                "path": binding.path.as_str(),
-                                "schema_version": binding.resolution.version,
-                            })
-                        })
-                        .collect(),
-                ),
             );
         }
     }
@@ -1235,6 +1232,10 @@ fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
         }),
         PolicySemanticEvent::ExceptionalProcedureExit { scope } => json!({
             "type": "exceptional_procedure_exit",
+            "scope": typestate_exit_scope_label(scope),
+        }),
+        PolicySemanticEvent::SuspensionBoundary { scope } => json!({
+            "type": "suspension_boundary",
             "scope": typestate_exit_scope_label(scope),
         }),
     }

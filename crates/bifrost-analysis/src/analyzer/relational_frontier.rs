@@ -162,6 +162,22 @@ impl RecordingRelationalFrontier {
         }
     }
 
+    /// Copy answers another session already batched into this one, so a
+    /// workspace-derived layer resolved once (the Scala hierarchy) does not
+    /// have to be re-asked and re-batched by every later request.
+    fn adopt_answers(
+        &self,
+        answers: &HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>,
+    ) {
+        let mut state = self.state.lock().expect("relational frontier poisoned");
+        for (question, value) in answers {
+            state
+                .answers
+                .entry(question.clone())
+                .or_insert_with(|| Arc::clone(value));
+        }
+    }
+
     fn answer_snapshot(
         &self,
     ) -> Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>> {
@@ -534,6 +550,10 @@ where
 /// retained between calls. The session therefore avoids repeating the same
 /// indexed lookup for every file without becoming analyzer-lifetime state or
 /// rebuilding a workspace-wide definition materialization.
+/// Batched answers a session can hand to another.
+pub(crate) type FrontierAnswers =
+    Arc<HashMap<RelationalDefinitionQuestion, Arc<RelationalDefinitionValue>>>;
+
 pub(crate) struct RelationalFrontierSession<'a> {
     analyzer: &'a dyn IAnalyzer,
     cancellation: &'a CancellationToken,
@@ -547,6 +567,17 @@ impl<'a> RelationalFrontierSession<'a> {
             cancellation,
             frontier: Arc::new(RecordingRelationalFrontier::default()),
         }
+    }
+
+    /// The answers this session has batched so far, shareable with sessions
+    /// that ask the same workspace-derived questions.
+    pub(crate) fn answer_snapshot(&self) -> FrontierAnswers {
+        self.frontier.answer_snapshot()
+    }
+
+    /// Start from answers another session already batched.
+    pub(crate) fn adopt_answers(&self, answers: &FrontierAnswers) {
+        self.frontier.adopt_answers(answers);
     }
 
     pub(crate) fn resolve_owned<T>(

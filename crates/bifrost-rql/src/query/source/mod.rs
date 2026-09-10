@@ -1,26 +1,21 @@
 //! Source-oriented parsing, validation, and help for unsaved RQL documents.
 
-mod json;
 mod rql;
 mod shared;
 
-use json::analyze_json_with_schema_registry;
 use rql::{analyze_rql, validate_rql_query};
 use shared::*;
 
 use super::ir::{MAX_BINDING_NAME_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH};
 use super::schema;
 use super::schema::{
-    ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
-    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, BINDING_OF_STEP_OPTIONS,
-    CodeQueryExecutionMode, DECORATOR_BINDING_STEP_OPTIONS, PatternField, QueryField,
-    QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS,
-    ScopeFilterField, StringPredicateField, binding_option_for_rql_label,
+    ALL_RQL_FORMS, ALL_RQL_PROPERTIES, BINDING_OF_STEP_OPTIONS, DECORATOR_BINDING_STEP_OPTIONS,
+    QueryStepField, QueryStepOp, ReceiverTypeConstraintForm, RqlForm, RqlFormClass, RqlProperty,
+    SCOPE_SEED_RQL_LABELS, ScopeFilterField, binding_option_for_rql_label,
     candidate_option_for_rql_label, constrained_step_option_labels,
     declaration_state_option_for_rql_label, environment_filter_labels, export_field_for_rql_label,
-    generation_site_field_for_rql_label, jsx_element_identity_from_label,
-    jsx_element_identity_labels, occurrence_filter_labels, occurrence_option_for_rql_label,
-    reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
+    generation_site_field_for_rql_label, jsx_element_identity_from_label, occurrence_filter_labels,
+    occurrence_option_for_rql_label, reference_kind_from_label, usage_kind_from_label,
     usage_proof_from_label, usage_surface_from_label,
 };
 use super::schema::{ExportFilterField, GenerationSiteFilterField};
@@ -28,8 +23,8 @@ use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_ARITY, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
+    MAX_WHERE_GLOBS,
 };
 use crate::sexp::{Expr, ExprKind};
 use brokk_bifrost_core::analyzer::Language;
@@ -43,10 +38,8 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
 use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_DECLARED_VISIBILITIES, DeclaredVisibility,
 };
-use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
-use json_spanned_value::{ErrorExt, spanned};
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use strsim::damerau_levenshtein;
@@ -54,8 +47,6 @@ use strsim::damerau_levenshtein;
 pub const MAX_QUERY_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_DIAGNOSTICS: usize = 100;
 const MAX_SOURCE_HELP_ITEMS: usize = 1_000;
-const MAX_JSON_COMPLETION_DEPTH: usize = 6;
-const MAX_JSON_COMPLETION_SOURCE_BYTES: usize = 8 * 1024;
 
 #[derive(Default)]
 struct SourcePlanBudget {
@@ -119,8 +110,7 @@ pub struct QuerySourceHelp {
 }
 
 impl CodeQuery {
-    /// Parse RQL or canonical JSON. JSON is selected only when the first
-    /// non-whitespace character is an opening brace.
+    /// Parse authored RQL text. Decode generated machine JSON with `Self::from_json`.
     pub fn from_source(source: &str) -> Result<Self, String> {
         if source.len() > MAX_QUERY_SOURCE_BYTES {
             return Err(format!(
@@ -129,13 +119,7 @@ impl CodeQuery {
                 MAX_QUERY_SOURCE_BYTES
             ));
         }
-        if is_json_source(source) {
-            let parsed: spanned::Value =
-                json_spanned_value::from_str(source).map_err(|error| error.to_string())?;
-            Self::from_json(&spanned_to_json(&parsed)).map_err(|error| error.to_string())
-        } else {
-            Self::from_sexp(source)
-        }
+        Self::from_sexp(source)
     }
 }
 
@@ -152,21 +136,17 @@ pub fn validate_query_source(source: &str) -> Vec<QuerySourceDiagnostic> {
             fix: None,
         }];
     }
-    analyze_source(source).diagnostics
+    analyze_rql(source).diagnostics
 }
 
 pub fn query_source_help_at(source: &str, byte_offset: usize) -> Option<QuerySourceHelp> {
     if source.len() > MAX_QUERY_SOURCE_BYTES {
         return None;
     }
-    analyze_source(source)
+    analyze_rql(source)
         .help
         .into_iter()
         .find(|help| help.range.start <= byte_offset && byte_offset < help.range.end)
-}
-
-fn is_json_source(source: &str) -> bool {
-    source.trim_start().starts_with('{')
 }
 
 type SuggestionCandidate = (String, String);
@@ -278,35 +258,11 @@ fn rql_property_candidates() -> Vec<SuggestionCandidate> {
     candidates
 }
 
-fn json_field_candidates<T>(
-    fields: &[T],
-    label: impl Fn(T) -> &'static str,
-) -> Vec<SuggestionCandidate>
-where
-    T: Copy,
-{
-    fields
-        .iter()
-        .copied()
-        .map(|field| {
-            let label = label(field);
-            (label.to_string(), label.to_string())
-        })
-        .collect()
-}
-
-fn pattern_field_candidates() -> Vec<SuggestionCandidate> {
-    let mut candidates = json_field_candidates(ALL_PATTERN_FIELDS, PatternField::label);
-    candidates.extend(
-        ALL_ROLES
-            .iter()
-            .map(|role| (role.label().to_string(), role.label().to_string())),
-    );
-    candidates
-}
-
 fn language_candidates() -> Vec<SuggestionCandidate> {
-    let mut candidates = Vec::new();
+    let mut candidates = super::schema::LANGUAGE_FAMILIES
+        .iter()
+        .map(|family| (family.label.to_string(), family.label.to_string()))
+        .collect::<Vec<_>>();
     for language in Language::ANALYZABLE {
         let canonical = language.config_label().to_string();
         candidates.push((canonical.clone(), canonical));
@@ -343,20 +299,6 @@ fn result_detail_candidates() -> Vec<SuggestionCandidate> {
     CodeQueryResultDetail::ALL
         .iter()
         .map(|detail| (detail.label().to_string(), detail.label().to_string()))
-        .collect()
-}
-
-fn execution_mode_candidates() -> Vec<SuggestionCandidate> {
-    super::schema::ALL_CODE_QUERY_EXECUTION_MODES
-        .iter()
-        .map(|mode| (mode.label().to_string(), mode.label().to_string()))
-        .collect()
-}
-
-fn query_step_candidates() -> Vec<SuggestionCandidate> {
-    ALL_QUERY_STEP_OPS
-        .iter()
-        .map(|op| (op.label().to_string(), op.label().to_string()))
         .collect()
 }
 
@@ -474,32 +416,6 @@ pub(super) fn query_expr_path_for_range(expr: &Expr, range: &Range<usize>) -> Op
     let mut plan_budget = SourcePlanBudget::default();
     validate_rql_query(expr, "", &mut analysis, 0, &mut plan_budget);
     analysis.path_for_range(range)
-}
-
-fn analyze_source(source: &str) -> Analysis {
-    if is_json_source(source) {
-        analyze_json_with_schema_registry(source, rql_schema_version_registry())
-    } else {
-        analyze_rql(source)
-    }
-}
-
-fn spanned_to_json(value: &spanned::Value) -> Value {
-    match value.get_ref() {
-        json_spanned_value::Value::Null => Value::Null,
-        json_spanned_value::Value::Bool(value) => Value::Bool(*value),
-        json_spanned_value::Value::Number(value) => Value::Number(value.clone()),
-        json_spanned_value::Value::String(value) => Value::String(value.clone()),
-        json_spanned_value::Value::Array(values) => {
-            Value::Array(values.iter().map(spanned_to_json).collect())
-        }
-        json_spanned_value::Value::Object(values) => Value::Object(
-            values
-                .iter()
-                .map(|(key, value)| (key.get_ref().clone(), spanned_to_json(value)))
-                .collect::<Map<_, _>>(),
-        ),
-    }
 }
 
 #[cfg(test)]

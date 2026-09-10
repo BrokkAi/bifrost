@@ -53,11 +53,11 @@ use brokk_bifrost_rql::structural::search::{
     CodeQueryOccurrence, CodeQueryResolutionCandidate,
 };
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQueryStableOwnerDerivation,
-    DetailedCodeQueryDomain, DetailedCodeQueryKey, UnitRowEvidence, UnitRowIdentities,
-    UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance, UnitRowItemRef,
-    UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance, UnitRowProvenanceRef,
-    execute_code_query_detailed_eager_index,
+    CodeQueryExecutionScope, CodeQueryRowFamilySession, CodeQueryStableOwnerCandidate,
+    CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryKey, UnitRowEvidence,
+    UnitRowIdentities, UnitRowIdentityCandidate, UnitRowItem, UnitRowItemProvenance,
+    UnitRowItemRef, UnitRowItemRefValue, UnitRowItemTerminal, UnitRowProvenance,
+    UnitRowProvenanceRef, execute_code_query_detailed_eager_index,
     execute_code_query_detailed_eager_index_with_row_family_session_in_scope,
     execute_code_query_detailed_eager_index_without_targets_with_row_family_session_in_scope,
     execute_code_query_detailed_eager_index_workspace, execute_code_query_unit,
@@ -2975,22 +2975,23 @@ fn adapt_match_candidate(
 
     let owner = match evidence.stable_owner_candidate.as_ref() {
         Some(candidate) => {
-            let identity = match candidate.derivation {
-                CodeQueryStableOwnerDerivation::AnalyzerDeclarationId => {
-                    StableSemanticIdentity::analyzer_declaration_id(
-                        &candidate.namespace,
-                        path.clone(),
-                        &candidate.semantic_key,
-                    )
+            let identity = match candidate {
+                CodeQueryStableOwnerCandidate::Declaration { namespace, id } => {
+                    StableSemanticIdentity::analyzer_declaration_id(namespace, path.clone(), id)
                 }
-                CodeQueryStableOwnerDerivation::CanonicalAstIdentity => {
-                    StableSemanticIdentity::canonical_ast_identity(
-                        &candidate.namespace,
-                        path.clone(),
-                        &candidate.semantic_key,
-                    )
-                }
-                CodeQueryStableOwnerDerivation::SemanticWireId => {
+                CodeQueryStableOwnerCandidate::Derived {
+                    namespace,
+                    derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
+                    semantic_key,
+                } => StableSemanticIdentity::canonical_ast_identity(
+                    namespace,
+                    path.clone(),
+                    semantic_key,
+                ),
+                CodeQueryStableOwnerCandidate::Derived {
+                    derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+                    ..
+                } => {
                     return Err(());
                 }
             };
@@ -3998,22 +3999,19 @@ fn validated_provenance_identity(
 ) -> Option<StableSemanticIdentity> {
     let candidate = candidate?;
     let path = workspace_relative_path(&candidate.rel_path).ok()?;
-    let identity = match candidate.candidate.derivation {
-        CodeQueryStableOwnerDerivation::AnalyzerDeclarationId => {
-            StableSemanticIdentity::analyzer_declaration_id(
-                &candidate.candidate.namespace,
-                path,
-                &candidate.candidate.semantic_key,
-            )
+    let identity = match &candidate.candidate {
+        CodeQueryStableOwnerCandidate::Declaration { namespace, id } => {
+            StableSemanticIdentity::analyzer_declaration_id(namespace, path, id)
         }
-        CodeQueryStableOwnerDerivation::CanonicalAstIdentity => {
-            StableSemanticIdentity::canonical_ast_identity(
-                &candidate.candidate.namespace,
-                path,
-                &candidate.candidate.semantic_key,
-            )
-        }
-        CodeQueryStableOwnerDerivation::SemanticWireId => return None,
+        CodeQueryStableOwnerCandidate::Derived {
+            namespace,
+            derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
+            semantic_key,
+        } => StableSemanticIdentity::canonical_ast_identity(namespace, path, semantic_key),
+        CodeQueryStableOwnerCandidate::Derived {
+            derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+            ..
+        } => return None,
     };
     identity.ok()
 }
@@ -4411,18 +4409,28 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, finding_id.as_bytes());
         }
-        DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
+        DetailedCodeQueryKey::ProcedureEffect {
+            id,
+            procedure_id,
+            site_id,
+        } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, site_id.as_bytes());
         }
         DetailedCodeQueryKey::CallableApplicability { id, site_ast_id }
         | DetailedCodeQueryKey::OverloadSelection { id, site_ast_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_ast_id.as_bytes());
         }
-        DetailedCodeQueryKey::CallableSignature { id, declaration_id } => {
+        DetailedCodeQueryKey::CallableSignature {
+            id,
+            declaration_id,
+            site_id,
+        } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, declaration_id.as_bytes());
+            update_hash(&mut hasher, site_id.as_bytes());
         }
         DetailedCodeQueryKey::SignatureParameter { id, signature_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -4643,6 +4651,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         CodeQueryDiagnosticCode::SemanticResultsOmitted
         | CodeQueryDiagnosticCode::SemanticAnalysisPartial
         | CodeQueryDiagnosticCode::CallBindingDispatchPartial
+        | CodeQueryDiagnosticCode::CallBindingSelectorRejected
         | CodeQueryDiagnosticCode::SemanticBudgetExhausted
         | CodeQueryDiagnosticCode::SemanticProviderFailed
         | CodeQueryDiagnosticCode::UnresolvedProtocolReference

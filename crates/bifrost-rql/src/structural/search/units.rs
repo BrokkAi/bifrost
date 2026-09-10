@@ -1013,6 +1013,11 @@ pub struct UnitRowItem {
     pub domain: DetailedCodeQueryDomain,
     pub path: Box<str>,
     pub range: Option<CodeQueryRange>,
+    /// The row-level semantic evidence object exactly as live query transports
+    /// publish it. Absent for row families whose status fields describe a
+    /// different domain fact rather than analysis evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<CodeQuerySemanticEvidence>,
     /// Every scalar the row's domain declares and this row carries, in the
     /// domain's own declaration order.
     ///
@@ -1061,6 +1066,7 @@ impl UnitRowItem {
             domain,
             path: boxed(row_path(&item.value)),
             range: item.value.display_range(),
+            evidence: row_semantic_evidence(&item.value).cloned(),
             fields,
             unknown_fields,
             terminal: UnitRowItemTerminal::project(&item.value),
@@ -1107,6 +1113,19 @@ impl UnitRowItem {
             .iter()
             .find(|field| field.name.as_ref() == name)
             .map(|field| field.value.borrowed()))
+    }
+}
+
+fn row_semantic_evidence(value: &CodeQueryResultValue) -> Option<&CodeQuerySemanticEvidence> {
+    match value {
+        CodeQueryResultValue::Procedure { value } => Some(&value.evidence),
+        CodeQueryResultValue::ProgramPoint { value } => Some(&value.evidence),
+        CodeQueryResultValue::ControlEdge { value } => Some(&value.evidence),
+        CodeQueryResultValue::TypestateWitness { value } => Some(&value.evidence),
+        CodeQueryResultValue::FlowWitness { value } => Some(&value.evidence),
+        CodeQueryResultValue::AbsentMemberWitness { value } => Some(&value.evidence),
+        CodeQueryResultValue::TaintFinding { value } => Some(&value.evidence),
+        _ => None,
     }
 }
 

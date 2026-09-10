@@ -72,12 +72,11 @@ pub(super) fn public_absent_member_witness(
             &finding.range,
             cache,
         ),
-        quality: CodeQuerySemanticEvidence {
-            proof: CodeQuerySemanticProof::Unproven,
-            proof_reason: None,
-            completeness: CodeQuerySemanticCompleteness::Partial,
-            completeness_reason: None,
-        },
+        evidence: CodeQuerySemanticEvidence::new(
+            CodeQuerySemanticProof::Unproven,
+            CodeQuerySemanticCompleteness::Partial,
+            None,
+        ),
         steps: Vec::new(),
         retained_bytes: 0,
         truncated: false,
@@ -90,9 +89,9 @@ pub(super) fn public_absent_member_witness(
     match &root.witness {
         Err(error) => {
             let reason = bounded_reason(&error.to_string());
-            row.quality.proof_reason = Some(reason.clone());
-            row.quality.completeness_reason =
-                Some("retained witness evidence is unavailable".to_owned());
+            row.evidence.reason = Some(format!(
+                "proof: {reason}; completeness: retained witness evidence is unavailable"
+            ));
             row.unavailable_reason = Some(reason);
         }
         Ok(witness) => {
@@ -112,18 +111,18 @@ pub(super) fn public_absent_member_witness(
                 witness.omitted_steps_lower_bound().saturating_add(omitted);
             row.alternatives_truncated = witness.alternatives_truncated();
             row.retention_truncated = witness.retention_truncated();
-            row.quality.proof = if witness.quality().is_proven() {
+            row.evidence.proof = if witness.quality().is_proven() {
                 CodeQuerySemanticProof::Proven
             } else {
                 CodeQuerySemanticProof::Unproven
             };
-            row.quality.completeness = if witness.quality().is_complete() && !row.truncated {
+            row.evidence.completeness = if witness.quality().is_complete() && !row.truncated {
                 CodeQuerySemanticCompleteness::Complete
             } else {
                 CodeQuerySemanticCompleteness::Partial
             };
             if row.truncated {
-                row.quality.completeness_reason = Some(format!(
+                row.evidence.reason = Some(format!(
                     "retained witness is truncated; at least {} step(s) omitted",
                     row.omitted_steps_lower_bound,
                 ));
@@ -200,24 +199,24 @@ pub(super) fn public_evidence(
     proof: &ProofStatus,
     completeness: &EvidenceCompleteness,
 ) -> CodeQuerySemanticEvidence {
-    CodeQuerySemanticEvidence {
-        proof: match proof {
+    CodeQuerySemanticEvidence::from_axis_reasons(
+        match proof {
             ProofStatus::Proven => CodeQuerySemanticProof::Proven,
             ProofStatus::Unproven(_) => CodeQuerySemanticProof::Unproven,
         },
-        proof_reason: match proof {
-            ProofStatus::Proven => None,
-            ProofStatus::Unproven(reason) => Some(bounded_reason(reason)),
-        },
-        completeness: match completeness {
+        match completeness {
             EvidenceCompleteness::Complete => CodeQuerySemanticCompleteness::Complete,
             EvidenceCompleteness::Partial(_) => CodeQuerySemanticCompleteness::Partial,
         },
-        completeness_reason: match completeness {
+        match proof {
+            ProofStatus::Proven => None,
+            ProofStatus::Unproven(reason) => Some(bounded_reason(reason)),
+        },
+        match completeness {
             EvidenceCompleteness::Complete => None,
             EvidenceCompleteness::Partial(reason) => Some(bounded_reason(reason)),
         },
-    }
+    )
 }
 
 pub(super) fn bounded_reason(reason: &str) -> String {
@@ -505,7 +504,7 @@ pub(crate) fn project_taint_finding_report_bounded(
                 path: sink.site().path().as_str().to_owned(),
                 language: sink.site().language().config_label(),
                 range: locator_range(workspace, sink.site()),
-                quality: public_taint_quality(
+                evidence: public_taint_quality(
                     witness.quality(),
                     truncated,
                     truncation_cause.as_deref(),
@@ -538,21 +537,20 @@ pub(crate) fn project_taint_finding_report_bounded(
             origins_truncated,
             witnesses,
             witnesses_truncated,
-            evidence: CodeQuerySemanticEvidence {
-                proof: if proven {
+            evidence: CodeQuerySemanticEvidence::new(
+                if proven {
                     CodeQuerySemanticProof::Proven
                 } else {
                     CodeQuerySemanticProof::Unproven
                 },
-                proof_reason: None,
-                completeness: if complete {
+                if complete {
                     CodeQuerySemanticCompleteness::Complete
                 } else {
                     CodeQuerySemanticCompleteness::Partial
                 },
-                completeness_reason: (!complete)
+                (!complete)
                     .then(|| "taint finding or retained origin evidence is incomplete".to_owned()),
-            },
+            ),
             ambiguous: !proven,
         };
         let projected_bytes = if max_projected_bytes == usize::MAX {
@@ -793,23 +791,22 @@ fn public_taint_quality(
     truncated: bool,
     truncation_cause: Option<&str>,
 ) -> CodeQuerySemanticEvidence {
-    CodeQuerySemanticEvidence {
-        proof: if quality.is_proven() {
+    CodeQuerySemanticEvidence::new(
+        if quality.is_proven() {
             CodeQuerySemanticProof::Proven
         } else {
             CodeQuerySemanticProof::Unproven
         },
-        proof_reason: None,
-        completeness: if quality.is_complete() && !truncated {
+        if quality.is_complete() && !truncated {
             CodeQuerySemanticCompleteness::Complete
         } else {
             CodeQuerySemanticCompleteness::Partial
         },
-        completeness_reason: truncated.then(|| match truncation_cause {
+        truncated.then(|| match truncation_cause {
             Some(cause) => format!("taint witness evidence is truncated: {cause}"),
             None => "taint witness evidence is truncated".to_owned(),
         }),
-    }
+    )
 }
 
 #[cfg(test)]

@@ -61,6 +61,17 @@ const JAVA_IMPLICIT_IMPORT_PACKAGE: &str = "java.lang";
 /// `Some(self)` to `IAnalyzer::type_hierarchy_provider`, and the target-spec
 /// and receiver-compatibility paths that hold only the concrete Java analyzer
 /// used it in both roles.
+/// What a file declares under one class fq name (see
+/// [`JavaSource::unique_class_by_fqn_in_file`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UniqueClassInFile {
+    None,
+    Unique(CodeUnit),
+    /// More than one distinct unit under the name: the lexical walk fails
+    /// closed rather than pick one.
+    Ambiguous,
+}
+
 pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
     fn all_files(&self) -> Vec<ProjectFile>;
@@ -97,6 +108,26 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
 
     /// The type identifiers a file spells, from the analyzer's persisted parse.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;
+
+    /// The one class declared in `file` under exactly `fqn`. Answered from
+    /// the in-memory declaration index, never a definition query: the lexical
+    /// type walk asks this once per enclosing scope of every type reference,
+    /// and a request-scoped per-file index keeps that O(1) on a 50k-line
+    /// generated class instead of rebuilding the file's sorted declaration
+    /// set per ask.
+    fn unique_class_by_fqn_in_file(&self, fqn: &str, file: &ProjectFile) -> UniqueClassInFile {
+        let units = self.declarations(file);
+        let mut candidates = units
+            .iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fqn);
+        let Some(first) = candidates.next() else {
+            return UniqueClassInFile::None;
+        };
+        if candidates.any(|candidate| candidate != first) {
+            return UniqueClassInFile::Ambiguous;
+        }
+        UniqueClassInFile::Unique(first.clone())
+    }
 
     /// The supertype names written on `code_unit`, unresolved.
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;

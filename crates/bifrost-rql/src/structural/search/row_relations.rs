@@ -841,6 +841,7 @@ pub(super) fn edge_row_expansions(
                 "{omitted} derived reference edge{} had no exact indexed target declaration and were omitted",
                 if omitted == 1 { "" } else { "s" }
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     expansions

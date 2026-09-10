@@ -18,7 +18,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::extractor::{
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
     CSharpDeclaredType, CSharpInitializerOwnerLookups, CSharpInitializerOwnerTarget,
-    argument_count as csharp_argument_count, canonical_builtin_type_identity,
+    argument_count as csharp_argument_count,
     collection_target_element_type_node as csharp_collection_target_element_type_node,
     first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node,

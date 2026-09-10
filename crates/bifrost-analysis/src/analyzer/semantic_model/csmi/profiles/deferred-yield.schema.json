@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csmi.brokk.ai/schema/profiles/deferred-yield/0.1/schema.json",
+  "title": "CSMI deferred-yield 0.1.0 payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "factory", "resume", "handleType", "roots", "construction", "resumeContract", "yield"],
+  "properties": {
+    "kind": { "const": "deferred-yield" },
+    "factory": { "$ref": "#/$defs/localId" },
+    "resume": { "$ref": "#/$defs/localId" },
+    "handleType": { "$ref": "#/$defs/localId" },
+    "receiverSubstitution": { "$ref": "#/$defs/uncertainOrReceiverSubstitution" },
+    "roots": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/rootShape" } },
+    "construction": { "$ref": "#/$defs/construction" },
+    "resumeContract": { "$ref": "#/$defs/resumeContract" },
+    "yield": { "$ref": "#/$defs/yieldContract" }
+  },
+  "$defs": {
+    "localId": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "typeExpression": {
+      "oneOf": [
+        { "$ref": "#/$defs/unknownType" },
+        { "$ref": "#/$defs/referenceType" },
+        { "$ref": "#/$defs/parameterType" }
+      ]
+    },
+    "unknownType": {
+      "type": "object", "additionalProperties": false, "required": ["kind"],
+      "properties": { "kind": { "const": "unknown" } }
+    },
+    "referenceType": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "symbol"],
+      "properties": {
+        "kind": { "const": "reference" }, "symbol": { "$ref": "#/$defs/localId" },
+        "arguments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/typeExpression" } }
+      }
+    },
+    "parameterType": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "symbol"],
+      "properties": { "kind": { "const": "parameter" }, "symbol": { "$ref": "#/$defs/localId" } }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false, "required": ["message"],
+      "properties": {
+        "message": { "$ref": "#/$defs/nonEmptyString" }, "code": { "$ref": "#/$defs/nonEmptyString" }, "details": true
+      }
+    },
+    "limitation": {
+      "type": "object", "additionalProperties": false, "required": ["kind"],
+      "properties": { "kind": { "$ref": "#/$defs/nonEmptyString" }, "diagnostic": { "$ref": "#/$defs/diagnostic" } },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "other" } }, "required": ["kind"] }, "then": { "required": ["diagnostic"] } }
+      ]
+    },
+    "unknownOrUnsupported": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "limitation"],
+      "properties": { "kind": { "enum": ["unknown", "unsupported"] }, "limitation": { "$ref": "#/$defs/limitation" } }
+    },
+    "inputReceiverRoot": {
+      "type": "object", "additionalProperties": false, "required": ["phase", "role"],
+      "properties": { "phase": { "const": "input" }, "role": { "const": "receiver" } }
+    },
+    "inputParameterRoot": {
+      "type": "object", "additionalProperties": false, "required": ["phase", "role", "position"],
+      "properties": { "phase": { "const": "input" }, "role": { "const": "parameter" }, "position": { "type": "integer", "minimum": 0 } }
+    },
+    "outputResultRoot": {
+      "type": "object", "additionalProperties": false, "required": ["phase", "role", "position"],
+      "properties": { "phase": { "const": "output" }, "role": { "const": "result" }, "position": { "type": "integer", "minimum": 0 } }
+    },
+    "boundaryRoot": {
+      "oneOf": [
+        { "$ref": "#/$defs/inputReceiverRoot" }, { "$ref": "#/$defs/inputParameterRoot" }, { "$ref": "#/$defs/outputResultRoot" }
+      ]
+    },
+    "shape": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "type"],
+          "properties": { "kind": { "const": "value" }, "type": { "$ref": "#/$defs/typeExpression" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "components"],
+          "properties": { "kind": { "const": "product" }, "components": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/shape" } } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "key", "value"],
+          "properties": {
+            "kind": { "const": "keyed" }, "key": { "$ref": "#/$defs/shape" }, "value": { "$ref": "#/$defs/shape" },
+            "entryComponents": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "enum": ["key", "value"] } }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "limitation"],
+          "properties": { "kind": { "const": "unknown" }, "limitation": { "$ref": "#/$defs/limitation" } }
+        }
+      ]
+    },
+    "rootShape": {
+      "type": "object", "additionalProperties": false, "required": ["callable", "root", "shape"],
+      "properties": { "callable": { "$ref": "#/$defs/localId" }, "root": { "$ref": "#/$defs/boundaryRoot" }, "shape": { "$ref": "#/$defs/shape" } }
+    },
+    "projection": {
+      "type": "object", "additionalProperties": false, "required": ["scheme", "schemeVersion", "steps"],
+      "properties": {
+        "scheme": { "const": "csmi.deferred-yield" }, "schemeVersion": { "const": "0.1.0" },
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } }
+      }
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "args"],
+          "properties": {
+            "kind": { "const": "entry" },
+            "args": {
+              "type": "object", "additionalProperties": false, "required": ["key"],
+              "properties": {
+                "key": {
+                  "oneOf": [
+                    { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "all" } } },
+                    { "type": "object", "additionalProperties": false, "required": ["kind", "position"], "properties": { "kind": { "const": "parameter" }, "position": { "type": "integer", "minimum": 0 } } }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "enum": ["entry-key", "entry-value"] } } }
+      ]
+    },
+    "location": {
+      "type": "object", "additionalProperties": false, "required": ["callable", "root"],
+      "properties": { "callable": { "$ref": "#/$defs/localId" }, "root": { "$ref": "#/$defs/boundaryRoot" }, "projection": { "$ref": "#/$defs/projection" } }
+    },
+    "uncertainOrReceiverSubstitution": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "declaration"],
+          "properties": { "kind": { "const": "receiver-arguments" }, "declaration": { "$ref": "#/$defs/localId" } }
+        },
+        { "$ref": "#/$defs/unknownOrUnsupported" }
+      ]
+    },
+    "invalidation": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "invalidates"],
+          "properties": { "kind": { "const": "source-mutation" }, "invalidates": { "enum": ["handle", "yield-delivery"] } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "invalidates"],
+          "properties": { "kind": { "const": "handle-drop" }, "invalidates": { "const": "yield-delivery" } }
+        },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "none-asserted" } } },
+        { "$ref": "#/$defs/unknownOrUnsupported" }
+      ]
+    },
+    "validity": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "invalidation"],
+          "properties": { "kind": { "enum": ["source-retained", "handle-retained"] }, "invalidation": { "$ref": "#/$defs/invalidation" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "invalidation"],
+          "properties": { "kind": { "const": "independent" }, "invalidation": { "$ref": "#/$defs/invalidation" } }
+        },
+        { "$ref": "#/$defs/unknownOrUnsupported" }
+      ]
+    },
+    "retention": {
+      "oneOf": [
+        { "enum": ["borrowed-shared", "borrowed-exclusive", "owned"] }, { "$ref": "#/$defs/unknownOrUnsupported" }
+      ]
+    },
+    "construction": {
+      "type": "object", "additionalProperties": false, "required": ["source", "handle", "retention", "validity"],
+      "properties": { "source": { "$ref": "#/$defs/location" }, "handle": { "$ref": "#/$defs/location" }, "retention": { "$ref": "#/$defs/retention" }, "validity": { "$ref": "#/$defs/validity" } }
+    },
+    "resumeContract": {
+      "type": "object", "additionalProperties": false, "required": ["handleInput", "yieldedResult", "factoryResultFlow"],
+      "properties": { "handleInput": { "$ref": "#/$defs/location" }, "yieldedResult": { "$ref": "#/$defs/location" }, "factoryResultFlow": { "$ref": "#/$defs/factoryResultFlow" } }
+    },
+    "factoryResultFlow": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "factoryResult", "resumeInput"],
+      "properties": { "kind": { "const": "required-consumer-proof" }, "factoryResult": { "$ref": "#/$defs/location" }, "resumeInput": { "$ref": "#/$defs/location" } }
+    },
+    "delivery": {
+      "oneOf": [
+        { "enum": ["shared-borrow", "exclusive-borrow", "move", "copy", "derived"] }, { "$ref": "#/$defs/unknownOrUnsupported" }
+      ]
+    },
+    "yieldMember": {
+      "type": "object", "additionalProperties": false, "required": ["position", "role", "source", "delivery"],
+      "properties": { "position": { "type": "integer", "minimum": 0 }, "role": { "enum": ["key", "value", "item"] }, "source": { "$ref": "#/$defs/location" }, "delivery": { "$ref": "#/$defs/delivery" } }
+    },
+    "yieldContract": {
+      "type": "object", "additionalProperties": false, "required": ["timing", "perResume", "perHandle", "members"],
+      "properties": { "timing": { "const": "after-construction" }, "perResume": { "const": "zero-or-one" }, "perHandle": { "const": "zero-or-more" }, "members": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/yieldMember" } } }
+    }
+  }
+}

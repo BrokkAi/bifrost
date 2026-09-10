@@ -138,7 +138,8 @@ pub(crate) fn load_endpoint_closure(
     };
     resolve_selector_locators(&mut definition.selector, analyzer)?;
     let selector_path = PolicySelectorPath::new("/endpoint/selector")?;
-    let resolved = resolve_parsed_selector(root, &parsed, selector_path, &definition.selector)?;
+    let resolved =
+        resolve_parsed_selector(root, &parsed, selector_path, &definition.selector, analyzer)?;
     let referenced_bytes = resolved
         .referenced
         .as_ref()

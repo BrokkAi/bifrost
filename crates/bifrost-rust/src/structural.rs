@@ -1,8 +1,8 @@
 //! Rust structural spec for `query_code`.
 
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
+    attach_terminal_callee, field_name_in_parent, first_named_child, is_field_of, nearest_ancestor,
+    node_range,
 };
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
@@ -30,6 +30,8 @@ use brokk_bifrost_core::analyzer::structural::routes::{
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
+
+use crate::syntax::{outer_attributes, unwrap_attributes};
 
 /// The left-nested qualified-path chains of the Rust grammar, paired with the
 /// field that names each link's own segment. A turbofish link
@@ -102,9 +104,22 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("block", NormalizedKind::Block),
 ];
 
+// Attribute wrappers carry syntax ownership but are not separate semantic
+// values. Role targets must name the payload that becomes a structural fact.
+fn attach_rust_role<'tree>(
+    sink: &mut RoleSink<'_>,
+    role: Role,
+    target: Node<'tree>,
+    name_of: impl FnOnce(Node<'tree>) -> Option<Node<'tree>>,
+) {
+    let target = unwrap_attributes(target);
+    sink.role_maybe_named(role, target, name_of(target));
+}
+
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
-    let mut current = expression;
+    let mut current = unwrap_attributes(expression);
     loop {
+        current = unwrap_attributes(current);
         match current.kind() {
             "identifier" | "field_identifier" | "type_identifier" | "self" | "super" | "crate" => {
                 return Some(current);
@@ -125,7 +140,7 @@ fn attach_scoped_receiver(sink: &mut RoleSink<'_>, function: Node<'_>) {
         return;
     }
     if let Some(path) = function.child_by_field_name("path") {
-        attach_role_with_derived_name(sink, Role::Receiver, path, expression_name_node);
+        attach_rust_role(sink, Role::Receiver, path, expression_name_node);
     }
 }
 
@@ -159,11 +174,11 @@ fn is_inside_negative_numeric_wrapper(node: Node<'_>) -> bool {
 fn attach_use_module(sink: &mut RoleSink<'_>, node: Node<'_>) {
     match node.kind() {
         "identifier" | "scoped_identifier" | "self" | "super" | "crate" => {
-            attach_role_with_derived_name(sink, Role::Module, node, expression_name_node);
+            attach_rust_role(sink, Role::Module, node, expression_name_node);
         }
         "use_as_clause" => {
             if let Some(alias) = node.child_by_field_name("alias") {
-                attach_role_with_derived_name(sink, Role::Module, alias, expression_name_node);
+                attach_rust_role(sink, Role::Module, alias, expression_name_node);
             } else if let Some(first) = first_named_child(node) {
                 attach_use_module(sink, first);
             }
@@ -214,31 +229,14 @@ fn is_inside_derive_attribute(node: Node<'_>, source: &str) -> bool {
 
 /// Attach `decorators` edges for the outer attributes written above `item`.
 ///
-/// tree-sitter-rust does not nest an item's attributes inside the item: an
-/// outer `#[...]` is an `attribute_item` sibling that precedes the item in the
-/// parent's child list, so the run of `attribute_item` siblings immediately
-/// before `item` is exactly its attribute list. Inner `#![...]` attributes are
-/// `inner_attribute_item` nodes that configure the enclosing module rather
-/// than the item that follows them, so the walk stops at the first sibling
-/// that is not an `attribute_item`.
+/// Tree-sitter-rust 0.24 stores an item's outer attributes in a grammar-owned
+/// `attributes` group. Inner `#![...]` attributes remain separate nodes that
+/// configure the enclosing module rather than the item.
 fn attach_outer_attribute_decorators(sink: &mut RoleSink<'_>, item: Node<'_>) {
-    let mut first = item;
-    while let Some(previous) = first.prev_named_sibling() {
-        if previous.kind() != "attribute_item" {
-            break;
+    for attribute_item in outer_attributes(item) {
+        if let Some(attribute) = first_named_child(attribute_item) {
+            attach_rust_role(sink, Role::Decorator, attribute, first_named_child);
         }
-        first = previous;
-    }
-    // Walk the run forward again so the edges land in source order.
-    let mut current = first;
-    while current.id() != item.id() {
-        if let Some(attribute) = first_named_child(current) {
-            attach_role_with_derived_name(sink, Role::Decorator, attribute, first_named_child);
-        }
-        let Some(next) = current.next_named_sibling() else {
-            break;
-        };
-        current = next;
     }
 }
 
@@ -430,6 +428,10 @@ impl StructuralSpec for RustStructuralSpec {
         Language::Rust
     }
 
+    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        (node.kind() == "macro_invocation").then_some("rust_macro_invocation")
+    }
+
     fn supports_boolean_literal_value(&self) -> bool {
         true
     }
@@ -615,7 +617,23 @@ impl StructuralSpec for RustStructuralSpec {
                         attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
                     }
                     if let Some(arguments) = macro_arguments(node) {
-                        attach_positional_argument_roles(sink, arguments, expression_name_node);
+                        for index in 0..arguments.named_child_count() {
+                            if !sink.should_continue() {
+                                break;
+                            }
+                            let Some(argument) = arguments.named_child(index) else {
+                                continue;
+                            };
+                            if matches!(argument.kind(), "line_comment" | "block_comment") {
+                                continue;
+                            }
+                            let argument = unwrap_attributes(argument);
+                            sink.argument_maybe_named(
+                                argument,
+                                expression_name_node(argument),
+                                false,
+                            );
+                        }
                     }
                 } else if let Some(function) = node.child_by_field_name("function") {
                     attach_terminal_callee(sink, function, expression_name_node(function));
@@ -623,19 +641,26 @@ impl StructuralSpec for RustStructuralSpec {
                     if target.kind() == "field_expression"
                         && let Some(value) = target.child_by_field_name("value")
                     {
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Receiver,
-                            value,
-                            expression_name_node,
-                        );
+                        attach_rust_role(sink, Role::Receiver, value, expression_name_node);
                     }
                     attach_scoped_receiver(sink, target);
                 }
                 if node.kind() != "macro_invocation"
                     && let Some(arguments) = node.child_by_field_name("arguments")
                 {
-                    attach_positional_argument_roles(sink, arguments, expression_name_node);
+                    for index in 0..arguments.named_child_count() {
+                        if !sink.should_continue() {
+                            break;
+                        }
+                        let Some(argument) = arguments.named_child(index) else {
+                            continue;
+                        };
+                        if matches!(argument.kind(), "line_comment" | "block_comment") {
+                            continue;
+                        }
+                        let argument = unwrap_attributes(argument);
+                        sink.argument_maybe_named(argument, expression_name_node(argument), false);
+                    }
                 }
             }
             NormalizedKind::FieldAccess => {
@@ -644,7 +669,7 @@ impl StructuralSpec for RustStructuralSpec {
                     sink.role_named(Role::Field, field, field);
                 }
                 if let Some(value) = node.child_by_field_name("value") {
-                    attach_role_with_derived_name(sink, Role::Object, value, expression_name_node);
+                    attach_rust_role(sink, Role::Object, value, expression_name_node);
                 }
             }
             NormalizedKind::Function
@@ -665,46 +690,26 @@ impl StructuralSpec for RustStructuralSpec {
                         sink.set_name(name);
                     }
                     if let Some(value) = node.child_by_field_name("value") {
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Right,
-                            value,
-                            expression_name_node,
-                        );
+                        attach_rust_role(sink, Role::Right, value, expression_name_node);
                     }
                 }
                 "let_declaration" => {
                     if let Some(pattern) = node.child_by_field_name("pattern") {
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Left,
-                            pattern,
-                            expression_name_node,
-                        );
+                        attach_rust_role(sink, Role::Left, pattern, expression_name_node);
                         if let Some(name) = expression_name_node(pattern) {
                             sink.set_name(name);
                         }
                     }
                     if let Some(value) = node.child_by_field_name("value") {
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Right,
-                            value,
-                            expression_name_node,
-                        );
+                        attach_rust_role(sink, Role::Right, value, expression_name_node);
                     }
                 }
                 "assignment_expression" | "compound_assignment_expr" => {
                     if let Some(left) = node.child_by_field_name("left") {
-                        attach_role_with_derived_name(sink, Role::Left, left, expression_name_node);
+                        attach_rust_role(sink, Role::Left, left, expression_name_node);
                     }
                     if let Some(right) = node.child_by_field_name("right") {
-                        attach_role_with_derived_name(
-                            sink,
-                            Role::Right,
-                            right,
-                            expression_name_node,
-                        );
+                        attach_rust_role(sink, Role::Right, right, expression_name_node);
                     }
                 }
                 _ => {}
@@ -721,12 +726,7 @@ impl StructuralSpec for RustStructuralSpec {
             },
             NormalizedKind::ForLoop => {
                 if let Some(value) = node.child_by_field_name("value") {
-                    attach_role_with_derived_name(
-                        sink,
-                        Role::Iterable,
-                        value,
-                        expression_name_node,
-                    );
+                    attach_rust_role(sink, Role::Iterable, value, expression_name_node);
                 }
             }
             NormalizedKind::CollectionLiteral => {
@@ -742,13 +742,83 @@ impl StructuralSpec for RustStructuralSpec {
                     let Some(child) = node.named_child(index) else {
                         continue;
                     };
-                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                    if matches!(
+                        child.kind(),
+                        "attributes" | "line_comment" | "block_comment"
+                    ) {
                         continue;
                     }
-                    attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
+                    attach_rust_role(sink, Role::Element, child, expression_name_node);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod attribute_element_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
+    use brokk_bifrost_core::hash::HashMap;
+
+    #[test]
+    fn collection_elements_exclude_attributes_and_target_expression_payloads() {
+        for source in [
+            "fn f() { let values = [#[Marker] first(), second()]; }",
+            "fn f() { let values = (#[Marker] first(), second()); }",
+        ] {
+            let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust tree");
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let mut facts = HashMap::default();
+            let mut collection = None;
+            let mut calls = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                let id = facts.len() as u32;
+                facts.insert(node.id(), id);
+                if matches!(node.kind(), "array_expression" | "tuple_expression") {
+                    collection = Some(node);
+                }
+                if node.kind() == "call_expression" {
+                    calls.push((node.start_byte(), id));
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            calls.sort_unstable();
+            let mut roles = Vec::new();
+            let mut occurrences = Vec::new();
+            let parents = ParentIndex::new(tree.root_node());
+            let mut sink = RoleSink::new(&facts, &mut roles, &mut occurrences, 32, None, &parents);
+            RUST_STRUCTURAL_SPEC.extract(
+                collection.unwrap(),
+                NormalizedKind::CollectionLiteral,
+                &mut sink,
+            );
+            assert_eq!(sink.into_parts().1, None);
+            assert_eq!(
+                roles.iter().map(|role| role.role).collect::<Vec<_>>(),
+                [Role::Element, Role::Element]
+            );
+            assert_eq!(
+                roles
+                    .iter()
+                    .map(|role| role.span.text(source))
+                    .collect::<Vec<_>>(),
+                ["first()", "second()"]
+            );
+            assert_eq!(
+                roles.iter().map(|role| role.node).collect::<Vec<_>>(),
+                calls
+                    .into_iter()
+                    .map(|(_, id)| Some(id))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }

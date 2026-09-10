@@ -1,3 +1,4 @@
+use crate::syntax::{item_has_path_attribute, unwrap_attributes};
 use brokk_bifrost_core::analyzer::common::{IdentifierSigil, node_ident_text};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
@@ -174,31 +175,19 @@ fn rust_bounded_declaration_label(node: Node<'_>, source: &str) -> String {
     format!("{} /* ... */", &full[..end])
 }
 
-/// Whether `item` is directly preceded by a test-evidence attribute
+/// Whether `item` carries an attached test-evidence attribute
 /// (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`, `#[sqlx::test]`, ...).
 ///
-/// In tree-sitter-rust, outer attributes attach to an item as *preceding
-/// siblings*, not children, so we walk backward across the contiguous run of
-/// attribute/comment siblings and stop at the first real item. This is the
+/// Tree-sitter-rust 0.24 associates outer attributes through an explicit
+/// wrapper, so read only that grammar-owned group. This is the
 /// per-item half of the test-region taint: combined with the taint inherited
 /// from enclosing items, it decides whether a declaration lies in a test
 /// region. It operates on whatever tree/source the caller passes, so it also
 /// covers the region reparse of item-position macros (#1015).
 fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
-    let mut prev = item.prev_sibling();
-    while let Some(node) = prev {
-        match node.kind() {
-            "attribute_item" => {
-                if crate::test_detection::rust_attribute_is_test_evidence(node, source) {
-                    return true;
-                }
-            }
-            "inner_attribute_item" | "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        prev = node.prev_sibling();
-    }
-    false
+    crate::syntax::outer_attributes(item).any(|attribute_item| {
+        crate::test_detection::rust_attribute_is_test_evidence(attribute_item, source)
+    })
 }
 
 pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
@@ -239,6 +228,7 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         let Some(child) = root.named_child(index) else {
             continue;
         };
+        let child = unwrap_attributes(child);
         if child.kind() == "use_declaration" {
             for import in rust_imports_from_use_declaration(child, source) {
                 crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, &import);
@@ -249,6 +239,7 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         let Some(child) = root.named_child(index) else {
             continue;
         };
+        let child = unwrap_attributes(child);
         match child.kind() {
             "use_declaration" => {}
             "struct_item" | "enum_item" | "trait_item" => {
@@ -457,6 +448,7 @@ fn visit_rust_class_like(
             let Some(child) = body.named_child(index) else {
                 continue;
             };
+            let child = unwrap_attributes(child);
             match child.kind() {
                 "field_declaration" | "enum_variant" | "const_item" => {
                     visit_rust_field(
@@ -552,6 +544,7 @@ fn visit_rust_module(
             let Some(child) = body.named_child(index) else {
                 continue;
             };
+            let child = unwrap_attributes(child);
             if child.kind() == "use_declaration" {
                 for import in rust_imports_from_use_declaration(child, source) {
                     crate::lexical_scope::insert_rust_import_binding(
@@ -566,6 +559,7 @@ fn visit_rust_module(
             let Some(child) = body.named_child(index) else {
                 continue;
             };
+            let child = unwrap_attributes(child);
             match child.kind() {
                 "function_item" => {
                     visit_rust_function(
@@ -685,8 +679,8 @@ fn visit_rust_function(
     // `proc_macro_derive(Name)` exports its argument, not the function's name.
     // Keep it a function: declaration-node lookup requires the exported name
     // and the declaration identifier to agree.
-    if crate::imports::rust_item_has_attribute(node, source, "proc_macro")
-        || crate::imports::rust_item_has_attribute(node, source, "proc_macro_attribute")
+    if item_has_path_attribute(node, source, "proc_macro")
+        || item_has_path_attribute(node, source, "proc_macro_attribute")
     {
         return register_rust_macro(
             file,
@@ -883,6 +877,7 @@ fn visit_rust_macro_invocation_definitions(
         let Some(child) = root.named_child(index) else {
             continue;
         };
+        let child = unwrap_attributes(child);
         if child.kind() == "use_declaration" {
             let imports = rust_imports_from_use_declaration(child, source);
             for import in &imports {
@@ -899,6 +894,7 @@ fn visit_rust_macro_invocation_definitions(
         let Some(child) = root.named_child(index) else {
             continue;
         };
+        let child = unwrap_attributes(child);
         visit_rust_macro_item(
             file,
             source,
@@ -951,7 +947,7 @@ fn rust_reparsed_items_are_indexable(root: Node<'_>) -> bool {
     let mut cursor = root.walk();
     let mut saw_item = false;
     for child in root.named_children(&mut cursor) {
-        match child.kind() {
+        match unwrap_attributes(child).kind() {
             "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item" => {}
             kind if rust_is_indexable_item_kind(kind) => saw_item = true,
             _ => return false,
@@ -1135,6 +1131,7 @@ pub fn rust_rules_item_macro_definitions(
         let mut children = scope.named_children(&mut cursor).collect::<Vec<_>>();
         children.reverse();
         for child in children {
+            let child = unwrap_attributes(child);
             if child.kind() == "macro_definition" {
                 if let Some(name) = rust_macro_definition_name(child, source) {
                     definitions.push((
@@ -2071,7 +2068,9 @@ pub fn rust_nominal_type_path(node: Node<'_>, source: &str) -> Option<Vec<String
     let mut pending = vec![node];
     while let Some(candidate) = pending.pop() {
         match candidate.kind() {
-            "type_identifier" | "identifier" => {
+            // Primitive spellings can name user declarations (for example
+            // half::f16). The parser classifies the token, not its binding.
+            "type_identifier" | "identifier" | "primitive_type" => {
                 let name = rust_node_text(candidate, source).trim();
                 if !name.is_empty() {
                     return Some(vec![name.to_string()]);
@@ -2107,7 +2106,7 @@ fn rust_path_components(node: Node<'_>, source: &str) -> Vec<String> {
     let mut pending = vec![node];
     while let Some(candidate) = pending.pop() {
         match candidate.kind() {
-            "crate" | "self" | "super" | "identifier" | "type_identifier" => {
+            "crate" | "self" | "super" | "identifier" | "type_identifier" | "primitive_type" => {
                 let text = rust_node_text(candidate, source).trim();
                 if !text.is_empty() {
                     components.push(text.to_string());
@@ -2271,7 +2270,12 @@ fn rust_callable_parameter_type_spellings(
     let mut cursor = parameters.walk();
     parameters
         .named_children(&mut cursor)
-        .filter(|parameter| parameter.kind() != "attribute_item")
+        .filter(|parameter| {
+            !matches!(
+                parameter.kind(),
+                "attribute_item" | "attributes" | "line_comment" | "block_comment"
+            )
+        })
         .map(|parameter| {
             if parameter.kind() != "parameter" {
                 return None;
@@ -2560,6 +2564,27 @@ macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
         assert!(!rust_builtin_macro_does_not_replay_item_arguments(
             "external_cfg_items"
         ));
+    }
+
+    #[test]
+    fn primitive_spelling_does_not_hide_a_user_types_impl_members() {
+        let source = "pub struct f16; impl f16 { pub fn to_f32(&self) -> f32 { 0.0 } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "half.rs");
+        let parsed = parse_rust_file(&file, source, &tree);
+        assert!(
+            parsed.children.iter().any(|(owner, members)| {
+                owner.identifier() == "f16"
+                    && members.iter().any(|member| member.identifier() == "to_f32")
+            }),
+            "the source-declared f16 must retain its impl members: {:?}",
+            parsed.children
+        );
     }
 
     #[test]

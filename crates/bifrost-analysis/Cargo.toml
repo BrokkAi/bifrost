@@ -63,13 +63,13 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-c-sharp = "0.23.1"
+tree-sitter-c-sharp = { package = "brokk-tree-sitter-c-sharp", version = "=0.23.6" }
 tree-sitter-cpp = "0.23.4"
 tree-sitter-java = "0.23.5"
 tree-sitter-php = "0.23.11"
 tree-sitter-rbs = "=0.2.2"
 tree-sitter-ruby = "0.23.1"
-tree-sitter-rust = "0.24.0"
+tree-sitter-rust = { package = "brokk-tree-sitter-rust", version = "=0.24.3" }
 tree-sitter-typescript = "0.23.2"
 tar = { version = "0.4.44", default-features = false }
 walkdir = "2.5.0"

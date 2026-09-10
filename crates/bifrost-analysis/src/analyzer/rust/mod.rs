@@ -8,6 +8,7 @@ mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod external;
 mod fact_catch_up;
+pub(crate) mod generated_model;
 mod graph_support;
 mod hierarchy;
 mod imports;
@@ -1497,6 +1498,15 @@ fn expand_rust_imported_external_callee(
 impl LanguageSupport for RustSupport {
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn bind_generated_symbols(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        symbols: &mut [crate::analyzer::semantic_model::SemanticModelSymbol],
+    ) {
+        generated_model::bind_generated_functions(file, source, symbols);
     }
 
     fn call_argument_conversion_prover(

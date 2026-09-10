@@ -36,6 +36,323 @@ pub const CSMI_COLLECTION_FLOW_PROFILE_ID: &str = "csmi.collection-flow";
 pub const CSMI_COLLECTION_FLOW_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_COLLECTION_FLOW_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/collection-flow/0.1/schema.json";
+pub const CSMI_DEFERRED_YIELD_PROFILE_ID: &str = "csmi.deferred-yield";
+pub const CSMI_DEFERRED_YIELD_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_DEFERRED_YIELD_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/deferred-yield/0.1/schema.json";
+
+/// Typed payload for the CSMI deferred-yield vocabulary.
+///
+/// This is intentionally independent from collection-flow. A collection-flow
+/// transfer happens during a callable invocation; this contract describes a
+/// handle established by construction and a later resume boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldPayload {
+    pub kind: CsmiDeferredYieldKind,
+    pub factory: LocalId,
+    pub resume: LocalId,
+    #[serde(rename = "handleType")]
+    pub handle_type: LocalId,
+    #[serde(
+        rename = "receiverSubstitution",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receiver_substitution: Option<CsmiDeferredYieldSubstitution>,
+    pub roots: Vec<CsmiDeferredYieldRoot>,
+    pub construction: CsmiDeferredYieldConstruction,
+    #[serde(rename = "resumeContract")]
+    pub resume_contract: CsmiDeferredYieldResumeContract,
+    #[serde(rename = "yield")]
+    pub yield_contract: CsmiDeferredYieldContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiDeferredYieldKind {
+    #[serde(rename = "deferred-yield")]
+    DeferredYield,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldSubstitution {
+    ReceiverArguments { declaration: LocalId },
+    Unknown { limitation: CsmiProfileLimitation },
+    Unsupported { limitation: CsmiProfileLimitation },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldRoot {
+    pub callable: LocalId,
+    pub root: CsmiDeferredYieldBoundaryRoot,
+    pub shape: CsmiDeferredYieldShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiDeferredYieldBoundaryRoot {
+    InputReceiver(CsmiInputReceiverRoot),
+    InputParameter(CsmiInputParameterRoot),
+    OutputResult(CsmiOutputResultRoot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldShape {
+    Value {
+        #[serde(rename = "type")]
+        r#type: CsmiDeferredYieldTypeExpression,
+    },
+    Product {
+        components: Vec<CsmiDeferredYieldShape>,
+    },
+    Keyed {
+        key: Box<CsmiDeferredYieldShape>,
+        value: Box<CsmiDeferredYieldShape>,
+        #[serde(
+            rename = "entryComponents",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        entry_components: Option<Vec<CsmiDeferredYieldEntryComponent>>,
+    },
+    Unknown {
+        limitation: CsmiProfileLimitation,
+    },
+}
+
+/// Deferred-yield shapes use the core CSMI type-expression vocabulary. Keep a
+/// profile-named alias for callers that want to state the narrower contract;
+/// semantic validation rejects core intrinsic expressions, which the profile
+/// does not permit.
+pub type CsmiDeferredYieldTypeExpression = CsmiTypeExpression;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldEntryComponent {
+    Key,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldLocation {
+    pub callable: LocalId,
+    pub root: CsmiDeferredYieldBoundaryRoot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<CsmiDeferredYieldProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldProjection {
+    pub scheme: String,
+    #[serde(rename = "schemeVersion")]
+    pub scheme_version: String,
+    pub steps: Vec<CsmiDeferredYieldProjectionStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldProjectionStep {
+    Entry { args: CsmiDeferredYieldEntryArgs },
+    EntryKey,
+    EntryValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldEntryArgs {
+    pub key: CsmiDeferredYieldEntrySelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldEntrySelector {
+    All,
+    Parameter { position: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldConstruction {
+    pub source: CsmiDeferredYieldLocation,
+    pub handle: CsmiDeferredYieldLocation,
+    pub retention: CsmiDeferredYieldRetention,
+    pub validity: CsmiDeferredYieldValidity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldResumeContract {
+    #[serde(rename = "handleInput")]
+    pub handle_input: CsmiDeferredYieldLocation,
+    #[serde(rename = "yieldedResult")]
+    pub yielded_result: CsmiDeferredYieldLocation,
+    #[serde(rename = "factoryResultFlow")]
+    pub factory_result_flow: CsmiDeferredYieldFactoryResultFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldFactoryResultFlow {
+    pub kind: CsmiDeferredYieldFactoryResultFlowKind,
+    #[serde(rename = "factoryResult")]
+    pub factory_result: CsmiDeferredYieldLocation,
+    #[serde(rename = "resumeInput")]
+    pub resume_input: CsmiDeferredYieldLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldFactoryResultFlowKind {
+    RequiredConsumerProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiDeferredYieldRetention {
+    Mode(CsmiDeferredYieldRetentionMode),
+    Uncertain(CsmiDeferredYieldUncertainty),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldRetentionMode {
+    BorrowedShared,
+    BorrowedExclusive,
+    Owned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldUncertainty {
+    pub kind: CsmiDeferredYieldUncertaintyKind,
+    pub limitation: CsmiProfileLimitation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldValidity {
+    SourceRetained {
+        invalidation: CsmiDeferredYieldInvalidation,
+    },
+    HandleRetained {
+        invalidation: CsmiDeferredYieldInvalidation,
+    },
+    Independent {
+        invalidation: CsmiDeferredYieldInvalidation,
+    },
+    Unknown {
+        limitation: CsmiProfileLimitation,
+    },
+    Unsupported {
+        limitation: CsmiProfileLimitation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiDeferredYieldInvalidation {
+    SourceMutation {
+        invalidates: CsmiDeferredYieldInvalidates,
+    },
+    HandleDrop {
+        invalidates: CsmiDeferredYieldHandleDropInvalidates,
+    },
+    NoneAsserted,
+    Unknown {
+        limitation: CsmiProfileLimitation,
+    },
+    Unsupported {
+        limitation: CsmiProfileLimitation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldInvalidates {
+    Handle,
+    YieldDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldHandleDropInvalidates {
+    YieldDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldUncertaintyKind {
+    Unknown,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldContract {
+    pub timing: CsmiDeferredYieldTiming,
+    #[serde(rename = "perResume")]
+    pub per_resume: CsmiDeferredYieldPerResume,
+    #[serde(rename = "perHandle")]
+    pub per_handle: CsmiDeferredYieldPerHandle,
+    pub members: Vec<CsmiDeferredYieldMember>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldTiming {
+    AfterConstruction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldPerResume {
+    ZeroOrOne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldPerHandle {
+    ZeroOrMore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiDeferredYieldMember {
+    pub position: u32,
+    pub role: CsmiDeferredYieldMemberRole,
+    pub source: CsmiDeferredYieldLocation,
+    pub delivery: CsmiDeferredYieldDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldMemberRole {
+    Key,
+    Value,
+    Item,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CsmiDeferredYieldDelivery {
+    Mode(CsmiDeferredYieldDeliveryMode),
+    Uncertain(CsmiDeferredYieldUncertainty),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiDeferredYieldDeliveryMode {
+    SharedBorrow,
+    ExclusiveBorrow,
+    Move,
+    Copy,
+    Derived,
+}
 
 /// Typed payload for the CSMI collection-flow vocabulary.
 ///

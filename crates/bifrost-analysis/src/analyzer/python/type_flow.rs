@@ -1677,7 +1677,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // guard remainders, scoped writes, and open builtin call results.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-exact-class-polarity-v31",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-v32",
         )
         .expect("adapter name is non-empty")
     }

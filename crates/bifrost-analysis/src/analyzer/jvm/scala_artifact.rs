@@ -1213,6 +1213,7 @@ fn finish_production(
         collection_flows: (!collection_flows.is_empty()).then_some(CollectionFlowsPayload {
             flows: collection_flows,
         }),
+        deferred_yields: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),

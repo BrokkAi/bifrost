@@ -933,7 +933,7 @@ impl ScanCtx<'_> {
             || (self.target_is_path_qualifier
                 && segments
                     .iter()
-                    .any(|segment| self.name_gate.admits(segment)))
+                    .any(|segment| self.name_gate.admits(segment) || *segment == "Self"))
     }
 
     /// The single-segment counterpart of [`Self::path_could_name_target`].
@@ -961,7 +961,9 @@ impl ScanCtx<'_> {
                 let Some(text) = simple_node_text(candidate, self.source) else {
                     continue;
                 };
-                if self.name_gate.admits(strip_raw_identifier_prefix(&text)) {
+                if self.name_gate.admits(strip_raw_identifier_prefix(&text))
+                    || (self.target_is_path_qualifier && text == "Self")
+                {
                     return true;
                 }
             }
@@ -977,6 +979,32 @@ impl ScanCtx<'_> {
 
     pub(super) fn target_identifier(&self) -> &str {
         self.target.identifier()
+    }
+
+    pub(super) fn self_path_matches_target(&self, node: Node<'_>) -> bool {
+        let Some(type_node) =
+            enclosing_impl_item(node).and_then(|impl_item| impl_item.child_by_field_name("type"))
+        else {
+            return false;
+        };
+        rust_resolve_type_node_fqn(
+            self.analyzer,
+            self.refs.token(),
+            self.support,
+            self.file,
+            self.source,
+            type_node,
+            Some(type_node.start_byte()),
+        )
+        .is_some_and(|fqn| {
+            fqn_matches_owner(
+                self.rust,
+                self.refs.token(),
+                self.support,
+                &fqn,
+                self.target,
+            )
+        })
     }
 
     fn target_reference_namespace(&self) -> RustReferenceNamespace {
@@ -1517,17 +1545,21 @@ fn scan_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
                     if is_rust_non_reference_underscore(node, ctx.source) {
                         return TreeWalkAction::Descend;
                     }
-                    if !ctx.name_gate.admits(text) {
+                    if text != "Self" && !ctx.name_gate.admits(text) {
                         return TreeWalkAction::Descend;
                     }
                     if brokk_bifrost_rust::graph::ast::is_rust_declaration_name(node) {
                         return TreeWalkAction::Descend;
                     }
-                    // `matches_identifier` gates on the same condition; checking it
-                    // here also skips token-tree role classification and the
-                    // whole-tree shadowing walk.
+                    // Capital `Self` names the target through the enclosing
+                    // implementation's structured type field instead of spelling
+                    // the target name, so it cannot use the ordinary name gate.
                     let resolution_started = RustScanPhaseTimings::start();
-                    let matches = identifier_matches_target(node, root, text, ctx);
+                    let matches = if text == "Self" {
+                        ctx.target_is_path_qualifier && ctx.self_path_matches_target(node)
+                    } else {
+                        identifier_matches_target(node, root, text, ctx)
+                    };
                     if let Some(started) = resolution_started
                         && started.elapsed().as_millis() >= 10
                     {

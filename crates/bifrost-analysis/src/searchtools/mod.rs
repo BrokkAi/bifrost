@@ -9,8 +9,7 @@ use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, FuzzyResolveBudget, FuzzyResolveStop, is_bare_symbol_query,
     resolve_codeunit_exact, resolve_codeunit_fuzzy, resolve_codeunit_fuzzy_bounded,
-    resolve_codeunit_fuzzy_with, resolve_enclosing_codeunits, strip_trailing_call_suffix,
-    symbol_selector_leaf,
+    resolve_enclosing_codeunits, strip_trailing_call_suffix, symbol_selector_leaf,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{

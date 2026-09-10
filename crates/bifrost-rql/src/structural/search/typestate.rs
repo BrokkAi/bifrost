@@ -446,6 +446,7 @@ impl TypestateQueryState {
             branch: Vec::new(),
             language: "workspace",
             message,
+            exhausted_roots: Vec::new(),
         });
     }
 
@@ -599,24 +600,23 @@ impl SemanticTypestateFindingValue {
                         path: self.public.path.clone(),
                         language: self.public.language,
                         range: self.public.range,
-                        quality: CodeQuerySemanticEvidence {
-                            proof: if witness.quality().is_proven() {
+                        evidence: CodeQuerySemanticEvidence::new(
+                            if witness.quality().is_proven() {
                                 CodeQuerySemanticProof::Proven
                             } else {
                                 CodeQuerySemanticProof::Unproven
                             },
-                            proof_reason: None,
-                            completeness: if witness.quality().is_complete() && removed_steps == 0 {
+                            if witness.quality().is_complete() && removed_steps == 0 {
                                 CodeQuerySemanticCompleteness::Complete
                             } else {
                                 CodeQuerySemanticCompleteness::Partial
                             },
-                            completeness_reason: (removed_steps > 0).then(|| {
+                            (removed_steps > 0).then(|| {
                                 format!(
                                     "query witness limits omitted at least {removed_steps} step(s)"
                                 )
                             }),
-                        },
+                        ),
                         uncertainty: public_uncertainty(witness.uncertainty()),
                         abstained: witness.abstained(),
                         steps,

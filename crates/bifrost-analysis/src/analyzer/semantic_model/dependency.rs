@@ -1122,6 +1122,7 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
 
+        let artifact_read_scope = crate::profiling::scope("semantic_pack.read_exact_artifacts");
         let mut exact_artifacts = Vec::with_capacity(dependency.artifacts.len());
         for artifact in &dependency.artifacts {
             if is_cancelled(cancellation) {
@@ -1219,6 +1220,7 @@ pub fn prepare_dependency_semantic_packs(
                 }
             }
         }
+        drop(artifact_read_scope);
         if cancelled {
             break;
         }
@@ -1238,7 +1240,11 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+        let reusable = {
+            let _scope = crate::profiling::scope("semantic_pack.lookup_generated");
+            reusable_generated_pack(catalog, &key, dependency, &input_digest)
+        };
+        match reusable {
             Ok(Some(prepared)) => {
                 record_reused_generated_pack(
                     prepared,
@@ -1291,7 +1297,11 @@ pub fn prepare_dependency_semantic_packs(
 
         // Another process may have completed this exact production while this
         // process waited for the key-specific lock.
-        match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+        let reusable = {
+            let _scope = crate::profiling::scope("semantic_pack.lookup_generated_after_lock");
+            reusable_generated_pack(catalog, &key, dependency, &input_digest)
+        };
+        match reusable {
             Ok(Some(prepared)) => {
                 record_reused_generated_pack(
                     prepared,
@@ -1315,7 +1325,11 @@ pub fn prepare_dependency_semantic_packs(
                 cancelled = true;
                 break;
             }
-            if let Err(error) = acquire(catalog, &AcquisitionRequest::GeneratedProduction(&key)) {
+            let acquisition = {
+                let _scope = crate::profiling::scope("semantic_pack.acquire_generated");
+                acquire(catalog, &AcquisitionRequest::GeneratedProduction(&key))
+            };
+            if let Err(error) = acquisition {
                 diagnostics.warning(
                     "production.acquire",
                     Some(&dependency.id),
@@ -1324,7 +1338,12 @@ pub fn prepare_dependency_semantic_packs(
             }
             // The provider can only attempt installation. Re-read through the
             // ordinary verified catalog path before falling back to production.
-            match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+            let reusable = {
+                let _scope =
+                    crate::profiling::scope("semantic_pack.lookup_generated_after_acquire");
+                reusable_generated_pack(catalog, &key, dependency, &input_digest)
+            };
+            match reusable {
                 Ok(Some(prepared)) => {
                     record_reused_generated_pack(
                         prepared,
@@ -1728,7 +1747,11 @@ fn resolve_declared_dependency_pack(
     if is_cancelled(cancellation) {
         return Err(DeclaredPackCancelled);
     }
-    if let Err(error) = acquire(catalog, &AcquisitionRequest::DeclaredPack(&query)) {
+    let acquisition = {
+        let _scope = crate::profiling::scope("semantic_pack.acquire_declared");
+        acquire(catalog, &AcquisitionRequest::DeclaredPack(&query))
+    };
+    if let Err(error) = acquisition {
         diagnostics.warning(
             "dependency.acquire",
             Some(&dependency.id),

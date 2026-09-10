@@ -37,7 +37,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
@@ -355,6 +355,39 @@ impl JavaAnalyzer {
 /// Every method forwards to one of this analyzer's own accessors or memo
 /// cells, so the cells stay here and the free functions in
 /// [`brokk_bifrost_jvm::java::graph_support`] cannot reach past this surface.
+/// One file's class declarations by fq name, built once per request from the
+/// in-memory declaration set (see `JavaSource::unique_class_by_fqn_in_file`).
+struct JavaFileClassIndex {
+    classes_by_fqn: HashMap<String, Vec<CodeUnit>>,
+}
+
+impl JavaFileClassIndex {
+    fn build(declarations: BTreeSet<CodeUnit>) -> Self {
+        let mut classes_by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for unit in declarations.into_iter().filter(CodeUnit::is_class) {
+            classes_by_fqn.entry(unit.fq_name()).or_default().push(unit);
+        }
+        Self { classes_by_fqn }
+    }
+
+    fn unique_class(&self, fqn: &str) -> brokk_bifrost_jvm::java::graph_support::UniqueClassInFile {
+        use brokk_bifrost_jvm::java::graph_support::UniqueClassInFile;
+        let Some(units) = self.classes_by_fqn.get(fqn) else {
+            return UniqueClassInFile::None;
+        };
+        let first = &units[0];
+        if units[1..].iter().any(|candidate| candidate != first) {
+            return UniqueClassInFile::Ambiguous;
+        }
+        UniqueClassInFile::Unique(first.clone())
+    }
+}
+
+#[derive(Default)]
+struct JavaFileClassIndexMemo {
+    by_file: Mutex<HashMap<ProjectFile, Arc<JavaFileClassIndex>>>,
+}
+
 impl JavaSource for JavaAnalyzer {
     fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
@@ -388,6 +421,41 @@ impl JavaSource for JavaAnalyzer {
     ) {
         let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Java);
         read(&lookup);
+    }
+
+    fn unique_class_by_fqn_in_file(
+        &self,
+        fqn: &str,
+        file: &ProjectFile,
+    ) -> brokk_bifrost_jvm::java::graph_support::UniqueClassInFile {
+        let memo = self
+            .inner
+            .active_query_request_memo::<JavaFileClassIndexMemo>();
+        let index = match &memo {
+            Some(memo) => {
+                let cached = memo
+                    .by_file
+                    .lock()
+                    .expect("Java file class index memo poisoned")
+                    .get(file)
+                    .cloned();
+                match cached {
+                    Some(index) => index,
+                    None => {
+                        let index =
+                            Arc::new(JavaFileClassIndex::build(self.inner.declarations(file)));
+                        memo.by_file
+                            .lock()
+                            .expect("Java file class index memo poisoned")
+                            .entry(file.clone())
+                            .or_insert_with(|| Arc::clone(&index))
+                            .clone()
+                    }
+                }
+            }
+            None => Arc::new(JavaFileClassIndex::build(self.inner.declarations(file))),
+        };
+        index.unique_class(fqn)
     }
 
     fn source_types_in_packages(
@@ -1346,5 +1414,14 @@ impl crate::analyzer::usages::MemberFamilyProvider for JavaAnalyzer {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
         crate::analyzer::usages::java_member_family(self, self, member, cancellation)
+    }
+
+    fn external_member_family(
+        &self,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        self.resolve_external_member_family(self, identity, max_visits, cancellation)
     }
 }

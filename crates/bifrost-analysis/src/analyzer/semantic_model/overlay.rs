@@ -20,7 +20,7 @@ use super::{
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
 const MODEL_URI_BASE: &str = "bifrost-model://v1";
@@ -183,8 +183,17 @@ pub struct SemanticModelProvenance {
     pub ambiguous: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFunctionScope {
+    pub(crate) file: String,
+    pub(crate) module: String,
+    pub(crate) local: Option<(usize, usize)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticModelSymbol {
+    #[serde(skip)]
+    pub(crate) rust_generated_scope: Option<Box<GeneratedFunctionScope>>,
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<String>,
@@ -615,6 +624,7 @@ pub struct SemanticModelOverlay {
     /// declaration surface to prove a miss against.
     declaration_surface_languages: Vec<String>,
     symbols: Vec<SemanticModelSymbol>,
+    has_rust_generated_functions: bool,
     relations: Vec<SemanticModelRelation>,
     symbols_by_id: HashMap<String, Vec<usize>>,
     symbols_by_name: HashMap<String, Vec<usize>>,
@@ -626,6 +636,8 @@ pub struct SemanticModelOverlay {
     runtime_values: Vec<RuntimeValueContracts>,
     collection_flows: Vec<CollectionFlowContract>,
     collection_flows_by_callable: HashMap<String, Vec<usize>>,
+    deferred_yields: Vec<DeferredYieldContract>,
+    deferred_yields_by_scope: HashMap<(String, String, String), Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -662,6 +674,27 @@ pub struct CollectionFlowContract {
     pub coverage: Option<Completeness>,
 }
 
+/// One deferred-yield fact retained with the activation evidence of its
+/// publishing shard. Endpoint IDs remain linked scope, rather than being
+/// reduced to names or a factory-only index.
+#[derive(Debug)]
+pub struct DeferredYieldContract {
+    pub provenance: SemanticModelProvenance,
+    pub factory: String,
+    pub resume: String,
+    pub handle_type: String,
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiDeferredYieldPayload,
+    pub coverage: Option<Completeness>,
+}
+
+impl DeferredYieldContract {
+    pub fn is_complete(&self) -> bool {
+        self.coverage == Some(Completeness::Complete)
+            && self.provenance.completeness == SemanticModelCompleteness::Complete
+            && !self.provenance.ambiguous
+    }
+}
+
 impl CollectionFlowContract {
     pub fn is_complete(&self) -> bool {
         self.coverage == Some(Completeness::Complete)
@@ -694,6 +727,7 @@ impl SemanticModelOverlay {
                 extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
                 declaration_surface_languages: Vec::new(),
                 symbols: Vec::new(),
+                has_rust_generated_functions: false,
                 relations: Vec::new(),
                 symbols_by_id: HashMap::default(),
                 symbols_by_name: HashMap::default(),
@@ -705,6 +739,8 @@ impl SemanticModelOverlay {
                 runtime_values: Vec::new(),
                 collection_flows: Vec::new(),
                 collection_flows_by_callable: HashMap::default(),
+                deferred_yields: Vec::new(),
+                deferred_yields_by_scope: HashMap::default(),
             });
         }
         let mut type_ids = Vec::new();
@@ -712,6 +748,7 @@ impl SemanticModelOverlay {
         let mut relation_ids = Vec::new();
         let mut runtime_values = Vec::new();
         let mut collection_flows = Vec::new();
+        let mut deferred_yields = Vec::new();
         let mut declaration_surface_languages: Vec<String> = Vec::new();
         for shard in active.shards() {
             if cancellation.is_cancelled() {
@@ -744,6 +781,25 @@ impl SemanticModelOverlay {
                         callable: flow.callable.clone(),
                         payload: flow.payload.clone(),
                         coverage: flow.coverage,
+                    });
+                }
+            }
+            if let Some(payload) = shard.shard.deferred_yields() {
+                for contract in &payload.yields {
+                    deferred_yields.push(DeferredYieldContract {
+                        provenance: provenance(
+                            active,
+                            shard,
+                            &contract.factory,
+                            &model_location(shard, "deferred-yield", &contract.factory),
+                            None,
+                            false,
+                        ),
+                        factory: contract.factory.clone(),
+                        resume: contract.resume.clone(),
+                        handle_type: contract.handle_type.clone(),
+                        payload: contract.payload.clone(),
+                        coverage: contract.coverage,
                     });
                 }
             }
@@ -882,11 +938,25 @@ impl SemanticModelOverlay {
                 .or_insert_with(Vec::new)
                 .push(index);
         }
+        let mut deferred_yields_by_scope = HashMap::default();
+        for (index, contract) in deferred_yields.iter().enumerate() {
+            deferred_yields_by_scope
+                .entry((
+                    contract.factory.clone(),
+                    contract.resume.clone(),
+                    contract.handle_type.clone(),
+                ))
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
         let mut overlay = Self {
             active_model_set_hash: active.active_model_set_hash().to_string(),
             extraction_gaps: active.extraction_gaps().to_vec(),
             extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
             declaration_surface_languages,
+            has_rust_generated_functions: symbols
+                .iter()
+                .any(crate::analyzer::is_rust_generated_function),
             symbols,
             relations,
             symbols_by_id: HashMap::default(),
@@ -899,6 +969,8 @@ impl SemanticModelOverlay {
             runtime_values,
             collection_flows,
             collection_flows_by_callable,
+            deferred_yields,
+            deferred_yields_by_scope,
         };
         overlay.rebuild_indexes(cancellation)?;
         if active
@@ -942,6 +1014,10 @@ impl SemanticModelOverlay {
         self.gapped(&declaration).or_else(|| self.gapped(owner))
     }
 
+    pub(crate) fn has_rust_generated_functions(&self) -> bool {
+        self.has_rust_generated_functions
+    }
+
     pub fn symbols(&self) -> &[SemanticModelSymbol] {
         &self.symbols
     }
@@ -966,6 +1042,46 @@ impl SemanticModelOverlay {
         callable: &str,
     ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
         self.collection_flow_match(self.collection_flows_by_callable.get(callable))
+    }
+
+    pub fn deferred_yield_contracts(&self) -> &[DeferredYieldContract] {
+        &self.deferred_yields
+    }
+
+    pub fn deferred_yields_for(
+        &self,
+        factory: &str,
+        resume: &str,
+        handle_type: &str,
+    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
+        self.deferred_yield_match(self.deferred_yields_by_scope.get(&(
+            factory.to_owned(),
+            resume.to_owned(),
+            handle_type.to_owned(),
+        )))
+    }
+
+    pub fn deferred_yields_for_factory(
+        &self,
+        factory: &str,
+    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
+        let mut records = self
+            .deferred_yields
+            .iter()
+            .filter(|contract| contract.factory == factory)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            (&left.resume, &left.handle_type).cmp(&(&right.resume, &right.handle_type))
+        });
+        let disposition = match records.len() {
+            0 => SemanticModelOverlayDisposition::Empty,
+            1 => SemanticModelOverlayDisposition::Unique,
+            _ => SemanticModelOverlayDisposition::Conflict,
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
+        }
     }
 
     pub fn runtime_exposures(
@@ -1908,6 +2024,11 @@ impl SemanticModelOverlay {
                     .saturating_add(symbol.owner_id.as_ref().map_or(0, String::capacity))
                     .saturating_add(symbol.name.capacity())
                     .saturating_add(symbol.qualified_name.capacity())
+                    .saturating_add(symbol.rust_generated_scope.as_ref().map_or(0, |scope| {
+                        std::mem::size_of_val(scope.as_ref())
+                            .saturating_add(scope.module.capacity())
+                            .saturating_add(scope.file.capacity())
+                    }))
                     .saturating_add(symbol.language.capacity())
                     .saturating_add(symbol.signature.as_ref().map_or(0, String::capacity))
                     .saturating_add(symbol.aliases.iter().map(String::capacity).sum::<usize>())
@@ -1951,10 +2072,30 @@ impl SemanticModelOverlay {
                 );
             }
         }
+        let deferred_bytes = self.deferred_yields.iter().fold(0usize, |bytes, contract| {
+            bytes
+                .saturating_add(std::mem::size_of::<DeferredYieldContract>())
+                .saturating_add(contract.factory.capacity())
+                .saturating_add(contract.resume.capacity())
+                .saturating_add(contract.handle_type.capacity())
+                .saturating_add(contract.provenance.retained_string_bytes())
+        });
+        for ((factory, resume, handle_type), posting) in &self.deferred_yields_by_scope {
+            index_bytes = index_bytes
+                .saturating_add(factory.capacity())
+                .saturating_add(resume.capacity())
+                .saturating_add(handle_type.capacity())
+                .saturating_add(
+                    posting
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+        }
         u64::try_from(
             std::mem::size_of::<Self>()
                 .saturating_add(symbol_bytes)
                 .saturating_add(relation_bytes)
+                .saturating_add(deferred_bytes)
                 .saturating_add(index_bytes),
         )
         .unwrap_or(u64::MAX)
@@ -1990,6 +2131,40 @@ impl SemanticModelOverlay {
             SemanticModelOverlayDisposition::Conflict
         } else {
             SemanticModelOverlayDisposition::Unique
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
+        }
+    }
+
+    fn deferred_yield_match(
+        &self,
+        indexes: Option<&Vec<usize>>,
+    ) -> SemanticModelOverlayMatch<'_, DeferredYieldContract> {
+        let Some(indexes) = indexes else {
+            return SemanticModelOverlayMatch {
+                records: Vec::new(),
+                disposition: SemanticModelOverlayDisposition::Empty,
+            };
+        };
+        let records = indexes
+            .iter()
+            .map(|index| &self.deferred_yields[*index])
+            .collect::<Vec<_>>();
+        let disposition = match records.first() {
+            None => SemanticModelOverlayDisposition::Empty,
+            Some(first)
+                if records.iter().all(|record| {
+                    !record.provenance.ambiguous
+                        && record.payload == first.payload
+                        && record.coverage == first.coverage
+                        && record.provenance.pack_digest == first.provenance.pack_digest
+                }) =>
+            {
+                SemanticModelOverlayDisposition::Unique
+            }
+            Some(_) => SemanticModelOverlayDisposition::Conflict,
         };
         SemanticModelOverlayMatch {
             records,
@@ -3416,6 +3591,9 @@ fn generated_overlay_facts(
                         }
                     }
                 }
+                crate::analyzer::languages::language_support(provider.structural_language())
+                    .expect("every structural fact provider language has registered support")
+                    .bind_generated_symbols(file, facts.source(), &mut generated.symbols);
                 Ok(generated)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3490,8 +3668,13 @@ fn rule_trigger_matches(
                         )
                 })
         }
-        RuleTrigger::MacroInvocation { name: expected }
-        | RuleTrigger::GeneratorInvocation { name: expected } => {
+        RuleTrigger::MacroInvocation { name: expected } => {
+            node.kind == NormalizedKind::Call
+                && (crate::analyzer::common::language_for_file(file) != Language::Rust
+                    || node.construct.as_deref() == Some("rust_macro_invocation"))
+                && name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
+        }
+        RuleTrigger::GeneratorInvocation { name: expected } => {
             node.kind == NormalizedKind::Call
                 && name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
         }
@@ -3922,10 +4105,9 @@ fn role_span_anchor(
     enclosing: Option<&CodeUnit>,
 ) -> SemanticModelAuthoredAnchor {
     let mut anchor = span_anchor(facts, file, target.span, enclosing);
-    if let Some(enclosing) = enclosing {
-        let name = target.name.unwrap_or(target.span).text(facts.source());
-        anchor.symbol = format!("{}.{}", enclosing.fq_name(), name);
-    }
+    anchor.symbol =
+        projected_role_value(CaptureProjection::StableId, facts, target, file, enclosing)
+            .expect("every argument role has a stable capture identity");
     anchor
 }
 
@@ -4127,6 +4309,7 @@ fn emit_rule_match(
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
                         locator_path: None,
+                        rust_generated_scope: None,
                         location,
                         provenance: model_provenance,
                     },
@@ -4179,6 +4362,7 @@ fn emit_rule_match(
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
                             locator_path: None,
+                            rust_generated_scope: None,
                             location,
                             provenance: model_provenance,
                         }
@@ -4585,6 +4769,7 @@ fn type_symbol(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
+        rust_generated_scope: None,
         provenance: provenance(
             active,
             shard,
@@ -4645,6 +4830,7 @@ fn member_symbol(
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
+        rust_generated_scope: None,
         provenance: provenance(
             active,
             shard,
@@ -5163,6 +5349,9 @@ mod tests {
             extraction_gaps: Vec::new(),
             extraction_gap_by_declaration: HashMap::default(),
             declaration_surface_languages: Vec::new(),
+            has_rust_generated_functions: symbols
+                .iter()
+                .any(crate::analyzer::is_rust_generated_function),
             symbols,
             relations,
             symbols_by_id: HashMap::default(),
@@ -5175,6 +5364,8 @@ mod tests {
             runtime_values: Vec::new(),
             collection_flows: Vec::new(),
             collection_flows_by_callable: HashMap::default(),
+            deferred_yields: Vec::new(),
+            deferred_yields_by_scope: HashMap::default(),
         };
         overlay
             .rebuild_indexes(&crate::CancellationToken::default())
@@ -5308,6 +5499,7 @@ mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
+            rust_generated_scope: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{qualified_name}"),
                 range: SemanticModelRange {
@@ -5423,6 +5615,7 @@ mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
+            rust_generated_scope: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{}", owner.qualified_name),
                 range: SemanticModelRange {

@@ -88,11 +88,13 @@ pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 pub use member_family::{
-    Admission, CSharpFamilyRules, JavaFamilyRules, MemberFacts, MemberFamilyAnswer,
-    MemberFamilyEdge, MemberFamilyProvider, MemberFamilySupport, NominalFamilyRules,
-    ScalaFamilyRules, csharp_member_family, csharp_member_family_capability, java_member_family,
-    java_member_family_capability, member_family_id, member_family_support, nominal_member_family,
-    nominal_member_family_capability, scala_member_family, scala_member_family_capability,
+    Admission, CSharpFamilyRules, ExternalMemberFamilyAnswer, ExternalMemberFamilyIncompleteReason,
+    ExternalMemberFamilyStatus, JavaFamilyRules, JvmExternalMemberIdentity, JvmReceiverSemantics,
+    MemberFacts, MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, MemberFamilySupport,
+    NominalFamilyRules, ScalaFamilyRules, csharp_member_family, csharp_member_family_capability,
+    java_member_family, java_member_family_capability, member_family_id, member_family_support,
+    nominal_member_family, nominal_member_family_capability, scala_member_family,
+    scala_member_family_capability,
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,

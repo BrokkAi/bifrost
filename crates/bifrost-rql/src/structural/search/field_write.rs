@@ -209,5 +209,6 @@ fn push_incomplete(
         branch: Vec::new(),
         language: language.config_label(),
         message: message.to_string(),
+        exhausted_roots: Vec::new(),
     });
 }

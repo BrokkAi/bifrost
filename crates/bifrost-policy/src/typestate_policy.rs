@@ -2663,41 +2663,28 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 event: semantic_event,
             } = &event.trigger
             {
-                let exit_kind = procedure_exit_kind(*semantic_event);
                 for subject in subjects
                     .iter()
                     .filter(|subject| event.applies_to_subjects.contains(&subject.endpoint))
                 {
-                    let root = &subject.root;
-                    let exit = match exit_kind {
-                        ProtocolProcedureExitKind::Normal => {
-                            root.point_handle(root.semantics().normal_exit_point())
-                        }
-                        ProtocolProcedureExitKind::Exceptional => {
-                            root.point_handle(root.semantics().exceptional_exit_point())
-                        }
+                    for (point, quality) in semantic_event_points(&subject.root, *semantic_event)? {
+                        events.push(PendingEventBinding {
+                            event: event_key.clone(),
+                            policy_event: event.id.clone(),
+                            subject: subject.key.clone(),
+                            site: TypestateObservationSite::program_point(
+                                point,
+                                TypestateBindingContext::root(),
+                            ),
+                            phase: EventObservationPhase::AnalysisRoot(*semantic_event),
+                            order,
+                            role: TypestateObjectRole::CurrentObject,
+                            quality,
+                            endpoint: None,
+                            modeled_external_effect: None,
+                            alias_derived: false,
+                        });
                     }
-                    .ok_or_else(|| {
-                        TypestatePolicyCompileError::SemanticUnavailable(
-                            "analysis root has no requested exit point".to_owned(),
-                        )
-                    })?;
-                    events.push(PendingEventBinding {
-                        event: event_key.clone(),
-                        policy_event: event.id.clone(),
-                        subject: subject.key.clone(),
-                        site: TypestateObservationSite::program_point(
-                            exit,
-                            TypestateBindingContext::root(),
-                        ),
-                        phase: EventObservationPhase::AnalysisRoot(*semantic_event),
-                        order,
-                        role: TypestateObjectRole::CurrentObject,
-                        quality: TypestateBindingQuality::proven_unique(),
-                        endpoint: None,
-                        modeled_external_effect: None,
-                        alias_derived: false,
-                    });
                 }
                 continue;
             }
@@ -2781,38 +2768,25 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 })?;
             match &expectation.trigger {
                 ResolvedTypestateTerminalTrigger::SemanticEvent { event } => {
-                    let exit_kind = procedure_exit_kind(*event);
                     for subject in subjects.iter().filter(|subject| {
                         expectation.applies_to_subjects.contains(&subject.endpoint)
                     }) {
-                        let root = &subject.root;
-                        let exit = match exit_kind {
-                            ProtocolProcedureExitKind::Normal => {
-                                root.point_handle(root.semantics().normal_exit_point())
-                            }
-                            ProtocolProcedureExitKind::Exceptional => {
-                                root.point_handle(root.semantics().exceptional_exit_point())
-                            }
+                        for (point, quality) in semantic_event_points(&subject.root, *event)? {
+                            terminals.push(PendingTerminalBinding {
+                                expectation: expectation_key.clone(),
+                                policy_expectation: expectation.id.clone(),
+                                subject: subject.key.clone(),
+                                site: TypestateObservationSite::program_point(
+                                    point,
+                                    TypestateBindingContext::root(),
+                                ),
+                                phase: TerminalObservationPhase::AnalysisRoot(*event),
+                                role: TypestateObjectRole::CurrentObject,
+                                quality,
+                                endpoint: None,
+                                alias_derived: false,
+                            });
                         }
-                        .ok_or_else(|| {
-                            TypestatePolicyCompileError::SemanticUnavailable(
-                                "analysis root has no requested exit point".to_owned(),
-                            )
-                        })?;
-                        terminals.push(PendingTerminalBinding {
-                            expectation: expectation_key.clone(),
-                            policy_expectation: expectation.id.clone(),
-                            subject: subject.key.clone(),
-                            site: TypestateObservationSite::program_point(
-                                exit,
-                                TypestateBindingContext::root(),
-                            ),
-                            phase: TerminalObservationPhase::AnalysisRoot(*event),
-                            role: TypestateObjectRole::CurrentObject,
-                            quality: TypestateBindingQuality::proven_unique(),
-                            endpoint: None,
-                            alias_derived: false,
-                        });
                     }
                 }
                 ResolvedTypestateTerminalTrigger::MatchEndpoints { endpoints, phase } => {
@@ -5177,11 +5151,7 @@ fn event_occurrence(trigger: &ResolvedTypestateEventTrigger) -> ProtocolEventOcc
                 phase: protocol_observation_phase(*phase),
             }
         }
-        ResolvedTypestateEventTrigger::SemanticEvent { event } => {
-            ProtocolEventOccurrence::ProcedureExit {
-                kind: procedure_exit_kind(*event),
-            }
-        }
+        ResolvedTypestateEventTrigger::SemanticEvent { event } => semantic_event_occurrence(*event),
     }
 }
 
@@ -5198,11 +5168,25 @@ fn terminal_observation(
                 },
             }
         }
-        ResolvedTypestateTerminalTrigger::SemanticEvent { event } => {
-            ProtocolTerminalObservationSpec::AnalysisRootExit {
-                kind: procedure_exit_kind(*event),
+        ResolvedTypestateTerminalTrigger::SemanticEvent { event } => match event {
+            PolicySemanticEvent::SuspensionBoundary { .. } => {
+                ProtocolTerminalObservationSpec::Event {
+                    observation: ProtocolObservationSpec {
+                        occurrence: ProtocolEventOccurrence::SuspensionBoundary,
+                    },
+                }
             }
-        }
+            PolicySemanticEvent::NormalProcedureExit { .. } => {
+                ProtocolTerminalObservationSpec::AnalysisRootExit {
+                    kind: ProtocolProcedureExitKind::Normal,
+                }
+            }
+            PolicySemanticEvent::ExceptionalProcedureExit { .. } => {
+                ProtocolTerminalObservationSpec::AnalysisRootExit {
+                    kind: ProtocolProcedureExitKind::Exceptional,
+                }
+            }
+        },
     }
 }
 
@@ -5217,12 +5201,81 @@ const fn protocol_observation_phase(phase: EndpointObservationPhase) -> Protocol
     }
 }
 
-const fn procedure_exit_kind(event: PolicySemanticEvent) -> ProtocolProcedureExitKind {
+const fn semantic_event_occurrence(event: PolicySemanticEvent) -> ProtocolEventOccurrence {
     match event {
-        PolicySemanticEvent::NormalProcedureExit { .. } => ProtocolProcedureExitKind::Normal,
+        PolicySemanticEvent::NormalProcedureExit { .. } => ProtocolEventOccurrence::ProcedureExit {
+            kind: ProtocolProcedureExitKind::Normal,
+        },
         PolicySemanticEvent::ExceptionalProcedureExit { .. } => {
-            ProtocolProcedureExitKind::Exceptional
+            ProtocolEventOccurrence::ProcedureExit {
+                kind: ProtocolProcedureExitKind::Exceptional,
+            }
         }
+        PolicySemanticEvent::SuspensionBoundary { .. } => {
+            ProtocolEventOccurrence::SuspensionBoundary
+        }
+    }
+}
+
+fn semantic_event_points(
+    root: &ProcedureHandle,
+    event: PolicySemanticEvent,
+) -> Result<Vec<(ProgramPointHandle, TypestateBindingQuality)>, TypestatePolicyCompileError> {
+    use brokk_bifrost_analysis::analyzer::semantic::{SemanticCapability, SemanticEffect};
+    let semantics = root.semantics();
+    match event {
+        PolicySemanticEvent::SuspensionBoundary { .. } => {
+            if !root
+                .artifact()
+                .capabilities()
+                .is_available(SemanticCapability::AsyncSuspendResume)
+            {
+                return Err(TypestatePolicyCompileError::SemanticUnavailable(
+                    "async suspension evidence is unsupported for the analysis root".to_owned(),
+                ));
+            }
+            let gaps = semantics
+                .gaps()
+                .iter()
+                .filter(|gap| gap.capability == SemanticCapability::AsyncSuspendResume)
+                .collect::<Vec<_>>();
+            if !gaps.is_empty() {
+                return Err(TypestatePolicyCompileError::SemanticUnavailable(format!(
+                    "suspension boundary coverage is incomplete: {gaps:?}"
+                )));
+            }
+            let mut points = Vec::new();
+            for point in semantics.points() {
+                for event in &point.events {
+                    if matches!(event.effect, SemanticEffect::AsyncSuspend { .. }) {
+                        let evidence = semantics
+                            .evidence_row(event.evidence)
+                            .expect("validated suspension retains evidence");
+                        points.push((
+                            root.point_handle(point.id)
+                                .expect("validated suspension retains its point"),
+                            TypestateBindingQuality::new(
+                                evidence.proof.clone(),
+                                evidence.completeness.clone(),
+                                TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
+                                    .expect("one current object is valid multiplicity"),
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(points)
+        }
+        PolicySemanticEvent::NormalProcedureExit { .. } => Ok(vec![(
+            root.point_handle(semantics.normal_exit_point())
+                .expect("validated procedure retains normal exit"),
+            TypestateBindingQuality::proven_unique(),
+        )]),
+        PolicySemanticEvent::ExceptionalProcedureExit { .. } => Ok(vec![(
+            root.point_handle(semantics.exceptional_exit_point())
+                .expect("validated procedure retains exceptional exit"),
+            TypestateBindingQuality::proven_unique(),
+        )]),
     }
 }
 

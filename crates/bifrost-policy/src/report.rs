@@ -95,28 +95,9 @@ impl PolicyRuleDescriptor {
         let mut selector_schemas = policy
             .resolved_selectors()
             .iter()
-            .flat_map(|selector| {
-                selector.as_query().map_or_else(
-                    || {
-                        selector
-                            .query_bindings()
-                            .into_iter()
-                            .map(|binding| {
-                                SelectorSchemaVersionResolution::new(
-                                    PolicySelectorPath::new(&binding.path)
-                                        .expect("resolved row binding path is valid"),
-                                    binding.schema_resolution,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                    |(schema, _)| {
-                        vec![SelectorSchemaVersionResolution::new(
-                            selector.path.clone(),
-                            *schema,
-                        )]
-                    },
-                )
+            .map(|selector| {
+                let (schema, _) = selector.as_query().expect("selectors are RQL queries");
+                SelectorSchemaVersionResolution::new(selector.path.clone(), *schema)
             })
             .collect::<Vec<_>>();
         selector_schemas.sort_by(|left, right| left.path.cmp(&right.path));
@@ -388,9 +369,6 @@ impl Serialize for EndpointDependencyWire<'_> {
         match value.selector_schemas() {
             ResolvedEndpointSelectorSchemas::Query(resolution) => {
                 state.serialize_field("selector_schema", &SchemaResolutionWire(*resolution))?;
-            }
-            ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-                state.serialize_field("selector_schemas", &EndpointRowSchemasWire(bindings))?;
             }
         }
         state.serialize_field("model", &EndpointModelWire(value.model()))?;
@@ -764,9 +742,6 @@ impl Serialize for ManifestEntryWire<'_> {
             ResolvedEndpointSelectorSchemas::Query(resolution) => {
                 state.serialize_field("selector_schema", &SchemaResolutionWire(*resolution))?;
             }
-            ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-                state.serialize_field("selector_schemas", &EndpointRowSchemasWire(bindings))?;
-            }
         }
         state.serialize_field("semantic_hash", &DisplayWire(self.0.semantic_hash))?;
         state.serialize_field(
@@ -774,24 +749,6 @@ impl Serialize for ManifestEntryWire<'_> {
             &DisplayWire(self.0.analysis_projection_hash),
         )?;
         state.end()
-    }
-}
-
-struct EndpointRowSchemasWire<'a>(&'a [super::resolved::ResolvedEndpointRowBindingSchema]);
-
-impl Serialize for EndpointRowSchemasWire<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for binding in self.0 {
-            sequence.serialize_element(&SelectorSchemaVersionResolution::new(
-                binding.path.clone(),
-                binding.resolution,
-            ))?;
-        }
-        sequence.end()
     }
 }
 
@@ -3909,7 +3866,7 @@ mod tests {
         let PolicyAnalysis::Match { spec } = &definition.analysis else {
             panic!("fixture must be a match policy");
         };
-        let PolicySelector::Inline { schema, query } = &spec.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(

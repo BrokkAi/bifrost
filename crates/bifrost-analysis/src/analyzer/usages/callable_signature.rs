@@ -120,32 +120,21 @@ pub struct CallableSignatureReport {
     pub parameters: Vec<SignatureParameterRow>,
 }
 
-/// Canonical source declaration-site identity shared by signature consumers.
-/// Byte ranges distinguish overload sites; line numbering is presentation only.
-pub fn declaration_site_id(unit: &CodeUnit, range: crate::analyzer::Range) -> String {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.callable_signature_site.v1");
-    digest.push(crate::path_utils::rel_path_string(unit.source()).as_bytes());
-    digest.push(unit.fq_name().as_bytes());
-    digest.push(&range.start_byte.to_le_bytes());
-    digest.push(&range.end_byte.to_le_bytes());
-    digest.finish().to_string()
-}
-
 /// Project every persisted signature entry of `unit` into rows.
 ///
-/// `declaration_id` is the caller's canonical identity digest for the
-/// declaration, which anchors every row id here; `entries` is the analyzer's
-/// own `signature_metadata` answer, in persisted order. An empty slice still
-/// yields exactly one report, whose coverage is `unrecorded`.
+/// `declaration_site_id` is the caller's declaration identity plus exact source
+/// span, which anchors every row id here; `entries` is the analyzer's own
+/// `signature_metadata` answer, in persisted order. An empty slice still yields
+/// exactly one report, whose coverage is `unrecorded`.
 pub fn callable_signature_reports(
-    declaration_id: &str,
+    declaration_site_id: &str,
     unit: &CodeUnit,
     entries: &[SignatureMetadata],
 ) -> Vec<CallableSignatureReport> {
     if entries.is_empty() {
         return vec![CallableSignatureReport {
             signature: CallableSignatureRow {
-                id: signature_row_id(declaration_id, 0),
+                id: signature_row_id(declaration_site_id, 0),
                 ordinal: 0,
                 coverage: SignatureCoverage::Unrecorded,
                 role: role_of(unit, None),
@@ -163,17 +152,17 @@ pub fn callable_signature_reports(
     entries
         .iter()
         .enumerate()
-        .map(|(ordinal, metadata)| report_for_entry(declaration_id, unit, ordinal, metadata))
+        .map(|(ordinal, metadata)| report_for_entry(declaration_site_id, unit, ordinal, metadata))
         .collect()
 }
 
 fn report_for_entry(
-    declaration_id: &str,
+    declaration_site_id: &str,
     unit: &CodeUnit,
     ordinal: usize,
     metadata: &SignatureMetadata,
 ) -> CallableSignatureReport {
-    let signature_id = signature_row_id(declaration_id, ordinal);
+    let signature_id = signature_row_id(declaration_site_id, ordinal);
     let arity = metadata.callable_arity();
     let declared_types = metadata.callable_parameter_types();
     let last_index = metadata.parameters().len().saturating_sub(1);
@@ -222,9 +211,9 @@ fn report_for_entry(
     }
 }
 
-fn signature_row_id(declaration_id: &str, ordinal: usize) -> String {
+fn signature_row_id(declaration_site_id: &str, ordinal: usize) -> String {
     let mut digest = LengthDelimitedDigest::new(CALLABLE_SIGNATURE_ID_DOMAIN);
-    digest.push(declaration_id.as_bytes());
+    digest.push(declaration_site_id.as_bytes());
     digest.push(&ordinal.to_le_bytes());
     digest.finish().to_string()
 }

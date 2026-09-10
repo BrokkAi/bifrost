@@ -295,7 +295,7 @@ sink(input);
     );
     assert!(matches!(
         &evidence.stable_owner_candidate,
-        Some(CodeQueryStableOwnerCandidate {
+        Some(CodeQueryStableOwnerCandidate::Derived {
             derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
             semantic_key,
             ..
@@ -387,7 +387,7 @@ export function write(input: string) {
     ));
     assert!(matches!(
         &evidence.stable_owner_candidate,
-        Some(CodeQueryStableOwnerCandidate {
+        Some(CodeQueryStableOwnerCandidate::Derived {
             derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
             ..
         })
@@ -533,11 +533,9 @@ export function invoke(service: Service) { service.run(); }
                 Some(Sha256::digest(&source.as_bytes()[byte_span]).into())
             );
             assert!(matches!(
-                evidence.stable_owner_candidate,
-                Some(CodeQueryStableOwnerCandidate {
-                    derivation: CodeQueryStableOwnerDerivation::AnalyzerDeclarationId,
-                    ..
-                })
+                &evidence.stable_owner_candidate,
+                Some(CodeQueryStableOwnerCandidate::Declaration { id, .. })
+                    if id.starts_with("decl:v1:")
             ));
         }
     }
@@ -1845,6 +1843,7 @@ fn occurrence_row_projection_exposes_typed_identity_and_rejects_unknown_fields()
         end_line: 1,
         signature: None,
         id: Some("decl-1".to_string()),
+        site_id: Some("decl-1:0-1".to_string()),
         node_range: None,
         semantic_model: None,
     };
@@ -1905,6 +1904,7 @@ fn occurrence_row_projection_does_not_invent_one_identity_for_ambiguous_targets(
         end_line: 1,
         signature: None,
         id: Some(id.to_string()),
+        site_id: Some(format!("{id}:0-1")),
         node_range: None,
         semantic_model: None,
     };

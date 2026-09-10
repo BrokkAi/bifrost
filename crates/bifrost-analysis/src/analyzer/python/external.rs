@@ -168,6 +168,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             diagnostics,
@@ -346,6 +347,7 @@ impl PythonArtifactPackProducer {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             completeness,
@@ -505,6 +507,7 @@ impl PythonArtifactPackProducer {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             completeness,
@@ -1068,8 +1071,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let is_static = decorators
             .iter()
             .any(|decorator| decorator == "staticmethod");
-        let signature =
+        let mut signature =
             function_signature(definition, self.source, self.limits.max_signature_depth);
+        if let Some(signature) = &mut signature
+            && let Some(return_type) = definition.child_by_field_name("return_type")
+        {
+            let declared = self.hierarchy_type_ref(return_type, &owner, guard);
+            signature.returns = Some(canonical_python_return_type(declared));
+        }
         self.record_hierarchy_binding(&owner, &name, None, guard, false);
         self.push_member(owner, name, member_kind, is_static, signature, guard);
     }
@@ -2445,37 +2454,10 @@ fn type_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn type_name_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
-    let mut segments = Vec::new();
-    let mut current = node;
-    loop {
-        match current.kind() {
-            "identifier" => {
-                segments.push(node_identifier(Some(current), source)?);
-                break;
-            }
-            // One wrapper around the shape, and the generic name of a
-            // subscripted annotation, are both the first named child.
-            "type" | "generic_type" | "subscript" => current = current.named_child(0)?,
-            "attribute" => {
-                segments.push(node_identifier(
-                    current.child_by_field_name("attribute"),
-                    source,
-                )?);
-                current = current.child_by_field_name("object")?;
-            }
-            // `member_type` carries no fields: its children are the
-            // qualifying type and the member identifier, in that order.
-            "member_type" => {
-                let mut children = named_children(current);
-                let qualifier = children.next()?;
-                segments.push(node_identifier(children.next(), source)?);
-                current = qualifier;
-            }
-            _ => return None,
-        }
-    }
-    segments.reverse();
-    Some(segments)
+    brokk_bifrost_python::syntax::python_static_type_path(node)?
+        .into_iter()
+        .map(|segment| node_identifier(Some(segment), source))
+        .collect()
 }
 
 fn any_type() -> TypeRef {
@@ -2483,6 +2465,30 @@ fn any_type() -> TypeRef {
         name: "Any".to_owned(),
         arguments: Vec::new(),
         nullable: false,
+    }
+}
+
+fn canonical_python_return_type(reference: TypeRef) -> TypeRef {
+    match reference {
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } if name == "typing_extensions.NoReturn" => TypeRef::Named {
+            name: "typing.NoReturn".to_owned(),
+            arguments,
+            nullable,
+        },
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } if name == "typing_extensions.Never" => TypeRef::Named {
+            name: "typing.Never".to_owned(),
+            arguments,
+            nullable,
+        },
+        reference => reference,
     }
 }
 
@@ -4616,6 +4622,60 @@ def run(
             );
             assert!(!parameters.iter().any(|parameter| parameter.variadic));
         }
+        drop(collector);
+        let (diagnostics, suppressed) = diagnostics.finish();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(suppressed, SuppressedDiagnostics::default());
+    }
+
+    #[test]
+    fn stub_signature_qualifies_imported_return_annotations() {
+        let source = r#"import typing_extensions as t
+from typing import NoReturn as NR
+
+def first() -> NR: ...
+def second() -> t.Never: ...
+"#;
+        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut collector = PythonApiCollector::new(
+            "sys",
+            Path::new("sys.pyi"),
+            "sys.pyi".to_owned(),
+            source,
+            &limits,
+            &mut diagnostics,
+        );
+        collector.collect(tree.root_node(), None);
+        let returns = collector
+            .members
+            .iter()
+            .filter(|member| matches!(member.name.as_str(), "first" | "second"))
+            .map(|member| {
+                member
+                    .signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref())
+                    .cloned()
+                    .expect("fixture functions have return annotations")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            returns,
+            [
+                TypeRef::Named {
+                    name: "typing.NoReturn".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                TypeRef::Named {
+                    name: "typing.Never".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+            ]
+        );
         drop(collector);
         let (diagnostics, suppressed) = diagnostics.finish();
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");

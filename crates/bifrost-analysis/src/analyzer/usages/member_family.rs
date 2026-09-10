@@ -37,6 +37,7 @@ use brokk_bifrost_core::analyzer::model::CallableOverrideModifier;
 use brokk_bifrost_core::analyzer::structural::resolution::{
     MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
 };
+pub use brokk_bifrost_jvm::realm::{JvmExternalMemberIdentity, JvmReceiverSemantics};
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::LengthDelimitedDigest;
@@ -231,6 +232,63 @@ impl MemberFamilyAnswer {
     }
 }
 
+/// Why an external-root workspace member-family query is incomplete even
+/// though it is supported and was not cancelled or budget-exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalMemberFamilyIncompleteReason {
+    ExternalRootUnresolved,
+    HierarchyFactsUnavailable,
+    MemberFactsUnavailable,
+    OverloadIdentityUnproven,
+    MixedJvmRealmUnsupported(Language),
+}
+
+/// Completion of an external-root workspace member-family query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalMemberFamilyStatus {
+    Complete,
+    Incomplete(ExternalMemberFamilyIncompleteReason),
+    Unsupported,
+    Cancelled,
+    BudgetExhausted,
+}
+
+/// Exact workspace declarations that can implement or override one external
+/// JVM member.
+///
+/// Only `Complete` carries candidates. Every other status preserves a
+/// targetless dispatch boundary and publishes no partial candidate set as an
+/// exhaustive answer.
+#[derive(Debug, Clone)]
+pub struct ExternalMemberFamilyAnswer {
+    pub status: ExternalMemberFamilyStatus,
+    pub candidates: Vec<CodeUnit>,
+    pub visited: usize,
+}
+
+impl ExternalMemberFamilyAnswer {
+    pub fn unsupported() -> Self {
+        Self::stopped(ExternalMemberFamilyStatus::Unsupported, 0)
+    }
+
+    pub fn incomplete(reason: ExternalMemberFamilyIncompleteReason, visited: usize) -> Self {
+        Self::stopped(ExternalMemberFamilyStatus::Incomplete(reason), visited)
+    }
+
+    pub(crate) fn stopped(status: ExternalMemberFamilyStatus, visited: usize) -> Self {
+        debug_assert!(status != ExternalMemberFamilyStatus::Complete);
+        Self {
+            status,
+            candidates: Vec::new(),
+            visited,
+        }
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.status, ExternalMemberFamilyStatus::Complete)
+    }
+}
+
 /// The per-language capability for exact member-family edges.
 ///
 /// There is deliberately no blanket implementation and no default `supported`.
@@ -259,6 +317,19 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
         member: &CodeUnit,
         cancellation: Option<&CancellationToken>,
     ) -> MemberFamilyAnswer;
+
+    /// Exact workspace implementations or overrides of an external JVM
+    /// member. `max_visits` is supplied by the caller and covers the complete
+    /// workspace hierarchy/member scan; cancellation and exhaustion are
+    /// distinguishable so neither can be mistaken for a complete-empty proof.
+    fn external_member_family(
+        &self,
+        _identity: &JvmExternalMemberIdentity,
+        _max_visits: usize,
+        _cancellation: Option<&CancellationToken>,
+    ) -> ExternalMemberFamilyAnswer {
+        ExternalMemberFamilyAnswer::unsupported()
+    }
 }
 
 /// The shared state of one member's family answer: the two sources the walk
@@ -662,7 +733,7 @@ pub struct MemberFacts {
 }
 
 impl MemberFacts {
-    fn read(analyzer: &dyn IAnalyzer, member: &CodeUnit) -> Option<Self> {
+    pub(crate) fn read(analyzer: &dyn IAnalyzer, member: &CodeUnit) -> Option<Self> {
         let metadata = analyzer
             .signature_metadata(member)
             .into_iter()
@@ -709,6 +780,10 @@ impl MemberFacts {
     /// extending a trait implements that trait's members.
     pub fn is_static(&self) -> bool {
         self.is_static
+    }
+
+    pub(crate) fn arity(&self) -> Option<brokk_bifrost_core::analyzer::model::CallableArity> {
+        self.arity
     }
 
     /// The reason this member participates in no family in *any* nominal

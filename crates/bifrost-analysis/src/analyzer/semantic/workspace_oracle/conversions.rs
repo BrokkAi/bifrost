@@ -15,9 +15,7 @@ use crate::analyzer::usages::call_binding::{
 };
 use crate::analyzer::usages::call_conversion::{CallConversionCache, ConversionUnknown};
 use crate::analyzer::usages::call_shape::call_shapes_in_file;
-use crate::analyzer::usages::callable_signature::{
-    callable_signature_reports, declaration_site_id,
-};
+use crate::analyzer::usages::callable_signature::callable_signature_reports;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_target_batch_with_source,
 };
@@ -161,8 +159,10 @@ impl WorkspaceSemanticOracle<'_> {
             if metadata.len() != 1 {
                 return None;
             }
-            let signatures =
-                callable_signature_reports(&declaration_site_id(target, *range), target, &metadata);
+            let site_id = target
+                .declaration_site_id(range.start_byte, range.end_byte)
+                .to_string();
+            let signatures = callable_signature_reports(&site_id, target, &metadata);
             let [signature] = signatures.as_slice() else {
                 return None;
             };

@@ -164,17 +164,64 @@ pub struct DetailedCodeQueryIdentityCandidate {
     pub candidate: CodeQueryStableOwnerCandidate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeQueryStableOwnerCandidate {
-    pub namespace: String,
-    pub derivation: CodeQueryStableOwnerDerivation,
-    pub semantic_key: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CodeQueryStableOwnerCandidate {
+    Declaration {
+        namespace: String,
+        id: String,
+    },
+    Derived {
+        namespace: String,
+        derivation: CodeQueryStableOwnerDerivation,
+        semantic_key: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for CodeQueryStableOwnerCandidate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DeclarationWire {
+            namespace: String,
+            id: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DerivedWire {
+            namespace: String,
+            derivation: CodeQueryStableOwnerDerivation,
+            semantic_key: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Declaration(DeclarationWire),
+            Derived(DerivedWire),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Declaration(wire) => Ok(Self::Declaration {
+                namespace: wire.namespace,
+                id: wire.id,
+            }),
+            Wire::Derived(wire) => Ok(Self::Derived {
+                namespace: wire.namespace,
+                derivation: wire.derivation,
+                semantic_key: wire.semantic_key,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryStableOwnerDerivation {
-    AnalyzerDeclarationId,
     CanonicalAstIdentity,
     SemanticWireId,
 }
@@ -345,7 +392,9 @@ mod value_domain {
     use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
     use crate::query::{FailureUseConsumer, FailureUseProvenance};
     use crate::structural::search::results::environment::CodeQueryCandidateRef;
-    use crate::structural::search::{dispatch, member_family, receiver, render};
+    use crate::structural::search::{
+        CodeQueryFlowStatus, dispatch, member_family, receiver, render,
+    };
     use brokk_bifrost_core::analyzer::Language;
     use brokk_bifrost_core::analyzer::structural::callable::{
         ApplicabilityVerdict, ArgumentListKind, CallKind, CallShapeCoverage,
@@ -374,7 +423,6 @@ mod value_domain {
         RewriteDomainKind, RewriteOutcomeKind,
     };
     use brokk_bifrost_core::analyzer::structural::routes::SegmentResolutionStatus;
-    use brokk_bifrost_flow::dataflow::SemanticInputStatus;
     use brokk_bifrost_flow::type_flow::ClassSetStatus;
 
     pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
@@ -435,7 +483,7 @@ mod value_domain {
 
     pub(super) const PROCEDURE_KIND: &[&str] = ProcedureKind::LABELS;
     pub(super) const CONTROL_EDGE_KIND: &[&str] = ControlEdgeKind::LABELS;
-    pub(super) const SEMANTIC_STATUS: &[&str] = SemanticInputStatus::LABELS;
+    pub(super) const FLOW_STATUS: &[&str] = CodeQueryFlowStatus::LABELS;
     pub(super) const SEMANTIC_CAPABILITY: &[&str] = SemanticCapability::LABELS;
     pub(super) const SEMANTIC_BUDGET_LANE: &[&str] = SemanticBudgetLane::LABELS;
 
@@ -952,6 +1000,7 @@ detailed_row_domains! {
         identities: Primary,
         fields: [
                     CodeQueryRowField::optional("id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("site_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::required_enum("kind", value_domain::DECLARATION_KIND),
                     CodeQueryRowField::required("fq_name", Scalar::String),
@@ -1063,7 +1112,8 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("plan_ref", Scalar::StableId),
                     CodeQueryRowField::required("ambiguous", Scalar::Boolean),
-                    CodeQueryRowField::required_enum("semantic_status", value_domain::SEMANTIC_STATUS),
+                    CodeQueryRowField::required_enum("status", value_domain::FLOW_STATUS),
+                    CodeQueryRowField::optional("reason", Scalar::String),
         ],
     },
     FlowWitness => "flow_witness" {
@@ -1352,6 +1402,7 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("group_id", Scalar::StableId),
                     CodeQueryRowField::optional("argument_id", Scalar::StableId),
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("declared_target_id", Scalar::StableId),
                     CodeQueryRowField::optional("semantic_target_id", Scalar::StableId),
                     CodeQueryRowField::optional_enum("target_origin", value_domain::TARGET_ORIGIN),
                     CodeQueryRowField::required_enum("dispatch_outcome", value_domain::DISPATCH_OUTCOME),
@@ -1690,6 +1741,7 @@ detailed_row_domains! {
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("procedure_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("procedure_name", Scalar::String),
                     CodeQueryRowField::optional("effect_id", Scalar::String),
                     CodeQueryRowField::optional_enum(
@@ -1724,6 +1776,7 @@ detailed_row_domains! {
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
                     CodeQueryRowField::required_enum("coverage", value_domain::SIGNATURE_COVERAGE),
                     CodeQueryRowField::required_enum("role", value_domain::DECLARATION_ROLE),
@@ -2453,6 +2506,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::Declaration { value }, "id") => {
             value.id.as_deref().map(Scalar::DeclarationIdentity)
         }
+        (CodeQueryResultValue::Declaration { value }, "site_id") => {
+            value.site_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::Declaration { value }, "language") => {
             Some(Scalar::ConstrainedEnum(value.language))
         }
@@ -2661,8 +2717,11 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::FlowEndpoint { value }, "ambiguous") => {
             Some(Scalar::Boolean(value.ambiguous))
         }
-        (CodeQueryResultValue::FlowEndpoint { value }, "semantic_status") => {
-            Some(Scalar::ConstrainedEnum(value.semantic_status))
+        (CodeQueryResultValue::FlowEndpoint { value }, "status") => {
+            Some(Scalar::ConstrainedEnum(value.status.label()))
+        }
+        (CodeQueryResultValue::FlowEndpoint { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::FlowWitness { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::FlowWitness { value }, "endpoint_id") => {
@@ -3061,6 +3120,9 @@ fn project_code_query_row_field<'a>(
             .id
             .as_deref()
             .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallableSignature { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
         (CodeQueryResultValue::CallableSignature { value }, "ordinal") => {
             Some(Scalar::Integer(value.ordinal as u64))
         }
@@ -3243,6 +3305,9 @@ fn project_code_query_row_field<'a>(
             .as_ref()
             .and_then(|target| target.id.as_deref())
             .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallBinding { value }, "declared_target_id") => {
+            value.declared_target_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::CallBinding { value }, "semantic_target_id") => {
             value.semantic_target_id.as_deref().map(Scalar::StableId)
         }
@@ -3834,6 +3899,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ProcedureEffect { value }, "procedure_id") => {
             Some(Scalar::DeclarationIdentity(&value.procedure_id))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
         }
         (CodeQueryResultValue::ProcedureEffect { value }, "procedure_name") => {
             Some(Scalar::String(&value.procedure_name))
@@ -4809,10 +4877,12 @@ pub enum DetailedCodeQueryKey {
     ProcedureEffect {
         id: String,
         procedure_id: String,
+        site_id: String,
     },
     CallableSignature {
         id: String,
         declaration_id: String,
+        site_id: String,
     },
     CallableApplicability {
         id: String,
@@ -4992,12 +5062,23 @@ impl DetailedCodeQueryResult {
                 assert!(evidence.stable_owner_candidate.is_none());
             }
             if let Some(candidate) = &evidence.stable_owner_candidate {
-                assert!(!candidate.namespace.is_empty());
-                assert!(!candidate.semantic_key.is_empty());
-                match candidate.derivation {
-                    CodeQueryStableOwnerDerivation::AnalyzerDeclarationId
-                    | CodeQueryStableOwnerDerivation::CanonicalAstIdentity
-                    | CodeQueryStableOwnerDerivation::SemanticWireId => {}
+                match candidate {
+                    CodeQueryStableOwnerCandidate::Declaration { namespace, id } => {
+                        assert!(!namespace.is_empty());
+                        assert!(id.starts_with("decl:v1:"));
+                    }
+                    CodeQueryStableOwnerCandidate::Derived {
+                        namespace,
+                        derivation,
+                        semantic_key,
+                    } => {
+                        assert!(!namespace.is_empty());
+                        assert!(!semantic_key.is_empty());
+                        match derivation {
+                            CodeQueryStableOwnerDerivation::CanonicalAstIdentity
+                            | CodeQueryStableOwnerDerivation::SemanticWireId => {}
+                        }
+                    }
                 }
             }
             if let Some(wire_id) = semantic_wire_id(&evidence.key) {
@@ -5005,11 +5086,14 @@ impl DetailedCodeQueryResult {
                     .stable_owner_candidate
                     .as_ref()
                     .expect("semantic CodeQuery evidence requires its wire identity");
-                assert_eq!(
-                    candidate.derivation,
-                    CodeQueryStableOwnerDerivation::SemanticWireId
-                );
-                assert_eq!(candidate.semantic_key, wire_id);
+                assert!(matches!(
+                    candidate,
+                    CodeQueryStableOwnerCandidate::Derived {
+                        derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
+                        semantic_key,
+                        ..
+                    } if semantic_key == wire_id
+                ));
             }
             if let Some(sidecar) = &evidence.decorated_parameter {
                 let CodeQueryResultValue::DecoratedParameter { value } = &result.value else {

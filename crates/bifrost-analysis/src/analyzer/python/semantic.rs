@@ -14,23 +14,56 @@ use crate::analyzer::semantic::cfg::{
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
+use crate::analyzer::semantic_model::{
+    SemanticModelCallApplication, SemanticModelCallableDisposition, SemanticModelCallableKey,
+    SemanticModelOverlay, TypeRef,
+};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{Language, ProjectFile, PythonAnalyzer};
+use crate::analyzer::{IAnalyzer, Language, ProjectFile, PythonAnalyzer, StructuredImportPathKind};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_python::bindings::{
     PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
     python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
 };
+use brokk_bifrost_python::imports::python_import_infos_from_node;
+use brokk_bifrost_python::syntax::{python_static_attribute_path, python_static_type_path};
+use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v17";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v18";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
 const PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT: &str = "python.unknown_augmented_assignment";
 
-impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
+impl_program_semantics_provider!(PythonAnalyzer, |analyzer| PythonSemanticLowerer::new(
+    analyzer
+));
 
-struct PythonSemanticLowerer;
+struct PythonSemanticLowerer {
+    overlay: Option<Arc<SemanticModelOverlay>>,
+    dependencies: DependencyFingerprint,
+}
+
+impl PythonSemanticLowerer {
+    fn new(analyzer: &PythonAnalyzer) -> Self {
+        let snapshot = analyzer.active_semantic_model_snapshot();
+        let dependencies = snapshot.as_ref().map_or_else(
+            || DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            |snapshot| {
+                let mut identity = b"python-semantic-model-set-v1\0".to_vec();
+                identity
+                    .extend_from_slice(snapshot.active_models().active_model_set_hash().as_bytes());
+                DependencyFingerprint::hash_bytes(&identity)
+            },
+        );
+        Self {
+            overlay: snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.semantic_model_overlay().cloned()),
+            dependencies,
+        }
+    }
+}
 
 impl ProgramSemanticsLowerer for PythonSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -40,7 +73,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
             configuration: ConfigurationFingerprint::hash_bytes(
                 b"python-intrafile-execution-defaults-v1",
             ),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies: self.dependencies,
         }
     }
 
@@ -55,33 +88,42 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, class_names, class_constructors, builtin_proofs, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
-                    value,
-                    initial_work,
-                    ..
-                } => (
-                    value.specs,
-                    value.class_names,
-                    value.class_constructors,
-                    value.builtin_proofs,
-                    initial_work,
-                ),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
-            };
+        let (
+            specs,
+            module_bindings,
+            module_has_wildcard_import,
+            class_names,
+            class_constructors,
+            builtin_proofs,
+            initial_work,
+        ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+            ProcedureEnumeration::Complete {
+                value,
+                initial_work,
+                ..
+            } => (
+                value.specs,
+                value.module_bindings,
+                value.module_has_wildcard_import,
+                value.class_names,
+                value.class_constructors,
+                value.builtin_proofs,
+                initial_work,
+            ),
+            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            ProcedureEnumeration::Cancelled { work } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+        };
 
         lower_procedure_batch(
             &specs,
@@ -92,9 +134,12 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                 lower_procedure(
                     prepared,
                     spec,
+                    &module_bindings,
+                    module_has_wildcard_import,
                     &class_names,
                     &class_constructors,
                     builtin_proofs,
+                    self.overlay.as_deref(),
                     staged_budget,
                     cancellation,
                 )
@@ -158,9 +203,23 @@ struct ProcedureSpec<'tree> {
 
 struct PythonProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
+    module_bindings: HashMap<Box<str>, PythonModuleBinding<'tree>>,
+    module_has_wildcard_import: bool,
     class_names: HashSet<Box<str>>,
     class_constructors: HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
+}
+
+enum PythonModuleBinding<'tree> {
+    Class,
+    Function(Node<'tree>),
+    Import(PythonModuleImport),
+    Other,
+}
+
+struct PythonModuleImport {
+    canonical_path: Box<[Box<str>]>,
+    consumed_attributes: usize,
 }
 
 /// Whether each builtin this lowering reads still denotes its builtin at the
@@ -174,6 +233,8 @@ struct PythonBuiltinProofs {
     isinstance: bool,
     hasattr: bool,
     r#type: bool,
+    exit: bool,
+    quit: bool,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<PythonProcedureInventory<'tree>>;
@@ -195,7 +256,7 @@ fn enumerate_procedures<'tree>(
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "python-source", budget)?;
     let mut specs = Vec::new();
-    let mut module_bindings: HashMap<Box<str>, PythonDirectScopeBindingKind> = HashMap::default();
+    let mut module_bindings: HashMap<Box<str>, PythonModuleBinding<'tree>> = HashMap::default();
     let mut module_wildcard_import = false;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -252,8 +313,8 @@ fn enumerate_procedures<'tree>(
                 };
                 if let Some(existing) = module_bindings.get_mut(name) {
                     // Multiple module bindings are not a proven class identity,
-                    // even when more than one of them is a class declaration.
-                    *existing = PythonDirectScopeBindingKind::Other;
+                    // callable identity, or import identity.
+                    *existing = PythonModuleBinding::Other;
                     continue;
                 }
                 if let Err(stop) = inventory.observe_additional_work(SemanticWork {
@@ -262,7 +323,10 @@ fn enumerate_procedures<'tree>(
                 }) {
                     return Ok(stop.into_outcome());
                 }
-                module_bindings.insert(name.into(), binding.kind);
+                module_bindings.insert(
+                    name.into(),
+                    python_module_binding(frame.node, binding.kind, name, prepared.source()),
+                );
             }
         }
 
@@ -387,11 +451,13 @@ fn enumerate_procedures<'tree>(
         isinstance: unshadowed("isinstance"),
         hasattr: unshadowed("hasattr"),
         r#type: unshadowed("type"),
+        exit: unshadowed("exit"),
+        quit: unshadowed("quit"),
     };
     let class_names = module_bindings
-        .into_iter()
-        .filter_map(|(name, kind)| {
-            (kind == PythonDirectScopeBindingKind::ClassDeclaration).then_some(name)
+        .iter()
+        .filter_map(|(name, binding)| {
+            matches!(binding, PythonModuleBinding::Class).then_some(name.clone())
         })
         .collect();
     let class_constructors = specs
@@ -413,10 +479,61 @@ fn enumerate_procedures<'tree>(
         .collect();
     Ok(inventory.complete(PythonProcedureInventory {
         specs,
+        module_bindings,
+        module_has_wildcard_import: module_wildcard_import,
         class_names,
         class_constructors,
         builtin_proofs,
     }))
+}
+
+fn python_module_binding<'tree>(
+    node: Node<'tree>,
+    kind: PythonDirectScopeBindingKind,
+    local_name: &str,
+    source: &str,
+) -> PythonModuleBinding<'tree> {
+    if kind == PythonDirectScopeBindingKind::ClassDeclaration {
+        return PythonModuleBinding::Class;
+    }
+    if node.kind() == "function_definition"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "module")
+    {
+        return PythonModuleBinding::Function(node);
+    }
+    if !matches!(node.kind(), "import_statement" | "import_from_statement")
+        || node.parent().is_none_or(|parent| parent.kind() != "module")
+    {
+        return PythonModuleBinding::Other;
+    }
+    let mut matches = python_import_infos_from_node(node, source)
+        .into_iter()
+        .filter(|import| !import.is_wildcard && import.local_name() == Some(local_name));
+    let Some(import) = matches.next() else {
+        return PythonModuleBinding::Other;
+    };
+    if matches.next().is_some() {
+        return PythonModuleBinding::Other;
+    }
+    let Some(path) = import.path else {
+        return PythonModuleBinding::Other;
+    };
+    let consumed_attributes =
+        if path.kind == Some(StructuredImportPathKind::Namespace) && import.alias.is_none() {
+            path.segments.len().saturating_sub(1)
+        } else {
+            0
+        };
+    PythonModuleBinding::Import(PythonModuleImport {
+        canonical_path: path
+            .segments
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect(),
+        consumed_attributes,
+    })
 }
 
 /// The built-in descriptors keep the authored callable's parameters and
@@ -427,7 +544,7 @@ fn enumerate_procedures<'tree>(
 fn builtin_descriptor_preserves_call_boundary(
     callable: Node<'_>,
     source: &str,
-    module_bindings: &HashMap<Box<str>, PythonDirectScopeBindingKind>,
+    module_bindings: &HashMap<Box<str>, PythonModuleBinding<'_>>,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<bool> {
     if !scope_step() {
@@ -797,9 +914,12 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
     enclosing_class: Option<Box<str>>,
+    module_bindings: &'targets HashMap<Box<str>, PythonModuleBinding<'tree>>,
+    module_has_wildcard_import: bool,
     class_names: &'targets HashSet<Box<str>>,
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
+    overlay: Option<&'targets SemanticModelOverlay>,
     bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
@@ -808,9 +928,12 @@ struct LoweringContext<'tree, 'targets> {
 fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    module_bindings: &'targets HashMap<Box<str>, PythonModuleBinding<'tree>>,
+    module_has_wildcard_import: bool,
     class_names: &'targets HashSet<Box<str>>,
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
+    overlay: Option<&'targets SemanticModelOverlay>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -855,9 +978,12 @@ fn lower_procedure<'tree, 'targets>(
         locals: HashMap::default(),
         receiver: None,
         enclosing_class: enclosing_class_name(prepared.source(), spec.callable).map(Into::into),
+        module_bindings,
+        module_has_wildcard_import,
         class_names,
         class_constructors,
         builtin_proofs,
+        overlay,
         bindings,
         cleanups: Vec::new(),
     };
@@ -1979,6 +2105,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.binding_value(name).is_some() || !self.class_names.contains(name) {
             return Ok(false);
         }
+        self.module_name_fallback_allowed(builder, reference, name)
+    }
+
+    fn module_name_fallback_allowed(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        reference: Node<'tree>,
+        name: &str,
+    ) -> Result<bool, PythonLoweringError> {
         match self.bindings.name_resolution_at(name, reference) {
             PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
                 return Ok(false);
@@ -4270,6 +4405,215 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.proven_builtin_call(call, "str", self.builtin_proofs.str)
     }
 
+    fn call_has_absent_normal_continuation(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        call: Node<'tree>,
+        function: Node<'tree>,
+        arguments: &[Node<'tree>],
+    ) -> Result<bool, PythonLoweringError> {
+        if let Some(declaration) = self.workspace_callable_declaration(builder, function)?
+            && self.workspace_callable_diverges(declaration)
+        {
+            return Ok(true);
+        }
+        let external = if self.proven_builtin_call(call, "exit", self.builtin_proofs.exit) {
+            Some(("builtins".to_owned(), "exit".to_owned()))
+        } else if self.proven_builtin_call(call, "quit", self.builtin_proofs.quit) {
+            Some(("builtins".to_owned(), "quit".to_owned()))
+        } else {
+            self.imported_callable_identity(builder, function)?
+        };
+        Ok(external.is_some_and(|(owner, member)| {
+            self.semantic_model_callable_diverges(&owner, &member, arguments)
+        }))
+    }
+
+    fn workspace_callable_declaration(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        function: Node<'tree>,
+    ) -> Result<Option<Node<'tree>>, PythonLoweringError> {
+        if function.kind() != "identifier" {
+            return Ok(None);
+        }
+        let Some(name) = node_text(self.prepared.source(), function) else {
+            return Ok(None);
+        };
+        match self.bindings.name_resolution_at(name, function) {
+            PythonLexicalNameResolution::Local => {
+                Ok(self.bindings.local_function_declaration(name, function))
+            }
+            PythonLexicalNameResolution::Nonlocal => Ok(None),
+            PythonLexicalNameResolution::Global | PythonLexicalNameResolution::Unbound => {
+                if self.module_has_wildcard_import {
+                    return Ok(None);
+                }
+                if !self.module_name_fallback_allowed(builder, function, name)? {
+                    return Ok(None);
+                }
+                Ok(match self.module_bindings.get(name) {
+                    Some(PythonModuleBinding::Function(declaration)) => Some(*declaration),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    fn workspace_callable_diverges(&self, declaration: Node<'tree>) -> bool {
+        if declaration
+            .parent()
+            .is_some_and(|parent| parent.kind() == "decorated_definition")
+            || has_direct_token(declaration, "async")
+            || declaration
+                .child_by_field_name("body")
+                .is_some_and(body_contains_yield)
+        {
+            return false;
+        }
+        declaration
+            .child_by_field_name("return_type")
+            .is_some_and(|annotation| self.annotation_is_never(annotation))
+    }
+
+    fn annotation_is_never(&self, annotation: Node<'tree>) -> bool {
+        if self.module_has_wildcard_import {
+            return false;
+        }
+        let Some(path) = python_static_type_path(annotation) else {
+            return false;
+        };
+        let Some(local) = path
+            .first()
+            .and_then(|segment| node_text(self.prepared.source(), *segment))
+        else {
+            return false;
+        };
+        let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(local) else {
+            return false;
+        };
+        let suffix_start = 1usize.saturating_add(binding.consumed_attributes);
+        if suffix_start > path.len() {
+            return false;
+        }
+        let mut canonical = binding
+            .canonical_path
+            .iter()
+            .map(Box::as_ref)
+            .collect::<Vec<_>>();
+        canonical.extend(
+            path[suffix_start..]
+                .iter()
+                .filter_map(|segment| node_text(self.prepared.source(), *segment)),
+        );
+        matches!(
+            canonical.as_slice(),
+            ["typing" | "typing_extensions", "NoReturn" | "Never"]
+        )
+    }
+
+    fn imported_callable_identity(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        function: Node<'tree>,
+    ) -> Result<Option<(String, String)>, PythonLoweringError> {
+        if self.module_has_wildcard_import {
+            return Ok(None);
+        }
+        let Some(path) = python_static_attribute_path(function) else {
+            return Ok(None);
+        };
+        let Some(local) = path
+            .first()
+            .and_then(|segment| node_text(self.prepared.source(), *segment))
+        else {
+            return Ok(None);
+        };
+        if !self.module_name_fallback_allowed(builder, path[0], local)? {
+            return Ok(None);
+        }
+        let Some(PythonModuleBinding::Import(binding)) = self.module_bindings.get(local) else {
+            return Ok(None);
+        };
+        let mut canonical = binding
+            .canonical_path
+            .iter()
+            .map(Box::as_ref)
+            .collect::<Vec<_>>();
+        if path.len() == 1 {
+            if binding.consumed_attributes != 0 {
+                return Ok(None);
+            }
+        } else {
+            let attributes_after_local = path.len() - 1;
+            if attributes_after_local != binding.consumed_attributes + 1 {
+                return Ok(None);
+            }
+            let Some(member) = path
+                .last()
+                .and_then(|segment| node_text(self.prepared.source(), *segment))
+            else {
+                return Ok(None);
+            };
+            canonical.push(member);
+        }
+        let Some((member, owner)) = canonical.split_last() else {
+            return Ok(None);
+        };
+        if owner.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((owner.join("."), (*member).to_owned())))
+    }
+
+    fn semantic_model_callable_diverges(
+        &self,
+        owner: &str,
+        member: &str,
+        arguments: &[Node<'tree>],
+    ) -> bool {
+        let Some(overlay) = self.overlay else {
+            return false;
+        };
+        let mut positional_count = 0;
+        let mut named_labels = Vec::new();
+        let mut has_spread = false;
+        for argument in arguments {
+            match argument.kind() {
+                "keyword_argument" => {
+                    let Some(name) = argument
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(self.prepared.source(), name))
+                    else {
+                        return false;
+                    };
+                    named_labels.push(name.to_owned());
+                }
+                "list_splat" | "dictionary_splat" => has_spread = true,
+                _ => positional_count += 1,
+            }
+        }
+        let parameter_count = match u32::try_from(arguments.len()) {
+            Ok(parameter_count) => parameter_count,
+            Err(_) => return false,
+        };
+        let matched = overlay.callable_for_application(
+            SemanticModelCallableKey::new("python", owner, member, false, parameter_count),
+            &SemanticModelCallApplication::structured(positional_count, named_labels, has_spread),
+        );
+        matches!(
+            matched.disposition,
+            SemanticModelCallableDisposition::Unique
+                | SemanticModelCallableDisposition::CompatibleLayout
+        ) && !matched.records.is_empty()
+            && matched.records.iter().all(|record| {
+                record
+                    .structured_signature()
+                    .and_then(|signature| signature.returns.as_ref())
+                    .is_some_and(python_type_ref_is_never)
+            })
+    }
+
     /// Lower a proven builtin `str(...)` call as a modeled boundary instead of
     /// an unresolved call site: each argument value flows to the call result,
     /// matching how the binary-operator lowering propagates operand values.
@@ -4734,10 +5078,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
-        let invoke = self.point(builder, node, Vec::new())?;
-        let normal = self.point(builder, node, Vec::new())?;
-        let exceptional = self.point(builder, node, Vec::new())?;
         let function = required_field(node, "function")?;
+        let arguments = call_arguments(node);
+        let diverges =
+            self.call_has_absent_normal_continuation(builder, node, function, &arguments)?;
+        let invoke = self.point(builder, node, Vec::new())?;
+        let normal = if diverges {
+            None
+        } else {
+            Some(self.point(builder, node, Vec::new())?)
+        };
+        let exceptional = self.point(builder, node, Vec::new())?;
         let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
@@ -4796,7 +5147,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
-        let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
             .map(
@@ -4841,22 +5191,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.session
                 .add_allocation(builder, invoke, result, AllocationKind::Object)?;
         }
-        let call_site = self.session.add_call_site(
-            builder,
-            CallSiteScaffold {
-                point: invoke,
-                callee,
-                receiver,
-                arguments: argument_values.into_boxed_slice(),
-                normal_results: Box::new([]),
-                result: Some(result),
-                thrown: Some(thrown),
-                declared_targets: resolution.clone(),
-                normal_continuation: normal,
-                exceptional_continuation: exceptional,
-            },
-        )?;
-        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+        let call_site = if let Some(normal) = normal {
+            let call_site = self.session.add_call_site(
+                builder,
+                CallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver,
+                    arguments: argument_values.into_boxed_slice(),
+                    normal_results: Box::new([]),
+                    result: Some(result),
+                    thrown: Some(thrown),
+                    declared_targets: resolution.clone(),
+                    normal_continuation: normal,
+                    exceptional_continuation: exceptional,
+                },
+            )?;
+            self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+            self.edge(builder, normal, next)?;
+            call_site
+        } else {
+            self.session.add_diverging_call_site(
+                builder,
+                DivergingCallSiteScaffold {
+                    point: invoke,
+                    callee,
+                    receiver,
+                    arguments: argument_values.into_boxed_slice(),
+                    result: Some(result),
+                    thrown: Some(thrown),
+                    declared_targets: resolution.clone(),
+                    exceptional_continuation: exceptional,
+                },
+            )?
+        };
         self.edge(
             builder,
             invoke,
@@ -4865,7 +5233,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::Exceptional,
             },
         )?;
-        self.edge(builder, normal, next)?;
         self.abrupt(
             builder,
             exceptional,
@@ -5804,6 +6171,17 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
+fn python_type_ref_is_never(reference: &TypeRef) -> bool {
+    matches!(
+        reference,
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable: false,
+        } if arguments.is_empty() && matches!(name.as_str(), "typing.NoReturn" | "typing.Never")
+    )
+}
+
 fn non_empty_python_range(source: &str, call: Node<'_>) -> bool {
     let Some(values) = python_range_literal_values(source, call) else {
         return false;
@@ -5995,7 +6373,11 @@ mod tests {
             None,
         );
         let file = ProjectFile::new(std::env::temp_dir(), "fixture.py");
-        let SemanticOutcome::Complete { mut value, .. } = PythonSemanticLowerer
+        let lowerer = PythonSemanticLowerer {
+            overlay: None,
+            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+        };
+        let SemanticOutcome::Complete { mut value, .. } = lowerer
             .lower(
                 &file,
                 &prepared,

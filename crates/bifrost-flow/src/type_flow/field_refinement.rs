@@ -42,7 +42,7 @@ pub(super) struct FieldAlternative {
     pub guards: Vec<(usize, bool)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FieldLoadRefinement {
     pub point: ProgramPointId,
     pub result: ValueId,

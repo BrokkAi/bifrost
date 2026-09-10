@@ -64,8 +64,7 @@ pub struct WorkspaceSemanticOracle<'a> {
     runtime_reads: runtime_values::RuntimeReadCache,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
-    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
-    active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     dispatch_hints: Arc<DispatchHints>,
     // Capture the bounded workspace authority once per provider, including an
     // incomplete answer. A failed scan is not repeatedly retried per call.
@@ -98,43 +97,36 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         hierarchy_expansion: DispatchHierarchyExpansion,
     ) -> Self {
         let snapshot = workspace.analyzer().active_semantic_model_snapshot();
-        Self::with_limits_expansion_and_semantic_model_overlay(
+        Self::with_limits_expansion_and_semantic_model_snapshot(
             workspace,
             limits,
             hierarchy_expansion,
-            snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone)),
-            snapshot
-                .as_ref()
-                .map(|snapshot| Arc::clone(snapshot.active_models())),
+            snapshot,
             DispatchHints::empty(),
         )
     }
 
     /// Bind dispatch to one immutable receiver-class hint table and one
-    /// explicitly captured semantic-model overlay.
+    /// explicitly captured active-model snapshot.
     pub fn with_dispatch_hints(
         workspace: &'a WorkspaceAnalyzer,
-        snapshot: Option<&ActiveSemanticModelSnapshot>,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         dispatch_hints: DispatchHints,
     ) -> Self {
-        Self::with_limits_expansion_and_semantic_model_overlay(
+        Self::with_limits_expansion_and_semantic_model_snapshot(
             workspace,
             OracleLimits::default(),
             workspace.dispatch_hierarchy_expansion(),
-            snapshot.and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone)),
-            snapshot.map(|snapshot| Arc::clone(snapshot.active_models())),
+            snapshot,
             dispatch_hints,
         )
     }
 
-    fn with_limits_expansion_and_semantic_model_overlay(
+    fn with_limits_expansion_and_semantic_model_snapshot(
         workspace: &'a WorkspaceAnalyzer,
         limits: OracleLimits,
         hierarchy_expansion: DispatchHierarchyExpansion,
-        semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
-        active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         dispatch_hints: DispatchHints,
     ) -> Self {
         Self {
@@ -142,8 +134,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             runtime_reads: runtime_values::runtime_read_cache(),
             limits,
             hierarchy_expansion,
-            semantic_model_overlay,
-            active_semantic_models,
+            active_semantic_model_snapshot,
             dispatch_hints: Arc::new(dispatch_hints),
             python_saved_defaults_available: language_support(Language::Python)
                 .expect("Python support is registered")
@@ -168,12 +159,23 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         self.hierarchy_expansion
     }
 
-    pub const fn active_semantic_models(&self) -> Option<&Arc<ResolvedActiveSemanticModels>> {
-        self.active_semantic_models.as_ref()
+    pub fn active_semantic_models(&self) -> Option<&Arc<ResolvedActiveSemanticModels>> {
+        match self.active_semantic_model_snapshot.as_ref() {
+            Some(snapshot) => Some(snapshot.active_models()),
+            None => None,
+        }
+    }
+
+    pub(super) fn active_semantic_model_snapshot(
+        &self,
+    ) -> Option<Arc<ActiveSemanticModelSnapshot>> {
+        self.active_semantic_model_snapshot.as_ref().map(Arc::clone)
     }
 
     pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
-        self.semantic_model_overlay.as_ref().map(Arc::clone)
+        self.active_semantic_model_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone))
     }
 
     pub const fn dispatch_hints(&self) -> &Arc<DispatchHints> {
@@ -189,7 +191,10 @@ impl fmt::Debug for WorkspaceSemanticOracle<'_> {
             .field("hierarchy_expansion", &self.hierarchy_expansion)
             .field(
                 "has_semantic_model_overlay",
-                &self.semantic_model_overlay.is_some(),
+                &self
+                    .active_semantic_model_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.semantic_model_overlay().is_some()),
             )
             .field("dispatch_hints", &self.dispatch_hints.entries().len())
             .finish_non_exhaustive()

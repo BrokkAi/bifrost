@@ -3,6 +3,8 @@ title: RQL in VS Code
 description: Run Rune Query Language files from VS Code and navigate typed query results.
 ---
 
+Write queries in RQL text. The `.rql` language supports RQL diagnostics, hover, quick fixes, and execution; JSON-shaped query buffers are not supported. Generate canonical JSON with the REPL `:json` command for machine clients.
+
 The Bifrost VS Code extension recognizes `.rql` files as **Bifrost RQL**. RQL,
 the [Rune Query Language](/rune-query-language/), is Bifrost's experimental
 S-expression frontend for structural `query_code` searches.
@@ -72,7 +74,9 @@ result to open its file and highlight its range; control edges show both
 endpoint IDs and ranges. Typestate findings show certainty, protocol identity,
 proof/completeness, and witness counts without inventing severity. Expand a
 typestate witness to navigate each ordered source-backed step; tooltips retain
-evidence and truncation/omission metadata. Selecting a file result opens the
+the row's proof/completeness/reason evidence and truncation/omission metadata.
+Flow endpoints show their single public status and reason, without a placeholder
+must claim. Selecting a file result opens the
 file at its first line. Pipeline wrappers such as `enclosing-decl`,
 `cfg-successor-edges`, `typestate`, `witness`, `occurrences-in`,
 `binding-of`, `candidates-of`, `edges-of`, `edges-from`, and `file-of`

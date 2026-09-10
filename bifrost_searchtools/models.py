@@ -549,6 +549,7 @@ class CodeQueryDeclaration:
     end_line: int
     signature: str | None = None
     id: str | None = None
+    site_id: str | None = None
     node_range: CodeQueryRange | None = None
     provenance: list[CodeQueryProvenance] = field(default_factory=list)
     provenance_truncated: bool = False
@@ -564,6 +565,7 @@ class CodeQueryDeclaration:
             end_line=int(data["end_line"]),
             signature=data.get("signature"),
             id=data.get("id"),
+            site_id=data.get("site_id"),
             node_range=CodeQueryRange.from_dict(data["node_range"])
             if "node_range" in data
             else None,
@@ -603,21 +605,15 @@ class CodeQueryProgramPointBoundary(StrEnum):
 class CodeQuerySemanticEvidence:
     proof: CodeQuerySemanticProof
     completeness: CodeQuerySemanticCompleteness
-    proof_reason: str | None = None
-    completeness_reason: str | None = None
+    reason: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQuerySemanticEvidence:
         return cls(
             proof=CodeQuerySemanticProof(data["proof"]),
             completeness=CodeQuerySemanticCompleteness(data["completeness"]),
-            proof_reason=data.get("proof_reason"),
-            completeness_reason=data.get("completeness_reason"),
+            reason=data.get("reason"),
         )
-
-    @property
-    def status(self) -> str:
-        return f"{self.proof.value}/{self.completeness.value}"
 
 
 @dataclass(frozen=True)
@@ -672,7 +668,8 @@ class CodeQueryProcedure:
     def render_text(self) -> str:
         return (
             f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[procedure; {self.procedure_kind}; {self.evidence.status}]"
+            f"[procedure; {self.procedure_kind}; proof={self.evidence.proof.value}; "
+            f"completeness={self.evidence.completeness.value}]"
         )
 
 
@@ -713,7 +710,8 @@ class CodeQueryProgramPoint:
         return (
             f"{self.path}:{self.range.start_line}:{self.range.start_column} "
             f"[program point; {boundary}; {self.event_count} events; "
-            f"{self.evidence.status}]"
+            f"proof={self.evidence.proof.value}; "
+            f"completeness={self.evidence.completeness.value}]"
         )
 
 
@@ -750,7 +748,8 @@ class CodeQueryControlEdge:
     def render_text(self) -> str:
         return (
             f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[control edge; {self.edge_kind}; {self.evidence.status}] "
+            f"[control edge; {self.edge_kind}; proof={self.evidence.proof.value}; "
+            f"completeness={self.evidence.completeness.value}] "
             f"{self.source.id} -> {self.target.id}"
         )
 
@@ -934,7 +933,7 @@ class CodeQueryTypestateWitness:
     path: str
     language: str
     range: CodeQueryRange
-    quality: CodeQuerySemanticEvidence
+    evidence: CodeQuerySemanticEvidence
     steps: tuple[CodeQueryTypestateWitnessStep, ...]
     retained_bytes: int
     omitted_steps_lower_bound: int
@@ -961,7 +960,7 @@ class CodeQueryTypestateWitness:
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
-            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
             uncertainty=tuple(
                 CodeQueryTypestateUncertainty(value)
                 for value in _strict_list(data, "uncertainty", [])
@@ -1003,12 +1002,18 @@ class CodeQueryFlowCertainty(StrEnum):
     MAY = "may"
 
 
-class CodeQueryFlowCompletion(StrEnum):
+class CodeQueryFlowStatus(StrEnum):
     COMPLETE = "complete"
-    INCOMPLETE = "incomplete"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    CANCELLED = "cancelled"
+    PARTIAL = "partial"
+    AMBIGUOUS = "ambiguous"
+    UNKNOWN = "unknown"
+    UNPROVEN = "unproven"
     UNSUPPORTED = "unsupported"
+    SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
+    SOLVER_BUDGET_EXHAUSTED = "solver_budget_exhausted"
+    SEMANTIC_CANCELLED = "semantic_cancelled"
+    SOLVER_CANCELLED = "solver_cancelled"
+    QUERY_CANCELLED = "query_cancelled"
 
 
 @dataclass(frozen=True)
@@ -1240,16 +1245,14 @@ class CodeQueryFlowEndpoint:
     plan_ref: str
     sink: CodeQueryFlowEvent
     reachability: CodeQueryFlowReachability
-    must: str
     ambiguous: bool
-    completion: CodeQueryFlowCompletion
-    semantic_status: str
-    solver_termination: str
+    status: CodeQueryFlowStatus
     path: str
     language: str
     range: CodeQueryRange
     retained_witnesses: int
     omitted_witnesses: int
+    reason: str | None = None
     source: CodeQueryFlowEvent | None = None
     certainty: CodeQueryFlowCertainty | None = None
     path_qualities: tuple[CodeQuerySemanticEvidence, ...] = ()
@@ -1272,11 +1275,9 @@ class CodeQueryFlowEndpoint:
             certainty=(
                 CodeQueryFlowCertainty(certainty) if certainty is not None else None
             ),
-            must=data["must"],
             ambiguous=_strict_bool(data, "ambiguous", False),
-            completion=CodeQueryFlowCompletion(data["completion"]),
-            semantic_status=data["semantic_status"],
-            solver_termination=data["solver_termination"],
+            status=CodeQueryFlowStatus(data["status"]),
+            reason=data.get("reason"),
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
@@ -1294,7 +1295,7 @@ class CodeQueryFlowEndpoint:
         certainty = self.certainty.value if self.certainty is not None else "n/a"
         return (
             f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[flow endpoint; {self.reachability}; {certainty}; {self.completion}]"
+            f"[flow endpoint; {self.reachability}; {certainty}; {self.status.value}]"
         )
 
 
@@ -1366,7 +1367,7 @@ class CodeQueryFlowWitness:
     path: str
     language: str
     range: CodeQueryRange
-    quality: CodeQuerySemanticEvidence
+    evidence: CodeQuerySemanticEvidence
     steps: tuple[CodeQueryFlowWitnessStep, ...]
     retained_bytes: int
     omitted_steps_lower_bound: int
@@ -1386,7 +1387,7 @@ class CodeQueryFlowWitness:
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
-            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
             steps=tuple(
                 CodeQueryFlowWitnessStep.from_dict(step)
                 for step in _strict_list(data, "steps")
@@ -1433,7 +1434,7 @@ class CodeQueryAbsentMemberWitness:
     path: str
     language: str
     range: CodeQueryRange
-    quality: CodeQuerySemanticEvidence
+    evidence: CodeQuerySemanticEvidence
     steps: tuple[CodeQueryFlowWitnessStep, ...]
     retained_bytes: int
     omitted_steps_lower_bound: int
@@ -1452,7 +1453,7 @@ class CodeQueryAbsentMemberWitness:
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
-            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
             steps=tuple(
                 CodeQueryFlowWitnessStep.from_dict(step)
                 for step in _strict_list(data, "steps")
@@ -1592,7 +1593,7 @@ class CodeQueryTaintWitness:
     path: str
     language: str
     range: CodeQueryRange
-    quality: CodeQuerySemanticEvidence
+    evidence: CodeQuerySemanticEvidence
     steps: tuple[CodeQueryFlowWitnessStep, ...]
     retained_bytes: int
     omitted_steps_lower_bound: int
@@ -1609,7 +1610,7 @@ class CodeQueryTaintWitness:
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
-            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
             steps=tuple(
                 CodeQueryFlowWitnessStep.from_dict(step)
                 for step in _strict_list(data, "steps")
@@ -4444,6 +4445,7 @@ class CodeQueryProcedureEffect:
 
     id: str
     procedure_id: str
+    site_id: str
     procedure_name: str
     path: str
     language: str
@@ -4475,6 +4477,7 @@ class CodeQueryProcedureEffect:
         return cls(
             id=data["id"],
             procedure_id=data["procedure_id"],
+            site_id=data["site_id"],
             procedure_name=data["procedure_name"],
             path=data["path"],
             language=data["language"],
@@ -4529,6 +4532,7 @@ class CodeQueryCallableSignature:
     """
 
     id: str
+    site_id: str
     path: str
     language: str
     range: CodeQueryRange
@@ -4552,6 +4556,7 @@ class CodeQueryCallableSignature:
     def from_dict(cls, data: dict) -> CodeQueryCallableSignature:
         return cls(
             id=data["id"],
+            site_id=data["site_id"],
             path=data["path"],
             language=data["language"],
             range=CodeQueryRange.from_dict(data["range"]),
@@ -5580,6 +5585,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     TYPE_FLOW_WITNESS_TRUNCATED = "type_flow_witness_truncated"
     TYPE_FLOW_WITNESS_UNAVAILABLE = "type_flow_witness_unavailable"
     CALL_BINDING_DISPATCH_PARTIAL = "call_binding_dispatch_partial"
+    CALL_BINDING_SELECTOR_REJECTED = "call_binding_selector_rejected"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
     UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
@@ -6244,6 +6250,7 @@ class CodeQueryTypeFlowWork:
     root_summary_cache_hits: int = 0
     root_summary_observation_rejections: int = 0
     published_summaries: int = 0
+    solver_attempts: int = 0
     class_set_rows: int = 0
     finding_rows: int = 0
     witnesses: int = 0
@@ -6283,6 +6290,7 @@ class CodeQueryTypeFlowWork:
             "root_summary_cache_hits",
             "root_summary_observation_rejections",
             "published_summaries",
+            "solver_attempts",
             "class_set_rows",
             "finding_rows",
             "witnesses",

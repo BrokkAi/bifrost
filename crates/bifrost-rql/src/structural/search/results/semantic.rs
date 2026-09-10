@@ -158,7 +158,7 @@ pub struct CodeQueryTypestateWitness {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
-    pub quality: CodeQuerySemanticEvidence,
+    pub evidence: CodeQuerySemanticEvidence,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub uncertainty: Vec<CodeQueryTypestateUncertainty>,
     #[serde(skip_serializing_if = "is_false")]
@@ -189,28 +189,62 @@ pub enum CodeQueryFlowCertainty {
     May,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeQueryFlowMustStatus {
-    NotEstablished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeQueryFlowCompletion {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CodeQueryFlowStatus {
     Complete,
-    Incomplete,
-    BudgetExhausted,
-    Cancelled,
+    Partial,
+    Ambiguous,
+    Unknown,
+    Unproven,
     Unsupported,
+    SemanticBudgetExhausted,
+    SolverBudgetExhausted,
+    SemanticCancelled,
+    SolverCancelled,
+    QueryCancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeQueryFlowSolverTermination {
-    FixedPoint,
-    BudgetExhausted,
-    Cancelled,
+impl CodeQueryFlowStatus {
+    /// The stable public flow-row status domain. These labels describe the
+    /// client-visible outcome rather than mirroring the internal solver enum.
+    pub const LABELS: &'static [&'static str] = &[
+        "complete",
+        "partial",
+        "ambiguous",
+        "unknown",
+        "unproven",
+        "unsupported",
+        "semantic_budget_exhausted",
+        "solver_budget_exhausted",
+        "semantic_cancelled",
+        "solver_cancelled",
+        "query_cancelled",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Ambiguous => "ambiguous",
+            Self::Unknown => "unknown",
+            Self::Unproven => "unproven",
+            Self::Unsupported => "unsupported",
+            Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
+            Self::SolverBudgetExhausted => "solver_budget_exhausted",
+            Self::SemanticCancelled => "semantic_cancelled",
+            Self::SolverCancelled => "solver_cancelled",
+            Self::QueryCancelled => "query_cancelled",
+        }
+    }
+}
+
+impl Serialize for CodeQueryFlowStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.label())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -364,12 +398,11 @@ pub struct CodeQueryFlowEndpoint {
     pub reachability: CodeQueryFlowReachability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certainty: Option<CodeQueryFlowCertainty>,
-    pub must: CodeQueryFlowMustStatus,
     #[serde(skip_serializing_if = "is_false")]
     pub ambiguous: bool,
-    pub completion: CodeQueryFlowCompletion,
-    pub semantic_status: &'static str,
-    pub solver_termination: CodeQueryFlowSolverTermination,
+    pub status: CodeQueryFlowStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
@@ -419,7 +452,7 @@ pub struct CodeQueryFlowWitness {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
-    pub quality: CodeQuerySemanticEvidence,
+    pub evidence: CodeQuerySemanticEvidence,
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
@@ -495,7 +528,7 @@ pub struct CodeQueryAbsentMemberWitness {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
-    pub quality: CodeQuerySemanticEvidence,
+    pub evidence: CodeQuerySemanticEvidence,
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
@@ -532,7 +565,7 @@ pub struct CodeQueryTaintWitness {
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,
-    pub quality: CodeQuerySemanticEvidence,
+    pub evidence: CodeQuerySemanticEvidence,
     pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
@@ -796,45 +829,85 @@ pub struct CodeQueryCallResult {
     pub completeness: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeQuerySemanticEvidence {
     pub proof: CodeQuerySemanticProof,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proof_reason: Option<String>,
     pub completeness: CodeQuerySemanticCompleteness,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completeness_reason: Option<String>,
+    pub reason: Option<String>,
 }
 
 impl CodeQuerySemanticEvidence {
-    pub const fn status_label(&self) -> &'static str {
-        match (self.proof, self.completeness) {
-            (CodeQuerySemanticProof::Proven, CodeQuerySemanticCompleteness::Complete) => {
-                "proven/complete"
+    pub fn new(
+        proof: CodeQuerySemanticProof,
+        completeness: CodeQuerySemanticCompleteness,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            proof,
+            completeness,
+            reason,
+        }
+    }
+
+    pub(crate) fn from_axis_reasons(
+        proof: CodeQuerySemanticProof,
+        completeness: CodeQuerySemanticCompleteness,
+        proof_reason: Option<String>,
+        completeness_reason: Option<String>,
+    ) -> Self {
+        let reason = match (proof_reason, completeness_reason) {
+            (None, None) => None,
+            (Some(reason), None) | (None, Some(reason)) => Some(reason),
+            (Some(proof_reason), Some(completeness_reason))
+                if proof_reason == completeness_reason =>
+            {
+                Some(proof_reason)
             }
-            (CodeQuerySemanticProof::Proven, CodeQuerySemanticCompleteness::Partial) => {
-                "proven/partial"
-            }
-            (CodeQuerySemanticProof::Unproven, CodeQuerySemanticCompleteness::Complete) => {
-                "unproven/complete"
-            }
-            (CodeQuerySemanticProof::Unproven, CodeQuerySemanticCompleteness::Partial) => {
-                "unproven/partial"
-            }
+            (Some(proof_reason), Some(completeness_reason)) => Some(format!(
+                "proof: {proof_reason}; completeness: {completeness_reason}"
+            )),
+        };
+        Self {
+            proof,
+            completeness,
+            reason,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQuerySemanticProof {
     Proven,
     Unproven,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+impl CodeQuerySemanticProof {
+    pub const LABELS: &'static [&'static str] = &["proven", "unproven"];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::Unproven => "unproven",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeQuerySemanticCompleteness {
     Complete,
     Partial,
+}
+
+impl CodeQuerySemanticCompleteness {
+    pub const LABELS: &'static [&'static str] = &["complete", "partial"];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
 }

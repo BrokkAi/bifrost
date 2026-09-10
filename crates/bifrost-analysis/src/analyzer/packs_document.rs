@@ -400,17 +400,20 @@ pub fn activate_workspace_semantic_sources(
     if ecosystems.is_empty() && !workspace_models_present && !sources.intrinsic_shipped_models {
         return Ok(None);
     }
-    let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
-        Some(relative) => SemanticPackCatalog::open(
-            &sources.catalog_root.join(relative),
-            CatalogOpenMode::ReadWrite,
-            CatalogOptions::default(),
-        )?,
-        None => open_ambient_semantic_pack_catalog(
-            workspace,
-            sources.catalog_root,
-            CatalogOptions::default(),
-        )?,
+    let catalog = {
+        let _scope = crate::profiling::scope("semantic_pack.open_catalog");
+        match sources.config.and_then(WorkspacePacksConfig::catalog) {
+            Some(relative) => SemanticPackCatalog::open(
+                &sources.catalog_root.join(relative),
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )?,
+            None => open_ambient_semantic_pack_catalog(
+                workspace,
+                sources.catalog_root,
+                CatalogOptions::default(),
+            )?,
+        }
     };
     activate_workspace_semantic_sources_in_catalog(
         workspace,
@@ -477,11 +480,14 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     {
         return Ok(None);
     }
-    let shipped_models = if sources.intrinsic_shipped_models {
-        bootstrap_semantic_model_catalog(catalog)
-            .map_err(WorkspaceActivationError::ShippedModels)?
-    } else {
-        false
+    let shipped_models = {
+        let _scope = crate::profiling::scope("semantic_pack.bootstrap_shipped_models");
+        if sources.intrinsic_shipped_models {
+            bootstrap_semantic_model_catalog(catalog)
+                .map_err(WorkspaceActivationError::ShippedModels)?
+        } else {
+            false
+        }
     };
     // The reviewed workspace-local models join the same catalog handle and the
     // same evidence, before the dependency route resolves. A discovery,

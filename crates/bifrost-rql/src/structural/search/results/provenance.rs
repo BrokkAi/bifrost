@@ -44,6 +44,8 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        site_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         node_range: Option<CodeQueryRange>,
     },
     Procedure {
@@ -384,6 +386,7 @@ pub enum CodeQueryResultRef {
     ProcedureEffect {
         id: String,
         procedure_id: String,
+        site_id: String,
         path: String,
         range: CodeQueryRange,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +397,7 @@ pub enum CodeQueryResultRef {
     CallableSignature {
         id: String,
         declaration_id: Option<String>,
+        site_id: String,
         path: String,
         range: CodeQueryRange,
         role: &'static str,

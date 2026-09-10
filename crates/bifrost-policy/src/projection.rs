@@ -2125,6 +2125,7 @@ mod tests {
     use crate::resolved::{ResolvedTaintEndpoint, ResolvedTaintSourceDefinition};
     use crate::source::PolicySourceIdentity;
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+    use sha2::Digest;
 
     fn taint_policy(id: &str) -> String {
         taint_policy_with_report(id, "")
@@ -2322,7 +2323,7 @@ mod tests {
         let sink_identity = StableSemanticIdentity::analyzer_declaration_id(
             "test",
             WorkspaceRelativePath::new("src/test.rs").unwrap(),
-            sink_key,
+            format!("decl:v1:{:x}", sha2::Sha256::digest(sink_key.as_bytes())),
         )
         .unwrap();
         let anchor = TaintFindingAnchor::strong(

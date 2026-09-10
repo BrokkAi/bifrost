@@ -71,6 +71,72 @@ pub fn resolve_rql_schema_version(
     rql_schema_version_registry().resolve(authored_version)
 }
 
+/// Fixed public language-family membership for the RQL schema lineage.
+/// Changing an existing family's membership requires a new RQL schema version.
+#[derive(Debug, Clone, Copy)]
+pub struct LanguageFamily {
+    pub label: &'static str,
+    pub members: &'static [brokk_bifrost_core::analyzer::Language],
+    pub schema_version: u32,
+    pub signature: &'static str,
+    pub description: &'static str,
+}
+
+pub const LANGUAGE_FAMILIES: &[LanguageFamily] = &[
+    LanguageFamily {
+        label: "jvm",
+        members: &[
+            brokk_bifrost_core::analyzer::Language::Java,
+            brokk_bifrost_core::analyzer::Language::Kotlin,
+            brokk_bifrost_core::analyzer::Language::Scala,
+        ],
+        schema_version: 1,
+        signature: "jvm = [java kotlin scala]",
+        description: "Fixed RQL schema-1 family for Java, Kotlin and Scala. Nested language scopes intersect these concrete languages.",
+    },
+    LanguageFamily {
+        label: "js-ts",
+        members: &[
+            brokk_bifrost_core::analyzer::Language::JavaScript,
+            brokk_bifrost_core::analyzer::Language::TypeScript,
+        ],
+        schema_version: 1,
+        signature: "js-ts = [javascript typescript]",
+        description: "Fixed RQL schema-1 family for JavaScript (including JSX) and TypeScript (including TSX). No language is inferred from workspace contents.",
+    },
+];
+
+/// Expand concrete labels and fixed families, deduplicating in authored order.
+pub fn expand_language_labels(
+    labels: &[&str],
+) -> Result<Vec<brokk_bifrost_core::analyzer::Language>, String> {
+    use brokk_bifrost_core::analyzer::Language;
+    let mut languages = Vec::new();
+    for label in labels {
+        let concrete;
+        let members = if let Some(family) = LANGUAGE_FAMILIES
+            .iter()
+            .find(|family| family.label == *label)
+        {
+            assert_eq!(
+                family.schema_version, RQL_SCHEMA_VERSION,
+                "language family needs an explicit schema-version migration"
+            );
+            family.members
+        } else {
+            concrete = [Language::from_config_label(label)
+                .ok_or_else(|| format!("unknown language label `{label}`"))?];
+            &concrete
+        };
+        for language in members {
+            if !languages.contains(language) {
+                languages.push(*language);
+            }
+        }
+    }
+    Ok(languages)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFamily {
     Node,
@@ -136,6 +202,37 @@ impl RuntimeSourceOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverTypeConstraintForm {
+    AssignableTo,
+}
+
+impl ReceiverTypeConstraintForm {
+    pub fn from_rql_label(label: &str) -> Option<Self> {
+        matches!(label, "assignable-to" | "assignable_to").then_some(Self::AssignableTo)
+    }
+
+    pub const fn canonical_label(self) -> &'static str {
+        match self {
+            Self::AssignableTo => "assignable_to",
+        }
+    }
+
+    pub const fn signature(self) -> &'static str {
+        match self {
+            Self::AssignableTo => "(assignable-to identity|\"qualified\")",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::AssignableTo => {
+                "Require the named workspace receiver type or a descendant proven by its typed hierarchy."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
     QueryList,
@@ -148,6 +245,7 @@ pub enum ValueShape {
     CaptureName,
     RegexString,
     StringList,
+    PathScope,
     StringPredicate,
     RegexPredicate,
     KindList,
@@ -206,6 +304,9 @@ pub enum ValueShape {
     RuntimeGlobal,
     RuntimeContainer,
     RuntimeSourceOrigin,
+    CallIdentity,
+    ReceiverTypeConstraint,
+    CallProof,
 }
 
 impl ValueShape {
@@ -222,6 +323,9 @@ impl ValueShape {
             Self::CaptureName => "a non-empty declared capture name",
             Self::RegexString => "a regular expression string",
             Self::StringList => "one or more strings",
+            Self::PathScope => {
+                "a flat list of alternative path globs, or nested lists whose groups all match"
+            }
             Self::StringPredicate => "an exact string or regex predicate",
             Self::RegexPredicate => "a regex predicate object",
             Self::KindList => "a normalized kind or list of kinds",
@@ -286,6 +390,11 @@ impl ValueShape {
             Self::RuntimeGlobal => "a supported runtime global binding",
             Self::RuntimeContainer => "a supported runtime container member",
             Self::RuntimeSourceOrigin => "a supported runtime source-origin contract",
+            Self::CallIdentity => "a stable, qualified, or resolved typed call identity",
+            Self::ReceiverTypeConstraint => {
+                "an exact call identity or an assignable-to workspace receiver family"
+            }
+            Self::CallProof => "exact or declared",
         }
     }
 
@@ -638,6 +747,8 @@ query_step_ops! {
     DetachedTaskTransfers { shape: RowLocal, label: "detached_task_transfers", signature: "procedure -> detached_task_transfer", description: "Project receiver, argument, and exact local closure-capture values copied into calls whose semantic invocation mode is detached and whose execution timing is different_task. Each row carries stable value identity and an exact abstract-object identity when the heap oracle proves one closed candidate; absent, ambiguous, open, or unproven object sets remain explicit open terminal rows.", semantic: [Procedures, ProgramPoints] }
     ProcedureEffects { shape: RowLocal, label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
     CallBindings { shape: RowLocal, label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. Exact receiver rows carry a stable declaring-type identity. Selector proof is separate from runtime dispatch: it is derived for exact dispatch or for a resolver-proven receiverless external static target whose unique complete model supplies exact formals. It can also be authored-summary proof when a unique complete exact-member summary explicitly covers the sole unresolved override residual; full activated provenance is retained. Workspace arms, ambiguous overloads, partial or conflicting models, unproven owner identity, instance boundaries without a contract, other boundary kinds, and truncation remain inexact. The semantic dispatch identity, proof, completeness, and candidate coverage are still carried unchanged from the bounded dispatch answer. A source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
+    ResolvedCall { shape: RowLocal, label: "resolved_call", signature: "call_binding -> call_binding", description: "Retain call-binding rows that prove one resolved callable identity with exact or declared selector proof and an optional exact receiver-type identity. Qualified RQL locators are resolved only at a loaded-policy boundary." }
+    CallArgument { shape: RowLocal, label: "call_argument", signature: "call_binding -> call_binding", description: "Retain the source actual bound to one formal name or zero-based formal index, requiring exact mapping, exhaustive coverage, a non-terminal row, and argument identity." }
     CallableSignature { shape: RowLocal, label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
     SignatureParameters { shape: RowLocal, label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
     DecoratorBindings { shape: Batched, label: "decorator_bindings", signature: "structural_match -> decorated_parameter", description: "Project one typed decorator-binding row for each decorator applied to a parameter match. Semantic parameter identity is used only when an exact structural source identity selects one Parameter value; otherwise the row retains only a syntax explanation and explicitly incomplete coverage.", semantic: [Procedures] }
@@ -854,6 +965,8 @@ macro_rules! rql_forms {
                     | Self::CallArgumentGroups
                     | Self::CallArguments
                     | Self::CallBindings
+                    | Self::ResolvedCall
+                    | Self::CallArgument
                     | Self::CallEffects
                     | Self::ResultContractCalls
                     | Self::CallResultContracts
@@ -934,16 +1047,16 @@ rql_forms! {
     Where {
         labels: ["where"],
         class: Wrapper,
-        shape: StringList,
+        shape: PathScope,
         signature: "(where \"glob\" ... query)",
-        description: "Restrict the query to workspace-relative path globs.",
+        description: "Restrict the query to workspace-relative path globs. Globs in one wrapper are alternatives; repeated wrappers conjoin their groups and distribute over set-query seeds.",
     }
     Language {
         labels: ["language", "languages"],
         class: Wrapper,
         shape: LanguageList,
         signature: "(language label ... query)",
-        description: "Restrict the query to one or more analyzer languages.",
+        description: "Restrict the query to concrete analyzer languages or fixed jvm/js-ts families. Repeated wrappers intersect their language sets; disjoint sets are errors.",
     }
     Limit {
         labels: ["limit"],
@@ -1358,6 +1471,22 @@ rql_forms! {
         signature: "(call-bindings query)",
         description: (QueryStepOp::CallBindings),
         step: CallBindings,
+    }
+    ResolvedCall {
+        labels: ["resolved-call", "resolved_call"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(resolved-call :resolves-to identity|\"qualified\" :proof exact|declared [:receiver-type identity|\"qualified\"|(assignable-to identity|\"qualified\")] query)",
+        description: (QueryStepOp::ResolvedCall),
+        step: ResolvedCall,
+    }
+    CallArgument {
+        labels: ["call-argument", "call_argument"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-argument (:formal-name name | :formal-index index) query)",
+        description: (QueryStepOp::CallArgument),
+        step: CallArgument,
     }
     CallEffects {
         labels: ["call-effects", "call_effects"],
@@ -2089,7 +2218,7 @@ macro_rules! json_fields {
 json_fields! {
     QueryField,
     ALL_QUERY_FIELDS,
-    Where { label: "where", shape: StringList, signature: "\"where\": [\"glob\", ...]", description: "Restrict the query to workspace-relative path globs." }
+    Where { label: "where", shape: PathScope, signature: "\"where\": [\"glob\", ...] | [[\"glob\", ...], ...]", description: "Restrict the source relation to workspace-relative path globs; nested lists conjoin alternative-glob groups." }
     Languages { label: "languages", shape: LanguageList, signature: "\"languages\": [\"rust\", ...]", description: "Restrict the query to analyzer languages." }
     Match { label: "match", shape: Pattern, signature: "\"match\": { pattern }", description: "Define the required root structural pattern." }
     Union { label: "union", shape: QueryList, signature: "\"union\": [{ query }, { query }, ...]", description: "Combine compatible typed endpoints reached by any branch." }
@@ -2170,6 +2299,11 @@ json_fields! {
     FailureUseConsumers { label: "consumer", shape: FailureUseConsumerList, signature: "\"consumer\": [\"return\", \"returned_call_argument\", \"call_argument\"]", description: "Restrict failure-use rows to one or more structured consumer classes." }
     ControlRelations { label: "control_relation", shape: ControlRelationKindList, signature: "\"control_relation\": [\"dominates\", ...]", description: "Restrict control-relation rows to one or more relations." }
     ControlExitPartitions { label: "exit_partition", shape: ControlExitPartitionList, signature: "\"exit_partition\": [\"normal_and_exceptional\"]", description: "Restrict control-relation rows to one or more exit partitions the claim was computed against." }
+    ResolvesTo { label: "resolves_to", shape: CallIdentity, signature: "\"resolves_to\": { \"stable\" | \"qualified\" | \"workspace_declaration\" | \"active_semantic_model\": \"identity\" }", description: "Select one callable stable identity, qualified locator, or resolved typed identity." }
+    CallProof { label: "call_proof", shape: CallProof, signature: "\"call_proof\": \"exact\" | \"declared\"", description: "Require exact selector proof or a complete declared semantic-model callable." }
+    ReceiverType { label: "receiver_type", shape: ReceiverTypeConstraint, signature: "\"receiver_type\": call identity | { \"assignable_to\": call identity, \"resolved_identities\": [\"stable-id\", ...] }", description: "Require one exact receiver-type identity or the inclusive workspace family rooted at one type." }
+    FormalName { label: "formal_name", shape: ParameterName, signature: "\"formal_name\": \"name\"", description: "Select one exact declared formal name." }
+    FormalIndex { label: "formal_index", shape: NonNegativeInteger, signature: "\"formal_index\": non-negative integer", description: "Select one zero-based formal index." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -2291,6 +2425,27 @@ const KEYED_READ_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
 const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
     QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
+];
+const RESOLVED_CALL_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::required(
+        QueryStepField::ResolvesTo,
+        &[":resolves-to", ":resolves_to"],
+    ),
+    QueryStepOption::required(QueryStepField::CallProof, &[":proof"]),
+    QueryStepOption::optional(
+        QueryStepField::ReceiverType,
+        &[":receiver-type", ":receiver_type"],
+    ),
+];
+const CALL_ARGUMENT_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(
+        QueryStepField::FormalName,
+        &[":formal-name", ":formal_name"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::FormalIndex,
+        &[":formal-index", ":formal_index"],
+    ),
 ];
 /// Shared by the two occurrence-producing steps and by the `occurrences` seed,
 /// so an author spells the same filter the same way wherever it appears.
@@ -2467,6 +2622,8 @@ impl QueryStepOp {
             Self::FieldWriteValue => FIELD_WRITE_VALUE_STEP_OPTIONS,
             Self::KeyedReadValue => KEYED_READ_VALUE_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
+            Self::ResolvedCall => RESOLVED_CALL_STEP_OPTIONS,
+            Self::CallArgument => CALL_ARGUMENT_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,
             Self::DecoratorBindings => DECORATOR_BINDING_STEP_OPTIONS,

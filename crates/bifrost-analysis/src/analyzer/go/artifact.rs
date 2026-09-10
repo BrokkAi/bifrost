@@ -170,6 +170,7 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             diagnostics,
@@ -291,6 +292,7 @@ impl GoModulePackProducer {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 }],
             }),
             completeness,
@@ -2691,6 +2693,7 @@ var privateValue int
                 },
                 runtime_values: None,
                 collection_flows: None,
+                deferred_yields: None,
             }],
         };
         compile_pack(&pack, &CompilerOptions::default()).unwrap();

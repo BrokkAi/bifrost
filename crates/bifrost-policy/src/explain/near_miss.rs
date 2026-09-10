@@ -685,10 +685,17 @@ fn render_scope(seed: &CodeQuerySeed) -> String {
         String::from("the whole workspace")
     } else {
         seed.where_globs
+            .groups()
             .iter()
-            .map(|pattern| pattern.as_str())
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|pattern| pattern.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("] and [")
     };
     format!("kind [{kinds}] in [{languages}] under [{globs}]")
 }

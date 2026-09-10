@@ -28,6 +28,157 @@ use brokk_bifrost_core::analyzer::usages::model::{
 use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::ops::Range;
+
+/// Error returned when conjoined path-scope groups exceed the query budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPathScopeError {
+    EmptyGroup,
+    TooManyGlobs { count: usize, max: usize },
+}
+
+impl fmt::Display for QueryPathScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyGroup => {
+                formatter.write_str("a nested where group must contain at least one glob")
+            }
+            Self::TooManyGlobs { count, max } => {
+                write!(formatter, "at most {max} globs are allowed, got {count}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for QueryPathScopeError {}
+
+/// Workspace-relative path scope as conjunctions of glob alternatives.
+///
+/// An empty group list means unscoped. Each inner group is the historical
+/// flat `where` list: a path matches if it matches any glob in every group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryPathScope {
+    groups: Vec<Vec<glob::Pattern>>,
+}
+
+impl QueryPathScope {
+    pub fn from_flat(globs: Vec<glob::Pattern>) -> Self {
+        Self {
+            groups: if globs.is_empty() {
+                Vec::new()
+            } else {
+                vec![globs]
+            },
+        }
+    }
+
+    pub fn try_from_groups(groups: Vec<Vec<glob::Pattern>>) -> Result<Self, QueryPathScopeError> {
+        if groups.iter().any(|group| group.is_empty()) {
+            return Err(QueryPathScopeError::EmptyGroup);
+        }
+        let count = groups.iter().map(Vec::len).sum::<usize>();
+        if count > MAX_WHERE_GLOBS {
+            return Err(QueryPathScopeError::TooManyGlobs {
+                count,
+                max: MAX_WHERE_GLOBS,
+            });
+        }
+        let mut unique = Vec::with_capacity(groups.len());
+        for group in groups {
+            if !unique.contains(&group) {
+                unique.push(group);
+            }
+        }
+        Ok(Self { groups: unique })
+    }
+
+    /// Conjoin `self` with `other`, retaining the receiver's group order first.
+    /// Identical redundant groups collapse; one surviving group remains flat.
+    pub fn combine(&self, other: &Self) -> Result<Self, QueryPathScopeError> {
+        let mut groups = self.groups.clone();
+        for group in &other.groups {
+            if !groups.contains(group) {
+                groups.push(group.clone());
+            }
+        }
+        Self::try_from_groups(groups)
+    }
+
+    pub fn groups(&self) -> &[Vec<glob::Pattern>] {
+        &self.groups
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.groups.is_empty()
+            || self
+                .groups
+                .iter()
+                .all(|group| group.iter().any(|glob| glob.matches(path)))
+    }
+}
+
+/// Validate and compile one workspace-relative path glob at the shared RQL boundary.
+pub fn compile_path_glob(text: &str) -> Result<glob::Pattern, String> {
+    if text.len() > MAX_GLOB_LENGTH {
+        return Err(format!("glob must be at most {MAX_GLOB_LENGTH} bytes"));
+    }
+    glob::Pattern::new(text).map_err(|error| format!("invalid glob: {error}"))
+}
+
+/// Conflict from conjoining two non-empty explicit language scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageScopeConflict {
+    pub local: Vec<String>,
+    pub shared: Vec<String>,
+}
+
+impl fmt::Display for LanguageScopeConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "language scopes are disjoint: {:?} and {:?}",
+            self.local, self.shared
+        )
+    }
+}
+
+impl std::error::Error for LanguageScopeConflict {}
+
+/// Intersect explicit language filters, preserving the local scope's order.
+/// An empty vector means all languages and is not a statically disjoint scope.
+pub fn intersect_language_scopes(
+    local: &[Language],
+    shared: &[Language],
+) -> Result<Vec<Language>, LanguageScopeConflict> {
+    if local.is_empty() {
+        return Ok(shared.to_vec());
+    }
+    if shared.is_empty() {
+        return Ok(local.to_vec());
+    }
+    let combined = local
+        .iter()
+        .filter(|language| shared.contains(language))
+        .copied()
+        .collect::<Vec<_>>();
+    if combined.is_empty() {
+        return Err(LanguageScopeConflict {
+            local: local
+                .iter()
+                .map(|language| language.config_label().to_string())
+                .collect(),
+            shared: shared
+                .iter()
+                .map(|language| language.config_label().to_string())
+                .collect(),
+        });
+    }
+    Ok(combined)
+}
 
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 1000;
@@ -531,6 +682,116 @@ pub enum CallInputSelector {
     ParameterName(String),
 }
 
+/// One callable or receiver-type identity used by `resolved_call`.
+///
+/// JSON authors state the kind explicitly. RQL authors get the same typed
+/// distinction from syntax: an unquoted symbol is a stable identity and a
+/// quoted string is a qualified locator that a loaded policy resolves before
+/// execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallIdentity {
+    Stable(String),
+    Qualified {
+        value: String,
+        /// Exact RQL source range, populated only by the S-expression
+        /// frontend. It does not participate in canonical query JSON.
+        source_range: Option<Range<usize>>,
+        /// The typed identity selected at the loaded-policy boundary. Generic
+        /// query execution leaves qualified locators unresolved and therefore
+        /// cannot accidentally compare a display name with a stable identity.
+        resolved: Option<ResolvedCallIdentity>,
+    },
+}
+
+impl CallIdentity {
+    pub fn effective_identity(&self) -> Option<&str> {
+        match self {
+            Self::Stable(identity) => Some(identity),
+            Self::Qualified {
+                resolved: Some(resolved),
+                ..
+            } => Some(&resolved.identity),
+            Self::Qualified { resolved: None, .. } => None,
+        }
+    }
+
+    pub fn is_resolved_workspace_declaration(&self) -> bool {
+        matches!(
+            self,
+            Self::Qualified {
+                resolved: Some(ResolvedCallIdentity {
+                    kind: ResolvedCallIdentityKind::WorkspaceDeclaration,
+                    ..
+                }),
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCallIdentityKind {
+    WorkspaceDeclaration,
+    ActiveSemanticModel,
+}
+
+/// Resolution result retained on a qualified RQL locator.
+///
+/// Model provenance stays policy-owned; this query-level record carries only
+/// the stable identity and which structured identity domain selected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCallIdentity {
+    pub kind: ResolvedCallIdentityKind,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCallProof {
+    Exact,
+    Declared,
+}
+
+/// Receiver-owner constraint applied by `resolved_call`.
+///
+/// An assignable constraint retains its authored root and the inclusive,
+/// sorted declaration-identity family materialized at the loaded-policy
+/// boundary. An empty family is unresolved and cannot execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCallReceiverType {
+    Exact(CallIdentity),
+    AssignableTo {
+        root: CallIdentity,
+        resolved_identities: Vec<String>,
+    },
+}
+
+impl ResolvedCallReceiverType {
+    pub fn root(&self) -> &CallIdentity {
+        match self {
+            Self::Exact(identity) | Self::AssignableTo { root: identity, .. } => identity,
+        }
+    }
+
+    pub fn root_mut(&mut self) -> &mut CallIdentity {
+        match self {
+            Self::Exact(identity) | Self::AssignableTo { root: identity, .. } => identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCallFilter {
+    pub resolves_to: CallIdentity,
+    pub proof: ResolvedCallProof,
+    pub receiver_type: Option<ResolvedCallReceiverType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArgumentSelector {
+    FormalName(String),
+    FormalIndex(usize),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HierarchyTraversal {
     Direct,
@@ -583,6 +844,8 @@ pub enum QueryStep {
     CallArgumentGroups,
     CallArguments,
     CallBindings,
+    ResolvedCall(ResolvedCallFilter),
+    CallArgument(CallArgumentSelector),
     CallEffects,
     ResultContractCalls,
     CallResultContracts,
@@ -916,7 +1179,7 @@ impl OccurrenceFilter {
 /// containment verifier exists exactly once (see the ExecPlan decision log).
 #[derive(Debug, Clone, Default)]
 pub struct OccurrenceSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: OccurrenceFilter,
 }
@@ -951,11 +1214,12 @@ impl OccurrenceSeed {
 /// contains `[`, `?` or `*` selects itself on every correlated surface.
 pub fn exact_path_globs<'a>(
     paths: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<glob::Pattern>, glob::PatternError> {
+) -> Result<QueryPathScope, glob::PatternError> {
     paths
         .into_iter()
         .map(|path| glob::Pattern::new(&glob::Pattern::escape(path)))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(QueryPathScope::from_flat)
 }
 
 /// A non-structural seed producing lexical scope rows directly from workspace
@@ -966,7 +1230,7 @@ pub fn exact_path_globs<'a>(
 /// containment verifier stays in one place.
 #[derive(Debug, Clone, Default)]
 pub struct ScopeSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: ScopeFilter,
 }
@@ -1012,7 +1276,7 @@ pub struct SegmentsOfOptions {
 /// workspace facts (#1475).
 #[derive(Debug, Clone, Default)]
 pub struct PathSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: PathFilter,
 }
@@ -1033,7 +1297,7 @@ impl PathSeed {
 /// A non-structural seed producing binding rows directly from workspace facts.
 #[derive(Debug, Clone, Default)]
 pub struct BindingSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: BindingFilter,
 }
@@ -1042,7 +1306,7 @@ pub struct BindingSeed {
 /// recorded materialization provenance (issue #1476).
 #[derive(Debug, Clone, Default)]
 pub struct GenerationSiteSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: GenerationSiteFilter,
 }
@@ -1064,7 +1328,7 @@ impl GenerationSiteSeed {
 /// materialization provenance (issue #1476).
 #[derive(Debug, Clone, Default)]
 pub struct ExportSeed {
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     pub languages: Vec<Language>,
     pub filter: ExportFilter,
 }
@@ -1119,6 +1383,8 @@ impl QueryStep {
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::CallBindings => QueryStepOp::CallBindings,
+            Self::ResolvedCall(_) => QueryStepOp::ResolvedCall,
+            Self::CallArgument(_) => QueryStepOp::CallArgument,
             Self::CallEffects => QueryStepOp::CallEffects,
             Self::ResultContractCalls => QueryStepOp::ResultContractCalls,
             Self::CallResultContracts => QueryStepOp::CallResultContracts,
@@ -1233,6 +1499,7 @@ impl QueryStep {
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::CallBindings => Some(Self::CallBindings),
+            QueryStepOp::ResolvedCall | QueryStepOp::CallArgument => None,
             QueryStepOp::CallEffects => Some(Self::CallEffects),
             QueryStepOp::ResultContractCalls => Some(Self::ResultContractCalls),
             QueryStepOp::CallResultContracts => Some(Self::CallResultContracts),
@@ -1458,6 +1725,9 @@ impl QueryStep {
                 Some(QueryValueKind::CallArgument)
             }
             (Self::CallBindings, QueryValueKind::CallShape) => Some(QueryValueKind::CallBinding),
+            (Self::ResolvedCall(_) | Self::CallArgument(_), QueryValueKind::CallBinding) => {
+                Some(QueryValueKind::CallBinding)
+            }
             (Self::CallEffects, QueryValueKind::CallShape) => Some(QueryValueKind::CallEffect),
             (Self::ResultContractCalls, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallShape)
@@ -1679,6 +1949,7 @@ pub(super) fn validate_query_steps(
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::CallBindings => "call_shape",
+            QueryStep::ResolvedCall(_) | QueryStep::CallArgument(_) => "call_binding",
             QueryStep::CallEffects => "call_shape",
             QueryStep::ResultContractCalls => "call_shape",
             QueryStep::CallResultContracts => "call_shape",
@@ -1804,7 +2075,7 @@ impl CodeQueryResultDetail {
 #[derive(Debug, Clone)]
 pub struct CodeQuerySeed {
     /// Path globs relative to the workspace root; empty means all files.
-    pub where_globs: Vec<glob::Pattern>,
+    pub where_globs: QueryPathScope,
     /// Language filter; empty means all languages with structural adapters.
     pub languages: Vec<Language>,
     pub root: Pattern,

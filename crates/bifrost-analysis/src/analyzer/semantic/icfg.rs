@@ -744,7 +744,7 @@ impl<'a> WorkspaceIcfgProvider<'a> {
     ) -> Self {
         let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
             workspace,
-            snapshot.as_deref(),
+            snapshot.clone(),
             dispatch_hints,
         );
         let behavior_identity = IcfgProviderBehaviorIdentity::workspace(
@@ -804,6 +804,10 @@ impl<'a> WorkspaceIcfgProvider<'a> {
             &mut SemanticRequest<'_>,
         ) -> Result<T, SemanticProviderError>,
     ) -> Result<T, SemanticProviderError> {
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.workspace().analyzer(),
+            self.active_semantic_model_snapshot.clone(),
+        );
         let snapshot_cache = Arc::new(QueryLocalIcfgOutcomeCache::snapshot_overlay(Arc::clone(
             &self.outcome_cache,
         )));

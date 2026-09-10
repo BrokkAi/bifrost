@@ -6,6 +6,12 @@ produces, not for its position. The numbered files beside it carry a store
 forward through the current version; version numbers remain explicit because
 this chain can deliberately skip an unpublished number.
 
+`0062-current-fresh-schema.sql` is SQLite's rendering of the same final schema
+after the complete migration chain. A database with version zero and no schema
+objects may install it directly, avoiding obsolete table rewrites. Existing
+stores still run every pending numbered migration, and tests require the direct
+fresh schema and migrated schema to have identical object definitions.
+
 `BASELINE_MIGRATION_VERSION` and `CURRENT_MIGRATION_VERSION` in
 `src/cache_db.rs` name the two ends, and `CACHE_MIGRATIONS` writes the version
 beside each file's SQL rather than inferring it from a position. Compile-time

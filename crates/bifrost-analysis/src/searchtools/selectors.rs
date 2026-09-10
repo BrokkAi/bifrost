@@ -4,6 +4,7 @@ use super::*;
 // evidence has no equivalent in another supported language. Bounded selector projections
 // use the generic language capability, which keeps the framework out of C++ analyzer internals.
 use crate::analyzer::languages::language_support;
+use crate::analyzer::symbol_lookup::{FuzzyResolveBudget, resolve_codeunit_fuzzy_bounded_with};
 #[cfg(test)]
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CallableLinkage, CppCallableUnitRole, cpp_header_body_files_are_related};
@@ -128,7 +129,9 @@ pub(super) fn definition_lookup_incomplete_reason_for_kind(
         | "scala_parse_failed"
         | "read_failed"
         | "file_read_failed" => DefinitionLookupIncompleteReason::AnalysisFailure,
-        "cpp_navigation_structure_unavailable" | "source_unavailable" => {
+        "cpp_navigation_structure_unavailable"
+        | "source_unavailable"
+        | "csharp_receiver_type_unindexed" => {
             DefinitionLookupIncompleteReason::StructureUnavailable
         }
         "navigation_targets_truncated" => DefinitionLookupIncompleteReason::NavigationTargets,
@@ -854,6 +857,26 @@ pub(super) fn anchor_scoped_codeunit_resolution(
     anchor: &str,
     lookup: &str,
 ) -> CodeUnitResolution {
+    anchor_scoped_codeunit_resolution_bounded(
+        analyzer,
+        anchor,
+        lookup,
+        FuzzyResolveBudget::unbounded(),
+    )
+    .expect("an unbounded anchored resolution has no stop condition")
+}
+
+/// [`anchor_scoped_codeunit_resolution`] under the caller's fuzzy budget. The
+/// anchor narrows the candidate set, not the work: a bare member name like
+/// `flags` in a 224k-line kernel header matches hundreds of structs in that
+/// one file, and expanding each match is a store read apiece, so the fan-out
+/// gate applies here exactly as it does to an unanchored selector.
+pub(super) fn anchor_scoped_codeunit_resolution_bounded(
+    analyzer: &dyn IAnalyzer,
+    anchor: &str,
+    lookup: &str,
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<CodeUnitResolution, FuzzyResolveStop> {
     let in_anchor = |unit: &CodeUnit| rel_path_string(unit.source()) == anchor;
     if !is_bare_symbol_query(analyzer, lookup) {
         let exact: Vec<_> = resolve_codeunit_exact(analyzer, lookup)
@@ -861,13 +884,13 @@ pub(super) fn anchor_scoped_codeunit_resolution(
             .filter(in_anchor)
             .collect();
         if !exact.is_empty() {
-            return CodeUnitResolution::Resolved(exact);
+            return Ok(CodeUnitResolution::Resolved(exact));
         }
     }
 
-    let resolution = resolve_codeunit_fuzzy_with(analyzer, lookup, in_anchor);
+    let resolution = resolve_codeunit_fuzzy_bounded_with(analyzer, lookup, in_anchor, budget)?;
     let CodeUnitResolution::Ambiguous(candidates) = resolution else {
-        return resolution;
+        return Ok(resolution);
     };
     let lookup = lookup.trim();
     let named: Vec<_> = candidates
@@ -876,9 +899,9 @@ pub(super) fn anchor_scoped_codeunit_resolution(
         .cloned()
         .collect();
     if named.is_empty() {
-        return CodeUnitResolution::Ambiguous(candidates);
+        return Ok(CodeUnitResolution::Ambiguous(candidates));
     }
-    CodeUnitResolution::Resolved(named)
+    Ok(CodeUnitResolution::Resolved(named))
 }
 
 /// Resolve a symbol input into one selectable definition group. A file anchor
@@ -891,9 +914,13 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    resolve_selectable_definitions_bounded(analyzer, token, input, |analyzer, lookup| {
-        Ok(resolve(analyzer, lookup))
-    })
+    resolve_selectable_definitions_bounded(
+        analyzer,
+        token,
+        input,
+        FuzzyResolveBudget::unbounded(),
+        |analyzer, lookup| Ok(resolve(analyzer, lookup)),
+    )
     .expect("an unbounded selectable resolution has no stop condition")
 }
 
@@ -906,10 +933,12 @@ pub(super) fn resolve_selectable_definitions_bounded(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     input: &str,
+    budget: FuzzyResolveBudget<'_>,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionResolution, FuzzyResolveStop> {
     Ok(
-        match resolve_selectable_definition_groups_bounded(analyzer, token, input, resolve)? {
+        match resolve_selectable_definition_groups_bounded(analyzer, token, input, budget, resolve)?
+        {
             SelectableDefinitionGroups::NotFound(missing) => {
                 SelectableDefinitionResolution::NotFound(missing)
             }
@@ -934,9 +963,13 @@ pub(super) fn resolve_selectable_definition_groups(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionGroups {
-    resolve_selectable_definition_groups_bounded(analyzer, token, input, |analyzer, lookup| {
-        Ok(resolve(analyzer, lookup))
-    })
+    resolve_selectable_definition_groups_bounded(
+        analyzer,
+        token,
+        input,
+        FuzzyResolveBudget::unbounded(),
+        |analyzer, lookup| Ok(resolve(analyzer, lookup)),
+    )
     .expect("an unbounded selectable resolution has no stop condition")
 }
 
@@ -944,6 +977,7 @@ fn resolve_selectable_definition_groups_bounded(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     input: &str,
+    budget: FuzzyResolveBudget<'_>,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionGroups, FuzzyResolveStop> {
     let selector = split_workspace_definition_selector(analyzer, input);
@@ -952,7 +986,9 @@ fn resolve_selectable_definition_groups_bounded(
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
     };
     let mut resolution = match &anchor {
-        Some(anchor) => anchor_scoped_codeunit_resolution(analyzer, anchor, lookup),
+        Some(anchor) => {
+            anchor_scoped_codeunit_resolution_bounded(analyzer, anchor, lookup, budget)?
+        }
         None => resolve(analyzer, lookup)?,
     };
     if matches!(resolution, CodeUnitResolution::NotFound)
@@ -968,7 +1004,12 @@ fn resolve_selectable_definition_groups_bounded(
                 anchor: path_anchor,
                 lookup: path_lookup,
             } => {
-                resolution = anchor_scoped_codeunit_resolution(analyzer, &path_anchor, path_lookup);
+                resolution = anchor_scoped_codeunit_resolution_bounded(
+                    analyzer,
+                    &path_anchor,
+                    path_lookup,
+                    budget,
+                )?;
                 anchor = Some(path_anchor);
                 lookup = path_lookup;
             }

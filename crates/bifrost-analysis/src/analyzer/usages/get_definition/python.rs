@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::KeyedPoolSafeMemo;
 use crate::analyzer::lexical_definitions::{
     PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
 };
@@ -26,11 +27,150 @@ use brokk_bifrost_python::graph_support::PythonSource;
 use brokk_bifrost_python::imports::{
     PythonImportBinding, python_import_bindings_from_tree, resolve_python_relative_module,
 };
+use brokk_bifrost_python::syntax::python_static_attribute_path;
+use std::cell::Cell;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PYTHON_RECEIVER_TYPE_CACHE_LIMIT: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PythonDefinitionContextKey {
+    // The request memo lives on one Python analyzer generation. The remaining
+    // identity axes distinguish exact-source calls and concurrent query
+    // contexts that selected different semantic-model publications.
+    file: ProjectFile,
+    source: crate::analyzer::semantic::StableDigest,
+    semantic_overlay: Option<Box<str>>,
+}
+
+struct Replayable<T> {
+    value: T,
+    reads: Arc<crate::analyzer::ReadLedger>,
+}
+
+#[derive(Default)]
+pub(super) struct PythonDefinitionContextRequestMemo {
+    contexts:
+        KeyedPoolSafeMemo<PythonDefinitionContextKey, Replayable<Arc<PythonDefinitionContext>>>,
+    #[cfg(test)]
+    build_counters: Arc<PythonDefinitionBuildCounters>,
+}
+
+fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
+    for key in reads.keys() {
+        analyzer.record_read(key);
+    }
+    for _ in 0..reads.unattributed_reads() {
+        analyzer.record_unattributed_read();
+    }
+}
+
+fn definition_context_key(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> PythonDefinitionContextKey {
+    let semantic_overlay = analyzer
+        .semantic_model_overlay()
+        .map(|overlay| Box::<str>::from(overlay.active_model_set_hash()));
+    PythonDefinitionContextKey {
+        file: file.clone(),
+        source: crate::analyzer::semantic::StableDigest::sha256(source),
+        semantic_overlay,
+    }
+}
+
+pub(super) fn request_definition_context(
+    py: &PythonAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+) -> Arc<PythonDefinitionContext> {
+    let key = definition_context_key(analyzer, file, source);
+    let memo = py
+        .active_query_request_memo::<PythonDefinitionContextRequestMemo>()
+        .expect("Python definition context requires an active query scope");
+    let cell = memo.contexts.cell(&key);
+    let built_here = Cell::new(false);
+    let entry = cell.get_or_build_pool_independent(|| {
+        built_here.set(true);
+        let _scope = crate::profiling::scope("get_definition::python::batch_context");
+        #[cfg(test)]
+        memo.build_counters
+            .context_builds
+            .fetch_add(1, Ordering::Relaxed);
+        let (context, reads) = crate::analyzer::capture_query_reads(analyzer, || {
+            PythonDefinitionContext::build(
+                py,
+                analyzer,
+                token,
+                file,
+                #[cfg(test)]
+                Arc::clone(&memo.build_counters),
+            )
+        });
+        Replayable {
+            value: Arc::new(context),
+            reads,
+        }
+    });
+    if !built_here.get() {
+        replay_query_reads(analyzer, &entry.reads);
+    }
+    Arc::clone(&entry.value)
+}
+
+#[cfg(test)]
+pub(super) fn request_definition_build_counts(py: &PythonAnalyzer) -> (usize, usize, usize, usize) {
+    let counters = &py
+        .active_query_request_memo::<PythonDefinitionContextRequestMemo>()
+        .expect("Python definition build counts require an active query scope")
+        .build_counters;
+    (
+        counters.context_builds.load(Ordering::Relaxed),
+        counters.scope_fact_builds.load(Ordering::Relaxed),
+        counters.receiver_type_cache_misses.load(Ordering::Relaxed),
+        counters
+            .generic_receiver_type_fallbacks
+            .load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn request_definition_cached_read_keys(
+    py: &PythonAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> Vec<ReadKey> {
+    let memo = py
+        .active_query_request_memo::<PythonDefinitionContextRequestMemo>()
+        .expect("Python definition cached reads require an active query scope");
+    let key = definition_context_key(analyzer, file, source);
+    let cell = memo.contexts.cell(&key);
+    let entry = cell
+        .get_or_build_pool_independent(|| panic!("Python definition context was not initialized"));
+    let mut reads = entry.reads.keys();
+    if let Some(scope_facts) = entry.value.scope_facts.get() {
+        reads.extend(scope_facts.reads.keys());
+    }
+    for receiver in entry
+        .value
+        .receiver_types
+        .lock()
+        .expect("Python receiver type cache mutex poisoned")
+        .values
+        .values()
+    {
+        reads.extend(receiver.reads.keys());
+    }
+    reads.sort();
+    reads.dedup();
+    reads
+}
 
 pub(crate) struct PythonDefinitionProvider<'a> {
     python: &'a PythonAnalyzer,
@@ -484,7 +624,7 @@ pub(crate) fn python_namespace_imported_class_name_bounded(
     root: Node<'_>,
     expression: Node<'_>,
 ) -> Option<String> {
-    let path = python_static_call_path(expression)?;
+    let path = python_static_attribute_path(expression)?;
     if path.len() < 2 {
         return None;
     }
@@ -529,7 +669,7 @@ pub(crate) fn python_external_imported_symbol_bounded(
     if !support.python.indexed_source_matches(file, source) {
         return None;
     }
-    let path = python_static_call_path(expression)?;
+    let path = python_static_attribute_path(expression)?;
     let local_name = python_slice(*path.first()?, source);
     let binder = support.import_binder(token, file)?;
     let binding = binder.bindings.get(local_name)?;
@@ -1574,33 +1714,142 @@ fn python_type_from_annotation_bounded(
                 .find(|child| child.kind() == "string_content")?;
             python_type_from_annotation_bounded(support, token, file, source, content, depth + 1)
         }
-        _ => {
-            let mut candidates = Vec::new();
-            let mut stack = vec![annotation];
-            while let Some(node) = stack.pop() {
-                if !support.scope_step() {
-                    return None;
-                }
-                if node != annotation
-                    && matches!(node.kind(), "identifier" | "attribute" | "string")
-                    && let Some(candidate) = python_type_from_annotation_bounded(
+        // The grammar wraps an annotation, a PEP 695 bound and a `*Ts` unpack
+        // around the type they carry, and the type is the first named child.
+        "type" | "constrained_type" | "splat_type" | "type_parameter" => {
+            let inner = python_named_children_bounded(support, annotation)?
+                .into_iter()
+                .next()?;
+            python_type_from_annotation_bounded(support, token, file, source, inner, depth + 1)
+        }
+        // A subscripted annotation names its outer class, never a type
+        // argument: `list[int]` is a `list` and `Generator[Result, None,
+        // None]` is a generator, not a `Result`. `Optional[X]` and
+        // `Union[...]` are the two forms that name their arguments instead.
+        "generic_type" | "subscript" => {
+            let parts = python_subscripted_annotation_parts(support, annotation)?;
+            if python_annotation_names_its_arguments(parts.base, source) {
+                let mut candidates = Vec::new();
+                for argument in parts.arguments {
+                    if let Some(candidate) = python_type_from_annotation_bounded(
                         support,
                         token,
                         file,
                         source,
-                        node,
+                        argument,
                         depth + 1,
-                    )
-                {
-                    candidates.push(candidate);
-                    continue;
+                    ) {
+                        candidates.push(candidate);
+                    }
                 }
-                let children = python_named_children_bounded(support, node)?;
-                stack.extend(children.into_iter().rev());
+                unique_python_candidate(candidates)
+            } else {
+                python_type_from_annotation_bounded(
+                    support,
+                    token,
+                    file,
+                    source,
+                    parts.base,
+                    depth + 1,
+                )
+            }
+        }
+        // A PEP 604 `X | Y` names each member of the union. The grammar
+        // spells it `union_type` in a type position and `binary_operator`
+        // where the annotation is read as an expression.
+        "union_type" | "binary_operator"
+            if annotation.kind() == "union_type"
+                || annotation
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "|") =>
+        {
+            let mut candidates = Vec::new();
+            for member in python_named_children_bounded(support, annotation)? {
+                if let Some(candidate) = python_type_from_annotation_bounded(
+                    support,
+                    token,
+                    file,
+                    source,
+                    member,
+                    depth + 1,
+                ) {
+                    candidates.push(candidate);
+                }
             }
             unique_python_candidate(candidates)
         }
+        _ => None,
     }
+}
+
+/// The outer type and the type arguments of a subscripted annotation.
+struct PythonSubscriptedAnnotation<'tree> {
+    base: Node<'tree>,
+    arguments: Vec<Node<'tree>>,
+}
+
+fn python_subscripted_annotation_parts<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    annotation: Node<'tree>,
+) -> Option<PythonSubscriptedAnnotation<'tree>> {
+    match annotation.kind() {
+        // `list[int]` in an annotation: the outer name comes first and the
+        // bracketed arguments follow as one `type_parameter` list.
+        "generic_type" => {
+            let mut children = python_named_children_bounded(support, annotation)?.into_iter();
+            let base = children.next()?;
+            let mut arguments = Vec::new();
+            for list in children {
+                arguments.extend(python_named_children_bounded(support, list)?);
+            }
+            Some(PythonSubscriptedAnnotation { base, arguments })
+        }
+        // The same shape reached through expression syntax carries its
+        // arguments in one or more `subscript` fields.
+        "subscript" => {
+            let base = annotation.child_by_field_name("value")?;
+            let mut arguments = Vec::new();
+            let mut cursor = annotation.walk();
+            for child in annotation.children_by_field_name("subscript", &mut cursor) {
+                if !support.scope_step() {
+                    return None;
+                }
+                if child.kind() == "tuple" {
+                    arguments.extend(python_named_children_bounded(support, child)?);
+                } else {
+                    arguments.push(child);
+                }
+            }
+            Some(PythonSubscriptedAnnotation { base, arguments })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a subscripted annotation's outer name is one of the two forms whose
+/// type arguments are the annotated classes rather than parameters of an outer
+/// class: `Optional[X]` and `Union[...]`.
+fn python_annotation_names_its_arguments(base: Node<'_>, source: &str) -> bool {
+    let name = match base.kind() {
+        "identifier" => python_slice(base, source),
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                base.child_by_field_name("object"),
+                base.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            if object.kind() != "identifier"
+                || attribute.kind() != "identifier"
+                || !matches!(python_slice(object, source), "typing" | "typing_extensions")
+            {
+                return false;
+            }
+            python_slice(attribute, source)
+        }
+        _ => return false,
+    };
+    matches!(name, "Optional" | "Union")
 }
 
 fn python_callable_return_type_in_tree(
@@ -1906,7 +2155,7 @@ pub(super) fn resolve_python(
         };
     }
 
-    let ctx = context.python_context(token, py, file);
+    let ctx = context.python_context(token, py, file, source);
     let support = context.bounded_support();
     let reference = python_reference_node(node);
     match reference {
@@ -2279,7 +2528,7 @@ pub(super) fn exact_python_imported_call(
         return None;
     }
 
-    let path = python_static_call_path(call.child_by_field_name("function")?)?;
+    let path = python_static_attribute_path(call.child_by_field_name("function")?)?;
     if path.last()?.id() != callee.id() {
         return None;
     }
@@ -2316,32 +2565,6 @@ pub(super) fn exact_python_imported_call(
         canonical_callee,
         parameter_count,
     ))
-}
-
-fn python_static_call_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
-    if !matches!(node.kind(), "identifier" | "attribute") {
-        return None;
-    }
-    let mut path = Vec::new();
-    loop {
-        match node.kind() {
-            "identifier" => {
-                path.push(node);
-                break;
-            }
-            "attribute" => {
-                let attribute = node.child_by_field_name("attribute")?;
-                if attribute.kind() != "identifier" {
-                    return None;
-                }
-                path.push(attribute);
-                node = node.child_by_field_name("object")?;
-            }
-            _ => return None,
-        }
-    }
-    path.reverse();
-    Some(path)
 }
 
 fn python_visible_function_import_binding<'a>(
@@ -2857,12 +3080,14 @@ pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<String>>;
+
 pub(super) struct PythonDefinitionContext {
     file: ProjectFile,
     named: HashMap<String, String>,
     namespace: HashMap<String, String>,
     same_file: HashMap<String, Vec<CodeUnit>>,
-    scope_facts: OnceLock<Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>>>,
+    scope_facts: OnceLock<Replayable<Arc<PythonScopeFacts>>>,
     module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
     scoped_import_bindings: OnceLock<Arc<Vec<PythonImportBinding>>>,
     receiver_types: Mutex<PythonReceiverTypeCache>,
@@ -2872,7 +3097,7 @@ pub(super) struct PythonDefinitionContext {
 
 struct PythonReceiverTypeCache {
     limit: usize,
-    values: HashMap<(String, bool), Option<CodeUnit>>,
+    values: HashMap<(String, bool), Replayable<Option<CodeUnit>>>,
 }
 
 impl PythonReceiverTypeCache {
@@ -2999,7 +3224,8 @@ impl PythonDefinitionContext {
             .values
             .get(&key)
         {
-            return cached.clone();
+            replay_query_reads(analyzer, &cached.reads);
+            return cached.value.clone();
         }
 
         #[cfg(test)]
@@ -3007,16 +3233,25 @@ impl PythonDefinitionContext {
             .receiver_type_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let resolved = self
-            .receiver_type_for_object(py, support, raw_type)
-            .or_else(|| self.generic_receiver_type(analyzer, py, file, raw_type, target_self_file));
+        let (resolved, reads) = crate::analyzer::capture_query_reads(analyzer, || {
+            self.receiver_type_for_object(py, support, raw_type)
+                .or_else(|| {
+                    self.generic_receiver_type(analyzer, py, file, raw_type, target_self_file)
+                })
+        });
 
         let mut cache = self
             .receiver_types
             .lock()
             .expect("Python receiver type cache mutex poisoned");
         if cache.values.len() < cache.limit {
-            cache.values.insert(key, resolved.clone());
+            cache.values.insert(
+                key,
+                Replayable {
+                    value: resolved.clone(),
+                    reads,
+                },
+            );
         }
         resolved
     }
@@ -3064,19 +3299,29 @@ impl PythonDefinitionContext {
         file: &ProjectFile,
         source: &str,
         root: Node<'_>,
-    ) -> Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>> {
-        self.scope_facts
-            .get_or_init(|| {
-                let _scope = crate::profiling::scope("get_definition::python::scope_facts");
-                #[cfg(test)]
-                self.build_counters
-                    .scope_fact_builds
-                    .fetch_add(1, Ordering::Relaxed);
+    ) -> Arc<PythonScopeFacts> {
+        let built_here = Cell::new(false);
+        let entry = self.scope_facts.get_or_init(|| {
+            built_here.set(true);
+            let _scope = crate::profiling::scope("get_definition::python::scope_facts");
+            #[cfg(test)]
+            self.build_counters
+                .scope_fact_builds
+                .fetch_add(1, Ordering::Relaxed);
+            let (facts, reads) = crate::analyzer::capture_query_reads(analyzer, || {
                 Arc::new(with_python_graph_source(analyzer, |graph| {
                     collect_scope_facts_from_parsed_source(&graph, py, file, source, root)
                 }))
-            })
-            .clone()
+            });
+            Replayable {
+                value: facts,
+                reads,
+            }
+        });
+        if !built_here.get() {
+            replay_query_reads(analyzer, &entry.reads);
+        }
+        Arc::clone(&entry.value)
     }
 
     fn module_bindings(&self, source: &str, root: Node<'_>) -> Arc<ModuleBindingTimeline> {

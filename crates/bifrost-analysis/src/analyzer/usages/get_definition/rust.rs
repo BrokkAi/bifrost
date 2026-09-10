@@ -3962,6 +3962,7 @@ fn rust_self_scoped_associated_type_candidates(
     if let Some(body) = impl_item.child_by_field_name("body") {
         let mut cursor = body.walk();
         for item in body.named_children(&mut cursor) {
+            let item = brokk_bifrost_rust::syntax::unwrap_attributes(item);
             if !matches!(item.kind(), "associated_type" | "type_item") {
                 continue;
             }
@@ -4874,7 +4875,8 @@ fn rust_single_scoped_call_argument<'tree>(
     let mut cursor = arguments.walk();
     let mut values = arguments
         .named_children(&mut cursor)
-        .filter(|child| child.kind() != "attribute_item");
+        .filter(|child| !matches!(child.kind(), "attribute_item" | "attributes"))
+        .map(brokk_bifrost_rust::syntax::unwrap_attributes);
     let argument = values.next()?;
     values.next().is_none().then_some(argument)
 }
@@ -5681,6 +5683,7 @@ fn rust_extern_crate_binding_in_scope(
         scope
     };
     for node in named_children_iter(items) {
+        let node = brokk_bifrost_rust::syntax::unwrap_attributes(node);
         if node.kind() == "extern_crate_declaration" {
             let bound = node
                 .child_by_field_name("alias")
@@ -8725,6 +8728,22 @@ fn rust_focused_is_workspace_module_namespace(
 
 #[cfg(test)]
 mod bounded_tests {
+    #[test]
+    fn attributed_extern_crate_binding_stays_in_its_scope() {
+        let source = "#[macro_use] extern crate dependencies as external;\nmod nested { #[macro_use] extern crate another as local; }\n";
+        let tree =
+            brokk_bifrost_rust::lexical_scope::parse_rust_tree(source).expect("Rust grammar");
+        assert!(!tree.root_node().has_error());
+        assert_eq!(
+            super::rust_extern_crate_binding_in_scope(tree.root_node(), source, "external"),
+            Some("dependencies".to_string())
+        );
+        assert_eq!(
+            super::rust_extern_crate_binding_in_scope(tree.root_node(), source, "local"),
+            None
+        );
+    }
+
     use super::*;
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use crate::analyzer::{Language, Range};

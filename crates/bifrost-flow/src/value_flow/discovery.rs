@@ -40,7 +40,7 @@ pub struct ClosureLimits {
 }
 
 /// What the walk learned about one resolved call site.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSiteCoverage {
     /// Candidates whose bindings were obtained and whose procedures were
     /// queued for discovery.

@@ -5154,7 +5154,7 @@ mod tests {
         let PolicyAnalysis::Match { spec } = &definition.analysis else {
             panic!("fixture must be a match policy");
         };
-        let PolicySelector::Inline { schema, query } = &spec.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(
@@ -5867,7 +5867,7 @@ mod tests {
         let cross_file_identity = StableSemanticIdentity::analyzer_declaration_id(
             "rust",
             WorkspaceRelativePath::new("src/target.rs").unwrap(),
-            "function:crate::Target::run",
+            format!("decl:v1:{}", "1".repeat(64)),
         )
         .unwrap();
         let structural = PolicyQueryResultRef::StructuralMatch {

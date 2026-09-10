@@ -1,5 +1,7 @@
 use super::JavaGraphSource;
-use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
+use crate::java::graph_support::{
+    JavaSource, UniqueClassInFile, resolve_java_usage_type_components_in,
+};
 use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -644,17 +646,11 @@ fn unique_java_class_by_fqn_in_file(
     fqn: &str,
     file: &ProjectFile,
 ) -> Result<Option<CodeUnit>, ()> {
-    let units = java.declarations(file);
-    let mut candidates = units
-        .iter()
-        .filter(|unit| unit.is_class() && unit.fq_name() == fqn);
-    let Some(first) = candidates.next() else {
-        return Ok(None);
-    };
-    if candidates.any(|candidate| candidate != first) {
-        return Err(());
+    match java.unique_class_by_fqn_in_file(fqn, file) {
+        UniqueClassInFile::None => Ok(None),
+        UniqueClassInFile::Unique(unit) => Ok(Some(unit)),
+        UniqueClassInFile::Ambiguous => Err(()),
     }
-    Ok(Some(first.clone()))
 }
 
 fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {

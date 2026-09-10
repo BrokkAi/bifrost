@@ -141,7 +141,10 @@ impl StoreWriter {
         }
 
         let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
-        repair_planner_statistics_on_open(&conn);
+        {
+            let _scope = crate::profiling::scope("cache_db.repair_planner_statistics");
+            repair_planner_statistics_on_open(&conn);
+        }
         let reader_source = reader_source_path(&conn).unwrap_or_else(|| registry_key.clone());
         let writer = Arc::new(PersistentWriter::spawn(
             registry_key,

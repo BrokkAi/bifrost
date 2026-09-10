@@ -1,6 +1,8 @@
 //! Translation from a verified CSMI v0.1 logical pack into Bifrost authoring
 //! types. No CSMI sidecar or producer-specific metadata is consulted.
 
+use crate::analyzer::semantic_model::{DeferredYieldFact, DeferredYieldsPayload};
+
 use super::canonical::{canonical_pack_manifest, sha256_hex};
 use super::identity::{JVM_IDENTITY_SCHEME, JVM_IDENTITY_VERSION, type_symbol_id};
 use super::model::*;
@@ -384,6 +386,15 @@ fn import_semantic_document(
         } else {
             format!("member.{}", sha256_hex(declaration.symbol.as_bytes()))
         };
+        let callable_family_complete = model.completeness_statements.iter().any(|statement| {
+            statement.vocabulary.is_none()
+                && statement.version.is_none()
+                && statement.family == "declaration-aspects"
+                && statement.status == CsmiCoverageStatus::Complete
+                && statement.scope.get("symbol").and_then(Value::as_str)
+                    == Some(declaration.symbol.as_str())
+                && statement.scope.get("aspect").and_then(Value::as_str) == Some("callable-shape")
+        });
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
             id: member_id,
@@ -401,7 +412,7 @@ fn import_semantic_document(
             is_abstract: false,
             is_virtual: false,
             implicit_operation: None,
-            callable_family_complete: false,
+            callable_family_complete,
             signature: Some(signature),
             receiver: if matches!(
                 shape.receiver,
@@ -425,6 +436,12 @@ fn import_semantic_document(
         });
     }
     import_value_transfer_facts(model, &type_ids, &member_ids, &mut types, &mut members)?;
+    let deferred_yields = import_deferred_yields(
+        model,
+        document.default_provenance.as_deref(),
+        &type_ids,
+        &member_ids,
+    )?;
     let completeness = model
         .completeness_statements
         .iter()
@@ -545,6 +562,7 @@ fn import_semantic_document(
         },
         runtime_values,
         collection_flows,
+        deferred_yields,
     };
     let summary_shard = AuthoredShard {
         id: format!("csmi.{pack_digest}.procedure-summaries"),
@@ -552,6 +570,7 @@ fn import_semantic_document(
         payload: AuthoredPayload::ProcedureSummaries { summaries },
         runtime_values: None,
         collection_flows: None,
+        deferred_yields: None,
     };
     Ok(AuthoredSemanticModelPack {
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
@@ -705,6 +724,291 @@ fn import_collection_flows(
         });
     }
     Ok((!flows.is_empty()).then_some(CollectionFlowsPayload { flows }))
+}
+
+fn import_deferred_yields(
+    model: &CsmiSemanticModel,
+    default_provenance: Option<&str>,
+    type_ids: &HashMap<String, String>,
+    member_ids: &HashMap<String, String>,
+) -> Result<Option<DeferredYieldsPayload>, CsmiImportError> {
+    let mut yields: Vec<DeferredYieldFact> = Vec::new();
+    for (fact_index, fact) in model.extension_facts.iter().enumerate() {
+        if fact.vocabulary != CSMI_DEFERRED_YIELD_PROFILE_ID
+            || fact.version != CSMI_DEFERRED_YIELD_PROFILE_VERSION
+        {
+            continue;
+        }
+        if fact.family != "deferred-yields" {
+            return Err(CsmiImportError::Unsupported {
+                path: "extensionFacts.family".to_owned(),
+                semantic: "deferred-yield facts must use family deferred-yields".to_owned(),
+            });
+        }
+        let object = fact.scope.as_object().ok_or_else(|| {
+            CsmiImportError::Identity("deferred-yield fact scope must be an object".to_owned())
+        })?;
+        let factory = object
+            .get("factory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CsmiImportError::Identity("deferred-yield scope has no factory".to_owned())
+            })?;
+        let resume = object
+            .get("resume")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CsmiImportError::Identity("deferred-yield scope has no resume".to_owned())
+            })?;
+        let handle_type = object
+            .get("handleType")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CsmiImportError::Identity("deferred-yield scope has no handleType".to_owned())
+            })?;
+        let mut payload: CsmiDeferredYieldPayload = serde_json::from_value(fact.payload.clone())
+            .map_err(|error| CsmiImportError::Unsupported {
+                path: "extensionFacts.payload".to_owned(),
+                semantic: error.to_string(),
+            })?;
+        if payload.factory != factory
+            || payload.resume != resume
+            || payload.handle_type != handle_type
+        {
+            return Err(CsmiImportError::Identity(
+                "deferred-yield payload linked scope does not match fact scope".to_owned(),
+            ));
+        }
+        let factory = import_deferred_member_id(
+            factory,
+            member_ids,
+            &format!("extensionFacts[{fact_index}].scope.factory"),
+        )?;
+        let resume = import_deferred_member_id(
+            resume,
+            member_ids,
+            &format!("extensionFacts[{fact_index}].scope.resume"),
+        )?;
+        let handle_type = import_deferred_type_id(
+            handle_type,
+            type_ids,
+            &format!("extensionFacts[{fact_index}].scope.handleType"),
+        )?;
+        import_deferred_yield_payload(
+            &mut payload,
+            type_ids,
+            member_ids,
+            &format!("extensionFacts[{fact_index}].payload"),
+        )?;
+        let coverage = model
+            .completeness_statements
+            .iter()
+            .find(|statement| {
+                statement.vocabulary.as_deref() == Some(CSMI_DEFERRED_YIELD_PROFILE_ID)
+                    && statement.version.as_deref() == Some(CSMI_DEFERRED_YIELD_PROFILE_VERSION)
+                    && statement.family == "deferred-yields"
+                    && statement.scope == fact.scope
+            })
+            .map(|statement| match statement.status {
+                CsmiCoverageStatus::Complete => Completeness::Complete,
+                CsmiCoverageStatus::Unknown | CsmiCoverageStatus::Partial => Completeness::Partial,
+            });
+        let imported = DeferredYieldFact {
+            factory,
+            resume,
+            handle_type,
+            payload,
+            coverage,
+            provenance: if fact.provenance.is_empty() {
+                default_provenance.map(str::to_owned).into_iter().collect()
+            } else {
+                fact.provenance.clone()
+            },
+        };
+        if let Some(existing) = yields.iter_mut().find(|candidate| {
+            candidate.factory == imported.factory
+                && candidate.resume == imported.resume
+                && candidate.handle_type == imported.handle_type
+                && candidate.payload == imported.payload
+                && candidate.coverage == imported.coverage
+        }) {
+            existing.provenance.extend(imported.provenance);
+            existing.provenance.sort_unstable();
+            existing.provenance.dedup();
+        } else {
+            yields.push(imported);
+        }
+    }
+    yields.sort_by_cached_key(|fact| {
+        (
+            fact.factory.clone(),
+            fact.resume.clone(),
+            fact.handle_type.clone(),
+            serde_json::to_string(&fact.payload).expect("typed deferred-yield payload serializes"),
+            fact.coverage,
+        )
+    });
+    Ok((!yields.is_empty()).then_some(DeferredYieldsPayload { yields }))
+}
+
+fn import_deferred_member_id(
+    id: &str,
+    member_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<String, CsmiImportError> {
+    member_ids.get(id).cloned().ok_or_else(|| {
+        CsmiImportError::Identity(format!(
+            "unresolved deferred-yield callable symbol {id} at {path}"
+        ))
+    })
+}
+
+fn import_deferred_type_id(
+    id: &str,
+    type_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<String, CsmiImportError> {
+    type_ids.get(id).cloned().ok_or_else(|| {
+        CsmiImportError::Identity(format!(
+            "unresolved deferred-yield type symbol {id} at {path}"
+        ))
+    })
+}
+
+fn import_deferred_yield_payload(
+    payload: &mut CsmiDeferredYieldPayload,
+    type_ids: &HashMap<String, String>,
+    member_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiImportError> {
+    payload.factory =
+        import_deferred_member_id(&payload.factory, member_ids, &format!("{path}.factory"))?;
+    payload.resume =
+        import_deferred_member_id(&payload.resume, member_ids, &format!("{path}.resume"))?;
+    payload.handle_type = import_deferred_type_id(
+        &payload.handle_type,
+        type_ids,
+        &format!("{path}.handleType"),
+    )?;
+    if let Some(CsmiDeferredYieldSubstitution::ReceiverArguments { declaration }) =
+        &mut payload.receiver_substitution
+    {
+        *declaration = import_deferred_type_id(
+            declaration,
+            type_ids,
+            &format!("{path}.receiverSubstitution.declaration"),
+        )?;
+    }
+    for (position, root) in payload.roots.iter_mut().enumerate() {
+        let root_path = format!("{path}.roots[{position}]");
+        root.callable = import_deferred_member_id(
+            &root.callable,
+            member_ids,
+            &format!("{root_path}.callable"),
+        )?;
+        import_deferred_yield_shape(&mut root.shape, type_ids, &format!("{root_path}.shape"))?;
+    }
+    import_deferred_yield_location(
+        &mut payload.construction.source,
+        member_ids,
+        &format!("{path}.construction.source"),
+    )?;
+    import_deferred_yield_location(
+        &mut payload.construction.handle,
+        member_ids,
+        &format!("{path}.construction.handle"),
+    )?;
+    import_deferred_yield_location(
+        &mut payload.resume_contract.handle_input,
+        member_ids,
+        &format!("{path}.resumeContract.handleInput"),
+    )?;
+    import_deferred_yield_location(
+        &mut payload.resume_contract.yielded_result,
+        member_ids,
+        &format!("{path}.resumeContract.yieldedResult"),
+    )?;
+    import_deferred_yield_location(
+        &mut payload.resume_contract.factory_result_flow.factory_result,
+        member_ids,
+        &format!("{path}.resumeContract.factoryResultFlow.factoryResult"),
+    )?;
+    import_deferred_yield_location(
+        &mut payload.resume_contract.factory_result_flow.resume_input,
+        member_ids,
+        &format!("{path}.resumeContract.factoryResultFlow.resumeInput"),
+    )?;
+    for (position, member) in payload.yield_contract.members.iter_mut().enumerate() {
+        import_deferred_yield_location(
+            &mut member.source,
+            member_ids,
+            &format!("{path}.yield.members[{position}].source"),
+        )?;
+    }
+    Ok(())
+}
+
+fn import_deferred_yield_location(
+    location: &mut CsmiDeferredYieldLocation,
+    member_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiImportError> {
+    location.callable =
+        import_deferred_member_id(&location.callable, member_ids, &format!("{path}.callable"))?;
+    Ok(())
+}
+
+fn import_deferred_yield_shape(
+    shape: &mut CsmiDeferredYieldShape,
+    type_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiImportError> {
+    let mut stack = vec![(shape, path.to_owned())];
+    while let Some((shape, path)) = stack.pop() {
+        match shape {
+            CsmiDeferredYieldShape::Value { r#type } => {
+                import_deferred_yield_type_expression(r#type, type_ids, &format!("{path}.type"))?;
+            }
+            CsmiDeferredYieldShape::Product { components } => {
+                for (position, component) in components.iter_mut().enumerate().rev() {
+                    stack.push((component, format!("{path}.components[{position}]")));
+                }
+            }
+            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
+                stack.push((value, format!("{path}.value")));
+                stack.push((key, format!("{path}.key")));
+            }
+            CsmiDeferredYieldShape::Unknown { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn import_deferred_yield_type_expression(
+    expression: &mut CsmiDeferredYieldTypeExpression,
+    type_ids: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiImportError> {
+    let mut stack = vec![(expression, path.to_owned())];
+    while let Some((expression, path)) = stack.pop() {
+        if let CsmiTypeExpression::Parameter(parameter) = expression {
+            return Err(CsmiImportError::Unsupported {
+                path: format!("{path}.symbol"),
+                semantic: format!(
+                    "deferred type parameter {} requires an exact native generic binder mapping",
+                    parameter.symbol
+                ),
+            });
+        }
+        if let CsmiTypeExpression::Reference(reference) = expression {
+            reference.symbol =
+                import_deferred_type_id(&reference.symbol, type_ids, &format!("{path}.symbol"))?;
+            for (position, argument) in reference.arguments.iter_mut().enumerate().rev() {
+                stack.push((argument, format!("{path}.arguments[{position}]")));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn runtime_provenance(fact: &CsmiExtensionFact, default_provenance: Option<&str>) -> Vec<String> {

@@ -1328,6 +1328,7 @@ fn merge_java_dependency_packs(
             payload,
             runtime_values,
             collection_flows,
+            deferred_yields,
         } = shard;
         let (secondary_types, secondary_members, secondary_relations) = match payload {
             AuthoredPayload::DeclarationFacts {
@@ -1343,6 +1344,7 @@ fn merge_java_dependency_packs(
                         payload,
                         runtime_values,
                         collection_flows,
+                        deferred_yields,
                     });
                 }
                 continue;
@@ -1364,6 +1366,7 @@ fn merge_java_dependency_packs(
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 });
                 index
             });
@@ -4723,6 +4726,7 @@ mod tests {
                     },
                     runtime_values: None,
                     collection_flows: None,
+                    deferred_yields: None,
                 },
             );
         }

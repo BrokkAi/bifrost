@@ -699,7 +699,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
                 formal_name,
             } => {
                 // Keep the call-binding row as the endpoint's output. The
-                // `call-argument` derivation filters by the exact declared
+                // `call-argument` query step filters by the exact declared
                 // formal, while taint endpoint lowering remaps that formal to
                 // the caller-side actual index recorded in the row. This is
                 // essential for Locale-first and variadic overloads: Locale is
@@ -709,13 +709,11 @@ pub fn build_policy(category: InjectionCategory) -> String {
                 sinks.push_str(&format!(
                     "          (sink :id snk-{index} :display-name {display_name:?}\n\
                      \x20           :categories [data.sensitive]\n\
-                     \x20           :selector (row-selector :output calls\n\
-                     \x20             (bind :name calls :query\n\
-                     \x20               (rql :schema-version 1\n\
-                     \x20                 (language java\n\
-                     \x20                   (call-bindings (call-shape (call :callee (name {callee:?})))))))\n\
-                     \x20             (call :over calls :resolves-to {model_id} :proof declared)\n\
-                     \x20             (call-argument :over calls :formal-name {formal_name:?}))\n\
+                     \x20           :selector (rql :schema-version 1\n\
+                     \x20             (language java\n\
+                     \x20               (call-argument :formal-name {formal_name:?}\n\
+                     \x20                 (resolved-call :resolves-to {model_id} :proof declared\n\
+                     \x20                   (call-bindings (call-shape (call :callee (name {callee:?}))))))))\n\
                      \x20           :dangerous-operand (argument :name {formal_name:?}) :accepts [{hazard_label}])\n",
                 ));
             }

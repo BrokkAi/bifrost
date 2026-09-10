@@ -1,6 +1,7 @@
 use super::model::*;
 use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::identifier::validate_identifier;
+use crate::analyzer::semantic_model::DeferredYieldsPayload;
 use crate::workspace_document::has_portable_windows_path_prefix;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -70,8 +71,10 @@ fn validate_pack_internal(
         limits,
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
+        type_ids: HashSet::new(),
         member_ids: HashSet::new(),
         member_owners: HashMap::new(),
+        member_family_complete: HashMap::new(),
         member_operations: HashMap::new(),
         procedure_ids: HashSet::new(),
         procedure_targets: HashMap::new(),
@@ -92,8 +95,10 @@ struct Validator {
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
+    type_ids: HashSet<String>,
     member_ids: HashSet<String>,
     member_owners: HashMap<String, String>,
+    member_family_complete: HashMap<String, bool>,
     member_operations: HashMap<String, Option<ImplicitOperation>>,
     procedure_ids: HashSet<String>,
     procedure_targets: HashMap<(String, String), String>,
@@ -177,6 +182,8 @@ impl Validator {
             if let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload {
                 self.declaration_ids
                     .extend(types.iter().map(|fact| fact.id.clone()));
+                self.type_ids
+                    .extend(types.iter().map(|fact| fact.id.clone()));
                 self.declaration_ids
                     .extend(members.iter().map(|fact| fact.id.clone()));
                 self.member_ids
@@ -185,6 +192,11 @@ impl Validator {
                     members
                         .iter()
                         .map(|fact| (fact.id.clone(), fact.owner.clone())),
+                );
+                self.member_family_complete.extend(
+                    members
+                        .iter()
+                        .map(|fact| (fact.id.clone(), fact.callable_family_complete)),
                 );
                 self.member_operations.extend(
                     members
@@ -212,6 +224,28 @@ impl Validator {
                 self.collection_flows(
                     &format!("$.shards[{}/collection_flows]", shard.id),
                     collection_flows,
+                );
+            }
+            if let Some(deferred_yields) = &shard.deferred_yields {
+                self.deferred_yields(
+                    &format!("$.shards[{}/deferred_yields]", shard.id),
+                    deferred_yields,
+                );
+            }
+        }
+        if pack
+            .shards
+            .iter()
+            .any(|shard| shard.deferred_yields.is_some())
+        {
+            if native_deferred_depth_within(pack, self.limits.max_depth) {
+                self.diagnostics
+                    .extend(validate_native_deferred_contracts(pack));
+            } else {
+                self.error(
+                    "limit.deferred_depth",
+                    "$.shards",
+                    "deferred-yield shape nesting exceeds the configured depth budget",
                 );
             }
         }
@@ -252,6 +286,12 @@ impl Validator {
                         .as_ref()
                         .map_or(0, CollectionFlowsPayload::record_count),
                 );
+            let records = records.saturating_add(
+                shard
+                    .deferred_yields
+                    .as_ref()
+                    .map_or(0, DeferredYieldsPayload::record_count),
+            );
             if records == 0 {
                 self.error(
                     "shard.empty_payload",
@@ -969,6 +1009,22 @@ impl Validator {
                     "collection_flow.callable_scope",
                     format!("{current}.payload.callable"),
                     "payload callable must equal its native fact scope",
+                );
+            }
+        }
+    }
+
+    fn deferred_yields(&mut self, path: &str, payload: &DeferredYieldsPayload) {
+        for (index, fact) in payload.yields.iter().enumerate() {
+            let current = format!("{path}.yields[{index}]");
+            if fact.payload.factory != fact.factory
+                || fact.payload.resume != fact.resume
+                || fact.payload.handle_type != fact.handle_type
+            {
+                self.error(
+                    "deferred_yield.scope",
+                    &current,
+                    "payload identities must equal the native fact scope",
                 );
             }
         }
@@ -4152,4 +4208,538 @@ pub(crate) fn is_canonical_relative_path(value: &str) -> bool {
                     | Component::CurDir
             )
         }))
+}
+
+// Use the same neutral semantic checks for native producer payloads and imported
+// wire payloads. IDs stay native-local here; no display-name identity is created.
+fn validate_native_deferred_contracts(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+    use crate::analyzer::semantic_model::csmi::*;
+    use serde_json::json;
+
+    let mut declarations = Vec::new();
+    let mut completeness = Vec::new();
+    let mut occupied_declaration_symbols = pack
+        .shards
+        .iter()
+        .filter_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { types, members, .. } => Some(
+                types
+                    .iter()
+                    .map(|ty| ty.id.clone())
+                    .chain(members.iter().map(|member| member.id.clone())),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+    let mut next_binder_id = 0usize;
+    let mut generic_parameters = HashMap::new();
+    let mut generic_binders = HashMap::new();
+    for ty in pack
+        .shards
+        .iter()
+        .filter_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { types, .. } => Some(types),
+            _ => None,
+        })
+        .flatten()
+    {
+        let binders = native_generic_binder_symbols(
+            ty.type_parameters.len(),
+            &mut occupied_declaration_symbols,
+            &mut next_binder_id,
+        );
+        generic_parameters.insert(ty.id.clone(), ty.type_parameters.clone());
+        generic_binders.insert(ty.id.clone(), binders);
+    }
+    for shard in &pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload else {
+            continue;
+        };
+        for ty in types {
+            let mut declaration = json!({"symbol":ty.id,"category":"type"});
+            if let Some(binders) = generic_binders.get(&ty.id) {
+                declaration["genericParameters"] = native_generic_parameters(binders);
+                for symbol in binders {
+                    declarations.push(json!({
+                        "symbol":symbol,
+                        "category":"type-parameter",
+                    }));
+                }
+            }
+            declarations.push(declaration);
+        }
+        for member in members {
+            let mut declaration =
+                json!({"symbol":member.id,"category":"callable","owner":member.owner});
+            if let Some(signature) = &member.signature {
+                let parameters: Vec<_> = signature.parameters.iter().enumerate().map(|(position, parameter)| {
+                    json!({"position":position,"binding":"positional-only","required":!parameter.optional})
+                }).collect();
+                let results: Vec<_> = signature
+                    .returns
+                    .iter()
+                    .map(|_| json!({"position":0}))
+                    .collect();
+                let mut shape = json!({"kind":"method","parameters":parameters,"results":results});
+                if member.receiver.is_some() {
+                    shape["receiver"] = native_receiver_reference(
+                        &member.owner,
+                        generic_binders
+                            .get(&member.owner)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    );
+                }
+                declaration["callable"] = shape;
+            }
+            declarations.push(declaration);
+            completeness.push(json!({"family":"declaration-aspects","scope":{"symbol":member.id,"aspect":"callable-shape"},"status":if member.callable_family_complete {"complete"} else {"partial"}}));
+        }
+    }
+    let mut facts = Vec::new();
+    let mut affects = Vec::new();
+    let mut scopes = HashMap::new();
+    for shard in &pack.shards {
+        let Some(payload) = &shard.deferred_yields else {
+            continue;
+        };
+        for fact in &payload.yields {
+            let mut payload = fact.payload.clone();
+            if let Some(CsmiDeferredYieldSubstitution::ReceiverArguments { declaration }) =
+                &payload.receiver_substitution
+                && let Some(binders) = generic_binders.get(declaration)
+                && let Some(parameters) = generic_parameters.get(declaration)
+            {
+                remap_native_deferred_parameters(&mut payload, parameters, binders);
+            }
+            let scope =
+                json!({"factory":fact.factory,"resume":fact.resume,"handleType":fact.handle_type});
+            facts.push(json!({"vocabulary":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"family":"deferred-yields","scope":scope,"payload":payload}));
+            let key = (
+                fact.factory.clone(),
+                fact.resume.clone(),
+                fact.handle_type.clone(),
+            );
+            let complete = fact.coverage == Some(Completeness::Complete);
+            scopes
+                .entry(key)
+                .and_modify(|entry: &mut bool| *entry &= complete)
+                .or_insert(complete);
+        }
+    }
+    for ((factory, resume, handle_type), complete) in scopes {
+        let scope = json!({"factory":factory,"resume":resume,"handleType":handle_type});
+        affects.push(json!({"kind":"fact-family","family":"deferred-yields","scope":scope}));
+        completeness.push(json!({"vocabulary":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"family":"deferred-yields","scope":scope,"status":if complete {"complete"} else {"partial"}}));
+    }
+    let model: CsmiSemanticModel = serde_json::from_value(json!({
+        "artifactSelectors":[],"declarations":declarations,"extensionFacts":facts,
+        "vocabularyUses":[{"identifier":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"schema":CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,"requirement":"required","affects":affects}],
+        "completenessStatements":completeness
+    })).expect("native declaration shape construction is valid");
+    validate_native_deferred_yield_model(&model)
+        .into_iter()
+        .map(|diagnostic| Diagnostic::error(diagnostic.code, diagnostic.path, diagnostic.message))
+        .collect()
+}
+
+fn native_generic_binder_symbols(
+    count: usize,
+    occupied: &mut HashSet<String>,
+    next_id: &mut usize,
+) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            loop {
+                let symbol = format!("type-parameter.{next_id}");
+                *next_id += 1;
+                if occupied.insert(symbol.clone()) {
+                    break symbol;
+                }
+            }
+        })
+        .collect()
+}
+
+fn remap_native_deferred_parameters(
+    payload: &mut crate::analyzer::semantic_model::csmi::CsmiDeferredYieldPayload,
+    parameters: &[String],
+    binders: &[String],
+) {
+    use crate::analyzer::semantic_model::csmi::{CsmiDeferredYieldShape, CsmiTypeExpression};
+
+    let owner_binders = parameters
+        .iter()
+        .zip(binders)
+        .map(|(parameter, binder)| (format!("type-parameter.{parameter}"), binder.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut shapes = payload
+        .roots
+        .iter_mut()
+        .map(|root| &mut root.shape)
+        .collect::<Vec<_>>();
+    while let Some(shape) = shapes.pop() {
+        match shape {
+            CsmiDeferredYieldShape::Value { r#type } => {
+                let mut types = vec![r#type];
+                while let Some(r#type) = types.pop() {
+                    match r#type {
+                        CsmiTypeExpression::Parameter(parameter) => {
+                            if let Some(binder) = owner_binders.get(&parameter.symbol) {
+                                parameter.symbol.clone_from(binder);
+                            }
+                        }
+                        CsmiTypeExpression::Reference(reference) => {
+                            types.extend(reference.arguments.iter_mut());
+                        }
+                        CsmiTypeExpression::Unknown(_) | CsmiTypeExpression::Intrinsic(_) => {}
+                    }
+                }
+            }
+            CsmiDeferredYieldShape::Product { components } => shapes.extend(components),
+            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
+                shapes.push(key);
+                shapes.push(value);
+            }
+            CsmiDeferredYieldShape::Unknown { .. } => {}
+        }
+    }
+}
+
+fn native_generic_parameters(binders: &[String]) -> serde_json::Value {
+    serde_json::Value::Array(
+        binders
+            .iter()
+            .enumerate()
+            .map(|(position, symbol)| {
+                serde_json::json!({
+                    "position":position,
+                    "symbol":symbol,
+                    "kind":"type",
+                })
+            })
+            .collect(),
+    )
+}
+
+fn native_receiver_reference(owner: &str, binders: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "kind":"instance",
+        "type":{
+            "kind":"reference",
+            "symbol":owner,
+            "arguments":binders.iter().map(|symbol| serde_json::json!({
+                "kind":"parameter",
+                "symbol":symbol,
+            })).collect::<Vec<_>>(),
+        },
+    })
+}
+
+fn native_deferred_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usize) -> bool {
+    use crate::analyzer::semantic_model::csmi::{CsmiDeferredYieldShape, CsmiTypeExpression};
+    let mut shapes = Vec::new();
+    let mut types = Vec::new();
+    for shard in &pack.shards {
+        if let Some(payload) = &shard.deferred_yields {
+            for fact in &payload.yields {
+                shapes.extend(fact.payload.roots.iter().map(|root| (&root.shape, 0usize)));
+            }
+        }
+    }
+    while let Some((shape, depth)) = shapes.pop() {
+        if depth > max_depth {
+            return false;
+        }
+        match shape {
+            CsmiDeferredYieldShape::Value { r#type } => types.push((r#type, depth + 1)),
+            CsmiDeferredYieldShape::Product { components } => {
+                shapes.extend(components.iter().map(|component| (component, depth + 1)))
+            }
+            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
+                shapes.push((key, depth + 1));
+                shapes.push((value, depth + 1));
+            }
+            CsmiDeferredYieldShape::Unknown { .. } => {}
+        }
+    }
+    while let Some((ty, depth)) = types.pop() {
+        if depth > max_depth {
+            return false;
+        }
+        if let CsmiTypeExpression::Reference(reference) = ty {
+            types.extend(
+                reference
+                    .arguments
+                    .iter()
+                    .map(|argument| (argument, depth + 1)),
+            );
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod native_deferred_bridge_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::csmi::{
+        CSMI_DEFERRED_YIELD_PROFILE_ID, CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
+        CSMI_DEFERRED_YIELD_PROFILE_VERSION, CsmiSemanticModel,
+        validate_native_deferred_yield_model,
+    };
+    use serde_json::Value;
+
+    const PROFILE_PAYLOAD: &str = include_str!("csmi/profiles/deferred-yield-shared-entry.json");
+
+    fn remap_profile_payload() -> Value {
+        let mut payload: Value = serde_json::from_str(PROFILE_PAYLOAD).expect("valid profile");
+        let replacements = [
+            ("iter", "map.iter"),
+            ("next", "handle.next"),
+            ("Iter", "iter-handle"),
+        ];
+        rewrite_symbols(&mut payload, &replacements);
+        rewrite_parameter_shapes(&mut payload);
+        payload
+    }
+
+    fn rewrite_symbols(value: &mut Value, replacements: &[(&str, &str)]) {
+        match value {
+            Value::String(text) => {
+                if let Some((_, replacement)) = replacements.iter().find(|(old, _)| old == text) {
+                    *text = (*replacement).to_owned();
+                }
+            }
+            Value::Array(values) => values
+                .iter_mut()
+                .for_each(|value| rewrite_symbols(value, replacements)),
+            Value::Object(object) => object
+                .values_mut()
+                .for_each(|value| rewrite_symbols(value, replacements)),
+            _ => {}
+        }
+    }
+
+    fn rewrite_parameter_shapes(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(rewrite_parameter_shapes),
+            Value::Object(object) => {
+                let parameter =
+                    if object.get("kind") == Some(&Value::String("reference".to_owned())) {
+                        match object.get("symbol").and_then(Value::as_str) {
+                            Some("Key") => Some("K"),
+                            Some("Value") => Some("V"),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(parameter) = parameter {
+                    object.insert("kind".to_owned(), Value::String("parameter".to_owned()));
+                    object.insert(
+                        "symbol".to_owned(),
+                        Value::String(format!("type-parameter.{parameter}")),
+                    );
+                }
+                object.values_mut().for_each(rewrite_parameter_shapes);
+            }
+            _ => {}
+        }
+    }
+
+    fn native_type(symbol: &str, name: &str, parameters: Value) -> Value {
+        serde_json::json!({
+            "id":symbol,
+            "name":name,
+            "type_kind":"struct",
+            "visibility":"public",
+            "is_abstract":false,
+            "is_sealed":false,
+            "has_explicit_type_terms":false,
+            "type_parameters":parameters,
+            "locator":{"kind":"artifact","path":"test", "symbol":symbol},
+        })
+    }
+
+    fn native_pack(map_binders: Value) -> AuthoredSemanticModelPack {
+        let mut payload = remap_profile_payload();
+        payload["receiverSubstitution"] = serde_json::json!({
+            "kind":"receiver-arguments",
+            "declaration":"map",
+        });
+        serde_json::from_value(serde_json::json!({
+            "schema_version":2,
+            "pack_id":"native.deferred.test",
+            "version":"1.0.0",
+            "producer":{"name":"test","version":"1.0.0"},
+            "language":"rust",
+            "ecosystem":"cargo",
+            "compatibility":{"bifrost":">=0.0.0"},
+            "provenance":{"source":"test","revision":"native-deferred"},
+            "license":"MIT",
+            "completeness":"partial",
+            "safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{
+                "id":"deferred",
+                "activation":[{"targets":[],"configurations":[]}],
+                "payload":{"kind":"declaration_facts","types":[
+                    native_type("map","std.collections.HashMap",map_binders),
+                    native_type("iter-handle","std.collections.hash_map.Iter",serde_json::json!([])),
+                    native_type("type-parameter.0","Collision proof",serde_json::json!([])),
+                ],"members":[
+                    {
+                        "id":"map.iter",
+                        "owner":"map",
+                        "name":"iter",
+                        "member_kind":"method",
+                        "visibility":"public",
+                        "callable_family_complete":true,
+                        "signature":{"parameters":[],"returns":{"kind":"declared","id":"iter-handle","arguments":[
+                            {"kind":"type_parameter","name":"K"},
+                            {"kind":"type_parameter","name":"V"},
+                        ],"nullable":false}},
+                        "receiver":{"pointer":false},
+                        "locator":{"kind":"artifact","path":"test","symbol":"iter"},
+                    },
+                    {
+                        "id":"handle.next",
+                        "owner":"iter-handle",
+                        "name":"next",
+                        "member_kind":"method",
+                        "visibility":"public",
+                        "callable_family_complete":true,
+                        "signature":{"parameters":[],"returns":{"kind":"tuple","elements":[
+                            {"kind":"by_ref","element":{"kind":"type_parameter","name":"K"}},
+                            {"kind":"by_ref","element":{"kind":"type_parameter","name":"V"}},
+                        ]}},
+                        "receiver":{"pointer":false},
+                        "locator":{"kind":"artifact","path":"test","symbol":"next"},
+                    },
+                ],"relations":[]},
+                "deferred_yields":{"yields":[{
+                    "factory":"map.iter",
+                    "resume":"handle.next",
+                    "handleType":"iter-handle",
+                    "payload":payload,
+                    "coverage":"complete",
+                    "provenance":["test"],
+                }]},
+            }],
+        }))
+        .expect("valid native test pack")
+    }
+
+    #[test]
+    fn native_bridge_preserves_ordered_owner_binders_for_receiver_substitution() {
+        let mut occupied = HashSet::from(["type-parameter.0".to_owned()]);
+        let mut next_id = 0;
+        let binders = native_generic_binder_symbols(2, &mut occupied, &mut next_id);
+        assert_eq!(
+            binders,
+            vec!["type-parameter.1".to_owned(), "type-parameter.2".to_owned()]
+        );
+        let receiver = native_receiver_reference("map", &binders);
+        assert_eq!(
+            receiver["type"]["arguments"],
+            serde_json::json!([
+                {"kind":"parameter","symbol":"type-parameter.1"},
+                {"kind":"parameter","symbol":"type-parameter.2"},
+            ])
+        );
+        assert!(
+            validate_native_deferred_contracts(&native_pack(serde_json::json!(["K", "V"])))
+                .is_empty(),
+            "ordered binders should satisfy receiver substitution"
+        );
+    }
+
+    fn substitution_model(receiver_arguments: Value) -> CsmiSemanticModel {
+        let mut payload = remap_profile_payload();
+        payload["receiverSubstitution"] = serde_json::json!({
+            "kind":"receiver-arguments",
+            "declaration":"map",
+        });
+        let binder = |position: u32, symbol: &str| serde_json::json!({"position":position,"symbol":symbol,"kind":"type"});
+        let callable = |symbol: &str, receiver: Value| {
+            serde_json::json!({
+                "symbol":symbol,
+                "category":"callable",
+                "callable":{
+                    "kind":"method",
+                    "receiver":{"kind":"instance","type":receiver},
+                    "parameters":[],
+                    "results":[{"position":0}],
+                },
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "artifactSelectors":[],
+            "declarations":[
+                {"symbol":"map","category":"type","genericParameters":[
+                    binder(0,"type-parameter.map.K"), binder(1,"type-parameter.map.V"),
+                ]},
+                {"symbol":"type-parameter.map.K","category":"type-parameter"},
+                {"symbol":"type-parameter.map.V","category":"type-parameter"},
+                {"symbol":"iter-handle","category":"type"},
+                callable("map.iter", serde_json::json!({"kind":"reference","symbol":"map","arguments":receiver_arguments})),
+                callable("handle.next", serde_json::json!({"kind":"reference","symbol":"iter-handle"})),
+            ],
+            "extensionFacts":[{
+                "vocabulary":CSMI_DEFERRED_YIELD_PROFILE_ID,
+                "version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,
+                "family":"deferred-yields",
+                "scope":{"factory":"map.iter","resume":"handle.next","handleType":"iter-handle"},
+                "payload":payload,
+            }],
+            "vocabularyUses":[{
+                "identifier":CSMI_DEFERRED_YIELD_PROFILE_ID,
+                "version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,
+                "schema":CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
+                "requirement":"required",
+                "affects":[{"kind":"fact-family","family":"deferred-yields","scope":{
+                    "factory":"map.iter","resume":"handle.next","handleType":"iter-handle",
+                }}],
+            }],
+            "completenessStatements":[
+                {"family":"declaration-aspects","scope":{"symbol":"map.iter","aspect":"callable-shape"},"status":"complete"},
+                {"family":"declaration-aspects","scope":{"symbol":"handle.next","aspect":"callable-shape"},"status":"complete"},
+            ],
+        }))
+        .expect("valid CSMI test model")
+    }
+
+    #[test]
+    fn native_deferred_validation_rejects_bad_receiver_binder_sequences() {
+        let argument = |symbol: &str| serde_json::json!({"kind":"parameter","symbol":symbol});
+        let cases = [
+            (
+                "missing",
+                serde_json::json!([argument("type-parameter.map.K")]),
+            ),
+            (
+                "reordered",
+                serde_json::json!([
+                    argument("type-parameter.map.V"),
+                    argument("type-parameter.map.K")
+                ]),
+            ),
+            (
+                "mismatched",
+                serde_json::json!([
+                    argument("type-parameter.map.K"),
+                    argument("type-parameter.other.V")
+                ]),
+            ),
+        ];
+        for (name, arguments) in cases {
+            let diagnostics = validate_native_deferred_yield_model(&substitution_model(arguments));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "semantic.deferred_yield_receiver_arguments"
+                }),
+                "{name} binders must fail closed; diagnostics={diagnostics:?}"
+            );
+        }
+    }
 }

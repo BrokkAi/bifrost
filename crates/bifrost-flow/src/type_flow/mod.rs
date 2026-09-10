@@ -35,10 +35,11 @@ pub use plan::{
     MemberAccessSite, ProcedureDispatchReadContract, ProcedureRefinements, TypeFlowPlan,
     TypeFlowPlanError,
 };
-pub use report::{TypeFlowReport, solve_type_flow_workspace};
+pub use report::{TypeFlowReport, TypeFlowRootSolverExhaustion, solve_type_flow_workspace};
 pub use solve::{
-    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
+    AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, RootExhaustedLane,
+    RootIncompleteEvidence, SemanticExhaustionStage, TypeFlowError,
     TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
-    solve_type_flow_for_root,
+    TypeFlowSolveAttempt, TypeFlowSolvePhase, solve_type_flow_for_root,
 };
 pub use summary::{TypeFlowSummaryProfile, TypeFlowSummaryState};

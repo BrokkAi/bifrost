@@ -8,8 +8,7 @@ use crate::analyzer::usages::applicability::{
 };
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
-    CSharpDeclaredType, canonical_builtin_type_identity,
-    csharp_extension_invocation_return_type_fq_name_in_session,
+    CSharpDeclaredType, csharp_extension_invocation_return_type_fq_name_in_session,
     csharp_member_declared_type_fq_name_in_session,
     csharp_method_return_type_fq_name_for_arity_in_session, csharp_resolve_type_fq_name,
     csharp_usage_direct_base, csharp_visible_extension_method_candidates_in_session,
@@ -924,42 +923,15 @@ fn resolve_csharp_in_session(
                 receiver_type_names.sort();
                 receiver_type_names.dedup();
             }
-            let unindexed_builtin_receiver = owners.is_empty()
-                && structured_receiver_type_names
-                    .iter()
-                    .any(|name| canonical_builtin_type_identity(name).is_some());
             let arity = csharp_invocation_arity(name, source, definitions);
-            // What an extension candidate is allowed to answer depends on what
-            // this site can prove about it (#1266).
-            //
-            // When the receiver's own type IS indexed, `csharp_member_outcome`
-            // below searches every ordinary member of it and of its supertypes.
-            // An empty result there IS C#'s extension-precedence rule
-            // discharged: no applicable instance member exists, so an extension
-            // may answer, in a call position or as a method group.
-            //
-            // When the receiver's type is NOT indexed -- `System.Type`,
-            // `JsonSerializerOptions`, a BCL `IEnumerable<T>` -- that proof does
-            // not exist and cannot be obtained. An ordinary instance member of
-            // the same spelling may well be the binding, and a workspace
-            // extension that merely shares the name is a possibility rather than
-            // the answer. The site itself can still supply the OTHER half of
-            // applicability, so an external receiver is admitted only for an
-            // actual invocation, whose argument count the candidate's parameter
-            // list must accept. A bare member access over an external receiver
-            // proves nothing: BootstrapBlazor's `innerType.IsEnum` and
-            // YamlDotNet's `t.IsGenericType` read a `System.Type` PROPERTY, and
-            // answering them with the same-spelled workspace extension METHOD
-            // was a claim the inverse scan -- which has always required a call
-            // arity here -- never made.
-            let should_try_extensions = if owners.is_empty() {
-                !structured_receiver_type_names.is_empty()
-                    && !unindexed_builtin_receiver
-                    && arity.is_some()
-            } else {
-                true
-            };
-            let outcome = csharp_member_outcome(
+            // Indexed ordinary members retain precedence. For external types,
+            // invocation syntax and a precise receiver identity admit the same
+            // structured extension applicability checks, including builtins.
+            // A property read or an untyped receiver cannot prove an extension
+            // invocation (#1266, #3182).
+            let should_try_extensions =
+                !owners.is_empty() || (!receiver_type_names.is_empty() && arity.is_some());
+            let mut outcome = csharp_member_outcome(
                 analyzer,
                 token,
                 definitions,
@@ -1012,8 +984,27 @@ fn resolve_csharp_in_session(
                     ),
                 };
                 if !extensions.is_empty() {
-                    return candidates_outcome(extensions);
+                    outcome = candidates_outcome(extensions);
                 }
+            }
+            if owners.is_empty() && !receiver_type_names.is_empty() {
+                // The authored extension identity can be known while ordinary
+                // member lookup remains incomplete. Keep that frontier even
+                // for a positive result: an unindexed instance member might
+                // take precedence over the applicable workspace extension.
+                // An empty answer here is a boundary, not an exact negative.
+                if outcome.definitions.is_empty() {
+                    outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
+                    outcome
+                        .diagnostics
+                        .retain(|diagnostic| diagnostic.kind != "unsupported_csharp_receiver");
+                }
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    kind: "csharp_receiver_type_unindexed".to_owned(),
+                    message: format!(
+                        "receiver types {receiver_type_names:?} for C# member `{member}` are not indexed; applicable workspace extensions do not complete ordinary member lookup"
+                    ),
+                });
             }
             outcome
         }
@@ -1357,8 +1348,20 @@ fn csharp_type_lookup_node_resolution(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    node: Node<'_>,
+    mut node: Node<'_>,
 ) -> Option<CSharpTypeLookupResolution> {
+    // Contextual identifiers can retain their anonymous keyword token beneath
+    // the public `identifier` node. A reference range covers both exactly, and
+    // the smallest-node lookup selects the token; resolution must operate on
+    // the structured identifier wrapper that carries its AST role.
+    if !node.is_named()
+        && let Some(parent) = node.parent()
+        && parent.kind() == "identifier"
+        && parent.start_byte() == node.start_byte()
+        && parent.end_byte() == node.end_byte()
+    {
+        node = parent;
+    }
     if !definitions.scope_step() {
         return None;
     }

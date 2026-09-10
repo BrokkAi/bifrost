@@ -1,11 +1,11 @@
 use super::ir::{
-    ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
-    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ControlRelationFilter,
-    DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed,
-    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, ResultContractFailureUseFilter,
-    RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter, StringPredicate,
-    UNATTRIBUTED_TIER_LABEL,
+    ArityConstraint, BindingFilter, BindingSeed, CallArgumentSelector, CallIdentity,
+    CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQuerySeed, ControlRelationFilter, DeclarationStateFilter, DecoratorBindingFilter,
+    EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter,
+    GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern,
+    QueryPathScope, QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
+    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
@@ -81,15 +81,7 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
 pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
     let mut object = Map::new();
     if !seed.where_globs.is_empty() {
-        object.insert(
-            "where".to_string(),
-            Value::Array(
-                seed.where_globs
-                    .iter()
-                    .map(|glob| Value::String(glob.as_str().to_string()))
-                    .collect(),
-            ),
-        );
+        object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
     }
     if !seed.languages.is_empty() {
         object.insert(
@@ -159,15 +151,7 @@ pub(super) fn occurrence_filter_to_json(filter: &OccurrenceFilter) -> Map<String
 fn occurrence_seed_to_json(seed: &OccurrenceSeed) -> Map<String, Value> {
     let mut object = Map::new();
     if !seed.where_globs.is_empty() {
-        object.insert(
-            "where".to_string(),
-            Value::Array(
-                seed.where_globs
-                    .iter()
-                    .map(|glob| Value::String(glob.as_str().to_string()))
-                    .collect(),
-            ),
-        );
+        object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
     }
     if !seed.languages.is_empty() {
         object.insert(
@@ -196,6 +180,28 @@ impl OccurrenceSeed {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical occurrence seed is serializable")
     }
+}
+
+pub(super) fn path_scope_to_json(scope: &QueryPathScope) -> Value {
+    if scope.groups().len() == 1 {
+        return glob_group_to_json(&scope.groups()[0]);
+    }
+    Value::Array(
+        scope
+            .groups()
+            .iter()
+            .map(|group| glob_group_to_json(group))
+            .collect(),
+    )
+}
+
+fn glob_group_to_json(group: &[glob::Pattern]) -> Value {
+    Value::Array(
+        group
+            .iter()
+            .map(|glob| Value::String(glob.as_str().to_string()))
+            .collect(),
+    )
 }
 
 pub(super) fn scope_filter_to_json(filter: &ScopeFilter) -> Map<String, Value> {
@@ -644,20 +650,12 @@ fn path_seed_to_json(seed: &PathSeed) -> Map<String, Value> {
 
 /// The `where`/`languages` prefix every non-structural seed renders identically.
 fn environment_seed_scope_json(
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
     languages: &[brokk_bifrost_core::analyzer::Language],
 ) -> Map<String, Value> {
     let mut object = Map::new();
     if !where_globs.is_empty() {
-        object.insert(
-            "where".to_string(),
-            Value::Array(
-                where_globs
-                    .iter()
-                    .map(|glob| Value::String(glob.as_str().to_string()))
-                    .collect(),
-            ),
-        );
+        object.insert("where".to_string(), path_scope_to_json(where_globs));
     }
     if !languages.is_empty() {
         object.insert(
@@ -935,6 +933,42 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("parameter_name".to_string(), json!(name));
             }
         },
+        QueryStep::ResolvedCall(filter) => {
+            object.insert(
+                "resolves_to".to_string(),
+                call_identity_to_json(&filter.resolves_to),
+            );
+            object.insert(
+                "call_proof".to_string(),
+                json!(match filter.proof {
+                    super::ir::ResolvedCallProof::Exact => "exact",
+                    super::ir::ResolvedCallProof::Declared => "declared",
+                }),
+            );
+            if let Some(receiver_type) = &filter.receiver_type {
+                let receiver_type = match receiver_type {
+                    super::ir::ResolvedCallReceiverType::Exact(identity) => {
+                        call_identity_to_json(identity)
+                    }
+                    super::ir::ResolvedCallReceiverType::AssignableTo {
+                        root,
+                        resolved_identities,
+                    } => json!({
+                        "assignable_to": call_identity_to_json(root),
+                        "resolved_identities": resolved_identities,
+                    }),
+                };
+                object.insert("receiver_type".to_string(), receiver_type);
+            }
+        }
+        QueryStep::CallArgument(selector) => match selector {
+            CallArgumentSelector::FormalName(name) => {
+                object.insert("formal_name".to_string(), json!(name));
+            }
+            CallArgumentSelector::FormalIndex(index) => {
+                object.insert("formal_index".to_string(), json!(index));
+            }
+        },
         QueryStep::JsxAttributeValue(traversal) => {
             if let Some(identity) = traversal.identity {
                 object.insert("identity".to_string(), json!(identity.label()));
@@ -980,6 +1014,28 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         }
     }
     Value::Object(object)
+}
+
+fn call_identity_to_json(identity: &CallIdentity) -> Value {
+    match identity {
+        CallIdentity::Stable(identity) => json!({ "stable": identity }),
+        CallIdentity::Qualified {
+            value,
+            resolved: None,
+            ..
+        } => json!({ "qualified": value }),
+        CallIdentity::Qualified {
+            resolved: Some(resolved),
+            ..
+        } => match resolved.kind {
+            super::ir::ResolvedCallIdentityKind::WorkspaceDeclaration => {
+                json!({ "workspace_declaration": resolved.identity })
+            }
+            super::ir::ResolvedCallIdentityKind::ActiveSemanticModel => {
+                json!({ "active_semantic_model": resolved.identity })
+            }
+        },
+    }
 }
 
 impl QueryStep {

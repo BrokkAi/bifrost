@@ -2497,7 +2497,7 @@ fn fake_projection(
             "typescript",
             brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("app.ts")
                 .expect("workspace-relative path"),
-            "function:store",
+            format!("decl:v1:{}", "2".repeat(64)),
         )
         .expect("a stable sink identity"),
         0,

@@ -14,6 +14,7 @@ use tree_sitter::Node;
 use crate::declarations::{rust_node_text, rust_package_name};
 use crate::graph_support::{RustSource, resolve_module_package};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
+use crate::syntax::{outer_attributes, unwrap_attributes};
 
 /// Re-exported from core, where the persisted Rust usage facts that carry it
 /// live. It stays spelled `crate::imports::RustVisibility` for every Rust
@@ -118,17 +119,18 @@ pub fn rust_import_projection(
     let mut projected = Vec::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
-        if node.kind() == "extern_crate_declaration" {
+        let declaration = unwrap_attributes(node);
+        if declaration.kind() == "extern_crate_declaration" {
             if let Some(import) = rust_external_crate_import(node, source, base_module) {
                 projected.push(import);
             }
             continue;
         }
-        if node.kind() == "use_declaration" {
-            let owner = rust_import_owner(node, source, base_module);
+        if declaration.kind() == "use_declaration" {
+            let owner = rust_import_owner(declaration, source, base_module);
             let cfg_condition = rust_cfg_condition(node, source);
             projected.extend(
-                rust_imports_with_visibility_from_use_declaration(node, source)
+                rust_imports_with_visibility_from_use_declaration(declaration, source)
                     .into_iter()
                     .map(|import| RustProjectedImport {
                         import,
@@ -150,19 +152,20 @@ fn rust_external_crate_import(
     source: &str,
     base_module: &str,
 ) -> Option<RustProjectedImport> {
-    let name_node = node.child_by_field_name("name")?;
+    let declaration = unwrap_attributes(node);
+    let name_node = declaration.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
     if name.is_empty() {
         return None;
     }
-    let alias_node = node.child_by_field_name("alias");
+    let alias_node = declaration.child_by_field_name("alias");
     let alias = alias_node
         .map(|node| rust_node_text(node, source).trim().to_string())
         .filter(|alias| !alias.is_empty());
     let binder_node = alias_node.unwrap_or(name_node);
     let import = RustImportInfo {
         info: ImportInfo {
-            raw_snippet: rust_node_text(node, source).to_string(),
+            raw_snippet: rust_node_text(declaration, source).to_string(),
             is_wildcard: false,
             is_global: false,
             identifier: Some(name.to_string()),
@@ -172,11 +175,11 @@ fn rust_external_crate_import(
                 kind: Some(StructuredImportPathKind::Namespace),
                 lexical_prefixes: Vec::new(),
                 lexical_scopes: Vec::new(),
-                declaration_start_byte: node.start_byte(),
+                declaration_start_byte: declaration.start_byte(),
             }),
             binder_span: Some(node_span(binder_node)),
         },
-        visibility: rust_item_visibility(node, source),
+        visibility: rust_item_visibility(declaration, source),
         path: vec![name.to_string()],
         is_extern_crate: true,
         is_macro_use: rust_item_attribute(node, source, "macro_use")
@@ -184,7 +187,7 @@ fn rust_external_crate_import(
     };
     Some(RustProjectedImport {
         import,
-        owner: rust_import_owner(node, source, base_module),
+        owner: rust_import_owner(declaration, source, base_module),
         cfg_condition: rust_cfg_condition(node, source),
     })
 }
@@ -203,10 +206,8 @@ fn rust_item_attribute<'tree>(
     source: &str,
     expected: &str,
 ) -> Option<Node<'tree>> {
-    let mut sibling = node.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
+    for attribute_item in outer_attributes(node) {
         if matches!(attribute_item.kind(), "line_comment" | "block_comment") {
-            sibling = attribute_item.prev_named_sibling();
             continue;
         }
         if attribute_item.kind() != "attribute_item" {
@@ -221,7 +222,6 @@ fn rust_item_attribute<'tree>(
         if source.get(path.start_byte()..path.end_byte()) == Some(expected) {
             return Some(attribute);
         }
-        sibling = attribute_item.prev_named_sibling();
     }
     None
 }
@@ -237,11 +237,12 @@ pub fn rust_module_extents(
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children.into_iter().rev() {
-            if child.kind() == "mod_item"
-                && let Some(name) = child
+            let declaration = unwrap_attributes(child);
+            if declaration.kind() == "mod_item"
+                && let Some(name) = declaration
                     .child_by_field_name("name")
                     .and_then(|name| simple_segment(name, source))
-                && let Some(body) = child.child_by_field_name("body")
+                && let Some(body) = declaration.child_by_field_name("body")
             {
                 let module = if owner.is_empty() {
                     name

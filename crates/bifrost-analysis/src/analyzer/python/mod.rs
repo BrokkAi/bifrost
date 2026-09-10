@@ -149,6 +149,16 @@ pub struct PythonAnalyzer {
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
+    /// Return one typed memo shared by every nested scope of the active query.
+    /// Definition resolution uses this rather than exposing the language
+    /// analyzer's complete tree-sitter implementation.
+    pub(crate) fn active_query_request_memo<T>(&self) -> Option<Arc<T>>
+    where
+        T: Default + Send + Sync + 'static,
+    {
+        self.inner.active_query_request_memo::<T>()
+    }
+
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -236,6 +246,11 @@ impl PythonAnalyzer {
     #[doc(hidden)]
     pub fn full_hydration_count_for_test(&self) -> usize {
         self.inner.full_hydration_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.inner.prepared_syntax_parse_count_for_test(file)
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

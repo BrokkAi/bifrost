@@ -42,7 +42,7 @@ only as `target` is rejected because it has no parent; provide both `base` and
 
 ## Saved Code Queries
 
-Run a complete RQL or JSON `query_code` query from a workspace file without the generic tool wrapper:
+Run an authored RQL query or generated canonical JSON `query_code` payload from a workspace file without the generic tool wrapper:
 
 ```bash
 bifrost --query-file queries/audit.rql

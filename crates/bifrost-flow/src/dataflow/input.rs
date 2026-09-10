@@ -44,8 +44,7 @@ impl SemanticInputStatus {
         }
     }
 
-    /// The value domain the `flow_endpoint.semantic_status` row field
-    /// publishes (issue #2515).
+    /// Stable labels for internal diagnostics and snapshots.
     pub const LABELS: &'static [&'static str] = &[
         "complete",
         "ambiguous",

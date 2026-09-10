@@ -40,6 +40,8 @@ use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::Node;
 
+use crate::syntax::{outer_attributes, unwrap_attributes};
+
 /// The upper bound on source a diagnostics scan will look at, and on the number
 /// of diagnostics one file may report.
 pub const MAX_RUST_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
@@ -237,6 +239,7 @@ impl RustDiagnosticCollector<'_, '_> {
         scopes: &mut RustScopeStack,
         stack: &mut Vec<ScanFrame<'tree>>,
     ) {
+        let node = unwrap_attributes(node);
         if let Some(gap) = subtree_suppression(node, self.source) {
             // The whole subtree goes unjudged, so one typed outcome stands for
             // it rather than one per name inside it.
@@ -852,11 +855,12 @@ fn seed_function_like_bindings(node: Node<'_>, source: &str, scopes: &mut RustSc
 fn seed_block_item_bindings(node: Node<'_>, source: &str, scopes: &mut RustScopeStack) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        seed_item_name(child, source, scopes);
+        seed_item_name(unwrap_attributes(child), source, scopes);
     }
 }
 
 fn seed_item_name(node: Node<'_>, source: &str, scopes: &mut RustScopeStack) {
+    let node = unwrap_attributes(node);
     let kind = match node.kind() {
         "function_item" | "const_item" | "static_item" => SymbolKind::Value,
         "struct_item" | "enum_item" | "trait_item" | "type_item" => SymbolKind::Type,
@@ -1033,16 +1037,11 @@ fn is_inside_macro_invocation(node: Node<'_>) -> bool {
 fn enclosing_cfg_condition(node: Node<'_>, source: &str) -> Option<String> {
     let mut current = Some(node);
     while let Some(candidate) = current {
-        let mut sibling = candidate.prev_named_sibling();
-        while let Some(prev) = sibling {
-            if prev.kind() != "attribute_item" {
-                break;
-            }
+        for prev in outer_attributes(candidate) {
             let text = node_text(prev, source).trim();
             if text.starts_with("#[cfg") || text.starts_with("#![cfg") {
                 return Some(text.to_string());
             }
-            sibling = prev.prev_named_sibling();
         }
         current = candidate.parent();
     }

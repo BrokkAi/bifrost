@@ -95,6 +95,7 @@ pub(super) fn call_shape_expansions_for_input(
                 outcome.range.start_line,
                 outcome.site_ast_id,
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     let value = CallShapeValue {

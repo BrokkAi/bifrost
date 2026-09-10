@@ -65,22 +65,20 @@ pub enum SelectorOrigin {
         wrapper_authored_schema_version: Option<u32>,
         /// Exact pin in the referenced `(rql ...)` document envelope, when authored.
         document_authored_schema_version: Option<u32>,
+        /// Independent RQL pin in the enclosing analysis, when authored.
+        analysis_authored_schema_version: Option<u32>,
     },
     Catalog {
         catalog: ResolvedCatalogIdentity,
     },
 }
 
-/// The fully loaded selector body. A row selector retains the complete plan;
-/// it does not collapse its many query bindings into one compatibility query.
+/// The fully loaded selector body.
 #[derive(Debug, Clone)]
 pub enum ResolvedPolicySelectorKind {
     Query {
         schema_resolution: SchemaVersionResolution,
         query: CodeQuery,
-    },
-    Rows {
-        plan: RowSelectorPlan,
     },
 }
 
@@ -92,74 +90,30 @@ pub struct ResolvedPolicySelector {
     pub kind: ResolvedPolicySelectorKind,
     pub semantic_hash: ResolvedSelectorSemanticHash,
     pub origin: SelectorOrigin,
+    pub resolved_locators: Vec<ResolvedPolicyLocator>,
 }
 
-/// One independently resolved query binding inside a row selector.
-#[derive(Debug, Clone)]
-pub struct ResolvedSelectorQueryBinding<'a> {
-    pub name: &'a RowBindingName,
-    pub path: String,
-    pub schema_resolution: SchemaVersionResolution,
-    pub query: &'a CodeQuery,
-}
-
-/// The schema identity of an endpoint selector without inventing a root query
-/// for a multi-binding row plan.
+/// The RQL schema identity of an endpoint selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedEndpointSelectorSchemas {
     Query(SchemaVersionResolution),
-    Rows(Vec<ResolvedEndpointRowBindingSchema>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedEndpointRowBindingSchema {
-    pub path: PolicySelectorPath,
-    pub resolution: SchemaVersionResolution,
 }
 
 impl ResolvedEndpointSelectorSchemas {
     pub(crate) fn from_selector(selector: &ResolvedPolicySelector) -> Self {
-        if let Some((schema, _)) = selector.as_query() {
-            return Self::Query(*schema);
-        }
-        Self::Rows(
-            selector
-                .query_bindings()
-                .into_iter()
-                .map(|binding| ResolvedEndpointRowBindingSchema {
-                    path: PolicySelectorPath::new(&binding.path)
-                        .expect("resolved row binding selector path is valid"),
-                    resolution: binding.schema_resolution,
-                })
-                .collect(),
-        )
+        let (schema, _) = selector.as_query().expect("selectors are RQL queries");
+        Self::Query(*schema)
     }
 
     pub const fn as_query(&self) -> Option<SchemaVersionResolution> {
         match self {
             Self::Query(resolution) => Some(*resolution),
-            Self::Rows(_) => None,
-        }
-    }
-
-    pub fn as_rows(&self) -> Option<&[ResolvedEndpointRowBindingSchema]> {
-        match self {
-            Self::Query(_) => None,
-            Self::Rows(bindings) => Some(bindings),
         }
     }
 
     pub fn same_effective_versions(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Query(left), Self::Query(right)) => left.version == right.version,
-            (Self::Rows(left), Self::Rows(right)) => {
-                left.len() == right.len()
-                    && left.iter().zip(right).all(|(left, right)| {
-                        left.path == right.path
-                            && left.resolution.version == right.resolution.version
-                    })
-            }
-            (Self::Query(_), Self::Rows(_)) | (Self::Rows(_), Self::Query(_)) => false,
         }
     }
 }
@@ -170,6 +124,16 @@ impl ResolvedPolicySelector {
         schema_resolution: SchemaVersionResolution,
         query: CodeQuery,
         origin: SelectorOrigin,
+    ) -> Result<Self, LoadedModelError> {
+        Self::try_new_with_locators(path, schema_resolution, query, origin, Vec::new())
+    }
+
+    pub fn try_new_with_locators(
+        path: PolicySelectorPath,
+        schema_resolution: SchemaVersionResolution,
+        query: CodeQuery,
+        origin: SelectorOrigin,
+        resolved_locators: Vec<ResolvedPolicyLocator>,
     ) -> Result<Self, LoadedModelError> {
         if u64::from(schema_resolution.version) != query.schema_version {
             return Err(LoadedModelError::SelectorSchemaMismatch {
@@ -188,40 +152,7 @@ impl ResolvedPolicySelector {
             },
             semantic_hash,
             origin,
-        })
-    }
-
-    pub fn try_new_rows(
-        path: PolicySelectorPath,
-        plan: RowSelectorPlan,
-        origin: SelectorOrigin,
-    ) -> Result<Self, LoadedModelError> {
-        if !plan.bindings.iter().any(|binding| {
-            matches!(
-                &binding.source,
-                RowBindingSource::Query(PolicySelector::Inline { .. })
-            )
-        }) {
-            return Err(LoadedModelError::InvalidResolvedModel {
-                reason: "row selector requires an inline query binding",
-            });
-        }
-        if plan.bindings.iter().any(|binding| {
-            matches!(
-                &binding.source,
-                RowBindingSource::Query(PolicySelector::File { .. } | PolicySelector::Rows { .. })
-            )
-        }) {
-            return Err(LoadedModelError::InvalidResolvedModel {
-                reason: "row selector query bindings must be inline",
-            });
-        }
-        let semantic_hash = ResolvedSelectorSemanticHash::from_rows(&plan);
-        Ok(Self {
-            path,
-            kind: ResolvedPolicySelectorKind::Rows { plan },
-            semantic_hash,
-            origin,
+            resolved_locators,
         })
     }
 
@@ -231,47 +162,7 @@ impl ResolvedPolicySelector {
                 schema_resolution,
                 query,
             } => Some((schema_resolution, query)),
-            ResolvedPolicySelectorKind::Rows { .. } => None,
         }
-    }
-
-    pub fn as_rows(&self) -> Option<&RowSelectorPlan> {
-        match &self.kind {
-            ResolvedPolicySelectorKind::Query { .. } => None,
-            ResolvedPolicySelectorKind::Rows { plan } => Some(plan),
-        }
-    }
-
-    /// Enumerate every query binding in authored order. Each query remains an
-    /// independently typed source; no row selector is reduced to a synthetic
-    /// compatibility query.
-    pub fn query_bindings(&self) -> Vec<ResolvedSelectorQueryBinding<'_>> {
-        let Some(plan) = self.as_rows() else {
-            return Vec::new();
-        };
-        plan.bindings
-            .iter()
-            .filter_map(|binding| {
-                let RowBindingSource::Query(PolicySelector::Inline { schema, query }) =
-                    &binding.source
-                else {
-                    return None;
-                };
-                Some(ResolvedSelectorQueryBinding {
-                    name: &binding.name,
-                    path: row_selector_binding_selector_path(self.path.as_str(), &binding.name),
-                    schema_resolution: *schema,
-                    query,
-                })
-            })
-            .collect()
-    }
-
-    pub fn query_schemas(&self) -> Vec<SchemaVersionResolution> {
-        self.query_bindings()
-            .into_iter()
-            .map(|binding| binding.schema_resolution)
-            .collect()
     }
 }
 
@@ -1551,9 +1442,6 @@ fn validate_loaded_policy_model(
                     });
                 }
                 ResolvedSelectorSemanticHash::from_query(schema_resolution.version, query)
-            }
-            ResolvedPolicySelectorKind::Rows { plan } => {
-                ResolvedSelectorSemanticHash::from_rows(plan)
             }
         };
         if selector.semantic_hash != expected {
@@ -2880,9 +2768,9 @@ fn validate_authored_selector_resolution(
     resolved: &ResolvedPolicySelector,
 ) -> Result<(), LoadedModelError> {
     match authored {
-        PolicySelector::Inline { schema, query } => {
+        PolicySelector::Inline { schema, query, .. } => {
             let Some((resolved_schema, resolved_query)) = resolved.as_query() else {
-                return invalid("resolved inline selector has a row-selector kind");
+                return invalid("resolved inline selector is not a query");
             };
             if resolved_schema.version != schema.version
                 || resolved_query.to_canonical_query_plan_json()
@@ -2894,47 +2782,55 @@ fn validate_authored_selector_resolution(
         }
         PolicySelector::File {
             authored_schema_version,
+            analysis_schema_version,
             path,
         } => {
             let SelectorOrigin::ReferencedFile {
                 reference,
                 wrapper_authored_schema_version,
                 document_authored_schema_version,
+                analysis_authored_schema_version,
                 ..
             } = &resolved.origin
             else {
                 return invalid("resolved file selector lacks referenced-file provenance");
             };
-            if reference != path || wrapper_authored_schema_version != authored_schema_version {
+            if reference != path
+                || wrapper_authored_schema_version != authored_schema_version
+                || analysis_authored_schema_version != analysis_schema_version
+            {
                 return invalid(
                     "resolved file selector provenance differs from its authoring wrapper",
                 );
             }
             let expected_origin = if document_authored_schema_version.is_some() {
                 brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ReferencedDocumentExplicit
-            } else if authored_schema_version.is_some() {
+            } else if authored_schema_version.is_some() || analysis_schema_version.is_some() {
                 brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::Explicit
             } else {
                 brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible
             };
-            let expected_version = document_authored_schema_version.or(*authored_schema_version);
+            let expected_version = document_authored_schema_version
+                .or(*authored_schema_version)
+                .or(*analysis_schema_version);
+            if [
+                *authored_schema_version,
+                *document_authored_schema_version,
+                *analysis_schema_version,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|version| Some(version) != expected_version)
+            {
+                return invalid("resolved file selector has conflicting RQL version constraints");
+            }
             let Some((resolved_schema, _)) = resolved.as_query() else {
-                return invalid("resolved file selector has a row-selector kind");
+                return invalid("resolved file selector is not a query");
             };
             if resolved_schema.origin != expected_origin
                 || expected_version.is_some_and(|version| version != resolved_schema.version)
             {
                 return invalid("resolved file selector version precedence is inconsistent");
-            }
-        }
-        PolicySelector::Rows { plan } => {
-            if resolved
-                .as_rows()
-                .map(super::canonical::row_selector_plan_to_json)
-                != Some(super::canonical::row_selector_plan_to_json(plan))
-                || !matches!(resolved.origin, SelectorOrigin::Document { .. })
-            {
-                return invalid("resolved row selector differs from its authored plan");
             }
         }
     }
@@ -3349,7 +3245,7 @@ mod tests {
             panic!("fixture must be an endpoint");
         };
         let mut definition = *definition;
-        let PolicySelector::Inline { schema, query } = &definition.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &definition.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(
@@ -3551,7 +3447,7 @@ mod tests {
         let PolicyAnalysis::Match { spec } = &definition.analysis else {
             panic!("fixture must be a match policy");
         };
-        let PolicySelector::Inline { schema, query } = &spec.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(

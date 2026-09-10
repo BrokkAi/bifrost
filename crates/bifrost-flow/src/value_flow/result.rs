@@ -19,11 +19,6 @@ pub enum ValueFlowMayStatus {
     Unproven,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueFlowMustStatus {
-    NotEstablished,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueFlowMeeting {
     source: ValueFlowSourceId,
@@ -32,7 +27,6 @@ pub struct ValueFlowMeeting {
     point: ProgramPointHandle,
     path_qualities: PathQualityFrontier,
     may: ValueFlowMayStatus,
-    must: ValueFlowMustStatus,
     uncertainty: ValueFlowUncertainty,
     reached_index: usize,
     owner: Arc<()>,
@@ -61,10 +55,6 @@ impl ValueFlowMeeting {
 
     pub const fn may_status(&self) -> ValueFlowMayStatus {
         self.may
-    }
-
-    pub const fn must_status(&self) -> ValueFlowMustStatus {
-        self.must
     }
 
     pub const fn is_uncertain(&self) -> bool {
@@ -119,7 +109,6 @@ impl ValueFlowSummaryResult {
                 point: reached.point().clone(),
                 path_qualities: reached.path_qualities(),
                 may,
-                must: ValueFlowMustStatus::NotEstablished,
                 uncertainty: fact.uncertainty(),
                 reached_index,
                 owner: Arc::clone(plan.owner()),

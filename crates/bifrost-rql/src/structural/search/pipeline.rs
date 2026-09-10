@@ -3,6 +3,7 @@ use super::*;
 use crate::analyzer::semantic::{
     RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult, SemanticOutcome,
 };
+use crate::query::ResolvedCallReceiverType;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> {
@@ -49,6 +50,111 @@ fn keyed_endpoint_matches_seed(seed: &SeedMatch, endpoint: &RuntimeKeyedReadEndp
 
 fn same_byte_span(left: crate::analyzer::Range, right: crate::analyzer::Range) -> bool {
     left.start_byte == right.start_byte && left.end_byte == right.end_byte
+}
+
+fn resolved_call_identity_matches(value: &CallBindingValue, identity: &CallIdentity) -> bool {
+    let Some(expected) = identity.effective_identity() else {
+        return false;
+    };
+    match identity {
+        CallIdentity::Stable(_) => value.site.model_id.as_deref() == Some(expected),
+        CallIdentity::Qualified {
+            resolved: Some(resolved),
+            ..
+        } => match resolved.kind {
+            ResolvedCallIdentityKind::WorkspaceDeclaration => value
+                .site
+                .target
+                .as_ref()
+                .is_some_and(|target| target.unit.declaration_id().as_str() == expected),
+            ResolvedCallIdentityKind::ActiveSemanticModel => {
+                value.site.model_callable_id.as_deref() == Some(expected)
+            }
+        },
+        CallIdentity::Qualified { resolved: None, .. } => false,
+    }
+}
+
+fn resolved_call_receiver_matches(
+    value: &CallBindingValue,
+    receiver: &ResolvedCallReceiverType,
+) -> bool {
+    let Some(actual) = value.site.receiver_type_id.as_deref() else {
+        return false;
+    };
+    match receiver {
+        ResolvedCallReceiverType::Exact(identity) => identity.effective_identity() == Some(actual),
+        ResolvedCallReceiverType::AssignableTo {
+            resolved_identities,
+            ..
+        } => resolved_identities
+            .binary_search_by(|identity| identity.as_str().cmp(actual))
+            .is_ok(),
+    }
+}
+
+fn resolved_call_receiver_is_resolved(receiver: &ResolvedCallReceiverType) -> bool {
+    match receiver {
+        ResolvedCallReceiverType::Exact(identity) => identity.effective_identity().is_some(),
+        ResolvedCallReceiverType::AssignableTo {
+            root,
+            resolved_identities,
+        } => root.effective_identity().is_some() && !resolved_identities.is_empty(),
+    }
+}
+
+fn resolved_call_filter_matches(value: &CallBindingValue, filter: &ResolvedCallFilter) -> bool {
+    let row = value.row();
+    let workspace_declaration = filter.resolves_to.is_resolved_workspace_declaration();
+    if !resolved_call_identity_matches(value, &filter.resolves_to)
+        || (!workspace_declaration && value.site.semantic_target_id.is_none())
+        || value.site.formal_layout_id.is_none()
+        || filter
+            .receiver_type
+            .as_ref()
+            .is_some_and(|receiver| !resolved_call_receiver_matches(value, receiver))
+    {
+        return false;
+    }
+    match filter.proof {
+        ResolvedCallProof::Exact => workspace_declaration || value.site.selector.exact,
+        ResolvedCallProof::Declared => {
+            value.site.model_id.is_some()
+                && value.site.signature_id.is_some()
+                && value.site.pack_id.is_some()
+                && value
+                    .site
+                    .semantic_model_provenance
+                    .as_ref()
+                    .is_some_and(|provenance| !provenance.ambiguous)
+                && matches!(
+                    row.mapping,
+                    crate::analyzer::usages::call_binding::CallBindingMapping::Exact
+                )
+                && matches!(
+                    value.site.report.coverage,
+                    crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
+                )
+                && !row.terminal
+                && row.argument_id.is_some()
+        }
+    }
+}
+
+fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumentSelector) -> bool {
+    let row = value.row();
+    matches!(
+        row.mapping,
+        crate::analyzer::usages::call_binding::CallBindingMapping::Exact
+    ) && matches!(
+        value.site.report.coverage,
+        crate::analyzer::usages::call_binding::CallBindingCoverage::Exhaustive
+    ) && !row.terminal
+        && row.argument_id.is_some()
+        && match selector {
+            CallArgumentSelector::FormalName(name) => row.formal_name.as_ref() == Some(name),
+            CallArgumentSelector::FormalIndex(index) => row.formal_index == Some(*index),
+        }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,6 +629,7 @@ pub(super) fn apply_plan_step(
             branch: Vec::new(),
             language: "workspace",
             message: "workspace content changed during direct import relation replay; retry the query for a coherent snapshot".to_string(),
+        exhausted_roots: Vec::new(),
         });
         if state.access_mode == StructuralAccessMode::IndexedRequired {
             state.access_failure.get_or_insert_with(|| {
@@ -769,6 +876,7 @@ pub(super) fn invalid_plan_result(
             branch: Vec::new(),
             language: "workspace",
             message: error.to_string(),
+            exhausted_roots: Vec::new(),
         }],
     }
 }
@@ -854,10 +962,7 @@ pub(super) fn python_absent_member_file(
             && (languages.is_empty() || languages.contains(&Language::Python))
             && let Some(file) = files.iter().find(|file| {
                 crate::analyzer::common::language_for_file(file) == Language::Python
-                    && (globs.is_empty()
-                        || globs
-                            .iter()
-                            .any(|glob| glob.matches(&rel_path_string(file))))
+                    && globs.matches(&rel_path_string(file))
             })
         {
             return Some(file.clone());
@@ -1001,6 +1106,7 @@ pub(super) fn query_analysis_context_error_result(
             branch: Vec::new(),
             language: "workspace",
             message: error.to_string(),
+            exhausted_roots: Vec::new(),
         }],
     }
 }
@@ -1022,6 +1128,7 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
         branch: Vec::new(),
         language: "workspace",
         message: "query_code cancelled; any already-produced results are partial".to_string(),
+        exhausted_roots: Vec::new(),
     });
 }
 
@@ -1066,6 +1173,8 @@ pub(super) fn apply_pipeline_step(
         HashMap::default();
     let mut exhausted = false;
     let mut receiver_truncated = false;
+    let mut filter_witnessed_candidate = false;
+    let mut filter_selected_candidate = false;
     let receiver_service = matches!(
         step,
         QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
@@ -1093,8 +1202,27 @@ pub(super) fn apply_pipeline_step(
                     "{} requires WorkspaceAnalyzer-backed semantic services",
                     step.label()
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
+        return (Vec::new(), true, false);
+    }
+    if let QueryStep::ResolvedCall(filter) = step
+        && (filter.resolves_to.effective_identity().is_none()
+            || filter
+                .receiver_type
+                .as_ref()
+                .is_some_and(|receiver| !resolved_call_receiver_is_resolved(receiver)))
+    {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::InvalidPlan,
+            impact: CodeQueryDiagnosticImpact::Invalid,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "resolved_call contains a qualified locator or receiver family that was not resolved at a loaded-policy boundary"
+                .to_owned(),
+            exhausted_roots: Vec::new(),
+        });
         return (Vec::new(), true, false);
     }
     let window_result_contract_artifacts = matches!(
@@ -1253,6 +1381,7 @@ pub(super) fn apply_pipeline_step(
                         message:
                             "keyed_read_value requires WorkspaceAnalyzer-backed semantic services"
                                 .to_owned(),
+                        exhausted_roots: Vec::new(),
                     });
                     (RuntimeKeyedReadResult::default(), true)
                 }
@@ -1284,6 +1413,7 @@ pub(super) fn apply_pipeline_step(
                                 branch: Vec::new(),
                                 language: "workspace",
                                 message: format!("runtime keyed-read analysis failed: {error}"),
+                                exhausted_roots: Vec::new(),
                             });
                             (RuntimeKeyedReadResult::default(), true)
                         }
@@ -2269,6 +2399,7 @@ pub(super) fn apply_pipeline_step(
                         branch: Vec::new(),
                         language: seed.language.config_label(),
                         message: "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete".to_string(),
+                    exhausted_roots: Vec::new(),
                     });
                 }
                 expansions
@@ -2506,6 +2637,7 @@ pub(super) fn apply_pipeline_step(
                         message:
                             "call_bindings requires WorkspaceAnalyzer-backed dispatch services"
                                 .to_string(),
+                        exhausted_roots: Vec::new(),
                     });
                 }
                 let indexed = indexed_declarations
@@ -2520,6 +2652,37 @@ pub(super) fn apply_pipeline_step(
                     cancellation,
                     diagnostics,
                 )
+            }
+            (PipelineValue::CallBinding(value), QueryStep::ResolvedCall(filter)) => {
+                filter_witnessed_candidate |= match filter.proof {
+                    ResolvedCallProof::Exact => true,
+                    ResolvedCallProof::Declared => filter
+                        .resolves_to
+                        .effective_identity()
+                        .is_some_and(|expected| {
+                            value.site.model_callable_id.as_deref() == Some(expected)
+                                || value.site.model_id.as_deref() == Some(expected)
+                        }),
+                };
+                if resolved_call_filter_matches(value, filter) {
+                    filter_selected_candidate = true;
+                    vec![pipeline_expansion(PipelineValue::CallBinding(
+                        value.clone(),
+                    ))]
+                } else {
+                    Vec::new()
+                }
+            }
+            (PipelineValue::CallBinding(value), QueryStep::CallArgument(selector)) => {
+                filter_witnessed_candidate = true;
+                if call_argument_filter_matches(value, selector) {
+                    filter_selected_candidate = true;
+                    vec![pipeline_expansion(PipelineValue::CallBinding(
+                        value.clone(),
+                    ))]
+                } else {
+                    Vec::new()
+                }
             }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
                 occurrence_expansions_for_file(
@@ -3345,6 +3508,20 @@ pub(super) fn apply_pipeline_step(
         call_cache.effects.release_file_window();
     }
 
+    if filter_witnessed_candidate && !filter_selected_candidate {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::CallBindingSelectorRejected,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: format!(
+                "{} rejected every witnessed call-binding candidate",
+                step.label()
+            ),
+            exhausted_roots: Vec::new(),
+        });
+    }
+
     if step == &QueryStep::ImportersOf
         && let Some(graph) = import_graph
     {
@@ -3362,6 +3539,7 @@ pub(super) fn apply_pipeline_step(
                 language.config_label(),
                 step.label()
             ),
+            exhausted_roots: Vec::new(),
         });
     }
     append_semantic_omission_diagnostics(diagnostics, step, semantic_omissions);
@@ -3388,6 +3566,7 @@ pub(super) fn apply_pipeline_step(
             branch: Vec::new(),
             language: language.config_label(),
             message,
+            exhausted_roots: Vec::new(),
         });
     }
     if let Some(instrumentation) = instrumentation {

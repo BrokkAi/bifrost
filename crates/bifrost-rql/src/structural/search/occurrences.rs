@@ -225,6 +225,7 @@ impl OccurrenceTraversalCache {
                         branch: Vec::new(),
                         language: language.config_label(),
                         message,
+                        exhausted_roots: Vec::new(),
                     });
                 }
                 OccurrenceIncompleteReason::NoStructuralAdapter
@@ -248,6 +249,7 @@ impl OccurrenceTraversalCache {
                             "{} {detail}; its occurrences were omitted",
                             super::rel_path_string(file)
                         ),
+                        exhausted_roots: Vec::new(),
                     });
                 }
             }

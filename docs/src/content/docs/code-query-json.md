@@ -3,7 +3,7 @@ title: JSON CodeQuery
 description: Use the canonical JSON representation for Bifrost's query_code engine.
 ---
 
-JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
+JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. Author queries in RQL, then generate this serialization from the decoded `CodeQuery`; the RQL REPL prints it with `:json`. JSON examples on this page describe the machine wire contract, not a second authoring syntax. Generated `.json` query files remain supported; JSON text in `.rql` files or editor buffers is not supported.
 
 The single supported schema version is 1; it carries the complete vocabulary below. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
 
@@ -30,8 +30,8 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 | --- | --- | --- |
 | `schema_version` | integer | Optional. Version `1` is the only supported version; omit it or pin it explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
-| `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
-| `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
+| `where` | string array or array of non-empty string arrays | Optional project-relative globs. A flat list uses OR; nested lists use AND between groups and OR within each group. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
+| `languages` | string array | Optional language labels such as `python` or `cpp`, or fixed families `jvm` (`java`, `kotlin`, `scala`) and `js-ts` (`javascript`, `typescript`). Empty means every structural adapter. |
 | `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
 | `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. |
 | `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
@@ -171,12 +171,22 @@ The response contains a `results` array. Every item has a `result_type`: `struct
 With `result_detail: "full"`, results additionally include:
 
 - a deterministic match `id`
+- declaration `id` values in the analyzer's `decl:v1:<hex>` format and a
+  `site_id` formed from that ID plus the exact declaration byte span
 - `node_range` byte and 1-based line/column bounds
 - capture ranges and kinds
 - `decorator_ranges` for matched declarations
 - `decorated_range`, the union of the declaration and its decorators
 
 Every derived result includes `provenance`. Each provenance path records the original structural seed and every ordered step result. Declaration-returning reference steps additionally record the exact proving reference site under `via`. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
+
+Declaration identity is one cross-domain vocabulary. A declaration row's
+`id` and declaration-valued aliases such as `target_id`, `caller_id`,
+`callee_id`, `procedure_id`, and `declaration_id` are byte-identical when they
+name the same analyzer declaration. `procedure_effect` and
+`callable_signature` repeat that declaration's `site_id` because their range
+is the declaration site itself. Other `site_id` fields name their own typed
+domains, such as calls or AST occurrences, and are not declaration IDs.
 
 For completeness claims, result metadata is mandatory: inspect diagnostics, require `truncated: false`, distinguish `proven` from `unproven` graph edges, and check every derived result's `provenance_truncated` field. [Agent Result Safety](/agent-result-safety/) turns those fields into an explicit decision rule.
 
@@ -196,7 +206,7 @@ At every query-plan node, use exactly one source field: `match`, `union`, `inter
 
 `union` retains the first appearance of each exact typed endpoint in branch order. `intersect` retains endpoints present in every branch, in the first branch's order. `except` retains first-branch endpoints absent from every later branch. Endpoint identity comes from structured ranges and declaration/site identities, never rendered text.
 
-Union and intersection merge at most sixteen provenance traces in branch order. A trace or diagnostic inside composition includes a zero-based `branch` path; plain leaf queries omit it. Except retains provenance only from its positive first branch. Root-only `limit`, `result_detail`, `execution_mode`, and `schema_version` fields cannot appear inside operands, while structural `where`, `languages`, `inside`, and `not_inside` belong inside the branch containing `match`.
+Union and intersection merge at most sixteen provenance traces in branch order. A trace or diagnostic inside composition includes a zero-based `branch` path; plain leaf queries omit it. Except retains provenance only from its positive first branch. Root-only `limit`, `result_detail`, `execution_mode`, and `schema_version` fields cannot appear inside operands, while `inside`, `inside_decl`, and `not_inside` belong inside the branch containing `match`. Outer `where` and `languages` constraints conjoin with every branch's source scope before its pipeline steps; disjoint explicit language scopes are rejected.
 
 The public `limit` applies after the complete root set and common suffix. Execution budgets are shared across the request and fairly reserve work for later immediate operands. An incomplete operand sets `truncated: true` and produces a branch-labeled diagnostic rather than claiming a complete set. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 
@@ -286,7 +296,7 @@ This query starts from a structural function match, resolves its executable proc
 
 `procedure` rows include stable content-scoped `id` and `artifact_id`, workspace-relative `path`, `procedure_kind`, exact `range`, and semantic `evidence`. `program_point` rows add `procedure_id`, optional `boundary` (`entry`, `normal_exit`, or `exceptional_exit`), and `event_count`. `control_edge` rows add `edge_kind` plus complete source and target point references.
 
-Every semantic row carries `evidence.proof` (`proven` or `unproven`) and `evidence.completeness` (`complete` or `partial`), with a bounded reason when either status is degraded. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
+Every semantic row carries one `evidence` object: `proof` is `proven` or `unproven`, `completeness` is `complete` or `partial`, and optional `reason` preserves the typed failure or limit when either axis is degraded. There is no composite quality label and no separate per-axis reason field. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
 
 Each edge operation is exactly one hop. Compose more steps for a finite traversal; the CFG surface does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint. The registered typestate adapter described next is the only typestate entry point.
 
@@ -328,7 +338,23 @@ The host registers an already-built `ValueFlowPlan` under a namespaced reference
 }
 ```
 
-`flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, ambiguity, completion, must-status (`not_established`), and solver termination as separate fields. `flow_witness` rows contain bounded ordered source-backed steps plus truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
+`flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, and ambiguity. One `status` describes how the flow analysis ended, while optional `reason` carries the exact capability, budget, cancellation, or retained-evidence detail. There is no `must` field until must analysis exists. `flow_witness` rows contain bounded ordered source-backed steps, one `evidence` object, and truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
+
+| Flow `status` | Meaning |
+| --- | --- |
+| `complete` | Semantic input was complete and the solver reached a fixed point with complete coverage. |
+| `partial` | The solver reached a fixed point, but retained semantic evidence or coverage was incomplete. |
+| `ambiguous` | Structured semantic alternatives remain. |
+| `unknown` | The semantic provider could not establish the requested relation. |
+| `unproven` | A structured relation was retained without sufficient proof. |
+| `unsupported` | A required semantic capability is unavailable; `reason` names it. |
+| `semantic_budget_exhausted` | Semantic input construction hit a public semantic budget lane. |
+| `solver_budget_exhausted` | Flow propagation hit a solver work limit. |
+| `semantic_cancelled` | Cancellation stopped semantic input construction. |
+| `solver_cancelled` | Cancellation stopped the flow solver. |
+| `query_cancelled` | The enclosing query stopped after the solve and capped an otherwise complete row. |
+
+When solver termination and semantic input are both limited, `status` names the solver outcome and `reason` also retains the semantic outcome. Thus every formerly observable `semantic_status`/`completion`/`solver_termination` combination remains distinguishable without exposing those internal enums as separate public columns. `path_qualities` remains a collection of evidence objects because it is the frontier of incomparable concrete paths, not a second endpoint status.
 
 ### Caller-driven absent-member witnesses
 
@@ -353,7 +379,7 @@ receiver was classified.
 ```
 
 `absent_member_witness` rows link to a site-keyed `finding_id` and retain ordered
-source-backed `steps`, `quality`, byte counts, and omission/truncation metadata.
+source-backed `steps`, `evidence`, byte counts, and omission/truncation metadata.
 Witness IDs additionally distinguish caller contexts. `witness_status` is
 `available`, `truncated`, or `unavailable`; unavailable rows have no steps and
 include `unavailable_reason`. Retention exhaustion is a truncated marker, not an
@@ -380,7 +406,7 @@ The host registers immutable results produced by the production taint policy com
 }
 ```
 
-`taint_finding` rows preserve stable IDs, reached labels, origins, witnesses, proof/completeness, ambiguity, and truncation metadata. Registration aliases never enter those IDs. Matching projection limits produce rows field-for-field equal to the production policy outcome's public taint findings.
+`taint_finding` rows preserve stable IDs, reached labels, origins, witnesses, one semantic `evidence` object, ambiguity, and truncation metadata. Registration aliases never enter those IDs. Matching projection limits produce rows field-for-field equal to the production policy outcome's public taint findings.
 
 ### Typed occurrences
 

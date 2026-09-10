@@ -35,6 +35,7 @@ const JAVA_JVM_MAPPING_SCHEMA_JSON: &str = include_str!("profiles/java-jvm-mappi
 const JVM_COMPATIBILITY_SCHEMA_JSON: &str = include_str!("profiles/jvm-compatibility.schema.json");
 const RUNTIME_VALUES_SCHEMA_JSON: &str = include_str!("profiles/runtime-values.schema.json");
 const COLLECTION_FLOW_SCHEMA_JSON: &str = include_str!("profiles/collection-flow.schema.json");
+const DEFERRED_YIELD_SCHEMA_JSON: &str = include_str!("profiles/deferred-yield.schema.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsmiDiagnosticSeverity {
@@ -393,6 +394,13 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
             "runtimeGlobalBindingEvidence",
             "keyedReadObservation",
         ],
+    },
+    KnownProfile {
+        identifier: CSMI_DEFERRED_YIELD_PROFILE_ID,
+        version: CSMI_DEFERRED_YIELD_PROFILE_VERSION,
+        schema: CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
+        schema_json: DEFERRED_YIELD_SCHEMA_JSON,
+        payload_definitions: &["$root"],
     },
     KnownProfile {
         identifier: "csmi.javascript-typescript",
@@ -2440,7 +2448,1350 @@ fn validate_model(
     ) {
         valid = false;
     }
+    if !validate_deferred_yield_semantics(
+        model,
+        &prefix,
+        &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        diagnostics,
+    ) {
+        valid = false;
+    }
     valid
+}
+
+fn validate_deferred_yield_semantics(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let uses: Vec<(usize, &CsmiVocabularyUse)> = model
+        .vocabulary_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.identifier == CSMI_DEFERRED_YIELD_PROFILE_ID)
+        .collect();
+    let facts: Vec<(usize, &CsmiExtensionFact)> = model
+        .extension_facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| fact.vocabulary == CSMI_DEFERRED_YIELD_PROFILE_ID)
+        .collect();
+    if uses.is_empty() && facts.is_empty() {
+        return true;
+    }
+    let mut valid = true;
+    let mut affects = HashSet::new();
+    for (index, use_) in &uses {
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.version != CSMI_DEFERRED_YIELD_PROFILE_VERSION
+            || use_.schema != CSMI_DEFERRED_YIELD_PROFILE_SCHEMA
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_profile_identity",
+                &path,
+                "deferred-yield requires exact version 0.1.0 and schema URI",
+            );
+            valid = false;
+            continue;
+        }
+        if use_.requirement != CsmiVocabularyRequirement::Required {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_required_use",
+                format!("{path}.requirement"),
+                "deferred-yield facts require an exact required vocabulary use",
+            );
+            valid = false;
+        }
+        for (affect_index, affect) in use_.affects.iter().enumerate() {
+            let affect_path = format!("{path}.affects[{affect_index}]");
+            let CsmiAffectedUnit::FactFamily(family) = affect else {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_affect_kind",
+                    affect_path,
+                    "deferred-yield affects must identify a fact family",
+                );
+                valid = false;
+                continue;
+            };
+            if family.kind != CsmiAffectedFactFamilyKind::FactFamily
+                || family.family != "deferred-yields"
+                || !deferred_yield_scope_shape(
+                    &family.scope,
+                    symbols,
+                    declaration_categories,
+                    &format!("{affect_path}.scope"),
+                    diagnostics,
+                )
+            {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_affect_scope",
+                    affect_path,
+                    "deferred-yield affects must use family deferred-yields and an exact linked scope",
+                );
+                valid = false;
+                continue;
+            }
+            affects.insert(canonical_scope(&family.scope));
+        }
+    }
+    if facts
+        .iter()
+        .any(|(_, fact)| fact.version != CSMI_DEFERRED_YIELD_PROFILE_VERSION)
+        || !uses.iter().any(|(_, use_)| {
+            use_.version == CSMI_DEFERRED_YIELD_PROFILE_VERSION
+                && use_.schema == CSMI_DEFERRED_YIELD_PROFILE_SCHEMA
+        })
+    {
+        return false;
+    }
+    let mut scoped_payloads: HashMap<String, Vec<CsmiDeferredYieldPayload>> = HashMap::new();
+    for (index, fact) in facts {
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        if fact.family != "deferred-yields" {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_family",
+                format!("{path}.family"),
+                "deferred-yield facts must use family deferred-yields",
+            );
+            valid = false;
+            continue;
+        }
+        let Some(scope) = deferred_yield_scope(
+            &fact.scope,
+            symbols,
+            declaration_categories,
+            &format!("{path}.scope"),
+            diagnostics,
+        ) else {
+            valid = false;
+            continue;
+        };
+        let expected_scope = serde_json::json!({
+            "factory": scope.0,
+            "resume": scope.1,
+            "handleType": scope.2,
+        });
+        if fact.scope != expected_scope {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_scope",
+                format!("{path}.scope"),
+                "deferred-yield scope must be exactly factory, resume, and handleType",
+            );
+            valid = false;
+        }
+        let payload: CsmiDeferredYieldPayload = match serde_json::from_value(fact.payload.clone()) {
+            Ok(payload) => payload,
+            Err(cause) => {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_payload",
+                    format!("{path}.payload"),
+                    cause.to_string(),
+                );
+                valid = false;
+                continue;
+            }
+        };
+        if payload.kind != CsmiDeferredYieldKind::DeferredYield
+            || payload.factory != scope.0
+            || payload.resume != scope.1
+            || payload.handle_type != scope.2
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_payload_scope",
+                format!("{path}.payload"),
+                "payload kind and linked endpoint identities must match the fact scope",
+            );
+            valid = false;
+        }
+        if !validate_deferred_yield_payload(
+            &payload,
+            model,
+            symbols,
+            declaration_categories,
+            callable_declarations,
+            &format!("{path}.payload"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        let scope_key = canonical_scope(&expected_scope);
+        if !affects.contains(&scope_key) {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_missing_affect",
+                format!("{path}.scope"),
+                "deferred-yield fact scope must be listed in vocabularyUses.affects",
+            );
+            valid = false;
+        }
+        scoped_payloads.entry(scope_key).or_default().push(payload);
+    }
+    let mut coverage_scopes = HashSet::new();
+    for (index, statement) in model.completeness_statements.iter().enumerate() {
+        if statement.vocabulary.as_deref() != Some(CSMI_DEFERRED_YIELD_PROFILE_ID) {
+            continue;
+        }
+        let path = format!("{prefix}.completenessStatements[{index}]");
+        if statement.version.as_deref() != Some(CSMI_DEFERRED_YIELD_PROFILE_VERSION)
+            || statement.family != "deferred-yields"
+            || !coverage_scopes.insert(canonical_scope(&statement.scope))
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_completeness_identity",
+                &path,
+                "coverage requires the exact version, family, and unique linked scope",
+            );
+            valid = false;
+        }
+        if !deferred_yield_scope_shape(
+            &statement.scope,
+            symbols,
+            declaration_categories,
+            &format!("{path}.scope"),
+            diagnostics,
+        ) || !affects.contains(&canonical_scope(&statement.scope))
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_completeness_scope",
+                format!("{path}.scope"),
+                "deferred-yield completeness must use an affected exact linked scope",
+            );
+            valid = false;
+        }
+        if statement.status == CsmiCoverageStatus::Complete {
+            let Some(payloads) = scoped_payloads.get(&canonical_scope(&statement.scope)) else {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_missing_fact",
+                    format!("{path}.status"),
+                    "complete deferred-yield coverage requires a matching fact",
+                );
+                valid = false;
+                continue;
+            };
+            let scope = deferred_yield_scope(
+                &statement.scope,
+                symbols,
+                declaration_categories,
+                &format!("{path}.scope"),
+                diagnostics,
+            );
+            let endpoint_shapes_complete = scope.is_some_and(|(factory, resume, _)| {
+                [factory, resume].into_iter().all(|symbol| {
+                    model.completeness_statements.iter().any(|candidate| {
+                        candidate.vocabulary.is_none()
+                            && candidate.version.is_none()
+                            && candidate.family == "declaration-aspects"
+                            && candidate.status == CsmiCoverageStatus::Complete
+                            && candidate.scope.get("symbol").and_then(Value::as_str) == Some(symbol)
+                            && candidate.scope.get("aspect").and_then(Value::as_str)
+                                == Some("callable-shape")
+                    })
+                })
+            });
+            if !endpoint_shapes_complete
+                || payloads.iter().any(deferred_yield_payload_uncertain)
+                || payloads.windows(2).any(|window| window[0] != window[1])
+            {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_incomplete_claim",
+                    format!("{path}.status"),
+                    "complete deferred-yield coverage cannot contain uncertainty or conflicting records",
+                );
+                valid = false;
+            }
+        }
+    }
+    valid
+}
+
+/// Validate deferred-yield facts embedded in a native authored shard.
+///
+/// Native producers already hold the CSMI typed payload, so they bypass JSON
+/// Schema deserialization. Rebuild the small declaration index from the
+/// semantic model and run the same linked-scope joins used for imported wire
+/// documents before allowing a complete fact to be published.
+pub(crate) fn validate_native_deferred_yield_model(
+    model: &CsmiSemanticModel,
+) -> Vec<CsmiDiagnostic> {
+    let mut symbols: HashSet<String> = model
+        .declarations
+        .iter()
+        .map(|declaration| declaration.symbol.clone())
+        .collect();
+    symbols.extend(model.symbols.iter().map(|symbol| symbol.id.clone()));
+    let declaration_categories: HashMap<String, CsmiDeclarationCategory> = model
+        .declarations
+        .iter()
+        .map(|declaration| (declaration.symbol.clone(), declaration.category))
+        .collect();
+    let callable_declarations: HashMap<String, &CsmiCallableShape> = model
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .callable
+                .as_ref()
+                .map(|shape| (declaration.symbol.clone(), shape))
+        })
+        .collect();
+    let mut diagnostics = Vec::new();
+    let (profile_index, _) = known_profile(
+        CSMI_DEFERRED_YIELD_PROFILE_ID,
+        CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
+    )
+    .expect("deferred-yield profile is registered");
+    let schema = profile_schema_validators()[profile_index]
+        .as_ref()
+        .expect("payload schema");
+    for fact in model
+        .extension_facts
+        .iter()
+        .filter(|fact| fact.vocabulary == CSMI_DEFERRED_YIELD_PROFILE_ID)
+    {
+        for violation in schema.iter_errors(&fact.payload) {
+            error(
+                &mut diagnostics,
+                "deferred_yield.schema",
+                "$",
+                violation.to_string(),
+            );
+        }
+    }
+    let valid = validate_deferred_yield_semantics(
+        model,
+        "$",
+        &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        &mut diagnostics,
+    );
+    if !valid && diagnostics.is_empty() {
+        error(
+            &mut diagnostics,
+            "deferred_yield.invalid",
+            "$",
+            "invalid deferred-yield contract",
+        );
+    }
+    diagnostics
+}
+
+fn deferred_yield_scope<'a>(
+    scope: &'a Value,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let object = scope.as_object()?;
+    if object.len() != 3 {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_scope",
+            path,
+            "deferred-yield scope must contain exactly three linked identities",
+        );
+        return None;
+    }
+    let factory = object.get("factory")?.as_str()?;
+    let resume = object.get("resume")?.as_str()?;
+    let handle_type = object.get("handleType")?.as_str()?;
+    let callable = |id: &str| {
+        symbols.contains(id)
+            && matches!(
+                declaration_categories.get(id),
+                Some(CsmiDeclarationCategory::Callable)
+            )
+    };
+    let mut valid = true;
+    if !callable(factory) || !callable(resume) || factory == resume {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_scope_callable",
+            path,
+            "factory and resume must be distinct local callable declarations",
+        );
+        valid = false;
+    }
+    if !symbols.contains(handle_type)
+        || !matches!(
+            declaration_categories.get(handle_type),
+            Some(CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias)
+        )
+    {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_scope_type",
+            path,
+            "handleType must be a local type declaration",
+        );
+        valid = false;
+    }
+    valid.then_some((factory, resume, handle_type))
+}
+
+fn validate_deferred_yield_payload(
+    payload: &CsmiDeferredYieldPayload,
+    model: &CsmiSemanticModel,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    callable_declarations: &HashMap<String, &CsmiCallableShape>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = true;
+    let Some(factory_shape) = callable_declarations.get(&payload.factory) else {
+        return false;
+    };
+    let Some(resume_shape) = callable_declarations.get(&payload.resume) else {
+        return false;
+    };
+    if !validate_deferred_yield_substitution(
+        payload.receiver_substitution.as_ref(),
+        model,
+        factory_shape,
+        &format!("{path}.receiverSubstitution"),
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    let mut roots: HashMap<String, CsmiDeferredYieldShape> = HashMap::new();
+    for (index, root) in payload.roots.iter().enumerate() {
+        let root_path = format!("{path}.roots[{index}]");
+        let key = deferred_yield_root_key(&root.callable, &root.root);
+        if roots.insert(key, root.shape.clone()).is_some() {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_duplicate_root",
+                format!("{root_path}.root"),
+                "deferred-yield roots must be unique",
+            );
+            valid = false;
+        }
+        if !symbols.contains(&root.callable)
+            || !matches!(
+                declaration_categories.get(&root.callable),
+                Some(CsmiDeclarationCategory::Callable)
+            )
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_root_callable",
+                format!("{root_path}.callable"),
+                "root callable must be a local callable declaration",
+            );
+            valid = false;
+        }
+        if !validate_deferred_yield_shape(
+            &root.shape,
+            declaration_categories,
+            &format!("{root_path}.shape"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+    }
+    if !validate_deferred_yield_location(
+        &payload.construction.source,
+        &payload.factory,
+        "input",
+        factory_shape,
+        &roots,
+        &format!("{path}.construction.source"),
+        diagnostics,
+    ) || !validate_deferred_yield_location(
+        &payload.construction.handle,
+        &payload.factory,
+        "output",
+        factory_shape,
+        &roots,
+        &format!("{path}.construction.handle"),
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    let handle_shape = deferred_yield_shape_at_location(
+        &payload.construction.handle,
+        &roots,
+        factory_shape,
+        &format!("{path}.construction.handle"),
+        diagnostics,
+    );
+    let resume_handle_shape = deferred_yield_shape_at_location(
+        &payload.resume_contract.handle_input,
+        &roots,
+        resume_shape,
+        &format!("{path}.resumeContract.handleInput"),
+        diagnostics,
+    );
+    if let (Some(factory_handle), Some(resume_handle)) = (&handle_shape, &resume_handle_shape)
+        && (factory_handle != resume_handle
+            || !deferred_yield_shape_is_handle_type(factory_handle, &payload.handle_type))
+    {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_handle_shape",
+            format!("{path}.resumeContract"),
+            "factory handle output and resume handle input must have the exact declared handleType",
+        );
+        valid = false;
+    }
+    if !validate_deferred_yield_location(
+        &payload.resume_contract.handle_input,
+        &payload.resume,
+        "input",
+        resume_shape,
+        &roots,
+        &format!("{path}.resumeContract.handleInput"),
+        diagnostics,
+    ) || !validate_deferred_yield_location(
+        &payload.resume_contract.yielded_result,
+        &payload.resume,
+        "output",
+        resume_shape,
+        &roots,
+        &format!("{path}.resumeContract.yieldedResult"),
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    let item_shape = deferred_yield_shape_at_location(
+        &payload.resume_contract.yielded_result,
+        &roots,
+        resume_shape,
+        &format!("{path}.resumeContract.yieldedResult"),
+        diagnostics,
+    );
+    if payload.resume_contract.factory_result_flow.kind
+        != CsmiDeferredYieldFactoryResultFlowKind::RequiredConsumerProof
+        || payload.resume_contract.factory_result_flow.factory_result != payload.construction.handle
+        || payload.resume_contract.factory_result_flow.resume_input
+            != payload.resume_contract.handle_input
+    {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_flow",
+            format!("{path}.resumeContract.factoryResultFlow"),
+            "factory-result flow must repeat the exact construction handle and resume input",
+        );
+        valid = false;
+    }
+    if !validate_deferred_yield_retention(
+        &payload.construction.retention,
+        &format!("{path}.construction.retention"),
+        diagnostics,
+    ) || !validate_deferred_yield_validity(
+        &payload.construction.validity,
+        &format!("{path}.construction.validity"),
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    if payload.yield_contract.timing != CsmiDeferredYieldTiming::AfterConstruction
+        || payload.yield_contract.per_resume != CsmiDeferredYieldPerResume::ZeroOrOne
+        || payload.yield_contract.per_handle != CsmiDeferredYieldPerHandle::ZeroOrMore
+        || payload.yield_contract.members.is_empty()
+    {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_multiplicity",
+            format!("{path}.yield"),
+            "deferred-yield timing and multiplicity must use the exact profile constants",
+        );
+        valid = false;
+    }
+    let mut positions = HashSet::new();
+    let mut source_observations = HashSet::new();
+    let mut roles = HashSet::new();
+    for (index, member) in payload.yield_contract.members.iter().enumerate() {
+        let member_path = format!("{path}.yield.members[{index}]");
+        if !positions.insert(member.position) || member.position as usize != index {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_member_position",
+                format!("{member_path}.position"),
+                "yield member positions must be unique and contiguous",
+            );
+            valid = false;
+        }
+        if member.source.root != payload.construction.source.root
+            || !source_observations
+                .insert(serde_json::to_string(&member.source).expect("typed location serializes"))
+        {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_member_source",
+                &member_path,
+                "yield members require unique observations of the construction source",
+            );
+            valid = false;
+        }
+        if !validate_deferred_yield_location(
+            &member.source,
+            &payload.factory,
+            "input",
+            factory_shape,
+            &roots,
+            &format!("{member_path}.source"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !validate_deferred_yield_delivery(
+            &member.delivery,
+            &format!("{member_path}.delivery"),
+            diagnostics,
+        ) {
+            valid = false;
+        }
+        if !roles.insert(member.role) {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_member_role",
+                format!("{member_path}.role"),
+                "yield member roles must be distinct",
+            );
+            valid = false;
+        }
+        let steps = member
+            .source
+            .projection
+            .as_ref()
+            .map(|projection| projection.steps.as_slice())
+            .unwrap_or(&[]);
+        match member.role {
+            CsmiDeferredYieldMemberRole::Key
+                if !matches!(
+                    steps.last(),
+                    Some(CsmiDeferredYieldProjectionStep::EntryKey)
+                ) =>
+            {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_member_projection",
+                    format!("{member_path}.source"),
+                    "key role requires an explicit entry-key projection",
+                );
+                valid = false;
+            }
+            CsmiDeferredYieldMemberRole::Value
+                if !matches!(
+                    steps.last(),
+                    Some(CsmiDeferredYieldProjectionStep::EntryValue)
+                ) =>
+            {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_member_projection",
+                    format!("{member_path}.source"),
+                    "value role requires an explicit entry-value projection",
+                );
+                valid = false;
+            }
+            CsmiDeferredYieldMemberRole::Key | CsmiDeferredYieldMemberRole::Value => {}
+            CsmiDeferredYieldMemberRole::Item => {}
+        }
+        if let (Some(item_shape), Some(source_shape)) = (
+            item_shape.as_ref(),
+            deferred_yield_shape_at_location(
+                &member.source,
+                &roots,
+                factory_shape,
+                &format!("{member_path}.source"),
+                diagnostics,
+            )
+            .as_ref(),
+        ) && let CsmiDeferredYieldShape::Product { components } = item_shape
+        {
+            let Some(destination_shape) = components.get(member.position as usize) else {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_member_position",
+                    format!("{member_path}.position"),
+                    "yield member position must be present in the yielded result shape",
+                );
+                valid = false;
+                continue;
+            };
+            if !matches!(
+                member.delivery,
+                CsmiDeferredYieldDelivery::Mode(CsmiDeferredYieldDeliveryMode::Derived)
+            ) && source_shape != destination_shape
+            {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_member_shape",
+                    format!("{member_path}.source"),
+                    "non-derived member source and yielded result component must have identical shapes",
+                );
+                valid = false;
+            }
+        }
+        if matches!(
+            (&payload.construction.retention, &member.delivery),
+            (
+                CsmiDeferredYieldRetention::Mode(CsmiDeferredYieldRetentionMode::BorrowedShared),
+                CsmiDeferredYieldDelivery::Mode(
+                    CsmiDeferredYieldDeliveryMode::ExclusiveBorrow
+                        | CsmiDeferredYieldDeliveryMode::Move
+                )
+            ) | (
+                CsmiDeferredYieldRetention::Mode(CsmiDeferredYieldRetentionMode::BorrowedExclusive),
+                CsmiDeferredYieldDelivery::Mode(CsmiDeferredYieldDeliveryMode::Move)
+            )
+        ) {
+            error(
+                diagnostics,
+                "semantic.deferred_yield_retention_delivery",
+                format!("{member_path}.delivery"),
+                "delivery cannot exceed the construction retention relationship",
+            );
+            valid = false;
+        }
+    }
+    valid
+        && positions
+            .iter()
+            .copied()
+            .all(|position| position < payload.yield_contract.members.len() as u32)
+        && positions.len() == payload.yield_contract.members.len()
+}
+
+fn deferred_yield_root_key(callable: &str, root: &CsmiDeferredYieldBoundaryRoot) -> String {
+    format!(
+        "{callable}:{}",
+        serde_json::to_string(root).expect("CSMI root serializes")
+    )
+}
+
+fn validate_deferred_yield_substitution(
+    substitution: Option<&CsmiDeferredYieldSubstitution>,
+    model: &CsmiSemanticModel,
+    factory: &CsmiCallableShape,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let Some(substitution) = substitution else {
+        return true;
+    };
+    match substitution {
+        CsmiDeferredYieldSubstitution::Unknown { limitation }
+        | CsmiDeferredYieldSubstitution::Unsupported { limitation } => {
+            validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+        }
+        CsmiDeferredYieldSubstitution::ReceiverArguments { declaration } => {
+            let Some(record) = model
+                .declarations
+                .iter()
+                .find(|record| record.symbol == *declaration)
+            else {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_substitution",
+                    path,
+                    "receiver substitution declaration must be local",
+                );
+                return false;
+            };
+            if !matches!(
+                record.category,
+                CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias
+            ) {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_substitution",
+                    path,
+                    "receiver substitution declaration must be a type",
+                );
+                return false;
+            }
+            let matches_factory = factory.receiver.as_ref().is_some_and(|receiver| {
+                matches!(
+                    receiver.receiver_type.as_ref(),
+                    Some(CsmiTypeExpression::Reference(reference))
+                        if reference.symbol == *declaration
+                )
+            });
+            if !matches_factory {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_substitution",
+                    path,
+                    "receiver substitution must bind the factory receiver declaration",
+                );
+            }
+            let Some(receiver_type) = factory
+                .receiver
+                .as_ref()
+                .and_then(|receiver| receiver.receiver_type.as_ref())
+            else {
+                return false;
+            };
+            let CsmiTypeExpression::Reference(receiver_reference) = receiver_type else {
+                return false;
+            };
+            validate_receiver_generic_arguments(
+                receiver_reference,
+                record,
+                "semantic.deferred_yield_receiver_arguments",
+                path,
+                diagnostics,
+            ) && matches_factory
+        }
+    }
+}
+
+fn validate_receiver_generic_arguments(
+    receiver_reference: &CsmiReferenceType,
+    declaration: &CsmiDeclaration,
+    diagnostic_code: &str,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let parameters = &declaration.generic_parameters;
+    if parameters
+        .iter()
+        .map(|parameter| &parameter.symbol)
+        .collect::<HashSet<_>>()
+        .len()
+        != parameters.len()
+    {
+        error(
+            diagnostics,
+            diagnostic_code,
+            path,
+            "receiver declaration generic parameter symbols must be unique",
+        );
+        return false;
+    }
+    if receiver_reference.arguments.len() != parameters.len() {
+        error(
+            diagnostics,
+            diagnostic_code,
+            path,
+            "receiver type arguments must cover every declaration generic parameter",
+        );
+        return false;
+    }
+    let mut valid = true;
+    for (index, parameter) in parameters.iter().enumerate() {
+        if parameter.position != index as u32
+            || !matches!(
+                receiver_reference.arguments.get(index),
+                Some(CsmiTypeExpression::Parameter(argument))
+                    if argument.symbol == parameter.symbol
+            )
+        {
+            error(
+                diagnostics,
+                diagnostic_code,
+                path,
+                "receiver generic arguments must preserve declaration order",
+            );
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_deferred_yield_shape(
+    shape: &CsmiDeferredYieldShape,
+    declarations: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut stack = vec![(shape, path.to_owned())];
+    let mut valid = true;
+    while let Some((shape, path)) = stack.pop() {
+        match shape {
+            CsmiDeferredYieldShape::Value { r#type } => {
+                if !validate_deferred_yield_type_expression(
+                    r#type,
+                    declarations,
+                    &format!("{path}.type"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+            }
+            CsmiDeferredYieldShape::Product { components } => {
+                if components.is_empty() {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_shape_product",
+                        path,
+                        "product shapes require at least one component",
+                    );
+                    valid = false;
+                    continue;
+                }
+                for (index, component) in components.iter().enumerate().rev() {
+                    stack.push((component, format!("{path}.components[{index}]")));
+                }
+            }
+            CsmiDeferredYieldShape::Keyed {
+                key,
+                value,
+                entry_components,
+            } => {
+                stack.push((value, format!("{path}.value")));
+                stack.push((key, format!("{path}.key")));
+                if let Some(components) = entry_components
+                    && (components.len() != 2
+                        || components.iter().collect::<HashSet<_>>().len() != 2)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_entry_components",
+                        format!("{path}.entryComponents"),
+                        "entryComponents must list key and value exactly once",
+                    );
+                    valid = false;
+                }
+            }
+            CsmiDeferredYieldShape::Unknown { limitation } => {
+                if !validate_profile_limitation(
+                    limitation,
+                    &format!("{path}.limitation"),
+                    diagnostics,
+                ) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    valid
+}
+
+fn validate_deferred_yield_type_expression(
+    expression: &CsmiDeferredYieldTypeExpression,
+    declarations: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut stack = vec![(expression, path.to_owned())];
+    let mut valid = true;
+    while let Some((expression, path)) = stack.pop() {
+        match expression {
+            CsmiTypeExpression::Unknown(_) => {}
+            CsmiTypeExpression::Reference(reference) => {
+                if !matches!(
+                    declarations.get(&reference.symbol),
+                    Some(CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias)
+                ) {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_shape_type",
+                        &path,
+                        "reference type must name a local type declaration",
+                    );
+                    valid = false;
+                }
+                for (index, argument) in reference.arguments.iter().enumerate().rev() {
+                    stack.push((argument, format!("{path}.arguments[{index}]")));
+                }
+            }
+            CsmiTypeExpression::Parameter(parameter) => {
+                if declarations.get(&parameter.symbol)
+                    != Some(&CsmiDeclarationCategory::TypeParameter)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_shape_type",
+                        &path,
+                        "parameter type must name a local type-parameter declaration",
+                    );
+                    valid = false;
+                }
+            }
+            CsmiTypeExpression::Intrinsic(_) => {
+                error(
+                    diagnostics,
+                    "semantic.deferred_yield_shape_type",
+                    &path,
+                    "intrinsic type expressions are not part of deferred-yield 0.1",
+                );
+                valid = false;
+            }
+        }
+    }
+    valid
+}
+
+fn deferred_yield_shape_at_location(
+    location: &CsmiDeferredYieldLocation,
+    roots: &HashMap<String, CsmiDeferredYieldShape>,
+    callable: &CsmiCallableShape,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> Option<CsmiDeferredYieldShape> {
+    let key = deferred_yield_root_key(&location.callable, &location.root);
+    let mut current = roots.get(&key)?.clone();
+    let Some(projection) = &location.projection else {
+        return Some(current);
+    };
+    for (index, step) in projection.steps.iter().enumerate() {
+        let step_path = format!("{path}.projection.steps[{index}]");
+        match step {
+            CsmiDeferredYieldProjectionStep::Entry { args } => {
+                let CsmiDeferredYieldShape::Keyed { key, value, .. } = current else {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_projection_shape",
+                        step_path,
+                        "entry projection requires a keyed shape",
+                    );
+                    return None;
+                };
+                if let CsmiDeferredYieldEntrySelector::Parameter { position } = args.key
+                    && position as usize >= callable.parameters.len()
+                {
+                    return None;
+                }
+                current = CsmiDeferredYieldShape::Product {
+                    components: vec![*key, *value],
+                };
+            }
+            CsmiDeferredYieldProjectionStep::EntryKey => {
+                let CsmiDeferredYieldShape::Product { components } = current else {
+                    return None;
+                };
+                if components.len() != 2 {
+                    return None;
+                }
+                current = components.into_iter().next().expect("two components");
+            }
+            CsmiDeferredYieldProjectionStep::EntryValue => {
+                let CsmiDeferredYieldShape::Product { components } = current else {
+                    return None;
+                };
+                if components.len() != 2 {
+                    return None;
+                }
+                current = components.into_iter().nth(1).expect("two components");
+            }
+        }
+    }
+    Some(current)
+}
+
+fn deferred_yield_shape_is_handle_type(shape: &CsmiDeferredYieldShape, handle_type: &str) -> bool {
+    matches!(
+        shape,
+        CsmiDeferredYieldShape::Value {
+            r#type: CsmiTypeExpression::Reference(reference)
+        } if reference.symbol == handle_type
+    )
+}
+
+fn validate_deferred_yield_location(
+    location: &CsmiDeferredYieldLocation,
+    expected_callable: &str,
+    phase: &str,
+    callable: &CsmiCallableShape,
+    roots: &HashMap<String, CsmiDeferredYieldShape>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = location.callable == expected_callable;
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_location_callable",
+            format!("{path}.callable"),
+            "location callable must match its linked endpoint",
+        );
+    }
+    let root_phase = match &location.root {
+        CsmiDeferredYieldBoundaryRoot::InputReceiver(_) => {
+            if phase != "input" || callable.receiver.is_none() {
+                valid = false;
+            }
+            Some("input")
+        }
+        CsmiDeferredYieldBoundaryRoot::InputParameter(root) => {
+            if phase != "input" || root.position as usize >= callable.parameters.len() {
+                valid = false;
+            }
+            Some("input")
+        }
+        CsmiDeferredYieldBoundaryRoot::OutputResult(root) => {
+            if phase != "output" || root.position as usize >= callable.results.len() {
+                valid = false;
+            }
+            Some("output")
+        }
+    };
+    if root_phase != Some(phase) {
+        valid = false;
+    }
+    let key = deferred_yield_root_key(&location.callable, &location.root);
+    let Some(root_shape) = roots.get(&key) else {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_missing_shape",
+            format!("{path}.root"),
+            "location root must have a shape declared by the payload",
+        );
+        return false;
+    };
+    if let Some(projection) = &location.projection
+        && !validate_deferred_yield_projection(
+            projection,
+            root_shape,
+            callable,
+            &format!("{path}.projection"),
+            diagnostics,
+        )
+    {
+        valid = false;
+    }
+    valid
+}
+
+fn validate_deferred_yield_projection(
+    projection: &CsmiDeferredYieldProjection,
+    root_shape: &CsmiDeferredYieldShape,
+    callable: &CsmiCallableShape,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let mut valid = projection.scheme == CSMI_DEFERRED_YIELD_PROFILE_ID
+        && projection.scheme_version == CSMI_DEFERRED_YIELD_PROFILE_VERSION
+        && !projection.steps.is_empty();
+    if !valid {
+        error(
+            diagnostics,
+            "semantic.deferred_yield_projection_identity",
+            path,
+            "projection must use the exact deferred-yield scheme and a non-empty step list",
+        );
+    }
+    let mut current = root_shape.clone();
+    let mut entry_open = false;
+    for (index, step) in projection.steps.iter().enumerate() {
+        let step_path = format!("{path}.steps[{index}]");
+        match step {
+            CsmiDeferredYieldProjectionStep::Entry { args } => {
+                let CsmiDeferredYieldShape::Keyed { key, value, .. } = &current else {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_projection_shape",
+                        &step_path,
+                        "entry projection requires a keyed shape",
+                    );
+                    valid = false;
+                    continue;
+                };
+                if let CsmiDeferredYieldEntrySelector::Parameter { position } = &args.key
+                    && *position as usize >= callable.parameters.len()
+                {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_projection_args",
+                        &step_path,
+                        "entry parameter selector is outside the callable shape",
+                    );
+                    valid = false;
+                }
+                current = CsmiDeferredYieldShape::Product {
+                    components: vec![(**key).clone(), (**value).clone()],
+                };
+                entry_open = true;
+            }
+            CsmiDeferredYieldProjectionStep::EntryKey
+            | CsmiDeferredYieldProjectionStep::EntryValue => {
+                if !entry_open
+                    || !matches!(&current, CsmiDeferredYieldShape::Product { components } if components.len() == 2)
+                {
+                    error(
+                        diagnostics,
+                        "semantic.deferred_yield_projection_shape",
+                        &step_path,
+                        "entry member projection requires a preceding entry projection",
+                    );
+                    valid = false;
+                    continue;
+                }
+                current = match (&current, step) {
+                    (
+                        CsmiDeferredYieldShape::Product { components },
+                        CsmiDeferredYieldProjectionStep::EntryKey,
+                    ) => components[0].clone(),
+                    (
+                        CsmiDeferredYieldShape::Product { components },
+                        CsmiDeferredYieldProjectionStep::EntryValue,
+                    ) => components[1].clone(),
+                    _ => unreachable!("entry projection shape checked above"),
+                };
+                entry_open = false;
+            }
+        }
+    }
+    valid
+}
+
+fn validate_deferred_yield_retention(
+    retention: &CsmiDeferredYieldRetention,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match retention {
+        CsmiDeferredYieldRetention::Mode(_) => true,
+        CsmiDeferredYieldRetention::Uncertain(uncertainty) => validate_profile_limitation(
+            &uncertainty.limitation,
+            &format!("{path}.limitation"),
+            diagnostics,
+        ),
+    }
+}
+
+fn validate_deferred_yield_validity(
+    validity: &CsmiDeferredYieldValidity,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match validity {
+        CsmiDeferredYieldValidity::Unknown { limitation }
+        | CsmiDeferredYieldValidity::Unsupported { limitation } => {
+            validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+        }
+        CsmiDeferredYieldValidity::SourceRetained { invalidation }
+        | CsmiDeferredYieldValidity::HandleRetained { invalidation }
+        | CsmiDeferredYieldValidity::Independent { invalidation } => {
+            validate_deferred_yield_invalidation(
+                invalidation,
+                &format!("{path}.invalidation"),
+                diagnostics,
+            )
+        }
+    }
+}
+
+fn validate_deferred_yield_invalidation(
+    invalidation: &CsmiDeferredYieldInvalidation,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match invalidation {
+        CsmiDeferredYieldInvalidation::Unknown { limitation }
+        | CsmiDeferredYieldInvalidation::Unsupported { limitation } => {
+            validate_profile_limitation(limitation, &format!("{path}.limitation"), diagnostics)
+        }
+        CsmiDeferredYieldInvalidation::SourceMutation { .. }
+        | CsmiDeferredYieldInvalidation::HandleDrop { .. }
+        | CsmiDeferredYieldInvalidation::NoneAsserted => true,
+    }
+}
+
+fn validate_deferred_yield_delivery(
+    delivery: &CsmiDeferredYieldDelivery,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    match delivery {
+        CsmiDeferredYieldDelivery::Mode(_) => true,
+        CsmiDeferredYieldDelivery::Uncertain(uncertainty) => validate_profile_limitation(
+            &uncertainty.limitation,
+            &format!("{path}.limitation"),
+            diagnostics,
+        ),
+    }
+}
+
+fn deferred_yield_payload_uncertain(payload: &CsmiDeferredYieldPayload) -> bool {
+    let retention_unknown = matches!(
+        &payload.construction.retention,
+        CsmiDeferredYieldRetention::Uncertain(_)
+    );
+    let validity_unknown = matches!(
+        &payload.construction.validity,
+        CsmiDeferredYieldValidity::Unknown { .. } | CsmiDeferredYieldValidity::Unsupported { .. }
+    );
+    let invalidation_unknown = match &payload.construction.validity {
+        CsmiDeferredYieldValidity::SourceRetained { invalidation }
+        | CsmiDeferredYieldValidity::HandleRetained { invalidation }
+        | CsmiDeferredYieldValidity::Independent { invalidation } => matches!(
+            invalidation,
+            CsmiDeferredYieldInvalidation::Unknown { .. }
+                | CsmiDeferredYieldInvalidation::Unsupported { .. }
+        ),
+        CsmiDeferredYieldValidity::Unknown { .. }
+        | CsmiDeferredYieldValidity::Unsupported { .. } => false,
+    };
+    retention_unknown
+        || validity_unknown
+        || invalidation_unknown
+        || payload
+            .receiver_substitution
+            .as_ref()
+            .is_some_and(|substitution| {
+                matches!(
+                    substitution,
+                    CsmiDeferredYieldSubstitution::Unknown { .. }
+                        | CsmiDeferredYieldSubstitution::Unsupported { .. }
+                )
+            })
+        || payload
+            .yield_contract
+            .members
+            .iter()
+            .any(|member| matches!(&member.delivery, CsmiDeferredYieldDelivery::Uncertain(_)))
+        || payload
+            .roots
+            .iter()
+            .any(|root| deferred_yield_shape_uncertain(&root.shape))
+}
+
+fn deferred_yield_shape_uncertain(shape: &CsmiDeferredYieldShape) -> bool {
+    let mut shapes = vec![shape];
+    let mut types = Vec::new();
+    while let Some(shape) = shapes.pop() {
+        match shape {
+            CsmiDeferredYieldShape::Unknown { .. } => return true,
+            CsmiDeferredYieldShape::Value { r#type } => types.push(r#type),
+            CsmiDeferredYieldShape::Product { components } => shapes.extend(components),
+            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
+                shapes.push(key);
+                shapes.push(value);
+            }
+        }
+    }
+    while let Some(ty) = types.pop() {
+        match ty {
+            CsmiTypeExpression::Unknown(_) => return true,
+            CsmiTypeExpression::Reference(reference) => types.extend(&reference.arguments),
+            CsmiTypeExpression::Parameter(_) | CsmiTypeExpression::Intrinsic(_) => {}
+        }
+    }
+    false
+}
+
+fn deferred_yield_scope_shape(
+    scope: &Value,
+    symbols: &HashSet<String>,
+    declaration_categories: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    deferred_yield_scope(scope, symbols, declaration_categories, path, diagnostics).is_some()
 }
 
 fn validate_collection_flow_semantics(
@@ -2922,35 +4273,14 @@ fn validate_collection_flow_receiver_substitution(
                 );
                 return false;
             };
-            let mut valid = receiver_reference.symbol == *declaration;
-            let parameters = &declaration_record.generic_parameters;
-            if receiver_reference.arguments.len() != parameters.len() {
-                error(
-                    diagnostics,
+            receiver_reference.symbol == *declaration
+                && validate_receiver_generic_arguments(
+                    receiver_reference,
+                    declaration_record,
                     "semantic.collection_flow_receiver_arguments",
-                    format!("{path}.declaration"),
-                    "receiver type arguments must cover every declaration generic parameter",
-                );
-                valid = false;
-            }
-            for (index, parameter) in parameters.iter().enumerate() {
-                if parameter.position != index as u32
-                    || !matches!(
-                        receiver_reference.arguments.get(index),
-                        Some(CsmiTypeExpression::Parameter(argument))
-                            if argument.symbol == parameter.symbol
-                    )
-                {
-                    error(
-                        diagnostics,
-                        "semantic.collection_flow_receiver_arguments",
-                        format!("{path}.declaration"),
-                        "receiver generic arguments must preserve declaration order",
-                    );
-                    valid = false;
-                }
-            }
-            valid
+                    &format!("{path}.declaration"),
+                    diagnostics,
+                )
         }
     }
 }
@@ -4627,7 +5957,11 @@ fn require_id<T: std::borrow::Borrow<str>>(
 }
 
 fn canonical_scope(value: &Value) -> String {
-    serde_json::to_string(value).expect("JSON values are serializable")
+    // Scope equality ignores object insertion order, including when another
+    // workspace crate enables serde_json's preserve_order feature.
+    let mut value = value.clone();
+    value.sort_all_objects();
+    serde_json::to_string(&value).expect("JSON values are serializable")
 }
 
 fn error(
@@ -4670,4 +6004,32 @@ fn sort_diagnostics(diagnostics: &mut Vec<CsmiDiagnostic>) {
         (&left.path, &left.code, &left.message).cmp(&(&right.path, &right.code, &right.message))
     });
     diagnostics.dedup();
+}
+
+#[cfg(test)]
+mod scope_key_tests {
+    use super::canonical_scope;
+    use serde_json::Value;
+
+    #[test]
+    fn scope_keys_ignore_nested_object_order_but_preserve_array_order() {
+        let left: Value = serde_json::from_str(
+            r#"{"kind":"yield","items":[{"factory":"f","resume":"r"},"next"]}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"items":[{"resume":"r","factory":"f"},"next"],"kind":"yield"}"#,
+        )
+        .unwrap();
+        assert_eq!(left, reordered);
+        assert_eq!(canonical_scope(&left), canonical_scope(&reordered));
+
+        let mut different = reordered.clone();
+        different["items"].as_array_mut().unwrap().reverse();
+        assert_ne!(left, different);
+        assert_ne!(canonical_scope(&left), canonical_scope(&different));
+        different = reordered;
+        different["items"][0]["resume"] = Value::String("other".to_owned());
+        assert_ne!(canonical_scope(&left), canonical_scope(&different));
+    }
 }

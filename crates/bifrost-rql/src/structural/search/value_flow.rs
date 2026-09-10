@@ -6,10 +6,9 @@ use super::witness_projection::{
 };
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty, CodeQueryFlowCompletion,
-    CodeQueryFlowDeclarationSegment, CodeQueryFlowEndpoint, CodeQueryFlowEvent,
-    CodeQueryFlowFactSymbol, CodeQueryFlowMustStatus, CodeQueryFlowPortSymbol,
-    CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol, CodeQueryFlowSolverTermination,
+    CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty, CodeQueryFlowDeclarationSegment,
+    CodeQueryFlowEndpoint, CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryFlowPortSymbol,
+    CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol, CodeQueryFlowStatus,
     CodeQueryFlowSymbolSite, CodeQueryFlowWitness, CodeQueryFlowWitnessStep,
     CodeQueryFlowWitnessStepKind, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
     CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryValueFlowLimits, CodeQueryValueFlowWork,
@@ -241,8 +240,7 @@ impl ValueFlowQueryState {
         max_endpoints: usize,
     ) -> Vec<SemanticFlowEndpointValue> {
         let semantic_status = analysis_semantic_status(&analysis);
-        let completion = public_completion(semantic_status, &analysis.result);
-        let solver_termination = public_termination(analysis.result.result().termination());
+        let (status, reason) = public_status(semantic_status, &analysis.result);
         let ambiguous = analysis.plan.has_ambiguous_dispatch()
             || matches!(
                 analysis.plan.discovery_status(),
@@ -306,11 +304,9 @@ impl ValueFlowQueryState {
                                     ValueFlowMayStatus::Proven => CodeQueryFlowCertainty::Exact,
                                     ValueFlowMayStatus::Unproven => CodeQueryFlowCertainty::May,
                                 }),
-                                must: CodeQueryFlowMustStatus::NotEstablished,
                                 ambiguous,
-                                completion,
-                                semantic_status: semantic_status.label(),
-                                solver_termination,
+                                status,
+                                reason: reason.clone(),
                                 path: locator.path().as_str().to_string(),
                                 language: locator.language().config_label(),
                                 range: locator_range(workspace, locator),
@@ -341,11 +337,9 @@ impl ValueFlowQueryState {
                             sink: sink_public,
                             reachability,
                             certainty: None,
-                            must: CodeQueryFlowMustStatus::NotEstablished,
                             ambiguous,
-                            completion,
-                            semantic_status: semantic_status.label(),
-                            solver_termination,
+                            status,
+                            reason: reason.clone(),
                             path: locator.path().as_str().to_string(),
                             language: locator.language().config_label(),
                             range: locator_range(workspace, locator),
@@ -470,10 +464,10 @@ impl ValueFlowQueryState {
                 .witness_bytes
                 .saturating_add(saturating_u64(retained_bytes));
             let id = witness_id(&endpoint.public.id, witness_index, quality);
-            let mut public_quality = public_path_quality(quality);
+            let mut public_evidence = public_path_quality(quality);
             if truncated {
-                public_quality.completeness = CodeQuerySemanticCompleteness::Partial;
-                public_quality.completeness_reason = Some(if removed_steps > 0 {
+                public_evidence.completeness = CodeQuerySemanticCompleteness::Partial;
+                public_evidence.reason = Some(if removed_steps > 0 {
                     format!("query witness limits omitted at least {removed_steps} step(s)")
                 } else if witness.retention_truncated() {
                     "retained witness evidence was exhausted during the solver run".to_string()
@@ -493,7 +487,7 @@ impl ValueFlowQueryState {
                     path: endpoint.public.path.clone(),
                     language: endpoint.public.language,
                     range: endpoint.public.range,
-                    quality: public_quality,
+                    evidence: public_evidence,
                     steps,
                     retained_bytes,
                     truncated,
@@ -610,6 +604,7 @@ impl ValueFlowQueryState {
             branch: Vec::new(),
             language: "workspace",
             message,
+            exhausted_roots: Vec::new(),
         });
     }
 
@@ -684,33 +679,113 @@ fn analysis_semantic_status(analysis: &ValueFlowAnalysisResult) -> SemanticInput
     )
 }
 
-fn public_completion(
+fn public_status(
     semantic_status: SemanticInputStatus,
     result: &ValueFlowSummaryResult,
-) -> CodeQueryFlowCompletion {
-    if result.is_complete() && matches!(semantic_status, SemanticInputStatus::Complete) {
-        return CodeQueryFlowCompletion::Complete;
+) -> (CodeQueryFlowStatus, Option<String>) {
+    let semantic = public_semantic_status(semantic_status, result.is_complete());
+    let solver = match result.result().termination() {
+        SolverTermination::FixedPoint => PublicSolverOutcome::FixedPoint,
+        SolverTermination::Cancelled => PublicSolverOutcome::Cancelled,
+        SolverTermination::ExceededBudget(exceeded) => {
+            PublicSolverOutcome::BudgetExhausted(exceeded.to_string())
+        }
+    };
+    apply_solver_outcome(semantic, solver)
+}
+
+fn public_semantic_status(
+    semantic_status: SemanticInputStatus,
+    result_complete: bool,
+) -> (CodeQueryFlowStatus, Option<String>) {
+    if result_complete && matches!(semantic_status, SemanticInputStatus::Complete) {
+        return (CodeQueryFlowStatus::Complete, None);
     }
-    match result.result().termination() {
-        SolverTermination::Cancelled => CodeQueryFlowCompletion::Cancelled,
-        SolverTermination::ExceededBudget(_) => CodeQueryFlowCompletion::BudgetExhausted,
-        SolverTermination::FixedPoint => match semantic_status {
-            SemanticInputStatus::Cancelled => CodeQueryFlowCompletion::Cancelled,
-            SemanticInputStatus::ExceededBudget { .. } => CodeQueryFlowCompletion::BudgetExhausted,
-            SemanticInputStatus::Unsupported { .. } => CodeQueryFlowCompletion::Unsupported,
-            SemanticInputStatus::Complete
-            | SemanticInputStatus::Ambiguous
-            | SemanticInputStatus::Unknown
-            | SemanticInputStatus::Unproven => CodeQueryFlowCompletion::Incomplete,
-        },
+    match semantic_status {
+        SemanticInputStatus::Complete => (
+            CodeQueryFlowStatus::Partial,
+            Some("value-flow analysis retained incomplete semantic evidence".to_owned()),
+        ),
+        SemanticInputStatus::Ambiguous => (
+            CodeQueryFlowStatus::Ambiguous,
+            Some("semantic input retained ambiguous alternatives".to_owned()),
+        ),
+        SemanticInputStatus::Unknown => (
+            CodeQueryFlowStatus::Unknown,
+            Some("semantic input could not establish the requested relation".to_owned()),
+        ),
+        SemanticInputStatus::Unproven => (
+            CodeQueryFlowStatus::Unproven,
+            Some("semantic input retained an unproven relation".to_owned()),
+        ),
+        SemanticInputStatus::Unsupported { capability } => (
+            CodeQueryFlowStatus::Unsupported,
+            Some(format!(
+                "semantic capability `{}` is unsupported",
+                capability.label()
+            )),
+        ),
+        SemanticInputStatus::ExceededBudget { exceeded } => (
+            CodeQueryFlowStatus::SemanticBudgetExhausted,
+            Some(exceeded.to_string()),
+        ),
+        SemanticInputStatus::Cancelled => (
+            CodeQueryFlowStatus::SemanticCancelled,
+            Some("semantic input construction was cancelled".to_owned()),
+        ),
     }
 }
 
-fn public_termination(termination: SolverTermination) -> CodeQueryFlowSolverTermination {
-    match termination {
-        SolverTermination::FixedPoint => CodeQueryFlowSolverTermination::FixedPoint,
-        SolverTermination::Cancelled => CodeQueryFlowSolverTermination::Cancelled,
-        SolverTermination::ExceededBudget(_) => CodeQueryFlowSolverTermination::BudgetExhausted,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicSolverOutcome {
+    FixedPoint,
+    BudgetExhausted(String),
+    Cancelled,
+}
+
+fn apply_solver_outcome(
+    semantic: (CodeQueryFlowStatus, Option<String>),
+    solver: PublicSolverOutcome,
+) -> (CodeQueryFlowStatus, Option<String>) {
+    let (semantic_status, semantic_reason) = semantic;
+    match solver {
+        PublicSolverOutcome::FixedPoint => (semantic_status, semantic_reason),
+        PublicSolverOutcome::BudgetExhausted(solver_reason) => (
+            CodeQueryFlowStatus::SolverBudgetExhausted,
+            Some(combine_solver_and_semantic_reason(
+                solver_reason,
+                semantic_status,
+                semantic_reason,
+            )),
+        ),
+        PublicSolverOutcome::Cancelled => (
+            CodeQueryFlowStatus::SolverCancelled,
+            Some(combine_solver_and_semantic_reason(
+                "value-flow solver was cancelled".to_owned(),
+                semantic_status,
+                semantic_reason,
+            )),
+        ),
+    }
+}
+
+fn combine_solver_and_semantic_reason(
+    solver_reason: String,
+    semantic_status: CodeQueryFlowStatus,
+    semantic_reason: Option<String>,
+) -> String {
+    if semantic_status == CodeQueryFlowStatus::Complete {
+        return solver_reason;
+    }
+    match semantic_reason {
+        Some(semantic_reason) => format!(
+            "{solver_reason}; semantic status {}: {semantic_reason}",
+            semantic_status.label()
+        ),
+        None => format!(
+            "{solver_reason}; semantic status {}",
+            semantic_status.label()
+        ),
     }
 }
 
@@ -1015,20 +1090,19 @@ fn witness_id(endpoint_id: &str, witness_index: usize, quality: PathQuality) -> 
 }
 
 fn public_path_quality(quality: PathQuality) -> CodeQuerySemanticEvidence {
-    CodeQuerySemanticEvidence {
-        proof: if quality.is_proven() {
+    CodeQuerySemanticEvidence::new(
+        if quality.is_proven() {
             CodeQuerySemanticProof::Proven
         } else {
             CodeQuerySemanticProof::Unproven
         },
-        proof_reason: None,
-        completeness: if quality.is_complete() {
+        if quality.is_complete() {
             CodeQuerySemanticCompleteness::Complete
         } else {
             CodeQuerySemanticCompleteness::Partial
         },
-        completeness_reason: None,
-    }
+        None,
+    )
 }
 
 pub(crate) fn public_witness_step(
@@ -1429,6 +1503,7 @@ mod tests {
         SemanticLanguage, SemanticRole, SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId,
         WorkspaceRelativePath,
     };
+    use std::collections::HashSet;
 
     fn test_locator(offset: u32, role: SemanticRole) -> SemanticLocator {
         let anchor = SourceAnchor::new(
@@ -1476,5 +1551,145 @@ mod tests {
         assert_ne!(parameter, local);
         assert_ne!(parameter, second);
         assert_ne!(unordinaled, max_ordinal);
+    }
+
+    #[test]
+    fn old_flow_outcome_triples_remain_distinguishable() {
+        struct Case {
+            old_triple: &'static str,
+            semantic: (CodeQueryFlowStatus, Option<String>),
+            solver: PublicSolverOutcome,
+            expected_status: CodeQueryFlowStatus,
+        }
+
+        let cases = [
+            Case {
+                old_triple: "complete/complete/fixed_point",
+                semantic: (CodeQueryFlowStatus::Complete, None),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Complete,
+            },
+            Case {
+                old_triple: "complete/incomplete/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::Partial,
+                    Some("incomplete semantic evidence".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Partial,
+            },
+            Case {
+                old_triple: "ambiguous/incomplete/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::Ambiguous,
+                    Some("ambiguous alternatives".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Ambiguous,
+            },
+            Case {
+                old_triple: "unknown/incomplete/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::Unknown,
+                    Some("unknown relation".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Unknown,
+            },
+            Case {
+                old_triple: "unproven/incomplete/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::Unproven,
+                    Some("unproven relation".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Unproven,
+            },
+            Case {
+                old_triple: "unsupported/unsupported/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::Unsupported,
+                    Some("unsupported capability".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::Unsupported,
+            },
+            Case {
+                old_triple: "exceeded_budget/budget_exhausted/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::SemanticBudgetExhausted,
+                    Some("semantic row budget exhausted".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::SemanticBudgetExhausted,
+            },
+            Case {
+                old_triple: "cancelled/cancelled/fixed_point",
+                semantic: (
+                    CodeQueryFlowStatus::SemanticCancelled,
+                    Some("semantic construction cancelled".to_owned()),
+                ),
+                solver: PublicSolverOutcome::FixedPoint,
+                expected_status: CodeQueryFlowStatus::SemanticCancelled,
+            },
+            Case {
+                old_triple: "complete/budget_exhausted/budget_exhausted",
+                semantic: (CodeQueryFlowStatus::Complete, None),
+                solver: PublicSolverOutcome::BudgetExhausted(
+                    "solver reached-state budget exhausted".to_owned(),
+                ),
+                expected_status: CodeQueryFlowStatus::SolverBudgetExhausted,
+            },
+            Case {
+                old_triple: "ambiguous/budget_exhausted/budget_exhausted",
+                semantic: (
+                    CodeQueryFlowStatus::Ambiguous,
+                    Some("ambiguous alternatives".to_owned()),
+                ),
+                solver: PublicSolverOutcome::BudgetExhausted(
+                    "solver reached-state budget exhausted".to_owned(),
+                ),
+                expected_status: CodeQueryFlowStatus::SolverBudgetExhausted,
+            },
+            Case {
+                old_triple: "complete/cancelled/cancelled",
+                semantic: (CodeQueryFlowStatus::Complete, None),
+                solver: PublicSolverOutcome::Cancelled,
+                expected_status: CodeQueryFlowStatus::SolverCancelled,
+            },
+            Case {
+                old_triple: "ambiguous/cancelled/cancelled",
+                semantic: (
+                    CodeQueryFlowStatus::Ambiguous,
+                    Some("ambiguous alternatives".to_owned()),
+                ),
+                solver: PublicSolverOutcome::Cancelled,
+                expected_status: CodeQueryFlowStatus::SolverCancelled,
+            },
+        ];
+
+        let mut mapped = HashSet::new();
+        for case in cases {
+            let outcome = apply_solver_outcome(case.semantic, case.solver);
+            assert_eq!(outcome.0, case.expected_status, "{}", case.old_triple);
+            assert_eq!(
+                serde_json::to_value(outcome.0).expect("flow status serializes"),
+                serde_json::Value::String(outcome.0.label().to_owned()),
+                "{} public label",
+                case.old_triple
+            );
+            assert!(
+                mapped.insert(outcome),
+                "{} collapsed onto an earlier public status/reason pair",
+                case.old_triple
+            );
+        }
+        assert!(
+            mapped.insert((
+                CodeQueryFlowStatus::QueryCancelled,
+                Some("query execution was cancelled".to_owned()),
+            )),
+            "complete/cancelled/fixed_point query-envelope outcome collapsed"
+        );
     }
 }

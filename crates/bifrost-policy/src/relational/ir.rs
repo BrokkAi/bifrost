@@ -265,6 +265,13 @@ pub enum IrPredicate {
         column: IrColumn,
         values: Vec<RowLiteral>,
     },
+    /// Membership in a resolver-produced set of stable declaration identities.
+    /// Unlike authored `in`, this set is bounded by the workspace declaration
+    /// inventory rather than the human-authored literal limit.
+    ResolvedIdentitySet {
+        column: IrColumn,
+        identities: Vec<String>,
+    },
 }
 
 impl IrPredicate {
@@ -275,7 +282,9 @@ impl IrPredicate {
     pub const fn column(&self) -> &IrColumn {
         match self {
             Self::Compare { left, .. } => left,
-            Self::IsNull { column, .. } | Self::InSet { column, .. } => column,
+            Self::IsNull { column, .. }
+            | Self::InSet { column, .. }
+            | Self::ResolvedIdentitySet { column, .. } => column,
         }
     }
 }
@@ -302,6 +311,13 @@ impl fmt::Display for IrPredicate {
                     write!(formatter, "{value}")?;
                 }
                 formatter.write_str("))")
+            }
+            Self::ResolvedIdentitySet { column, identities } => {
+                write!(
+                    formatter,
+                    "({column} in resolved-identities[{}])",
+                    identities.len()
+                )
             }
         }
     }

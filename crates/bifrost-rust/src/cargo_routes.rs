@@ -16,9 +16,9 @@ use crate::declarations::{
     rust_macro_invocation_arguments, rust_package_name, rust_unqualified_macro_invocation_name,
 };
 use crate::imports::{
-    rust_external_module_route, rust_external_module_segments, rust_item_has_attribute,
-    rust_item_visibility,
+    rust_external_module_route, rust_external_module_segments, rust_item_visibility,
 };
+use crate::syntax::{item_has_path_attribute, unwrap_attributes};
 
 // How many times one Cargo-route build has iterated the complete analyzed
 // file set (issue #1817).
@@ -1588,6 +1588,7 @@ fn collect_module_route_facts(
         // unchanged bytes produce byte-identical rows.
         let mut descend = Vec::new();
         for child in named_children {
+            let child = unwrap_attributes(child);
             if child.kind() == "macro_invocation" {
                 let Some(name) = rust_unqualified_macro_invocation_name(child, source) else {
                     continue;
@@ -1624,7 +1625,7 @@ fn collect_module_route_facts(
             let name = strip_raw_identifier_prefix(name);
             let inherits_macros = facts.scopes[scope].imports_macros;
             let imports_macros =
-                inherits_macros && rust_item_has_attribute(child, source, "macro_use");
+                inherits_macros && item_has_path_attribute(child, source, "macro_use");
             let path_attribute = rust_path_attribute_value(child, source);
             if let Some(body) = child.child_by_field_name("body") {
                 facts.scopes.push(RustModuleScopeFact {
@@ -1997,6 +1998,7 @@ fn collect_external_module_children(
         let mut named_children: Vec<_> = node.named_children(&mut cursor).collect();
         named_children.reverse();
         for child in named_children {
+            let child = unwrap_attributes(child);
             if child.kind() == "macro_invocation" {
                 let invocation_start = source_base_byte.saturating_add(child.start_byte());
                 let is_passthrough = rust_unqualified_macro_invocation_name(child, source)
@@ -2037,7 +2039,7 @@ fn collect_external_module_children(
             let name = strip_raw_identifier_prefix(name);
             if let Some(body) = child.child_by_field_name("body") {
                 let imports_macros = imports_macros_to_file_scope
-                    && rust_item_has_attribute(child, source, "macro_use");
+                    && item_has_path_attribute(child, source, "macro_use");
                 let inline_directory = match rust_path_attribute(child, source) {
                     Some(path) => {
                         let Some(relative) = workspace_relative_path(
@@ -2073,7 +2075,7 @@ fn collect_external_module_children(
                 let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
                     let imports_macros = imports_macros_to_file_scope
-                        && rust_item_has_attribute(child, source, "macro_use");
+                        && item_has_path_attribute(child, source, "macro_use");
                     children.push(RustExternalModuleChild {
                         file: candidate,
                         declaring_module: declaring_module.clone(),
@@ -2097,7 +2099,7 @@ fn collect_external_module_children(
                 let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
                     let imports_macros = imports_macros_to_file_scope
-                        && rust_item_has_attribute(child, source, "macro_use");
+                        && item_has_path_attribute(child, source, "macro_use");
                     children.push(RustExternalModuleChild {
                         file: candidate,
                         declaring_module: declaring_module.clone(),
@@ -2160,24 +2162,11 @@ fn rust_latest_visible_item_macro(
 /// puts a `string_literal` beside `feature`, so both fail the single-identifier
 /// check without inspecting any text beyond those two identifiers.
 ///
-/// Attributes attach to an item as preceding siblings in tree-sitter-rust, and
-/// comments may sit between them, so walk back over the contiguous run exactly
-/// as `declarations::rust_item_carries_test_attribute` does.
+/// Attributes are attached in the grammar's grouped `attributes` node, so read
+/// that explicit association instead of scanning an item's siblings.
 fn rust_declaration_is_bare_cfg_test_gated(module: Node<'_>, source: &str) -> bool {
-    let mut prev = module.prev_sibling();
-    while let Some(node) = prev {
-        match node.kind() {
-            "attribute_item" => {
-                if rust_attribute_is_bare_cfg_test(node, source) {
-                    return true;
-                }
-            }
-            "inner_attribute_item" | "line_comment" | "block_comment" => {}
-            _ => break,
-        }
-        prev = node.prev_sibling();
-    }
-    false
+    crate::syntax::outer_attributes(module)
+        .any(|attribute_item| rust_attribute_is_bare_cfg_test(attribute_item, source))
 }
 
 fn rust_attribute_is_bare_cfg_test(attribute_item: Node<'_>, source: &str) -> bool {
@@ -2223,11 +2212,7 @@ fn rust_macro_argument_items<'a>(arguments: Node<'_>, source: &'a str) -> Option
 /// `rust_module_scopes` / `rust_module_routes` rows carry: the attribute is a
 /// content fact, and turning it into a path is the reader's job.
 fn rust_path_attribute_value(module: Node<'_>, source: &str) -> Option<String> {
-    let mut sibling = module.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
+    for attribute_item in crate::syntax::outer_attributes(module) {
         let attribute = attribute_item.named_child(0)?;
         let path = attribute.named_child(0)?;
         let path = source.get(path.start_byte()..path.end_byte())?;
@@ -2235,7 +2220,6 @@ fn rust_path_attribute_value(module: Node<'_>, source: &str) -> Option<String> {
             let value = attribute.child_by_field_name("value")?;
             return rust_static_string_literal(value, source).filter(|path| !path.is_empty());
         }
-        sibling = attribute_item.prev_named_sibling();
     }
     None
 }
@@ -3664,6 +3648,7 @@ mod tests {
         let mut cursor = root.walk();
         let module = root
             .named_children(&mut cursor)
+            .map(unwrap_attributes)
             .find(|child| child.kind() == "mod_item")
             .expect("fixture declares a module");
         rust_declaration_is_bare_cfg_test_gated(module, source)
@@ -3683,7 +3668,7 @@ mod tests {
         );
         assert!(
             module_is_test_gated("#[cfg(test)]\n// the sibling test module\nmod tests;\n"),
-            "a comment between the attribute and the item does not break the run"
+            "comments do not participate in attribute attachment"
         );
 
         assert!(!module_is_test_gated("mod tests;\n"));

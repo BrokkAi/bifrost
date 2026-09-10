@@ -2281,6 +2281,7 @@ pub(crate) struct PreparedClassSetSummaries<'plan> {
     source_witnesses: HashMap<[u8; 32], Option<crate::value_flow::ValueFlowSourceId>>,
     used: HashMap<ClassSetRuntimeLookupKey, Arc<ClassSetProcedureSummary>>,
     maintenance: SummaryMaintenanceMetrics,
+    maintenance_solver_budget_exhaustion: Option<crate::dataflow::SolverBudgetExceeded>,
     profile: TypeFlowSummaryProfile,
     retained_maintenance_writes: bool,
     retained_publication_writes: bool,
@@ -2744,6 +2745,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             source_witnesses,
             used: HashMap::default(),
             maintenance: SummaryMaintenanceMetrics::default(),
+            maintenance_solver_budget_exhaustion: None,
             profile,
             retained_maintenance_writes: false,
             retained_publication_writes: retained_semantic_publication,
@@ -3140,6 +3142,19 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         self.maintenance
     }
 
+    pub(crate) const fn maintenance_solver_budget_exhaustion(
+        &self,
+    ) -> Option<crate::dataflow::SolverBudgetExceeded> {
+        self.maintenance_solver_budget_exhaustion
+    }
+
+    fn retain_maintenance_termination(&mut self, termination: SolverTermination) {
+        if let Some(exceeded) = termination.budget_exceeded() {
+            self.maintenance_solver_budget_exhaustion
+                .get_or_insert(exceeded);
+        }
+    }
+
     pub(crate) const fn profile(&self) -> TypeFlowSummaryProfile {
         self.profile
     }
@@ -3197,6 +3212,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     where
         Provider: IcfgProvider + ?Sized,
     {
+        self.maintenance_solver_budget_exhaustion = None;
         #[derive(Clone)]
         struct DemandNode {
             procedure: ProcedureHandle,
@@ -3265,14 +3281,12 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             }
             let parent_rank = nodes[cursor].publication_rank;
             let dependency_count = rows[cursor].dependencies.len();
-            if request
-                .reserve(SolverWork {
-                    summary_applications: 1,
-                    flow_evaluations: dependency_count,
-                    ..SolverWork::default()
-                })
-                .is_some()
-            {
+            if let Some(termination) = request.reserve(SolverWork {
+                summary_applications: 1,
+                flow_evaluations: dependency_count,
+                ..SolverWork::default()
+            }) {
+                self.retain_maintenance_termination(termination);
                 return false;
             }
             let dependencies = rows[cursor].dependencies.clone();
@@ -3305,7 +3319,11 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     request,
                 ) {
                     Ok(Some(entry)) => entry,
-                    Ok(None) | Err(_) => return false,
+                    Ok(None) => return false,
+                    Err(termination) => {
+                        self.retain_maintenance_termination(termination);
+                        return false;
+                    }
                 };
                 let old_lookup = StableDigest::from_array(dependency.consumed_child_lookup_digest);
                 let old_row = match store.class_set_summary_for_digest(*old_lookup.as_bytes()) {
@@ -3404,7 +3422,10 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                                     request,
                                 ) {
                                     Ok(live) => live,
-                                    Err(_) => return false,
+                                    Err(termination) => {
+                                        self.retain_maintenance_termination(termination);
+                                        return false;
+                                    }
                                 };
                                 (dependencies_live
                                     && current_dependencies_match_stabilized(
@@ -3471,6 +3492,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                     Ok(result) => result,
                     Err(_) => return false,
                 };
+                self.retain_maintenance_termination(result.result().termination());
                 let metrics = result.result().metrics();
                 self.maintenance.hits = self
                     .maintenance
@@ -3542,14 +3564,14 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             // lookups. Charge the full returned fanout before intersecting it
             // in memory. A future store-side demanded-lookup filter can make
             // the SQL read itself demand-bounded without a schema change.
-            if request.cancellation.is_cancelled()
-                || request
-                    .reserve(SolverWork {
-                        flow_evaluations: reverse.len(),
-                        ..SolverWork::default()
-                    })
-                    .is_some()
-            {
+            if request.cancellation.is_cancelled() {
+                return false;
+            }
+            if let Some(termination) = request.reserve(SolverWork {
+                flow_evaluations: reverse.len(),
+                ..SolverWork::default()
+            }) {
+                self.retain_maintenance_termination(termination);
                 return false;
             }
             let reverse = reverse
@@ -6779,8 +6801,17 @@ mod tests {
         // Use a distinct workspace so the calibration solve cannot publish a
         // summary that changes the work shape of the bounded solve.
         let (_project, workspace, field_slots, procedures) = runtime_fixture(source);
-        let mut feedback_semantic_budget = SemanticBudget::default();
-        let mut feedback_solver_budget = SolverBudget::new(one_pass_solver_budget.used());
+        // Solver attempts have independent ledgers (#3194), so the outer
+        // solver budget no longer accumulates their work. Semantic work is
+        // still shared across feedback passes: admit the measured first pass
+        // and force the later refinement to stop on that shared budget.
+        let mut feedback_semantic_budget = SemanticBudget::new(
+            one_pass_semantic_budget
+                .used()
+                .component_max(SemanticWork::uniform(1)),
+        )
+        .expect("positive limits for every semantic dimension");
+        let mut feedback_solver_budget = SolverBudget::default();
         let fallback = solve_runtime_root_with_budgets(
             &workspace,
             &field_slots,
@@ -6795,7 +6826,7 @@ mod tests {
         assert!(
             fallback.complete,
             "feedback returns the earlier complete result after the refinement stops; one-pass work={:?}; fallback={fallback:#?}",
-            one_pass_solver_budget.used(),
+            one_pass_semantic_budget.used(),
         );
         assert_eq!(result_site_shape(&fallback), result_site_shape(&one_pass));
         assert_eq!(
@@ -9111,6 +9142,15 @@ mod tests {
         );
         assert_eq!(limited_solver_budget.used().summary_applications, 1);
         assert!(limited_solver_budget.used().flow_evaluations > 0);
+        let exhaustion = limited
+            .maintenance_solver_budget_exhaustion()
+            .expect("the refused maintenance charge remains typed");
+        assert_eq!(
+            exhaustion.dimension(),
+            crate::dataflow::SolverBudgetDimension::SummaryApplications
+        );
+        assert_eq!(exhaustion.limit(), 1);
+        assert_eq!(exhaustion.attempted(), 2);
 
         let mut prepared = PreparedClassSetSummaries::new(
             TypeFlowSummaryState::default(),

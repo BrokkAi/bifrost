@@ -480,11 +480,9 @@ impl TaintFindingAnchor {
         sink_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
         source_scenario_set_hash: SourceScenarioSetHash,
     ) -> Result<Self, FutureEvidenceError> {
-        if !matches!(
-            sink_identity.derivation(),
-            StableIdentityDerivation::AnalyzerDeclarationId
-                | StableIdentityDerivation::CanonicalAstIdentity
-        ) {
+        if sink_identity.declaration_id().is_none()
+            && sink_identity.derivation() != Some(StableIdentityDerivation::CanonicalAstIdentity)
+        {
             return Err(FutureEvidenceError::InvalidStrongIdentityDerivation {
                 field: "taint_sink_identity",
             });
@@ -1247,7 +1245,7 @@ impl TypestatePolicyProjectionFacts {
             });
         }
         if let Some(site) = &self.violation_site
-            && site.derivation() != StableIdentityDerivation::ProtocolViolationSite
+            && site.derivation() != Some(StableIdentityDerivation::ProtocolViolationSite)
         {
             return Err(FutureEvidenceError::InvalidStrongIdentityDerivation {
                 field: "typestate_violation_site",
@@ -1436,12 +1434,14 @@ impl TypestateFindingAnchor {
         scenario_set_hash: TypestateScenarioSetHash,
         violation: &TypestateViolationEvidence,
     ) -> Result<Self, FutureEvidenceError> {
-        if subject_identity.derivation() != StableIdentityDerivation::ProtocolSubject {
+        if subject_identity.derivation() != Some(StableIdentityDerivation::ProtocolSubject) {
             return Err(FutureEvidenceError::InvalidStrongIdentityDerivation {
                 field: "typestate_subject_identity",
             });
         }
-        if violation_site_identity.derivation() != StableIdentityDerivation::ProtocolViolationSite {
+        if violation_site_identity.derivation()
+            != Some(StableIdentityDerivation::ProtocolViolationSite)
+        {
             return Err(FutureEvidenceError::InvalidStrongIdentityDerivation {
                 field: "typestate_violation_site_identity",
             });
@@ -1652,7 +1652,7 @@ impl TypestateFindingEvidence {
             });
         }
         if let Some(site) = &violation_site
-            && site.derivation() != StableIdentityDerivation::ProtocolViolationSite
+            && site.derivation() != Some(StableIdentityDerivation::ProtocolViolationSite)
         {
             return Err(FutureEvidenceError::InvalidStrongIdentityDerivation {
                 field: "typestate_violation_site",
@@ -2224,8 +2224,26 @@ pub(crate) fn typestate_vulnerability_digest(anchor: &TypestateFindingAnchor) ->
 fn update_finding_stable_identity(hasher: &mut Sha256, identity: &StableSemanticIdentity) {
     update_finding_value(hasher, identity.namespace().as_bytes());
     update_finding_value(hasher, identity.path().as_str().as_bytes());
-    update_finding_value(hasher, identity.derivation().as_str().as_bytes());
-    update_finding_value(hasher, identity.semantic_key().as_bytes());
+    if let Some(id) = identity.declaration_id() {
+        update_finding_value(hasher, b"declaration_id");
+        update_finding_value(hasher, id.as_bytes());
+    } else {
+        update_finding_value(
+            hasher,
+            identity
+                .derivation()
+                .expect("a derived stable identity has a derivation")
+                .as_str()
+                .as_bytes(),
+        );
+        update_finding_value(
+            hasher,
+            identity
+                .semantic_key()
+                .expect("a derived stable identity has a semantic key")
+                .as_bytes(),
+        );
+    }
 }
 
 fn update_finding_value(hasher: &mut Sha256, value: &[u8]) {
@@ -2330,11 +2348,25 @@ fn hash_optional_stable_identity(
 fn hash_stable_identity(hasher: &mut CanonicalHasher, identity: &StableSemanticIdentity) {
     hasher.field("semantic_namespace", identity.namespace().as_bytes());
     hasher.field("semantic_path", identity.path().as_str().as_bytes());
-    hasher.field(
-        "semantic_derivation",
-        identity.derivation().as_str().as_bytes(),
-    );
-    hasher.field("semantic_key", identity.semantic_key().as_bytes());
+    if let Some(id) = identity.declaration_id() {
+        hasher.field("declaration_id", id.as_bytes());
+    } else {
+        hasher.field(
+            "semantic_derivation",
+            identity
+                .derivation()
+                .expect("a derived stable identity has a derivation")
+                .as_str()
+                .as_bytes(),
+        );
+        hasher.field(
+            "semantic_key",
+            identity
+                .semantic_key()
+                .expect("a derived stable identity has a semantic key")
+                .as_bytes(),
+        );
+    }
 }
 
 fn hash_taint_source_evidence(
@@ -2371,6 +2403,10 @@ fn hash_semantic_event(hasher: &mut CanonicalHasher, event: PolicySemanticEvent)
         }
         PolicySemanticEvent::ExceptionalProcedureExit { scope } => {
             hasher.field("semantic_event", b"exceptional_procedure_exit");
+            hasher.field("scope", typestate_exit_scope_label(scope).as_bytes());
+        }
+        PolicySemanticEvent::SuspensionBoundary { scope } => {
+            hasher.field("semantic_event", b"suspension_boundary");
             hasher.field("scope", typestate_exit_scope_label(scope).as_bytes());
         }
     }
@@ -2583,6 +2619,12 @@ impl Serialize for PolicySemanticEvent {
                 state.serialize_field("scope", &SerializableTypestateExitScope(*scope))?;
                 state.end()
             }
+            Self::SuspensionBoundary { scope } => {
+                let mut state = serializer.serialize_struct("PolicySemanticEvent", 2)?;
+                state.serialize_field("type", "suspension_boundary")?;
+                state.serialize_field("scope", &SerializableTypestateExitScope(*scope))?;
+                state.end()
+            }
         }
     }
 }
@@ -2699,6 +2741,7 @@ impl<'de> Deserialize<'de> for PolicySemanticEvent {
         enum Wire {
             NormalProcedureExit { scope: TypestateExitScopeWire },
             ExceptionalProcedureExit { scope: TypestateExitScopeWire },
+            SuspensionBoundary { scope: TypestateExitScopeWire },
         }
 
         Ok(match Wire::deserialize(deserializer)? {
@@ -2706,6 +2749,7 @@ impl<'de> Deserialize<'de> for PolicySemanticEvent {
             Wire::ExceptionalProcedureExit { scope } => {
                 Self::ExceptionalProcedureExit { scope: scope.0 }
             }
+            Wire::SuspensionBoundary { scope } => Self::SuspensionBoundary { scope: scope.0 },
         })
     }
 }
@@ -2880,13 +2924,6 @@ mod tests {
     fn stable_identity(derivation: StableIdentityDerivation, key: &str) -> StableSemanticIdentity {
         let path = WorkspaceRelativePath::new("src/app.rs").unwrap();
         match derivation {
-            StableIdentityDerivation::AnalyzerDeclarationId => {
-                StableSemanticIdentity::analyzer_declaration_id(
-                    "rust",
-                    path,
-                    format!("function:{key}"),
-                )
-            }
             StableIdentityDerivation::CanonicalAstIdentity => {
                 let semantic_key =
                     serde_json::to_string(&vec![("call_expression", Some(key))]).unwrap();
@@ -3504,6 +3541,36 @@ mod tests {
             .unwrap_err(),
             FutureEvidenceError::ObservedStateIsExpected
         );
+    }
+
+    #[test]
+    fn suspension_boundary_wire_round_trip_and_hash_are_distinct() {
+        let event = PolicySemanticEvent::SuspensionBoundary {
+            scope: TypestateExitScope::AnalysisRoot,
+        };
+        let wire = serde_json::to_value(event).expect("semantic event serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "suspension_boundary",
+                "scope": "analysis_root",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PolicySemanticEvent>(wire).expect("semantic event decodes"),
+            event
+        );
+
+        let mut suspension = CanonicalHasher::new(TYPESTATE_VIOLATION_DOMAIN);
+        hash_semantic_event(&mut suspension, event);
+        let mut normal = CanonicalHasher::new(TYPESTATE_VIOLATION_DOMAIN);
+        hash_semantic_event(
+            &mut normal,
+            PolicySemanticEvent::NormalProcedureExit {
+                scope: TypestateExitScope::AnalysisRoot,
+            },
+        );
+        assert_ne!(suspension.finish(), normal.finish());
     }
 
     #[test]

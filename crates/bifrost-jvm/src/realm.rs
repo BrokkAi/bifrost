@@ -38,6 +38,81 @@
 
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language};
 
+/// Whether a canonical JVM member target is selected through an instance or
+/// through its declaring type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JvmReceiverSemantics {
+    Instance,
+    Static,
+}
+
+/// Resolver-owned identity of an external JVM member.
+///
+/// The owner and member are accepted as already-canonical fields. This type
+/// deliberately does not parse a rendered locator or recover a terminal name:
+/// Java, Kotlin, and Scala can hand the same JVM identity across the workspace
+/// hierarchy seam without weakening the resolver's evidence.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JvmExternalMemberIdentity {
+    language: Language,
+    owner_fqn: Box<str>,
+    member: Box<str>,
+    arity: usize,
+    receiver: JvmReceiverSemantics,
+}
+
+impl JvmExternalMemberIdentity {
+    pub fn new(
+        language: Language,
+        owner_fqn: impl Into<Box<str>>,
+        member: impl Into<Box<str>>,
+        arity: usize,
+        receiver: JvmReceiverSemantics,
+    ) -> Self {
+        assert!(
+            matches!(
+                language,
+                Language::Java | Language::Kotlin | Language::Scala
+            ),
+            "external JVM member identity requires a JVM source language"
+        );
+        let owner_fqn = owner_fqn.into();
+        let member = member.into();
+        assert!(
+            !owner_fqn.is_empty(),
+            "external JVM owner must not be empty"
+        );
+        assert!(!member.is_empty(), "external JVM member must not be empty");
+        Self {
+            language,
+            owner_fqn,
+            member,
+            arity,
+            receiver,
+        }
+    }
+
+    pub const fn language(&self) -> Language {
+        self.language
+    }
+
+    pub fn owner_fqn(&self) -> &str {
+        &self.owner_fqn
+    }
+
+    pub fn member(&self) -> &str {
+        &self.member
+    }
+
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    pub const fn receiver(&self) -> JvmReceiverSemantics {
+        self.receiver
+    }
+}
+
 /// One JVM analyzer, seen as a member of a shared declaration universe.
 ///
 /// The supertrait is what makes a member useful beyond the lookup below: a

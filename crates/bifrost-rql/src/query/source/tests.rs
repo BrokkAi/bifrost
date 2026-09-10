@@ -2,14 +2,7 @@ use super::*;
 
 #[test]
 fn quiet_for_empty_and_incomplete_sources() {
-    for source in [
-        "",
-        "  ; comment",
-        "(call",
-        "(call :callee",
-        "\"unfinished",
-        "{\"match\":",
-    ] {
+    for source in ["", "  ; comment", "(call", "(call :callee", "\"unfinished"] {
         assert!(validate_query_source(source).is_empty(), "{source:?}");
     }
 }
@@ -25,95 +18,32 @@ fn reports_multiple_rql_errors_at_exact_ranges() {
 }
 
 #[test]
-fn reports_multiple_json_errors_at_key_and_value_ranges() {
-    let source = r#"{"oops": 1, "match": {"kind": "banana", "capture": 4}}"#;
-    let mut diagnostics = validate_query_source(source);
-    diagnostics.sort_by_key(|diagnostic| diagnostic.range.start);
-    assert_eq!(diagnostics.len(), 3);
-    assert_eq!(&source[diagnostics[0].range.clone()], "\"oops\"");
-    assert_eq!(&source[diagnostics[1].range.clone()], "\"banana\"");
-    assert_eq!(&source[diagnostics[2].range.clone()], "4");
-}
-
-#[test]
 fn reports_independent_semantic_errors_with_unknown_properties() {
-    for source in [
-        r#"(call :unknown 1 :name/regex "[")"#,
-        r#"{"unknown":1,"match":{"kind":"call","name":{"regex":"["}}}"#,
-    ] {
-        let diagnostics = validate_query_source(source);
-        assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "unknown-property")
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("invalid regex"))
-        );
-    }
+    let source = r#"(call :unknown 1 :name/regex "[")"#;
+    let diagnostics = validate_query_source(source);
+    assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unknown-property")
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("invalid regex"))
+    );
 }
 
 #[test]
 fn reports_role_compatibility_without_waiting_for_typed_lowering() {
-    for source in [
-        r#"(assignment :unknown 1 :callee (name "run"))"#,
-        r#"{"unknown":1,"match":{"kind":"assignment","callee":{"name":"run"}}}"#,
-    ] {
-        let diagnostics = validate_query_source(source);
-        assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("not valid for kind"))
-        );
-    }
-}
-
-#[test]
-fn text_predicate_requires_regex_object_in_json() {
-    let source = r#"{"match":{"text":"exact"}}"#;
-    let diagnostic = validate_query_source(source).pop().expect("diagnostic");
-    assert_eq!(diagnostic.code, "wrong-value-shape");
-    assert_eq!(&source[diagnostic.range], "\"exact\"");
-}
-
-#[test]
-fn malformed_json_range_is_byte_correct_after_utf8() {
-    let source = r#"{"λ": 1, ]"#;
-    let diagnostic = validate_query_source(source).pop().expect("diagnostic");
-    assert_eq!(diagnostic.code, "invalid-json");
-    assert_eq!(&source[diagnostic.range], "]");
-}
-
-#[test]
-fn json_schema_validation_uses_the_compatibility_registry() {
-    use brokk_bifrost_core::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
-
-    let registry = SchemaVersionRegistry::new(&[
-        SchemaVersionDescriptor::new(2, None, true),
-        SchemaVersionDescriptor::new(3, Some(2), true),
-    ])
-    .unwrap();
-    for source in [
-        r#"{"schema_version":2,"match":{"kind":"call"}}"#,
-        r#"{"match":{"kind":"call"}}"#,
-    ] {
-        let analysis = analyze_json_with_schema_registry(source, &registry);
-        assert!(
-            analysis.diagnostics.is_empty(),
-            "{:?}",
-            analysis.diagnostics
-        );
-    }
-
-    let source = r#"{"schema_version":1,"match":{"kind":"call"}}"#;
-    let analysis = analyze_json_with_schema_registry(source, &registry);
-    assert_eq!(analysis.diagnostics.len(), 1);
-    assert_eq!(analysis.diagnostics[0].code, "unsupported-schema-version");
-    assert_eq!(&source[analysis.diagnostics[0].range.clone()], "1");
+    let source = r#"(assignment :unknown 1 :callee (name "run"))"#;
+    let diagnostics = validate_query_source(source);
+    assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("not valid for kind"))
+    );
 }
 
 #[test]
@@ -123,21 +53,6 @@ fn incomplete_rql_keeps_help_for_completed_tokens() {
     let help = query_source_help_at(source, offset).expect("role help");
     assert_eq!(&source[help.range], ":callee");
     assert!(validate_query_source(source).is_empty());
-}
-
-#[test]
-fn incomplete_json_keeps_help_for_completed_keys() {
-    for (source, token) in [
-        (r#"{"match":"#, "match"),
-        (r#"{"match":{"kind":"#, "kind"),
-        (r#"{"match":{"kind":"call","callee":"#, "callee"),
-    ] {
-        let offset = source.find(token).unwrap();
-        let help = query_source_help_at(source, offset)
-            .unwrap_or_else(|| panic!("no help for {token} in {source}"));
-        assert_eq!(&source[help.range], format!("\"{token}\""));
-        assert!(validate_query_source(source).is_empty());
-    }
 }
 
 #[test]
@@ -160,61 +75,28 @@ fn source_and_diagnostic_budgets_are_bounded() {
 }
 
 #[test]
-fn plan_budgets_stop_json_and_rql_source_validation_early() {
-    let mut deep_json = serde_json::json!({ "match": 3 });
+fn plan_budgets_stop_rql_source_validation_early() {
     let mut deep_rql = "(banana)".to_string();
     for _ in 0..=MAX_QUERY_PLAN_DEPTH {
-        deep_json = serde_json::json!({
-            "union": [deep_json, { "match": { "kind": "call" } }]
-        });
         deep_rql = format!("(union {deep_rql} (call))");
     }
-    for source in [deep_json.to_string(), deep_rql] {
-        let diagnostics = validate_query_source(&source);
-        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
-        assert!(diagnostics[0].message.contains("plan depth"));
-    }
+    let source = deep_rql;
+    let diagnostics = validate_query_source(&source);
+    assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("plan depth"));
 
-    let json_groups = (0..4)
-        .map(|_| {
-            serde_json::json!({
-                "union": (0..16)
-                    .map(|_| serde_json::json!({ "match": { "kind": "call" } }))
-                    .collect::<Vec<_>>()
-            })
-        })
-        .collect::<Vec<_>>();
-    let wide_json = serde_json::json!({ "union": json_groups }).to_string();
     let rql_group = format!("(union {})", vec!["(call)"; 16].join(" "));
     let wide_rql = format!("(union {})", vec![rql_group; 4].join(" "));
-    for source in [wide_json, wide_rql] {
-        let diagnostics = validate_query_source(&source);
-        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
-        assert!(diagnostics[0].message.contains("at most 64 nodes"));
-    }
+    let source = wide_rql;
+    let diagnostics = validate_query_source(&source);
+    assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("at most 64 nodes"));
 }
 
 #[test]
-fn canonical_json_and_rql_execute_equivalently() {
-    let rql =
-        CodeQuery::from_source("(language rust (call :callee (name \"run\")))").expect("RQL query");
-    let json = CodeQuery::from_source(
-        r#"{"languages":["rust"],"match":{"kind":"call","callee":{"name":"run"}}}"#,
-    )
-    .expect("JSON query");
-    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
-}
-
-#[test]
-fn execution_mode_frontends_validate_with_exact_ranges_and_shared_help() {
+fn execution_mode_forms_validate_with_exact_ranges_and_shared_help() {
     let rql = "(profile (call))";
-    let json = r#"{"execution_mode":"profile","match":{"kind":"call"}}"#;
-    assert_eq!(
-        CodeQuery::from_source(rql).unwrap().to_canonical_json(),
-        CodeQuery::from_source(json).unwrap().to_canonical_json()
-    );
     assert!(validate_query_source(rql).is_empty());
-    assert!(validate_query_source(json).is_empty());
 
     let nested_rql = "(union (profile (call)) (call))";
     let diagnostic = validate_query_source(nested_rql)
@@ -223,13 +105,6 @@ fn execution_mode_frontends_validate_with_exact_ranges_and_shared_help() {
         .expect("nested RQL execution-mode diagnostic");
     assert_eq!(&nested_rql[diagnostic.range], "profile");
 
-    let nested_json = r#"{"union":[{"execution_mode":"profile","match":{"kind":"call"}},{"match":{"kind":"call"}}]}"#;
-    let diagnostic = validate_query_source(nested_json)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("root query"))
-        .expect("nested JSON execution-mode diagnostic");
-    assert_eq!(&nested_json[diagnostic.range], r#""execution_mode""#);
-
     let duplicated = "(profile (explain (call)))";
     let diagnostic = validate_query_source(duplicated)
         .into_iter()
@@ -237,46 +112,19 @@ fn execution_mode_frontends_validate_with_exact_ranges_and_shared_help() {
         .expect("mutually exclusive execution-mode diagnostic");
     assert_eq!(&duplicated[diagnostic.range], "profile");
 
-    let invalid_json = r#"{"execution_mode":"profil","match":{"kind":"call"}}"#;
-    let diagnostic = validate_query_source(invalid_json)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "invalid-execution-mode")
-        .expect("invalid execution mode diagnostic");
-    assert_eq!(&invalid_json[diagnostic.range.clone()], r#""profil""#);
-    assert_eq!(
-        diagnostic.fix,
-        Some(QuerySourceFix {
-            title: "Replace with `profile`".to_string(),
-            edit: QuerySourceEdit::Replace {
-                new_text: r#""profile""#.to_string(),
-            },
-        })
-    );
-
     let rql_help = query_source_help_at(rql, rql.find("profile").unwrap()).unwrap();
     assert_eq!(&rql[rql_help.range], "profile");
     assert!(rql_help.description.contains("operator timing"));
-    let value_offset = json.find("profile").unwrap();
-    let json_help = query_source_help_at(json, value_offset).unwrap();
-    assert_eq!(&json[json_help.range], r#""profile""#);
-    assert!(json_help.description.contains("operator-level"));
 }
 
 #[test]
-fn declaration_bounded_containment_has_shared_help_and_version_ranges() {
+fn declaration_bounded_containment_has_shared_help() {
     let rql = "(inside-decl (loop) (call :callee (name \"open\")))";
     assert!(validate_query_source(rql).is_empty());
     let help =
         query_source_help_at(rql, rql.find("inside-decl").unwrap()).expect("inside-decl help");
     assert_eq!(&rql[help.range], "inside-decl");
     assert!(help.description.contains("callable declaration"));
-
-    let json = r#"{"schema_version":4,"match":{"kind":"call"},"inside_decl":{"kind":"loop"}}"#;
-    let diagnostic = validate_query_source(json)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unsupported-schema-version")
-        .expect("version diagnostic");
-    assert_eq!(&json[diagnostic.range], "4");
 }
 
 #[test]
@@ -322,10 +170,6 @@ fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
     for (source, token) in [
         ("(boolean_literal :boolean-value true)", ":boolean-value"),
         ("(boolean_literal (boolean-value false))", "boolean-value"),
-        (
-            r#"{"match":{"kind":"boolean_literal","boolean_value":true}}"#,
-            r#""boolean_value""#,
-        ),
     ] {
         assert!(
             validate_query_source(source).is_empty(),
@@ -341,10 +185,6 @@ fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
     for (source, invalid) in [
         ("(boolean_literal :boolean-value 1)", "1"),
         ("(boolean_literal (boolean-value \"true\"))", r#""true""#),
-        (
-            r#"{"match":{"kind":"boolean_literal","boolean_value":"true"}}"#,
-            r#""true""#,
-        ),
     ] {
         let diagnostic = validate_query_source(source)
             .into_iter()
@@ -353,16 +193,12 @@ fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
         assert_eq!(&source[diagnostic.range], invalid);
     }
 
-    for source in [
-        "(boolean_literal :boolean-vlue true)",
-        r#"{"match":{"kind":"boolean_literal","boolean_vlue":true}}"#,
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.message.contains("Did you mean"))
-            .unwrap_or_else(|| panic!("missing boolean_value suggestion for {source}"));
-        assert!(diagnostic.message.contains("boolean"));
-    }
+    let source = "(boolean_literal :boolean-vlue true)";
+    let diagnostic = validate_query_source(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("Did you mean"))
+        .unwrap_or_else(|| panic!("missing boolean_value suggestion for {source}"));
+    assert!(diagnostic.message.contains("boolean"));
 }
 
 /// `module` is spelled by both a normalized kind and a role (issue #2518),
@@ -403,13 +239,6 @@ fn module_kind_and_module_role_keep_separate_help_and_validation() {
         role_help.description
     );
 
-    let json_source = r#"{"match":{"kind":"module","name":"tests"}}"#;
-    assert!(
-        validate_query_source(json_source).is_empty(),
-        "{:#?}",
-        validate_query_source(json_source)
-    );
-
     // The role is not valid on a module pattern, so constraining it is a
     // query error rather than a silent narrowing.
     let invalid = r#"(module :module (name "fmt"))"#;
@@ -434,18 +263,8 @@ fn iteration_vocabulary_help_suggestions_and_validation_ranges_are_schema_driven
             "for-each loop iterates",
         ),
         (
-            r#"{"match":{"kind":"for_loop","iterable":{"kind":"identifier"}}}"#,
-            r#""iterable""#,
-            "for-each loop iterates",
-        ),
-        (
             "(collection_literal :elements [(string_literal)])",
             ":elements",
-            "elements of a collection literal",
-        ),
-        (
-            r#"{"match":{"kind":"collection_literal","elements":[{"kind":"string_literal"}]}}"#,
-            r#""elements""#,
             "elements of a collection literal",
         ),
     ] {
@@ -502,7 +321,7 @@ fn iteration_vocabulary_help_suggestions_and_validation_ranges_are_schema_driven
     for (source, needle) in [
         ("(for_loop :iterble (identifier))", "iterable"),
         (
-            r#"{"match":{"kind":"collection_literal","element":[{"kind":"string_literal"}]}}"#,
+            "(collection_literal :element [(string_literal)])",
             "elements",
         ),
     ] {
@@ -519,7 +338,7 @@ fn iteration_vocabulary_help_suggestions_and_validation_ranges_are_schema_driven
 }
 
 #[test]
-fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
+fn typed_pipeline_help_and_diagnostics_use_shared_schema() {
     let rql = "(file-of (enclosing-decl (call)))";
     for token in ["file-of", "enclosing-decl"] {
         let offset = rql.find(token).unwrap();
@@ -533,27 +352,10 @@ fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     assert!(file_of_help.description.contains("receiver analyses"));
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"schema_version":1,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
-    for token in ["steps", "op", "file_of"] {
-        let offset = json.find(token).unwrap();
-        let help =
-            query_source_help_at(json, offset).unwrap_or_else(|| panic!("no help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    let file_of_help = query_source_help_at(json, json.find("file_of").unwrap()).unwrap();
-    assert!(file_of_help.description.contains("reference sites"));
-    assert!(file_of_help.description.contains("receiver analyses"));
-    assert!(
-        crate::schema::QueryStepOp::FileOf
-            .signature()
-            .contains("reference_site")
-    );
-    assert!(validate_query_source(json).is_empty());
-
-    let invalid = r#"{"schema_version":1,"match":{"kind":"call"},"steps":[{"op":"imports_of"}]}"#;
+    let invalid = "(imports-of (call))";
     let diagnostic = validate_query_source(invalid).pop().expect("diagnostic");
     assert_eq!(diagnostic.code, "invalid-query");
-    assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
+    assert_eq!(&invalid[diagnostic.range], "imports-of");
     assert!(diagnostic.message.contains("requires file"));
 }
 
@@ -568,28 +370,12 @@ fn decorator_binding_identity_options_have_shared_help_and_validation() {
         assert!(!help.description.is_empty());
     }
 
-    let json = r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings","module":"@nestjs/common","imported_name":"Query"}]}"#;
-    assert!(validate_query_source(json).is_empty(), "{json:?}");
-    for token in ["module", "imported_name"] {
-        let help = query_source_help_at(json, json.find(token).unwrap())
-            .unwrap_or_else(|| panic!("no help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-
     let invalid_rql = r#"(decorator-bindings :module (wrong) (parameter))"#;
     let diagnostic = validate_query_source(invalid_rql)
         .into_iter()
         .find(|diagnostic| diagnostic.code == "wrong-value-shape")
         .expect("invalid module value should be diagnosed");
     assert_eq!(&invalid_rql[diagnostic.range], "(wrong)");
-
-    let invalid_json =
-        r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings","module":7}]}"#;
-    let diagnostic = validate_query_source(invalid_json)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
-        .expect("invalid module value should be diagnosed");
-    assert_eq!(&invalid_json[diagnostic.range], "7");
 }
 
 #[test]
@@ -603,18 +389,24 @@ fn hierarchy_step_help_and_option_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let invalid = r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":0}]}"#;
+    let invalid = "(supertypes :depth 0 (enclosing-decl (class)))";
     let diagnostics = validate_query_source(invalid);
     assert!(diagnostics.iter().any(|diagnostic| {
         &invalid[diagnostic.range.clone()] == "0" && diagnostic.message.contains("positive integer")
     }));
 
-    let conflicting = r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"supertypes","depth":2,"transitive":true}]}"#;
+    let conflicting = "(supertypes :depth 2 :transitive true (enclosing-decl (class)))";
     let diagnostics = validate_query_source(conflicting);
-    assert!(diagnostics.iter().any(|diagnostic| {
-        &conflicting[diagnostic.range.clone()] == "true"
-            && diagnostic.message.contains("mutually exclusive")
-    }));
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            &conflicting[diagnostic.range.clone()] == "(enclosing-decl (class))"
+                && diagnostic.code == "wrong-value-shape"
+                && diagnostic
+                    .message
+                    .contains(":depth count or :transitive true")
+        }),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]
@@ -635,22 +427,7 @@ fn typestate_step_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"test:lifecycle"},{"op":"witness","max_steps":8,"max_bytes":2048}]}"#;
-    for token in [
-        "typestate",
-        "protocol_ref",
-        "witness",
-        "max_steps",
-        "max_bytes",
-    ] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON typestate help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty());
-
-    let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"missing-separator"}]}"#;
+    let invalid_ref = "(typestate :protocol-ref \"missing-separator\" (procedure-of (function)))";
     let diagnostic = validate_query_source(invalid_ref)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("namespace:name"))
@@ -659,7 +436,7 @@ fn typestate_step_help_and_diagnostics_are_range_precise() {
 }
 
 /// Hover help and validation ranges for the flow-state vocabulary (#1480), in
-/// both frontends. Every option name and every constrained value is checked at
+/// RQL source. Every option name and every constrained value is checked at
 /// its own range, so an editor cannot underline the wrong token.
 #[test]
 fn flow_state_help_and_diagnostics_are_range_precise() {
@@ -689,22 +466,6 @@ fn flow_state_help_and_diagnostics_are_range_precise() {
         assert!(!help.description.is_empty());
         assert!(validate_query_source(&source).is_empty(), "{source}");
     }
-
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"state_events_of","event_class":["read"],"subject":["property"]},{"op":"flow_relations_of","flow_relation":["dominates"],"certainty":["may"]}]}"#;
-    for token in [
-        "state_events_of",
-        "event_class",
-        "subject",
-        "flow_relations_of",
-        "flow_relation",
-        "certainty",
-    ] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON flow-state help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty(), "{json}");
 }
 
 /// A constrained value outside the registry is reported on the value's own
@@ -737,16 +498,16 @@ fn flow_state_constrained_values_report_their_allowed_set() {
         .expect("unknown option diagnostic");
     assert_eq!(&rql[diagnostic.range.clone()], ":relation");
 
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"flow_relations_of","flow_relation":["adjacent"]}]}"#;
-    let diagnostic = validate_query_source(json)
+    let rql_source = "(flow-relations-of :relation [adjacent] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql_source)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("adjacent"))
-        .expect("JSON flow-relation diagnostic");
-    assert_eq!(&json[diagnostic.range.clone()], "\"adjacent\"");
+        .expect("RQL flow-relation diagnostic");
+    assert_eq!(&rql_source[diagnostic.range.clone()], "adjacent");
 }
 
 /// Hover help and validation ranges for the control-relation vocabulary
-/// (#2443), in both frontends. Every option name and every constrained value is
+/// (#2443), in RQL source. Every option name and every constrained value is
 /// checked at its own range, so an editor cannot underline the wrong token.
 #[test]
 fn control_relation_help_and_diagnostics_are_range_precise() {
@@ -760,19 +521,10 @@ fn control_relation_help_and_diagnostics_are_range_precise() {
         assert!(!help.description.is_empty());
     }
     assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"control_relations","control_relation":["in_loop"],"exit_partition":["normal_and_exceptional"]}]}"#;
-    for token in ["control_relations", "control_relation", "exit_partition"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON control-relation help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty(), "{json}");
 }
 
 /// Hover help and validation ranges for the guard step (#2443 slice 2), in
-/// both frontends. The step has no option axis, so one borrowed from a sibling
+/// RQL source. The step has no option axis, so one borrowed from a sibling
 /// step is reported on its own token rather than ignored.
 #[test]
 fn guard_help_and_diagnostics_are_range_precise() {
@@ -786,13 +538,6 @@ fn guard_help_and_diagnostics_are_range_precise() {
         help.description
     );
     assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let json =
-        r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"guards_of"}]}"#;
-    let offset = json.find("guards_of").unwrap();
-    let help = query_source_help_at(json, offset).expect("JSON guard help");
-    assert!(!help.description.is_empty());
-    assert!(validate_query_source(json).is_empty(), "{json}");
 
     let borrowed = "(guards-of :relation [dominates] (procedure-of (function)))";
     let diagnostic = validate_query_source(borrowed)
@@ -842,7 +587,7 @@ fn control_relation_constrained_values_report_their_allowed_set() {
 }
 
 /// Hover help and validation ranges for the three project-topology steps
-/// (#2448), in both frontends.
+/// (#2448), in RQL source.
 ///
 /// Each step name hovers at its own range with the description the step
 /// registry declares, and a well-formed chain reports nothing. The steps carry
@@ -871,15 +616,6 @@ fn topology_step_help_and_diagnostics_are_range_precise() {
     );
     assert!(validate_query_source(source_set).is_empty(), "{source_set}");
 
-    let json = r#"{"match":{"kind":"class"},"steps":[{"op":"file_of"},{"op":"target_of"},{"op":"topology_edges_of"}]}"#;
-    for token in ["target_of", "topology_edges_of"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON topology help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty(), "{json}");
-
     let borrowed = "(target-of :scope [compile] (file-of (class)))";
     let diagnostic = validate_query_source(borrowed)
         .into_iter()
@@ -889,7 +625,7 @@ fn topology_step_help_and_diagnostics_are_range_precise() {
 }
 
 /// Hover help and validation ranges for the bounded rewrite vocabulary
-/// (#1480), in both frontends.
+/// (#1480), in RQL source.
 #[test]
 fn rewrite_path_help_and_diagnostics_are_range_precise() {
     let rql =
@@ -902,15 +638,6 @@ fn rewrite_path_help_and_diagnostics_are_range_precise() {
         assert!(!help.description.is_empty());
     }
     assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"file_of"},{"op":"rewrite_paths_of","domain":["rust_import_alias"],"rewrite_outcome":["converged"]}]}"#;
-    for token in ["rewrite_paths_of", "domain", "rewrite_outcome"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON rewrite-path help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty(), "{json}");
 }
 
 /// A constrained value outside the registry is reported on the value's own
@@ -934,16 +661,16 @@ fn rewrite_path_constrained_values_report_their_allowed_set() {
         .expect("unknown option diagnostic");
     assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
 
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"file_of"},{"op":"rewrite_paths_of","domain":["ruby_require"]}]}"#;
-    let diagnostic = validate_query_source(json)
+    let rql_source = "(rewrite-paths-of :domain [ruby_require] (file-of (function)))";
+    let diagnostic = validate_query_source(rql_source)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("ruby_require"))
-        .expect("JSON rewrite-domain diagnostic");
-    assert_eq!(&json[diagnostic.range.clone()], "\"ruby_require\"");
+        .expect("RQL rewrite-domain diagnostic");
+    assert_eq!(&rql_source[diagnostic.range.clone()], "ruby_require");
 }
 
 /// Hover help and validation ranges for the class-set type-flow steps, in
-/// both frontends. Each form takes exactly one query and no option axis, so
+/// RQL source. Each form takes exactly one query and no option axis, so
 /// an extra argument or a borrowed option is reported rather than ignored.
 #[test]
 fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
@@ -954,17 +681,6 @@ fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
         assert_eq!(&rql[help.range], form);
         assert!(!help.description.is_empty());
         assert!(validate_query_source(&rql).is_empty(), "{rql}");
-    }
-
-    for op in ["class_set", "absent_member"] {
-        let json = format!(
-            r#"{{"match":{{"kind":"function"}},"steps":[{{"op":"procedure_of"}},{{"op":"{op}"}}]}}"#
-        );
-        let offset = json.find(op).unwrap();
-        let help =
-            query_source_help_at(&json, offset).unwrap_or_else(|| panic!("no JSON {op} help"));
-        assert!(!help.description.is_empty());
-        assert!(validate_query_source(&json).is_empty(), "{json}");
     }
 
     let rql = "(class-set (function) (function))";
@@ -983,14 +699,6 @@ fn class_set_and_absent_member_help_and_diagnostics_are_range_precise() {
         diagnostic.message.contains("absent-member"),
         "{diagnostic:?}"
     );
-
-    let json =
-        r#"{"match":{"kind":"function"},"steps":[{"op":"class_set","plan_ref":"test:flow"}]}"#;
-    let diagnostic = validate_query_source(json)
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "unknown-property")
-        .expect("JSON class_set takes no option axis");
-    assert_eq!(&json[diagnostic.range.clone()], "\"plan_ref\"");
 }
 
 #[test]
@@ -1011,15 +719,6 @@ fn absent_member_witness_help_validation_and_status_domain_are_typed() {
         assert!(!help.description.is_empty());
     }
     assert!(validate_query_source(rql).is_empty(), "{rql}");
-
-    let json = r#"{"schema_version":1,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"absent_member"},{"op":"witness","max_steps":1,"max_bytes":256},{"op":"file_of"}]}"#;
-    assert!(validate_query_source(json).is_empty(), "{json}");
-    for token in ["absent_member", "witness", "file_of"] {
-        let offset = json.find(token).expect("JSON witness token");
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON witness help for {token}"));
-        assert!(!help.description.is_empty());
-    }
 
     let incompatible = "(witness (class-set (procedure-of (function))))";
     let diagnostic = validate_query_source(incompatible)
@@ -1057,16 +756,7 @@ fn value_flow_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"test:flow"},{"op":"witness","max_steps":8}]}"#;
-    for token in ["value_flow", "plan_ref", "witness", "max_steps"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON value-flow help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty());
-
-    let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"missing-separator"}]}"#;
+    let invalid_ref = "(value-flow :plan-ref \"missing-separator\" (procedure-of (function)))";
     let diagnostic = validate_query_source(invalid_ref)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("namespace:name"))
@@ -1086,16 +776,7 @@ fn taint_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"schema_version":1,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"test:flow"}]}"#;
-    for token in ["taint", "taint_ref"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON taint help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty());
-
-    let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"missing-separator"}]}"#;
+    let invalid_ref = "(taint :taint-ref \"missing-separator\" (procedure-of (function)))";
     let diagnostic = validate_query_source(invalid_ref)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("namespace:name"))
@@ -1115,15 +796,12 @@ fn set_composition_help_and_domain_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"union":[{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"}]},{"match":{"kind":"class"},"steps":[{"op":"file_of"}]}]}"#;
-    let diagnostic = validate_query_source(json)
+    let rql_source = "(union (enclosing-decl (class)) (file-of (class)))";
+    let diagnostic = validate_query_source(rql_source)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("first branch produces"))
         .expect("typed branch diagnostic");
-    assert_eq!(
-        &json[diagnostic.range],
-        r#"{"match":{"kind":"class"},"steps":[{"op":"file_of"}]}"#
-    );
+    assert_eq!(&rql_source[diagnostic.range], "(class)");
 
     let too_short = "(except (class))";
     let diagnostic = validate_query_source(too_short)
@@ -1134,35 +812,23 @@ fn set_composition_help_and_domain_diagnostics_are_range_precise() {
 }
 
 #[test]
-fn parameter_name_constraints_are_shared_by_json_and_rql_validation() {
+fn parameter_name_constraints_have_precise_ranges() {
     let oversized = "x".repeat(MAX_KWARG_NAME_LENGTH + 1);
     let rql = format!(
         "(call-input :parameter-name \"{oversized}\" (call-sites-to (enclosing-decl (method))))"
     );
-    let json = format!(
-        r#"{{"match":{{"kind":"method"}},"steps":[{{"op":"enclosing_decl"}},{{"op":"call_sites_to"}},{{"op":"call_input","parameter_name":"{oversized}"}}]}}"#
-    );
 
-    for (source, expected) in [
-        (rql.as_str(), format!("\"{oversized}\"")),
-        (json.as_str(), format!("\"{oversized}\"")),
-    ] {
-        let diagnostics = validate_query_source(source);
-        assert!(diagnostics.iter().any(|diagnostic| {
-            source[diagnostic.range.clone()] == expected
-                && diagnostic.message.contains("parameter name")
-        }));
-    }
+    let (source, expected) = (rql.as_str(), format!("\"{oversized}\""));
+    let diagnostics = validate_query_source(source);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        source[diagnostic.range.clone()] == expected
+            && diagnostic.message.contains("parameter name")
+    }));
 
-    for source in [
-        r#"(call-input :parameter-name "" (call-sites-to (enclosing-decl (method))))"#,
-        r#"{"match":{"kind":"method"},"steps":[{"op":"enclosing_decl"},{"op":"call_sites_to"},{"op":"call_input","parameter_name":""}]}"#,
-    ] {
-        assert!(validate_query_source(source).iter().any(|diagnostic| {
-            &source[diagnostic.range.clone()] == "\"\""
-                && diagnostic.message.contains("parameter name")
-        }));
-    }
+    let source = r#"(call-input :parameter-name "" (call-sites-to (enclosing-decl (method))))"#;
+    assert!(validate_query_source(source).iter().any(|diagnostic| {
+        &source[diagnostic.range.clone()] == "\"\"" && diagnostic.message.contains("parameter name")
+    }));
 }
 
 #[test]
@@ -1177,31 +843,22 @@ fn receiver_step_help_and_capture_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"match":{"kind":"call","receiver":{"capture":"service"}},"steps":[{"op":"points_to","capture":"service"}]}"#;
-    for token in ["points_to", "capture"] {
-        let offset = json.rfind(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON receiver traversal help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(validate_query_source(json).is_empty());
-
-    let missing = r#"{"match":{"kind":"call"},"steps":[{"op":"points_to","capture":"service"}]}"#;
+    let missing = r#"(points-to :capture "service" (call))"#;
     let diagnostic = validate_query_source(missing).pop().expect("diagnostic");
     assert_eq!(diagnostic.code, "invalid-query");
-    assert_eq!(&missing[diagnostic.range], r#""service""#);
+    assert_eq!(&missing[diagnostic.range], "points-to");
     assert!(
         diagnostic
             .message
             .contains("not declared by a positive pattern")
     );
 
-    let wrong_domain = r#"{"match":{"kind":"class","capture":"service"},"steps":[{"op":"enclosing_decl"},{"op":"references_of"},{"op":"points_to","capture":"service"}]}"#;
+    let wrong_domain = r#"(points-to :capture "service" (references-of (enclosing-decl (class :capture "service"))))"#;
     let diagnostic = validate_query_source(wrong_domain)
         .into_iter()
         .find(|diagnostic| diagnostic.message.contains("capture is allowed only"))
         .expect("domain diagnostic");
-    assert_eq!(&wrong_domain[diagnostic.range], r#""service""#);
+    assert_eq!(&wrong_domain[diagnostic.range], "points-to");
 }
 
 #[test]
@@ -1218,17 +875,11 @@ fn reference_step_help_and_option_diagnostics_are_range_precise() {
 
     for (source, token) in [
         (
-            r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"references_of","reference_kinds":["field_guess"]}]}"#,
-            "\"field_guess\"",
+            "(references-of :reference-kinds [field_guess] (enclosing-decl (class)))",
+            "field_guess",
         ),
-        (
-            r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"used_by","proof":"maybe"}]}"#,
-            "\"maybe\"",
-        ),
-        (
-            r#"{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"},{"op":"uses","surface":"all"}]}"#,
-            "\"all\"",
-        ),
+        ("(used-by :proof maybe (enclosing-decl (class)))", "maybe"),
+        ("(uses :surface all (enclosing-decl (class)))", "all"),
     ] {
         let diagnostics = validate_query_source(source);
         assert!(
@@ -1262,38 +913,6 @@ fn spelling_fixes_use_unique_canonical_schema_candidates() {
         ("(language .rss (call))", ".rss", "rust"),
         ("(result-detail ful (call))", "ful", "full"),
         ("(profle (call))", "profle", "profile"),
-        (r#"{"matc":{"kind":"call"}}"#, "\"matc\"", "\"match\""),
-        (r#"{"match":{"kind":"cal"}}"#, "\"cal\"", "\"call\""),
-        (
-            r#"{"match":{"kind":"call","calle":{"kind":"call"}}}"#,
-            "\"calle\"",
-            "\"callee\"",
-        ),
-        (
-            r#"{"match":{"name":{"regx":"item"}}}"#,
-            "\"regx\"",
-            "\"regex\"",
-        ),
-        (
-            r#"{"languages":["ruts"],"match":{"kind":"call"}}"#,
-            "\"ruts\"",
-            "\"rust\"",
-        ),
-        (
-            r#"{"result_detail":"ful","match":{"kind":"call"}}"#,
-            "\"ful\"",
-            "\"full\"",
-        ),
-        (
-            r#"{"execution_mode":"profil","match":{"kind":"call"}}"#,
-            "\"profil\"",
-            "\"profile\"",
-        ),
-        (
-            r#"{"steps":[{"op":"fileof"}],"match":{"kind":"call"}}"#,
-            "\"fileof\"",
-            "\"file_of\"",
-        ),
     ];
 
     for (source, token, replacement) in cases {
@@ -1363,25 +982,7 @@ fn suggestion_selector_deduplicates_aliases_and_suppresses_ties_and_distant_valu
 
 #[test]
 fn safe_shape_fixes_wrap_only_recognizable_single_values() {
-    let supported = [
-        (
-            r#"{"where":"src/**/*.rs","match":{"kind":"call"}}"#,
-            "\"src/**/*.rs\"",
-        ),
-        (
-            r#"{"languages":"rust","match":{"kind":"call"}}"#,
-            "\"rust\"",
-        ),
-        (
-            r#"{"steps":{"op":"file_of"},"match":{"kind":"call"}}"#,
-            r#"{"op":"file_of"}"#,
-        ),
-        (
-            r#"{"match":{"kind":"call","args":{"kind":"call"}}}"#,
-            r#"{"kind":"call"}"#,
-        ),
-        ("(call :args (call))", "(call)"),
-    ];
+    let supported = [("(call :args (call))", "(call)")];
     for (source, token) in supported {
         let diagnostic = validate_query_source(source)
             .into_iter()
@@ -1390,11 +991,7 @@ fn safe_shape_fixes_wrap_only_recognizable_single_values() {
         assert_eq!(
             diagnostic.fix,
             Some(QuerySourceFix {
-                title: if source.starts_with('(') {
-                    "Wrap in a pattern list".to_string()
-                } else {
-                    "Wrap in an array".to_string()
-                },
+                title: "Wrap in a pattern list".to_string(),
                 edit: QuerySourceEdit::Surround {
                     prefix: "[".to_string(),
                     suffix: "]".to_string(),
@@ -1403,16 +1000,7 @@ fn safe_shape_fixes_wrap_only_recognizable_single_values() {
         );
     }
 
-    for source in [
-        r#"{"where":1,"match":{"kind":"call"}}"#,
-        r#"{"match":{"kind":"call","args":"item"}}"#,
-        r#"{"match":{"kind":"call","kwargs":[]}}"#,
-        r#"{"match":{"kind":"call","args":{"wat":{"kind":"call"}}}}"#,
-        r#"{"steps":{"wat":"file_of"},"match":{"kind":"call"}}"#,
-        r#"{"steps":{"op":"wat"},"match":{"kind":"call"}}"#,
-        "(call :args \"item\")",
-        "(call :args (call :wat 1))",
-    ] {
+    for source in ["(call :args \"item\")", "(call :args (call :wat 1))"] {
         assert!(
             validate_query_source(source)
                 .into_iter()
@@ -1451,16 +1039,6 @@ fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
             ":role",
             "duplicate-property",
         ),
-        (
-            r#"{"occurrences":{"role":["binderr"]}}"#,
-            "\"binderr\"",
-            "unknown-value",
-        ),
-        (
-            r#"{"occurrences":{"kind":["function"]}}"#,
-            "\"kind\"",
-            "unknown-property",
-        ),
     ] {
         let diagnostic = validate_query_source(source)
             .into_iter()
@@ -1472,7 +1050,7 @@ fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
 
 /// Result-contract projection, aggregate validation, and typed operation uses
 /// hover from the same registry that parses and validates both RQL spellings
-/// and JSON operations.
+/// and typed operations.
 #[test]
 fn result_contract_use_form_help_and_diagnostics_are_range_precise() {
     for rql in [
@@ -1510,21 +1088,6 @@ fn result_contract_use_form_help_and_diagnostics_are_range_precise() {
         "{underscored}: {:#?}",
         validate_query_source(underscored)
     );
-
-    for operation in ["result_contract_uses", "result_contract_operation_uses"] {
-        let json = format!(
-            r#"{{"match":{{"kind":"call"}},"steps":[{{"op":"call_shape"}},{{"op":"call_result_contracts"}},{{"op":"{operation}"}}]}}"#
-        );
-        let offset = json.find(operation).unwrap();
-        let help = query_source_help_at(&json, offset).expect("no JSON result-contract-use help");
-        let expected = format!("\"{operation}\"");
-        assert_eq!(&json[help.range], expected.as_str());
-        assert!(
-            validate_query_source(&json).is_empty(),
-            "{json}: {:#?}",
-            validate_query_source(&json)
-        );
-    }
 
     let wrong_upstream = "(result-contract-operation-uses (call-shape (call)))";
     let diagnostic = validate_query_source(wrong_upstream)
@@ -1569,19 +1132,6 @@ fn result_contract_failure_use_help_and_diagnostics_are_range_precise() {
         validate_query_source(rql)
     );
 
-    let json = r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","provenance":["distinct_zero_binding"],"consumer":["returned_call_argument"]}]}"#;
-    for token in ["result_contract_failure_uses", "provenance", "consumer"] {
-        let offset = json.find(token).unwrap();
-        let help = query_source_help_at(json, offset)
-            .unwrap_or_else(|| panic!("no JSON failure-use help for {token}"));
-        assert!(!help.description.is_empty());
-    }
-    assert!(
-        validate_query_source(json).is_empty(),
-        "{json}: {:#?}",
-        validate_query_source(json)
-    );
-
     for (source, token, allowed) in [
         (
             "(result-contract-failure-uses :provenance [same-name] (call-result-contracts (call-shape (call))))",
@@ -1599,28 +1149,6 @@ fn result_contract_failure_use_help_and_diagnostics_are_range_precise() {
             .find(|diagnostic| diagnostic.code == "invalid-query-step-option")
             .unwrap_or_else(|| panic!("no constrained-value diagnostic for {source}"));
         assert_eq!(&source[diagnostic.range.clone()], token);
-        for label in allowed {
-            assert!(diagnostic.message.contains(label), "{diagnostic:?}");
-        }
-    }
-
-    for (source, token, allowed) in [
-        (
-            r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","provenance":["same_name"]}]}"#,
-            r#""same_name""#,
-            &["condition_result", "distinct_zero_binding", "unknown"][..],
-        ),
-        (
-            r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","consumer":["log"]}]}"#,
-            r#""log""#,
-            &["return", "returned_call_argument", "call_argument"][..],
-        ),
-    ] {
-        let diagnostic = validate_query_source(source)
-            .into_iter()
-            .find(|diagnostic| diagnostic.code == "unknown-value")
-            .unwrap_or_else(|| panic!("no JSON constrained-value diagnostic for {source}"));
-        assert_eq!(&source[diagnostic.range.clone()], token, "{diagnostic:?}");
         for label in allowed {
             assert!(diagnostic.message.contains(label), "{diagnostic:?}");
         }
@@ -1703,9 +1231,6 @@ fn decorator_binding_form_help_and_diagnostics_are_range_precise() {
         .find(|diagnostic| diagnostic.code == "unknown-form")
         .expect("unknown-form diagnostic");
     assert_eq!(&misspelled[diagnostic.range.clone()], "decorator-binding");
-
-    let json = r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings"}]}"#;
-    assert!(validate_query_source(json).is_empty(), "{json}");
 }
 
 /// Materialization filters are validated against the registries in both
@@ -1803,16 +1328,6 @@ fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
             "maybe",
             "unknown-value",
         ),
-        (
-            r#"{"generation_sites":{"kind":["accessor_macroo"]}}"#,
-            "\"accessor_macroo\"",
-            "unknown-value",
-        ),
-        (
-            r#"{"exports":{"input":["literal"]}}"#,
-            "\"input\"",
-            "unknown-property",
-        ),
     ] {
         let diagnostic = validate_query_source(source)
             .into_iter()
@@ -1824,11 +1339,7 @@ fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
 
 #[test]
 fn accepted_language_aliases_do_not_produce_diagnostics() {
-    for source in [
-        "(language c++ (call))",
-        "(language c# (call))",
-        r#"{"languages":["c++","c#"],"match":{"kind":"call"}}"#,
-    ] {
+    for source in ["(language c++ (call))", "(language c# (call))"] {
         assert!(
             validate_query_source(source).is_empty(),
             "accepted language alias should validate: {source}"
@@ -1837,7 +1348,7 @@ fn accepted_language_aliases_do_not_produce_diagnostics() {
 }
 
 #[test]
-fn arity_help_covers_the_predicate_form_property_and_json_field() {
+fn arity_help_covers_the_predicate_form_property() {
     // Predicate form and inline property both hover on the `arity` token.
     let form = "(call (arity :min 1 :max 3))";
     let form_help =
@@ -1853,25 +1364,15 @@ fn arity_help_covers_the_predicate_form_property_and_json_field() {
         query_source_help_at(property, property.find(":arity").unwrap()).expect("arity property");
     assert_eq!(&property[property_help.range], ":arity");
     assert!(!property_help.description.is_empty());
-
-    // The JSON `arity` field carries the same vocabulary help.
-    let json = r#"{"match":{"kind":"call","arity":1}}"#;
-    let json_help =
-        query_source_help_at(json, json.find("\"arity\"").unwrap()).expect("arity json help");
-    assert_eq!(&json[json_help.range], "\"arity\"");
-    assert!(json_help.description.contains("argument count"));
 }
 
 #[test]
-fn arity_frontends_validate_ranges_at_exact_positions() {
-    // Well-formed exact and range forms validate clean in both frontends.
+fn arity_forms_validate_ranges_at_exact_positions() {
+    // Well-formed exact and range forms validate clean in RQL source.
     for source in [
         r#"(call :callee (name "execute") :arity 1)"#,
         r#"(call (arity :min 1 :max 3))"#,
         r#"(call (arity :min 1))"#,
-        r#"{"match":{"kind":"call","arity":1}}"#,
-        r#"{"match":{"kind":"call","arity":{"min":1,"max":3}}}"#,
-        r#"{"match":{"kind":"call","arity":{"max":2}}}"#,
     ] {
         assert!(
             validate_query_source(source).is_empty(),
@@ -1889,22 +1390,13 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
         "{diagnostic:?}"
     );
 
-    let json = r#"{"match":{"kind":"call","arity":{"min":3,"max":1}}}"#;
-    let diagnostic = validate_query_source(json)
-        .pop()
-        .expect("json range diagnostic");
-    assert!(
-        diagnostic.message.contains("must not exceed"),
-        "{diagnostic:?}"
-    );
-
     // An empty range constrains nothing.
-    let json = r#"{"match":{"kind":"call","arity":{}}}"#;
-    let diagnostic = validate_query_source(json)
+    let rql_source = "(call (arity))";
+    let diagnostic = validate_query_source(rql_source)
         .pop()
         .expect("empty range diagnostic");
     assert!(
-        diagnostic.message.contains("at least one"),
+        diagnostic.message.contains("expects a count"),
         "{diagnostic:?}"
     );
 
@@ -1914,12 +1406,12 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
     assert!(diagnostic.message.contains("at most"), "{diagnostic:?}");
 
     // An unknown range key is flagged at that key.
-    let json = r#"{"match":{"kind":"call","arity":{"exactly":1}}}"#;
-    let diagnostics = validate_query_source(json);
+    let rql_source = "(call (arity :exactly 1))";
+    let diagnostics = validate_query_source(rql_source);
     assert!(
         diagnostics
             .iter()
-            .any(|diagnostic| &json[diagnostic.range.clone()] == "\"exactly\""),
+            .any(|diagnostic| &rql_source[diagnostic.range.clone()] == ":exactly"),
         "{diagnostics:#?}"
     );
 
@@ -1936,7 +1428,7 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
 }
 
 #[test]
-fn visibility_help_covers_the_predicate_form_property_and_json_field() {
+fn visibility_help_covers_the_predicate_form_property() {
     let form = "(method (visibility public))";
     let form_help =
         query_source_help_at(form, form.find("visibility").unwrap()).expect("visibility form help");
@@ -1950,15 +1442,10 @@ fn visibility_help_covers_the_predicate_form_property_and_json_field() {
     let property_help = query_source_help_at(property, property.find(":visibility").unwrap())
         .expect("visibility property");
     assert_eq!(&property[property_help.range], ":visibility");
-
-    let json = r#"{"match":{"kind":"method","visibility":"public"}}"#;
-    let json_help = query_source_help_at(json, json.find("\"visibility\"").unwrap())
-        .expect("visibility json help");
-    assert_eq!(&json[json_help.range], "\"visibility\"");
 }
 
 #[test]
-fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
+fn visibility_and_parameter_type_forms_validate_at_exact_positions() {
     for source in [
         "(method :visibility public)",
         "(method :visibility [public protected])",
@@ -1966,10 +1453,6 @@ fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
         "(method (visibility package-private))",
         r#"(method :parameter-type "String")"#,
         r#"(method :parameter-type/regex "String")"#,
-        r#"{"match":{"kind":"method","visibility":"public"}}"#,
-        r#"{"match":{"kind":"method","visibility":["public","protected"]}}"#,
-        r#"{"match":{"kind":"method","parameter_type":"String"}}"#,
-        r#"{"match":{"kind":"method","parameter_type":{"regex":"String"}}}"#,
     ] {
         assert!(
             validate_query_source(source).is_empty(),
@@ -1984,8 +1467,8 @@ fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
         .expect("visibility on call");
     assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
 
-    let json = r#"{"match":{"kind":"call","parameter_type":"String"}}"#;
-    let diagnostic = validate_query_source(json)
+    let rql_source = r#"(call :parameter-type "String")"#;
+    let diagnostic = validate_query_source(rql_source)
         .pop()
         .expect("parameter_type on call");
     assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
@@ -2001,7 +1484,7 @@ fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
 }
 
 #[test]
-fn jsx_attribute_value_source_frontends_validate_and_hover_from_schema() {
+fn jsx_attribute_value_source_forms_validate_and_hover_from_schema() {
     let rql = r#"(jsx-attribute-value :identity intrinsic :element-name div :property-name __html
         (jsx_attribute (name "dangerouslySetInnerHTML")))"#;
     assert!(
@@ -2013,20 +1496,74 @@ fn jsx_attribute_value_source_frontends_validate_and_hover_from_schema() {
         query_source_help_at(rql, rql.find(":identity").unwrap()).expect("identity option help");
     assert!(help.description.contains("semantic element identity"));
 
-    let json = r#"{"match":{"kind":"jsx_attribute"},"steps":[{"op":"jsx_attribute_value","identity":"intrinsic","element_name":"div","property_name":"__html"}]}"#;
-    assert!(
-        validate_query_source(json).is_empty(),
-        "{:#?}",
-        validate_query_source(json)
-    );
-    let help =
-        query_source_help_at(json, json.find("\"identity\"").unwrap()).expect("JSON identity help");
-    assert!(help.description.contains("semantic element identity"));
-
     let invalid = r#"(jsx-attribute-value :identity unresolved (jsx_attribute))"#;
     let diagnostic = validate_query_source(invalid)
         .into_iter()
         .find(|diagnostic| diagnostic.code == "unknown-value")
         .expect("invalid identity diagnostic");
     assert!(diagnostic.message.contains("intrinsic"));
+}
+
+#[test]
+fn generated_json_is_machine_serialization_only() {
+    let query = CodeQuery::from_source("(language rust (call :callee (name \"run\")))")
+        .expect("authored RQL");
+    let canonical = query.to_canonical_json();
+    let decoded = CodeQuery::from_json(&canonical).expect("machine JSON");
+    assert_eq!(decoded.to_canonical_json(), canonical);
+    let source = canonical.to_string();
+    assert!(CodeQuery::from_source(&source).is_err());
+    assert!(!validate_query_source(&source).is_empty());
+    assert!(query_source_help_at(&source, source.find("match").unwrap()).is_none());
+}
+
+#[test]
+fn assignable_receiver_family_validates_and_provides_schema_help() {
+    for form in ["assignable-to", "assignable_to"] {
+        let source = format!(
+            r#"(resolved-call :resolves-to "Child.sink" :proof exact
+              :receiver-type ({form} "Base")
+              (call-bindings (call-shape (call :callee "sink"))))"#
+        );
+        assert!(
+            validate_query_source(&source).is_empty(),
+            "{:#?}",
+            validate_query_source(&source)
+        );
+        let help = query_source_help_at(&source, source.find(form).unwrap())
+            .expect("receiver family help");
+        assert_eq!(&source[help.range.clone()], form);
+        assert!(help.description.contains("typed hierarchy"), "{help:?}");
+    }
+
+    let source = r#"(resolved-call :resolves-to "Child.sink" :proof exact
+      :receiver-type (subtype-of "Base")
+      (call-bindings (call-shape (call :callee "sink"))))"#;
+    let diagnostic = validate_query_source(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("assignable-to"))
+        .expect("unknown receiver family diagnostic");
+    assert_eq!(&source[diagnostic.range], "subtype-of");
+}
+
+#[test]
+fn language_family_help_and_validation_use_fixed_expansions() {
+    let source = "(language jvm (language java (call)))";
+    assert!(validate_query_source(source).is_empty());
+    let offset = source.find("jvm").unwrap();
+    let help = query_source_help_at(source, offset).unwrap();
+    assert_eq!(&source[help.range], "jvm");
+    assert_eq!(help.signature, "jvm = [java kotlin scala]");
+    let source = "(language \"js-ts\" (call))";
+    assert!(validate_query_source(source).is_empty());
+    let help = query_source_help_at(source, source.find("js-ts").unwrap()).unwrap();
+    assert_eq!(help.signature, "js-ts = [javascript typescript]");
+    let source = "(language jvmm (call))";
+    let errors = validate_query_source(source);
+    let error = errors
+        .iter()
+        .find(|error| error.code == "invalid-language")
+        .unwrap();
+    assert_eq!(&source[error.range.clone()], "jvmm");
+    assert!(format!("{:?}", error.fix).contains("jvm"));
 }

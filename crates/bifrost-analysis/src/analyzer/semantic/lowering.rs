@@ -661,6 +661,20 @@ pub(crate) struct CallSiteScaffold {
     pub(crate) exceptional_continuation: ProgramPointId,
 }
 
+/// Adapter-supplied values for an ordinary call whose declaration proves that
+/// it cannot return normally. The exceptional continuation remains explicit;
+/// the missing normal arm is part of the published call contract.
+pub(crate) struct DivergingCallSiteScaffold {
+    pub(crate) point: ProgramPointId,
+    pub(crate) callee: ValueId,
+    pub(crate) receiver: Option<ValueId>,
+    pub(crate) arguments: Box<[SemanticCallArgument]>,
+    pub(crate) result: Option<ValueId>,
+    pub(crate) thrown: Option<ValueId>,
+    pub(crate) declared_targets: CallableTargetResolution,
+    pub(crate) exceptional_continuation: ProgramPointId,
+}
+
 /// Adapter-supplied values for a call whose work starts in another task while
 /// the registering procedure continues normally. The spawned work has no
 /// exceptional continuation in its registering procedure.
@@ -1517,6 +1531,51 @@ impl<'a> ProcedureLoweringSession<'a> {
                 call_site: id,
                 kind: CallContinuationKind::Normal,
             },
+        )?;
+        self.append_effect(
+            builder,
+            call.exceptional_continuation,
+            SemanticEffect::CallContinuation {
+                call_site: id,
+                kind: CallContinuationKind::Exceptional,
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Publish an ordinary call whose declared return type proves that its
+    /// normal continuation is absent.
+    pub(crate) fn add_diverging_call_site(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: DivergingCallSiteScaffold,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
+        let metadata = self.metadata(call.point)?;
+        let id = CallSiteId::try_from_index(self.next_call_site)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many call sites".into()))?;
+        builder.add_call_site(SemanticCallSite {
+            id,
+            point: call.point,
+            invocation_mode: CallInvocationMode::Ordinary,
+            execution_timing: ExecutionTiming::SameEvaluation,
+            callee: call.callee,
+            receiver: call.receiver,
+            arguments: call.arguments,
+            normal_results: Box::new([]),
+            result: call.result,
+            thrown: call.thrown,
+            declared_targets: call.declared_targets,
+            target_evidence: metadata.evidence,
+            normal_continuation: ControlContinuation::Absent,
+            exceptional_continuation: ControlContinuation::Target(call.exceptional_continuation),
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_call_site += 1;
+        self.append_effect(
+            builder,
+            call.point,
+            SemanticEffect::Invoke { call_site: id },
         )?;
         self.append_effect(
             builder,

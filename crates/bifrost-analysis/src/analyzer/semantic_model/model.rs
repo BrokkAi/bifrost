@@ -54,6 +54,10 @@ pub const COLLECTION_FLOW_VOCABULARY: &str = "csmi.collection-flow";
 pub const COLLECTION_FLOW_VERSION: &str = "0.1.0";
 pub const COLLECTION_FLOW_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/collection-flow/0.1/schema.json";
+pub const DEFERRED_YIELD_VOCABULARY: &str = "csmi.deferred-yield";
+pub const DEFERRED_YIELD_VERSION: &str = "0.1.0";
+pub const DEFERRED_YIELD_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/deferred-yield/0.1/schema.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +92,48 @@ pub struct CollectionFlowFact {
     pub coverage: Option<Completeness>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<String>,
+}
+
+/// Typed native companion for the CSMI deferred-yield vocabulary. These facts
+/// retain their exact linked factory, resume, and handle-type scope in the
+/// payload; coverage and provenance remain independent claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredYieldsPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yields: Vec<DeferredYieldFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredYieldFact {
+    pub factory: String,
+    pub resume: String,
+    #[serde(rename = "handleType")]
+    pub handle_type: String,
+    #[schemars(with = "serde_json::Value")]
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiDeferredYieldPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Completeness>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+impl DeferredYieldsPayload {
+    pub fn record_count(&self) -> usize {
+        self.yields.len()
+    }
+
+    pub fn deferred_yield(
+        &self,
+        factory: &str,
+        resume: &str,
+        handle_type: &str,
+    ) -> Option<&DeferredYieldFact> {
+        self.yields.iter().find(|fact| {
+            fact.factory == factory && fact.resume == resume && fact.handle_type == handle_type
+        })
+    }
 }
 
 impl CollectionFlowsPayload {
@@ -938,6 +984,8 @@ pub struct AuthoredShard {
     pub runtime_values: Option<RuntimeValuesPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_flows: Option<CollectionFlowsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_yields: Option<DeferredYieldsPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

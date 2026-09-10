@@ -128,6 +128,25 @@
                   ]
                 },
                 "to": { "op": "capture", "name": "field_id" }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".getset-getter-reference" }
+                  ]
+                },
+                "relation_kind": "references",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".getset-getter" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "field_id" }
               }
             ]
           }

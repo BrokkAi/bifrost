@@ -551,9 +551,9 @@ readinessTest("release readiness is read-only and contains no publishing boundar
   }
 });
 
-readinessTest("release readiness starts every release binary while capping wheel matrices", () => {
+readinessTest("release readiness starts every binary and wheel target without an artificial matrix queue", () => {
   const caps = [...readiness.matchAll(/^\s+max-parallel:\s*(\d+)\s*$/gmu)].map((match) => Number(match[1]));
-  assert.deepEqual(caps, [6, 4, 4]);
+  assert.deepEqual(caps, [5, 5, 5]);
 });
 
 readinessTest("release binaries use the restricted larger-runner pools", () => {
@@ -570,7 +570,28 @@ readinessTest("release binaries use the restricted larger-runner pools", () => {
   }
 });
 
+readinessTest("release readiness gives the Linux x86 binary an independent critical path", () => {
+  const linuxBuild = jobBlock(readiness, "build-linux-x86-64");
+  assert.match(linuxBuild, /^    name: build binary \(x86_64-unknown-linux-gnu\)$/mu);
+  assert.match(linuxBuild, /^    runs-on: ubuntu-latest$/mu);
+  assert.match(linuxBuild, /name: bifrost-x86_64-unknown-linux-gnu/u);
+  assert.doesNotMatch(jobBlock(readiness, "build"), /target: x86_64-unknown-linux-gnu/u);
+
+  const policySmoke = jobBlock(readiness, "policy-scan-smoke");
+  assert.match(policySmoke, /^    needs: \[preflight, build-linux-x86-64, semantic-pack-python\]$/mu);
+  assert.doesNotMatch(policySmoke, /^    needs: \[preflight, build,/mu);
+
+  for (const job of ["agent-plugin-package", "pi-package", "vscode-package", "npm-package"]) {
+    assert.match(
+      jobBlock(readiness, job),
+      /^    needs: \[preflight, build-linux-x86-64, build(?:, agent-plugin-package)?\]$/mu,
+      `${job} must wait for the complete binary artifact set`,
+    );
+  }
+});
+
 readinessTest("release readiness separates pinned GNU builds from portable binary builds", () => {
+  const linuxBuild = jobBlock(readiness, "build-linux-x86-64");
   const build = jobBlock(readiness, "build");
   const binaryBuild = build.match(
     /^      - name: Build binary\n[\s\S]*?(?=^      - name: Build GNU\/Linux binary)/mu,
@@ -579,24 +600,26 @@ readinessTest("release readiness separates pinned GNU builds from portable binar
   assert.match(binaryBuild, /^        shell: bash$/mu);
   assert.match(binaryBuild, /run: cargo build --release --locked --bin "\$BIN_NAME"/u);
 
+  for (const gnuJob of [linuxBuild, build]) {
+    assert.match(gnuJob, /cargo-zigbuild --version '=0\.23\.3'/u);
+    assert.match(gnuJob, /ziglang==0\.15\.2/u);
+    assert.match(gnuJob, /LIBZ_SYS_STATIC: '1'/u);
+    assert.match(gnuJob, /cargo zigbuild --release --locked/u);
+    const verifier = gnuJob.indexOf("bash scripts/public/verify-linux-release-elf.sh");
+    const staging = gnuJob.indexOf("- name: Stage Unix archive");
+    assert.ok(verifier >= 0 && verifier < staging, "ELF verification must precede archive staging");
+  }
+
   const linkerSetup = build.match(
     /^      - name: Install pinned GNU\/Linux linker toolchain\n[\s\S]*?(?=^      - name: Set up Android NDK)/mu,
   )?.[0];
   assert.ok(linkerSetup, "expected the pinned GNU/Linux linker setup step");
-  assert.match(linkerSetup, /cargo-zigbuild --version '=0\.23\.3'/u);
-  assert.match(linkerSetup, /ziglang==0\.15\.2/u);
 
   const gnuBuild = build.match(
     /^      - name: Build GNU\/Linux binary with glibc 2\.28 floor\n[\s\S]*?(?=^      - name: Verify GNU\/Linux ELF contract)/mu,
   )?.[0];
   assert.ok(gnuBuild, "expected the constrained GNU/Linux build step");
-  assert.match(gnuBuild, /LIBZ_SYS_STATIC: '1'/u);
-  assert.match(gnuBuild, /cargo zigbuild --release --locked/u);
   assert.match(gnuBuild, /--target "\$\{\{ matrix\.target \}\}\.2\.28"/u);
-
-  const verifier = build.indexOf("bash scripts/public/verify-linux-release-elf.sh");
-  const staging = build.indexOf("- name: Stage Unix archive");
-  assert.ok(verifier >= 0 && verifier < staging, "ELF verification must precede archive staging");
   assert.doesNotMatch(build, /x86_64-unknown-linux-musl/u);
 });
 

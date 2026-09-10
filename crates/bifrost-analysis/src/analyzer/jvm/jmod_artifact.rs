@@ -371,6 +371,7 @@ impl JdkJmodSetPackProducer {
                 },
                 runtime_values: None,
                 collection_flows: None,
+                deferred_yields: None,
             });
         }
 

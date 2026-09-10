@@ -4,8 +4,16 @@
 //! that carries it is paired with a definition of the tested boolean that
 //! proves the opposite outcome.  Independent reaching-definition sets lose
 //! that relationship at a join.  This module retains the relationship as a
-//! sparse set of `(data definition, boolean definition, fact)` tuples and
-//! exposes the incompatible data definitions to the type-flow planner.
+//! set of `(data definition, boolean definition, fact)` tuples and exposes
+//! the incompatible data definitions to the type-flow planner.
+//!
+//! The point state stores that relation factored into its data component and
+//! its boolean component, with an explicit entry only for a pair whose
+//! branches genuinely correlate the two.  See [`FlowState`].
+//!
+//! Propagation is sparse: state exists only at the points that can change it
+//! or that a consumer reads, and the fixpoint runs over the reduced graph
+//! those points form.  See [`carried_points`].
 //!
 //! The analysis consumes only validated semantic IR.  It does not inspect
 //! source text, and it does not use a regular expression or a second parser.
@@ -136,9 +144,12 @@ impl From<SemanticBudgetExceeded> for CorrelationError {
 ///
 /// The caller supplies the same semantic budget used by the surrounding
 /// request.  One `nested_entries` unit is charged for each newly retained
-/// pair and one `control_edges` unit for each CFG edge traversal.  If either
-/// lane is exhausted, or cancellation is observed, the function returns an
-/// error and no partial relation is exposed.
+/// pair, which is one element of a state this analysis keeps, and one
+/// `control_edges` unit for each CFG edge walked or reduced-graph edge
+/// traversed.  Because state exists only at carried points, the retained
+/// charge follows the state the analysis holds rather than the procedure's
+/// length.  If either lane is exhausted, or cancellation is observed, the
+/// function returns an error and no partial relation is exposed.
 pub fn analyze_correlations(
     procedure: &ProcedureHandle,
     budget: &mut SemanticBudget,
@@ -178,6 +189,19 @@ pub fn analyze_correlations(
         cancellation,
     )?;
 
+    // State is stored only where it is consumed or where it can change, and
+    // the fixpoint runs over the reduced graph those points form.
+    let successors = cfg_successors(semantics, budget, cancellation)?;
+    let carried = carried_points(
+        semantics,
+        &successors,
+        &data_bindings,
+        &bool_bindings,
+        &open_bindings,
+        cancellation,
+    )?;
+    let carried_successors = carried_successors(&successors, &carried, budget, cancellation)?;
+
     let initial = FlowState::entry(&data_bindings, &bool_bindings, &definitions, budget)?;
     let point_count = semantics.points().len();
     let mut states = vec![FlowState::default(); point_count];
@@ -190,6 +214,10 @@ pub fn analyze_correlations(
     while let Some(point_id) = worklist.pop_front() {
         queued[point_id.index()] = false;
         check_cancelled(cancellation)?;
+        debug_assert!(
+            carried[point_id.index()],
+            "the reduced graph schedules only carried points"
+        );
         let entry_state = states[point_id.index()].clone();
         let exit_state = transfer_point(
             semantics,
@@ -204,14 +232,14 @@ pub fn analyze_correlations(
         )?;
         exits[point_id.index()] = exit_state.clone();
 
-        for (_edge_id, edge) in semantics.successor_edges(point_id) {
+        for &target_point in &carried_successors[point_id.index()] {
             check_cancelled(cancellation)?;
             charge_edges(budget, 1)?;
-            let target = edge.target_point.index();
+            let target = target_point.index();
             let changed = states[target].join(&exit_state, budget)?;
             if changed && !queued[target] {
                 queued[target] = true;
-                worklist.push_back(edge.target_point);
+                worklist.push_back(target_point);
             }
         }
     }
@@ -221,6 +249,10 @@ pub fn analyze_correlations(
         let Some((bool_binding, true_fact)) = guard_binding_and_true_fact(semantics, guard) else {
             continue;
         };
+        assert!(
+            carried[guard.point.index()],
+            "a queried guard point stores its exit state"
+        );
         let state = &exits[guard.point.index()];
         for (edge, expected) in [
             (guard.true_edge, true_fact),
@@ -228,15 +260,13 @@ pub fn analyze_correlations(
         ] {
             let Some(edge) = edge else { continue };
             for &data_binding in &data_bindings {
-                let Some(pairs) = state.relations.get(&(data_binding, bool_binding)) else {
-                    continue;
-                };
+                let pairs = state.pairs(data_binding, bool_binding);
                 let candidate = make_candidate(
                     edge,
                     bool_binding,
                     expected,
                     data_binding,
-                    pairs,
+                    &pairs,
                     &definitions,
                 );
                 if !candidate.all_reaching_data_defs.is_empty() {
@@ -258,6 +288,230 @@ pub fn analyze_correlations(
         definitions: definitions.data_records,
         guard_edge_exclusions,
     })
+}
+
+/// One event's replacement of a tracked component at one program point.
+///
+/// `rhs` is both the definition's right-hand side and, for a boolean write,
+/// the source whose relation the copy carries.  A write with no readable
+/// source has `None`, which is the explicit unknown definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentWrite {
+    Data {
+        binding: ValueId,
+        event_index: usize,
+        rhs: Option<ValueId>,
+    },
+    Boolean {
+        binding: ValueId,
+        event_index: usize,
+        rhs: Option<ValueId>,
+    },
+}
+
+/// Every tracked component one point replaces, in event order.
+///
+/// Three callers need exactly this list and must agree about it: the
+/// definition table interns one record per write, the transfer function
+/// replaces one component per write, and [`carried_points`] treats a point
+/// with no write as an identity transfer whose state need not be stored.
+fn component_writes(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    point: &crate::analyzer::semantic::ProgramPoint,
+    data_bindings: &[ValueId],
+    bool_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+) -> Vec<ComponentWrite> {
+    fn push(
+        writes: &mut Vec<ComponentWrite>,
+        data_bindings: &[ValueId],
+        bool_bindings: &[ValueId],
+        event_index: usize,
+        binding: ValueId,
+        rhs: Option<ValueId>,
+    ) {
+        if data_bindings.binary_search(&binding).is_ok() {
+            writes.push(ComponentWrite::Data {
+                binding,
+                event_index,
+                rhs,
+            });
+        }
+        if bool_bindings.binary_search(&binding).is_ok() {
+            writes.push(ComponentWrite::Boolean {
+                binding,
+                event_index,
+                rhs,
+            });
+        }
+    }
+    let mut writes = Vec::new();
+    for (event_index, event) in point.events.iter().enumerate() {
+        match &event.effect {
+            SemanticEffect::Assignment { target, value } => push(
+                &mut writes,
+                data_bindings,
+                bool_bindings,
+                event_index,
+                *target,
+                Some(*value),
+            ),
+            SemanticEffect::ValueFlow {
+                source,
+                target,
+                kind,
+            } if bool_bindings.binary_search(target).is_ok()
+                && kind.preserves_runtime_class()
+                && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
+            {
+                writes.push(ComponentWrite::Boolean {
+                    binding: *target,
+                    event_index,
+                    rhs: Some(*source),
+                });
+            }
+            effect => {
+                for binding in unknown_write_bindings(effect, semantics, open_bindings) {
+                    push(
+                        &mut writes,
+                        data_bindings,
+                        bool_bindings,
+                        event_index,
+                        binding,
+                        None,
+                    );
+                }
+            }
+        }
+        if let Some(result) = produced_value(&event.effect) {
+            push(
+                &mut writes,
+                data_bindings,
+                bool_bindings,
+                event_index,
+                result,
+                None,
+            );
+        }
+    }
+    writes
+}
+
+/// The points whose flow state this analysis stores.
+///
+/// Every other point has one predecessor and an identity transfer, so its
+/// state is its predecessor's exit state repeated.  Storing that copy is what
+/// made the charge proportional to procedure length instead of to the state
+/// the analysis actually consumes: parso's `tokenize_lines` has 1545 points
+/// but replaces a component at only a small fraction of them.
+///
+/// A point is carried when it is the entry, when two or more edges reach it
+/// and its state is therefore a join, when it replaces a component, or when a
+/// guard the consumer queries reads its exit state.
+fn carried_points(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    successors: &[Vec<ProgramPointId>],
+    data_bindings: &[ValueId],
+    bool_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<bool>, CorrelationError> {
+    let point_count = successors.len();
+    let mut predecessors = vec![0usize; point_count];
+    for targets in successors {
+        check_cancelled(cancellation)?;
+        for target in targets {
+            predecessors[target.index()] = predecessors[target.index()].saturating_add(1);
+        }
+    }
+    let mut carried = vec![false; point_count];
+    carried[semantics.entry_point().index()] = true;
+    for point in semantics.points() {
+        check_cancelled(cancellation)?;
+        if predecessors[point.id.index()] >= 2
+            || !component_writes(
+                semantics,
+                point,
+                data_bindings,
+                bool_bindings,
+                open_bindings,
+            )
+            .is_empty()
+        {
+            carried[point.id.index()] = true;
+        }
+    }
+    for guard in semantics.guard_facts() {
+        check_cancelled(cancellation)?;
+        if guard_binding_and_true_fact(semantics, guard).is_some() {
+            carried[guard.point.index()] = true;
+        }
+    }
+    Ok(carried)
+}
+
+/// For each carried point, the carried points its exit state reaches.
+///
+/// A chain of uncarried points transmits the state unchanged, so the fixpoint
+/// runs over this reduced graph.  Uncarried points have one predecessor, so
+/// the chains hanging off distinct carried points are disjoint and building
+/// the whole relation walks each CFG edge a bounded number of times.
+fn carried_successors(
+    successors: &[Vec<ProgramPointId>],
+    carried: &[bool],
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<Vec<ProgramPointId>>, CorrelationError> {
+    let point_count = carried.len();
+    let mut reduced = vec![Vec::new(); point_count];
+    // Generation stamps make the per-walk visited set O(1) to reset. The set
+    // is per walk, not global, so a chain shared by two carried points is
+    // still reported to both.
+    let mut visited = vec![0u32; point_count];
+    let mut generation = 0u32;
+    let mut stack = Vec::new();
+    for (index, carried_point) in carried.iter().enumerate() {
+        if !carried_point {
+            continue;
+        }
+        check_cancelled(cancellation)?;
+        generation += 1;
+        stack.clear();
+        stack.extend(successors[index].iter().copied());
+        let mut reached = Vec::new();
+        while let Some(next) = stack.pop() {
+            charge_edges(budget, 1)?;
+            if visited[next.index()] == generation {
+                continue;
+            }
+            visited[next.index()] = generation;
+            if carried[next.index()] {
+                reached.push(next);
+                continue;
+            }
+            stack.extend(successors[next.index()].iter().copied());
+        }
+        reached.sort_unstable();
+        reduced[index] = reached;
+    }
+    Ok(reduced)
+}
+
+/// This procedure's CFG as a successor list, charged once per edge.
+fn cfg_successors(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    budget: &mut SemanticBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<Vec<ProgramPointId>>, CorrelationError> {
+    let mut successors = vec![Vec::new(); semantics.points().len()];
+    for point in semantics.points() {
+        check_cancelled(cancellation)?;
+        for (_edge_id, edge) in semantics.successor_edges(point.id) {
+            charge_edges(budget, 1)?;
+            successors[point.id.index()].push(edge.target_point);
+        }
+    }
+    Ok(successors)
 }
 
 fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), CorrelationError> {
@@ -602,9 +856,74 @@ struct Pair {
     fact: BoolFact,
 }
 
+/// Reaching data definitions and boolean facts at one program point.
+///
+/// The question this analysis answers is which data definitions of one
+/// binding reach a guard together with which fact about the tested boolean.
+/// Keying that relation by `(data binding, boolean binding)` stores each data
+/// binding's reaching definitions once per boolean binding.  On a large
+/// procedure the repetition is the whole cost: parso's `tokenize_lines` has
+/// 1545 points, 48 data bindings and 6 boolean bindings, and the keyed form
+/// charged 683,390 nested entries for state that names 54 components per
+/// point (#3163).
+///
+/// The two components are therefore stored once each and a pair's relation is
+/// their product.  Every transfer preserves that form: a data write replaces
+/// one binding's reaching set, a boolean write replaces one binding's fact
+/// set, and both leave the other component alone.  Only a join can break it,
+/// and only for a pair whose two branches disagree about the data component
+/// in one direction and about the boolean component in the other.  Those
+/// pairs are retained explicitly in `correlated`; they are exactly the branch
+/// correlation this analysis exists to keep.
 #[derive(Debug, Clone, Default)]
 struct FlowState {
-    relations: HashMap<(ValueId, ValueId), HashSet<Pair>>,
+    /// Reaching definitions of each tracked data binding, as indices into the
+    /// definition table.  The same set for every boolean binding.
+    reaching: HashMap<ValueId, HashSet<usize>>,
+    /// Reaching definitions of each tested boolean binding with the fact each
+    /// proves.  The same set for every data binding outside `correlated`.
+    facts: HashMap<ValueId, HashSet<(BooleanDefinition, BoolFact)>>,
+    /// Pairs whose relation is smaller than the product of the components
+    /// above, stored in full.
+    correlated: HashMap<(ValueId, ValueId), HashSet<Pair>>,
+}
+
+/// The relation of one pair when neither component constrains the other.
+fn product(
+    reaching: &HashSet<usize>,
+    facts: &HashSet<(BooleanDefinition, BoolFact)>,
+) -> HashSet<Pair> {
+    reaching
+        .iter()
+        .flat_map(|&data_definition| {
+            facts.iter().map(move |&(boolean_definition, fact)| Pair {
+                data_definition,
+                boolean_definition,
+                fact,
+            })
+        })
+        .collect()
+}
+
+/// How one branch's component set relates to the other branch's at a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlap {
+    Equal,
+    /// This branch's set is contained in the other branch's.
+    SelfIncluded,
+    OtherIncluded,
+    Incomparable,
+}
+
+fn overlap<T: Eq + std::hash::Hash>(left: &HashSet<T>, right: &HashSet<T>) -> Overlap {
+    let left_in_right = left.iter().all(|value| right.contains(value));
+    let right_in_left = right.iter().all(|value| left.contains(value));
+    match (left_in_right, right_in_left) {
+        (true, true) => Overlap::Equal,
+        (true, false) => Overlap::SelfIncluded,
+        (false, true) => Overlap::OtherIncluded,
+        (false, false) => Overlap::Incomparable,
+    }
 }
 
 impl FlowState {
@@ -625,26 +944,80 @@ impl FlowState {
                     rhs: None,
                 })
                 .expect("every tracked data binding has an entry definition");
-            for &boolean_binding in bool_bindings {
-                let boolean_definition = BooleanDefinition {
-                    binding: boolean_binding,
-                    point: definitions.entry_point,
-                    event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
-                    rhs: None,
-                };
-                insert_pair(
-                    &mut state,
-                    (data_binding, boolean_binding),
-                    Pair {
-                        data_definition,
-                        boolean_definition,
-                        fact: BoolFact::Unknown,
-                    },
-                    budget,
-                )?;
-            }
+            charge_pairs(budget, 1)?;
+            state
+                .reaching
+                .insert(data_binding, [data_definition].into_iter().collect());
+        }
+        for &boolean_binding in bool_bindings {
+            let boolean_definition = BooleanDefinition {
+                binding: boolean_binding,
+                point: definitions.entry_point,
+                event_index: BooleanDefinition::ENTRY_EVENT_INDEX,
+                rhs: None,
+            };
+            charge_pairs(budget, 1)?;
+            state.facts.insert(
+                boolean_binding,
+                [(boolean_definition, BoolFact::Unknown)]
+                    .into_iter()
+                    .collect(),
+            );
         }
         Ok(state)
+    }
+
+    /// The point has no state yet: nothing has reached it.
+    fn is_bottom(&self) -> bool {
+        self.reaching.is_empty() && self.facts.is_empty()
+    }
+
+    /// The `(data definition, boolean definition, fact)` triples that reach
+    /// one pair of bindings together.
+    fn pairs(&self, data_binding: ValueId, bool_binding: ValueId) -> HashSet<Pair> {
+        if let Some(pairs) = self.correlated.get(&(data_binding, bool_binding)) {
+            return pairs.clone();
+        }
+        let (Some(reaching), Some(facts)) = (
+            self.reaching.get(&data_binding),
+            self.facts.get(&bool_binding),
+        ) else {
+            return HashSet::default();
+        };
+        product(reaching, facts)
+    }
+
+    /// Every element this state retains, which is what the budget charges.
+    fn retained_entries(&self) -> usize {
+        self.reaching
+            .values()
+            .map(HashSet::len)
+            .chain(self.facts.values().map(HashSet::len))
+            .chain(self.correlated.values().map(HashSet::len))
+            .fold(0, usize::saturating_add)
+    }
+
+    /// Drop an explicit correlation that is the product of its components
+    /// again, so a later join does not carry an exception that no longer
+    /// says anything.
+    fn normalize(&mut self) {
+        let redundant = self
+            .correlated
+            .iter()
+            .filter(|((data_binding, bool_binding), pairs)| {
+                match (
+                    self.reaching.get(data_binding),
+                    self.facts.get(bool_binding),
+                ) {
+                    (Some(reaching), Some(facts)) => **pairs == product(reaching, facts),
+                    _ => true,
+                }
+            })
+            .map(|(&key, _)| key)
+            .collect::<Vec<_>>();
+        for key in redundant {
+            self.correlated.remove(&key);
+        }
     }
 
     fn join(
@@ -652,11 +1025,114 @@ impl FlowState {
         other: &Self,
         budget: &mut SemanticBudget,
     ) -> Result<bool, CorrelationError> {
+        if other.is_bottom() {
+            return Ok(false);
+        }
+        if self.is_bottom() {
+            charge_pairs(budget, other.retained_entries())?;
+            *self = other.clone();
+            return Ok(true);
+        }
+        let empty_reaching = HashSet::<usize>::default();
+        let empty_facts = HashSet::<(BooleanDefinition, BoolFact)>::default();
+        let changed_data = other
+            .reaching
+            .iter()
+            .map(|(&binding, reaching)| {
+                (
+                    binding,
+                    overlap(
+                        self.reaching.get(&binding).unwrap_or(&empty_reaching),
+                        reaching,
+                    ),
+                )
+            })
+            .filter(|(_, overlap)| *overlap != Overlap::Equal)
+            .collect::<Vec<_>>();
+        let changed_facts = other
+            .facts
+            .iter()
+            .map(|(&binding, facts)| {
+                (
+                    binding,
+                    overlap(self.facts.get(&binding).unwrap_or(&empty_facts), facts),
+                )
+            })
+            .filter(|(_, overlap)| *overlap != Overlap::Equal)
+            .collect::<Vec<_>>();
+        // `(A1 x B1) u (A2 x B2)` is the product of the joined components
+        // whenever one branch's relation contains the other's, so only a pair
+        // whose branches disagree about both components in opposite
+        // directions can need an explicit union.  Every pair either side
+        // already states explicitly is a candidate too.  The union decides.
+        let mut candidates = self
+            .correlated
+            .keys()
+            .chain(other.correlated.keys())
+            .copied()
+            .collect::<HashSet<_>>();
+        for &(data_binding, data_overlap) in &changed_data {
+            for &(bool_binding, fact_overlap) in &changed_facts {
+                if data_overlap == fact_overlap
+                    && matches!(data_overlap, Overlap::SelfIncluded | Overlap::OtherIncluded)
+                {
+                    continue;
+                }
+                candidates.insert((data_binding, bool_binding));
+            }
+        }
         let mut changed = false;
-        for (&key, pairs) in &other.relations {
-            let destination = self.relations.entry(key).or_default();
-            for &pair in pairs {
-                if destination.insert(pair) {
+        let mut unions = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            let previous = self.pairs(key.0, key.1);
+            let mut pairs = previous.clone();
+            for pair in other.pairs(key.0, key.1) {
+                pairs.insert(pair);
+            }
+            changed |= pairs.len() != previous.len();
+            unions.push((key, previous.len(), pairs));
+        }
+        let mut joined_reaching = self.reaching.clone();
+        let mut joined_facts = self.facts.clone();
+        for (&binding, reaching) in &other.reaching {
+            joined_reaching.entry(binding).or_default().extend(reaching);
+        }
+        for (&binding, facts) in &other.facts {
+            joined_facts.entry(binding).or_default().extend(facts);
+        }
+        // Keep an explicit union only where it says more than the product of
+        // the joined components: the product is the cheaper statement and it
+        // is exact wherever it holds.
+        let mut correlated = HashMap::default();
+        for (key, previous_len, pairs) in unions {
+            let is_product = match (joined_reaching.get(&key.0), joined_facts.get(&key.1)) {
+                (Some(reaching), Some(facts)) => pairs == product(reaching, facts),
+                _ => pairs.is_empty(),
+            };
+            if is_product {
+                continue;
+            }
+            // Charge the triples the union adds. The rest of the relation is
+            // what this state already stood for, whether it stated it as a
+            // product or as an explicit correlation, and it was charged when
+            // it arrived.
+            charge_pairs(budget, pairs.len().saturating_sub(previous_len))?;
+            correlated.insert(key, pairs);
+        }
+        self.correlated = correlated;
+        for (&binding, reaching) in &other.reaching {
+            let destination = self.reaching.entry(binding).or_default();
+            for &definition in reaching {
+                if destination.insert(definition) {
+                    charge_pairs(budget, 1)?;
+                    changed = true;
+                }
+            }
+        }
+        for (&binding, facts) in &other.facts {
+            let destination = self.facts.entry(binding).or_default();
+            for &fact in facts {
+                if destination.insert(fact) {
                     charge_pairs(budget, 1)?;
                     changed = true;
                 }
@@ -664,19 +1140,6 @@ impl FlowState {
         }
         Ok(changed)
     }
-}
-
-fn insert_pair(
-    state: &mut FlowState,
-    key: (ValueId, ValueId),
-    pair: Pair,
-    budget: &mut SemanticBudget,
-) -> Result<bool, CorrelationError> {
-    let inserted = state.relations.entry(key).or_default().insert(pair);
-    if inserted {
-        charge_pairs(budget, 1)?;
-    }
-    Ok(inserted)
 }
 
 #[derive(Debug, Default)]
@@ -733,91 +1196,45 @@ impl DefinitionTable {
         budget: &mut SemanticBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), CorrelationError> {
-        let data_binding_set = data_bindings.iter().copied().collect::<HashSet<_>>();
-        let bool_binding_set = bool_bindings.iter().copied().collect::<HashSet<_>>();
         for point in semantics.points() {
             check_cancelled(cancellation)?;
-            for (event_index, event) in point.events.iter().enumerate() {
+            budget.charge(SemanticWork {
+                events: point.events.len(),
+                ..SemanticWork::default()
+            })?;
+            for write in component_writes(
+                semantics,
+                point,
+                data_bindings,
+                bool_bindings,
+                open_bindings,
+            ) {
                 check_cancelled(cancellation)?;
-                budget.charge(SemanticWork {
-                    events: 1,
-                    ..SemanticWork::default()
-                })?;
-                match &event.effect {
-                    SemanticEffect::Assignment { target, value } => {
-                        let (target, value) = (*target, *value);
-                        if data_binding_set.contains(&target) {
-                            self.intern_data(DefinitionRecord {
-                                binding: target,
-                                point: point.id,
-                                event_index,
-                                rhs: Some(value),
-                            });
-                        }
-                        if bool_binding_set.contains(&target) {
-                            self.intern_boolean(BooleanDefinition {
-                                binding: target,
-                                point: point.id,
-                                event_index,
-                                rhs: Some(value),
-                            });
-                        }
-                    }
-                    SemanticEffect::ValueFlow {
-                        source,
-                        target,
-                        kind,
-                    } if bool_binding_set.contains(target)
-                        && kind.preserves_runtime_class()
-                        && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
-                    {
-                        self.intern_boolean(BooleanDefinition {
-                            binding: *target,
+                match write {
+                    ComponentWrite::Data {
+                        binding,
+                        event_index,
+                        rhs,
+                    } => {
+                        self.intern_data(DefinitionRecord {
+                            binding,
                             point: point.id,
                             event_index,
-                            rhs: Some(*source),
+                            rhs,
                         });
                     }
-                    effect => {
-                        for binding in unknown_write_bindings(effect, semantics, open_bindings) {
-                            if data_binding_set.contains(&binding) {
-                                self.intern_data(DefinitionRecord {
-                                    binding,
-                                    point: point.id,
-                                    event_index,
-                                    rhs: None,
-                                });
-                            }
-                            if bool_binding_set.contains(&binding) {
-                                self.intern_boolean(BooleanDefinition {
-                                    binding,
-                                    point: point.id,
-                                    event_index,
-                                    rhs: None,
-                                });
-                            }
-                        }
+                    ComponentWrite::Boolean {
+                        binding,
+                        event_index,
+                        rhs,
+                    } => {
+                        self.intern_boolean(BooleanDefinition {
+                            binding,
+                            point: point.id,
+                            event_index,
+                            rhs,
+                        });
                     }
-                }
-                if let Some(result) = produced_value(&event.effect)
-                    && data_binding_set.contains(&result)
-                {
-                    self.intern_data(DefinitionRecord {
-                        binding: result,
-                        point: point.id,
-                        event_index,
-                        rhs: None,
-                    });
-                }
-                if let Some(result) = produced_value(&event.effect)
-                    && bool_binding_set.contains(&result)
-                {
-                    self.intern_boolean(BooleanDefinition {
-                        binding: result,
-                        point: point.id,
-                        event_index,
-                        rhs: None,
-                    });
                 }
             }
         }
@@ -876,118 +1293,57 @@ fn transfer_point(
     cancellation: Option<&CancellationToken>,
 ) -> Result<FlowState, CorrelationError> {
     let point = semantics.point(point_id).expect("validated point exists");
-    for (event_index, event) in point.events.iter().enumerate() {
+    for write in component_writes(
+        semantics,
+        point,
+        data_bindings,
+        bool_bindings,
+        open_bindings,
+    ) {
         check_cancelled(cancellation)?;
-        match &event.effect {
-            SemanticEffect::Assignment { target, value } => {
-                let (target, value) = (*target, *value);
-                if data_bindings.binary_search(&target).is_ok() {
-                    let definition =
-                        definitions.data_definition(target, point_id, event_index, Some(value));
-                    replace_data_component(&mut state, target, definition);
-                }
-                if bool_bindings.binary_search(&target).is_ok() {
-                    let definition = BooleanDefinition {
-                        binding: target,
-                        point: point_id,
-                        event_index,
-                        rhs: Some(value),
-                    };
-                    replace_boolean_component(
-                        &mut state,
-                        target,
-                        Some(value),
-                        definition,
-                        semantics,
-                        bool_bindings,
-                        budget,
-                    )?;
-                }
+        match write {
+            ComponentWrite::Data {
+                binding,
+                event_index,
+                rhs,
+            } => {
+                let definition = definitions.data_definition(binding, point_id, event_index, rhs);
+                replace_data_component(&mut state, binding, definition);
             }
-            SemanticEffect::ValueFlow {
-                source,
-                target,
-                kind,
-            } if bool_bindings.binary_search(target).is_ok()
-                && kind.preserves_runtime_class()
-                && !is_assignment_transfer_marker(point, event_index, *source, *target) =>
-            {
+            ComponentWrite::Boolean {
+                binding,
+                event_index,
+                rhs,
+            } => {
                 let definition = BooleanDefinition {
-                    binding: *target,
+                    binding,
                     point: point_id,
                     event_index,
-                    rhs: Some(*source),
+                    rhs,
                 };
                 replace_boolean_component(
                     &mut state,
-                    *target,
-                    Some(*source),
+                    binding,
+                    rhs,
                     definition,
                     semantics,
                     bool_bindings,
                     budget,
                 )?;
             }
-            effect => {
-                for binding in unknown_write_bindings(effect, semantics, open_bindings) {
-                    if data_bindings.binary_search(&binding).is_ok() {
-                        let definition =
-                            definitions.data_definition(binding, point_id, event_index, None);
-                        replace_data_component(&mut state, binding, definition);
-                    }
-                    if bool_bindings.binary_search(&binding).is_ok() {
-                        let definition = BooleanDefinition {
-                            binding,
-                            point: point_id,
-                            event_index,
-                            rhs: None,
-                        };
-                        replace_boolean_component(
-                            &mut state,
-                            binding,
-                            None,
-                            definition,
-                            semantics,
-                            bool_bindings,
-                            budget,
-                        )?;
-                    }
-                }
-            }
-        }
-        if let Some(result) = produced_value(&event.effect)
-            && data_bindings.binary_search(&result).is_ok()
-            && !matches!(&event.effect, SemanticEffect::Assignment { .. })
-        {
-            let definition = definitions.data_definition(result, point_id, event_index, None);
-            replace_data_component(&mut state, result, definition);
-        }
-        if let Some(result) = produced_value(&event.effect)
-            && bool_bindings.binary_search(&result).is_ok()
-            && !matches!(&event.effect, SemanticEffect::Assignment { .. })
-        {
-            let definition = BooleanDefinition {
-                binding: result,
-                point: point_id,
-                event_index,
-                rhs: None,
-            };
-            replace_boolean_component(
-                &mut state,
-                result,
-                None,
-                definition,
-                semantics,
-                bool_bindings,
-                budget,
-            )?;
         }
     }
     Ok(state)
 }
 
 fn replace_data_component(state: &mut FlowState, binding: ValueId, definition: usize) {
-    for ((data_binding, _), pairs) in &mut state.relations {
+    if state.is_bottom() {
+        return;
+    }
+    state
+        .reaching
+        .insert(binding, [definition].into_iter().collect());
+    for ((data_binding, _), pairs) in &mut state.correlated {
         if *data_binding == binding {
             let replacement = pairs
                 .drain()
@@ -999,6 +1355,7 @@ fn replace_data_component(state: &mut FlowState, binding: ValueId, definition: u
             *pairs = replacement;
         }
     }
+    state.normalize();
 }
 
 fn replace_boolean_component(
@@ -1014,6 +1371,9 @@ fn replace_boolean_component(
     // correlation.  Direct intrinsic booleans are independent of the current
     // data binding and can therefore update every retained data definition.
     // Other sources become an explicit unknown component.
+    if state.is_bottom() {
+        return Ok(());
+    }
     let source_literal = source.and_then(|source| intrinsic_boolean(semantics, source));
     let source_is_tracked = source_literal.is_none()
         && source.is_some_and(|source| bool_bindings.binary_search(&source).is_ok());
@@ -1035,41 +1395,47 @@ fn replace_boolean_component(
             budget,
         );
     }
-    let relation_keys = state
-        .relations
-        .keys()
-        .copied()
-        .filter(|(_, boolean_binding)| *boolean_binding == target)
-        .collect::<Vec<_>>();
-    let data_bindings = relation_keys
-        .iter()
-        .map(|(data_binding, _)| *data_binding)
-        .collect::<Vec<_>>();
-
-    let source_pairs = state
-        .relations
-        .iter()
-        .filter(|((_, boolean_binding), _)| *boolean_binding == source.expect("tracked source"))
-        .map(|((data_binding, _), pairs)| (*data_binding, pairs.clone()))
-        .collect::<HashMap<_, _>>();
-
-    for data_binding in data_bindings {
-        let target_key = (data_binding, target);
-        let replacement = source_pairs.get(&data_binding).cloned().map(|pairs| {
-            pairs
-                .into_iter()
-                .map(|pair| Pair {
-                    data_definition: pair.data_definition,
-                    boolean_definition: definition,
-                    fact: pair.fact,
-                })
+    // The copy carries the source binding's relation, so the target's fact
+    // component and every correlation the source retained move with it under
+    // the new boolean definition.
+    let source = source.expect("tracked source");
+    let facts = state
+        .facts
+        .get(&source)
+        .map(|facts| {
+            facts
+                .iter()
+                .map(|&(_, fact)| (definition, fact))
                 .collect::<HashSet<_>>()
-        });
-        state.relations.insert(target_key, HashSet::default());
-        for pair in replacement.unwrap_or_default() {
-            insert_pair(state, target_key, pair, budget)?;
-        }
+        })
+        .unwrap_or_default();
+    let correlated = state
+        .correlated
+        .iter()
+        .filter(|((_, boolean_binding), _)| *boolean_binding == source)
+        .map(|(&(data_binding, _), pairs)| {
+            (
+                (data_binding, target),
+                pairs
+                    .iter()
+                    .map(|pair| Pair {
+                        boolean_definition: definition,
+                        ..*pair
+                    })
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    state
+        .correlated
+        .retain(|(_, boolean_binding), _| *boolean_binding != target);
+    charge_pairs(budget, facts.len())?;
+    state.facts.insert(target, facts);
+    for (key, pairs) in correlated {
+        charge_pairs(budget, pairs.len())?;
+        state.correlated.insert(key, pairs);
     }
+    state.normalize();
     Ok(())
 }
 
@@ -1080,39 +1446,20 @@ fn replace_boolean_fact_component(
     fact: BoolFact,
     budget: &mut SemanticBudget,
 ) -> Result<(), CorrelationError> {
-    let data_bindings = state
-        .relations
-        .keys()
-        .copied()
-        .filter(|(_, boolean_binding)| *boolean_binding == target)
-        .map(|(data_binding, _)| data_binding)
-        .collect::<Vec<_>>();
-    for data_binding in data_bindings {
-        let target_key = (data_binding, target);
-        let replacement = current_data_definitions(state, data_binding)
-            .into_iter()
-            .map(|data_definition| Pair {
-                data_definition,
-                boolean_definition: definition,
-                fact,
-            })
-            .collect::<HashSet<_>>();
-        state.relations.insert(target_key, HashSet::default());
-        for pair in replacement {
-            insert_pair(state, target_key, pair, budget)?;
-        }
+    if state.is_bottom() {
+        return Ok(());
     }
+    // One definition with one fact reaches every data definition of every
+    // binding: the write says nothing about which data definition holds, so
+    // the pair's relation is the product again.
+    state
+        .correlated
+        .retain(|(_, boolean_binding), _| *boolean_binding != target);
+    charge_pairs(budget, 1)?;
+    state
+        .facts
+        .insert(target, [(definition, fact)].into_iter().collect());
     Ok(())
-}
-
-fn current_data_definitions(state: &FlowState, data_binding: ValueId) -> Vec<usize> {
-    let mut definitions = HashSet::default();
-    for ((binding, _), pairs) in &state.relations {
-        if *binding == data_binding {
-            definitions.extend(pairs.iter().map(|pair| pair.data_definition));
-        }
-    }
-    definitions.into_iter().collect()
 }
 
 fn intrinsic_boolean(
@@ -1305,16 +1652,20 @@ mod correlation_properties {
         let mut actual = FlowState::default();
         let mut reference = ReferenceState::default();
         for &data_binding in data_bindings {
+            actual
+                .reaching
+                .insert(data_binding, [0].into_iter().collect());
+        }
+        for &boolean_binding in boolean_bindings {
+            actual.facts.insert(
+                boolean_binding,
+                [(boolean_definition(0, boolean_binding), BoolFact::Unknown)]
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        for &data_binding in data_bindings {
             for &boolean_binding in boolean_bindings {
-                let pair = Pair {
-                    data_definition: 0,
-                    boolean_definition: boolean_definition(0, boolean_binding),
-                    fact: BoolFact::Unknown,
-                };
-                actual.relations.insert(
-                    (data_binding, boolean_binding),
-                    [pair].into_iter().collect(),
-                );
                 reference.relations.insert(
                     (data_binding, boolean_binding),
                     vec![ReferencePair {
@@ -1377,22 +1728,28 @@ mod correlation_properties {
         }
     }
 
-    fn actual_signature(state: &FlowState) -> Vec<(ValueId, ValueId, usize, usize, BoolFact)> {
-        let mut signature = state
-            .relations
-            .iter()
-            .flat_map(|(&(data_binding, boolean_binding), pairs)| {
-                pairs.iter().map(move |pair| {
-                    (
+    /// The relation the factored state stands for, pair by pair, so the
+    /// reference model can compare against the same tuples the consumer
+    /// reads.
+    fn actual_signature(
+        state: &FlowState,
+        data_bindings: &[ValueId],
+        boolean_bindings: &[ValueId],
+    ) -> Vec<(ValueId, ValueId, usize, usize, BoolFact)> {
+        let mut signature = Vec::new();
+        for &data_binding in data_bindings {
+            for &boolean_binding in boolean_bindings {
+                for pair in state.pairs(data_binding, boolean_binding) {
+                    signature.push((
                         data_binding,
                         boolean_binding,
                         pair.data_definition,
                         pair.boolean_definition.event_index,
                         pair.fact,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+                    ));
+                }
+            }
+        }
         signature.sort_unstable();
         signature
     }
@@ -1508,6 +1865,14 @@ mod correlation_properties {
             definition: u16,
             fact: BoolFact,
         },
+        /// Two branches that disagree about the data component and about the
+        /// boolean component. Their union is the one relation the factored
+        /// state cannot state as a product of its components.
+        JoinCorrelated {
+            binding: u8,
+            definition: u16,
+            fact: BoolFact,
+        },
     }
 
     impl TraceOperation {
@@ -1516,7 +1881,8 @@ mod correlation_properties {
                 Self::ReplaceData { binding, .. }
                 | Self::ReplaceBoolean { binding, .. }
                 | Self::JoinData { binding, .. }
-                | Self::JoinBoolean { binding, .. } => binding as usize,
+                | Self::JoinBoolean { binding, .. }
+                | Self::JoinCorrelated { binding, .. } => binding as usize,
             }
         }
     }
@@ -1549,14 +1915,126 @@ mod correlation_properties {
                     definition,
                 }
             }),
+            (binding.clone(), definition.clone(), fact.clone()).prop_map(
+                |(binding, definition, fact)| TraceOperation::JoinBoolean {
+                    binding,
+                    definition,
+                    fact,
+                }
+            ),
             (binding, definition, fact).prop_map(|(binding, definition, fact)| {
-                TraceOperation::JoinBoolean {
+                TraceOperation::JoinCorrelated {
                     binding,
                     definition,
                     fact,
                 }
             }),
         ]
+    }
+
+    /// The reduced graph must preserve reachability between carried points.
+    ///
+    /// The oracle is independent of the reduction: plain breadth-first search
+    /// over the whole generated CFG. If the two relations agree for every
+    /// carried source, then a fixpoint over the reduced graph reaches exactly
+    /// the carried points a fixpoint over the whole CFG reaches, which is what
+    /// makes storing state only at carried points equivalent.
+    fn reachable_in_full_graph(
+        successors: &[Vec<ProgramPointId>],
+        from: usize,
+    ) -> std::collections::BTreeSet<usize> {
+        // Reachability along one or more edges, so a cycle reports its own
+        // entry point exactly as the reduced closure does.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut visited = vec![false; successors.len()];
+        let mut queue = VecDeque::from([from]);
+        while let Some(point) = queue.pop_front() {
+            for target in &successors[point] {
+                if !visited[target.index()] {
+                    visited[target.index()] = true;
+                    seen.insert(target.index());
+                    queue.push_back(target.index());
+                }
+            }
+        }
+        seen
+    }
+
+    /// A carried marking the production rule can produce: every point two or
+    /// more edges reach is carried, and any other point may be.
+    fn graph_strategy() -> impl Strategy<Value = (Vec<Vec<ProgramPointId>>, Vec<bool>)> {
+        (2_usize..=8)
+            .prop_flat_map(|point_count| {
+                (
+                    Just(point_count),
+                    prop::collection::vec(
+                        prop::collection::vec(0_usize..point_count, 0..=3),
+                        point_count,
+                    ),
+                    prop::collection::vec(any::<bool>(), point_count),
+                )
+            })
+            .prop_map(|(point_count, edges, extra)| {
+                let successors = edges
+                    .into_iter()
+                    .map(|targets| {
+                        let mut targets = targets
+                            .into_iter()
+                            .map(|target| ProgramPointId::new(target as u32))
+                            .collect::<Vec<_>>();
+                        targets.sort_unstable();
+                        targets.dedup();
+                        targets
+                    })
+                    .collect::<Vec<_>>();
+                let mut predecessors = vec![0usize; point_count];
+                for targets in &successors {
+                    for target in targets {
+                        predecessors[target.index()] += 1;
+                    }
+                }
+                let mut carried = extra;
+                carried[0] = true;
+                for (index, count) in predecessors.iter().enumerate() {
+                    if *count >= 2 {
+                        carried[index] = true;
+                    }
+                }
+                (successors, carried)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+        #[test]
+        fn reduced_graph_preserves_carried_reachability(
+            (successors, carried) in graph_strategy()
+        ) {
+            let mut budget = SemanticBudget::uniform(100_000).expect("positive test budget");
+            let reduced = carried_successors(&successors, &carried, &mut budget, None)
+                .expect("a small reduced graph stays within budget");
+
+            for source in 0..carried.len() {
+                if !carried[source] {
+                    prop_assert!(reduced[source].is_empty());
+                    continue;
+                }
+                let mut closure = std::collections::BTreeSet::new();
+                let mut queue = VecDeque::from([source]);
+                while let Some(point) = queue.pop_front() {
+                    for target in &reduced[point] {
+                        if closure.insert(target.index()) {
+                            queue.push_back(target.index());
+                        }
+                    }
+                }
+                let expected = reachable_in_full_graph(&successors, source)
+                    .into_iter()
+                    .filter(|point| carried[*point])
+                    .collect::<std::collections::BTreeSet<_>>();
+                prop_assert_eq!(closure, expected);
+            }
+        }
     }
 
     // Exercises short generated finite traces. The reference keeps sorted
@@ -1637,9 +2115,39 @@ mod correlation_properties {
                         .expect("finite loop join stays within budget");
                     reference.join(&branch_reference);
                 }
+                TraceOperation::JoinCorrelated {
+                    definition, fact, ..
+                } => {
+                    let mut data_actual = actual.clone();
+                    let mut data_reference = reference.clone();
+                    replace_data_component(&mut data_actual, data_binding, definition as usize);
+                    reference_replace_data(&mut data_reference, data_binding, definition as usize);
+                    let mut boolean_actual = actual.clone();
+                    let mut boolean_reference = reference.clone();
+                    replace_boolean_fact_component(
+                        &mut boolean_actual,
+                        boolean_binding,
+                        boolean_definition(definition as usize, boolean_binding),
+                        fact,
+                        &mut budget,
+                    )
+                    .expect("finite correlated branch stays within budget");
+                    reference_replace_boolean_fact(
+                        &mut boolean_reference,
+                        boolean_binding,
+                        definition as usize,
+                        fact,
+                    );
+                    data_actual
+                        .join(&boolean_actual, &mut budget)
+                        .expect("finite correlated join stays within budget");
+                    data_reference.join(&boolean_reference);
+                    actual = data_actual;
+                    reference = data_reference;
+                }
             }
                 assert_eq!(
-                    actual_signature(&actual),
+                    actual_signature(&actual, &data_bindings, &boolean_bindings),
                     reference_signature(&reference),
                     "relation mismatch at step {step}"
                 );
@@ -1673,7 +2181,7 @@ mod correlation_properties {
                 .join(&body_actual, &mut budget)
                 .expect("fixed loop join stays within budget");
             reference.join(&body_reference);
-            let actual_signature_now = actual_signature(&actual);
+            let actual_signature_now = actual_signature(&actual, &data_bindings, &boolean_bindings);
             let reference_signature_now = reference_signature(&reference);
             if let Some(previous) = &previous_actual {
                 assert_eq!(
@@ -1694,10 +2202,7 @@ mod correlation_properties {
 
         for &data_binding in &data_bindings {
             for &boolean_binding in &boolean_bindings {
-                let actual_pairs = actual
-                    .relations
-                    .get(&(data_binding, boolean_binding))
-                    .expect("relation key remains present");
+                let actual_pairs = actual.pairs(data_binding, boolean_binding);
                 let reference_pairs = reference
                     .relations
                     .get(&(data_binding, boolean_binding))
@@ -1708,7 +2213,7 @@ mod correlation_properties {
                         boolean_binding,
                         expected,
                         data_binding,
-                        actual_pairs,
+                        &actual_pairs,
                         &definitions,
                     );
                     let expected_signature = reference_candidate(expected, reference_pairs);

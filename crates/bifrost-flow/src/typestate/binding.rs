@@ -1862,6 +1862,23 @@ fn validate_observation_shape(
             matches!(site, TypestateObservationSite::ProgramPoint { .. })
                 && role == TypestateObjectRole::EscapedObject
         }
+        ProtocolEventOccurrence::SuspensionBoundary => {
+            let TypestateObservationSite::ProgramPoint { point, .. } = site else {
+                return Err(TypestateBindingPlanError::InvalidObservationShape);
+            };
+            let point = point
+                .procedure()
+                .semantics()
+                .point(point.id())
+                .expect("validated program point handle resolves");
+            role == TypestateObjectRole::CurrentObject
+                && point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        crate::analyzer::semantic::SemanticEffect::AsyncSuspend { .. }
+                    )
+                })
+        }
         ProtocolEventOccurrence::ProcedureExit { kind } => {
             role == TypestateObjectRole::CurrentObject && site_has_exit_kind(site, *kind)
         }

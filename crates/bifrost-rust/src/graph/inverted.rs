@@ -932,7 +932,7 @@ fn collect_param_patterns(params: Node<'_>, source: &str, out: &mut HashSet<Stri
     let mut cursor = params.walk();
     for child in params.named_children(&mut cursor) {
         match child.kind() {
-            "self_parameter" => {}
+            "self_parameter" | "attributes" | "line_comment" | "block_comment" => {}
             "parameter" => {
                 if let Some(pattern) = child.child_by_field_name("pattern") {
                     collect_pattern_bindings(pattern, source, out);
@@ -1254,4 +1254,24 @@ fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         true,
         &crate::declarations::RUST_IDENTIFIER_SIGIL,
     )
+}
+
+#[cfg(test)]
+mod parameter_attribute_tests {
+    use super::*;
+
+    #[test]
+    fn parameter_attributes_do_not_shadow_names_in_usage_scopes() {
+        let source = "fn f(#[Marker] actual: u8, neighbor: u8) {}";
+        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        assert!(!tree.root_node().has_error());
+        let function = crate::syntax::unwrap_attributes(tree.root_node().named_child(0).unwrap());
+        let parameters = function.child_by_field_name("parameters").unwrap();
+        let mut bindings = HashSet::default();
+        collect_param_patterns(parameters, source, &mut bindings);
+        assert_eq!(
+            bindings,
+            HashSet::from_iter(["actual".to_owned(), "neighbor".to_owned()])
+        );
+    }
 }

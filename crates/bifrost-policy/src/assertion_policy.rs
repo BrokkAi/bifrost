@@ -90,6 +90,7 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_json(&query).expect("valid inline query"),
+            resolved_locators: Vec::new(),
         }
     }
 

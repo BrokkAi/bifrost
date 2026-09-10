@@ -7,11 +7,15 @@
   :severity warning
   :analysis
     (analysis
+      :languages [jvm java kotlin scala]
+      :where ["src/**"]
+      :rql-schema-version 1
       :type match
       :selector
         (rql
-          (language python
-            (call :callee (name/regex "eval\\("))))))
+          (language java
+            (where "src/app/**"
+              (call :callee (name/regex "eval\\(")))))))
 
 ; Explicit caller subset contracts remain native RQL within policy selectors.
 (policy
@@ -35,11 +39,34 @@
   :severity warning
   :analysis
     (analysis
+      :languages [js-ts]
       :type taint
       :mode may
       :call-modeling (call-modeling :unmodeled optimistic)
       :sources (endpoint-set)
       :sinks (endpoint-set)))
+
+; Semantic typestate records use the same conservative record and keyword scopes.
+(policy
+  :id "bifrost.security.suspension-boundary"
+  :name "Suspension boundary"
+  :message "Example"
+  :severity warning
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :subjects (subject-set)
+      :uncertainty (uncertainty :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open closed]
+          :initial open
+          :accepting-states [closed]
+          :error-states [open]
+          :events [(event :id suspend
+                    :on (suspension-boundary :scope analysis-root))]
+          :transitions [(transition :from open :on suspend :to closed)]))))
 
 ; Deferred selectors are policy syntax, not embedded RQL source.
 (endpoint
@@ -52,20 +79,36 @@
   :binding return-value
   :supersedes [])
 
-; Exact call-binding policy sugar keeps model member and receiver identities opaque.
-(policy
-  :id "bifrost.security.modeled-call"
+; Exact call-binding endpoint selectors are native RQL pipelines.
+(endpoint
+  :id "bifrost.sources.modeled-call"
   :name "Modeled call"
+  :display-name "Modeled call timeout"
+  :role source
+  :categories [input.external]
+  :selector
+    (rql
+      (call-argument :formal-name "timeout"
+        (resolved-call
+          :resolves-to member.widget.send
+          :receiver-type (assignable-to "Widget")
+          :proof exact
+          (call-bindings (call-shape (call :callee "send"))))))
+  :binding (argument :name "timeout"))
+
+; Relational call records remain available to assertion plans.
+(policy
+  :id "bifrost.assertions.modeled-call"
+  :name "Modeled call assertion"
   :message "Example"
   :severity warning
   :analysis
     (analysis
+      :languages [js-ts javascript typescript]
+      :rql-schema-version 1
       :type assertion
-      (bind :name calls
-        :query (rql
-          (call-bindings (call-shape (call :callee "send")))))
-      (call :over calls
-        :resolves-to member.widget.send
-        :receiver-type type.widget
-        :proof exact)
+      (bind :name calls :query
+        (rql (call-bindings (call-shape (call :callee "send")))))
+      (call :over calls :resolves-to "Widget.send" :proof exact
+        :receiver-type (assignable-to "Widget"))
       (call-argument :over calls :formal-name "timeout")))

@@ -526,6 +526,7 @@ impl ControlRelationTraversalCache {
                     relations.generation,
                     uncovered_relations(&relations.completeness).join(", ")
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
     }

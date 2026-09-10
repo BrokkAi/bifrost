@@ -1131,6 +1131,7 @@ pub(super) fn append_diagnostic_terminations(
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
             | CodeQueryDiagnosticCode::CallBindingDispatchPartial
+            | CodeQueryDiagnosticCode::CallBindingSelectorRejected
             | CodeQueryDiagnosticCode::SemanticProviderFailed
             | CodeQueryDiagnosticCode::UnresolvedProtocolReference
             | CodeQueryDiagnosticCode::TypestateRegistrationStale

@@ -48,6 +48,7 @@ code_query_labeled_enum! {
         SemanticCapabilityUnsupported => "semantic_capability_unsupported",
         SemanticAnalysisPartial => "semantic_analysis_partial",
         CallBindingDispatchPartial => "call_binding_dispatch_partial",
+        CallBindingSelectorRejected => "call_binding_selector_rejected",
         SemanticBudgetExhausted => "semantic_budget_exhausted",
         SemanticProviderFailed => "semantic_provider_failed",
         UnresolvedProtocolReference => "unresolved_protocol_reference",
@@ -150,6 +151,99 @@ pub struct CodeQueryDiagnostic {
     pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
+    /// Every root or file whose exhausted work produced this diagnostic.
+    ///
+    /// A budget diagnostic that says only that some budget ran out cannot be
+    /// acted on: attributing one required an instrumented build (#3194). The
+    /// list carries the complete attribution, and the message renders it one
+    /// line per entry up to the prose bound a policy report allows. Empty for
+    /// every diagnostic that is not about exhausted work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+}
+
+/// One root or file whose work stopped against a named limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeQueryExhaustedRoot {
+    /// The workspace-relative path of the file the work belonged to.
+    pub path: String,
+    /// The qualified name of the procedure that was the analysis root.
+    /// Absent when the exhausted work is file-scoped rather than per root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<String>,
+    /// The exhausted lane, `<budget>/<dimension>`, for example
+    /// `solver/reached_states`, `semantic/nested_entries`, or
+    /// `semantic/retained_bytes`.
+    pub lane: String,
+    /// The stage of the analysis that charged the lane, for example
+    /// `plan_refinement` or `value_flow_solve`. Absent when the emitting
+    /// analysis has one stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// The charge that did not fit, and the limit it was checked against.
+    /// Absent when the producing code records the stop without a charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge: Option<CodeQueryExhaustedCharge>,
+    /// The feedback iteration whose plan produced the stop, counting from
+    /// zero. Absent for an analysis without feedback iterations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_iteration: Option<usize>,
+}
+
+/// The exact charge one lane refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeQueryExhaustedCharge {
+    pub attempted: usize,
+    pub limit: usize,
+}
+
+impl CodeQueryExhaustedRoot {
+    /// The one-line rendering the diagnostic message carries.
+    pub fn render(&self) -> String {
+        let mut line = self.path.clone();
+        if let Some(procedure) = &self.procedure {
+            line.push_str(&format!(" {procedure}"));
+        }
+        line.push_str(&format!(" lane {}", self.lane));
+        if let Some(stage) = &self.stage {
+            line.push_str(&format!(" stage {stage}"));
+        }
+        match self.charge {
+            Some(charge) => line.push_str(&format!(
+                " charged {} limit {}",
+                charge.attempted, charge.limit
+            )),
+            None => line.push_str(" charge unrecorded"),
+        }
+        if let Some(iteration) = self.feedback_iteration {
+            line.push_str(&format!(" iteration {iteration}"));
+        }
+        line
+    }
+}
+
+/// Render one exhausted-work diagnostic message: the reason, then one line
+/// per attributed entry, bounded by `max_bytes` so a policy report keeps the
+/// prose it validates (`MAX_REPORT_PROSE_BYTES`). Entries the bound cuts stay
+/// in `exhausted_roots`.
+pub fn render_exhausted_roots(
+    reason: &str,
+    roots: &[CodeQueryExhaustedRoot],
+    max_bytes: usize,
+) -> String {
+    let noun = if roots.len() == 1 { "root" } else { "roots" };
+    let mut message = format!("{reason} in {} {noun}", roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        let line = format!("\n- {}", root.render());
+        let remaining = roots.len() - index;
+        let elision = format!("\n- [{remaining} more in exhausted_roots]");
+        if message.len() + line.len() + elision.len() > max_bytes {
+            message.push_str(&elision);
+            break;
+        }
+        message.push_str(&line);
+    }
+    message
 }
 
 /// Read one diagnostic back, resolving its language label to the one static
@@ -174,6 +268,8 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             branch: Vec<usize>,
             language: String,
             message: String,
+            #[serde(default)]
+            exhausted_roots: Vec<CodeQueryExhaustedRoot>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -189,6 +285,7 @@ impl<'de> Deserialize<'de> for CodeQueryDiagnostic {
             branch: wire.branch,
             language,
             message: wire.message,
+            exhausted_roots: wire.exhausted_roots,
         })
     }
 }
@@ -952,6 +1049,10 @@ pub struct CodeQueryTypeFlowWork {
     /// for every sink in the current plan.
     pub root_summary_observation_rejections: u64,
     pub published_summaries: u64,
+    /// Independently bounded solver runs performed across all input roots.
+    /// A source-refined root may contribute both an exploratory and a refined
+    /// solve while `solves` remains the number of distinct root transactions.
+    pub solver_attempts: u64,
     #[serde(
         skip_serializing_if = "brokk_bifrost_flow::type_flow::TypeFlowSummaryProfile::is_empty"
     )]
@@ -994,6 +1095,7 @@ impl CodeQueryTypeFlowWork {
             && self.root_summary_cache_hits == 0
             && self.root_summary_observation_rejections == 0
             && self.published_summaries == 0
+            && self.solver_attempts == 0
             && self.summary_profile.is_empty()
             && self.class_set_rows == 0
             && self.finding_rows == 0
@@ -1077,6 +1179,7 @@ impl CodeQueryTypeFlowWork {
             published_summaries: self
                 .published_summaries
                 .saturating_sub(earlier.published_summaries),
+            solver_attempts: self.solver_attempts.saturating_sub(earlier.solver_attempts),
             summary_profile: self.summary_profile.saturating_sub(earlier.summary_profile),
             class_set_rows: self.class_set_rows.saturating_sub(earlier.class_set_rows),
             finding_rows: self.finding_rows.saturating_sub(earlier.finding_rows),
@@ -1167,6 +1270,7 @@ impl CodeQueryTypeFlowWork {
             published_summaries: self
                 .published_summaries
                 .saturating_add(other.published_summaries),
+            solver_attempts: self.solver_attempts.saturating_add(other.solver_attempts),
             summary_profile: self.summary_profile.saturating_add(other.summary_profile),
             class_set_rows: self.class_set_rows.saturating_add(other.class_set_rows),
             finding_rows: self.finding_rows.saturating_add(other.finding_rows),
@@ -1287,6 +1391,7 @@ mod type_flow_summary_profile_tests {
         assert_eq!(legacy.root_result_publications, 0);
         assert_eq!(legacy.root_summary_cache_hits, 0);
         assert_eq!(legacy.root_summary_observation_rejections, 0);
+        assert_eq!(legacy.solver_attempts, 0);
 
         let mut work = CodeQueryTypeFlowWork::default();
         work.summary_profile.lookup_relation = 3;

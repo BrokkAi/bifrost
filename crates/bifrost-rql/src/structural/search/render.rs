@@ -475,6 +475,7 @@ pub(super) fn render_provenance(
                         CodeQueryResultRef::ProcedureEffect {
                             id: rendered.id,
                             procedure_id: rendered.procedure_id,
+                            site_id: rendered.site_id,
                             path: rendered.path,
                             range: rendered.range,
                             effect_id: rendered.effect_id,
@@ -487,6 +488,7 @@ pub(super) fn render_provenance(
                         CodeQueryResultRef::CallableSignature {
                             id: rendered.id,
                             declaration_id: rendered.declaration.id,
+                            site_id: rendered.site_id,
                             path: rendered.path,
                             range: rendered.range,
                             role: rendered.role,
@@ -646,14 +648,8 @@ pub(super) fn render_declaration_ref(
     let kind = declaration.kind_label();
     let full = !detail.is_compact();
     CodeQueryResultRef::Declaration {
-        id: full.then(|| {
-            declaration_id(
-                &path,
-                declaration.identity_kind_label(),
-                &fq_name,
-                declaration.range,
-            )
-        }),
+        id: full.then(|| declaration.declaration_id()),
+        site_id: full.then(|| declaration.site_id()),
         path,
         kind,
         fq_name,
@@ -677,19 +673,11 @@ pub(super) fn render_reference_site_ref(
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryResultRef {
-    let target_path = rel_path_string(site.target.unit.source());
     let target_fq_name = site.target.unit.fq_name();
     CodeQueryResultRef::ReferenceSite {
         path: rel_path_string(&site.file),
         range: render_reference_range(analyzer, site, cache),
-        target_id: (!detail.is_compact()).then(|| {
-            declaration_id(
-                &target_path,
-                site.target.identity_kind_label(),
-                &target_fq_name,
-                site.target.range,
-            )
-        }),
+        target_id: (!detail.is_compact()).then(|| site.target.declaration_id()),
         target_fq_name,
         usage_kind: (site.usage_kind != UsageHitKind::Reference)
             .then(|| site.usage_kind.wire_label()),
@@ -1668,36 +1656,10 @@ pub(super) fn render_declaration(
         .signature()
         .map(str::to_string)
         .or_else(|| analyzer.signatures_of(&declaration.unit).into_iter().next());
-    let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
-        let matched = overlay.symbols_named(&fq_name);
-        if matched.disposition
-            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
-        {
-            return None;
-        }
-        let symbol = matched.records[0];
-        let exact_origin = declaration.unit.is_synthetic()
-            || matches!(
-                &symbol.location,
-                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
-                    if anchor.path == path && anchor.symbol == fq_name
-            );
-        exact_origin.then(|| (symbol.id.clone(), Box::new(symbol.provenance.clone())))
-    });
+    let semantic_model = exact_semantic_model_declaration(analyzer, declaration, &path, &fq_name);
     CodeQueryDeclaration {
-        id: full.then(|| {
-            semantic_model
-                .as_ref()
-                .map(|(id, _)| id.clone())
-                .unwrap_or_else(|| {
-                    declaration_id(
-                        &path,
-                        declaration.identity_kind_label(),
-                        &fq_name,
-                        declaration.range,
-                    )
-                })
-        }),
+        id: full.then(|| declaration.declaration_id()),
+        site_id: full.then(|| declaration.site_id()),
         path,
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
             .config_label(),
@@ -1711,6 +1673,33 @@ pub(super) fn render_declaration(
             .flatten(),
         semantic_model: semantic_model.map(|(_, provenance)| provenance),
     }
+}
+
+fn exact_semantic_model_declaration(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    path: &str,
+    fq_name: &str,
+) -> Option<(
+    String,
+    Box<crate::analyzer::semantic_model::SemanticModelProvenance>,
+)> {
+    analyzer.semantic_model_overlay().and_then(|overlay| {
+        let matched = overlay.symbols_named(fq_name);
+        if matched.disposition
+            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        {
+            return None;
+        }
+        let symbol = matched.records[0];
+        let exact_origin = declaration.unit.is_synthetic()
+            || matches!(
+                &symbol.location,
+                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                    if anchor.path == path && anchor.symbol == fq_name
+            );
+        exact_origin.then(|| (symbol.id.clone(), Box::new(symbol.provenance.clone())))
+    })
 }
 
 pub(super) fn augment_public_result_with_semantic_overlay(
@@ -1844,7 +1833,10 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                     start_line: range.start_line,
                     end_line: range.end_line,
                     signature: symbol.signature.clone(),
-                    id: (!query.result_detail.is_compact()).then(|| symbol.id.clone()),
+                    // A semantic-wire declaration has no analyzer CodeUnit and
+                    // therefore cannot truthfully publish a DeclarationId.
+                    id: None,
+                    site_id: None,
                     node_range: None,
                     semantic_model: Some(Box::new(symbol.provenance.clone())),
                 },
@@ -1870,6 +1862,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
             message:
                 "semantic-model declaration conflict prevented an authoritative CodeQuery result"
                     .to_string(),
+            exhausted_roots: Vec::new(),
         });
     }
 }
@@ -2693,6 +2686,7 @@ pub(super) fn render_call_binding(
             .target
             .as_ref()
             .map(|target| render_declaration(analyzer, target, detail, cache)),
+        declared_target_id: value.site.declared_target_id.clone(),
         semantic_target_id: value.site.semantic_target_id.clone(),
         target_origin: value.site.target_origin,
         dispatch_outcome: value.site.dispatch.outcome,
@@ -3148,6 +3142,7 @@ pub(super) fn render_procedure_effect(
     CodeQueryProcedureEffect {
         id: row.id.clone(),
         procedure_id: row.procedure_declaration_id.clone(),
+        site_id: declaration.site_id(),
         procedure_name: row.procedure_name.clone(),
         path: rel_path_string(declaration.unit.source()),
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
@@ -3192,6 +3187,7 @@ pub(super) fn render_callable_signature(
     let file = value.file();
     CodeQueryCallableSignature {
         id: signature.id.clone(),
+        site_id: value.declaration.site_id(),
         path: rel_path_string(file),
         language: crate::analyzer::common::language_for_file(file).config_label(),
         range: render_source_range(analyzer, file, &value.declaration.range, cache),
@@ -3255,33 +3251,28 @@ pub(super) fn render_receiver_evidence(
     };
     let declaration =
         declaration_unit.map(|unit| declaration_value_for_unit(analyzer, unit, fallback));
+    let semantic_model = declaration.as_ref().and_then(|declaration| {
+        exact_semantic_model_declaration(
+            analyzer,
+            declaration,
+            &rel_path_string(declaration.unit.source()),
+            &declaration.unit.fq_name(),
+        )
+    });
     let rendered_declaration = declaration.as_ref().map(|declaration| {
         render_declaration(analyzer, declaration, CodeQueryResultDetail::Full, cache)
     });
     let rendered_declaration_id = rendered_declaration
         .as_ref()
         .and_then(|declaration| declaration.id.clone());
-    let model_id = rendered_declaration.as_ref().and_then(|declaration| {
-        declaration
-            .semantic_model
-            .as_ref()
-            .and_then(|_| declaration.id.clone())
-    });
-    let pack_id = rendered_declaration.as_ref().and_then(|declaration| {
-        declaration
-            .semantic_model
-            .as_ref()
-            .map(|provenance| provenance.pack_id.clone())
-    });
-    let factory_id = value.factory.as_ref().map(|factory| {
-        let declaration = declaration_value_for_unit(analyzer, factory, fallback);
-        declaration_id(
-            &rel_path_string(declaration.unit.source()),
-            declaration.identity_kind_label(),
-            &declaration.unit.fq_name(),
-            declaration.range,
-        )
-    });
+    let model_id = semantic_model.as_ref().map(|(id, _)| id.clone());
+    let pack_id = semantic_model
+        .as_ref()
+        .map(|(_, provenance)| provenance.pack_id.clone());
+    let factory_id = value
+        .factory
+        .as_ref()
+        .map(|factory| factory.declaration_id().to_string());
     let proof = match &value.receiver.report.analysis {
         ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(_)) => "precise",
         _ => "ambiguous",
@@ -3462,13 +3453,6 @@ pub(super) fn render_source_range(
         })
 }
 
-pub(super) fn declaration_id(path: &str, kind: &str, fq_name: &str, range: Range) -> String {
-    format!(
-        "{path}:{kind}:{fq_name}:{}-{}",
-        range.start_byte, range.end_byte
-    )
-}
-
 pub(super) fn range_for_offsets(
     source: &str,
     line_starts: &[usize],
@@ -3561,6 +3545,7 @@ pub(super) fn push_budget_diagnostic(
         branch: Vec::new(),
         language: "workspace",
         message: "query_code execution budget exhausted before the query finished; refine the query with where, languages, kind/name anchors, or a narrower pattern".to_string(),
+    exhausted_roots: Vec::new(),
     });
 }
 
@@ -3581,6 +3566,7 @@ pub(super) fn push_pipeline_budget_diagnostic(
         branch: Vec::new(),
         language: "workspace",
         message: "query_code pipeline budget exhausted while producing seed and edge rows; refine the match, where, or languages filters".to_string(),
+    exhausted_roots: Vec::new(),
     });
 }
 
@@ -3608,6 +3594,7 @@ pub(super) fn push_import_graph_budget_diagnostic(
         branch: Vec::new(),
         language: "workspace",
         message: "query_code import graph budget exhausted while resolving files and direct edges; import traversal results are partial".to_string(),
+    exhausted_roots: Vec::new(),
     });
 }
 
@@ -3625,6 +3612,7 @@ pub(super) fn push_truncation_diagnostic(
         message: format!(
             "query_code reached the query limit of {limit} and returned the first {limit} results; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern"
         ),
+    exhausted_roots: Vec::new(),
     });
 }
 
@@ -3651,6 +3639,7 @@ pub(super) fn push_broad_query_diagnostic(
         branch: Vec::new(),
         language: "workspace",
         message: "broad unanchored query_code query scanned the workspace without a source anchor; add where, languages, exact name predicates, or a more specific pattern to reduce work and output".to_string(),
+    exhausted_roots: Vec::new(),
     });
 }
 
@@ -3659,7 +3648,7 @@ pub(super) fn file_matches_globs(file: &ProjectFile, query: &CodeQuerySeed) -> b
         return true;
     }
     let rel_path = rel_path_string(file);
-    query.where_globs.iter().any(|glob| glob.matches(&rel_path))
+    query.where_globs.matches(&rel_path)
 }
 
 pub(super) fn render_match(

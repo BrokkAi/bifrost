@@ -249,6 +249,13 @@ Each result records:
    or continuation boundaries.
 4. **Path quality:** the proof and completeness of each concrete retained path.
 
+Those are internal engine dimensions. A public `flow_endpoint` projects them to
+one documented status and optional reason: semantic and solver limits stay
+distinguishable, while internal termination enum names are not exposed as the
+wire contract. Reachability, exact/may certainty, and ambiguity remain separate
+facts about the endpoint. The endpoint has no `must` field until a must analysis
+exists.
+
 Path alternatives follow the shared
 [proof and completeness contract](../evidence-and-results/#proof-and-completeness):
 the solver keeps incomparable concrete paths separate. Only a concrete

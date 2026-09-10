@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
+use crate::query::QueryPathScope;
 
 #[derive(Clone)]
 pub(super) enum SeedStructuralAccess {
@@ -455,7 +456,7 @@ pub(super) fn prepare_seed_access(
 pub(super) fn seed_scan_files(
     state: &QueryExecutionState<'_>,
     languages: &[Language],
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
 ) -> Vec<ProjectFile> {
     let mut files: Vec<ProjectFile> = match state.scope.seed_files() {
         Some(seed_files) => seed_files
@@ -478,14 +479,11 @@ pub(super) fn seed_scan_files(
 fn seed_file_in_scope(
     file: &ProjectFile,
     languages: &[Language],
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
 ) -> bool {
     let language = crate::analyzer::common::language_for_file(file);
     (languages.is_empty() || languages.contains(&language))
-        && (where_globs.is_empty() || {
-            let path = rel_path_string(file);
-            where_globs.iter().any(|glob| glob.matches(&path))
-        })
+        && where_globs.matches(&rel_path_string(file))
 }
 
 /// The whole-workspace enumeration the structural seed still needs for its
@@ -612,6 +610,7 @@ pub(super) fn execute_occurrence_seed(
                     message: format!(
                         "occurrence seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 break;
             }
@@ -653,7 +652,7 @@ pub(super) enum EnvironmentSeedKind<'a> {
 /// budget and one honesty rule; only which rows are selected differs.
 pub(super) fn execute_environment_seed(
     kind: EnvironmentSeedKind<'_>,
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
     languages: &[Language],
     terminal_cap: Option<usize>,
     state: &mut QueryExecutionState<'_>,
@@ -748,6 +747,7 @@ pub(super) fn execute_environment_seed(
                     message: format!(
                         "lexical environment seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 break;
             }
@@ -782,7 +782,7 @@ pub(super) enum MaterializationSeedKind<'a> {
 /// diagnostics.
 pub(super) fn execute_materialization_seed(
     kind: MaterializationSeedKind<'_>,
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
     languages: &[Language],
     terminal_cap: Option<usize>,
     state: &mut QueryExecutionState<'_>,
@@ -869,6 +869,7 @@ pub(super) fn execute_materialization_seed(
                     message: format!(
                         "materialization seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 break;
             }
@@ -890,7 +891,7 @@ pub(super) fn execute_materialization_seed(
 
 pub(super) fn execute_path_seed(
     filter: &PathFilter,
-    where_globs: &[glob::Pattern],
+    where_globs: &QueryPathScope,
     languages: &[Language],
     terminal_cap: Option<usize>,
     state: &mut QueryExecutionState<'_>,
@@ -970,6 +971,7 @@ pub(super) fn execute_path_seed(
                     message: format!(
                         "qualified path seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 break;
             }
@@ -1100,6 +1102,7 @@ pub(super) fn execute_seed(
                         branch: Vec::new(),
                         language: diagnostic.language().config_label(),
                         message: diagnostic.message(),
+                        exhausted_roots: Vec::new(),
                     }),
             );
         }
@@ -1126,6 +1129,7 @@ pub(super) fn execute_seed(
                     "no structural adapter for {} yet; its files were not searched",
                     language.config_label()
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
     }
@@ -1532,6 +1536,7 @@ pub(super) fn execute_seed(
             branch: Vec::new(),
             language: "workspace",
             message: "callable visibility is unrecorded for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
+        exhausted_roots: Vec::new(),
         });
     }
     if signature_incomplete.parameter_types_unrecorded.get() {
@@ -1541,6 +1546,7 @@ pub(super) fn execute_seed(
             branch: Vec::new(),
             language: "workspace",
             message: "callable parameter types are unrecorded for at least one declaration; results that depend on them are incomplete rather than a clean miss".to_string(),
+        exhausted_roots: Vec::new(),
         });
     }
     if selected_index_content
@@ -1559,6 +1565,7 @@ pub(super) fn execute_seed(
             branch: Vec::new(),
             language: "workspace",
             message: "workspace content changed during structural posting replay; retry the query for a coherent snapshot".to_string(),
+        exhausted_roots: Vec::new(),
         });
     }
     if pending.len() > desired_rows {

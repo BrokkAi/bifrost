@@ -6,6 +6,7 @@ use crate::graph_support::{
 };
 use crate::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
+use crate::syntax::unwrap_attributes;
 use crate::usage::exported_targets_from_files;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -577,6 +578,7 @@ impl RustHierarchyBuilder {
         let mut methods = Vec::new();
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
+            let child = unwrap_attributes(child);
             match child.kind() {
                 "function_item" | "function_signature_item" => {
                     let Some(name) = declaration_name(child, source) else {
@@ -632,6 +634,7 @@ impl RustHierarchyBuilder {
         };
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
+            let child = unwrap_attributes(child);
             match child.kind() {
                 "function_item" => {
                     let Some(name) = declaration_name(child, source) else {
@@ -861,19 +864,26 @@ fn declarations_by_range(
 }
 
 fn declaration_name<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    let node = unwrap_attributes(node);
     let name = rust_node_text(node.child_by_field_name("name")?, source).trim();
     (!name.is_empty()).then_some(name)
 }
 
 /// The number of parameters a callable declares, the `self` receiver included.
 fn declared_arity(node: Node<'_>) -> usize {
+    let node = unwrap_attributes(node);
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return 0;
     };
     let mut cursor = parameters.walk();
     parameters
         .named_children(&mut cursor)
-        .filter(|child| child.kind() != "attribute_item")
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "attribute_item" | "attributes" | "line_comment" | "block_comment"
+            )
+        })
         .count()
 }
 
@@ -943,7 +953,8 @@ pub fn canonical_rust_hierarchy_type(
 fn named_nodes_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
     let mut out = Vec::new();
     let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    while let Some(raw_node) = stack.pop() {
+        let node = unwrap_attributes(raw_node);
         if node.kind() == kind {
             out.push(node);
         }

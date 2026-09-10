@@ -216,24 +216,30 @@ impl CodeQueryResult {
         code_query_completion(self.truncated, &self.diagnostics)
     }
 
-    /// Cap per-row flow completion by the run's own completion (#1952).
+    /// Cap a clean per-row flow status by the run's own completion (#1952).
     ///
     /// An interrupted or budget-limited query may be missing rows, so no
-    /// retained flow row may present itself as a complete clean negative.
-    /// The row's analysis-level detail stays in `semantic_status`.
-    pub(crate) fn cap_flow_completion_by_run(&mut self) {
-        let cap = match self.completion() {
+    /// retained flow row may present itself as a complete clean negative. The
+    /// reason states that the query envelope, rather than the flow solve,
+    /// imposed the cap.
+    pub(crate) fn cap_flow_status_by_run(&mut self) {
+        let (status, reason) = match self.completion() {
             CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. } => return,
-            CodeQueryCompletion::Cancelled => CodeQueryFlowCompletion::Cancelled,
-            CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Invalid { .. } => {
-                CodeQueryFlowCompletion::Incomplete
-            }
+            CodeQueryCompletion::Cancelled => (
+                CodeQueryFlowStatus::QueryCancelled,
+                "query execution was cancelled",
+            ),
+            CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Invalid { .. } => (
+                CodeQueryFlowStatus::Partial,
+                "query execution was incomplete",
+            ),
         };
         for item in &mut self.results {
             if let CodeQueryResultValue::FlowEndpoint { value } = &mut item.value
-                && value.completion == CodeQueryFlowCompletion::Complete
+                && value.status == CodeQueryFlowStatus::Complete
             {
-                value.completion = cap;
+                value.status = status;
+                value.reason = Some(reason.to_owned());
             }
         }
     }
@@ -641,6 +647,9 @@ pub struct CodeQueryDeclaration {
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// The declaration id plus this row's exact half-open byte span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]

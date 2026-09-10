@@ -3,10 +3,6 @@ use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
-use crate::definition::{RowBindingName, RowBindingSource, RowExpansionStep};
-use crate::relational::{
-    RelationCoverage, RelationalInput, evaluate_row_selector_ir, validate_row_selector_plan,
-};
 use crate::resolved::LoadedPolicy;
 use crate::unit_execution::{UnitAttempt, UnitReuse, recompute_unit};
 use crate::units::{
@@ -31,19 +27,20 @@ use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAna
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_rql::structural::search::{
     CodeQueryExecutionScope, CodeQuerySemanticReceipt, DetailedCodeQueryDecoratedParameterEvidence,
-    DetailedCodeQueryDomain, DetailedCodeQueryEvidence, UnitExecutionResult, UnitRowItem,
+    DetailedCodeQueryDomain, DetailedCodeQueryEvidence, UnitExecutionResult,
     execute_code_query_detailed_eager_index_workspace_with_semantic_receipt,
     execute_code_query_selector_unit, merge_unit_rows, plan_seed_files,
 };
 use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryResult, CodeQueryResultDetail,
-    CodeQueryResultItem, CodeQueryResultValue, CodeQuerySemanticCompleteness,
-    CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticRowLimits, CodeQuerySemanticWork, QueryValueKind,
+    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryResult, CodeQueryResultItem,
+    CodeQueryResultValue, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQuerySemanticLimits, CodeQuerySemanticProof, CodeQuerySemanticRowLimits,
+    CodeQuerySemanticWork,
 };
 use brokk_bifrost_rql::{
     CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, PlanPartitioning, QueryStep,
+    ResolvedCallProof,
 };
 
 #[derive(Debug)]
@@ -125,6 +122,55 @@ fn query_plan_contains_decorator_bindings(plan: &CodeQueryPlan) -> bool {
         }
     }
     false
+}
+
+fn query_guarantees_declared_call_proof(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![(plan, false)];
+    while let Some((plan, has_declared_proof)) = pending.pop() {
+        let has_declared_proof = has_declared_proof
+            || plan.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    QueryStep::ResolvedCall(filter)
+                        if filter.proof == ResolvedCallProof::Declared
+                )
+            });
+        match &plan.source {
+            CodeQueryPlanSource::Set { branches, .. } => {
+                pending.extend(branches.iter().map(|branch| (branch, has_declared_proof)));
+            }
+            _ if !has_declared_proof => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn query_guarantees_workspace_exact_call_proof(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![(plan, false)];
+    while let Some((plan, has_workspace_exact_proof)) = pending.pop() {
+        let has_workspace_exact_proof = has_workspace_exact_proof
+            || plan.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    QueryStep::ResolvedCall(filter)
+                        if filter.proof == ResolvedCallProof::Exact
+                            && filter.resolves_to.is_resolved_workspace_declaration()
+                )
+            });
+        match &plan.source {
+            CodeQueryPlanSource::Set { branches, .. } => {
+                pending.extend(
+                    branches
+                        .iter()
+                        .map(|branch| (branch, has_workspace_exact_proof)),
+                );
+            }
+            _ if !has_workspace_exact_proof => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 impl From<DetailedCodeQueryDecoratedParameterEvidence> for PolicyDecoratedParameterSelection {
@@ -394,8 +440,8 @@ pub(super) struct PolicySelectedCallBinding {
     pub(super) actual_index: usize,
     pub(super) formal_index: usize,
     pub(super) formal_name: String,
-    pub(super) semantic_target_id: String,
-    pub(super) model_callable_id: String,
+    pub(super) semantic_target_id: Option<String>,
+    pub(super) model_callable_id: Option<String>,
     pub(super) formal_layout_id: String,
     pub(super) signature_id: Option<String>,
     pub(super) model_id: Option<String>,
@@ -413,15 +459,23 @@ impl PolicySelectedCallBinding {
         debug_assert!(!self.site_id.is_empty());
         debug_assert!(!self.site_ast_id.is_empty());
         debug_assert!(!self.argument_id.is_empty());
-        debug_assert!(!self.semantic_target_id.is_empty());
-        debug_assert!(!self.model_callable_id.is_empty());
+        debug_assert!(
+            self.semantic_target_id
+                .as_ref()
+                .is_none_or(|identity| !identity.is_empty())
+        );
+        debug_assert!(
+            self.model_callable_id
+                .as_ref()
+                .is_none_or(|identity| !identity.is_empty())
+        );
         debug_assert!(!self.formal_layout_id.is_empty());
         debug_assert!(self.signature_id.as_ref().is_none_or(|id| !id.is_empty()));
         debug_assert!(self.model_id.as_ref().is_none_or(|id| !id.is_empty()));
         debug_assert!(self.pack_id.as_ref().is_none_or(|pack| !pack.is_empty()));
         debug_assert!(matches!(
             self.selector_proof,
-            "declared" | "derived" | "authored_summary"
+            "declared" | "derived" | "authored_summary" | "resolved_workspace"
         ));
         debug_assert!(
             self.selector_proof != "declared"
@@ -709,9 +763,6 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         selector: &ResolvedPolicySelector,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
-        if let Some(plan) = selector.as_rows() {
-            return self.select_rows(selector, plan);
-        }
         let query = self.selector_query(selector)?;
         let retain_decorated_parameter_artifacts =
             query_plan_contains_decorator_bindings(&query.plan);
@@ -720,7 +771,7 @@ impl<'a> PolicySelectorSession<'a> {
         } else {
             self.execute_selector_query(&query)?
         };
-        let (selected, artifact_charge) = Self::selected_sites(selector, detailed)?;
+        let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
         if let Some(artifact_charge) = artifact_charge {
             self.apply_artifact_charge(
                 Ok(artifact_charge),
@@ -759,16 +810,13 @@ impl<'a> PolicySelectorSession<'a> {
         &mut self,
         selector: &ResolvedPolicySelector,
     ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
-        if let Some(plan) = selector.as_rows() {
-            return self.select_rows(selector, plan);
-        }
         let query = self.selector_query(selector)?;
         if self.units.is_some() {
             return self.select_sliced(selector, &query);
         }
         let detailed = self.execute_selector_query_with_artifact_continuation(&query)?;
         let retained_incomplete_result_contracts = detailed.retained_incomplete_result_contracts;
-        let (selected, artifact_charge) = Self::selected_sites(selector, detailed)?;
+        let (selected, artifact_charge) = self.selected_sites(selector, detailed)?;
         if retained_incomplete_result_contracts {
             self.retained_incomplete_result_contract_selectors = self
                 .retained_incomplete_result_contract_selectors
@@ -917,7 +965,7 @@ impl<'a> PolicySelectorSession<'a> {
         let retained_artifacts = artifact_charge
             .as_ref()
             .is_some_and(|charge| !charge.is_empty());
-        let (sites, artifact_charge) = Self::selected_sites(
+        let (sites, artifact_charge) = self.selected_sites(
             selector,
             PolicySelectorQueryResult {
                 result: detailed.result,
@@ -1078,6 +1126,7 @@ impl<'a> PolicySelectorSession<'a> {
     }
 
     fn selected_sites(
+        &self,
         selector: &ResolvedPolicySelector,
         detailed: PolicySelectorQueryResult,
     ) -> Result<
@@ -1085,7 +1134,32 @@ impl<'a> PolicySelectorSession<'a> {
         PolicySelectorSessionError,
     > {
         let result_contract_subset = detailed.retained_incomplete_result_contracts;
+        let declared_call = selector
+            .as_query()
+            .is_some_and(|(_, query)| query_guarantees_declared_call_proof(&query.plan));
+        let declared_call_complete = declared_call
+            && !detailed.result.truncated
+            && !detailed.result.diagnostics.is_empty()
+            && detailed.result.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::CallBindingDispatchPartial
+            });
+        let workspace_exact_call = selector
+            .as_query()
+            .is_some_and(|(_, query)| query_guarantees_workspace_exact_call_proof(&query.plan));
+        let workspace_exact_positive = workspace_exact_call
+            && !detailed.result.results.is_empty()
+            && !detailed.result.truncated
+            && !detailed.result.diagnostics.is_empty()
+            && detailed.result.diagnostics.iter().all(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    CodeQueryDiagnosticCode::CallBindingDispatchPartial
+                        | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+                )
+            });
         if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete)
+            && !declared_call_complete
+            && !workspace_exact_positive
             && !result_contract_subset
         {
             let diagnostics = detailed
@@ -1174,7 +1248,13 @@ impl<'a> PolicySelectorSession<'a> {
                         selector.path
                     ))
                 })?;
-                let (proof, completeness) = selected_site_quality(item);
+                let (proof, completeness) = if (declared_call || workspace_exact_call)
+                    && matches!(item.value, CodeQueryResultValue::CallBinding { .. })
+                {
+                    (ProofStatus::Proven, EvidenceCompleteness::Complete)
+                } else {
+                    selected_site_quality(item)
+                };
                 let result_contract = match &item.value {
                     CodeQueryResultValue::CallResultContract { value } => {
                         Some(PolicyResultContractSelection {
@@ -1237,6 +1317,88 @@ impl<'a> PolicySelectorSession<'a> {
                     }
                     (_, None) => (None, false, false),
                 };
+                let call_binding = match &item.value {
+                    CodeQueryResultValue::CallBinding { value } => {
+                        let call_span = self.call_span_for_ast_id(
+                            &evidence.file,
+                            &value.site_ast_id,
+                        )?;
+                        Some(PolicySelectedCallBinding {
+                            row_id: value.id.clone(),
+                            site_id: value.site_id.clone(),
+                            site_ast_id: value.site_ast_id.clone(),
+                            argument_id: value.argument_id.clone().ok_or_else(|| {
+                                PolicySelectorSessionError::Unavailable(format!(
+                                    "selector `{}` selected a binding without an argument identity",
+                                    selector.path
+                                ))
+                            })?,
+                            call_span,
+                            actual_index: value.actual_index.ok_or_else(|| {
+                                PolicySelectorSessionError::Unavailable(format!(
+                                    "selector `{}` selected a binding without an actual index",
+                                    selector.path
+                                ))
+                            })?,
+                            formal_index: value.formal_index.ok_or_else(|| {
+                                PolicySelectorSessionError::Unavailable(format!(
+                                    "selector `{}` selected a binding without a formal index",
+                                    selector.path
+                                ))
+                            })?,
+                            formal_name: value.formal_name.clone().ok_or_else(|| {
+                                PolicySelectorSessionError::Unavailable(format!(
+                                    "selector `{}` selected a binding without a formal name",
+                                    selector.path
+                                ))
+                            })?,
+                            semantic_target_id: value.semantic_target_id.clone(),
+                            model_callable_id: value.model_callable_id.clone(),
+                            formal_layout_id: value.formal_layout_id.clone().ok_or_else(|| {
+                                PolicySelectorSessionError::Unavailable(format!(
+                                    "selector `{}` selected a binding without formal-layout identity",
+                                    selector.path
+                                ))
+                            })?,
+                            signature_id: value.signature_id.clone(),
+                            model_id: value.model_id.clone(),
+                            pack_id: value.pack_id.clone(),
+                            selector_proof: if declared_call {
+                                "declared"
+                            } else if workspace_exact_call {
+                                "resolved_workspace"
+                            } else {
+                                value.selector_proof.ok_or_else(|| {
+                                    PolicySelectorSessionError::Unavailable(format!(
+                                        "selector `{}` selected a binding without selector proof",
+                                        selector.path
+                                    ))
+                                })?
+                            },
+                            selector_summary_id: if declared_call || workspace_exact_call {
+                                None
+                            } else {
+                                value.selector_summary_id.clone()
+                            },
+                            selector_summary_model_id: if declared_call || workspace_exact_call {
+                                None
+                            } else {
+                                value.selector_summary_model_id.clone()
+                            },
+                            selector_summary_pack_id: if declared_call || workspace_exact_call {
+                                None
+                            } else {
+                                value.selector_summary_pack_id.clone()
+                            },
+                            selector_summary_pack_digest: if declared_call || workspace_exact_call {
+                                None
+                            } else {
+                                value.selector_summary_pack_digest.clone()
+                            },
+                        })
+                    }
+                    _ => None,
+                };
                 Ok(Some(PolicySelectedSite {
                     file: evidence.file,
                     span,
@@ -1244,7 +1406,7 @@ impl<'a> PolicySelectorSession<'a> {
                     completeness,
                     result_contract,
                     call_shape,
-                    call_binding: None,
+                    call_binding,
                     decorated_parameter,
                     runtime_keyed_read,
                     runtime_keyed_read_row,
@@ -1257,327 +1419,6 @@ impl<'a> PolicySelectorSession<'a> {
             .flatten()
             .collect();
         Ok((selected, detailed.artifact_charge))
-    }
-
-    fn select_rows(
-        &mut self,
-        selector: &ResolvedPolicySelector,
-        plan: &crate::definition::RowSelectorPlan,
-    ) -> Result<Vec<PolicySelectedSite>, PolicySelectorSessionError> {
-        let lowered = validate_row_selector_plan(plan).map_err(|error| {
-            PolicySelectorSessionError::Unavailable(format!(
-                "selector `{}` has an invalid row plan: {error}",
-                selector.path
-            ))
-        })?;
-        let binding_queries = row_binding_queries(plan)?;
-        let mut executed = Vec::with_capacity(binding_queries.len());
-        let mut coverages = Vec::with_capacity(binding_queries.len());
-        let mut incomplete_completion = None;
-        let mut diagnostics = Vec::new();
-
-        for (binding, mut query) in binding_queries {
-            query.result_detail = CodeQueryResultDetail::Full;
-            query.limit = self.max_selector_results;
-            self.selector_scans = self.selector_scans.saturating_add(1);
-            let query_limits = self.remaining_query_limits()?;
-            let artifact_leases = self.artifact_leases.snapshot();
-            let mut detailed =
-                execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
-                    self.workspace,
-                    &query,
-                    query_limits,
-                    Some(self.cancellation),
-                    &self.semantic_budget,
-                    &self.semantic_execution_budget,
-                    artifact_leases,
-                    self.execution_scope,
-                );
-            let semantic_receipt = detailed.take_semantic_receipt();
-            self.query_work = self.query_work.saturating_add(detailed.work);
-            self.charge_query_semantic_work(detailed.work.semantic, semantic_receipt)?;
-            let completion = detailed.result.completion();
-            let declared_binding = lowered.declared_call_binding.as_ref() == Some(&binding);
-            let declaration_complete = declared_binding
-                && !detailed.result.truncated
-                && (matches!(completion, CodeQueryCompletion::Complete)
-                    || (!detailed.result.diagnostics.is_empty()
-                        && detailed.result.diagnostics.iter().all(|diagnostic| {
-                            diagnostic.code == CodeQueryDiagnosticCode::CallBindingDispatchPartial
-                        })));
-            let coverage = match (&completion, declaration_complete) {
-                (_, true) => RelationCoverage::Exhaustive,
-                (CodeQueryCompletion::Complete, false) if !detailed.result.truncated => {
-                    RelationCoverage::Exhaustive
-                }
-                (CodeQueryCompletion::ProvenSubset { .. }, false) => RelationCoverage::ProvenSubset,
-                _ => RelationCoverage::incomplete(vec![
-                    crate::PolicyIncompleteReason::PartialDiscovery,
-                ]),
-            };
-            if (!matches!(completion, CodeQueryCompletion::Complete) || detailed.result.truncated)
-                && !declaration_complete
-            {
-                incomplete_completion.get_or_insert(completion);
-            }
-            diagnostics.extend(detailed.result.diagnostics.iter().map(|diagnostic| {
-                format!(
-                    "{}: {}: {}",
-                    binding.as_str(),
-                    diagnostic.code.as_str(),
-                    diagnostic.message
-                )
-            }));
-            coverages.push(coverage);
-            executed.push((binding, detailed));
-        }
-
-        // One adapter serves every path that evaluates a relational plan: the
-        // rendered rows are projected into the same product a unit publishes
-        // before the plan reads a field of them.
-        let projected = executed
-            .iter()
-            .map(|(_, detailed)| {
-                detailed
-                    .result
-                    .results
-                    .iter()
-                    .map(UnitRowItem::project)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let inputs = executed
-            .iter()
-            .zip(&coverages)
-            .zip(&projected)
-            .map(|(((binding, _), coverage), rows)| RelationalInput {
-                binding,
-                rows,
-                coverage: coverage.clone(),
-            })
-            .collect::<Vec<_>>();
-        let selection = evaluate_row_selector_ir(
-            &lowered.plan,
-            lowered.relation,
-            lowered.upstream,
-            &lowered.upstream_binding,
-            &inputs,
-        )
-        .map_err(|error| {
-            PolicySelectorSessionError::Unavailable(format!(
-                "selector `{}` row evaluation failed: {error}",
-                selector.path
-            ))
-        })?;
-
-        let upstream = executed
-            .iter()
-            .find(|(binding, _)| *binding == lowered.upstream_binding)
-            .ok_or_else(|| {
-                PolicySelectorSessionError::Unavailable(format!(
-                    "selector `{}` did not execute output binding `{}`",
-                    selector.path, lowered.upstream_binding
-                ))
-            })?;
-        let declared_output =
-            lowered.declared_call_binding.as_ref() == Some(&lowered.upstream_binding);
-        let uncertain_upstream = !declared_output
-            && selection.upstream_rows.iter().any(|row| {
-                upstream.1.result.results.get(row.row).is_none_or(|item| {
-                    if matches!(
-                        &item.value,
-                        CodeQueryResultValue::CallBinding { value }
-                            if value.binding_kind == Some("receiver")
-                    ) {
-                        return false;
-                    }
-                    let (proof, completeness) = selected_site_quality(item);
-                    !matches!(proof, ProofStatus::Proven)
-                        || !matches!(completeness, EvidenceCompleteness::Complete)
-                })
-            });
-        // The call shape existed, but the exact identity/formal contract
-        // rejected every binding row. That is an abstention about a witnessed
-        // candidate, not proof that the endpoint is absent. A genuinely absent
-        // shape has no upstream rows and remains a conclusive empty selection.
-        let rejected_witnessed_candidate = selection.selected_rows.is_empty()
-            && !selection.upstream_rows.is_empty()
-            && (!declared_output
-                || lowered
-                    .declared_call_model_id
-                    .as_ref()
-                    .is_none_or(|expected| {
-                        selection.upstream_rows.iter().any(|row| {
-                            matches!(
-                                upstream.1.result.results.get(row.row).map(|item| &item.value),
-                                Some(CodeQueryResultValue::CallBinding { value })
-                                    if value.model_callable_id.as_deref() == Some(expected.as_str())
-                                        || value.model_id.as_deref() == Some(expected.as_str())
-                            )
-                        })
-                    }));
-        let incomplete = incomplete_completion.is_some()
-            || !selection.upstream_coverage.is_exhaustive()
-            || !selection.selected_coverage.is_exhaustive()
-            || selection.limit_exceeded
-            || uncertain_upstream
-            || rejected_witnessed_candidate;
-        if selection.selected_rows.is_empty() && incomplete {
-            return Err(PolicySelectorSessionError::Incomplete {
-                completion: incomplete_completion
-                    .unwrap_or(CodeQueryCompletion::Incomplete { codes: Vec::new() }),
-                detail: format!(
-                    "selector `{}` could not prove an empty row selection{}",
-                    selector.path,
-                    if diagnostics.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", diagnostics.join("; "))
-                    }
-                ),
-            });
-        }
-
-        selection
-            .selected_rows
-            .into_iter()
-            .map(|selected| {
-                let item = upstream.1.result.results.get(selected.row).ok_or_else(|| {
-                    PolicySelectorSessionError::Unavailable(format!(
-                        "selector `{}` selected an absent row",
-                        selector.path
-                    ))
-                })?;
-                let evidence = upstream
-                    .1
-                    .evidence
-                    .iter()
-                    .find(|evidence| evidence.result_index == selected.row)
-                    .ok_or_else(|| {
-                        PolicySelectorSessionError::Unavailable(format!(
-                            "selector `{}` selected a row without source evidence",
-                            selector.path
-                        ))
-                    })?;
-                let span = evidence.byte_span.clone().ok_or_else(|| {
-                    PolicySelectorSessionError::Unavailable(format!(
-                        "selector `{}` selected a row without a source span",
-                        selector.path
-                    ))
-                })?;
-                let CodeQueryResultValue::CallBinding { value } = &item.value else {
-                    return Err(PolicySelectorSessionError::Unavailable(format!(
-                        "selector `{}` output is not a call-binding row",
-                        selector.path
-                    )));
-                };
-                let call_span = self.call_span_for_ast_id(&evidence.file, &value.site_ast_id)?;
-                let (proof, mut completeness) = if declared_output {
-                    (ProofStatus::Proven, EvidenceCompleteness::Complete)
-                } else {
-                    selected_site_quality(item)
-                };
-                if incomplete {
-                    completeness = EvidenceCompleteness::Partial(
-                        "row selector input or filtered output was not exhaustive".into(),
-                    );
-                }
-                Ok(PolicySelectedSite {
-                    file: evidence.file.clone(),
-                    span,
-                    proof,
-                    completeness,
-                    result_contract: None,
-                    call_shape: None,
-                    decorated_parameter: None,
-                    runtime_keyed_read: None,
-                    runtime_keyed_read_row: false,
-                    runtime_keyed_read_conclusive_exclusion: false,
-                    retained_incomplete_result_contract_query: false,
-                    call_binding: Some(PolicySelectedCallBinding {
-                        row_id: value.id.clone(),
-                        site_id: value.site_id.clone(),
-                        site_ast_id: value.site_ast_id.clone(),
-                        argument_id: value.argument_id.clone().ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without an argument identity",
-                                selector.path
-                            ))
-                        })?,
-                        call_span,
-                        actual_index: value.actual_index.ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without an actual index",
-                                selector.path
-                            ))
-                        })?,
-                        formal_index: value.formal_index.ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without a formal index",
-                                selector.path
-                            ))
-                        })?,
-                        formal_name: value.formal_name.clone().ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without a formal name",
-                                selector.path
-                            ))
-                        })?,
-                        semantic_target_id: value.semantic_target_id.clone().ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without semantic target identity",
-                                selector.path
-                            ))
-                        })?,
-                        model_callable_id: value.model_callable_id.clone().ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without callable-family identity",
-                                selector.path
-                            ))
-                        })?,
-                        formal_layout_id: value.formal_layout_id.clone().ok_or_else(|| {
-                            PolicySelectorSessionError::Unavailable(format!(
-                                "selector `{}` selected a binding without formal-layout identity",
-                                selector.path
-                            ))
-                        })?,
-                        signature_id: value.signature_id.clone(),
-                        model_id: value.model_id.clone(),
-                        pack_id: value.pack_id.clone(),
-                        selector_proof: if declared_output {
-                            "declared"
-                        } else {
-                            value.selector_proof.ok_or_else(|| {
-                                PolicySelectorSessionError::Unavailable(format!(
-                                    "selector `{}` selected a binding without selector proof",
-                                    selector.path
-                                ))
-                            })?
-                        },
-                        selector_summary_id: if declared_output {
-                            None
-                        } else {
-                            value.selector_summary_id.clone()
-                        },
-                        selector_summary_model_id: if declared_output {
-                            None
-                        } else {
-                            value.selector_summary_model_id.clone()
-                        },
-                        selector_summary_pack_id: if declared_output {
-                            None
-                        } else {
-                            value.selector_summary_pack_id.clone()
-                        },
-                        selector_summary_pack_digest: if declared_output {
-                            None
-                        } else {
-                            value.selector_summary_pack_digest.clone()
-                        },
-                    }),
-                })
-            })
-            .collect()
     }
 
     fn call_span_for_ast_id(
@@ -2713,83 +2554,6 @@ pub(super) fn source_range(span: &ByteRange<usize>) -> Range {
     }
 }
 
-fn row_binding_queries(
-    plan: &crate::definition::RowSelectorPlan,
-) -> Result<Vec<(RowBindingName, CodeQuery)>, PolicySelectorSessionError> {
-    let mut queries: Vec<(RowBindingName, CodeQuery)> = Vec::with_capacity(plan.bindings.len());
-    let mut by_name = HashMap::<&str, usize>::new();
-    for binding in &plan.bindings {
-        let query = match &binding.source {
-            RowBindingSource::Query(crate::PolicySelector::Inline { query, .. }) => query.clone(),
-            RowBindingSource::Query(crate::PolicySelector::File { .. }) => {
-                return Err(PolicySelectorSessionError::Unavailable(format!(
-                    "row selector binding `{}` uses a deferred file selector",
-                    binding.name
-                )));
-            }
-            RowBindingSource::Query(crate::PolicySelector::Rows { .. }) => {
-                return Err(PolicySelectorSessionError::Unavailable(format!(
-                    "row selector binding `{}` nests another row selector",
-                    binding.name
-                )));
-            }
-            RowBindingSource::Expansion { from, step } => {
-                let source = by_name
-                    .get(from.as_str())
-                    .and_then(|index| queries.get(*index));
-                let Some((_, source)) = source else {
-                    return Err(PolicySelectorSessionError::Unavailable(format!(
-                        "row selector binding `{}` expands unavailable binding `{from}`",
-                        binding.name
-                    )));
-                };
-                let mut query = source.clone();
-                match step {
-                    RowExpansionStep::ReceiverOutcome | RowExpansionStep::ReceiverEvidence => {
-                        let source_is_receiver = query
-                            .validate_steps()
-                            .is_ok_and(|kind| kind == QueryValueKind::ReceiverAnalysis);
-                        if !source_is_receiver {
-                            query
-                                .plan
-                                .steps
-                                .push(QueryStep::ReceiverTargets(Default::default()));
-                        }
-                        query.plan.steps.push(match step {
-                            RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
-                            _ => QueryStep::ReceiverEvidence,
-                        });
-                    }
-                    RowExpansionStep::MemberSelection => {
-                        query.plan.steps.push(QueryStep::MemberSelection)
-                    }
-                    RowExpansionStep::MemberCandidates => query
-                        .plan
-                        .steps
-                        .push(QueryStep::CandidatesOf(Default::default())),
-                    RowExpansionStep::CandidateHierarchy => {
-                        query.plan.steps.push(QueryStep::CandidateHierarchy)
-                    }
-                    RowExpansionStep::MemberFamily => {
-                        query.plan.steps.push(QueryStep::MemberFamily)
-                    }
-                    RowExpansionStep::FamilyEdges => query.plan.steps.push(QueryStep::FamilyEdges),
-                    RowExpansionStep::DispatchOutcome => {
-                        query.plan.steps.push(QueryStep::DispatchOutcome)
-                    }
-                    RowExpansionStep::DispatchTargets => {
-                        query.plan.steps.push(QueryStep::DispatchTargets)
-                    }
-                }
-                query
-            }
-        };
-        by_name.insert(binding.name.as_str(), queries.len());
-        queries.push((binding.name.clone(), query));
-    }
-    Ok(queries)
-}
-
 pub(super) fn selected_site_quality(
     item: &CodeQueryResultItem,
 ) -> (ProofStatus, EvidenceCompleteness) {
@@ -2797,8 +2561,8 @@ pub(super) fn selected_site_quality(
         CodeQueryResultValue::Procedure { value } => Some(&value.evidence),
         CodeQueryResultValue::ProgramPoint { value } => Some(&value.evidence),
         CodeQueryResultValue::ControlEdge { value } => Some(&value.evidence),
-        CodeQueryResultValue::TypestateWitness { value } => Some(&value.quality),
-        CodeQueryResultValue::AbsentMemberWitness { value } => Some(&value.quality),
+        CodeQueryResultValue::TypestateWitness { value } => Some(&value.evidence),
+        CodeQueryResultValue::AbsentMemberWitness { value } => Some(&value.evidence),
         CodeQueryResultValue::TaintFinding { value } => Some(&value.evidence),
         _ => None,
     };

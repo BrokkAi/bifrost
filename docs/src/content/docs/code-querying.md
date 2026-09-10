@@ -109,17 +109,18 @@ The terminology describes three layers:
 
 | Form | Prefer it when | Trade-off and execution path |
 | --- | --- | --- |
-| [Rune Query Language (RQL)](/rune-query-language/) | A person is exploring, reviewing, or maintaining a query. Its compact S-expression nesting, comments, multiline input, and REPL/editor assistance favor hand authoring. | RQL is an experimental authoring syntax. It lowers to the canonical JSON shape and then validates as `CodeQuery`. MCP cannot accept raw RQL inline, but `query_file` can name a saved workspace `.rql` file. |
-| [JSON `CodeQuery`](/code-query-json/) | An agent, script, Python client, or other protocol client needs an explicit, schema-versioned payload. | JSON is more verbose to write by hand, but it is the stable machine-facing serialization. MCP accepts its fields inline through `query_code`, and `query_file` can name a saved `.json` query. |
+| [Rune Query Language (RQL)](/rune-query-language/) | A person is exploring, reviewing, or maintaining a query. Its compact S-expression nesting, comments, multiline input, and REPL/editor assistance favor hand authoring. | RQL is the single authoring syntax. It decodes to a validated `CodeQuery`, which can generate canonical JSON. MCP cannot accept raw RQL inline, but `query_file` can name a saved workspace `.rql` file. |
+| [JSON `CodeQuery`](/code-query-json/) | An agent, script, Python client, or other protocol client needs an explicit, schema-versioned payload. | JSON is generated from a decoded `CodeQuery` and remains the stable machine-facing serialization. MCP accepts its fields inline through `query_code`, and `query_file` can name a saved `.json` query. |
 | Rust `CodeQuery` value | An in-process Rust embedding already owns query construction and execution. | The caller can parse or construct the typed model and use the lower-level execution API without a wire-format round trip. Deployed protocol-style behavior goes through `SearchToolsService`; protocol clients use JSON. |
 
-RQL and JSON are frontends to the same typed model, planner, executor, result
-types, budgets, and completeness rules. Choosing one does not select a more
-powerful matcher or a different analysis. Use RQL for human authoring, JSON for
-machine integration, and the Rust value only for in-process embedding.
+RQL compiles to the typed model; generated JSON serializes that same model. Both
+execution paths share the planner, executor, result types, budgets, and
+completeness rules. Author queries in RQL; generate canonical JSON from the
+decoded model for machine integration. Rust embedders can construct the typed
+model directly. `.rql` files and editor buffers accept RQL text only.
 
 See [JSON CodeQuery](/code-query-json/) for the complete schema, validation
-rules, result model, and copy-paste examples. See
+rules, result model, and machine payload examples. See
 [Rune Query Language](/rune-query-language/) for interactive authoring and
 canonical JSON inspection, and [MCP query and RQL
 availability](/mcp/#query-and-rql-availability) for the exact inline and saved
@@ -136,7 +137,7 @@ The examples below use one-shot CLI mode. They were validated against a toy work
 
 ### Saved Queries
 
-For a reusable query, save the complete RQL or canonical JSON query under the workspace and run it directly:
+For a reusable query, save the authored RQL query or generated canonical JSON under the workspace and run it directly:
 
 ```bash
 bifrost --query-file queries/audit.rql

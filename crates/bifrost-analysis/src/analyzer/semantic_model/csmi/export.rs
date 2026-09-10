@@ -1,5 +1,7 @@
 //! Translation from Bifrost semantic-model packs to CSMI v0.1 documents.
 
+use crate::analyzer::semantic_model::DeferredYieldsPayload;
+
 use super::canonical::{canonical_json, sha256_hex};
 use super::identity::{
     callable_disambiguator, member_symbol_id, type_expression, type_symbol, type_symbol_id,
@@ -154,9 +156,10 @@ fn export_semantic_document<'a>(
     let has_collection_flows = shards
         .iter()
         .any(|shard| shard.collection_flows().is_some());
+    let has_deferred_yields = shards.iter().any(|shard| shard.deferred_yields().is_some());
     if cpp_portability.is_some() {
         validate_exact_artifact_evidence(artifact)?;
-    } else if has_runtime_values || has_collection_flows {
+    } else if has_runtime_values || has_collection_flows || has_deferred_yields {
         // Runtime profiles select exact versioned runtime distributions, which
         // may use a non-Maven PURL such as pkg:generic. Keep that evidence
         // exact without forcing runtime artifacts through the declaration-pack
@@ -391,6 +394,12 @@ fn export_semantic_document<'a>(
     let mut runtime_values_completeness = Vec::new();
     let mut collection_flow_affects = Vec::new();
     let mut collection_flow_completeness = Vec::new();
+    let mut deferred_yield_affects = Vec::new();
+    let mut deferred_yield_completeness = Vec::new();
+    let callable_shape_completeness: HashMap<String, bool> = member_facts
+        .iter()
+        .map(|member| (member.id.clone(), member.callable_family_complete))
+        .collect();
     for shard in &shards {
         let Some(runtime_values) = shard.runtime_values() else {
             continue;
@@ -401,6 +410,20 @@ fn export_semantic_document<'a>(
             &mut extension_facts,
             &mut runtime_values_affects,
             &mut runtime_values_completeness,
+        )?;
+    }
+    for shard in &shards {
+        let Some(deferred_yields) = shard.deferred_yields() else {
+            continue;
+        };
+        export_deferred_yields(
+            deferred_yields,
+            options,
+            &symbol_by_bifrost_id,
+            &callable_shape_completeness,
+            &mut extension_facts,
+            &mut deferred_yield_affects,
+            &mut deferred_yield_completeness,
         )?;
     }
     for shard in &shards {
@@ -700,6 +723,7 @@ fn export_semantic_document<'a>(
     }
     completeness_statements.extend(runtime_values_completeness);
     completeness_statements.extend(collection_flow_completeness);
+    completeness_statements.extend(deferred_yield_completeness);
     let declaration_status = match pack_completeness {
         Completeness::Complete => CsmiCoverageStatus::Complete,
         Completeness::Partial => CsmiCoverageStatus::Partial,
@@ -944,6 +968,15 @@ fn export_semantic_document<'a>(
                         affects: collection_flow_affects,
                     });
                 }
+                if !deferred_yield_affects.is_empty() {
+                    uses.push(CsmiVocabularyUse {
+                        identifier: CSMI_DEFERRED_YIELD_PROFILE_ID.to_owned(),
+                        version: CSMI_DEFERRED_YIELD_PROFILE_VERSION.to_owned(),
+                        schema: CSMI_DEFERRED_YIELD_PROFILE_SCHEMA.to_owned(),
+                        requirement: CsmiVocabularyRequirement::Required,
+                        affects: deferred_yield_affects,
+                    });
+                }
                 if cpp_portability.is_some() {
                     uses.push(CsmiVocabularyUse {
                         identifier: CSMI_C_CPP_RESOLUTION_PROFILE_ID.to_owned(),
@@ -1037,6 +1070,11 @@ fn logical_pack(
         CSMI_COLLECTION_FLOW_PROFILE_SCHEMA,
     );
     support.add(
+        CSMI_DEFERRED_YIELD_PROFILE_ID,
+        CSMI_DEFERRED_YIELD_PROFILE_VERSION,
+        CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
+    );
+    support.add(
         CSMI_C_CPP_RESOLUTION_PROFILE_ID,
         CSMI_C_CPP_RESOLUTION_PROFILE_VERSION,
         CSMI_CPP_PROFILE_SCHEMA,
@@ -1114,6 +1152,262 @@ fn export_collection_flows(
             },
             extensions: Vec::new(),
         });
+    }
+    Ok(())
+}
+
+fn export_deferred_yields(
+    deferred_yields: &DeferredYieldsPayload,
+    options: &CsmiExportOptions,
+    symbol_by_bifrost_id: &HashMap<String, String>,
+    callable_shape_completeness: &HashMap<String, bool>,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    for deferred_yield in &deferred_yields.yields {
+        let factory = symbol_by_bifrost_id
+            .get(&deferred_yield.factory)
+            .ok_or_else(|| CsmiExportError::MissingDeclaration {
+                path: "deferred_yields.factory".to_owned(),
+                target: deferred_yield.factory.clone(),
+            })?;
+        let resume = symbol_by_bifrost_id
+            .get(&deferred_yield.resume)
+            .ok_or_else(|| CsmiExportError::MissingDeclaration {
+                path: "deferred_yields.resume".to_owned(),
+                target: deferred_yield.resume.clone(),
+            })?;
+        let handle_type = symbol_by_bifrost_id
+            .get(&deferred_yield.handle_type)
+            .ok_or_else(|| CsmiExportError::MissingDeclaration {
+                path: "deferred_yields.handle_type".to_owned(),
+                target: deferred_yield.handle_type.clone(),
+            })?;
+        let scope = json!({
+            "factory": factory,
+            "resume": resume,
+            "handleType": handle_type,
+        });
+        let payload = &deferred_yield.payload;
+        if payload.factory != deferred_yield.factory
+            || payload.resume != deferred_yield.resume
+            || payload.handle_type != deferred_yield.handle_type
+        {
+            return Err(CsmiExportError::Identity(
+                "deferred-yield payload linked scope does not match native scope".to_owned(),
+            ));
+        }
+        let mut payload = payload.clone();
+        remap_deferred_yield_payload(&mut payload, symbol_by_bifrost_id)?;
+        let provenance = vec![options.provenance_id.clone()];
+        facts.push(CsmiExtensionFact {
+            vocabulary: CSMI_DEFERRED_YIELD_PROFILE_ID.to_owned(),
+            version: CSMI_DEFERRED_YIELD_PROFILE_VERSION.to_owned(),
+            family: "deferred-yields".to_owned(),
+            scope: scope.clone(),
+            payload: serde_json::to_value(&payload)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
+            provenance: provenance.clone(),
+            extensions: Vec::new(),
+        });
+        affects.push(CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+            kind: CsmiAffectedFactFamilyKind::FactFamily,
+            family: "deferred-yields".to_owned(),
+            scope: scope.clone(),
+        }));
+        let (status, limitations) = match deferred_yield.coverage {
+            Some(Completeness::Complete) => (CsmiCoverageStatus::Complete, Vec::new()),
+            Some(Completeness::Partial) | None => (
+                CsmiCoverageStatus::Partial,
+                vec![CsmiLimitation {
+                    kind: "coverage-limited".to_owned(),
+                    diagnostic: None,
+                }],
+            ),
+        };
+        completeness.push(CsmiCompletenessStatement {
+            vocabulary: Some(CSMI_DEFERRED_YIELD_PROFILE_ID.to_owned()),
+            version: Some(CSMI_DEFERRED_YIELD_PROFILE_VERSION.to_owned()),
+            family: "deferred-yields".to_owned(),
+            scope,
+            status,
+            limitations,
+            provenance,
+            extensions: Vec::new(),
+        });
+        for (native_id, role) in [
+            (&deferred_yield.factory, "factory"),
+            (&deferred_yield.resume, "resume"),
+        ] {
+            let Some(symbol) = symbol_by_bifrost_id.get(native_id) else {
+                return Err(CsmiExportError::MissingDeclaration {
+                    path: format!("deferred_yields.{role}"),
+                    target: native_id.clone(),
+                });
+            };
+            let status = callable_shape_completeness
+                .get(native_id)
+                .copied()
+                .unwrap_or(false);
+            completeness.push(CsmiCompletenessStatement {
+                vocabulary: None,
+                version: None,
+                family: "declaration-aspects".to_owned(),
+                scope: json!({"symbol": symbol, "aspect": "callable-shape"}),
+                status: if status {
+                    CsmiCoverageStatus::Complete
+                } else {
+                    CsmiCoverageStatus::Partial
+                },
+                limitations: if status {
+                    Vec::new()
+                } else {
+                    vec![CsmiLimitation {
+                        kind: "coverage-limited".to_owned(),
+                        diagnostic: None,
+                    }]
+                },
+                provenance: vec![options.provenance_id.clone()],
+                extensions: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn remap_deferred_yield_payload(
+    payload: &mut CsmiDeferredYieldPayload,
+    symbols: &HashMap<String, String>,
+) -> Result<(), CsmiExportError> {
+    payload.factory = export_deferred_id(&payload.factory, symbols, "payload.factory")?;
+    payload.resume = export_deferred_id(&payload.resume, symbols, "payload.resume")?;
+    payload.handle_type = export_deferred_id(&payload.handle_type, symbols, "payload.handleType")?;
+    if let Some(CsmiDeferredYieldSubstitution::ReceiverArguments { declaration }) =
+        &mut payload.receiver_substitution
+    {
+        *declaration = export_deferred_id(
+            declaration,
+            symbols,
+            "payload.receiverSubstitution.declaration",
+        )?;
+    }
+    for (position, root) in payload.roots.iter_mut().enumerate() {
+        root.callable = export_deferred_id(
+            &root.callable,
+            symbols,
+            &format!("payload.roots[{position}].callable"),
+        )?;
+        remap_deferred_yield_shape(
+            &mut root.shape,
+            symbols,
+            &format!("payload.roots[{position}].shape"),
+        )?;
+    }
+    remap_deferred_yield_location(
+        &mut payload.construction.source,
+        symbols,
+        "payload.construction.source",
+    )?;
+    remap_deferred_yield_location(
+        &mut payload.construction.handle,
+        symbols,
+        "payload.construction.handle",
+    )?;
+    remap_deferred_yield_location(
+        &mut payload.resume_contract.handle_input,
+        symbols,
+        "payload.resumeContract.handleInput",
+    )?;
+    remap_deferred_yield_location(
+        &mut payload.resume_contract.yielded_result,
+        symbols,
+        "payload.resumeContract.yieldedResult",
+    )?;
+    remap_deferred_yield_location(
+        &mut payload.resume_contract.factory_result_flow.factory_result,
+        symbols,
+        "payload.resumeContract.factoryResultFlow.factoryResult",
+    )?;
+    remap_deferred_yield_location(
+        &mut payload.resume_contract.factory_result_flow.resume_input,
+        symbols,
+        "payload.resumeContract.factoryResultFlow.resumeInput",
+    )?;
+    for (position, member) in payload.yield_contract.members.iter_mut().enumerate() {
+        remap_deferred_yield_location(
+            &mut member.source,
+            symbols,
+            &format!("payload.yield.members[{position}].source"),
+        )?;
+    }
+    Ok(())
+}
+
+fn export_deferred_id(
+    id: &str,
+    symbols: &HashMap<String, String>,
+    path: &str,
+) -> Result<String, CsmiExportError> {
+    symbols
+        .get(id)
+        .cloned()
+        .ok_or_else(|| CsmiExportError::MissingDeclaration {
+            path: path.to_owned(),
+            target: id.to_owned(),
+        })
+}
+
+fn remap_deferred_yield_location(
+    location: &mut CsmiDeferredYieldLocation,
+    symbols: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiExportError> {
+    location.callable =
+        export_deferred_id(&location.callable, symbols, &format!("{path}.callable"))?;
+    Ok(())
+}
+
+fn remap_deferred_yield_shape(
+    shape: &mut CsmiDeferredYieldShape,
+    symbols: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiExportError> {
+    let mut stack = vec![(shape, path.to_owned())];
+    while let Some((shape, path)) = stack.pop() {
+        match shape {
+            CsmiDeferredYieldShape::Value { r#type } => {
+                remap_deferred_yield_type_expression(r#type, symbols, &format!("{path}.type"))?;
+            }
+            CsmiDeferredYieldShape::Product { components } => {
+                for (position, component) in components.iter_mut().enumerate().rev() {
+                    stack.push((component, format!("{path}.components[{position}]")));
+                }
+            }
+            CsmiDeferredYieldShape::Keyed { key, value, .. } => {
+                stack.push((value, format!("{path}.value")));
+                stack.push((key, format!("{path}.key")));
+            }
+            CsmiDeferredYieldShape::Unknown { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn remap_deferred_yield_type_expression(
+    expression: &mut CsmiDeferredYieldTypeExpression,
+    symbols: &HashMap<String, String>,
+    path: &str,
+) -> Result<(), CsmiExportError> {
+    let mut stack = vec![(expression, path.to_owned())];
+    while let Some((expression, path)) = stack.pop() {
+        if let CsmiTypeExpression::Reference(reference) = expression {
+            reference.symbol =
+                export_deferred_id(&reference.symbol, symbols, &format!("{path}.symbol"))?;
+            for (position, argument) in reference.arguments.iter_mut().enumerate().rev() {
+                stack.push((argument, format!("{path}.arguments[{position}]")));
+            }
+        }
     }
     Ok(())
 }

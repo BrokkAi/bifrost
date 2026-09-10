@@ -30,6 +30,7 @@ use crate::imports::{
     rust_item_visibility, rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
+use crate::syntax::unwrap_attributes;
 use crate::usage::exported_targets_from_files;
 use crate::usage_queries::RustDeclarationFacts;
 use crate::usage_walks::RustWalkCaches;
@@ -916,10 +917,11 @@ pub fn export_index_of_declarations(
             let Some(node) = root.named_child(index_in_root) else {
                 continue;
             };
-            if node.kind() != "use_declaration" {
+            let declaration = unwrap_attributes(node);
+            if declaration.kind() != "use_declaration" {
                 continue;
             }
-            for import in rust_imports_with_visibility_from_use_declaration(node, source) {
+            for import in rust_imports_with_visibility_from_use_declaration(declaration, source) {
                 let binding_name = import.binding_name();
                 if matches!(
                     import.visibility,

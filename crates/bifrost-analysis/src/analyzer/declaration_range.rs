@@ -68,6 +68,87 @@ impl DeclarationNameRangeContext {
         self.name_ranges_from_ranges(analyzer.ranges_of(code_unit), code_unit)
     }
 
+    /// `name_range_for_declaration` for many declarations of this file in one
+    /// pass. Locating one declaration walks each node's child list on the way
+    /// down, which is linear in the file's widest node per declaration: on a
+    /// single-header amalgamation (simdjson.h, one `namespace` with tens of
+    /// thousands of children) 2,386 search hits cost 188 s that way. Here the
+    /// requests are sorted by start byte and partitioned down the tree
+    /// together, so every child list on the way is read once for all the
+    /// requests it contains, and each declaration's search starts at its
+    /// deepest containing node.
+    pub fn name_ranges_for_declarations(
+        &self,
+        requests: &[(&CodeUnit, Range)],
+    ) -> Vec<Option<Range>> {
+        let Some(root) = self.root_node() else {
+            return vec![None; requests.len()];
+        };
+        let mut order: Vec<usize> = (0..requests.len()).collect();
+        order.sort_by_key(|&index| {
+            let range = &requests[index].1;
+            (range.start_byte, range.end_byte)
+        });
+        let mut answers = vec![None; requests.len()];
+        let mut answer = |index: usize, scope: Node<'_>| {
+            let (code_unit, range) = requests[index];
+            answers[index] = code_unit_declaration_name_range_scoped(
+                &self.content,
+                root,
+                scope,
+                code_unit,
+                range,
+            );
+        };
+        // (node, lo, hi): the requests order[lo..hi] all lie within `node`.
+        let mut stack: Vec<(Node<'_>, usize, usize)> = vec![(root, 0, order.len())];
+        let mut cursor = root.walk();
+        while let Some((node, lo, hi)) = stack.pop() {
+            let mut next = lo;
+            cursor.reset(node);
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    if child.is_named() {
+                        // Children are disjoint and in source order and the
+                        // requests are sorted by start, so the requests a
+                        // child contains are one contiguous run, and a request
+                        // starting before the child that no earlier child
+                        // contained belongs to `node` itself.
+                        while next < hi && requests[order[next]].1.start_byte < child.start_byte() {
+                            answer(order[next], node);
+                            next += 1;
+                        }
+                        let first = next;
+                        while next < hi && requests[order[next]].1.end_byte <= child.end_byte() {
+                            next += 1;
+                        }
+                        if next > first {
+                            stack.push((child, first, next));
+                        }
+                        // A request starting inside the child but running past
+                        // it is contained by no child.
+                        while next < hi && requests[order[next]].1.start_byte < child.end_byte() {
+                            answer(order[next], node);
+                            next += 1;
+                        }
+                        if next >= hi {
+                            break;
+                        }
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            while next < hi {
+                answer(order[next], node);
+                next += 1;
+            }
+        }
+        answers
+    }
+
     pub fn location_name_ranges(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -143,10 +224,26 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
     code_unit: &CodeUnit,
     declaration_range: Range,
 ) -> Option<Range> {
+    code_unit_declaration_name_range_scoped(content, root, root, code_unit, declaration_range)
+}
+
+/// [`code_unit_declaration_name_range_for_range`] with the declaration's
+/// search started at `scope`: the root's child containing
+/// `declaration_range` when the caller located one, else the root itself
+/// (a persisted range can also lie outside the tree, e.g. after a line-ending
+/// change, and then only the line-based fallback can answer). That fallback
+/// still searches from the root: a declaration's lines can run past the scope.
+fn code_unit_declaration_name_range_scoped<'tree>(
+    content: &str,
+    root: Node<'tree>,
+    scope: Node<'tree>,
+    code_unit: &CodeUnit,
+    declaration_range: Range,
+) -> Option<Range> {
     let identifier = declaration_source_identifier(code_unit);
     let support = crate::analyzer::languages::language_support(language_for_target(code_unit));
-    let name_node = node_for_exact_range(root, &declaration_range)
-        .or_else(|| node_for_smallest_containing_range(root, &declaration_range))
+    let name_node = node_for_exact_range(scope, &declaration_range)
+        .or_else(|| node_for_smallest_containing_range(scope, &declaration_range))
         .and_then(|declaration_node| {
             declaration_name_node(declaration_node, identifier, content, support)
         })

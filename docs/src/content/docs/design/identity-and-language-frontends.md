@@ -116,6 +116,7 @@ them as a "symbol ID" risks reuse outside the boundary where an ID is valid.
 | Identity | What it contains | Valid use | Important limit |
 | --- | --- | --- | --- |
 | `DeclarationId` | A versioned digest of language, normalized relative path, declaration kind, structured qualified-name segments, package boundary, signature, and synthetic status | Referring to the same extracted declaration across processes that implement the same identity recipe | A move, rename, signature change, or identity-version change can produce a new ID |
+| Declaration site ID | One `DeclarationId` plus an exact half-open byte span | Referring to one source site of an extracted declaration | The span changes when that declaration site moves or changes extent |
 | Semantic locator | Logical workspace mount, relative path, language, lexical declaration segments, semantic role, and source anchor | Finding or remapping source-facing semantic entities and explaining their origin | Requires a separate cache-validity key |
 | Stable locator digest | The stable source-facing portion of a semantic locator, excluding the absolute checkout mount | Comparing equivalent source identities across checkout locations | Artifact inputs and dependencies still need independent validation |
 | Semantic artifact key | The source revision or overlay content, logical mount and relative path, language, adapter and IR versions, configuration, and dependency fingerprints | Reusing one exact immutable semantic artifact | It contains more validity inputs than a locator |
@@ -127,6 +128,14 @@ numbers, so byte-equivalent checkouts with the same relative structure can
 produce the same ID. Moves, renames, signature changes, and identity-recipe
 changes can still mint a different ID. A semantic locator provides a remappable
 source-facing address. Artifact reuse is governed by the larger cache key.
+
+Every public RQL row field that names an indexed declaration uses the same
+`decl:v1:<hex>` `DeclarationId`, including role-specific aliases such as
+`target_id`, `procedure_id`, and `declaration_id`. A full-detail declaration
+also carries `site_id`; it is the declaration ID plus that row's exact byte
+span. Display names, line/column ranges, and semantic-model wire IDs are not
+inputs to either identity. Semantic-wire and canonical-AST owners remain
+separate identity domains and retain an explicit derivation.
 
 Dense IDs are artifact-local and interpreted with the immutable artifact or
 graph that assigned them. A bare value ID in storage, or a call-site comparison

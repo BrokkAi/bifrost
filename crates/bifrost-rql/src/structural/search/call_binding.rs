@@ -62,6 +62,10 @@ pub(super) struct CallBindingSiteValue {
     /// The target rendered as a workspace declaration, when the workspace
     /// indexes an exact range for it.
     pub(super) target: Option<DeclarationValue>,
+    /// Process-independent identity of the workspace declaration selected by
+    /// the production resolver. Unlike the rendered declaration `id`, this is
+    /// independent of source ranges and is suitable for policy predicates.
+    pub(super) declared_target_id: Option<String>,
     /// The `callable_signature` row this binding selects: the target's only
     /// entry, or the entry of a multi-entry set that this call's arity accepts.
     /// Absent when entries with different parameter lists accept it, or none
@@ -859,6 +863,7 @@ pub(super) fn call_binding_expansions(
                     branch: Vec::new(),
                     language: crate::analyzer::common::language_for_file(&file).config_label(),
                     message: "call_bindings found incomplete or conflicting semantic-model provenance for an exact source target".to_owned(),
+                exhausted_roots: Vec::new(),
                 });
             }
         }
@@ -942,6 +947,7 @@ pub(super) fn call_binding_expansions(
                     message: format!(
                         "call_bindings semantic model callable is incomplete: {reason:?}"
                     ),
+                    exhausted_roots: Vec::new(),
                 });
             }
             ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
@@ -956,6 +962,18 @@ pub(super) fn call_binding_expansions(
     if formal_layout_id.is_none() {
         formal_layout_id = signature_id.clone();
     }
+    let receiver_owner_applicable = crate::analyzer::common::language_for_file(&file)
+        == Language::Go
+        || !matches!(
+            &target,
+            CallBindingTarget::Resolved {
+                receiver: CallReceiverBinding::Absent,
+                ..
+            } | CallBindingTarget::ResolvedExternal {
+                receiver: CallReceiverBinding::Absent,
+                ..
+            }
+        );
     let mut report = call_binding_report(&file, &shape.report, target);
     // The initial producer consumes exact source signatures. Model signature
     // substitution must not lend a different signature's proof to these rows.
@@ -969,16 +987,14 @@ pub(super) fn call_binding_expansions(
     // uncertainty travels on the conversion field and is charged only when a
     // consumer reads that field, not when a policy selects the binding itself.
     let report = Arc::new(report);
-    // The owner identity is meaningful only when this call's shared binder
-    // emitted an exact receiver/implicit row. In particular, do not attach a
-    // model member's owner to static, unestablished, or terminal rows.
-    if report.rows.iter().any(|row| {
-        matches!(
-            row.binding_kind,
-            Some(crate::analyzer::usages::call_binding::CallBindingKind::Receiver)
-                | Some(crate::analyzer::usages::call_binding::CallBindingKind::Implicit)
-        ) && matches!(row.mapping, CallBindingMapping::Exact)
-    }) {
+    // Publish the resolved member owner only for a call whose typed binder did
+    // not classify the qualifier as a scope. An unestablished receiver may
+    // still retain the independently proven member owner, while an associated
+    // or static call must not acquire receiver identity from that owner. A Go
+    // declaration beneath a type is necessarily a receiver method, so its
+    // resolver-proven owner remains applicable even when its receiver clause
+    // was not materialized into the shared formal layout.
+    if receiver_owner_applicable {
         if receiver_type_id.is_none()
             && let Some(source_target) = source_target.as_ref()
         {
@@ -1026,6 +1042,7 @@ pub(super) fn call_binding_expansions(
                 dispatch.target_count,
                 report.coverage.label(),
             ),
+        exhausted_roots: Vec::new(),
         });
     } else if has_semantic && !selector.exact {
         diagnostics.push(CodeQueryDiagnostic {
@@ -1037,11 +1054,15 @@ pub(super) fn call_binding_expansions(
                 "call_bindings established an exact declared target and actual-to-formal mapping, but exact selector proof remains unavailable (dispatch outcome={}, coverage={}, target_count={})",
                 dispatch.outcome, dispatch.coverage, dispatch.target_count,
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     let site = CallBindingSiteValue {
         report,
         target: declaration,
+        declared_target_id: source_target
+            .as_ref()
+            .map(|target| target.declaration_id().to_string()),
         signature_id,
         model_callable_id,
         formal_layout_id,
@@ -1179,9 +1200,9 @@ fn selected_signature(
     declaration: &DeclarationValue,
     actual_count: usize,
 ) -> SelectedSignature {
-    let declaration_id = callable_signature::declaration_site_id(declaration);
+    let declaration_site_id = declaration.site_id();
     let entries = analyzer.signature_metadata(&declaration.unit);
-    let reports = callable_signature_reports(&declaration_id, &declaration.unit, &entries);
+    let reports = callable_signature_reports(&declaration_site_id, &declaration.unit, &entries);
     signature_choice(&reports, actual_count)
 }
 

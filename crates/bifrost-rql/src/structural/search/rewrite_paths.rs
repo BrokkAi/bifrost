@@ -89,6 +89,7 @@ impl RewritePathTraversalCache {
                      {generation} ({detail}); uncovered domains: [{}]",
                     uncovered.join(", ")
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
     }

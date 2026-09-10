@@ -73,6 +73,5 @@ pub use provider::{
     ValueFlowCache, ValueFlowCacheStatsSnapshot, ValueFlowProvider, WorkspaceValueFlowProvider,
 };
 pub use result::{
-    ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,
-    ValueFlowSummaryResult,
+    ValueFlowMayStatus, ValueFlowMeeting, ValueFlowSinkOutcome, ValueFlowSummaryResult,
 };

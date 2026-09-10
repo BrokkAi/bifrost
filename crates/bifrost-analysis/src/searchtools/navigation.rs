@@ -1617,6 +1617,26 @@ pub(super) fn render_definition_lookup(
                 if matched.records.is_empty() && target.contains('#') {
                     matched = overlay.symbols_named(&target.replace('#', "."));
                 }
+                if language_for_file(file) == Language::Rust {
+                    matched
+                        .records
+                        .retain(|symbol| !crate::analyzer::is_rust_generated_function(symbol));
+                    if let Some(reference) = outcome.reference.as_ref() {
+                        matched
+                            .records
+                            .extend(crate::analyzer::resolve_rust_generated_functions(
+                                analyzer, &overlay, file, reference,
+                            ));
+                    }
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
                 if structured_reference_kind(analyzer, file, outcome.reference.as_ref())
                     == Some(NormalizedKind::FieldAccess)
                     && matched
@@ -2781,10 +2801,38 @@ pub(super) fn collect_ranked_names_by(
     semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
     matches_kind: impl Fn(&CodeUnit) -> bool,
 ) -> Vec<SearchSymbolHit> {
-    let mut hits: Vec<_> = code_units
+    let candidates: Vec<&RankedSearchCandidate> = code_units
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
-        .flat_map(|candidate| {
+        .collect();
+    // One pass over the file for every candidate's name range rather than a
+    // root walk per candidate (see `name_ranges_for_declarations`).
+    let display_lines: Vec<usize> = {
+        let _scope = profiling::scope(
+            "searchtools::search_symbols.render.collect_hits.declaration_name_range",
+        );
+        let name_ranges = render_context.map(|context| {
+            let requests: Vec<(&CodeUnit, Range)> = candidates
+                .iter()
+                .map(|candidate| (&candidate.code_unit, candidate.primary_range))
+                .collect();
+            context.name_ranges_for_declarations(&requests)
+        });
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                search_symbol_display_line(
+                    candidate,
+                    name_ranges.as_ref().and_then(|ranges| ranges[index]),
+                )
+            })
+            .collect()
+    };
+    let mut hits: Vec<_> = candidates
+        .iter()
+        .zip(display_lines)
+        .flat_map(|(candidate, line)| {
             let semantic_model = semantic_model_overlay.and_then(|overlay| {
                 let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
                 (matched.disposition
@@ -2797,12 +2845,6 @@ pub(super) fn collect_ranked_names_by(
                     "searchtools::search_symbols.render.collect_hits.display_signatures",
                 );
                 display_signatures(analyzer, &candidate.code_unit)
-            };
-            let line = {
-                let _scope = profiling::scope(
-                    "searchtools::search_symbols.render.collect_hits.declaration_name_range",
-                );
-                search_symbol_display_range(candidate, render_context).start_line
             };
             signatures
                 .into_iter()
@@ -2835,19 +2877,16 @@ pub(super) fn load_declaration_name_context(
     Some(DeclarationNameRangeContext::new(file, content))
 }
 
-pub(super) fn search_symbol_display_range(
+/// The line a search hit is shown at: its declaration name's line (1-based)
+/// when the file's tree yields one, else the declaration range's line.
+fn search_symbol_display_line(
     candidate: &RankedSearchCandidate,
-    render_context: Option<&DeclarationNameRangeContext>,
-) -> Range {
-    let name_range = render_context.and_then(|context| {
-        context.name_range_for_declaration(&candidate.code_unit, candidate.primary_range)
-    });
-    if let Some(mut name_range) = name_range {
-        name_range.start_line += 1;
-        name_range.end_line += 1;
-        return name_range;
+    name_range: Option<Range>,
+) -> usize {
+    match name_range {
+        Some(name_range) => name_range.start_line + 1,
+        None => candidate.primary_range.start_line,
     }
-    candidate.primary_range
 }
 
 pub(super) fn strip_params(symbols: Vec<String>) -> Vec<String> {

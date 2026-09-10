@@ -517,6 +517,7 @@ impl TypeScriptDeclarationPackProducer {
             },
             runtime_values: None,
             collection_flows: None,
+            deferred_yields: None,
         }];
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
@@ -854,6 +855,7 @@ impl TypeScriptDeclarationPackProducer {
                 },
                 runtime_values: None,
                 collection_flows: None,
+                deferred_yields: None,
             });
         }
         shards.sort_unstable_by(|left, right| left.id.cmp(&right.id));
@@ -2255,6 +2257,7 @@ fn finish_typescript_production(
         },
         runtime_values: None,
         collection_flows: None,
+        deferred_yields: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),

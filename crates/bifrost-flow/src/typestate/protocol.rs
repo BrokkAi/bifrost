@@ -243,6 +243,7 @@ pub enum ProtocolEventOccurrence {
     FieldWrite,
     Escape,
     ProcedureExit { kind: ProtocolProcedureExitKind },
+    SuspensionBoundary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]

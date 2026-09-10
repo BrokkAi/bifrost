@@ -580,6 +580,7 @@ fn pack_source(
             },
             runtime_values: None,
             collection_flows: None,
+            deferred_yields: None,
         }],
     };
     let mut rendered =

@@ -11,7 +11,6 @@ use super::super::lexical_environment::{
 };
 use super::super::occurrence_rows::ast_id;
 use super::super::occurrences::Namespace;
-use super::callable_signature::declaration_site_id;
 use super::results::{CodeQueryDecoratedParameter, DetailedCodeQueryDecoratedParameterEvidence};
 use super::*;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
@@ -57,7 +56,7 @@ pub(super) fn expansions_for_seed(
     let parameter_range = seed_range(seed);
     let parameter_id = ast_id(seed.facts.source_identity(), seed.fact_match.node);
     let owner = enclosing_declaration_value(analyzer, seed, declarations).0;
-    let owner_id = owner.as_ref().map(declaration_site_id);
+    let owner_id = owner.as_ref().map(DeclarationValue::site_id);
     let environment = environment_for_file(analyzer, &seed.file);
     let (semantic_identity, semantic_reason) = semantic.map_or((None, None), |context| {
         let procedures = context.procedure_of_match(seed);

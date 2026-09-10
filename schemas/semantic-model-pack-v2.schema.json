@@ -907,6 +907,16 @@
             }
           ]
         },
+        "deferred_yields": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredYieldsPayload"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -2178,6 +2188,57 @@
           "const": "unknown"
         }
       ]
+    },
+    "DeferredYieldFact": {
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Completeness"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "factory": {
+          "type": "string"
+        },
+        "handleType": {
+          "type": "string"
+        },
+        "payload": true,
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resume": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "factory",
+        "resume",
+        "handleType",
+        "payload"
+      ]
+    },
+    "DeferredYieldsPayload": {
+      "description": "Typed native companion for the CSMI deferred-yield vocabulary. These facts\nretain their exact linked factory, resume, and handle-type scope in the\npayload; coverage and provenance remain independent claims.",
+      "type": "object",
+      "properties": {
+        "yields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeferredYieldFact"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "EmbeddedTypeFact": {
       "type": "object",

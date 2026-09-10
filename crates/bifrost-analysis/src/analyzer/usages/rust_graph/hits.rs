@@ -194,13 +194,16 @@ fn record_scoped_target_segment_hit(
         };
         let path_text = path_segment_texts(&path_segments, ctx.source);
         let root_shadowed = path_root_shadowed(&path_segments, ctx);
-        if (ctx.matches_path(
-            &path_text,
-            path.start_byte(),
-            RustReferenceNamespace::PathPrefix,
-            root_shadowed,
-            rust_path_is_leading_absolute(path),
-        ) || (!root_shadowed && structured_path_matches_unique_target(path, ctx)))
+        let self_owner_match = path_text == ["Self"] && ctx.self_path_matches_target(path);
+        if (self_owner_match
+            || ctx.matches_path(
+                &path_text,
+                path.start_byte(),
+                RustReferenceNamespace::PathPrefix,
+                root_shadowed,
+                rust_path_is_leading_absolute(path),
+            )
+            || (!root_shadowed && structured_path_matches_unique_target(path, ctx)))
             && let Some(segment) = path_segments.last().copied()
         {
             record_target_segment(segment, false, ctx);

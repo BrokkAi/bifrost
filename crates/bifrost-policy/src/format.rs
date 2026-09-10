@@ -544,6 +544,48 @@ mod tests {
     }
 
     #[test]
+    fn analysis_shared_selector_context_round_trips() {
+        let source = r#"(policy
+  :id "bifrost.example.shared-selector-context"
+  :name "Shared selector context"
+  :message "Example"
+  :severity warning
+  :analysis (analysis
+    :languages [jvm]
+    :where ["src/**" "lib/**"]
+    :rql-schema-version 1
+    :type match
+    :selector (rql
+      (language scala
+        (where "src/scala/**"
+          (call :callee (name "eval"))))))
+)"#;
+
+        let formatted = at_width(source, 80);
+        assert!(formatted.contains(":languages [jvm]"));
+        assert!(formatted.contains(":where [\"src/**\" \"lib/**\"]"));
+        assert!(formatted.contains(":rql-schema-version 1"));
+        assert!(formatted.contains("(language scala"));
+        assert!(formatted.contains("(where \"src/scala/**\""));
+        assert_eq!(at_width(&formatted, 80), formatted);
+        let default_formatted = format_rqlp_source(source).unwrap();
+        assert_eq!(
+            format_rqlp_source(&default_formatted).unwrap(),
+            default_formatted
+        );
+    }
+
+    #[test]
+    fn statically_disjoint_shared_context_still_formats_before_validation() {
+        let source = "(policy :id \"example.disjoint\" :name \"Disjoint\" :message \"Example\" :severity warning :analysis (analysis :languages [java] :type match :selector (rql (language python (call :callee (name \"eval\"))))))";
+        let formatted = at_width(source, 80);
+
+        assert!(formatted.contains(":languages [java]"));
+        assert!(formatted.contains("(language python"));
+        assert_eq!(at_width(&formatted, 80), formatted);
+    }
+
+    #[test]
     fn formatting_is_idempotent_at_every_supported_gold_width() {
         let source = "(endpoint :id \"bifrost.sources.request-parameter\" :name \"Request parameter\" :display-name \"User-controlled I/O\" :role source :categories [user-controlled input web] :selector (rql (language python (call :callee (name \"request_parameter\")))) :binding return-value ; retained comment\n :unknown-future-field (future-record :value \"preserved\") :taint (source-semantics :labels [untrusted]))";
         for max_width in [80, 100, 120] {

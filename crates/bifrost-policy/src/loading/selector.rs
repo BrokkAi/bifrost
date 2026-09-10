@@ -7,17 +7,20 @@ use std::path::Path;
 use crate::{
     LoadedModelError, PolicySelector, PolicySelectorPath, ResolvedPolicySelector, SelectorOrigin,
 };
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDocument, WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
 };
-use brokk_bifrost_rql::query::sexp::{code_query_from_expr, validate_policy_selector_expr};
+use brokk_bifrost_rql::query::sexp::{
+    code_query_from_expr_with_scope, validate_policy_selector_expr,
+};
 use brokk_bifrost_rql::schema::resolve_rql_schema_version;
 use brokk_bifrost_rql::sexp::{Expr, parse_sexp};
 use brokk_bifrost_rql::structural::CodeQuery;
 
 use super::super::source::{
-    ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceDiagnosticSeverity,
+    ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceDiagnosticSeverity, PolicySourceError,
     PolicySourceIdentity, PolicySourceIdentityError, PolicySourceRelatedDiagnostic,
     UnresolvedPolicySelectorReference, workspace_policy_source_identity,
 };
@@ -70,16 +73,22 @@ pub(crate) fn resolve_parsed_selector(
     parsed: &ParsedRqlpDocument,
     selector_path: PolicySelectorPath,
     selector: &PolicySelector,
+    analyzer: Option<&dyn IAnalyzer>,
 ) -> Result<ResolvedSelectorLoad, SelectorLoadError> {
     match selector {
-        PolicySelector::Inline { schema, query } => {
-            let selector = ResolvedPolicySelector::try_new(
+        PolicySelector::Inline {
+            schema,
+            query,
+            resolved_locators,
+        } => {
+            let selector = ResolvedPolicySelector::try_new_with_locators(
                 selector_path,
                 *schema,
                 query.clone(),
                 SelectorOrigin::Document {
                     source: parsed.identity().clone(),
                 },
+                resolved_locators.clone(),
             )?;
             Ok(ResolvedSelectorLoad {
                 selector,
@@ -89,6 +98,7 @@ pub(crate) fn resolve_parsed_selector(
         PolicySelector::File {
             authored_schema_version,
             path,
+            ..
         } => {
             let reference = parsed
                 .unresolved_file_selectors()
@@ -104,8 +114,14 @@ pub(crate) fn resolve_parsed_selector(
             let root = root.ok_or_else(|| SelectorLoadError::WorkspaceRequired {
                 path: selector_path.clone(),
             })?;
-            let referenced = resolve_referenced_rql(root, parsed.identity(), reference)?;
-            let selector = ResolvedPolicySelector::try_new(
+            let mut referenced = resolve_referenced_rql(root, parsed.identity(), reference)?;
+            let mut resolved_locators = Vec::new();
+            super::super::locator::resolve_query_locators(
+                &mut referenced.query,
+                &mut resolved_locators,
+                analyzer,
+            )?;
+            let selector = ResolvedPolicySelector::try_new_with_locators(
                 selector_path,
                 referenced.schema_resolution,
                 referenced.query.clone(),
@@ -114,24 +130,17 @@ pub(crate) fn resolve_parsed_selector(
                     source: referenced.source_identity.clone(),
                     wrapper_authored_schema_version: referenced.wrapper_authored_schema_version,
                     document_authored_schema_version: referenced.document_authored_schema_version,
+                    analysis_authored_schema_version: reference
+                        .context
+                        .schema_version
+                        .as_ref()
+                        .map(|(version, _)| *version),
                 },
+                resolved_locators,
             )?;
             Ok(ResolvedSelectorLoad {
                 selector,
                 referenced: Some(referenced),
-            })
-        }
-        PolicySelector::Rows { plan } => {
-            let selector = ResolvedPolicySelector::try_new_rows(
-                selector_path,
-                plan.clone(),
-                SelectorOrigin::Document {
-                    source: parsed.identity().clone(),
-                },
-            )?;
-            Ok(ResolvedSelectorLoad {
-                selector,
-                referenced: None,
             })
         }
     }
@@ -207,6 +216,25 @@ pub(crate) fn resolve_referenced_rql(
         )
     })?;
 
+    if let (Some((analysis_version, analysis_range)), Some(document_version)) = (
+        reference.context.schema_version.as_ref(),
+        decoded.authored_schema_version,
+    ) && *analysis_version != document_version
+    {
+        return Err(source_error(
+            "conflicting-rql-schema-version",
+            source_identity,
+            decoded
+                .schema_version_range
+                .unwrap_or_else(|| expr.range.clone()),
+            format!(
+                "analysis pins RQL schema version {analysis_version}, but referenced document pins {document_version}"
+            ),
+            referrer,
+            analysis_range,
+        ));
+    }
+
     if let (Some(wrapper), Some(document_version)) = (
         reference.authored_schema_version,
         decoded.authored_schema_version,
@@ -227,7 +255,13 @@ pub(crate) fn resolve_referenced_rql(
     }
 
     let mut schema_resolution = match (
-        reference.authored_schema_version,
+        reference.authored_schema_version.or_else(|| {
+            reference
+                .context
+                .schema_version
+                .as_ref()
+                .map(|(version, _)| *version)
+        }),
         decoded.authored_schema_version,
     ) {
         (_, Some(version)) => resolve_rql_schema_version(Some(version)).map_err(|error| {
@@ -270,16 +304,46 @@ pub(crate) fn resolve_referenced_rql(
             &reference.range,
         )
     })?;
-    let query = code_query_from_expr(decoded.query, schema_resolution).map_err(|error| {
+    let query = code_query_from_expr_with_scope(
+        decoded.query,
+        schema_resolution,
+        &reference.context.languages,
+        &reference.context.where_globs,
+    )
+    .map_err(|error| {
         let message = error.to_string();
-        source_error(
+        let shared_field =
+            if error.origin == brokk_bifrost_rql::query::sexp::QueryExprErrorOrigin::SharedScope {
+                if error.path == "languages"
+                    || error.path.ends_with(".languages")
+                    || error.path.starts_with("languages[")
+                {
+                    Some(&reference.context.languages)
+                } else {
+                    Some(&reference.context.where_globs)
+                }
+            } else {
+                None
+            };
+        let mut error = source_error(
             "invalid-referenced-rql",
             source_identity.clone(),
             error.range,
             message,
             referrer,
             &reference.range,
-        )
+        );
+        if let ReferencedRqlError::Source { diagnostic, .. } = &mut error
+            && let Some(field) = shared_field
+            && let (Some(first), Some(last)) = (field.first(), field.last())
+        {
+            diagnostic.related.push(PolicySourceRelatedDiagnostic {
+                source: referrer.clone(),
+                range: first.range.start..last.range.end,
+                message: "analysis-wide RQL selector constraint".to_string(),
+            });
+        }
+        error
     })?;
 
     Ok(ResolvedReferencedRql {
@@ -435,6 +499,7 @@ pub(crate) enum SelectorLoadError {
     MissingReference { path: PolicySelectorPath },
     WorkspaceRequired { path: PolicySelectorPath },
     Referenced(ReferencedRqlError),
+    Policy(PolicySourceError),
     Model(LoadedModelError),
 }
 
@@ -451,6 +516,7 @@ impl fmt::Display for SelectorLoadError {
                 write!(formatter, "selector {path} requires a workspace root")
             }
             Self::Referenced(error) => error.fmt(formatter),
+            Self::Policy(error) => error.fmt(formatter),
             Self::Model(error) => error.fmt(formatter),
         }
     }
@@ -460,6 +526,7 @@ impl std::error::Error for SelectorLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Referenced(error) => Some(error),
+            Self::Policy(error) => Some(error),
             Self::Model(error) => Some(error),
             Self::MissingReference { .. } | Self::WorkspaceRequired { .. } => None,
         }
@@ -478,6 +545,12 @@ impl From<LoadedModelError> for SelectorLoadError {
     }
 }
 
+impl From<PolicySourceError> for SelectorLoadError {
+    fn from(error: PolicySourceError) -> Self {
+        Self::Policy(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +564,7 @@ mod tests {
             authored_schema_version: wrapper,
             workspace_path: WorkspaceRelativePath::new("queries/query.rql").unwrap(),
             range: 12..42,
+            context: Default::default(),
         }
     }
 
@@ -557,6 +631,35 @@ mod tests {
     }
 
     #[test]
+    fn analysis_pin_is_inherited_and_conflicts_point_to_both_documents() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("queries")).unwrap();
+        let path = temp.path().join("queries/query.rql");
+        fs::write(&path, "(name \"A\")").unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let identity = PolicySourceIdentity::new("policies/root.rqlp");
+        let mut reference = reference(None);
+        reference.context.schema_version = Some((1, 101..102));
+        let inherited = resolve_referenced_rql(&root, &identity, &reference).unwrap();
+        assert_eq!(inherited.schema_resolution().version, 1);
+        assert_eq!(
+            inherited.schema_resolution().origin,
+            SchemaVersionOrigin::Explicit
+        );
+        assert_eq!(inherited.wrapper_authored_schema_version(), None);
+        fs::write(&path, "(rql :schema-version 3 (name \"A\"))").unwrap();
+        let error = resolve_referenced_rql(&root, &identity, &reference).unwrap_err();
+        let ReferencedRqlError::Source { source, diagnostic } = error else {
+            panic!("expected source diagnostic");
+        };
+        assert_eq!(source.as_str(), "queries/query.rql");
+        assert_eq!(diagnostic.code, "conflicting-rql-schema-version");
+        assert_eq!(diagnostic.range, 21..22);
+        assert_eq!(diagnostic.related[0].source, identity);
+        assert_eq!(diagnostic.related[0].range, 101..102);
+    }
+
+    #[test]
     fn source_identity_is_bounded_before_referenced_rql_io() {
         let temp = TempDir::new().unwrap();
         let root = WorkspaceRoot::open(temp.path()).unwrap();
@@ -569,6 +672,7 @@ mod tests {
             ))
             .unwrap(),
             range: 12..42,
+            context: Default::default(),
         };
 
         let error = resolve_referenced_rql(

@@ -16,6 +16,7 @@ pub(super) fn push_seed_provider_omission(
             "structural seed omitted {} because its provider returned no {unavailable}",
             rel_path_string(file)
         ),
+        exhausted_roots: Vec::new(),
     });
 }
 

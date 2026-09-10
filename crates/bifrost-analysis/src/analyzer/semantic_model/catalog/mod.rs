@@ -51,7 +51,13 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 560 classes, `int`, `float` and `types.NoneType` among them, had no
 /// ancestry, so no consumer could resolve their surface or exclude them from
 /// an `isinstance` guard.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 16;
+/// 17: the Python stub producer resolves imported return annotations and
+/// canonicalizes the exact `typing_extensions` aliases for `NoReturn` and
+/// `Never`. Warm generated packs carry only the unqualified local spelling.
+/// 18: the Rust rustdoc producer emits keyed `std::collections::HashMap`
+/// collection-flow facts. Warm generated packs predate those contracts.
+/// 19: native compilation preserves and validates deferred-yield contracts.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 19;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -804,21 +810,31 @@ impl SemanticPackCatalog {
                 "read-only semantic-pack catalog root does not exist".to_owned(),
             ));
         }
-        let root = match mode {
-            CatalogOpenMode::ReadWrite => storage::prepare_root(root)?,
-            CatalogOpenMode::ReadOnly => storage::open_read_only_root(root)?,
+        let root = {
+            let _scope = crate::profiling::scope("semantic_pack.catalog.prepare_root");
+            match mode {
+                CatalogOpenMode::ReadWrite => storage::prepare_root(root)?,
+                CatalogOpenMode::ReadOnly => storage::open_read_only_root(root)?,
+            }
         };
         // SQLite can leave every concurrent first opener in SQLITE_PROTOCOL
         // while they independently negotiate WAL locking on Windows. Elect
         // one initializer through schema migration and storage reconciliation;
         // normal catalog work remains concurrent after this lock is dropped.
-        let initialization_lock = if mode == CatalogOpenMode::ReadWrite {
-            Some(storage::acquire_initialization_lock(&root)?)
-        } else {
-            None
+        let initialization_lock = {
+            let _scope = crate::profiling::scope("semantic_pack.catalog.initialization_lock");
+            if mode == CatalogOpenMode::ReadWrite {
+                Some(storage::acquire_initialization_lock(&root)?)
+            } else {
+                None
+            }
         };
-        let mut connection = db::open(&root, mode)?;
+        let mut connection = {
+            let _scope = crate::profiling::scope("semantic_pack.catalog.db_open");
+            db::open(&root, mode)?
+        };
         if mode == CatalogOpenMode::ReadWrite {
+            let _scope = crate::profiling::scope("semantic_pack.catalog.reconcile_storage");
             reconcile_storage(&root, &mut connection)?;
         }
         drop(initialization_lock);

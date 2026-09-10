@@ -706,19 +706,6 @@ fn selector_schema_key(schemas: &ResolvedEndpointSelectorSchemas) -> (u8, Vec<(S
                 origin_rank(resolution.origin),
             )],
         ),
-        ResolvedEndpointSelectorSchemas::Rows(bindings) => (
-            1,
-            bindings
-                .iter()
-                .map(|binding| {
-                    (
-                        binding.path.as_str().to_owned(),
-                        binding.resolution.version,
-                        origin_rank(binding.resolution.origin),
-                    )
-                })
-                .collect(),
-        ),
     }
 }
 

@@ -95,7 +95,14 @@ fn parses_the_issue_example_query() {
     }));
 
     let seed = query.seed().expect("structural seed");
-    assert_eq!(seed.where_globs.len(), 2);
+    assert_eq!(
+        seed.where_globs
+            .groups()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        2
+    );
     assert_eq!(query.limit, 100);
     assert_eq!(seed.root.kinds, vec![NormalizedKind::Call]);
     let callee = seed.root.callee.as_ref().expect("callee pattern");
@@ -3308,4 +3315,129 @@ fn rejects_invalid_arity_specifications() {
         CodeQuery::from_sexp(r#"(arity 1)"#).is_err(),
         "arity alone is not a root anchor"
     );
+}
+
+#[test]
+fn conjunctive_where_preserves_flat_identity_and_matches_all_groups() {
+    let flat = parse_ok(json!({"match": {"kind": "call"}, "where": ["src/**", "lib/**"]}));
+    let nested = parse_ok(json!({"match": {"kind": "call"}, "where": [["src/**", "lib/**"]]}));
+    assert_eq!(flat.to_canonical_json(), nested.to_canonical_json());
+    assert_eq!(
+        flat.to_canonical_json()["where"],
+        json!(["src/**", "lib/**"])
+    );
+    let conjoined =
+        CodeQuery::from_sexp(r#"(where "**/*.py" (where "src/**" "lib/**" (call)))"#).unwrap();
+    let seed = conjoined.seed().unwrap();
+    assert!(seed.where_globs.matches("src/main.py"));
+    assert!(seed.where_globs.matches("lib/main.py"));
+    assert!(!seed.where_globs.matches("src/main.rs"));
+    assert!(!seed.where_globs.matches("test/main.py"));
+    assert_eq!(
+        CodeQuery::from_json(&conjoined.to_canonical_json())
+            .unwrap()
+            .to_canonical_json(),
+        conjoined.to_canonical_json()
+    );
+    let redundant = CodeQuery::from_sexp(r#"(where "src/**" (where "src/**" (call)))"#).unwrap();
+    assert_eq!(redundant.to_canonical_json()["where"], json!(["src/**"]));
+}
+
+#[test]
+fn nested_where_rejects_empty_mixed_and_over_budget_groups() {
+    for scope in [json!([[]]), json!(["src/**", ["lib/**"]]), json!([[7]])] {
+        assert!(parse(json!({"match": {"kind": "call"}, "where": scope})).is_err());
+    }
+    let total = vec![
+        vec!["src/**"; MAX_WHERE_GLOBS / 2 + 1],
+        vec!["lib/**"; MAX_WHERE_GLOBS / 2 + 1],
+    ];
+    let error = parse(json!({"match": {"kind": "call"}, "where": total})).unwrap_err();
+    assert_eq!(error.path, "where");
+    let empty = parse_ok(json!({"match": {"kind": "call"}, "where": []}));
+    assert!(empty.seed().unwrap().where_globs.matches("any/file.rs"));
+}
+
+#[test]
+fn shared_scope_and_nested_wrappers_distribute_identically_over_sets() {
+    use crate::sexp::parse_sexp;
+    let local = parse_sexp(r#"(union (language java (call)) (union (language kotlin (call)) (language scala (call))))"#).unwrap().expr.unwrap();
+    let language = parse_sexp("jvm").unwrap().expr.unwrap();
+    let glob = parse_sexp(r#""src/**""#).unwrap().expr.unwrap();
+    let shared = sexp::code_query_from_expr_with_scope(
+        &local,
+        schema::resolve_rql_schema_version(None).unwrap(),
+        &[language],
+        &[glob],
+    )
+    .unwrap();
+    let explicit = CodeQuery::from_sexp(
+        r#"(language jvm (where "src/**" (union (language java (call)) (union (language kotlin (call)) (language scala (call))))))"#,
+    ).unwrap();
+    assert_eq!(shared.to_canonical_json(), explicit.to_canonical_json());
+    let conflict = CodeQuery::from_sexp(
+        "(language jvm (union (call) (union (call) (language python (call)))))",
+    )
+    .unwrap_err();
+    assert!(
+        conflict.contains("union[1].union[1].languages"),
+        "{conflict}"
+    );
+    assert!(conflict.contains("disjoint"), "{conflict}");
+}
+
+#[test]
+fn language_families_expand_and_deduplicate_in_both_frontends() {
+    for (alias, members) in [
+        ("jvm", vec!["java", "kotlin", "scala"]),
+        ("js-ts", vec!["javascript", "typescript"]),
+    ] {
+        let rql =
+            CodeQuery::from_sexp(&format!("(language {alias} {} (call))", members[0])).unwrap();
+        let json = parse_ok(json!({"match": {"kind": "call"}, "languages": members}));
+        assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+        assert_eq!(
+            parse_ok(json!({"match": {"kind": "call"}, "languages": [alias]})).to_canonical_json(),
+            rql.to_canonical_json()
+        );
+    }
+    let narrowed = CodeQuery::from_sexp("(language jvm (language java (call)))").unwrap();
+    assert_eq!(narrowed.to_canonical_json()["languages"], json!(["java"]));
+    assert!(
+        CodeQuery::from_sexp("(language js-ts (language java (call)))")
+            .unwrap_err()
+            .contains("disjoint")
+    );
+    assert_eq!(
+        CodeQuery::from_sexp("(language tsx (call))")
+            .unwrap()
+            .to_canonical_json()["languages"],
+        json!(["typescript"])
+    );
+}
+
+#[test]
+fn shared_scope_errors_retain_local_or_embedding_provenance() {
+    use crate::sexp::parse_sexp;
+    let schema = schema::resolve_rql_schema_version(None).unwrap();
+    let local = parse_sexp("(union (call) (language python (call)))")
+        .unwrap()
+        .expr
+        .unwrap();
+    let language = parse_sexp("jvm").unwrap().expr.unwrap();
+    let error =
+        sexp::code_query_from_expr_with_scope(&local, schema, &[language], &[]).unwrap_err();
+    assert_eq!(error.origin, sexp::QueryExprErrorOrigin::SharedScope);
+    assert_eq!(error.path, "union[1].languages");
+    let bad_glob = parse_sexp(r#""[""#).unwrap().expr.unwrap();
+    let error =
+        sexp::code_query_from_expr_with_scope(&local, schema, &[], &[bad_glob]).unwrap_err();
+    assert_eq!(error.origin, sexp::QueryExprErrorOrigin::SharedScope);
+    assert_eq!(error.path, "where[0]");
+    let invalid = parse_sexp(r#"(call :name (regex "["))"#)
+        .unwrap()
+        .expr
+        .unwrap();
+    let error = sexp::code_query_from_expr_with_scope(&invalid, schema, &[], &[]).unwrap_err();
+    assert_eq!(error.origin, sexp::QueryExprErrorOrigin::Local);
 }

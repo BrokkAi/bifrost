@@ -1000,14 +1000,17 @@ impl WorkspaceAnalyzer {
 
         activation.evidence.sort();
         activation.evidence.dedup();
-        let runtime = acquire_active_semantic_models_with_evidence(
-            self.analyzer(),
-            context.catalog,
-            context.persistence,
-            &activation,
-            Some(&publication_evidence),
-            context.cancellation,
-        );
+        let runtime = {
+            let _scope = crate::profiling::scope("semantic_pack.acquire_active");
+            acquire_active_semantic_models_with_evidence(
+                self.analyzer(),
+                context.catalog,
+                context.persistence,
+                &activation,
+                Some(&publication_evidence),
+                context.cancellation,
+            )
+        };
         let diagnostic_refresh_required =
             matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. });
         DependencyPackActivationOutcome {
@@ -1332,10 +1335,13 @@ impl WorkspaceAnalyzer {
         automatic_gc: bool,
         tier_access: Option<Arc<AnalyzerBuildTierAccess>>,
     ) -> Result<Self, StoreError> {
-        let mut store_context = if automatic_gc {
-            crate::analyzer::persistent_store_context(project.as_ref())?
-        } else {
-            crate::analyzer::persistent_store_context_without_automatic_gc(project.as_ref())?
+        let mut store_context = {
+            let _scope = profiling::scope("WorkspaceAnalyzer::open_persistent_store");
+            if automatic_gc {
+                crate::analyzer::persistent_store_context(project.as_ref())?
+            } else {
+                crate::analyzer::persistent_store_context_without_automatic_gc(project.as_ref())?
+            }
         };
         if let Some(tier_access) = tier_access {
             store_context.build_tier_access = tier_access;

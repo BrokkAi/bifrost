@@ -945,7 +945,7 @@ mod tests {
 
     fn seed(name: &str) -> CodeQuerySeed {
         CodeQuerySeed {
-            where_globs: Vec::new(),
+            where_globs: Default::default(),
             languages: Vec::new(),
             root: Pattern {
                 name: Some(StringPredicate::Exact(name.to_owned())),

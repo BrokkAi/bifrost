@@ -2679,6 +2679,7 @@ fn point_occurrence(protocol: &CompiledProtocol, event: ProtocolEventId) -> bool
             | ProtocolEventOccurrence::FieldRead
             | ProtocolEventOccurrence::FieldWrite
             | ProtocolEventOccurrence::Escape
+            | ProtocolEventOccurrence::SuspensionBoundary
     )
 }
 
@@ -2746,6 +2747,7 @@ fn terminal_point_occurrence(
                     | ProtocolEventOccurrence::FieldRead
                     | ProtocolEventOccurrence::FieldWrite
                     | ProtocolEventOccurrence::Escape
+                    | ProtocolEventOccurrence::SuspensionBoundary
             )
     )
 }

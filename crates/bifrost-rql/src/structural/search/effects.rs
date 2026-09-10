@@ -72,8 +72,9 @@ const MAX_CALL_SITES_PER_PROCEDURE: usize = 512;
 const MAX_CONDITIONAL_WRAPPER_DEPTH: usize = 8;
 
 /// Domain separator for the graph identity of an external member the workspace
-/// holds no declaration for. It is separate from `render::declaration_id`, so a
-/// summarized external leaf can never collide with a workspace declaration row.
+/// holds no declaration for. It is separate from the analyzer's `DeclarationId`
+/// wire domain, so a summarized external leaf can never collide with a
+/// workspace declaration row.
 const EXTERNAL_EFFECT_PROCEDURE_ID_DOMAIN: &[u8] =
     b"bifrost.code_query.external_effect_procedure.v1";
 
@@ -8754,6 +8755,7 @@ fn record_result_contract_incomplete(
         branch: Vec::new(),
         language: crate::analyzer::common::language_for_file(file).config_label(),
         message: format!("{message} in `{}`", rel_path_string(file)),
+        exhausted_roots: Vec::new(),
     });
 }
 
@@ -8783,6 +8785,7 @@ fn record_coverage(
                     message:
                         "effect derivation reached a bound; the retained effect set may be missing rows"
                             .to_owned(),
+                exhausted_roots: Vec::new(),
                 });
             }
             cache.incomplete = true;
@@ -8798,6 +8801,7 @@ fn record_coverage(
                     message:
                         "an unresolved or unmodeled callee leaves the effect set non-exhaustive"
                             .to_owned(),
+                    exhausted_roots: Vec::new(),
                 });
             }
         }
@@ -8910,7 +8914,7 @@ fn dispatch_arms(
         let complete = arm.completeness == "complete";
         let (key, lookup, declaration_id) = match &arm.target_unit {
             Some(unit) => {
-                let declaration_id = declaration_identity(analyzer, unit);
+                let declaration_id = Some(declaration_identity(unit));
                 match cache.key_for(analyzer, unit) {
                     Some(key) => {
                         let lookup = match cache.answer_for(analyzer, &key) {
@@ -9055,18 +9059,8 @@ fn site_coverage(
 
 /// The `declaration` domain's own identity for one workspace unit, so an
 /// effect row joins a declaration row by id equality.
-fn declaration_identity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
-    let range = analyzer
-        .ranges_of(unit)
-        .into_iter()
-        .min_by_key(primary_range_key)?;
-    let declaration = DeclarationValue::new(unit.clone(), range);
-    Some(render::declaration_id(
-        &rel_path_string(unit.source()),
-        declaration.identity_kind_label(),
-        &unit.fq_name(),
-        range,
-    ))
+fn declaration_identity(unit: &CodeUnit) -> String {
+    unit.declaration_id().to_string()
 }
 
 /// Derive the transitive effect summary of one declaration.
@@ -9082,9 +9076,7 @@ pub(super) fn procedure_effect_expansions(
     cache_profile: &mut Option<QueryCacheProfile>,
     declaration: &DeclarationValue,
 ) -> Vec<PipelineExpansion> {
-    let Some(identity) = declaration_identity(analyzer, &declaration.unit) else {
-        return Vec::new();
-    };
+    let identity = declaration_identity(&declaration.unit);
     let report = match cache.reports.get(&identity) {
         Some(report) => Arc::clone(report),
         None => {
@@ -9187,7 +9179,7 @@ fn discover_effect_graph(
             graph.truncated = true;
             return None;
         }
-        let identity = declaration_identity(analyzer, unit)?;
+        let identity = declaration_identity(unit);
         let declared = match cache.key_for(analyzer, unit) {
             Some(key) => match cache.answer_for(analyzer, &key) {
                 ModelAnswer::Modeled { effects, .. } => effects,

@@ -500,10 +500,15 @@ fn get_symbol_sources_with_budget(
         // misrouted as a filesystem path, and real namespace symbols like
         // `fmt::formatter` are never stolen by path-selector parsing.
         let exact_scope = crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
-        let exact =
-            resolve_selectable_definitions_bounded(analyzer, token, &symbol, |analyzer, lookup| {
+        let exact = resolve_selectable_definitions_bounded(
+            analyzer,
+            token,
+            &symbol,
+            resolution_budget(&keep_going),
+            |analyzer, lookup| {
                 exact_codeunit_resolution_bounded(analyzer, lookup, resolution_budget(&keep_going))
-            });
+            },
+        );
         let exact = match exact {
             Ok(resolution) => resolution,
             Err(stop) => return stopped_source_outcome(&symbol, stop),
@@ -729,10 +734,15 @@ fn get_symbol_sources_with_budget(
         drop(file_pattern_scope);
 
         let _fuzzy_scope = crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
-        let fuzzy =
-            resolve_selectable_definitions_bounded(analyzer, token, &symbol, |analyzer, lookup| {
+        let fuzzy = resolve_selectable_definitions_bounded(
+            analyzer,
+            token,
+            &symbol,
+            resolution_budget(&keep_going),
+            |analyzer, lookup| {
                 resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget(&keep_going))
-            });
+            },
+        );
         let fuzzy = match fuzzy {
             Ok(resolution) => resolution,
             Err(stop) => return stopped_source_outcome(&symbol, stop),

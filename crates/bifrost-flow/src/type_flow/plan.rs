@@ -23,9 +23,9 @@ use crate::analyzer::semantic::{
     DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, LengthDelimitedDigest,
     MemberAccessKind, MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict,
     ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudget, SemanticCallSite, SemanticEffect, SemanticLocator, SemanticProviderError,
-    SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan, StableDigest,
-    TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
+    SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticLocator,
+    SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
+    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -87,6 +87,22 @@ pub enum ProcedureDispatchReadContract {
     Unattributed(Box<[DispatchReadUnattributedReason]>),
 }
 
+/// What one `refine_sources` round did to the plan it refined.
+///
+/// The caller solves the plan to collect the evidence each round reads, so it
+/// needs to know whether the plan it solved is still the plan it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceRefinement {
+    /// The rebuild reproduced the plan exactly and installed nothing. The
+    /// evidence solve that fed this round is a solve of the current plan.
+    Unchanged,
+    /// The plan changed, but its semantic source observations did not, so
+    /// another round would derive the same sources again.
+    Settled,
+    /// New source observations. Another round can refine further.
+    Refined,
+}
+
 /// A root's value-flow plan plus the class-set tables keyed by its ids.
 ///
 /// The discovered closure is consumed by construction: its snapshots and
@@ -94,7 +110,11 @@ pub enum ProcedureDispatchReadContract {
 /// beside them so `interpret` can attribute an unreached sink to the boundary
 /// (`UnresolvedCall`, `Truncated`) the coverage names, the same derivation
 /// the seeds already use.
-#[derive(Debug)]
+///
+/// Equality is the feedback loop's fixpoint test: two iterations that built
+/// the same plan cannot solve to different results, so the later one must not
+/// solve again. Every field below is an input the solve or `interpret` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeFlowPlan {
     value_flow: ValueFlowPlan,
     atoms: Vec<ClassAtom>,
@@ -105,10 +125,16 @@ pub struct TypeFlowPlan {
     dispatch_reads: HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
     local_structure_digests: HashMap<DurableProcedureKey, StableDigest>,
     summary_cuts: HashSet<DurableProcedureKey>,
-    field_slot_semantic_budget_exhausted: bool,
+    /// The workspace field-slot index this plan read stopped short. The typed
+    /// charge is present whenever the index named one; the index also reports
+    /// an untyped transient resolver-budget stop, which sets the flag alone.
+    field_slot_semantic_exhausted: bool,
+    field_slot_semantic_exhaustion: Option<SemanticBudgetExceeded>,
     provider_failure_observed: bool,
     field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
     refinement_budget_exhausted: bool,
+    /// The first semantic charge a procedure-local refinement could not pay.
+    refinement_exhaustion: Option<SemanticBudgetExceeded>,
     correlations: Vec<(ProcedureHandle, CorrelationAnalysis)>,
     guard_bindings: HashMap<DurableProcedureKey, GuardBindings>,
 }
@@ -209,7 +235,7 @@ pub enum TypeFlowPlanError {
     RootRelationsUnavailable,
     WorkspaceEnumeration(std::io::Error),
     Cancelled,
-    RefinementBudget(crate::analyzer::semantic::SemanticBudgetExceeded),
+    RefinementBudget(SemanticBudgetExceeded),
     Flow(ValueFlowPlanError),
     GuardControl(CfgAlgorithmError<ProgramPointId>),
     ExternalSummary(ProcedureSummaryBindingError),
@@ -933,7 +959,7 @@ impl TypeFlowPlan {
         unmaterialized_external_targets.dedup();
         let mut tables = SeedTables::new();
         let mut field_refinements = Vec::new();
-        let mut refinement_budget_exhausted = false;
+        let mut refinement_exhaustion: Option<SemanticBudgetExceeded> = None;
         let mut correlations = Vec::new();
         let mut guard_bindings = HashMap::default();
         for procedure in &closure.procedures {
@@ -950,7 +976,9 @@ impl TypeFlowPlan {
                 Ok(bindings) => {
                     guard_bindings.insert(procedure.durable_key(), bindings);
                 }
-                Err(CorrelationError::Budget(_)) => refinement_budget_exhausted = true,
+                Err(CorrelationError::Budget(exceeded)) => {
+                    refinement_exhaustion.get_or_insert(exceeded);
+                }
                 Err(CorrelationError::Cancelled { .. }) => {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
@@ -977,7 +1005,9 @@ impl TypeFlowPlan {
                         correlations.push((procedure.clone(), analysis));
                     }
                 }
-                Err(CorrelationError::Budget(_)) => refinement_budget_exhausted = true,
+                Err(CorrelationError::Budget(exceeded)) => {
+                    refinement_exhaustion.get_or_insert(exceeded);
+                }
                 Err(CorrelationError::Cancelled { .. }) => {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
@@ -1018,8 +1048,8 @@ impl TypeFlowPlan {
                     },
                 ) {
                     Ok(fields) => fields,
-                    Err(CorrelationError::Budget(_)) => {
-                        refinement_budget_exhausted = true;
+                    Err(CorrelationError::Budget(exceeded)) => {
+                        refinement_exhaustion.get_or_insert(exceeded);
                         Vec::new()
                     }
                     Err(CorrelationError::Cancelled { .. }) => {
@@ -1167,18 +1197,19 @@ impl TypeFlowPlan {
             dispatch_reads,
             local_structure_digests,
             summary_cuts,
-            field_slot_semantic_budget_exhausted: field_slots.semantic_budget_exhausted()
-                || refinement_budget_exhausted,
+            field_slot_semantic_exhausted: field_slots.semantic_budget_exhausted(),
+            field_slot_semantic_exhaustion: field_slots.semantic_budget_exhaustion(),
             provider_failure_observed,
             field_refinements,
-            refinement_budget_exhausted,
+            refinement_budget_exhausted: refinement_exhaustion.is_some(),
+            refinement_exhaustion,
             correlations,
             guard_bindings,
         })
     }
 
     pub(super) fn discovery_boundary(&self) -> Option<UnknownReason> {
-        if self.field_slot_semantic_budget_exhausted || self.refinement_budget_exhausted {
+        if self.field_slot_semantic_budget_exhausted() {
             Some(UnknownReason::SemanticBudget)
         } else if self.provider_failure_observed {
             Some(UnknownReason::IncompleteRoot)
@@ -1203,9 +1234,32 @@ impl TypeFlowPlan {
             })
     }
 
-    pub(crate) fn mark_refinement_budget_exhausted(&mut self) {
-        self.field_slot_semantic_budget_exhausted = true;
+    /// Record that a refinement round could not pay for the evidence the plan
+    /// still needs, with the charge that failed when the caller knows it.
+    pub(crate) fn mark_refinement_budget_exhausted(
+        &mut self,
+        exhaustion: Option<SemanticBudgetExceeded>,
+    ) {
         self.refinement_budget_exhausted = true;
+        if self.refinement_exhaustion.is_none() {
+            self.refinement_exhaustion = exhaustion;
+        }
+    }
+
+    /// The first semantic charge a procedure-local refinement could not pay.
+    pub(crate) const fn refinement_exhaustion(&self) -> Option<SemanticBudgetExceeded> {
+        self.refinement_exhaustion
+    }
+
+    /// The charge the workspace field-slot index could not pay, when it named
+    /// one. `None` with [`Self::field_slot_semantic_exhausted`] set is the
+    /// index's untyped transient resolver-budget stop.
+    pub(crate) const fn field_slot_semantic_exhaustion(&self) -> Option<SemanticBudgetExceeded> {
+        self.field_slot_semantic_exhaustion
+    }
+
+    pub(crate) const fn field_slot_semantic_exhausted(&self) -> bool {
+        self.field_slot_semantic_exhausted
     }
 
     /// These sources and exclusions depend on a preliminary solve of this
@@ -1265,7 +1319,7 @@ impl TypeFlowPlan {
         evidence: &DefinitionSources,
         budget: &mut SemanticBudget,
         cancellation: &CancellationToken,
-    ) -> Result<bool, TypeFlowPlanError> {
+    ) -> Result<SourceRefinement, TypeFlowPlanError> {
         budget
             .charge(SemanticWork {
                 nested_entries: self.value_flow.sources().len(),
@@ -1384,10 +1438,16 @@ impl TypeFlowPlan {
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
             }
-            for (_, spec) in self
-                .value_flow
-                .sources()
-                .filter(|(_, spec)| spec.point().procedure() == procedure)
+            // Mint refined candidates above the sources that survive this
+            // rebuild, not above the sources it replaces. Taking the
+            // high-water mark from the whole current plan counted the
+            // previous round's candidates, so every round minted strictly
+            // higher ordinals for the same observation and rebuilt a plan
+            // that differed from the one the round had just solved.
+            for (spec, _, _) in tables
+                .sources
+                .iter()
+                .filter(|(spec, _, _)| spec.point().procedure() == procedure)
             {
                 tables
                     .ordinals
@@ -1581,10 +1641,20 @@ impl TypeFlowPlan {
             atoms.push(atom);
             sites.push(site);
         }
+        if value_flow == self.value_flow && atoms == self.atoms && sites == self.source_sites {
+            // The rebuild reproduced the plan. Installing it would replace
+            // each part with its own equal, and the caller's evidence solve
+            // remains a solve of exactly this plan.
+            return Ok(SourceRefinement::Unchanged);
+        }
         self.value_flow = value_flow;
         self.atoms = atoms;
         self.source_sites = sites;
-        Ok(sources_changed)
+        if sources_changed {
+            Ok(SourceRefinement::Refined)
+        } else {
+            Ok(SourceRefinement::Settled)
+        }
     }
 
     /// Unknown member-surface annotations on a base do not describe its
@@ -1677,7 +1747,7 @@ impl TypeFlowPlan {
     }
 
     pub(crate) const fn field_slot_semantic_budget_exhausted(&self) -> bool {
-        self.field_slot_semantic_budget_exhausted
+        self.field_slot_semantic_exhausted || self.refinement_budget_exhausted
     }
 
     pub(crate) const fn provider_failure_observed(&self) -> bool {

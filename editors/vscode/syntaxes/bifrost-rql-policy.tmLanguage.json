@@ -14,6 +14,10 @@
     },
     {
       "name": "entity.name.function.record.bifrost-rql-policy",
+      "match": "(?<=\\()(?:normal-procedure-exit|exceptional-procedure-exit|suspension-boundary)(?=$|[\\s)])"
+    },
+    {
+      "name": "entity.name.function.record.bifrost-rql-policy",
       "match": "(?<=\\()[a-z][a-z0-9-]*(?=$|[\\s)])"
     },
     {
@@ -27,6 +31,10 @@
     {
       "name": "constant.language.bifrost-rql-policy",
       "match": "\\b(?:true|false|null)\\b"
+    },
+    {
+      "name": "constant.other.symbol.bifrost-rql-policy",
+      "match": "(?<=[\\s\\[,(])[a-z][a-z0-9-]*(?=$|[\\s\\],)])"
     },
     {
       "name": "punctuation.section.brackets.bifrost-rql-policy",

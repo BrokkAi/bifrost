@@ -402,6 +402,69 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-linux-x86-64:
+    name: build binary (x86_64-unknown-linux-gnu)
+    needs: [preflight, notices]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+      - name: Cache Cargo dependencies for binary build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-build-x86_64-unknown-linux-gnu
+      - name: Install pinned GNU/Linux linker toolchain
+        shell: bash
+        run: |
+          cargo install --locked cargo-zigbuild --version '=0.23.3'
+          python3 -m venv "$RUNNER_TEMP/ziglang"
+          "$RUNNER_TEMP/ziglang/bin/pip" install --disable-pip-version-check 'ziglang==0.15.2'
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/ziglang/bin/python-zig" >> "$GITHUB_ENV"
+      - name: Build GNU/Linux binary with glibc 2.28 floor
+        shell: bash
+        env:
+          BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
+          LIBZ_SYS_STATIC: '1'
+        run: cargo zigbuild --release --locked --bin "$BIN_NAME" --target x86_64-unknown-linux-gnu.2.28
+      - name: Verify GNU/Linux ELF contract
+        shell: bash
+        run: bash scripts/public/verify-linux-release-elf.sh "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" x86_64-unknown-linux-gnu
+      - name: Stage Unix archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          target=x86_64-unknown-linux-gnu
+          stage="${BIN_NAME}-${RELEASE_TAG}-${target}"
+          mkdir -p "dist/${stage}"
+          cp "target/${target}/release/${BIN_NAME}" "dist/${stage}/"
+          cp LICENSE.md README.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+      - name: Upload exact binary archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-x86_64-unknown-linux-gnu
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: build binary (${{ matrix.target }})
     needs: [preflight, notices]
@@ -409,15 +472,11 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      # Start every target immediately. The paid macOS and Windows pools have
+      # Start every remaining target immediately. The paid macOS and Windows pools have
       # their own lower capacity limits in the release-readiness runner group.
-      max-parallel: 6
+      max-parallel: 5
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             rust_targets: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -463,7 +522,7 @@ jobs:
         shell: bash
         run: rustup target add ${{ matrix.rust_targets }}
       - name: Install pinned GNU/Linux linker toolchain
-        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           cargo install --locked cargo-zigbuild --version '=0.23.3'
@@ -491,20 +550,20 @@ jobs:
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
           } >> "$GITHUB_ENV"
       - name: Build binary
-        if: matrix.target != 'universal-apple-darwin' && !endsWith(matrix.target, '-unknown-linux-gnu')
+        if: matrix.target != 'universal-apple-darwin' && matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
         env:
           BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
         run: cargo build --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}"
       - name: Build GNU/Linux binary with glibc 2.28 floor
-        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         env:
           BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
           LIBZ_SYS_STATIC: '1'
         run: cargo zigbuild --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}.2.28"
       - name: Verify GNU/Linux ELF contract
-        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: bash scripts/public/verify-linux-release-elf.sh "target/${{ matrix.target }}/release/${BIN_NAME}" "${{ matrix.target }}"
       - name: Build macOS universal binary
@@ -560,7 +619,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 5
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -622,7 +681,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 5
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -750,7 +809,7 @@ jobs:
 
   agent-plugin-package:
     name: package agent plugin
-    needs: [preflight, build]
+    needs: [preflight, build-linux-x86-64, build]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -806,7 +865,7 @@ jobs:
 
   agent-plugin-smoke:
     name: prepublish Codex and Claude list_policies smoke
-    needs: [preflight, build, agent-plugin-package]
+    needs: [preflight, agent-plugin-package]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -864,7 +923,7 @@ jobs:
     # Keep this explicit so the new artifact dependency does not change that
     # release path into a rebuild.
     if: ${{ inputs.requalify_from_run == '' }}
-    needs: [preflight, build, semantic-pack-python]
+    needs: [preflight, build-linux-x86-64, semantic-pack-python]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -941,7 +1000,7 @@ jobs:
 
   pi-package:
     name: package Pi archive
-    needs: [preflight, build]
+    needs: [preflight, build-linux-x86-64, build]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -991,7 +1050,7 @@ jobs:
 
   vscode-package:
     name: package VSIX
-    needs: [preflight, build]
+    needs: [preflight, build-linux-x86-64, build]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -1043,7 +1102,7 @@ jobs:
 
   npm-package:
     name: package npm release archives
-    needs: [preflight, build]
+    needs: [preflight, build-linux-x86-64, build]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -1214,6 +1273,7 @@ jobs:
       - notices
       - crate-package
       - semantic-pack-bundle
+      - build-linux-x86-64
       - build
       - python-wheels
       - uv-wheels

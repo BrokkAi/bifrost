@@ -81,7 +81,6 @@ impl MatchResultDomain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StableIdentityDerivation {
-    AnalyzerDeclarationId,
     CanonicalAstIdentity,
     CatalogEntry,
     ProtocolSubject,
@@ -91,7 +90,6 @@ pub enum StableIdentityDerivation {
 impl StableIdentityDerivation {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AnalyzerDeclarationId => "analyzer_declaration_id",
             Self::CanonicalAstIdentity => "canonical_ast_identity",
             Self::CatalogEntry => "catalog_entry",
             Self::ProtocolSubject => "protocol_subject",
@@ -102,13 +100,22 @@ impl StableIdentityDerivation {
 
 /// A stable semantic identity whose producer contract excludes coordinates and
 /// snapshot-local handles.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StableSemanticIdentity {
     namespace: String,
-    #[serde(serialize_with = "serialize_workspace_path")]
     path: WorkspaceRelativePath,
-    derivation: StableIdentityDerivation,
-    semantic_key: String,
+    identity: StableSemanticIdentityKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum StableSemanticIdentityKind {
+    Declaration {
+        id: String,
+    },
+    Derived {
+        derivation: StableIdentityDerivation,
+        semantic_key: String,
+    },
 }
 
 impl StableSemanticIdentity {
@@ -124,14 +131,19 @@ impl StableSemanticIdentity {
     pub(crate) fn analyzer_declaration_id(
         namespace: impl AsRef<str>,
         path: WorkspaceRelativePath,
-        semantic_key: impl AsRef<str>,
+        id: impl AsRef<str>,
     ) -> Result<Self, StableSemanticIdentityError> {
-        Self::try_new_for_derivation(
-            namespace,
+        let namespace = namespace.as_ref();
+        validate_namespace(namespace).map_err(StableSemanticIdentityError::Namespace)?;
+        let id = id.as_ref();
+        validate_declaration_id(id)?;
+        Ok(Self {
+            namespace: namespace.to_string().into_boxed_str().into_string(),
             path,
-            StableIdentityDerivation::AnalyzerDeclarationId,
-            semantic_key,
-        )
+            identity: StableSemanticIdentityKind::Declaration {
+                id: id.to_string().into_boxed_str().into_string(),
+            },
+        })
     }
 
     pub(crate) fn canonical_ast_identity(
@@ -203,8 +215,10 @@ impl StableSemanticIdentity {
         Ok(Self {
             namespace: namespace.to_string().into_boxed_str().into_string(),
             path,
-            derivation,
-            semantic_key: semantic_key.to_string().into_boxed_str().into_string(),
+            identity: StableSemanticIdentityKind::Derived {
+                derivation,
+                semantic_key: semantic_key.to_string().into_boxed_str().into_string(),
+            },
         })
     }
 
@@ -216,20 +230,61 @@ impl StableSemanticIdentity {
         &self.path
     }
 
-    pub const fn derivation(&self) -> StableIdentityDerivation {
-        self.derivation
+    pub const fn declaration_id(&self) -> Option<&str> {
+        match &self.identity {
+            StableSemanticIdentityKind::Declaration { id } => Some(id.as_str()),
+            StableSemanticIdentityKind::Derived { .. } => None,
+        }
     }
 
-    pub fn semantic_key(&self) -> &str {
-        &self.semantic_key
+    pub const fn derivation(&self) -> Option<StableIdentityDerivation> {
+        match self.identity {
+            StableSemanticIdentityKind::Declaration { .. } => None,
+            StableSemanticIdentityKind::Derived { derivation, .. } => Some(derivation),
+        }
+    }
+
+    pub fn semantic_key(&self) -> Option<&str> {
+        match &self.identity {
+            StableSemanticIdentityKind::Declaration { .. } => None,
+            StableSemanticIdentityKind::Derived { semantic_key, .. } => Some(semantic_key),
+        }
+    }
+}
+
+impl Serialize for StableSemanticIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match &self.identity {
+            StableSemanticIdentityKind::Declaration { .. } => 3,
+            StableSemanticIdentityKind::Derived { .. } => 4,
+        };
+        let mut state = serializer.serialize_struct("StableSemanticIdentity", field_count)?;
+        state.serialize_field("namespace", &self.namespace)?;
+        state.serialize_field("path", self.path.as_str())?;
+        match &self.identity {
+            StableSemanticIdentityKind::Declaration { id } => {
+                state.serialize_field("id", id)?;
+            }
+            StableSemanticIdentityKind::Derived {
+                derivation,
+                semantic_key,
+            } => {
+                state.serialize_field("derivation", derivation)?;
+                state.serialize_field("semantic_key", semantic_key)?;
+            }
+        }
+        state.end()
     }
 }
 
 /// The wire shape of a stable semantic identity.
 ///
-/// Deserialization goes back through [`StableSemanticIdentity::try_new`], so a
-/// stored identity whose namespace, semantic key or derivation shape no longer
-/// validates is a load error rather than an identity nothing minted.
+/// Deserialization goes back through the typed constructors, so a stored
+/// declaration or derived identity that no longer validates is a load error
+/// rather than an identity nothing minted.
 impl<'de> Deserialize<'de> for StableSemanticIdentity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -237,17 +292,41 @@ impl<'de> Deserialize<'de> for StableSemanticIdentity {
     {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Wire {
+        struct DeclarationWire {
+            namespace: String,
+            path: String,
+            id: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DerivedWire {
             namespace: String,
             path: String,
             derivation: StableIdentityDerivation,
             semantic_key: String,
         }
 
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Declaration(DeclarationWire),
+            Derived(DerivedWire),
+        }
+
         let wire = Wire::deserialize(deserializer)?;
-        let path = WorkspaceRelativePath::new(&wire.path).map_err(de::Error::custom)?;
-        Self::try_new(wire.namespace, path, wire.derivation, wire.semantic_key)
-            .map_err(de::Error::custom)
+        match wire {
+            Wire::Declaration(wire) => {
+                let path = WorkspaceRelativePath::new(&wire.path).map_err(de::Error::custom)?;
+                Self::analyzer_declaration_id(wire.namespace, path, wire.id)
+                    .map_err(de::Error::custom)
+            }
+            Wire::Derived(wire) => {
+                let path = WorkspaceRelativePath::new(&wire.path).map_err(de::Error::custom)?;
+                Self::try_new(wire.namespace, path, wire.derivation, wire.semantic_key)
+                    .map_err(de::Error::custom)
+            }
+        }
     }
 }
 
@@ -262,6 +341,7 @@ pub enum StableSemanticIdentityError {
     AbsoluteOrNativePathPrefix,
     CoordinateOrOffsetEncoding,
     DenseOrRunLocalHandle,
+    InvalidDeclarationId,
     InvalidDerivationShape {
         derivation: StableIdentityDerivation,
     },
@@ -285,6 +365,9 @@ impl fmt::Display for StableSemanticIdentityError {
                 .write_str("semantic key must not encode source coordinates or byte offsets"),
             Self::DenseOrRunLocalHandle => formatter
                 .write_str("semantic key must not be a dense, snapshot-local, or run-local handle"),
+            Self::InvalidDeclarationId => {
+                formatter.write_str("declaration id must be a decl:v1 lowercase SHA-256 digest")
+            }
             Self::InvalidDerivationShape { derivation } => write!(
                 formatter,
                 "semantic key does not satisfy the {} producer contract",
@@ -320,6 +403,19 @@ fn validate_semantic_key(value: &str) -> Result<(), StableSemanticIdentityError>
     Ok(())
 }
 
+fn validate_declaration_id(value: &str) -> Result<(), StableSemanticIdentityError> {
+    let valid = value.strip_prefix("decl:v1:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    });
+    if !valid {
+        return Err(StableSemanticIdentityError::InvalidDeclarationId);
+    }
+    Ok(())
+}
+
 fn validate_derivation_shape(
     derivation: StableIdentityDerivation,
     semantic_key: &str,
@@ -328,19 +424,6 @@ fn validate_derivation_shape(
         return validate_canonical_ast_key(semantic_key, derivation);
     }
     let valid = match derivation {
-        StableIdentityDerivation::AnalyzerDeclarationId => {
-            let Some((kind, declaration)) = semantic_key.split_once(':') else {
-                return Err(StableSemanticIdentityError::InvalidDerivationShape { derivation });
-            };
-            !kind.is_empty()
-                && kind.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'-' | b'_')
-                })
-                && !declaration.is_empty()
-                && !declaration.bytes().all(|byte| byte.is_ascii_digit())
-        }
         StableIdentityDerivation::CanonicalAstIdentity => unreachable!("handled above"),
         StableIdentityDerivation::CatalogEntry
         | StableIdentityDerivation::ProtocolSubject
@@ -844,7 +927,10 @@ impl RetainedSize for StableSemanticIdentity {
         std::mem::size_of::<Self>()
             .saturating_add(self.namespace.capacity())
             .saturating_add(self.path.as_str().len())
-            .saturating_add(self.semantic_key.capacity())
+            .saturating_add(match &self.identity {
+                StableSemanticIdentityKind::Declaration { id } => id.capacity(),
+                StableSemanticIdentityKind::Derived { semantic_key, .. } => semantic_key.capacity(),
+            })
     }
 }
 
@@ -1008,10 +1094,7 @@ impl PolicyFindingId {
                 update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
                 if let Some(owner) = &anchor.semantic_owner {
                     update_length_prefixed(&mut hasher, b"owner");
-                    update_length_prefixed(&mut hasher, owner.namespace.as_bytes());
-                    update_length_prefixed(&mut hasher, owner.path.as_str().as_bytes());
-                    update_length_prefixed(&mut hasher, owner.derivation.as_str().as_bytes());
-                    update_length_prefixed(&mut hasher, owner.semantic_key.as_bytes());
+                    update_stable_semantic_identity(&mut hasher, owner);
                 } else {
                     update_length_prefixed(&mut hasher, b"no-owner");
                 }
@@ -1109,10 +1192,7 @@ pub(crate) fn match_vulnerability_digest(anchor: &MatchFindingAnchor) -> [u8; 32
             update_length_prefixed(&mut hasher, anchor.path.as_str().as_bytes());
             if let Some(owner) = &anchor.semantic_owner {
                 update_length_prefixed(&mut hasher, b"owner");
-                update_length_prefixed(&mut hasher, owner.namespace.as_bytes());
-                update_length_prefixed(&mut hasher, owner.path.as_str().as_bytes());
-                update_length_prefixed(&mut hasher, owner.derivation.as_str().as_bytes());
-                update_length_prefixed(&mut hasher, owner.semantic_key.as_bytes());
+                update_stable_semantic_identity(&mut hasher, owner);
             } else {
                 update_length_prefixed(&mut hasher, b"no-owner");
             }
@@ -1262,14 +1342,22 @@ fn update_analysis_kind(hasher: &mut Sha256, analysis_type: PolicyAnalysisType) 
     update_length_prefixed(hasher, value);
 }
 
-fn serialize_workspace_path<S>(
-    path: &WorkspaceRelativePath,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(path.as_str())
+fn update_stable_semantic_identity(hasher: &mut Sha256, identity: &StableSemanticIdentity) {
+    update_length_prefixed(hasher, identity.namespace().as_bytes());
+    update_length_prefixed(hasher, identity.path().as_str().as_bytes());
+    match &identity.identity {
+        StableSemanticIdentityKind::Declaration { id } => {
+            update_length_prefixed(hasher, b"declaration_id");
+            update_length_prefixed(hasher, id.as_bytes());
+        }
+        StableSemanticIdentityKind::Derived {
+            derivation,
+            semantic_key,
+        } => {
+            update_length_prefixed(hasher, derivation.as_str().as_bytes());
+            update_length_prefixed(hasher, semantic_key.as_bytes());
+        }
+    }
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
@@ -1294,16 +1382,32 @@ mod tests {
         WorkspaceRelativePath::new("src/app.rs").unwrap()
     }
 
+    fn declaration_id(byte: char) -> String {
+        format!("decl:v1:{}", byte.to_string().repeat(64))
+    }
+
     #[test]
     fn stable_semantic_identity_accepts_producer_contract_keys() {
-        let identity = StableSemanticIdentity::try_new(
-            "rust",
-            path(),
-            StableIdentityDerivation::AnalyzerDeclarationId,
-            "function:crate::Service::run(str)",
-        )
-        .unwrap();
-        assert_eq!(identity.semantic_key(), "function:crate::Service::run(str)");
+        let declaration_id = declaration_id('a');
+        let identity =
+            StableSemanticIdentity::analyzer_declaration_id("rust", path(), &declaration_id)
+                .unwrap();
+        assert_eq!(identity.declaration_id(), Some(declaration_id.as_str()));
+        assert_eq!(identity.derivation(), None);
+        assert_eq!(identity.semantic_key(), None);
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "namespace": "rust",
+                "path": "src/app.rs",
+                "id": declaration_id,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<StableSemanticIdentity>(wire).unwrap(),
+            identity
+        );
 
         let canonical = StableSemanticIdentity::canonical_ast_identity(
             "rust",
@@ -1313,7 +1417,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             canonical.derivation(),
-            StableIdentityDerivation::CanonicalAstIdentity
+            Some(StableIdentityDerivation::CanonicalAstIdentity)
         );
     }
 
@@ -1414,7 +1518,7 @@ mod tests {
         let cross_file_owner = StableSemanticIdentity::analyzer_declaration_id(
             "rust",
             WorkspaceRelativePath::new("src/other.rs").unwrap(),
-            "function:crate::Other::run",
+            declaration_id('b'),
         )
         .unwrap();
         assert_eq!(

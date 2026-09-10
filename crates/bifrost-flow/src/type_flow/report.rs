@@ -16,19 +16,28 @@ use crate::analyzer::semantic::{
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{AnalyzerQueryScope, Language, ProjectFile, WorkspaceAnalyzer};
-use crate::dataflow::{DataflowRequest, SolverBudget};
+use crate::dataflow::{DataflowRequest, SolverBudget, SolverBudgetExceeded};
 use crate::hash::HashMap;
 use crate::value_flow::{ClosureLimits, ValueFlowCache};
 
 use super::solve::{
     AbsentMemberFinding, ClassSetStatus, FeedbackLimits, ReceiverClassSet, TypeFlowError,
-    TypeFlowRootResult, prefer_retained_finding, solve_type_flow_for_root,
+    TypeFlowRootResult, TypeFlowSolvePhase, prefer_retained_finding, solve_type_flow_for_root,
 };
 use super::{FieldSlotIndex, TypeFlowSummaryState};
 
 /// Durable identity of one member access: the file, the receiver span, and
 /// the member name survive re-materialization; handles do not.
 type SiteIdentity = (ProjectFile, SourceSpan, Box<str>);
+
+/// Exact solver-budget exhaustion attributed to one structurally identified
+/// type-flow root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeFlowRootSolverExhaustion {
+    pub root: crate::analyzer::semantic::SemanticLocator,
+    pub phase: TypeFlowSolvePhase,
+    pub exceeded: SolverBudgetExceeded,
+}
 
 /// The merged answer of [`solve_type_flow_workspace`].
 #[derive(Debug, Default)]
@@ -39,6 +48,7 @@ pub struct TypeFlowReport {
     unknown_reasons: HashMap<UnknownReason, usize>,
     roots_analyzed: usize,
     roots_incomplete: usize,
+    solver_budget_exhaustions: Vec<TypeFlowRootSolverExhaustion>,
 }
 
 impl TypeFlowReport {
@@ -76,6 +86,11 @@ impl TypeFlowReport {
         self.roots_incomplete
     }
 
+    /// Every root attempt that exhausted its per-solve ledger.
+    pub fn solver_budget_exhaustions(&self) -> &[TypeFlowRootSolverExhaustion] {
+        &self.solver_budget_exhaustions
+    }
+
     /// Merge one root's result. Class sets union per site; a reason is
     /// counted once per site that reports it; findings deduplicate by (site,
     /// class, member), preferring retained witness evidence over an unavailable
@@ -85,6 +100,16 @@ impl TypeFlowReport {
         if !result.complete {
             self.roots_incomplete += 1;
         }
+        self.solver_budget_exhaustions
+            .extend(result.solver_attempts.iter().filter_map(|attempt| {
+                attempt
+                    .budget_exhaustion
+                    .map(|exceeded| TypeFlowRootSolverExhaustion {
+                        root: result.root.semantics().locator().clone(),
+                        phase: attempt.phase,
+                        exceeded,
+                    })
+            }));
         for set in result.class_sets {
             let key: SiteIdentity = (
                 set.site.file.clone(),

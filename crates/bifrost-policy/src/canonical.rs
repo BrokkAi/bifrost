@@ -491,14 +491,6 @@ fn ensure_inline_selector(
                 path: path.as_str().to_string(),
             })
         }
-        PolicySelector::Rows { plan } => {
-            for binding in &plan.bindings {
-                if let RowBindingSource::Query(selector) = &binding.source {
-                    ensure_inline_selector(selector)?;
-                }
-            }
-            Ok(())
-        }
     }
 }
 
@@ -940,6 +932,9 @@ fn row_derivation_to_json(derivation: &RowDerivation) -> Value {
             if matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall)) {
                 object.insert("evidence".to_owned(), json!("declared_call"));
             }
+            if filter.receiver_constraint == Some(ReceiverTypeConstraintKind::AssignableTo) {
+                object.insert("receiver_constraint".to_owned(), json!("assignable_to"));
+            }
             Value::Object(object)
         }
         RowDerivation::Project(projection) => json!({
@@ -1034,6 +1029,9 @@ fn row_predicate_to_json(predicate: &RowPredicate) -> Value {
                 Value::Array(values.iter().map(row_literal_to_json).collect()),
             );
         }
+        RowPredicateOperand::ResolvedIdentitySet(values) => {
+            insert(&mut object, "resolved_identities", json!(values));
+        }
         RowPredicateOperand::None => {}
     }
     Value::Object(object)
@@ -1056,10 +1054,15 @@ pub(crate) fn resolved_locator_to_json(locator: &ResolvedPolicyLocator) -> Value
         ResolvedPolicyLocatorKind::WorkspaceDeclaration => "workspace_declaration",
         ResolvedPolicyLocatorKind::ActiveSemanticModel => "active_semantic_model",
     };
+    let constraint = match locator.constraint {
+        ReceiverTypeConstraintKind::Exact => "exact",
+        ReceiverTypeConstraintKind::AssignableTo => "assignable_to",
+    };
     json!({
         "role": role,
         "kind": kind,
         "identity": locator.identity,
+        "constraint": constraint,
         "provenance": locator.provenance,
     })
 }
@@ -1471,7 +1474,7 @@ fn policy_severity_to_json(severity: &PolicySeveritySpec) -> Value {
 
 pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
     match selector {
-        PolicySelector::Inline { schema, query } => {
+        PolicySelector::Inline { schema, query, .. } => {
             json!({
                 "type": "inline",
                 "schema_version": schema.version,
@@ -1480,51 +1483,21 @@ pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
         }
         PolicySelector::File {
             authored_schema_version,
+            analysis_schema_version,
             path,
         } => {
             let mut object = tagged("file");
             insert_option(
                 &mut object,
                 "authored_schema_version",
-                authored_schema_version.map(|version| json!(version)),
+                authored_schema_version
+                    .or(*analysis_schema_version)
+                    .map(|version| json!(version)),
             );
             insert(&mut object, "path", json!(path.as_str()));
             Value::Object(object)
         }
-        PolicySelector::Rows { plan } => row_selector_plan_to_json(plan),
     }
-}
-
-pub(crate) fn row_selector_plan_to_json(plan: &RowSelectorPlan) -> Value {
-    let mut object = Map::new();
-    insert(
-        &mut object,
-        "bindings",
-        Value::Array(plan.bindings.iter().map(row_binding_to_json).collect()),
-    );
-    if !plan.derivations.is_empty() {
-        insert(
-            &mut object,
-            "derivations",
-            Value::Array(
-                plan.derivations
-                    .iter()
-                    .map(row_derivation_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if !plan.joins.is_empty() {
-        insert(
-            &mut object,
-            "joins",
-            Value::Array(plan.joins.iter().map(row_join_to_json).collect()),
-        );
-    }
-    insert(&mut object, "output", json!(plan.output.as_str()));
-    let mut tagged = tagged("rows");
-    insert(&mut tagged, "plan", Value::Object(object));
-    Value::Object(tagged)
 }
 
 fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
@@ -2117,6 +2090,10 @@ fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
         }),
         PolicySemanticEvent::ExceptionalProcedureExit { scope } => json!({
             "type": "exceptional_procedure_exit",
+            "scope": typestate_exit_scope_label(scope),
+        }),
+        PolicySemanticEvent::SuspensionBoundary { scope } => json!({
+            "type": "suspension_boundary",
             "scope": typestate_exit_scope_label(scope),
         }),
     }
@@ -2721,6 +2698,7 @@ mod tests {
                 },
             }))
             .unwrap(),
+            resolved_locators: Vec::new(),
         }
     }
 
@@ -2822,6 +2800,7 @@ mod tests {
                 ],
                 selector: PolicySelector::File {
                     authored_schema_version: Some(1),
+                    analysis_schema_version: None,
                     path: WorkspaceRelativePath::new("queries/request.rql").unwrap(),
                 },
                 binding: PolicyEndpointBinding::ArgumentIndex { index: 0 },
@@ -3097,6 +3076,19 @@ mod tests {
     }
 
     #[test]
+    fn typestate_suspension_boundary_uses_a_distinct_canonical_event_type() {
+        assert_eq!(
+            policy_semantic_event_to_json(PolicySemanticEvent::SuspensionBoundary {
+                scope: TypestateExitScope::AnalysisRoot,
+            }),
+            json!({
+                "type": "suspension_boundary",
+                "scope": "analysis_root",
+            })
+        );
+    }
+
+    #[test]
     fn classification_and_cvss_projection_use_ordered_rules_and_first_labels() {
         let metric = CvssMetric::Base {
             metric: CvssBaseMetric::Av,
@@ -3177,6 +3169,7 @@ mod tests {
         let inferred = PolicySelector::Inline {
             schema: schema(2),
             query: query.clone(),
+            resolved_locators: Vec::new(),
         };
         let explicit = PolicySelector::Inline {
             schema: SchemaVersionResolution {
@@ -3184,6 +3177,7 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             },
             query,
+            resolved_locators: Vec::new(),
         };
         assert_eq!(selector_to_json(&inferred), selector_to_json(&explicit));
         assert_eq!(
@@ -3335,6 +3329,35 @@ mod tests {
             .expect("an inline relational policy is a closed document");
         serde_json_canonicalizer::to_vec(&value)
             .expect("validated policy values have a canonical JSON encoding")
+    }
+
+    #[test]
+    fn receiver_family_projects_internal_identity_set() {
+        let source = r#"(policy
+  :id "test.receiver.family.canonical"
+  :name "Receiver family canonical"
+  :message "M"
+  :severity warning
+  :analysis (analysis :type assertion
+    (bind :name calls :query
+      (rql (call-bindings (call-shape (call :callee "run")))))
+    (call :over calls :resolves-to member.widget.create :proof exact
+      :receiver-type (assignable-to "pkg.Base"))))"#;
+        let parsed = crate::parse_rqlp_source(
+            source,
+            crate::PolicySourceIdentity::new("test:receiver-family-canonical"),
+        )
+        .unwrap();
+        let value = parsed
+            .document()
+            .to_inline_local_canonical_semantic_json()
+            .unwrap();
+        let derivation = &value["analysis"]["plan"]["derivations"][0];
+        assert_eq!(derivation["receiver_constraint"], "assignable_to");
+        assert_eq!(
+            derivation["where"].as_array().unwrap().last().unwrap()["resolved_identities"],
+            serde_json::json!([])
+        );
     }
 
     fn canonical_semantic_sha256(source: &str) -> String {

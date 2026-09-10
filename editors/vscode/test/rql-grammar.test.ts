@@ -258,6 +258,20 @@ void test("highlights receiver traversal forms and capture options", async () =>
   assertScoped(tokens, ":member-target-id", "variable.parameter.role.bifrost-rql");
 });
 
+void test("highlights call-binding selector pipeline forms and options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    '(call-argument :formal-name "sql" (resolved-call :resolves-to member.statement.execute :proof exact :receiver-type (assignable-to "java.sql.Statement") (call-bindings (call-shape (call)))))'
+  );
+  for (const form of ["call-argument", "resolved-call", "call-bindings", "call-shape"]) {
+    assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
+  }
+  assertScoped(tokens, "assignable-to", "support.function.wrapper.bifrost-rql");
+  for (const option of [":formal-name", ":resolves-to", ":proof", ":receiver-type"]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+});
+
 void test("highlights schema-v3 CFG forms and aliases", async () => {
   const forms = [
     "procedure-of",
@@ -429,4 +443,10 @@ void test("highlights schema-v7 taint forms and retained-result references", asy
   );
   assertScoped(tokens, "taint", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":taint-ref", "variable.parameter.role.bifrost-rql");
+});
+
+void test("highlights fixed language families in ordinary RQL", async () => {
+  const tokens = tokenizeGrammar(await grammar(), "(language jvm (call))\n(language js-ts (call))");
+  assertScoped(tokens, "jvm", "support.constant.language-family.bifrost-rql");
+  assertScoped(tokens, "js-ts", "support.constant.language-family.bifrost-rql");
 });

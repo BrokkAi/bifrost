@@ -20,6 +20,14 @@ reporting form, but it is not an alternate RQLP authoring syntax.
 > co-presence of a source and sink proves reachability, and neither creates a
 > finding by itself.
 
+Every policy endpoint selector is one RQL query, inline as `(rql ...)` or
+loaded from `(rql-file ...)`. Endpoint selection does not have a separate row
+sublanguage. When an endpoint needs an exact modeled call operand, the
+`resolved-call` and `call-argument` RQL pipeline steps retain `call_binding`
+rows while enforcing callable identity and exact actual-to-formal evidence.
+Relational `bind`, `filter`, `project`, `join`, `group`, and `aggregate`
+records belong to assertion plans; they are not endpoint selector forms.
+
 ## One Document Per File
 
 Every `.rqlp` file contains exactly one top-level document:
@@ -312,6 +320,11 @@ The same run with the default `warning` threshold produces identical report
 text and exits 1. Add `--verbose` to include the complete finding identity,
 evidence, provenance, proof, classification, rule schema, and manifest record.
 
+Policy evaluation units preserve the same row-level `{proof, completeness,
+reason}` evidence object emitted by direct CodeQuery, CLI, MCP, and LSP results.
+This object survives unit serialization and reuse without recreating a composite
+quality label or dropping a typed limitation reason.
+
 ## Schema Versions And Selectors
 
 Policy/endpoint schema versions and nested RQL schema versions resolve
@@ -349,6 +362,138 @@ An inline `(rql ...)` selector is lowered directly from the nested S-expression.
 An `(rql-file ...)` selector names one workspace-relative `.rql` file and is
 resolved only by a workspace-backed loader. There is no ambient policy,
 endpoint, query, catalog, environment, or network discovery.
+
+### Analysis-Shared Selector Context
+
+An analysis may declare selector context once:
+
+```lisp
+(analysis
+  :languages [java]
+  :where ["src/java/**" "src/generated/java/**"]
+  :rql-schema-version 1
+  :type match
+  :selector (rql (call :callee (name "eval"))))
+```
+
+`:languages` is a list of public analyzer labels or first-class family aliases,
+not file extensions, tags, display names, or inferred identities. Shared RQL
+defines `jvm` as exactly `[java kotlin scala]` and `js-ts` as exactly
+`[javascript typescript]`. Alias expansion is concrete before composition:
+`[jvm java]` and `[js-ts typescript]` deduplicate their members instead of
+erroring, and concrete aliases can compose as `[jvm js-ts]`. Family membership
+is fixed; changing membership is an explicit schema/version decision, never a
+silent addition.
+
+There is no separate `tsx` analyzer language. The `typescript` label covers both
+`.ts` and TSX-bearing `.tsx` source, while `javascript` covers `.js`, `.mjs`,
+`.cjs`, and JSX-bearing `.jsx` source. Those ownership boundaries do not turn a
+filename, policy tag, workspace listing, or qualified name into language
+inference.
+
+The shared language and path constraints are conjoined outer constraints. A
+selector with no local language or path scope inherits the analysis scope. A
+selector with an explicit scope is conjoined with it; shared context never
+replaces local context. Language sets intersect, and statically disjoint
+language sets fail to load. Paths use ordinary set logic without glob-subset
+guessing: one `:where` list is one OR group, while the language constraint and
+path constraint are AND groups. Thus the example accepts either path pattern in
+Java source. An explicit `(where "src/java/**" (where "src/acme/**" QUERY))`
+form represents two separate path constraints, so both must accept a path.
+
+Every local selector receives this context before execution, semantic
+projection, and hashing:
+
+- `match :selector`
+- taint source, sink, sanitizer, transform, external-model, entry-point,
+  store-write, and store-read selectors
+- flow origin, observation, and kill selectors
+- typestate subject selectors and direct `calls` selectors
+- assertion `:subject` selectors and relational `bind :query` selectors
+
+Endpoint, category, catalog, and derived-bind references do not acquire a
+second RQL meaning. A `bind :from NAME :step STEP` expands an already typed row
+relation; only its `:query` form is an RQL selector. The same rule preserves
+row selectors and their destination vocabulary in relational assertions.
+
+The hoisted context is sugar for the equivalent explicit selector form. The
+match example therefore canonicalizes to the same effective typed query,
+findings, completion state, semantic representation, and semantic hash as:
+
+```lisp
+:selector
+  (rql :schema-version 1
+    (language java
+      (where "src/java/**" "src/generated/java/**"
+        (call :callee (name "eval")))))
+```
+
+Repeated explicit wrapper forms conjoin; there is no additional shared-RQL
+group syntax in policy schema version 1. Keep the examples above within one
+analysis if you mean one OR path group and one explicit language family.
+
+`:rql-schema-version` is a nested RQL pin, not a policy pin; the policy and RQL
+lineages remain independent. A local inline selector with no pin inherits the
+analysis pin. If it has an explicit pin, the two must agree. For `rql-file`,
+the analysis pin supplies the wrapper pin when the wrapper omits one; the usual
+wrapper-versus-referenced-document agreement rules then apply. A conflict among
+the analysis, wrapper, inline selector, or referenced document fails with the
+available source locations. Source-only editor validation still cannot read a
+workspace `.rql` file, so that final file agreement remains deferred until
+workspace-backed loading.
+
+There is no default that silently overrides either side. An empty or narrower
+result caused by conjoined scopes is a real result, not a shared-context error;
+only languages that provably have no intersection are rejected statically.
+
+### Receiver-Type Constraints
+
+In an endpoint selector, `resolved-call :receiver-type` constrains the resolved
+declaring owner of the selected member. Assertion plans provide the same
+constraint on their relational `call` record. In both places it is an
+owner-membership constraint, not a constraint on the syntactic receiver
+expression or on the complete set of runtime values that might arrive at the
+call.
+
+The scalar form remains exact-owner equality:
+
+```lisp
+(resolved-call :resolves-to "com.acme.Base.sink" :proof exact
+  :receiver-type "com.acme.Base"
+  query)
+```
+
+The inclusive form accepts the named workspace type and every descendant proven
+by that language's typed hierarchy:
+
+```lisp
+(resolved-call :resolves-to "com.acme.Child.sink" :proof exact
+  :receiver-type (assignable-to "com.acme.Base")
+  query)
+```
+
+Inside an assertion plan, put the same scalar or `(assignable-to ROOT)` value
+on `(call :over calls ... :receiver-type ...)`.
+
+For Java, `com.acme.Base` therefore matches a member owned by `Base` and by
+proven subclasses or interface implementations. It does not match an unrelated
+class that happens to define a method with the same name. Scala and other
+languages can use the same authoring form only where their native typed
+hierarchy can expand the workspace family completely; otherwise the run keeps
+its typed incompleteness. Availability is proved by the resolver, not inferred
+from the syntax.
+
+The root must resolve to a source-backed workspace declaration. A model-only or
+external root, a missing hierarchy provider, or a hierarchy that cannot be
+obtained completely is a typed receiver-hierarchy incompleteness, never a
+name-based fallback or a silently empty family. A retained positive proves that
+the resolved member owner is in the family; it does not prove exhaustive runtime
+dispatch. A clean negative additionally requires the existing exhaustive
+call-binding and dispatch evidence.
+
+This form stays in policy schema version 1. Its canonical loaded-policy form
+distinguishes exact equality from inclusive assignability, so the two forms have
+different semantic hashes.
 
 ## Reusable Endpoints
 
@@ -1613,6 +1758,26 @@ of the exact API:
       (inside-decl (class :name "AcmeStore") (method :name "put")))))
 ```
 
+For an endpoint that must retain the full call-binding row and pin a reviewed
+callable identity, use the endpoint-specific RQL pipeline:
+
+```lisp
+(call-argument :formal-name "value"
+  (resolved-call :resolves-to member.acme-store.put :proof declared
+    (call-bindings
+      (call-shape (call :callee (name "put"))))))
+```
+
+`resolved-call` accepts `:proof exact|declared` and an optional
+`:receiver-type`. An unquoted identity is a stable analyzer/model ID. A quoted
+qualified name is resolved once, with provenance, while the policy is loaded
+against its workspace and active semantic models. `call-argument` accepts
+exactly one `:formal-name` or zero-based `:formal-index`; it retains only a
+non-terminal row with an argument identity, exact mapping, and exhaustive
+actual coverage. Those guarantees are why `call-input :parameter-name` is not
+an equivalent endpoint selector: `call-input` projects the expression site and
+does not retain the call-binding proof row.
+
 Over the Java tree it returns one row, the operand of `store.put(value)`. Over
 the Python tree it returns the operand of both `store.put(value)` and
 `store.put(value=value)`, so a named call binds formal `value` the same way a
@@ -1830,8 +1995,11 @@ annotation type: an unrelated `@Pure` from another package would also match.
 
 `procedure-effects` publishes one row per (procedure, effect id) with `depth`,
 `classification`, `certainty`, `timing`, `coverage`, and a bounded witness
-chain, keyed on the `declaration` domain's own `procedure_id`. The join is
-therefore declaration-identity equality, and the witness's
+chain, keyed on the `declaration` domain's own `procedure_id` and repeating
+that declaration's `site_id`. `procedure_id` is the analyzer's opaque
+`decl:v1:<hex>` token, byte-identical to the declaration row's `id`; it is not
+derived from the displayed kind, name, path, or range. The join is therefore
+declaration-identity equality, and the witness's
 `witness_effect_site_id` is an id equality against the direct `call_effect`
 row, so "show me the exact call this transitive finding came from" is a join
 rather than a text search.
@@ -1865,7 +2033,7 @@ blocked claim as data:
   "assertion": "pure-procedure-network-effects",
   "kind": "absence_requires_exhaustive_coverage",
   "group": "pure-procedure",
-  "group_key": "src/com/acme/App.java:method:com.acme.App.pureCallsAnUnresolvedTarget:273-385",
+  "group_key": "decl:v1:59e27161404b54b1d60f747be5e1020fcb8082f51266f172c2797fa2432ca5b7",
   "reasons": ["capability_incomplete"]
 }
 ```
@@ -2333,9 +2501,12 @@ bifrost --root . \
 ```
 
 The join works because a strong finding identity hashes only content-derived
-facts: the workspace-relative path, the semantic owner key, a digest of the
-matched source bytes, and a small ordinal for identical slices under one
-owner. It contains no absolute path, revision, timestamp, or run-local
+facts: the workspace-relative path, either the analyzer `DeclarationId` or a
+typed non-declaration semantic owner key, a digest of the matched source
+bytes, and a small ordinal for identical slices under one owner.
+Declaration-backed owners serialize `id` without a `derivation`; canonical
+AST and semantic-wire owners serialize `derivation` plus `semantic_key`. The
+identity contains no absolute path, revision, timestamp, or run-local
 handle, so the same finding in unchanged content produces the same identity
 at both revisions. The base revision is exported into a private temporary
 directory and analyzed there; the checkout is never touched.

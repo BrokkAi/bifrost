@@ -116,6 +116,7 @@ pub fn compile_pack(
             safety: normalized.safety.clone(),
             runtime_values: shard.runtime_values.clone(),
             collection_flows: shard.collection_flows.clone(),
+            deferred_yields: shard.deferred_yields.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
                 .map_err(artifact_diagnostic)?,
@@ -271,6 +272,16 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
             collection_flows
                 .flows
                 .sort_by(|left, right| left.callable.cmp(&right.callable));
+        }
+        if let Some(deferred_yields) = &mut shard.deferred_yields {
+            for fact in &mut deferred_yields.yields {
+                fact.provenance.sort_unstable();
+                fact.provenance.dedup();
+            }
+            deferred_yields
+                .yields
+                .sort_by_cached_key(canonical_sort_key);
+            deferred_yields.yields.dedup();
         }
         match &mut shard.payload {
             AuthoredPayload::DeclarationFacts {

@@ -102,6 +102,7 @@ impl MaterializationTraversalCache {
                         language.config_label(),
                         axis.label()
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 continue;
             }
@@ -123,6 +124,7 @@ impl MaterializationTraversalCache {
                         .join(", "),
                     axis.label()
                 ),
+            exhausted_roots: Vec::new(),
             });
         }
     }

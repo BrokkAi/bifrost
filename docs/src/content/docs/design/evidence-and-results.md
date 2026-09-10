@@ -12,7 +12,9 @@ bounded absence claim.
 
 ## Proof and completeness
 
-Every semantic edge or relation carries two independent fields:
+Every semantic edge or relation carries two independent axes inside one public
+`evidence` object. Optional `reason` carries the typed failure or limit that
+explains an unproven or partial result:
 
 | Field | Complete value | Limited value |
 | --- | --- | --- |
@@ -26,6 +28,10 @@ target.
 
 When paths differ in proof or completeness, the solver keeps the incomparable
 alternatives. It discards a path only when another path dominates its evidence.
+
+Public renderers name the axes as `proof` and `completeness`; they do not mint a
+third composite quality label. Cached policy unit rows retain the same evidence
+object as direct, CLI, MCP, and LSP query results.
 
 ## Request outcomes
 

@@ -15,7 +15,8 @@ use super::semantic::SemanticProcedureValue;
 use super::witness_projection::{bounded_reason, saturating_u64};
 use super::{
     CodeQueryAbsentMemberWitness, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryTypeFlowWork, CodeQueryValueFlowLimits,
+    CodeQueryDiagnosticImpact, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
+    CodeQueryTypeFlowWork, CodeQueryValueFlowLimits, render_exhausted_roots,
 };
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
@@ -41,8 +42,9 @@ use brokk_bifrost_flow::dataflow::{
 use brokk_bifrost_flow::flow_state::procedure_public_digest;
 use brokk_bifrost_flow::type_flow::{
     ClassSetStatus, FeedbackLimits, FieldSlotIndex, FieldSlotIndexAcquisitionKind,
-    FieldSlotIndexMissReason, TypeFlowError, TypeFlowPlanError, TypeFlowRootPersistenceStatus,
-    TypeFlowRootResult, active_semantic_model_pack_digest, solve_type_flow_for_root,
+    FieldSlotIndexMissReason, RootExhaustedLane, RootIncompleteEvidence, TypeFlowError,
+    TypeFlowPlanError, TypeFlowRootPersistenceStatus, TypeFlowRootResult,
+    active_semantic_model_pack_digest, solve_type_flow_for_root,
 };
 use brokk_bifrost_flow::value_flow::{ClosureLimits, ValueFlowCache, ValueFlowCacheStatsSnapshot};
 
@@ -52,6 +54,11 @@ const CLOSURE_LIMITS: ClosureLimits = ClosureLimits {
     max_procedures: 512,
 };
 const ROOT_RESULT_REPRESENTATION_VERSION: u32 = 2;
+/// Prose bound for one exhausted-work message. A policy report validates its
+/// diagnostic prose against `MAX_REPORT_PROSE_BYTES` (4 KiB) and drops a
+/// longer one, so the rendered list stops short of that and the complete
+/// attribution stays in the diagnostic's `exhausted_roots`.
+const MAX_EXHAUSTED_ROOT_MESSAGE_BYTES: usize = 3_584;
 
 fn field_slot_semantic_limits(caller: SemanticWork) -> SemanticWork {
     caller.component_max(SemanticWork::default_limits())
@@ -105,6 +112,12 @@ pub(super) struct TypeFlowQueryState {
     witness_projection_cache:
         HashMap<AbsentMemberWitnessProjectionKey, Option<AbsentMemberWitnessValue>>,
     diagnostics: Vec<CodeQueryDiagnostic>,
+    /// Roots whose solve stopped before a fixed point, and roots whose solve
+    /// could not pay a semantic charge, each with the lane that stopped it.
+    /// Held until the diagnostics are taken so one diagnostic per code can
+    /// carry the complete attribution instead of one opaque line per root.
+    incomplete_roots: Vec<CodeQueryExhaustedRoot>,
+    semantic_exhausted_roots: Vec<CodeQueryExhaustedRoot>,
     work: CodeQueryTypeFlowWork,
     semantic_budget_exhausted: bool,
     witness_render_cache: super::PipelineRenderCache,
@@ -131,6 +144,8 @@ impl TypeFlowQueryState {
             field_slots: HashMap::default(),
             witness_projection_cache: HashMap::default(),
             diagnostics: Vec::new(),
+            incomplete_roots: Vec::new(),
+            semantic_exhausted_roots: Vec::new(),
             work: CodeQueryTypeFlowWork::default(),
             semantic_budget_exhausted: false,
             witness_render_cache: super::PipelineRenderCache::default(),
@@ -773,21 +788,21 @@ impl TypeFlowQueryState {
                             .work
                             .summary_profile
                             .saturating_add(result.summary_profile);
+                        self.work.solver_attempts = self
+                            .work
+                            .solver_attempts
+                            .saturating_add(result.solver_attempts.len() as u64);
                         if result.semantic_budget_exhausted {
                             self.semantic_budget_exhausted = true;
-                            self.push_diagnostic(
-                                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                                "class-set semantic input exceeded its budget".to_string(),
+                            self.record_semantic_exhausted_root(
+                                procedure,
+                                &result.incomplete_evidence,
                             );
                         }
                         if !result.complete {
                             self.work.incomplete_roots =
                                 self.work.incomplete_roots.saturating_add(1);
-                            self.push_diagnostic(
-                                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                                "class-set analysis retained incomplete semantic evidence"
-                                    .to_string(),
-                            );
+                            self.record_incomplete_root(procedure, &result.incomplete_evidence);
                         }
                         let projected_rows = if !persistent_store_failed
                             && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
@@ -925,11 +940,82 @@ impl TypeFlowQueryState {
             branch: Vec::new(),
             language: "workspace",
             message,
+            exhausted_roots: Vec::new(),
         });
     }
 
+    /// Attribute one root's semantic-budget stop to its semantic lanes.
+    fn record_semantic_exhausted_root(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        evidence: &RootIncompleteEvidence,
+    ) {
+        let entries = exhausted_root_entries(
+            procedure,
+            evidence,
+            evidence
+                .lanes
+                .iter()
+                .filter(|lane| matches!(lane, RootExhaustedLane::Semantic { .. })),
+        );
+        extend_distinct(&mut self.semantic_exhausted_roots, entries);
+    }
+
+    /// Attribute one root that stopped before a fixed point to every lane
+    /// that stopped it.
+    fn record_incomplete_root(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        evidence: &RootIncompleteEvidence,
+    ) {
+        let entries = exhausted_root_entries(procedure, evidence, evidence.lanes.iter());
+        extend_distinct(&mut self.incomplete_roots, entries);
+    }
+
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {
+        let semantic_roots = std::mem::take(&mut self.semantic_exhausted_roots);
+        if !semantic_roots.is_empty() {
+            let message = render_exhausted_roots(
+                "class-set semantic input exceeded its budget",
+                &semantic_roots,
+                MAX_EXHAUSTED_ROOT_MESSAGE_BYTES,
+            );
+            self.push_exhaustion_diagnostic(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                message,
+                semantic_roots,
+            );
+        }
+        let incomplete_roots = std::mem::take(&mut self.incomplete_roots);
+        if !incomplete_roots.is_empty() {
+            let message = render_exhausted_roots(
+                "class-set analysis retained incomplete semantic evidence",
+                &incomplete_roots,
+                MAX_EXHAUSTED_ROOT_MESSAGE_BYTES,
+            );
+            self.push_exhaustion_diagnostic(
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                message,
+                incomplete_roots,
+            );
+        }
         std::mem::take(&mut self.diagnostics)
+    }
+
+    fn push_exhaustion_diagnostic(
+        &mut self,
+        code: CodeQueryDiagnosticCode,
+        message: String,
+        exhausted_roots: Vec<CodeQueryExhaustedRoot>,
+    ) {
+        self.diagnostics.push(CodeQueryDiagnostic {
+            code,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message,
+            exhausted_roots,
+        });
     }
 
     pub(super) fn work(&self) -> CodeQueryTypeFlowWork {
@@ -1032,7 +1118,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v6";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v7";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1300,6 +1386,63 @@ fn source_range(span: SourceSpan) -> Range {
         start_line: span.start().line() as usize + 1,
         end_line: span.end().line() as usize + 1,
     }
+}
+
+fn extend_distinct(
+    destination: &mut Vec<CodeQueryExhaustedRoot>,
+    entries: Vec<CodeQueryExhaustedRoot>,
+) {
+    for entry in entries {
+        if !destination.contains(&entry) {
+            destination.push(entry);
+        }
+    }
+}
+
+/// Project one root's typed exhaustion evidence onto the diagnostic wire:
+/// the root's path and qualified name, the lane, the charge that did not fit,
+/// and the feedback iteration that produced it.
+fn exhausted_root_entries<'lane>(
+    procedure: &SemanticProcedureValue,
+    evidence: &RootIncompleteEvidence,
+    lanes: impl Iterator<Item = &'lane RootExhaustedLane>,
+) -> Vec<CodeQueryExhaustedRoot> {
+    let path = rel_path_string(procedure.file());
+    let name = procedure_name(&procedure.handle);
+    lanes
+        .map(|lane| {
+            let (lane_label, stage, charge) = match lane {
+                RootExhaustedLane::Solver(exceeded) => (
+                    format!("solver/{}", exceeded.dimension().label()),
+                    None,
+                    Some(CodeQueryExhaustedCharge {
+                        attempted: exceeded.attempted(),
+                        limit: exceeded.limit(),
+                    }),
+                ),
+                RootExhaustedLane::Cancelled => ("solver/cancelled".to_string(), None, None),
+                RootExhaustedLane::Semantic { stage, exceeded } => (
+                    exceeded.map_or_else(
+                        || "semantic/unrecorded".to_string(),
+                        |exceeded| format!("semantic/{}", exceeded.dimension().label()),
+                    ),
+                    Some(stage.label().to_string()),
+                    exceeded.map(|exceeded| CodeQueryExhaustedCharge {
+                        attempted: exceeded.attempted(),
+                        limit: exceeded.limit(),
+                    }),
+                ),
+            };
+            CodeQueryExhaustedRoot {
+                path: path.clone(),
+                procedure: Some(name.clone()),
+                lane: lane_label,
+                stage,
+                charge,
+                feedback_iteration: Some(evidence.feedback_iteration),
+            }
+        })
+        .collect()
 }
 
 /// The procedure's declaration path, rendered the way a reader spells it:
@@ -1584,7 +1727,7 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v6",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v7",
             "class-preserving transfers must not reuse operand-dependency root results"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
@@ -1637,11 +1780,11 @@ mod tests {
         assert!(row.steps.is_empty());
         assert_eq!(row.retained_bytes, 0);
         assert_eq!(
-            row.quality.proof,
+            row.evidence.proof,
             crate::structural::search::CodeQuerySemanticProof::Unproven
         );
         assert_eq!(
-            row.quality.completeness,
+            row.evidence.completeness,
             crate::structural::search::CodeQuerySemanticCompleteness::Partial
         );
         assert!(row.unavailable_reason.is_some());
@@ -1684,7 +1827,7 @@ mod tests {
         assert!(row.unavailable_reason.is_none());
         assert_eq!(row.steps.len(), 0);
         assert_eq!(
-            row.quality.completeness,
+            row.evidence.completeness,
             crate::structural::search::CodeQuerySemanticCompleteness::Partial
         );
         assert_diagnostic(

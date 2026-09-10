@@ -7,11 +7,12 @@ use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
 use super::{
     CodeQueryCallResult, CodeQueryControlEdge, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryProcedure, CodeQueryProgramPoint,
-    CodeQueryProgramPointBoundary, CodeQueryProgramPointRef, CodeQueryRange,
-    CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticLimits,
-    CodeQuerySemanticProof, CodeQuerySemanticReceipt, CodeQuerySemanticRowLimits,
-    CodeQuerySemanticWork, DeclarationValue, SeedMatch, seed_range,
+    CodeQueryDiagnosticImpact, CodeQueryExhaustedCharge, CodeQueryExhaustedRoot,
+    CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryProgramPointBoundary,
+    CodeQueryProgramPointRef, CodeQueryRange, CodeQuerySemanticCompleteness,
+    CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
+    CodeQuerySemanticReceipt, CodeQuerySemanticRowLimits, CodeQuerySemanticWork, DeclarationValue,
+    SeedMatch, seed_range,
 };
 use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
 use crate::analyzer::semantic::workspace_oracle::{
@@ -302,7 +303,7 @@ impl<'a> SemanticQueryContext<'a> {
         }
         crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
             self.workspace,
-            self.active_semantic_model_snapshot.as_deref(),
+            self.active_semantic_model_snapshot.clone(),
             DispatchHints::empty(),
         )
         .runtime_keyed_read_at_source(file, range, filter, &mut request)
@@ -1673,6 +1674,7 @@ impl<'a> SemanticQueryContext<'a> {
                         message: format!(
                             "complete concurrency summaries exceeded workspace retention: {error}"
                         ),
+                        exhausted_roots: Vec::new(),
                     });
                 }
                 Some(summaries)
@@ -1684,6 +1686,7 @@ impl<'a> SemanticQueryContext<'a> {
                     branch: Vec::new(),
                     language: "workspace",
                     message: format!("concurrency summary projection was incomplete: {error}"),
+                    exhausted_roots: Vec::new(),
                 });
                 None
             }
@@ -1716,6 +1719,7 @@ impl<'a> SemanticQueryContext<'a> {
                             "concurrent access analysis retained incomplete task slices: {:?}",
                             report.reasons
                         ),
+                        exhausted_roots: Vec::new(),
                     });
                 }
                 report
@@ -1733,6 +1737,7 @@ impl<'a> SemanticQueryContext<'a> {
                     branch: Vec::new(),
                     language: "workspace",
                     message: format!("concurrent access analysis failed: {error}"),
+                    exhausted_roots: Vec::new(),
                 });
                 Vec::new()
             }
@@ -2015,12 +2020,7 @@ impl<'a> SemanticQueryContext<'a> {
             return true;
         };
         self.budget_exhausted = true;
-        self.push_diagnostic(
-            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            CodeQueryDiagnosticImpact::Incomplete,
-            file,
-            &error.to_string(),
-        );
+        self.push_exhausted_diagnostic(file, &error.to_string(), "semantic/retained_bytes", None);
         false
     }
 
@@ -2034,11 +2034,11 @@ impl<'a> SemanticQueryContext<'a> {
         {
             self.evict_prepared_source_dispatch();
             self.budget_exhausted = true;
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
+            self.push_exhausted_diagnostic(
                 file,
                 &error.to_string(),
+                "semantic/retained_bytes",
+                None,
             );
             return false;
         }
@@ -2058,18 +2058,17 @@ impl<'a> SemanticQueryContext<'a> {
         // Mandatory retained rows always displace the optional parsed dispatch
         // cache before admission is decided.
         self.evict_prepared_source_dispatch();
-        if bytes
-            > self
-                .limits
-                .max_retained_bytes
-                .saturating_sub(self.physical_retained_bytes())
-        {
+        let retained = self.physical_retained_bytes();
+        if bytes > self.limits.max_retained_bytes.saturating_sub(retained) {
             self.budget_exhausted = true;
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
+            self.push_exhausted_diagnostic(
                 file,
                 "semantic retained-artifact byte budget exhausted",
+                "semantic/retained_bytes",
+                Some(CodeQueryExhaustedCharge {
+                    attempted: retained.saturating_add(bytes),
+                    limit: self.limits.max_retained_bytes,
+                }),
             );
             return false;
         }
@@ -2087,12 +2086,7 @@ impl<'a> SemanticQueryContext<'a> {
             "retained-byte invariant fallback only reports arithmetic overflow"
         );
         self.budget_exhausted = true;
-        self.push_diagnostic(
-            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-            CodeQueryDiagnosticImpact::Incomplete,
-            file,
-            &error.to_string(),
-        );
+        self.push_exhausted_diagnostic(file, &error.to_string(), "semantic/retained_bytes", None);
     }
 
     fn record_active_retained_bytes(&mut self, bytes: usize) {
@@ -2196,11 +2190,20 @@ impl<'a> SemanticQueryContext<'a> {
                 file.clone(),
                 CachedSemanticMaterialization::FileBudgetExhausted,
             );
-            self.push_diagnostic(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                CodeQueryDiagnosticImpact::Incomplete,
+            // A receipt-driven execution owns its own admission ledger, so the
+            // file limit this state holds is not the one that refused.
+            let charge = self
+                .receipt_execution
+                .is_none()
+                .then_some(CodeQueryExhaustedCharge {
+                    attempted: self.attempts.saturating_add(1),
+                    limit: self.limits.max_materialized_files,
+                });
+            self.push_exhausted_diagnostic(
                 file,
                 "semantic materialization file budget exhausted",
+                "semantic/files",
+                charge,
             );
             return None;
         }
@@ -2515,20 +2518,20 @@ impl<'a> SemanticQueryContext<'a> {
                 None
             }
             CachedSemanticMaterialization::FileBudgetExhausted => {
-                self.push_diagnostic(
-                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    CodeQueryDiagnosticImpact::Incomplete,
+                self.push_exhausted_diagnostic(
                     file,
                     "semantic materialization file budget exhausted",
+                    "semantic/files",
+                    None,
                 );
                 None
             }
             CachedSemanticMaterialization::RetainedBudgetExhausted => {
-                self.push_diagnostic(
-                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    CodeQueryDiagnosticImpact::Incomplete,
+                self.push_exhausted_diagnostic(
                     file,
                     "semantic retained-artifact byte budget exhausted",
+                    "semantic/retained_bytes",
+                    None,
                 );
                 None
             }
@@ -2631,6 +2634,45 @@ impl<'a> SemanticQueryContext<'a> {
         quality
     }
 
+    /// Push one diagnostic that attributes exhausted work to this file.
+    ///
+    /// The rendered message names the file, the lane and the charge that did
+    /// not fit, and the same values ride the diagnostic's `exhausted_roots`
+    /// so a consumer reads them without parsing prose (#3194).
+    fn push_exhausted_diagnostic(
+        &mut self,
+        file: &ProjectFile,
+        reason: &str,
+        lane: &str,
+        charge: Option<CodeQueryExhaustedCharge>,
+    ) {
+        let entry = CodeQueryExhaustedRoot {
+            path: crate::path_utils::rel_path_string(file),
+            procedure: None,
+            lane: lane.to_string(),
+            stage: None,
+            charge,
+            feedback_iteration: None,
+        };
+        let message = format!("{reason}: {}", entry.render());
+        let key = (
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            file.clone(),
+            message.clone(),
+        );
+        if !self.reported.insert(key) {
+            return;
+        }
+        self.diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: crate::analyzer::common::language_for_file(file).config_label(),
+            message,
+            exhausted_roots: vec![entry],
+        });
+    }
+
     fn push_diagnostic(
         &mut self,
         code: CodeQueryDiagnosticCode,
@@ -2648,6 +2690,7 @@ impl<'a> SemanticQueryContext<'a> {
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(file).config_label(),
             message: message.to_string(),
+            exhausted_roots: Vec::new(),
         });
     }
 }
@@ -3175,12 +3218,12 @@ fn public_evidence(
                 Some(bounded_reason(reason)),
             ),
         };
-    CodeQuerySemanticEvidence {
+    CodeQuerySemanticEvidence::from_axis_reasons(
         proof,
-        proof_reason,
         completeness,
+        proof_reason,
         completeness_reason,
-    }
+    )
 }
 
 fn bounded_reason(reason: &str) -> String {

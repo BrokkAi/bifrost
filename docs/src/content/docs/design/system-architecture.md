@@ -26,9 +26,9 @@ whether they arrive over JSON-RPC or MCP.
 
 ### Query and policy layer
 
-Rune Query Language (RQL) is the human-oriented authoring frontend for the
+Rune Query Language (RQL) is the single authoring syntax for the
 canonical typed `CodeQuery` model. The RQL compiler produces a `CodeQuery`.
-JSON is its stable machine-facing serialization: MCP clients can supply fields
+Canonical JSON is generated from a decoded `CodeQuery` and remains its stable machine-facing serialization: MCP clients can supply fields
 inline, and `query_file` accepts saved `.rql` queries. Both paths reach the same
 typed logical and physical planner. Rust embedders can also construct the model
 directly. See

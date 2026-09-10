@@ -422,6 +422,16 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// does nothing when it is absent.
     fn warm_usage_analysis(&self, _analyzer: &dyn IAnalyzer) {}
 
+    /// Attach language-owned source scope to declarations emitted by semantic-model rules.
+    /// The default leaves generated symbols unchanged.
+    fn bind_generated_symbols(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _symbols: &mut [crate::analyzer::semantic_model::SemanticModelSymbol],
+    ) {
+    }
+
     /// This language's tree-sitter grammar for `flavor`. The parameter exists for
     /// TypeScript, whose `.ts` and `.tsx` files parse under distinct grammars while
     /// sharing one adapter; every other language answers the same grammar for both.

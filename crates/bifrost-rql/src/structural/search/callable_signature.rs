@@ -61,14 +61,12 @@ pub(super) fn callable_signature_expansions_for_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
 ) -> Vec<PipelineExpansion> {
-    // The canonical member digest is deliberately *not* the anchor here: two
-    // Java overloads share one canonical member identity, and anchoring on it
-    // would give their signature rows one id and collapse the overload set to
-    // a single row. The anchor is the declaration site: its file, its fully
-    // qualified name, and its own byte range.
-    let declaration_id = declaration_site_id(declaration);
+    // Overloads with the same displayed name remain distinct because the
+    // analyzer declaration identity includes their structured signature. The
+    // source span then distinguishes multiple indexed sites of that identity.
+    let declaration_site_id = declaration.site_id();
     let entries = analyzer.signature_metadata(&declaration.unit);
-    callable_signature_reports(&declaration_id, &declaration.unit, &entries)
+    callable_signature_reports(&declaration_site_id, &declaration.unit, &entries)
         .into_iter()
         .map(|report| {
             pipeline_expansion(PipelineValue::CallableSignature(Box::new(
@@ -79,16 +77,6 @@ pub(super) fn callable_signature_expansions_for_declaration(
             )))
         })
         .collect()
-}
-
-/// The identity of one declaration *site*: file, fully qualified name, and
-/// byte range. Two overloads of one name are two sites and must never share
-/// it.
-pub(super) fn declaration_site_id(declaration: &DeclarationValue) -> String {
-    brokk_bifrost_analysis::analyzer::usages::callable_signature::declaration_site_id(
-        &declaration.unit,
-        declaration.range,
-    )
 }
 
 /// Expand one already-derived signature row into its ordered parameter rows.

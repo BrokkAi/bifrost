@@ -558,13 +558,52 @@ pub(crate) fn build_scala_project_types(
         .into_iter()
         .map(|(file, state)| (file, scala_file_facts(state)))
         .collect();
+    let (index, facts) = scala_store_backed_indexes(inner);
+    ScalaProjectTypes::from_parts(index, facts, file_states)
+}
+
+/// The analyzer-cached [`ScalaProjectTypes`] from a seed whose hierarchy was
+/// already resolved on the relational frontier. Definition and callable
+/// questions stay store-backed as in [`build_scala_project_types`]; what this
+/// avoids is resolving the whole workspace's supertypes one synchronous store
+/// read at a time, which held every worker of a candidate-discovery pass on
+/// akka (2,656 Scala files) past the fuzzer's probe cap.
+fn build_scala_project_types_from_seed(
+    inner: TreeSitterAnalyzer<ScalaAdapter>,
+    seed: ScalaProjectTypesSeed,
+) -> ScalaProjectTypes {
+    let (index, facts) = scala_store_backed_indexes(inner);
+    ScalaProjectTypes::from_seed(index, facts, seed)
+}
+
+fn scala_store_backed_indexes(
+    inner: TreeSitterAnalyzer<ScalaAdapter>,
+) -> (
+    Arc<ScalaRelationalDefinitionIndex>,
+    Arc<ScalaRelationalCallableFacts>,
+) {
     let index = Arc::new(ScalaRelationalDefinitionIndex {
         backend: ScalaRelationalBackend::Store(Box::new(inner.clone())),
     });
     let facts = Arc::new(ScalaRelationalCallableFacts {
         backend: ScalaRelationalBackend::Store(Box::new(inner)),
     });
-    ScalaProjectTypes::from_parts(index, facts, file_states)
+    (index, facts)
+}
+
+/// The per-generation resolved seed plus the frontier answers its hierarchy
+/// pass batched, so a later request's session starts with them instead of
+/// re-asking the same workspace-derived questions.
+struct ScalaResolvedQuerySeed {
+    seed: ScalaProjectTypesSeed,
+    answers: crate::analyzer::relational_frontier::FrontierAnswers,
+}
+
+/// How one request obtained the workspace's resolved Scala seed.
+pub(crate) enum ScalaResolvedSeedOutcome {
+    Ready(ScalaProjectTypesSeed),
+    Cancelled,
+    Failed(&'static str),
 }
 
 /// One file's lazily hydrated facts cell in [`ScalaQueryFileFactsProvider`].
@@ -661,16 +700,23 @@ const SCALA_QUERY_SWEEP_CHUNK_FILES: usize = 64;
 /// facts source for the files resolution actually touches. Unlike
 /// [`build_scala_project_types`], no whole-workspace map of thirteen-field
 /// per-file records is materialized or retained.
+fn scala_query_file_facts_provider(
+    inner: &TreeSitterAnalyzer<ScalaAdapter>,
+    touched: Arc<AtomicUsize>,
+) -> Arc<dyn ScalaFileFactsProvider> {
+    Arc::new(ScalaQueryFileFactsProvider {
+        inner: inner.clone(),
+        cells: Mutex::new(HashMap::default()),
+        touched,
+    })
+}
+
 fn scala_project_types_query_seed(
     inner: &TreeSitterAnalyzer<ScalaAdapter>,
     touched: Arc<AtomicUsize>,
     files: &[ProjectFile],
 ) -> ScalaProjectTypesSeed {
-    let provider = Arc::new(ScalaQueryFileFactsProvider {
-        inner: inner.clone(),
-        cells: Mutex::new(HashMap::default()),
-        touched,
-    });
+    let provider = scala_query_file_facts_provider(inner, touched);
     let mut sweep = ScalaProjectTypesSweep::default();
     for chunk in files.chunks(SCALA_QUERY_SWEEP_CHUNK_FILES) {
         let states = inner.bulk_file_states(chunk.iter().cloned(), BulkFileStateSource::Omit);
@@ -713,6 +759,11 @@ pub struct ScalaAnalyzer {
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
+    /// The workspace's Scala seed with its hierarchy resolved on the
+    /// relational frontier, built once per analyzer generation. Every
+    /// targeted usage query and the analyzer-cached `project_types` build
+    /// start from it instead of re-sweeping the workspace.
+    resolved_query_seed: Arc<OnceLock<ScalaResolvedQuerySeed>>,
     pub(crate) dead_code_usage_edges: UsageEdgesCache,
     project_types_build_count: Arc<AtomicUsize>,
     /// Files whose full per-file facts the current analyzer generation's
@@ -953,6 +1004,7 @@ impl ScalaAnalyzer {
         clone.external_index = Arc::new(OnceLock::new());
         clone.file_dependency_index = Arc::new(OnceLock::new());
         clone.project_types = Arc::new(OnceLock::new());
+        clone.resolved_query_seed = Arc::new(OnceLock::new());
         clone.dead_code_usage_edges =
             build_weighted_cache(self.memo_budget / 8, weight_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
@@ -1003,6 +1055,7 @@ impl ScalaAnalyzer {
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             lazy_hierarchy_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
+            resolved_query_seed: Arc::new(OnceLock::new()),
             dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_file_facts_touched: Arc::new(AtomicUsize::new(0)),
@@ -1019,6 +1072,97 @@ impl ScalaAnalyzer {
         self.initialize_project_types(|| {
             self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
         })
+    }
+
+    /// The workspace's resolved seed for one request, on that request's
+    /// relational session: the cached per-generation seed with a fresh
+    /// per-query facts provider (the session adopts the hierarchy answers the
+    /// first request batched), or, on first use, the chunked workspace sweep
+    /// (#3142) plus one hierarchy pass on `session`.
+    pub(crate) fn resolved_query_seed(
+        &self,
+        session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+    ) -> ScalaResolvedSeedOutcome {
+        if let Some(seed) = self.cached_resolved_query_seed(session) {
+            return ScalaResolvedSeedOutcome::Ready(seed);
+        }
+        let workspace_files = match self.inner.project().analyzable_files(Language::Scala) {
+            Ok(files) => files.into_iter().collect::<Vec<_>>(),
+            Err(_) => {
+                return ScalaResolvedSeedOutcome::Failed(
+                    "the Scala workspace file set is unavailable",
+                );
+            }
+        };
+        let unresolved_seed = self.project_types_query_seed(&workspace_files);
+        self.resolve_query_seed(session, &unresolved_seed)
+    }
+
+    fn cached_resolved_query_seed(
+        &self,
+        session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+    ) -> Option<ScalaProjectTypesSeed> {
+        let cached = self.resolved_query_seed.get()?;
+        session.adopt_answers(&cached.answers);
+        Some(
+            cached
+                .seed
+                .clone()
+                .with_file_facts_provider(scala_query_file_facts_provider(
+                    &self.inner,
+                    Arc::clone(&self.scala_query_file_facts_touched),
+                )),
+        )
+    }
+
+    /// Resolve one already-built workspace seed and publish its hierarchy for
+    /// the analyzer generation. Eager callers keep their original file-facts
+    /// map and targeted callers replace it with a fresh per-query provider.
+    fn resolve_query_seed(
+        &self,
+        session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+        unresolved_seed: &ScalaProjectTypesSeed,
+    ) -> ScalaResolvedSeedOutcome {
+        let fresh_provider = || {
+            scala_query_file_facts_provider(
+                &self.inner,
+                Arc::clone(&self.scala_query_file_facts_touched),
+            )
+        };
+        if let Some(seed) = self.cached_resolved_query_seed(session) {
+            return ScalaResolvedSeedOutcome::Ready(seed);
+        }
+        let resolved_seed = match session.resolve_owned("scala_hierarchy", |frontier| {
+            self.build_project_types_from_frontier(frontier, unresolved_seed.clone())
+                .resolved_seed()
+        }) {
+            crate::analyzer::RelationalFrontierOutcome::Complete(seed) => seed,
+            crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                return ScalaResolvedSeedOutcome::Cancelled;
+            }
+            crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                return ScalaResolvedSeedOutcome::Failed("the Scala hierarchy frontier failed");
+            }
+        };
+        // The cached copy carries a provider nothing hydrates through, so no
+        // query's touched facts outlive it; each request gets its own.
+        let cached = self
+            .resolved_query_seed
+            .get_or_init(|| ScalaResolvedQuerySeed {
+                seed: resolved_seed
+                    .clone()
+                    .with_file_facts_provider(fresh_provider()),
+                answers: session.answer_snapshot(),
+            });
+        // A concurrent resolver may have published the winning seed. Its
+        // hierarchy and recorded answers must travel together in this session.
+        session.adopt_answers(&cached.answers);
+        ScalaResolvedSeedOutcome::Ready(
+            cached
+                .seed
+                .clone()
+                .with_file_facts_provider(fresh_provider()),
+        )
     }
 
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
@@ -1264,7 +1408,31 @@ impl ScalaAnalyzer {
             .get_or_init(|| {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(build_scala_project_types(self.inner.clone(), file_states()))
+                let file_states: HashMap<ProjectFile, ScalaFileFacts> = file_states()
+                    .into_iter()
+                    .map(|(file, state)| (file, scala_file_facts(state)))
+                    .collect();
+                let file_states = Arc::new(file_states);
+                let unresolved_seed = ScalaProjectTypes::seed(Arc::clone(&file_states))
+                    .with_source_facts_cache(Arc::clone(&self.scala_source_facts_by_file));
+                let uncancelled = crate::CancellationToken::new();
+                let session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+                    self,
+                    &uncancelled,
+                );
+                let types = match self.resolve_query_seed(&session, &unresolved_seed) {
+                    ScalaResolvedSeedOutcome::Ready(seed) => build_scala_project_types_from_seed(
+                        self.inner.clone(),
+                        seed.with_eager_file_facts(file_states),
+                    ),
+                    // The frontier read failed part-way; the same eager seed
+                    // resolves through the store backend and reports its own
+                    // errors without reading any file twice.
+                    ScalaResolvedSeedOutcome::Cancelled | ScalaResolvedSeedOutcome::Failed(_) => {
+                        build_scala_project_types_from_seed(self.inner.clone(), unresolved_seed)
+                    }
+                };
+                Arc::new(types)
             })
             .clone()
     }
@@ -2761,5 +2929,44 @@ mod dead_code_cache_tests {
         assert!(rebuilt.dead_code_usage_edges.get(&key).is_none());
         let overlay = analyzer.clone_with_project(fixture.project_dyn());
         assert!(overlay.dead_code_usage_edges.get(&key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod project_types_seed_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn eager_hierarchy_reads_once_and_targeted_queries_keep_fresh_facts() {
+        let fixture = InlineTestProject::with_language(Language::Scala)
+            .file("Base.scala", "package sample\nclass Base\n")
+            .file("Child.scala", "package sample\nclass Child extends Base\n")
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let files = analyzer.analyzed_files();
+        analyzer.reset_full_hydration_count_for_test();
+        let before = analyzer.bulk_hydration_count_for_test();
+        let types = analyzer.project_types();
+        assert_eq!(analyzer.bulk_hydration_count_for_test() - before, 2);
+
+        for query in 1..=2 {
+            let token = crate::CancellationToken::new();
+            let session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+                &analyzer, &token,
+            );
+            let ScalaResolvedSeedOutcome::Ready(seed) = analyzer.resolved_query_seed(&session)
+            else {
+                panic!("the fixture hierarchy resolves completely");
+            };
+            seed.prefetch_file_facts(&files);
+            assert_eq!(
+                analyzer.bulk_hydration_count_for_test() - before,
+                2 + query * 2,
+                "each query owns its file facts while reusing the resolved hierarchy",
+            );
+        }
+        assert!(Arc::ptr_eq(&types, &analyzer.project_types()));
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
     }
 }

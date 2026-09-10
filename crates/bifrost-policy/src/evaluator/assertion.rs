@@ -3221,6 +3221,7 @@ fn evaluate_lowered_occurrence_assert<'rows>(
             domain: DetailedCodeQueryDomain::StructuralMatch,
             path: "".into(),
             range: None,
+            evidence: None,
             fields: vec![
                 UnitRowField {
                     name: "id".into(),

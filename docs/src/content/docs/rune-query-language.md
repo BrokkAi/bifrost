@@ -15,7 +15,9 @@ The default `bifrost` command still starts the MCP stdio server. Use `--repl` wh
 
 RQL is only a query language. It is not a second matcher or query engine.
 
-Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
+RQL text is the single query authoring syntax. `.rql` files and editor buffers accept RQL text only, including unsaved queries sent through LSP. The REPL also accepts only RQL input; `:json` generates machine output. Canonical JSON is generated machine serialization, not authored query source.
+
+Every RQL expression decodes to a validated `CodeQuery` before execution. The decoded query generates [canonical JSON](/code-query-json/) for machine serialization. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
 RQL omits a schema version by default and therefore targets the single supported CodeQuery schema version 1. A root `:schema-version 1` option pins it explicitly; other versions are rejected.
 
@@ -40,8 +42,11 @@ Inline selectors use `(rql [:schema-version N] QUERY)`, while
 saved selector to workspace-backed policy loading. Policy/endpoint and nested
 RQL schema versions are resolved independently. JSON remains a CodeQuery and
 reporting surface, not an alternate `.rqlp` authoring syntax.
+Analysis-level shared selector context belongs to the policy language and is
+described in [static-analysis policies](/static-analysis-policies/); it applies
+to these RQL selectors but never changes the policy and RQL version lineages.
 
-Use `:ir <language>` for the opposite direction: paste source code through a line containing only `:end`, then inspect the [Rune IR](/rune-ir/) produced by that language's real structural adapter and copy the generated starter RQL. Use the `tsx` language label for TypeScript snippets containing JSX. Rune IR is the normalized source-side representation matched by `CodeQuery`; it is not RQL's query-side IR.
+Use `:ir <language>` for the opposite direction: paste source code through a line containing only `:end`, then inspect the [Rune IR](/rune-ir/) produced by that language's real structural adapter and copy the generated starter RQL. Use the `typescript` language label for TypeScript snippets containing TSX; `javascript` covers JavaScript source, including JSX-bearing source. Rune IR is the normalized source-side representation matched by `CodeQuery`; it is not RQL's query-side IR.
 
 ## Complete Example
 
@@ -126,7 +131,25 @@ Wrapper forms control the query around the root pattern:
 (not-inside (function :name "test") (call :callee (name "eval")))
 ```
 
+`where` accepts one or more globs. The globs in one `where` form are
+alternatives. Repeated `where` forms and repeated `language` forms are separate
+outer constraints and conjoin; language labels intersect, so statically
+disjoint labels fail validation. First-class family aliases are `jvm` (exactly
+`java`, `kotlin`, `scala`) and `js-ts` (exactly `javascript`, `typescript`);
+they expand concretely and duplicate members deduplicate. There is no separate `tsx` analyzer language: TypeScript owns TSX source
+and JavaScript owns JSX source. Existing extension spellings such as `tsx`
+normalize to their concrete analyzer language. No RQL
+surface infers a language label.
+
 `explain` lowers and selects a plan without scanning workspace data. `profile` executes and returns the ordinary result plus structured measurements. They are mutually exclusive root controls and are not legal inside policy selectors. See [Explain and Profile CodeQuery](/code-query-explain-profile/) for the response schemas and measured production scheduling policy.
+
+`result-detail full` publishes analyzer declaration identity. Every
+declaration-valued `id`, `target_id`, `caller_id`, `callee_id`,
+`procedure_id`, or `declaration_id` uses the same opaque `decl:v1:<hex>` token
+for the same declaration. A declaration row also publishes `site_id`, that
+token plus its exact byte span; joins never reconstruct either value from a
+rendered kind, name, path, or line range. The same full-detail query preserves
+these values through the CLI, MCP, and LSP transports.
 
 Pipeline wrappers transform the result domain. Inner wrappers execute first:
 
@@ -147,6 +170,9 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (callees (enclosing-decl (method :name "handle")))
 (call-input :receiver true (call-sites-from (enclosing-decl (method :name "handle"))))
 (call-input :parameter-name "payload" (call-sites-to :proof proven (enclosing-decl (method :name "sink"))))
+(call-argument :formal-name "payload"
+  (resolved-call :resolves-to member.service.sink :proof declared
+    (call-bindings (call-shape (call :callee (name "sink"))))))
 (receiver-targets (call :callee "run" :receiver "service"))
 (points-to :capture receiver (call :receiver (capture "receiver")))
 (member-targets (references-of :proof proven (enclosing-decl (method :name "run"))))
@@ -173,7 +199,7 @@ Typed set forms combine complete compatible pipelines and may themselves be wrap
 
 All operands at one node must produce the same terminal domain. Union preserves first appearance by operand order; intersection and except preserve the first operand's order. Branch provenance and diagnostics use zero-based paths. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `callers :proof proven :completeness proven-subset` is the one explicit non-exhaustive contract: it returns only resolved proven caller edges and labels the result as a proven subset, never as all callers. It remains diagnostic-visible when a caller cannot be rendered as an indexed declaration, and is rejected without `:proof proven` or on `callees`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. Procedure, program-point, control-edge, and receiver-analysis rows may all be projected through `file-of`. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `callers :proof proven :completeness proven-subset` is the one explicit non-exhaustive contract: it returns only resolved proven caller edges and labels the result as a proven subset, never as all callers. It remains diagnostic-visible when a caller cannot be rendered as an indexed declaration, and is rejected without `:proof proven` or on `callees`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `resolved-call` consumes `call_binding` rows and retains only rows for one stable callable identity with `exact` or `declared` proof. Its optional `:receiver-type` accepts either one exact receiver identity or `(assignable-to ROOT)`, which accepts the source-backed workspace root and every descendant produced by the analyzer's complete typed hierarchy. An incomplete, cancelled, external, or model-only hierarchy fails closed. Unquoted identities are stable IDs. Quoted qualified locators are resolved at a loaded-policy boundary and cannot execute as unresolved standalone queries. `call-argument` also consumes and returns `call_binding` rows, selects exactly one formal by name or zero-based index, and requires exact mapping, exhaustive coverage, a non-terminal row, and a present argument identity. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. Procedure, program-point, control-edge, and receiver-analysis rows may all be projected through `file-of`. `:json` renders every wrapper as an ordered `steps` array.
 
 Receiver wrappers consume the structured facts exposed by the selected adapter. Availability is not defined by a static language list: unsupported source forms preserve an explicit `unsupported` row and capability diagnostic. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for allocation, factory, ambiguity, reference-site, and call-input examples with exact output.
 
@@ -191,7 +217,7 @@ The typed control-flow algebra is part of the same schema. `procedure-of` resolv
           (function :name "run"))))))
 ```
 
-This returns `program_point` rows for targets of edges leaving `run`'s entry. Procedure, point, and edge rows include checkout-independent content-scoped IDs, exact source ranges, mandatory proof/completeness evidence, and normal CodeQuery provenance. Unsupported capabilities, partial semantic artifacts, cancellation, and exhausted budgets remain explicit diagnostics and cannot produce a falsely complete empty answer.
+This returns `program_point` rows for targets of edges leaving `run`'s entry. Procedure, point, and edge rows include checkout-independent content-scoped IDs, exact source ranges, one `{proof, completeness, reason}` evidence object, and normal CodeQuery provenance. The optional reason carries a typed failure or limit; no composite quality label is published. Unsupported capabilities, partial semantic artifacts, cancellation, and exhausted budgets remain explicit diagnostics and cannot produce a falsely complete empty answer.
 
 Semantic materialization is lazy and request-scoped. It has separate finite limits of 256 materialized files, 16 MiB of source, 1,000,000 rows per semantic dimension, 64 MiB retained semantic data, and 1,000,000 traversal steps. Repeating an edge form is how an authored query asks for another hop; no form silently computes an unbounded closure.
 
@@ -199,7 +225,7 @@ This CFG surface is a procedure-local inspection API. It does not cross call bou
 
 Schema v5 adds `inside-decl`: containment that can match an enclosing callable itself, but stops before searching beyond a non-matching nested function, method, constructor, or lambda. Ordinary `inside` remains lexical and can cross those boundaries.
 
-Schema v6 adds `(value-flow :plan-ref namespace:name query)`, mapping procedure rows to diagnostic-neutral flow endpoints backed by a host-registered `ValueFlowPlan`. `(witness ...)` also accepts flow endpoints and returns retained bounded flow paths. Endpoint reachability, exact/may certainty, ambiguity, completion, and solver-budget status remain separate fields; no policy classification is implied.
+Schema v6 adds `(value-flow :plan-ref namespace:name query)`, mapping procedure rows to diagnostic-neutral flow endpoints backed by a host-registered `ValueFlowPlan`. `(witness ...)` also accepts flow endpoints and returns retained bounded flow paths. Endpoint reachability, exact/may certainty, and ambiguity remain explicit; one public `status` plus optional `reason` preserves semantic, solver, and query termination detail. The status labels and meanings are defined in the [JSON CodeQuery value-domain table](/code-query-json/#registered-value-flow-endpoints-and-witnesses). There is no `must` column until must analysis exists, and no policy classification is implied.
 
 <!-- code-query-test:rql:value-flow-witness -->
 ```lisp
@@ -477,7 +503,7 @@ The `typestate` step consumes an exact `procedure` and a namespaced `:protocol-r
       (function :name "lifecycle"))))
 ```
 
-This lowers to `procedure_of`, `typestate`, and `witness` JSON steps. The optional witness limits are non-negative reductions, so zero requests metadata without step payload. They cannot enlarge host limits, alter finding certainty, or rerun analysis. Findings are diagnostic-neutral: they carry protocol and binding hashes, canonical subject identity, kind, `may`/`must`/`inconclusive` certainty, proof/completeness, uncertainty, exact range, and witness counts—not severity, messages, classifications, or SARIF fields. Witnesses add ordered source-backed steps and truncation/omission metadata.
+This lowers to `procedure_of`, `typestate`, and `witness` JSON steps. The optional witness limits are non-negative reductions, so zero requests metadata without step payload. They cannot enlarge host limits, alter finding certainty, or rerun analysis. Findings are diagnostic-neutral: they carry protocol and binding hashes, canonical subject identity, kind, `may`/`must`/`inconclusive` certainty, proof/completeness, uncertainty, exact range, and witness counts—not severity, messages, classifications, or SARIF fields. Witnesses add one semantic evidence object, ordered source-backed steps, and truncation/omission metadata.
 
 The query never accepts protocol paths, query-time bindings, or may/must mode changes. Missing/stale registrations, wrong procedure roots, unsupported/partial semantics, cancellation, and solver/finding/witness budgets remain explicit incomplete diagnostics. Explain mode needs no registration; results and profile resolve the immutable host snapshot before execution.
 

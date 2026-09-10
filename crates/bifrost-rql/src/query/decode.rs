@@ -1,21 +1,22 @@
 use super::ir::{
-    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallInputSelector,
-    CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
-    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
-    ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter,
-    EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance,
-    FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
-    HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadValueTraversal, MAX_ARITY,
-    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
-    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
+    CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
+    CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
+    CodeQuerySeed, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
+    DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
+    FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
+    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadValueTraversal,
+    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
     MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, ResultContractFailureUseFilter,
-    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
-    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
-    ValueFlowTraversal, WitnessTraversal,
+    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope,
+    QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter,
+    ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
+    ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate,
+    TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal,
+    WitnessTraversal, intersect_language_scopes,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -309,7 +310,7 @@ fn decode_plan(
         CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -340,7 +341,7 @@ fn decode_plan(
         CodeQueryPlanSource::Occurrences(Box::new(OccurrenceSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -357,7 +358,7 @@ fn decode_plan(
         CodeQueryPlanSource::Scopes(Box::new(ScopeSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -374,7 +375,7 @@ fn decode_plan(
         CodeQueryPlanSource::Bindings(Box::new(BindingSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -391,7 +392,7 @@ fn decode_plan(
         CodeQueryPlanSource::Paths(Box::new(PathSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -408,7 +409,7 @@ fn decode_plan(
         CodeQueryPlanSource::GenerationSites(Box::new(GenerationSiteSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -425,7 +426,7 @@ fn decode_plan(
         CodeQueryPlanSource::Exports(Box::new(ExportSeed {
             where_globs: fields
                 .where_globs
-                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
                 .transpose()?
                 .unwrap_or_default(),
             languages: fields
@@ -437,8 +438,6 @@ fn decode_plan(
         }))
     } else {
         for (label, value) in [
-            ("where", fields.where_globs),
-            ("languages", fields.languages),
             ("inside", fields.inside),
             ("inside_decl", fields.inside_decl),
             ("not_inside", fields.not_inside),
@@ -489,7 +488,22 @@ fn decode_plan(
                 depth + 1,
             )?);
         }
-        CodeQueryPlanSource::Set { op, branches }
+        let mut set = CodeQueryPlanSource::Set { op, branches };
+        if let Some(shared_scope) = fields
+            .where_globs
+            .map(|value| decode_path_scope(value, &child_path(path, "where")))
+            .transpose()?
+        {
+            conjoin_source_scope(&mut set, Some(&shared_scope), None, path)?;
+        }
+        if let Some(shared_languages) = fields
+            .languages
+            .map(|value| decode_languages(value, &child_path(path, "languages")))
+            .transpose()?
+        {
+            conjoin_source_scope(&mut set, None, Some(&shared_languages), path)?;
+        }
+        set
     };
 
     let steps_path = child_path(path, "steps");
@@ -1117,31 +1131,112 @@ pub(super) fn decode_declaration_state_filter(
     })
 }
 
-fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
+pub(super) fn decode_path_scope(value: &Value, path: &str) -> Result<QueryPathScope, QueryError> {
     let entries = value
         .as_array()
-        .ok_or_else(|| QueryError::new(path, "expected an array of glob strings"))?;
-    if entries.len() > MAX_WHERE_GLOBS {
+        .ok_or_else(|| QueryError::new(path, "expected glob strings or nested glob groups"))?;
+    if entries.iter().all(Value::is_string) {
+        return Ok(QueryPathScope::from_flat(decode_globs(entries, path)?));
+    }
+
+    let mut groups = Vec::with_capacity(entries.len());
+    for (group_index, entry) in entries.iter().enumerate() {
+        let group_path = index_path(path, group_index);
+        let group = entry.as_array().ok_or_else(|| {
+            QueryError::new(
+                &group_path,
+                "expected a glob string or an array of glob strings",
+            )
+        })?;
+        if group.is_empty() {
+            return Err(QueryError::new(
+                &group_path,
+                "where group must not be empty",
+            ));
+        }
+        groups.push(decode_globs(group, &group_path)?);
+    }
+    QueryPathScope::try_from_groups(groups)
+        .map_err(|error| QueryError::new(path, error.to_string()))
+}
+
+fn decode_globs(values: &[Value], path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
+    if values.len() > MAX_WHERE_GLOBS {
         return Err(QueryError::new(
             path,
             format!("at most {MAX_WHERE_GLOBS} globs are allowed"),
         ));
     }
-    let mut globs = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
+    let mut globs = Vec::with_capacity(values.len());
+    for (index, entry) in values.iter().enumerate() {
         let entry_path = index_path(path, index);
         let text = entry
             .as_str()
             .ok_or_else(|| QueryError::new(&entry_path, "expected a glob string"))?;
-        reject_too_long(text, &entry_path, MAX_GLOB_LENGTH, "glob")?;
-        let compiled = glob::Pattern::new(text)
-            .map_err(|error| QueryError::new(&entry_path, format!("invalid glob: {error}")))?;
+        let compiled = super::ir::compile_path_glob(text)
+            .map_err(|error| QueryError::new(&entry_path, error))?;
         globs.push(compiled);
     }
     Ok(globs)
 }
 
-fn decode_languages(value: &Value, path: &str) -> Result<Vec<Language>, QueryError> {
+pub(super) fn conjoin_plan_scope(
+    plan: &mut CodeQueryPlan,
+    scope: Option<&QueryPathScope>,
+    languages: Option<&[Language]>,
+    path: &str,
+) -> Result<(), QueryError> {
+    conjoin_source_scope(&mut plan.source, scope, languages, path)
+}
+
+fn conjoin_source_scope(
+    source: &mut CodeQueryPlanSource,
+    scope: Option<&QueryPathScope>,
+    languages: Option<&[Language]>,
+    path: &str,
+) -> Result<(), QueryError> {
+    let mut pending = vec![(source, path.to_string())];
+    while let Some((source, path)) = pending.pop() {
+        let (local_scope, local_languages) = match source {
+            CodeQueryPlanSource::Seed(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::Occurrences(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::Scopes(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::Bindings(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::Paths(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::GenerationSites(seed) => {
+                (&mut seed.where_globs, &mut seed.languages)
+            }
+            CodeQueryPlanSource::Exports(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::Set { op, branches } => {
+                let branch_path = child_path(&path, op.label());
+                pending.extend(
+                    branches
+                        .iter_mut()
+                        .enumerate()
+                        .rev()
+                        .map(|(index, branch)| {
+                            (&mut branch.source, index_path(&branch_path, index))
+                        }),
+                );
+                continue;
+            }
+        };
+        if let Some(shared) = scope {
+            *local_scope = local_scope
+                .combine(shared)
+                .map_err(|error| QueryError::new(child_path(&path, "where"), error.to_string()))?;
+        }
+        if let Some(shared) = languages {
+            *local_languages =
+                intersect_language_scopes(local_languages, shared).map_err(|error| {
+                    QueryError::new(child_path(&path, "languages"), error.to_string())
+                })?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_languages(value: &Value, path: &str) -> Result<Vec<Language>, QueryError> {
     let entries = value
         .as_array()
         .ok_or_else(|| QueryError::new(path, "expected an array of language labels"))?;
@@ -1157,9 +1252,13 @@ fn decode_languages(value: &Value, path: &str) -> Result<Vec<Language>, QueryErr
         let text = entry
             .as_str()
             .ok_or_else(|| QueryError::new(&entry_path, "expected a language label string"))?;
-        let language = Language::from_config_label(text)
-            .ok_or_else(|| QueryError::new(&entry_path, format!("unknown language {text:?}")))?;
-        languages.push(language);
+        let expanded = super::schema::expand_language_labels(&[text])
+            .map_err(|message| QueryError::new(&entry_path, message))?;
+        for language in expanded {
+            if !languages.contains(&language) {
+                languages.push(language);
+            }
+        }
     }
     Ok(languages)
 }
@@ -1202,6 +1301,133 @@ fn decode_schema_version(
         .resolve(authored_version)
         .map(|resolution| u64::from(resolution.version))
         .map_err(|error| QueryError::new(path, error.to_string()))
+}
+
+fn decode_call_identity(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+    required: bool,
+) -> Result<Option<CallIdentity>, QueryError> {
+    let field_path = child_path(path, field);
+    let Some(value) = object.get(field) else {
+        return if required {
+            Err(QueryError::new(field_path, "required field is missing"))
+        } else {
+            Ok(None)
+        };
+    };
+    let identity = value.as_object().ok_or_else(|| {
+        QueryError::new(
+            &field_path,
+            "expected an object containing exactly one call identity kind",
+        )
+    })?;
+    if identity.len() != 1 {
+        return Err(QueryError::new(
+            &field_path,
+            "call identity requires exactly one identity kind",
+        ));
+    }
+    let (kind, value) = identity.iter().next().expect("one identity entry");
+    let value_path = child_path(&field_path, kind);
+    let identity = value
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= MAX_STRING_PREDICATE_LENGTH)
+        .ok_or_else(|| QueryError::new(&value_path, "expected a non-empty bounded string"))?;
+    match kind.as_str() {
+        "stable" => Ok(Some(CallIdentity::Stable(identity.to_owned()))),
+        "qualified" => Ok(Some(CallIdentity::Qualified {
+            value: identity.to_owned(),
+            source_range: None,
+            resolved: None,
+        })),
+        "workspace_declaration" => Ok(Some(CallIdentity::Qualified {
+            value: identity.to_owned(),
+            source_range: None,
+            resolved: Some(super::ir::ResolvedCallIdentity {
+                kind: super::ir::ResolvedCallIdentityKind::WorkspaceDeclaration,
+                identity: identity.to_owned(),
+            }),
+        })),
+        "active_semantic_model" => Ok(Some(CallIdentity::Qualified {
+            value: identity.to_owned(),
+            source_range: None,
+            resolved: Some(super::ir::ResolvedCallIdentity {
+                kind: super::ir::ResolvedCallIdentityKind::ActiveSemanticModel,
+                identity: identity.to_owned(),
+            }),
+        })),
+        _ => Err(QueryError::new(
+            value_path,
+            "call identity key must be stable, qualified, workspace_declaration, or active_semantic_model",
+        )),
+    }
+}
+
+fn decode_receiver_type(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<Option<ResolvedCallReceiverType>, QueryError> {
+    let field_path = child_path(path, "receiver_type");
+    let Some(value) = object.get("receiver_type") else {
+        return Ok(None);
+    };
+    let receiver = value.as_object().ok_or_else(|| {
+        QueryError::new(
+            &field_path,
+            "expected an exact call identity or an assignable_to receiver family",
+        )
+    })?;
+    if receiver.contains_key("assignable_to") {
+        if receiver
+            .keys()
+            .any(|key| key != "assignable_to" && key != "resolved_identities")
+        {
+            return Err(QueryError::new(
+                &field_path,
+                "assignable_to receiver family accepts only assignable_to and resolved_identities",
+            ));
+        }
+        let root = decode_call_identity(receiver, &field_path, "assignable_to", true)?
+            .expect("required receiver family root decoded");
+        let identities_path = child_path(&field_path, "resolved_identities");
+        let mut resolved_identities = match receiver.get("resolved_identities") {
+            None => Vec::new(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value
+                        .as_str()
+                        .filter(|identity| {
+                            !identity.is_empty() && identity.len() <= MAX_STRING_PREDICATE_LENGTH
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            QueryError::new(
+                                index_path(&identities_path, index),
+                                "expected a non-empty bounded stable identity",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(QueryError::new(
+                    identities_path,
+                    "resolved_identities must be an array of stable identities",
+                ));
+            }
+        };
+        resolved_identities.sort();
+        resolved_identities.dedup();
+        return Ok(Some(ResolvedCallReceiverType::AssignableTo {
+            root,
+            resolved_identities,
+        }));
+    }
+    decode_call_identity(object, path, "receiver_type", false)
+        .map(|identity| identity.map(ResolvedCallReceiverType::Exact))
 }
 
 fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError> {
@@ -1288,6 +1514,16 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 QueryStep::Taint(TaintTraversal { taint_ref })
             }
             super::schema::QueryStepOp::Witness => QueryStep::Witness(WitnessTraversal::default()),
+            super::schema::QueryStepOp::ResolvedCall => {
+                QueryStep::ResolvedCall(ResolvedCallFilter {
+                    resolves_to: CallIdentity::Stable(String::new()),
+                    proof: ResolvedCallProof::Exact,
+                    receiver_type: None,
+                })
+            }
+            super::schema::QueryStepOp::CallArgument => {
+                QueryStep::CallArgument(CallArgumentSelector::FormalIndex(0))
+            }
             _ => QueryStep::from_label(label)
                 .expect("option-free and defaultable query steps construct from their labels"),
         };
@@ -1302,6 +1538,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_)
         );
         let call_input = matches!(step, QueryStep::CallInput(_));
+        let resolved_call = matches!(step, QueryStep::ResolvedCall(_));
+        let call_argument = matches!(step, QueryStep::CallArgument(_));
         let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
         let field_write_value = matches!(step, QueryStep::FieldWriteValue(_));
         let keyed_read_value = matches!(step, QueryStep::KeyedReadValue(_));
@@ -1342,6 +1580,13 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ParameterIndex
                     | QueryStepField::ParameterName,
                 ) if call_input => {}
+                Some(
+                    QueryStepField::ResolvesTo
+                    | QueryStepField::CallProof
+                    | QueryStepField::ReceiverType,
+                ) if resolved_call => {}
+                Some(QueryStepField::FormalName | QueryStepField::FormalIndex) if call_argument => {
+                }
                 Some(
                     QueryStepField::Identity
                     | QueryStepField::ElementName
@@ -1465,7 +1710,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ControlExitPartitions
                     | QueryStepField::FailureUseProvenances
                     | QueryStepField::FailureUseConsumers
-                    | QueryStepField::Resolved,
+                    | QueryStepField::Resolved
+                    | QueryStepField::ResolvesTo
+                    | QueryStepField::CallProof
+                    | QueryStepField::ReceiverType
+                    | QueryStepField::FormalName
+                    | QueryStepField::FormalIndex,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -1475,7 +1725,64 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
             }
         }
-        if occurrence {
+        if resolved_call {
+            let resolves_to = decode_call_identity(object, &entry_path, "resolves_to", true)?
+                .expect("required call identity decoded");
+            let proof_path = child_path(&entry_path, "call_proof");
+            let proof = match object.get("call_proof").and_then(Value::as_str) {
+                Some("exact") => ResolvedCallProof::Exact,
+                Some("declared") => ResolvedCallProof::Declared,
+                Some(_) => {
+                    return Err(QueryError::new(
+                        proof_path,
+                        "call_proof must be exact or declared",
+                    ));
+                }
+                None => return Err(QueryError::new(proof_path, "required field is missing")),
+            };
+            let receiver_type = decode_receiver_type(object, &entry_path)?;
+            step = QueryStep::ResolvedCall(ResolvedCallFilter {
+                resolves_to,
+                proof,
+                receiver_type,
+            });
+        } else if call_argument {
+            let selector_count = ["formal_name", "formal_index"]
+                .into_iter()
+                .filter(|field| object.contains_key(*field))
+                .count();
+            if selector_count != 1 {
+                return Err(QueryError::new(
+                    &entry_path,
+                    "call_argument requires exactly one of formal_name or formal_index",
+                ));
+            }
+            let selector = if let Some(value) = object.get("formal_name") {
+                let path = child_path(&entry_path, "formal_name");
+                let shape = QueryStepField::FormalName.value_shape();
+                let name = value
+                    .as_str()
+                    .filter(|name| shape.accepts_string(name))
+                    .ok_or_else(|| {
+                        let (minimum, maximum) = shape
+                            .string_length_bounds()
+                            .expect("formal-name shape has string bounds");
+                        QueryError::new(
+                            path,
+                            format!("expected a string between {minimum} and {maximum} bytes"),
+                        )
+                    })?;
+                CallArgumentSelector::FormalName(name.to_owned())
+            } else {
+                let path = child_path(&entry_path, "formal_index");
+                let index = object["formal_index"]
+                    .as_u64()
+                    .and_then(|raw| usize::try_from(raw).ok())
+                    .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))?;
+                CallArgumentSelector::FormalIndex(index)
+            };
+            step = QueryStep::CallArgument(selector);
+        } else if occurrence {
             let filter = decode_occurrence_filter(object, &entry_path)?;
             step = match step {
                 QueryStep::OccurrencesOf(_) => QueryStep::OccurrencesOf(filter),

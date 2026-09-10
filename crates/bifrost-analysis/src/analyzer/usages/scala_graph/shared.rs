@@ -301,37 +301,25 @@ pub(in crate::analyzer::usages) enum ScalaFrontierSeedOutcome<'a> {
 }
 
 impl<'a> ScalaFrontierScan<'a> {
-    /// The workspace-wide sweep derives the seed's type-namespace structures
-    /// in bounded chunks; per-file facts for the files the query actually
-    /// touches rehydrate lazily through the seed (#3142). The hierarchy pass
-    /// resolves the seed once; the inputs it carried are dropped after.
+    /// The workspace's resolved seed for this query (cached per analyzer
+    /// generation, with a fresh per-query facts provider; see
+    /// `ScalaAnalyzer::resolved_query_seed`) plus the relational session the
+    /// catalog and scan phases run on.
     pub(in crate::analyzer::usages) fn seed(
         scala: &'a ScalaAnalyzer,
         analyzer: &'a dyn IAnalyzer,
         cancellation: &'a crate::CancellationToken,
     ) -> ScalaFrontierSeedOutcome<'a> {
-        let workspace_files = match analyzer.project().analyzable_files(Language::Scala) {
-            Ok(files) => files.into_iter().collect::<Vec<_>>(),
-            Err(_) => {
-                return ScalaFrontierSeedOutcome::Failed(
-                    "the Scala workspace file set is unavailable",
-                );
-            }
-        };
         let session = RelationalFrontierSession::new(analyzer, cancellation);
-        let unresolved_seed = scala.project_types_query_seed(&workspace_files);
-        let resolved_seed = match session.resolve_owned("scala_hierarchy", |frontier| {
-            scala
-                .build_project_types_from_frontier(frontier, unresolved_seed.clone())
-                .resolved_seed()
-        }) {
-            RelationalFrontierOutcome::Complete(seed) => seed,
-            RelationalFrontierOutcome::Cancelled => return ScalaFrontierSeedOutcome::Cancelled,
-            RelationalFrontierOutcome::Failed(_) => {
-                return ScalaFrontierSeedOutcome::Failed("the Scala hierarchy frontier failed");
+        let resolved_seed = match scala.resolved_query_seed(&session) {
+            crate::analyzer::scala::ScalaResolvedSeedOutcome::Ready(seed) => seed,
+            crate::analyzer::scala::ScalaResolvedSeedOutcome::Cancelled => {
+                return ScalaFrontierSeedOutcome::Cancelled;
+            }
+            crate::analyzer::scala::ScalaResolvedSeedOutcome::Failed(reason) => {
+                return ScalaFrontierSeedOutcome::Failed(reason);
             }
         };
-        drop(unresolved_seed);
         ScalaFrontierSeedOutcome::Ready(Self {
             scala,
             cancellation,

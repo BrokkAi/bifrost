@@ -3,6 +3,75 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
+/// The identifier nodes in one static Python value path, from root to leaf.
+///
+/// Dynamic receivers and subscripts have no static path. Keeping the nodes
+/// lets callers combine the parser shape with lexical/import binding facts
+/// without reparsing a dotted source spelling.
+pub fn python_static_attribute_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    if !matches!(node.kind(), "identifier" | "attribute") {
+        return None;
+    }
+    let mut path = Vec::new();
+    loop {
+        match node.kind() {
+            "identifier" => {
+                path.push(node);
+                break;
+            }
+            "attribute" => {
+                let attribute = node.child_by_field_name("attribute")?;
+                if attribute.kind() != "identifier" {
+                    return None;
+                }
+                path.push(attribute);
+                node = node.child_by_field_name("object")?;
+            }
+            _ => return None,
+        }
+    }
+    path.reverse();
+    Some(path)
+}
+
+/// The identifier nodes in one static Python annotation name, root to leaf.
+/// Wrappers and generic arguments are ignored while the named generic origin
+/// remains part of the path.
+pub fn python_static_type_path<'tree>(mut node: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    let mut path = Vec::new();
+    loop {
+        match node.kind() {
+            "identifier" => {
+                path.push(node);
+                break;
+            }
+            "type" | "generic_type" | "subscript" => node = node.named_child(0)?,
+            "attribute" => {
+                let attribute = node.child_by_field_name("attribute")?;
+                if attribute.kind() != "identifier" {
+                    return None;
+                }
+                path.push(attribute);
+                node = node.child_by_field_name("object")?;
+            }
+            "member_type" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor);
+                let qualifier = children.next()?;
+                let member = children.next()?;
+                if member.kind() != "identifier" || children.next().is_some() {
+                    return None;
+                }
+                path.push(member);
+                node = qualifier;
+            }
+            _ => return None,
+        }
+    }
+    path.reverse();
+    Some(path)
+}
+
 /// The text one plain string literal denotes.
 ///
 /// Prefixed strings, interpolations, escapes, implicit concatenations, and

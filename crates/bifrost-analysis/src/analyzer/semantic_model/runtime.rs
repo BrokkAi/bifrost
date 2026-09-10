@@ -1,3 +1,4 @@
+use crate::analyzer::semantic_model::DeferredYieldsPayload;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -300,6 +301,19 @@ impl ResolvedActiveSemanticModels {
             shard
                 .shard
                 .collection_flows()
+                .map(|payload| (payload, shard))
+        })
+    }
+
+    /// Deferred-yield contracts retain their activation shard so consumers can
+    /// pair exact endpoint identities with the evidence that activated them.
+    pub fn deferred_yields(
+        &self,
+    ) -> impl Iterator<Item = (&DeferredYieldsPayload, &ActiveSemanticModelShard)> {
+        self.shards.iter().filter_map(|shard| {
+            shard
+                .shard
+                .deferred_yields()
                 .map(|payload| (payload, shard))
         })
     }
@@ -2060,6 +2074,7 @@ impl SemanticModelRuntimeCache {
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<ActiveSemanticModelSnapshot>, SemanticModelOverlayBuildError> {
+        let _scope = crate::profiling::scope("semantic_pack.publish_overlay");
         {
             let published = self
                 .published
@@ -2140,6 +2155,7 @@ pub fn resolve_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelResolutionOutcome {
+    let _scope = crate::profiling::scope("semantic_pack.resolve_active");
     let mut report = SemanticModelActivationReport::default();
     let activation_sql_start = catalog.sql_statement_count();
     let selection_started = Instant::now();
@@ -2713,6 +2729,7 @@ fn publish_active_models(
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     active: &ResolvedActiveSemanticModels,
 ) -> Result<(), super::CatalogError> {
+    let _scope = crate::profiling::scope("semantic_pack.publish_active_set");
     let Some(persistence) = persistence else {
         return Ok(());
     };

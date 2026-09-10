@@ -1200,7 +1200,7 @@ fn handle_run_rql_query_request(
             let response = Response::new_err(
                 id,
                 ErrorCode::InvalidParams as i32,
-                format!("Failed to parse query source: {error}"),
+                format!("Failed to parse RQL query source: {error}"),
             );
             return connection
                 .sender
@@ -2921,6 +2921,7 @@ impl lsp_types::request::Request for RunRqlQuery {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct RunRqlQueryParams {
+    /// Authored RQL text, as in a bifrost-rql editor document.
     query: String,
 }
 
@@ -5324,12 +5325,11 @@ mod tests {
             end_line: 1,
             end_column: 5,
         };
-        let evidence = CodeQuerySemanticEvidence {
-            proof: CodeQuerySemanticProof::Proven,
-            proof_reason: None,
-            completeness: CodeQuerySemanticCompleteness::Complete,
-            completeness_reason: None,
-        };
+        let evidence = CodeQuerySemanticEvidence::new(
+            CodeQuerySemanticProof::Proven,
+            CodeQuerySemanticCompleteness::Complete,
+            None,
+        );
         let response = CodeQueryResponse::Results(CodeQueryResult {
             session_subset: None,
             results: vec![CodeQueryResultItem {
@@ -5349,7 +5349,7 @@ mod tests {
                         path: "main.ts".to_string(),
                         language: "typescript",
                         range,
-                        quality: evidence.clone(),
+                        evidence: evidence.clone(),
                         uncertainty: Vec::new(),
                         abstained: false,
                         steps: vec![

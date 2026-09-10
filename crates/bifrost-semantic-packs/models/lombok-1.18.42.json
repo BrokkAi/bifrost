@@ -225,6 +225,40 @@
                   "op": "capture",
                   "name": "field_id"
                 }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter-reference"
+                    }
+                  ]
+                },
+                "relation_kind": "references",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "to": {
+                  "op": "capture",
+                  "name": "field_id"
+                }
               }
             ]
           },
@@ -377,6 +411,25 @@
                   "op": "capture",
                   "name": "field_id"
                 }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-setter-reference" }
+                  ]
+                },
+                "relation_kind": "references",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-setter" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "field_id" }
               }
             ]
           },
@@ -569,6 +622,25 @@
                   "op": "capture",
                   "name": "field_id"
                 }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-getter-reference" }
+                  ]
+                },
+                "relation_kind": "references",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-getter" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "field_id" }
               }
             ]
           },
@@ -761,6 +833,25 @@
                   "op": "capture",
                   "name": "field_id"
                 }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-getter-reference" }
+                  ]
+                },
+                "relation_kind": "references",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".lombok-getter" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "field_id" }
               }
             ]
           },
@@ -823,6 +914,25 @@
                   ]
                 },
                 "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-no-args-constructor" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "owner_id" }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-no-args-reference" }
+                  ]
+                },
+                "relation_kind": "references",
                 "from": {
                   "op": "concat",
                   "values": [
@@ -919,6 +1029,25 @@
                   ]
                 },
                 "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-required-args-constructor" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "owner_id" }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-required-args-reference" }
+                  ]
+                },
+                "relation_kind": "references",
                 "from": {
                   "op": "concat",
                   "values": [

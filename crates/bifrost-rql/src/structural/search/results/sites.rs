@@ -742,6 +742,9 @@ pub struct CodeQueryCallBinding {
     /// declaration identity used by source joins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CodeQueryDeclaration>,
+    /// Stable workspace declaration identity selected by the resolver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_target_id: Option<String>,
     /// The canonical #2438 semantic target identity when the sole dispatch
     /// arm is proven to be the same materialized source declaration named by
     /// the binding resolver, or the same unique complete model symbol selected
@@ -1298,6 +1301,8 @@ pub struct CodeQueryProcedureEffect {
     pub id: String,
     /// Equal to the `declaration` domain's `id` for the same procedure.
     pub procedure_id: String,
+    /// The procedure declaration id plus this row's exact byte span.
+    pub site_id: String,
     pub procedure_name: String,
     pub path: String,
     pub language: &'static str,
@@ -1374,6 +1379,8 @@ pub struct CodeQueryProcedureEffect {
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryCallableSignature {
     pub id: String,
+    /// The declaration id plus this row's exact byte span.
+    pub site_id: String,
     pub path: String,
     pub language: &'static str,
     pub range: CodeQueryRange,

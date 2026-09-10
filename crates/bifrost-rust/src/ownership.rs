@@ -13,6 +13,7 @@
 use crate::declarations::rust_node_text;
 use crate::graph::ast::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::imports::{RustImportBindingName, rust_imports_with_visibility_from_use_declaration};
+use crate::syntax::{outer_attributes, unwrap_attributes};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -190,7 +191,7 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
 
         while let Some(frame) = stack.pop() {
             charge(1)?;
-            let node = frame.node;
+            let node = unwrap_attributes(frame.node);
             let macro_context =
                 frame.under_macro || matches!(node.kind(), "macro_invocation" | "macro_definition");
 
@@ -902,6 +903,7 @@ fn nominal_declaration<'tree>(
     module_path: &[String],
     shadowed: &mut HashSet<ShadowedBinding>,
 ) -> Option<NominalDeclaration<'tree>> {
+    let node = unwrap_attributes(node);
     let expected_kind = match node.kind() {
         "struct_item" => "struct",
         "enum_item" => "enum",
@@ -995,30 +997,20 @@ fn collect_body_types<'tree>(
 
 fn derive_evidence(node: Node<'_>, source: &str) -> TraitEvidence {
     let mut evidence = TraitEvidence::default();
-    let mut sibling = node.prev_named_sibling();
-    while let Some(attribute_item) = sibling {
-        if matches!(attribute_item.kind(), "line_comment" | "block_comment") {
-            sibling = attribute_item.prev_named_sibling();
-            continue;
-        }
-        if attribute_item.kind() != "attribute_item" {
-            break;
-        }
+    for attribute_item in outer_attributes(node) {
         let Some(attribute) = attribute_item.named_child(0) else {
             break;
         };
         let Some(path) = attribute.named_child(0) else {
-            break;
+            continue;
         };
         if path.kind() == "identifier" && rust_node_text(path, source) == "derive" {
             let Some(arguments) = attribute.child_by_field_name("arguments") else {
                 evidence.malformed_derive = true;
-                sibling = attribute_item.prev_named_sibling();
                 continue;
             };
             let Ok(traits) = derive_builtin_traits(arguments, source) else {
                 evidence.malformed_derive = true;
-                sibling = attribute_item.prev_named_sibling();
                 continue;
             };
             for (trait_kind, qualified) in traits {
@@ -1035,7 +1027,6 @@ fn derive_evidence(node: Node<'_>, source: &str) -> TraitEvidence {
                 }
             }
         }
-        sibling = attribute_item.prev_named_sibling();
     }
     evidence
 }

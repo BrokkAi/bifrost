@@ -35,14 +35,6 @@ pub fn relational_binding_selector_path(name: &RowBindingName) -> String {
     format!("/analysis/plan/bindings/{}/query", name.as_str())
 }
 
-/// The selector path of a query nested in an endpoint row selector.
-///
-/// The endpoint's own selector path is the prefix so source, sink, flow, and
-/// auxiliary endpoint sets can all use the same stable naming rule.
-pub fn row_selector_binding_selector_path(path: &str, name: &RowBindingName) -> String {
-    format!("{path}/bindings/{}/query", name.as_str())
-}
-
 pub const DEFAULT_WITNESS_MAX_STEPS: usize = 64;
 pub const DEFAULT_WITNESS_MAX_BYTES: usize = 16 * 1024;
 pub const DEFAULT_WITNESSES_PER_FINDING: usize = 8;
@@ -241,21 +233,6 @@ pub struct RelationalAssertionPlan {
     pub limits: RelationalAssertionLimits,
 }
 
-/// A bounded relational selector used by a taint or value-flow endpoint.
-///
-/// Unlike an assertion plan, this form has no groups or assertions. Its
-/// output is one live relation, which is later consumed as the endpoint's
-/// selected call/argument rows. Joins are retained here because endpoint
-/// selectors may combine exact call and binding evidence before selecting the
-/// output relation.
-#[derive(Debug, Clone)]
-pub struct RowSelectorPlan {
-    pub bindings: Vec<RowBinding>,
-    pub derivations: Vec<RowDerivation>,
-    pub joins: Vec<RowJoin>,
-    pub output: RowBindingName,
-}
-
 #[derive(Debug, Clone)]
 pub struct RowBinding {
     pub name: RowBindingName,
@@ -338,6 +315,10 @@ pub struct RowFilter {
     /// analyzer and active semantic-model context. Symbol-shaped stable IDs
     /// do not use this field and remain ordinary relational literals.
     pub call_locator: Option<CallLocator>,
+    /// The receiver-family comparison represented by the authored `(call ...)`
+    /// shorthand. Exact constraints are fully represented by ordinary
+    /// predicates and remain `None` here for stable canonical bytes.
+    pub receiver_constraint: Option<ReceiverTypeConstraintKind>,
     /// Typed identity/provenance produced when `call_locator` is resolved.
     /// Source ranges and authored spellings are deliberately not retained.
     pub resolved_locators: Vec<ResolvedPolicyLocator>,
@@ -352,11 +333,25 @@ pub struct PolicyLocator {
     pub range: Range<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverTypeConstraintKind {
+    Exact,
+    AssignableTo,
+}
+
+/// One qualified receiver spelling and whether it names the exact owner or an
+/// inclusive assignable-to family root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverTypeLocator {
+    pub locator: PolicyLocator,
+    pub constraint: ReceiverTypeConstraintKind,
+}
+
 /// Pending values from a qualified `(call ...)` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallLocator {
     pub target: Option<PolicyLocator>,
-    pub receiver_type: Option<PolicyLocator>,
+    pub receiver_type: Option<ReceiverTypeLocator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +374,7 @@ pub struct ResolvedPolicyLocator {
     pub role: ResolvedPolicyLocatorRole,
     pub kind: ResolvedPolicyLocatorKind,
     pub identity: String,
+    pub constraint: ReceiverTypeConstraintKind,
     pub provenance: Option<SemanticModelProvenance>,
 }
 
@@ -569,6 +565,9 @@ pub enum RowPredicateOperand {
     Field(RowFieldRef),
     /// The bounded literal set of an `in` test.
     Set(Vec<RowLiteral>),
+    /// The unbounded, resolver-materialized identity set used by an inclusive
+    /// receiver-family constraint. This is never an authored operand spelling.
+    ResolvedIdentitySet(Vec<String>),
     /// The two null tests state everything in their operator.
     None,
 }
@@ -1644,13 +1643,15 @@ pub enum PolicySelector {
     Inline {
         schema: SchemaVersionResolution,
         query: CodeQuery,
+        /// Typed provenance for qualified locators resolved inside the query.
+        /// Stable IDs need no entry.
+        resolved_locators: Vec<ResolvedPolicyLocator>,
     },
     File {
         authored_schema_version: Option<u32>,
+        /// Independent RQL pin inherited from this selector's analysis.
+        analysis_schema_version: Option<u32>,
         path: WorkspaceRelativePath,
-    },
-    Rows {
-        plan: RowSelectorPlan,
     },
 }
 
@@ -2123,6 +2124,7 @@ pub enum TypestateCallBinding {
 pub enum PolicySemanticEvent {
     NormalProcedureExit { scope: TypestateExitScope },
     ExceptionalProcedureExit { scope: TypestateExitScope },
+    SuspensionBoundary { scope: TypestateExitScope },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

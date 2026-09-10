@@ -140,6 +140,25 @@
                 ]
               },
               "to": { "op": "capture", "name": "parameter_id" }
+            },
+            {
+              "kind": "relation",
+              "id": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "parameter_id" },
+                  { "op": "literal", "value": ".accessor.reference" }
+                ]
+              },
+              "relation_kind": "references",
+              "from": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "parameter_id" },
+                  { "op": "literal", "value": ".accessor" }
+                ]
+              },
+              "to": { "op": "capture", "name": "parameter_id" }
             }
           ]
         }

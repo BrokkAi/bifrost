@@ -27,7 +27,7 @@ use super::loading::{
     PolicyDocumentLoadError, SelectorLoadError, enumerate_endpoint_directory,
     load_endpoint_closure, read_rqlp_document, resolve_parsed_selector,
 };
-use super::locator::resolve_policy_definition_locators;
+use super::locator::{resolve_policy_definition_locators, resolve_selector_locators};
 use super::resolved::*;
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
@@ -509,8 +509,13 @@ impl PolicyRegistry {
                             };
                             let path =
                                 selector_path(relational_binding_selector_path(&binding.name))?;
-                            let selector =
-                                self.resolve_selector(parsed, path, query, &mut retained_bytes)?;
+                            let selector = self.resolve_selector(
+                                parsed,
+                                path,
+                                query,
+                                &mut retained_bytes,
+                                analyzer,
+                            )?;
                             insert_selector(&mut fixed_selectors, selector)?;
                         }
                     } else {
@@ -520,6 +525,7 @@ impl PolicyRegistry {
                             path,
                             &spec.subject,
                             &mut retained_bytes,
+                            analyzer,
                         )?;
                         insert_selector(&mut fixed_selectors, selector)?;
                     }
@@ -534,8 +540,13 @@ impl PolicyRegistry {
                 }
                 PolicyAnalysis::Match { spec } => {
                     let path = selector_path("/analysis/selector")?;
-                    let selector =
-                        self.resolve_selector(parsed, path, &spec.selector, &mut retained_bytes)?;
+                    let selector = self.resolve_selector(
+                        parsed,
+                        path,
+                        &spec.selector,
+                        &mut retained_bytes,
+                        analyzer,
+                    )?;
                     insert_selector(&mut fixed_selectors, selector)?;
                     (
                         None,
@@ -562,6 +573,7 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
+                        analyzer,
                     )?;
                     self.build_catalog_taint_inputs(
                         spec,
@@ -569,6 +581,7 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
+                        analyzer,
                     )?;
                     let uses = taint_match_uses(spec)?;
                     let match_inputs = self.build_match_inputs(
@@ -612,6 +625,7 @@ impl PolicyRegistry {
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
                         &mut retained_bytes,
+                        analyzer,
                     )?;
                     let uses = typestate_match_uses(spec)?;
                     let match_inputs = self.build_match_inputs(
@@ -697,7 +711,6 @@ impl PolicyRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn build_local_taint_inputs(
         &self,
         parsed: &ParsedRqlpDocument,
@@ -708,6 +721,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<(), PolicyRegistryError> {
         for source in &spec.sources.entries {
             let base = format!(
@@ -716,7 +730,8 @@ impl PolicyRegistry {
                 pointer_segment(source.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
-            let selector = self.resolve_selector(parsed, path, &source.selector, retained_bytes)?;
+            let selector =
+                self.resolve_selector(parsed, path, &source.selector, retained_bytes, analyzer)?;
             let identity = ResolvedEndpointIdentity::Local {
                 policy_id: definition.metadata.id.clone(),
                 entry_id: source.id.clone(),
@@ -752,7 +767,8 @@ impl PolicyRegistry {
                 pointer_segment(sink.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
-            let selector = self.resolve_selector(parsed, path, &sink.selector, retained_bytes)?;
+            let selector =
+                self.resolve_selector(parsed, path, &sink.selector, retained_bytes, analyzer)?;
             let identity = ResolvedEndpointIdentity::Local {
                 policy_id: definition.metadata.id.clone(),
                 entry_id: sink.id.clone(),
@@ -795,8 +811,13 @@ impl PolicyRegistry {
                 pointer_segment(entry_point.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
-            let selector =
-                self.resolve_selector(parsed, path, &entry_point.selector, retained_bytes)?;
+            let selector = self.resolve_selector(
+                parsed,
+                path,
+                &entry_point.selector,
+                retained_bytes,
+                analyzer,
+            )?;
             let identity = ResolvedEndpointIdentity::Local {
                 policy_id: definition.metadata.id.clone(),
                 entry_id: entry_point.id.clone(),
@@ -834,6 +855,7 @@ impl PolicyRegistry {
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
             retained_bytes,
+            analyzer,
         )?;
         self.resolve_local_auxiliary_selectors(
             parsed,
@@ -844,6 +866,7 @@ impl PolicyRegistry {
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
             retained_bytes,
+            analyzer,
         )?;
         self.resolve_local_auxiliary_selectors(
             parsed,
@@ -854,6 +877,7 @@ impl PolicyRegistry {
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
             retained_bytes,
+            analyzer,
         )?;
         // Store writes and reads share the one `stores` authoring segment;
         // their entry IDs share the local taint namespace, so the combined
@@ -866,6 +890,7 @@ impl PolicyRegistry {
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
             retained_bytes,
+            analyzer,
         )?;
         self.resolve_local_auxiliary_selectors(
             parsed,
@@ -875,6 +900,7 @@ impl PolicyRegistry {
                 .map(|entry| (&entry.id, &entry.selector)),
             fixed_selectors,
             retained_bytes,
+            analyzer,
         )?;
         Ok(())
     }
@@ -886,13 +912,15 @@ impl PolicyRegistry {
         entries: impl Iterator<Item = (&'a TaintEntryId, &'a PolicySelector)>,
         selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<(), PolicyRegistryError> {
         for (id, authored) in entries {
             let path = selector_path(format!(
                 "/analysis/{kind}/entries/{}/selector",
                 pointer_segment(id.as_str())
             ))?;
-            let selector = self.resolve_selector(parsed, path, authored, retained_bytes)?;
+            let selector =
+                self.resolve_selector(parsed, path, authored, retained_bytes, analyzer)?;
             insert_selector(selectors, selector)?;
         }
         Ok(())
@@ -905,6 +933,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<(), PolicyRegistryError> {
         // Catalog storage is independently bounded, but each loaded policy
         // clones the selected typed definitions and queries. Charge one full
@@ -930,7 +959,7 @@ impl PolicyRegistry {
         for reference in &spec.sources.include_sets {
             let catalog = self.catalogs.resolve(reference)?;
             for source in &catalog.definition().sources {
-                let (identity, selector) = catalog_selector(catalog, &source.id)?;
+                let (identity, selector) = catalog_selector(catalog, &source.id, analyzer)?;
                 let dependency = ResolvedEndpointDependency::from_composed_model(
                     ResolvedEndpointIdentity::Catalog {
                         catalog: identity.clone(),
@@ -960,7 +989,7 @@ impl PolicyRegistry {
         for reference in &spec.sinks.include_sets {
             let catalog = self.catalogs.resolve(reference)?;
             for sink in &catalog.definition().sinks {
-                let (identity, selector) = catalog_selector(catalog, &sink.id)?;
+                let (identity, selector) = catalog_selector(catalog, &sink.id, analyzer)?;
                 let dependency = ResolvedEndpointDependency::from_composed_model(
                     ResolvedEndpointIdentity::Catalog {
                         catalog: identity.clone(),
@@ -999,6 +1028,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
+            analyzer,
         )?;
         self.resolve_catalog_auxiliary_selectors(
             &spec.transforms.include_sets,
@@ -1011,6 +1041,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
+            analyzer,
         )?;
         self.resolve_catalog_auxiliary_selectors(
             &spec.external_models.include_sets,
@@ -1023,6 +1054,7 @@ impl PolicyRegistry {
                     .collect()
             },
             fixed_selectors,
+            analyzer,
         )?;
         Ok(())
     }
@@ -1034,6 +1066,7 @@ impl PolicyRegistry {
             &'a RegisteredTaintCatalog,
         ) -> Vec<(&'a TaintEntryId, &'a PolicySelector)>,
         selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<(), PolicyRegistryError> {
         for reference in references {
             let catalog = self.catalogs.resolve(reference)?;
@@ -1051,6 +1084,7 @@ impl PolicyRegistry {
                     SelectorOrigin::Catalog {
                         catalog: identity.clone(),
                     },
+                    analyzer,
                 )?;
                 insert_selector(selectors, selector)?;
             }
@@ -1068,6 +1102,7 @@ impl PolicyRegistry {
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<(), PolicyRegistryError> {
         for subject in &spec.subjects.entries {
             let base = format!(
@@ -1076,7 +1111,7 @@ impl PolicyRegistry {
             );
             let path = selector_path(format!("{base}/selector"))?;
             let selector =
-                self.resolve_selector(parsed, path, &subject.selector, retained_bytes)?;
+                self.resolve_selector(parsed, path, &subject.selector, retained_bytes, analyzer)?;
             let dependency = ResolvedEndpointDependency::from_composed_model(
                 ResolvedEndpointIdentity::Local {
                     policy_id: definition.metadata.id.clone(),
@@ -1107,7 +1142,8 @@ impl PolicyRegistry {
                     "/analysis/automaton/events/{}/selector",
                     pointer_segment(event.id.as_str())
                 ))?;
-                let selector = self.resolve_selector(parsed, path, selector, retained_bytes)?;
+                let selector =
+                    self.resolve_selector(parsed, path, selector, retained_bytes, analyzer)?;
                 insert_selector(fixed_selectors, selector)?;
             }
         }
@@ -1345,8 +1381,15 @@ impl PolicyRegistry {
         path: PolicySelectorPath,
         authored: &PolicySelector,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
-        let loaded = resolve_parsed_selector(self.workspace_root.as_ref(), parsed, path, authored)?;
+        let loaded = resolve_parsed_selector(
+            self.workspace_root.as_ref(),
+            parsed,
+            path,
+            authored,
+            analyzer,
+        )?;
         if let Some(reference) = loaded.referenced.as_ref() {
             self.charge_local(retained_bytes, reference.document().source().len())?;
         }
@@ -1546,16 +1589,26 @@ fn inline_selector(
     path: PolicySelectorPath,
     authored: &PolicySelector,
     origin: SelectorOrigin,
+    analyzer: Option<&dyn IAnalyzer>,
 ) -> Result<ResolvedPolicySelector, PolicyRegistryError> {
-    let PolicySelector::Inline { schema, query } = authored else {
+    let mut authored = authored.clone();
+    resolve_selector_locators(&mut authored, analyzer)?;
+    let PolicySelector::Inline {
+        schema,
+        query,
+        resolved_locators,
+    } = authored
+    else {
         return Err(PolicyRegistryError::CatalogFileSelector);
     };
-    ResolvedPolicySelector::try_new(path, *schema, query.clone(), origin).map_err(Into::into)
+    ResolvedPolicySelector::try_new_with_locators(path, schema, query, origin, resolved_locators)
+        .map_err(Into::into)
 }
 
 fn catalog_selector(
     catalog: &RegisteredTaintCatalog,
     entry_id: &TaintEntryId,
+    analyzer: Option<&dyn IAnalyzer>,
 ) -> Result<(ResolvedCatalogIdentity, ResolvedPolicySelector), PolicyRegistryError> {
     let identity = resolved_catalog_identity(catalog)?;
     let entry = catalog
@@ -1588,6 +1641,7 @@ fn catalog_selector(
         SelectorOrigin::Catalog {
             catalog: identity.clone(),
         },
+        analyzer,
     )?;
     Ok((identity, selector))
 }
@@ -1610,30 +1664,17 @@ fn rekey_endpoint_selector(
         "/dependencies/match-endpoints/{}/selector",
         pointer_segment(endpoint.definition().id.as_str())
     ))?;
-    if let Some(plan) = endpoint.resolved_selector().as_rows() {
-        ResolvedPolicySelector::try_new_rows(
-            path,
-            plan.clone(),
-            endpoint.resolved_selector().origin.clone(),
-        )
-    } else {
-        ResolvedPolicySelector::try_new(
-            path,
-            endpoint
-                .resolved_selector()
-                .as_query()
-                .expect("query selector has query kind")
-                .0
-                .to_owned(),
-            endpoint
-                .resolved_selector()
-                .as_query()
-                .expect("query selector has query kind")
-                .1
-                .clone(),
-            endpoint.resolved_selector().origin.clone(),
-        )
-    }
+    let (schema, query) = endpoint
+        .resolved_selector()
+        .as_query()
+        .expect("selectors are RQL queries");
+    ResolvedPolicySelector::try_new_with_locators(
+        path,
+        *schema,
+        query.clone(),
+        endpoint.resolved_selector().origin.clone(),
+        endpoint.resolved_selector().resolved_locators.clone(),
+    )
     .map_err(Into::into)
 }
 

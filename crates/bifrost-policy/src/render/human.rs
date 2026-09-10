@@ -949,9 +949,6 @@ fn endpoint_schema_resolutions(
 ) -> Vec<SchemaVersionResolution> {
     match schemas {
         ResolvedEndpointSelectorSchemas::Query(resolution) => vec![*resolution],
-        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-            bindings.iter().map(|binding| binding.resolution).collect()
-        }
     }
 }
 
@@ -1065,24 +1062,6 @@ fn write_endpoint_dependency<W: Write>(
             .map_err(map_io_error)?;
             write_schema_resolution_value(output, *resolution)?;
             writeln!(output).map_err(map_io_error)?;
-        }
-        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-            writeln!(
-                output,
-                "    selector {}: row plan",
-                escape_terminal_text(endpoint.selector_path().as_str()),
-            )
-            .map_err(map_io_error)?;
-            for binding in bindings {
-                write!(
-                    output,
-                    "      binding {}: ",
-                    escape_terminal_text(binding.path.as_str()),
-                )
-                .map_err(map_io_error)?;
-                write_schema_resolution_value(output, binding.resolution)?;
-                writeln!(output).map_err(map_io_error)?;
-            }
         }
     }
     writeln!(output, "    semantic hash: {}", endpoint.semantic_hash()).map_err(map_io_error)?;
@@ -1286,18 +1265,6 @@ fn write_manifest_entry<W: Write>(
             write!(output, "      selector schema: ").map_err(map_io_error)?;
             write_schema_resolution_value(output, *resolution)?;
             writeln!(output).map_err(map_io_error)?;
-        }
-        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
-            for binding in bindings {
-                write!(
-                    output,
-                    "      selector binding {}: ",
-                    escape_terminal_text(binding.path.as_str()),
-                )
-                .map_err(map_io_error)?;
-                write_schema_resolution_value(output, binding.resolution)?;
-                writeln!(output).map_err(map_io_error)?;
-            }
         }
     }
     writeln!(output, "      semantic hash: {}", entry.semantic_hash).map_err(map_io_error)?;
@@ -2605,12 +2572,28 @@ fn write_optional_stable_identity<W: Write>(
     };
     write!(
         output,
-        "{}:{}:{}:{}",
+        "{}:{}:",
         escape_terminal_text(identity.namespace()),
         escape_terminal_text(identity.path().as_str()),
-        identity.derivation().as_str(),
-        escape_terminal_text(identity.semantic_key()),
     )
+    .map_err(map_io_error)?;
+    if let Some(id) = identity.declaration_id() {
+        write!(output, "{}", escape_terminal_text(id))
+    } else {
+        write!(
+            output,
+            "{}:{}",
+            identity
+                .derivation()
+                .expect("a derived stable identity has a derivation")
+                .as_str(),
+            escape_terminal_text(
+                identity
+                    .semantic_key()
+                    .expect("a derived stable identity has a semantic key")
+            ),
+        )
+    }
     .map_err(map_io_error)
 }
 
@@ -3376,6 +3359,7 @@ const fn semantic_event(value: PolicySemanticEvent) -> &'static str {
         PolicySemanticEvent::ExceptionalProcedureExit { .. } => {
             "exceptional_procedure_exit/analysis_root"
         }
+        PolicySemanticEvent::SuspensionBoundary { .. } => "suspension_boundary/analysis_root",
     }
 }
 

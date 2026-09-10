@@ -99,6 +99,8 @@ pub struct CompiledShard {
     pub(crate) runtime_values: Option<RuntimeValuesPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) collection_flows: Option<CollectionFlowsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deferred_yields: Option<DeferredYieldsPayload>,
     /// The pack-level native C/C++ evidence is repeated in each shard wire
     /// envelope so a shard remains self-describing after extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +125,11 @@ impl CompiledShard {
                 self.collection_flows
                     .as_ref()
                     .map_or(0, CollectionFlowsPayload::record_count),
+            )
+            .saturating_add(
+                self.deferred_yields
+                    .as_ref()
+                    .map_or(0, DeferredYieldsPayload::record_count),
             )
     }
 
@@ -164,6 +171,10 @@ impl CompiledShard {
 
     pub fn collection_flows(&self) -> Option<&CollectionFlowsPayload> {
         self.collection_flows.as_ref()
+    }
+
+    pub fn deferred_yields(&self) -> Option<&DeferredYieldsPayload> {
+        self.deferred_yields.as_ref()
     }
 }
 
@@ -686,6 +697,8 @@ struct WireCompiledShard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    deferred_yields: Option<DeferredYieldsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cpp_portability: Option<CppPortabilityEvidence>,
     payload: CompiledPayload,
 }
@@ -1068,6 +1081,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         safety: wire.safety,
         runtime_values: wire.runtime_values,
         collection_flows: wire.collection_flows,
+        deferred_yields: wire.deferred_yields,
         cpp_portability: wire.cpp_portability,
         payload: wire.payload,
     }
@@ -1231,6 +1245,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         #[serde(skip_serializing_if = "Option::is_none")]
         collection_flows: &'a Option<CollectionFlowsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        deferred_yields: &'a Option<DeferredYieldsPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         payload: &'a CompiledPayload,
     }
@@ -1246,6 +1262,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         safety: &shard.safety,
         runtime_values: &shard.runtime_values,
         collection_flows: &shard.collection_flows,
+        deferred_yields: &shard.deferred_yields,
         cpp_portability: &shard.cpp_portability,
         payload: &shard.payload,
     })?;
@@ -1546,6 +1563,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
             payload: authored_payload_from_compiled(&shard.payload),
             runtime_values: shard.runtime_values.clone(),
             collection_flows: shard.collection_flows.clone(),
+            deferred_yields: shard.deferred_yields.clone(),
         }],
     }
 }

@@ -285,6 +285,7 @@ impl EnvironmentTraversalCache {
                         language.config_label(),
                         axis.label()
                     ),
+                exhausted_roots: Vec::new(),
                 });
                 continue;
             }
@@ -306,6 +307,7 @@ impl EnvironmentTraversalCache {
                         .join(", "),
                     axis.label()
                 ),
+            exhausted_roots: Vec::new(),
             });
         }
     }
@@ -337,6 +339,7 @@ impl EnvironmentTraversalCache {
                 language.config_label(),
                 trace.completeness.label()
             ),
+        exhausted_roots: Vec::new(),
         });
     }
 }

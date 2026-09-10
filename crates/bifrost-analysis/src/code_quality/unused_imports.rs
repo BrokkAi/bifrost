@@ -56,6 +56,7 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range, RustOverlayCrates
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_rust::syntax::outer_attributes;
 use tree_sitter::Node;
 
 /// Whether this derivation reports findings for a language, and why not when
@@ -555,17 +556,12 @@ fn refine_import_certainties(
 fn declaration_rules_out_ambient_use(language: Language, node: Node<'_>) -> bool {
     match language {
         Language::Rust => {
-            // Attributes are preceding siblings in tree-sitter-rust. A
+            // `outer_attributes` reads the grammar's grouped layout only. A
             // procedural macro declaration looks like a function, and an
             // attribute macro can transform the declaration that follows it.
             // Neither is a source-backed nonambient proof without expansion.
-            let mut previous = node.prev_named_sibling();
-            while let Some(sibling) = previous {
-                match sibling.kind() {
-                    "attribute_item" => return false,
-                    "line_comment" | "block_comment" => previous = sibling.prev_named_sibling(),
-                    _ => break,
-                }
+            if outer_attributes(node).next().is_some() {
+                return false;
             }
             matches!(
                 node.kind(),
@@ -1013,6 +1009,40 @@ mod tests {
                     )
                 ),
             ],
+        );
+    }
+
+    /// Grammar 0.24.3 nests item attributes in a `declaration_with_attribute`
+    /// wrapper. An attribute macro can turn an apparent concrete struct into
+    /// arbitrary syntax, so the same attribute must preserve ambient-use doubt
+    /// in the new layout that a preceding-sibling attribute preserved before.
+    #[test]
+    fn rust_grouped_outer_attributes_keep_a_resolved_struct_ambient() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", "mod definitions; mod consumer;\n")
+            .file(
+                "src/definitions.rs",
+                "#[cfg_attr(unix, derive(Debug))]\npub struct Widget;\n",
+            )
+            .file(
+                "src/consumer.rs",
+                "use crate::definitions::Widget as Unused;\nfn run() { crate::definitions::Widget; }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result =
+            unused_imports_for_file(workspace.analyzer(), &project.file("src/consumer.rs"));
+        assert!(result.completeness.is_complete(), "{result:?}");
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .map(|finding| (finding.local_name.as_str(), finding.certainty))
+                .collect::<Vec<_>>(),
+            [(
+                "Unused",
+                UnusedImportCertainty::AmbientUsePossible(AmbientImportUse::RustTraitMethodScope)
+            )]
         );
     }
 

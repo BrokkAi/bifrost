@@ -15,5 +15,11 @@
 ; Semicolons are comments only after whitespace, never inside a string.
 (call :callee (name "semi;colon")) ; trailing comment
 
+; Endpoint call-binding selectors are ordinary RQL pipeline wrappers.
+(call-argument :formal-name "sql"
+  (resolved-call :resolves-to member.statement.execute :proof exact
+    :receiver-type (assignable-to "java.sql.Statement")
+    (call-bindings (call-shape (call :callee "execute")))))
+
 ; Unsupported values and unknown forms must remain safely tokenizable and plain.
 (custom_identifier :unexpected true false null 7

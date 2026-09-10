@@ -38,7 +38,7 @@ pub fn normalize_tool_arguments(
         "rename_symbol" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
         "get_file_contents" => normalize_get_file_contents_paths(&mut arguments, workspace_root)?,
         "query_code" => {
-            normalize_string_array_field(&mut arguments, "where", workspace_root)?;
+            normalize_query_path_scopes(&mut arguments, workspace_root)?;
             normalize_workspace_file_field(&mut arguments, "query_file", workspace_root)?;
         }
         "search_file_contents" => {
@@ -469,6 +469,37 @@ fn normalize_string_array_field(
     })
 }
 
+fn normalize_query_path_scopes(arguments: &mut Value, workspace_root: &Path) -> Result<(), String> {
+    let mut plans = vec![arguments];
+    while let Some(plan) = plans.pop() {
+        if let Some(scope) = plan.get_mut("where").and_then(Value::as_array_mut) {
+            for entry in scope {
+                let mut globs = match entry {
+                    Value::Array(group) => group.iter_mut(),
+                    value => std::slice::from_mut(value).iter_mut(),
+                };
+                for glob in &mut globs {
+                    if let Some(raw) = glob.as_str()
+                        && let Some(normalized) = normalize_mcp_path_argument(raw, workspace_root)?
+                    {
+                        *glob = Value::String(normalized);
+                    }
+                }
+            }
+        }
+        if let Some(object) = plan.as_object_mut() {
+            for (field, value) in object {
+                if matches!(field.as_str(), "union" | "intersect" | "except")
+                    && let Some(branches) = value.as_array_mut()
+                {
+                    plans.extend(branches);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_string_array_field_with(
     arguments: &mut Value,
     field: &str,
@@ -819,6 +850,27 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["where"][0], "src/**/*.py");
+    }
+
+    #[test]
+    fn normalizes_conjunctive_query_path_groups_without_flattening() {
+        let root = TempDir::new().expect("temp dir");
+        let absolute = root
+            .path()
+            .join("src")
+            .join("**")
+            .to_string_lossy()
+            .to_string();
+        let normalized = normalize_tool_arguments(
+            "query_code",
+            json!({"match": {"kind": "call"}, "where": [[absolute], ["**/*.py", "**/*.rb"]]}),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            normalized["where"],
+            json!([["src/**"], ["**/*.py", "**/*.rb"]])
+        );
     }
 
     #[test]

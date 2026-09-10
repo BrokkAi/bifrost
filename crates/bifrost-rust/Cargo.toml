@@ -24,7 +24,7 @@ regex = "1.12.2"
 semver = "1.0.28"
 toml = "0.8.23"
 tree-sitter = "0.25.10"
-tree-sitter-rust = "0.24.0"
+tree-sitter-rust = { package = "brokk-tree-sitter-rust", version = "=0.24.3" }
 
 [features]
 default = []

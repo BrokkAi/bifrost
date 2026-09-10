@@ -27,8 +27,8 @@ use crate::dataflow::{
 };
 
 use super::{
-    BackwardValueFlowResult, ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPlan,
-    ValueFlowSinkId, ValueFlowSolveError, ValueFlowSourceId, ValueFlowSummaryResult,
+    BackwardValueFlowResult, ValueFlowMayStatus, ValueFlowPlan, ValueFlowSinkId,
+    ValueFlowSolveError, ValueFlowSourceId, ValueFlowSummaryResult,
     backward_client::BackwardValueFlowSolveError,
 };
 
@@ -120,7 +120,6 @@ pub struct ValueFlowCanonicalMeeting {
     sink: ValueFlowSinkId,
     path_qualities: PathQualityFrontier,
     may: ValueFlowMayStatus,
-    must: ValueFlowMustStatus,
     uncertain: bool,
 }
 
@@ -139,10 +138,6 @@ impl ValueFlowCanonicalMeeting {
 
     pub const fn may_status(&self) -> ValueFlowMayStatus {
         self.may
-    }
-
-    pub const fn must_status(&self) -> ValueFlowMustStatus {
-        self.must
     }
 
     pub const fn is_uncertain(&self) -> bool {
@@ -447,7 +442,6 @@ fn canonical_summary_findings(
             sink: meeting.sink(),
             path_qualities: meeting.path_qualities(),
             may: meeting.may_status(),
-            must: meeting.must_status(),
             uncertain: meeting.is_uncertain(),
         })
         .collect::<Vec<_>>();
@@ -468,7 +462,6 @@ fn canonical_backward_findings(
             } else {
                 ValueFlowMayStatus::Proven
             },
-            must: ValueFlowMustStatus::NotEstablished,
             uncertain: meeting.is_uncertain(),
         })
         .collect::<Vec<_>>();

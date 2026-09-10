@@ -55,9 +55,8 @@ export interface RqlDeclarationResult extends RqlQueryResultBase {
 
 export interface RqlSemanticEvidence {
   proof: "proven" | "unproven";
-  proof_reason?: string;
   completeness: "complete" | "partial";
-  completeness_reason?: string;
+  reason?: string;
 }
 
 export type RqlProgramPointBoundary = "entry" | "normal_exit" | "exceptional_exit";
@@ -180,7 +179,7 @@ export interface RqlTypestateWitnessResult extends RqlQueryResultBase {
   observed_state?: string;
   language: string;
   range: RqlResultRange;
-  quality: RqlSemanticEvidence;
+  evidence: RqlSemanticEvidence;
   uncertainty?: RqlTypestateUncertainty[];
   abstained?: boolean;
   steps: RqlTypestateWitnessStep[];
@@ -193,9 +192,18 @@ export interface RqlTypestateWitnessResult extends RqlQueryResultBase {
 
 export type RqlFlowReachability = "reached" | "not_reached" | "inconclusive";
 export type RqlFlowCertainty = "exact" | "may";
-export type RqlFlowCompletion =
-  "complete" | "incomplete" | "budget_exhausted" | "cancelled" | "unsupported";
-
+export type RqlFlowStatus =
+  | "complete"
+  | "partial"
+  | "ambiguous"
+  | "unknown"
+  | "unproven"
+  | "unsupported"
+  | "semantic_budget_exhausted"
+  | "solver_budget_exhausted"
+  | "semantic_cancelled"
+  | "solver_cancelled"
+  | "query_cancelled";
 export interface RqlFlowEvent {
   id: string;
   site: RqlFlowSymbolSite;
@@ -298,11 +306,9 @@ export interface RqlFlowEndpointResult extends RqlQueryResultBase {
   sink: RqlFlowEvent;
   reachability: RqlFlowReachability;
   certainty?: RqlFlowCertainty;
-  must: "not_established";
   ambiguous?: boolean;
-  completion: RqlFlowCompletion;
-  semantic_status: string;
-  solver_termination: "fixed_point" | "budget_exhausted" | "cancelled";
+  status: RqlFlowStatus;
+  reason?: string;
   language: string;
   range: RqlResultRange;
   path_qualities?: RqlSemanticEvidence[];
@@ -327,7 +333,7 @@ export interface RqlFlowWitnessResult extends RqlQueryResultBase {
   witness_index: number;
   language: string;
   range: RqlResultRange;
-  quality: RqlSemanticEvidence;
+  evidence: RqlSemanticEvidence;
   steps: RqlFlowWitnessStep[];
   retained_bytes: number;
   truncated?: boolean;
@@ -350,7 +356,7 @@ export interface RqlTaintWitness {
   path: string;
   language: string;
   range: RqlResultRange;
-  quality: RqlSemanticEvidence;
+  evidence: RqlSemanticEvidence;
   steps: RqlFlowWitnessStep[];
   retained_bytes: number;
   truncated?: boolean;
@@ -1075,19 +1081,19 @@ function candidateName(candidate: RqlCandidateRef): string {
 export function queryResultDescription(result: RqlQueryResultItem): string {
   switch (result.result_type) {
     case "procedure":
-      return `${result.evidence.proof}/${result.evidence.completeness} · ${result.range.start_line}:${result.range.start_column}`;
+      return `${semanticEvidenceLabel(result.evidence)} · ${result.range.start_line}:${result.range.start_column}`;
     case "program_point":
-      return `${result.event_count} events · ${result.evidence.proof}/${result.evidence.completeness}`;
+      return `${result.event_count} events · ${semanticEvidenceLabel(result.evidence)}`;
     case "control_edge":
-      return `${result.evidence.proof}/${result.evidence.completeness} · ${result.range.start_line}:${result.range.start_column}`;
+      return `${semanticEvidenceLabel(result.evidence)} · ${result.range.start_line}:${result.range.start_column}`;
     case "typestate_finding":
       return `${result.certainty} · ${result.protocol_ref} · ${result.range.start_line}:${result.range.start_column}`;
     case "typestate_witness":
-      return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
+      return `${semanticEvidenceLabel(result.evidence)} · ${result.truncated ? "truncated" : "complete"}`;
     case "flow_endpoint":
-      return `${result.certainty ?? "n/a"} · ${result.completion} · ${result.plan_ref}`;
+      return `${result.certainty ?? "n/a"} · ${result.status} · ${result.plan_ref}`;
     case "flow_witness":
-      return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
+      return `${semanticEvidenceLabel(result.evidence)} · ${result.truncated ? "truncated" : "complete"}`;
     case "taint_finding":
       return `${semanticEvidenceLabel(result.evidence)} · ${result.origins.length} origin${result.origins.length === 1 ? "" : "s"}`;
     case "file":
@@ -1186,7 +1192,7 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
       return (
         `**Typestate witness ${result.witness_index + 1}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
         `\n\nProtocol: \`${result.protocol_ref}\` (${result.protocol_hash.slice(0, 12)})` +
-        `\n\nEvidence: ${semanticEvidenceLabel(result.quality)}` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}` +
         `\n\nSteps: ${result.steps.length}; retained bytes: ${result.retained_bytes}` +
         (result.truncated
           ? `\n\nTruncated; at least ${result.omitted_steps_lower_bound} step(s) omitted.`
@@ -1200,14 +1206,15 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         `**Value-flow endpoint (${result.reachability})** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
         `\n\nPlan: \`${result.plan_ref}\`` +
         `\n\nCertainty: ${result.certainty ?? "not applicable"}; ambiguous: ${result.ambiguous ? "yes" : "no"}` +
-        `\n\nCompletion: ${result.completion}; must: ${result.must}` +
+        `\n\nStatus: ${result.status}` +
+        (result.reason ? `\n\nReason: ${result.reason}` : "") +
         `\n\nWitnesses: ${result.retained_witnesses} retained, ${result.omitted_witnesses} omitted`
       );
     case "flow_witness":
       return (
         `**Value-flow witness ${result.witness_index + 1}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
         `\n\nPlan: \`${result.plan_ref}\`` +
-        `\n\nEvidence: ${semanticEvidenceLabel(result.quality)}` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}` +
         `\n\nSteps: ${result.steps.length}; retained bytes: ${result.retained_bytes}` +
         (result.truncated
           ? `\n\nTruncated; at least ${result.omitted_steps_lower_bound} step(s) omitted.`
@@ -1589,11 +1596,8 @@ function flowFactLabel(fact: RqlFlowFactSymbol): string {
 }
 
 function semanticEvidenceLabel(evidence: RqlSemanticEvidence): string {
-  const status = `${evidence.proof}/${evidence.completeness}`;
-  const reasons = [evidence.proof_reason, evidence.completeness_reason].filter(
-    (reason): reason is string => reason !== undefined
-  );
-  return reasons.length > 0 ? `${status} — ${reasons.join("; ")}` : status;
+  const axes = `proof=${evidence.proof}; completeness=${evidence.completeness}`;
+  return evidence.reason ? `${axes}: ${evidence.reason}` : axes;
 }
 
 function programPointRefLabel(point: RqlProgramPointRef): string {

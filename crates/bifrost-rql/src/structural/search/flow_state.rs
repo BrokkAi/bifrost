@@ -342,6 +342,7 @@ impl FlowStateTraversalCache {
                     "{subject} has an incomplete flow-state derivation in generation {generation} ({detail}); uncovered axes: [{}]",
                     uncovered.join(", ")
                 ),
+            exhausted_roots: Vec::new(),
             });
         }
     }

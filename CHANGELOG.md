@@ -32,8 +32,47 @@ projection and its commit history does not contain every source commit.
 - JavaScript and TypeScript value flow lowers exact declaration-style
   `Object.entries` loops into allocation-rooted member loads and binder flow.
   Shadowed, escaped, dynamic, and unmatched forms stay explicitly incomplete.
+- RQLP analyses can share explicit language and path constraints and an independent
+  RQL schema pin across their selectors. Hoisting equivalent wrappers preserves
+  canonical queries and policy hashes; nested scopes conjoin instead of overriding.
 
 ### Changed
+
+- RQL semantic rows now publish one `evidence` object with typed `proof`,
+  `completeness`, and an optional `reason`; the composite quality label and
+  separate proof/completeness reason fields are removed. Value-flow endpoints
+  now publish one typed `status` plus an optional `reason` instead of
+  `semantic_status`, `completion`, `solver_termination`, and the placeholder
+  `must` field. Witness rows likewise use `evidence` instead of `quality`.
+  Cached policy-unit products now retain the same evidence object as live CLI,
+  MCP, and LSP rows, intentionally rotating the policy substrate epoch and its
+  derived opaque unit and evaluation-row hashes. Declaration IDs, site IDs,
+  finding IDs, canonical policy semantic hashes, and RQL authoring syntax are
+  unchanged.
+
+- RQLP endpoint selectors are now ordinary RQL pipelines. New `resolved-call`
+  and `call-argument` steps preserve exact callable and actual-to-formal
+  guarantees without the removed `row-selector` sublanguage. A
+  `resolved-call` receiver constraint accepts either one exact owner or an
+  `(assignable-to ROOT)` workspace family proven by the analyzer's typed
+  hierarchy. The
+  `bifrost.security.java.servlet-parameter-to-jdbc` semantic hash rotates from
+  `3a3c7a9cb58701596dc1cb9d320ce4e00e679d324cd71e2c11c96657bc26bd76` to
+  `760d433a7d90e481dbf4636dd82abcd2f22c5291934327133f156a8515fff7df`.
+- RQL declaration-valued row fields now share the analyzer's
+  `decl:v1:<hex>` identity, and full declaration, `procedure_effect`, and
+  `callable_signature` rows publish a declaration `site_id` formed from that
+  ID plus the exact byte span. Declaration-backed policy owners now serialize
+  `id` without a derivation; canonical-AST and semantic-wire owners retain
+  `derivation` and `semantic_key`. This intentionally rotates declaration,
+  callable-signature, signature-parameter, decorator-owner, callable-selection,
+  receiver-evidence, procedure-effect, policy finding, vulnerability, baseline,
+  and suppression opaque IDs. No canonical policy semantic hashes change.
+
+- RQL text is the single query authoring syntax. JSON-shaped `.rql` buffers
+  and LSP or REPL query text are no longer accepted. Generated canonical JSON remains
+  supported by MCP and saved `.json` query consumers; canonical query and
+  policy hashes, row fields, and opaque identities are unchanged.
 
 - Semantic budget failures now report the public lanes `source`, `rows`,
   `retained_bytes`, `steps`, and `files`. Dispatch rows, diagnostics, semantic-IR

@@ -3501,7 +3501,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         let workspace = self.selectors.workspace();
         let oracle = WorkspaceSemanticOracle::with_dispatch_hints(
             workspace,
-            self.active_semantic_model_snapshot.as_deref(),
+            self.active_semantic_model_snapshot.clone(),
             DispatchHints::empty(),
         );
         let outcome = {

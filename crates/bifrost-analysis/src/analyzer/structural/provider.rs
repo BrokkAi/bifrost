@@ -424,6 +424,20 @@ impl StructuralFactsCache {
     }
 }
 
+impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
+    /// Whether a structural question about `file` is this provider's to
+    /// answer. Every caller asks all providers and takes the first answer, so
+    /// a provider that read a foreign file would parse it with the wrong
+    /// grammar and publish facts for a file it never indexed: a Python
+    /// provider handed bcc's 4.8 MB `vmlinux.h` spent minutes extracting
+    /// facts from a flat error tree on every definition lookup. The owner is
+    /// decided the way indexing decides it (`adapter_owns_file`), including
+    /// include-claimed files (#1837).
+    fn owns_structural_file(&self, file: &ProjectFile) -> bool {
+        self.adapter_owns_file(file, &self.live_path_snapshot())
+    }
+}
+
 impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
     fn structural_language(&self) -> Language {
         self.adapter().language()
@@ -464,6 +478,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
     }
 
     fn structural_source(&self, file: &ProjectFile) -> Option<String> {
+        if !self.owns_structural_file(file) {
+            return None;
+        }
         self.file_source(file)
     }
 
@@ -473,6 +490,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         max_source_bytes: usize,
         cancellation: Option<&CancellationToken>,
     ) -> StructuralSourceLimitedOutcome {
+        if !self.owns_structural_file(file) {
+            return StructuralSourceLimitedOutcome::Unavailable;
+        }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return StructuralSourceLimitedOutcome::Cancelled;
         }
@@ -498,6 +518,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         max_source_bytes: usize,
         cancellation: Option<&CancellationToken>,
     ) -> StructuralSyntaxLimitedOutcome {
+        if !self.owns_structural_file(file) {
+            return StructuralSyntaxLimitedOutcome::Unavailable;
+        }
         let scope = crate::analyzer::AnalyzerQueryScope::new(self);
         match self.prepared_syntax_limited_cancellable(
             scope.token(),
@@ -531,6 +554,9 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         let Some(spec) = self.adapter().structural_spec() else {
             return (None, StructuralFactsCacheOutcome::Unavailable);
         };
+        if !self.owns_structural_file(file) {
+            return (None, StructuralFactsCacheOutcome::Unavailable);
+        }
         // Ask the memo for this file's content before reading that content.
         // The workspace's reusable identity for a file is exactly the key its
         // facts are memoized under, and answering it costs a map lookup (one
@@ -860,6 +886,44 @@ mod tests {
         assert_eq!(outcome, StructuralFactsCacheOutcome::Unavailable);
         assert_eq!(unavailable.hydration_count(), 0);
         assert_eq!(unavailable.extraction_count(), 1);
+    }
+
+    #[test]
+    fn a_provider_declines_a_file_of_another_language() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let own = ProjectFile::new(root.clone(), "app.ts");
+        own.write("export function demo(): void {}\n")
+            .expect("write source");
+        // A C header this grammar would mis-parse into a flat error tree.
+        // bcc's 4.8 MB vmlinux.h cost a Python provider minutes per
+        // definition lookup that way, and the facts it published were for a
+        // file it never indexed.
+        let foreign = ProjectFile::new(root.clone(), "vmlinux.h");
+        foreign
+            .write("struct s { int a; };\nenum e { E_A = 0, E_B = 1 };\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let provider = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .next()
+            .expect("TypeScript structural provider");
+        let before = provider.structural_extraction_count();
+
+        assert!(provider.structural_facts(&own).is_some());
+        assert!(provider.structural_facts(&foreign).is_none());
+        assert!(provider.structural_source(&foreign).is_none());
+        assert!(matches!(
+            provider.structural_source_limited(&foreign, usize::MAX, None),
+            StructuralSourceLimitedOutcome::Unavailable
+        ));
+        assert!(matches!(
+            provider.structural_syntax_limited(&foreign, usize::MAX, None),
+            StructuralSyntaxLimitedOutcome::Unavailable
+        ));
+        assert_eq!(provider.structural_extraction_count(), before + 1);
     }
 
     #[test]

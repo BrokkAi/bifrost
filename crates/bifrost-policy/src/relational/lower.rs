@@ -16,9 +16,8 @@ use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 
 use crate::definition::{
     PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBinding,
-    RowBindingName, RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowFilterEvidence,
-    RowJoin, RowJoinKind, RowLiteral, RowPredicate, RowPredicateOp, RowPredicateOperand,
-    RowProjection, RowSelectorPlan,
+    RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowJoin, RowJoinKind, RowPredicate,
+    RowPredicateOp, RowPredicateOperand, RowProjection,
 };
 
 use super::ir::{
@@ -41,24 +40,6 @@ struct RelationSlot {
     name: String,
     id: IrRelationId,
     domain: Option<DetailedCodeQueryDomain>,
-}
-
-/// A row-selector plan lowered onto the same typed IR as relational assertions.
-///
-/// `output` is the filtered relation the endpoint consumes. `upstream` is the
-/// source or expansion relation behind it before any derivation ran. Keeping
-/// both identities is what lets endpoint selection retain incomplete producer
-/// evidence even when an authored filter removes the row that carries it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoweredRowSelector {
-    pub plan: RelationalPlanIr,
-    pub relation: IrRelationId,
-    pub output_relation: IrRelationId,
-    pub upstream: IrRelationId,
-    pub output_binding: RowBindingName,
-    pub upstream_binding: RowBindingName,
-    pub declared_call_binding: Option<RowBindingName>,
-    pub declared_call_model_id: Option<String>,
 }
 
 fn lower_bindings_and_derivations(
@@ -93,9 +74,6 @@ fn lower_bindings_and_derivations(
             }
             RowBindingSource::Query(PolicySelector::File { .. }) => {
                 return Err(RelationalAssertionPlanError::DeferredSelectorDomain { binding: name });
-            }
-            RowBindingSource::Query(PolicySelector::Rows { .. }) => {
-                return Err(RelationalAssertionPlanError::NestedRowSelector { binding: name });
             }
             RowBindingSource::Expansion { from, step } => {
                 let Some((source_id, source_domain)) = slots
@@ -154,87 +132,6 @@ fn lower_bindings_and_derivations(
     }
 
     Ok((relations, slots))
-}
-
-/// Lower one endpoint row selector onto the shared typed relational IR.
-pub fn lower_row_selector_plan(
-    selector: &RowSelectorPlan,
-) -> Result<LoweredRowSelector, RelationalAssertionPlanError> {
-    let declared_call = selector.derivations.iter().find_map(|derivation| {
-        let RowDerivation::Filter(filter) = derivation else {
-            return None;
-        };
-        if !matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall)) {
-            return None;
-        }
-        let model_id = filter.predicates.iter().find_map(|predicate| {
-            if !matches!(
-                predicate.field.field.as_str(),
-                "model_callable_id" | "model_id"
-            ) || !matches!(predicate.op, RowPredicateOp::Eq)
-            {
-                return None;
-            }
-            let RowPredicateOperand::Literal(RowLiteral::String(model_id)) = &predicate.operand
-            else {
-                return None;
-            };
-            Some(model_id.clone())
-        });
-        Some((filter.over.clone(), model_id))
-    });
-    let (mut relations, slots) =
-        lower_bindings_and_derivations(&selector.bindings, &selector.derivations)?;
-    let Some(output_relation) = slots
-        .iter()
-        .find(|slot| slot.name == selector.output.as_str())
-        .map(|slot| slot.id)
-    else {
-        return Err(RelationalAssertionPlanError::UnknownBinding {
-            name: selector.output.as_str().to_string(),
-        });
-    };
-    let mut upstream = output_relation;
-    loop {
-        upstream = match &relations[upstream.index()].op {
-            IrRelationOp::Filter { input, .. } | IrRelationOp::Project { input, .. } => *input,
-            IrRelationOp::Source { .. } | IrRelationOp::Expand { .. } => break,
-            IrRelationOp::Join { .. } | IrRelationOp::Group { .. } => {
-                unreachable!("row selectors cannot author joins or groups")
-            }
-        };
-    }
-    let upstream_binding = match &relations[upstream.index()].op {
-        IrRelationOp::Source { binding, .. } | IrRelationOp::Expand { binding, .. } => {
-            binding.clone()
-        }
-        IrRelationOp::Filter { .. }
-        | IrRelationOp::Project { .. }
-        | IrRelationOp::Join { .. }
-        | IrRelationOp::Group { .. } => {
-            unreachable!("upstream row-selector relation is a source or expansion")
-        }
-    };
-    let (relation, schema) = lower_joins(&mut relations, &slots, &selector.joins)?;
-    if !schema_binds(&schema, selector.output.as_str()) {
-        return Err(RelationalAssertionPlanError::DisconnectedBinding {
-            binding: selector.output.as_str().to_string(),
-        });
-    }
-    Ok(LoweredRowSelector {
-        plan: RelationalPlanIr {
-            relations,
-            assertions: Vec::new(),
-            limits: IrLimits::default(),
-        },
-        relation,
-        output_relation,
-        upstream,
-        output_binding: selector.output.clone(),
-        upstream_binding,
-        declared_call_binding: declared_call.as_ref().map(|(binding, _)| binding.clone()),
-        declared_call_model_id: declared_call.and_then(|(_, model_id)| model_id),
-    })
 }
 
 fn lower_joins(
@@ -610,6 +507,12 @@ fn lower_predicate(
             column: left,
             values: values.clone(),
         }),
+        (RowPredicateOp::In, RowPredicateOperand::ResolvedIdentitySet(identities)) => {
+            Ok(IrPredicate::ResolvedIdentitySet {
+                column: left,
+                identities: identities.clone(),
+            })
+        }
         (op, RowPredicateOperand::Literal(value)) => Ok(IrPredicate::Compare {
             left,
             op: compare_op(op, &predicate.field)?,

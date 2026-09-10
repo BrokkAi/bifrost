@@ -266,6 +266,7 @@ pub(super) fn map_call_relation_diagnostic(
         branch: Vec::new(),
         language,
         message: diagnostic.message,
+        exhausted_roots: Vec::new(),
     }
 }
 
@@ -481,6 +482,7 @@ pub(super) fn outbound_reference_expansions(
                 if omitted == 1 { "" } else { "s" },
                 declaration.unit.fq_name()
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     sort_reference_sites(&mut sites);
@@ -742,6 +744,7 @@ pub(super) fn append_semantic_omission_diagnostics(
                 step.label(),
                 if count == 1 { "" } else { "s" }
             ),
+            exhausted_roots: Vec::new(),
         });
     }
 }

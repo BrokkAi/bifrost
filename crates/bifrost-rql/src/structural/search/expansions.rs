@@ -62,6 +62,7 @@ fn finish_call_declaration_expansions(
             if omitted == 1 { "" } else { "s" },
             declaration.unit.fq_name()
         ),
+    exhausted_roots: Vec::new(),
     });
     // The explicit proven-subset contract declines only the exhaustive
     // negative claim caused by an unrenderable related declaration. It never
@@ -395,6 +396,7 @@ pub(super) fn inbound_reference_expansions(
                     "references_of source-byte budget truncated candidate files for {}",
                     declaration.unit.fq_name()
                 ),
+                exhausted_roots: Vec::new(),
             });
         } else if report && query.candidate_files_truncated {
             exhausted = true;
@@ -408,6 +410,7 @@ pub(super) fn inbound_reference_expansions(
                     "references_of candidate files were truncated for {}",
                     declaration.unit.fq_name()
                 ),
+                exhausted_roots: Vec::new(),
             });
         }
         match query.result {
@@ -454,6 +457,7 @@ pub(super) fn inbound_reference_expansions(
                                 "references_of omitted {omitted} unproven reference candidates for {}",
                                 declaration.unit.fq_name()
                             ),
+                        exhausted_roots: Vec::new(),
                         });
                     }
                 }
@@ -482,6 +486,7 @@ pub(super) fn inbound_reference_expansions(
                             "references_of emitted ambiguous candidates for {} as unproven",
                             declaration.unit.fq_name()
                         ),
+                        exhausted_roots: Vec::new(),
                     });
                 }
             }
@@ -511,6 +516,7 @@ pub(super) fn inbound_reference_expansions(
                             "references_of found {total_callsites} call sites for {}, exceeding limit {limit}",
                             declaration.unit.fq_name()
                         ),
+                    exhausted_roots: Vec::new(),
                     });
                 }
             }
@@ -528,6 +534,7 @@ pub(super) fn inbound_reference_expansions(
                             "references_of does not support {}: {reason}",
                             declaration.unit.fq_name()
                         ),
+                        exhausted_roots: Vec::new(),
                     });
                 }
             }
@@ -586,6 +593,7 @@ pub(super) fn inbound_reference_expansions(
                 },
                 declaration.unit.fq_name()
             ),
+        exhausted_roots: Vec::new(),
         });
     }
     sort_reference_sites(&mut sites);
@@ -704,6 +712,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
                 if ambiguous_sites == 1 { "" } else { "s" },
                 rel_path_string(file)
             ),
+            exhausted_roots: Vec::new(),
         });
     }
     if omitted > 0 {
@@ -717,6 +726,7 @@ pub(super) fn append_outbound_lookup_diagnostics(
                 if omitted == 1 { "" } else { "s" },
                 rel_path_string(file)
             ),
+        exhausted_roots: Vec::new(),
         });
     }
 }
@@ -744,6 +754,7 @@ pub(super) fn scan_outbound_reference_hits(
                 "uses could not inspect {} because its indexed source snapshot was unavailable",
                 rel_path_string(file)
             ),
+            exhausted_roots: Vec::new(),
         });
         return (Vec::new(), true);
     };
@@ -764,6 +775,7 @@ pub(super) fn scan_outbound_reference_hits(
             branch: Vec::new(),
             language: language.config_label(),
             message: format!("uses does not support parsing {}", rel_path_string(file)),
+            exhausted_roots: Vec::new(),
         });
         return (Vec::new(), false);
     };
@@ -813,6 +825,7 @@ pub(super) fn scan_outbound_reference_hits(
                     "uses returned a bounded partial scan of {} after reaching the structured reference-candidate limit of {candidate_limit}",
                     rel_path_string(file)
                 ),
+            exhausted_roots: Vec::new(),
             });
         }
     }
@@ -827,6 +840,7 @@ pub(super) fn scan_outbound_reference_hits(
                 "uses has no reference-candidate capacity for {}",
                 rel_path_string(file)
             ),
+            exhausted_roots: Vec::new(),
         });
     }
     let requests = ranges
@@ -895,6 +909,7 @@ pub(super) fn scan_outbound_reference_hits(
                     "uses retained a bounded positive reference sample for {} after the usage analyzer reached its candidate limit",
                     target.fq_name()
                 ),
+            exhausted_roots: Vec::new(),
             });
         }
         for hit in target_hits {

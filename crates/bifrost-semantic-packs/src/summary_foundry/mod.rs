@@ -594,6 +594,7 @@ fn round_trip(
             payload: AuthoredPayload::ProcedureSummaries { summaries },
             runtime_values: None,
             collection_flows: None,
+            deferred_yields: None,
         }],
     };
     let source = serde_json::to_vec(&pack).expect("the authored pack is serializable");

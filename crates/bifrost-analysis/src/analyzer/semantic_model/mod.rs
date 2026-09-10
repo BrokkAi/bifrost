@@ -8,6 +8,7 @@ mod authoring;
 mod catalog;
 mod compiler;
 pub mod csmi;
+mod deferred_runtime;
 mod dependency;
 mod identity;
 mod model;
@@ -37,6 +38,7 @@ pub use artifact::{
 pub use authoring::*;
 pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
+pub use deferred_runtime::*;
 pub use dependency::*;
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use rusqlite::ffi::ErrorCode;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -121,6 +122,8 @@ const CLASS_SET_UNMODELED_GUARDS_SQL: &str =
     include_str!("../migrations/cache/0061-class-set-unmodeled-guards.sql");
 const CLASS_SET_CLASS_CREATION_REMAINDER_SQL: &str =
     include_str!("../migrations/cache/0062-class-set-class-creation-remainder.sql");
+const CURRENT_FRESH_SCHEMA_SQL: &str =
+    include_str!("../migrations/cache/0062-current-fresh-schema.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -358,6 +361,15 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
     }
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
+// SHA-256 of `schema_object_definitions` for the schema produced by every
+// migration above. A current store validates its actual schema against this
+// pinned identity without rebuilding all historical schemas in a second,
+// in-memory database on every process start. The regression test below derives
+// the value through SQLite and forces this constant to move with a migration.
+const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
+    0x7f, 0x9d, 0x32, 0xd3, 0x77, 0xac, 0x41, 0x15, 0x6a, 0x55, 0x08, 0x7f, 0x7c, 0x21, 0x3a, 0xda,
+    0xbe, 0x86, 0x45, 0x97, 0x44, 0x39, 0xfa, 0xd9, 0x5a, 0xe0, 0x80, 0xbd, 0x1c, 0xce, 0x4a, 0xbc,
+];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
 // Large repositories can therefore have several independent analyzer/semantic
@@ -535,7 +547,10 @@ fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
 /// bare `unable to open database file` (issue #1544).
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     disable_sqlite_memory_statistics();
-    validate_writable_cache_filesystem(db_path)?;
+    {
+        let _scope = crate::profiling::scope("cache_db.validate_filesystem");
+        validate_writable_cache_filesystem(db_path)?;
+    }
     open_unified_connection_unclassified(db_path).map_err(|error| {
         match cache_write_denial(db_path) {
             Some(denied) => cache_permission_denied_message(db_path, &denied),
@@ -657,6 +672,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
                     db_path.display()
                 )
             })?;
+        let _scope = crate::profiling::scope("cache_db.prepare_path");
         prepare_cache_db_path(db_path)?
     };
     ensure_safe_cache_path(&db_path)?;
@@ -667,25 +683,44 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
-    let startup_cleanup = disused_version_stores_on_startup(&db_path);
+    let startup_cleanup = {
+        let _scope = crate::profiling::scope("cache_db.disused_store_scan");
+        disused_version_stores_on_startup(&db_path)
+    };
     // An older store is optional input. When it cannot be carried forward the
     // operator needs to know -- a cold start on an indexed corpus is hours of
     // re-embedding -- but a neighbouring file this build cannot read must not
     // be what stops the workspace from opening at all.
-    if let Err(error) = import_newest_older_store(&db_path) {
+    let import_result = {
+        let _scope = crate::profiling::scope("cache_db.import_older_store");
+        import_newest_older_store(&db_path)
+    };
+    if let Err(error) = import_result {
         eprintln!("Bifrost cache upgrade skipped, starting a fresh store: {error}");
     }
-    let mut conn = Connection::open_with_flags(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    install_busy_timeout(&conn)?;
-    configure_connection_after_busy_timeout(&mut conn)?;
-    let initialized_before_open = unified_cache_initialized(&conn)?;
-    migrate(&mut conn)?;
+    let mut conn = {
+        let _scope = crate::profiling::scope("cache_db.sqlite_open");
+        Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?
+    };
+    {
+        let _scope = crate::profiling::scope("cache_db.configure_writer");
+        install_busy_timeout(&conn)?;
+        configure_connection_after_busy_timeout(&mut conn)?;
+    }
+    let initialized_before_open = {
+        let _scope = crate::profiling::scope("cache_db.check_initialized");
+        unified_cache_initialized(&conn)?
+    };
+    {
+        let _scope = crate::profiling::scope("cache_db.migrate");
+        migrate(&mut conn)?;
+    }
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
@@ -1937,10 +1972,19 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    migrate_with_sql(conn, &CACHE_MIGRATIONS)
+    migrate_with_sql_inner(conn, &CACHE_MIGRATIONS, Some(CURRENT_FRESH_SCHEMA_SQL))
 }
 
+#[cfg(test)]
 fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Result<()> {
+    migrate_with_sql_inner(conn, migrations, None)
+}
+
+fn migrate_with_sql_inner(
+    conn: &mut Connection,
+    migrations: &[CacheMigration],
+    current_fresh_schema: Option<&str>,
+) -> Result<()> {
     let user_version = cache_migration_version(conn)?;
     if current_schema_fast_path(migrations, user_version)
         && current_schema_claim_is_valid(conn, migrations, user_version)?
@@ -1953,7 +1997,7 @@ fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Res
     // changes when it detects that case; after toggling, the repair pass reacquires
     // the write lock and re-inspects before rebuilding and migrating atomically.
     if matches!(
-        migrate_with_sql_locked(conn, migrations, false)?,
+        migrate_with_sql_locked(conn, migrations, current_fresh_schema, false)?,
         LockedMigrationOutcome::Complete
     ) {
         return drain_free_pages(conn);
@@ -1961,7 +2005,7 @@ fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Res
 
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    let result = match migrate_with_sql_locked(conn, migrations, true) {
+    let result = match migrate_with_sql_locked(conn, migrations, current_fresh_schema, true) {
         Ok(LockedMigrationOutcome::Complete) => drain_free_pages(conn),
         Ok(LockedMigrationOutcome::RebuildRequired) => {
             Err("cache DB schema rebuild was not applied".to_string())
@@ -2072,6 +2116,7 @@ enum BaselinePreparation {
 fn migrate_with_sql_locked(
     conn: &mut Connection,
     migrations: &[CacheMigration],
+    current_fresh_schema: Option<&str>,
     rebuild_invalid_schema: bool,
 ) -> Result<LockedMigrationOutcome> {
     let tx = conn
@@ -2114,6 +2159,22 @@ fn migrate_with_sql_locked(
         user_version = 0;
     }
 
+    if user_version == 0
+        && let Some(fresh_schema) = current_fresh_schema
+        && user_schema_objects(&tx)?.is_empty()
+    {
+        tx.execute_batch(fresh_schema)
+            .map_err(|err| format!("cache DB current-schema creation error: {err}"))?;
+        tx.pragma_update(None, "user_version", newest_version)
+            .map_err(|err| {
+                format!("cache DB migration error setting version {newest_version}: {err}")
+            })?;
+        validate_foreign_keys(&tx)?;
+        tx.commit()
+            .map_err(|err| format!("cache DB migration error: {err}"))?;
+        return Ok(LockedMigrationOutcome::Complete);
+    }
+
     let user_version = match prepare_baseline_migration(&tx, user_version, rebuild_invalid_schema)?
     {
         BaselinePreparation::Ready(user_version) => user_version,
@@ -2127,13 +2188,18 @@ fn migrate_with_sql_locked(
         .filter(|migration| migration.version > user_version)
     {
         let version = migration.version;
-        tx.execute_batch(migration.sql)
-            .map_err(|err| format!("cache DB migration error applying version {version}: {err}"))?;
+        {
+            let _scope = crate::profiling::scope_with(|| format!("cache_db.migration.{version}"));
+            tx.execute_batch(migration.sql).map_err(|err| {
+                format!("cache DB migration error applying version {version}: {err}")
+            })?;
+        }
         tx.pragma_update(None, "user_version", version)
             .map_err(|err| format!("cache DB migration error setting version {version}: {err}"))?;
         migration_applied = true;
     }
     if migration_applied {
+        let _scope = crate::profiling::scope("cache_db.validate_foreign_keys");
         validate_foreign_keys(&tx)?;
     }
     tx.commit()
@@ -2278,6 +2344,18 @@ fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, S
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
+fn schema_object_definitions_sha256(conn: &Connection) -> Result<[u8; 32]> {
+    let definitions = schema_object_definitions(conn)?;
+    let mut hasher = Sha256::new();
+    for (object_type, name, sql) in definitions {
+        for field in [object_type, name, sql] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
 fn prepare_baseline_migration(
     tx: &Transaction<'_>,
     user_version: i64,
@@ -2328,7 +2406,7 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
 }
 
 fn current_schema_shape_is_valid(conn: &Connection) -> Result<bool> {
-    if schema_object_definitions(conn)? != *CURRENT_SCHEMA_OBJECTS {
+    if schema_object_definitions_sha256(conn)? != CURRENT_SCHEMA_OBJECTS_SHA256 {
         return Ok(false);
     }
     let versions = conn.query_row(
@@ -2718,6 +2796,28 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn current_schema_digest_matches_migrations() {
+        let migrated = Connection::open_in_memory().unwrap();
+        for migration in &CACHE_MIGRATIONS {
+            migrated
+                .execute_batch(migration.sql)
+                .unwrap_or_else(|error| {
+                    panic!("apply cache migration {}: {error}", migration.version)
+                });
+        }
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(CURRENT_FRESH_SCHEMA_SQL).unwrap();
+        assert_eq!(
+            schema_object_definitions(&fresh).unwrap(),
+            schema_object_definitions(&migrated).unwrap()
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&fresh).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
     }
 
     #[test]
@@ -3899,6 +3999,20 @@ mod tests {
         conn.execute_batch("DROP TABLE semantic_vectors;").unwrap();
         conn.pragma_update(None, "user_version", BASELINE_MIGRATION_VERSION)
             .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn current_version_with_incomplete_schema_is_rebuilt() {
+        let mut conn = open_in_memory_cache();
+        conn.execute_batch("DROP TABLE semantic_vectors;").unwrap();
 
         migrate(&mut conn).unwrap();
 

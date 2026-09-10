@@ -95,6 +95,7 @@ use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use brokk_bifrost_jvm::scala::graph::syntax::ScalaPackageContextIndex;
+use brokk_bifrost_python::graph_support::PythonSource;
 use brokk_bifrost_ruby::graph::RubyGraphSource;
 use brokk_bifrost_ruby::graph::extractor::{
     ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
@@ -1676,8 +1677,6 @@ struct DefinitionBatchContext<'a> {
     exact_token_focus: bool,
     #[cfg(test)]
     cpp_class_range_builds: usize,
-    #[cfg(test)]
-    python_build_counters: Arc<python::PythonDefinitionBuildCounters>,
 }
 
 impl<'a> DefinitionBatchContext<'a> {
@@ -1712,8 +1711,6 @@ impl<'a> DefinitionBatchContext<'a> {
             exact_token_focus: false,
             #[cfg(test)]
             cpp_class_range_builds: 0,
-            #[cfg(test)]
-            python_build_counters: Arc::default(),
         }
     }
 
@@ -1735,7 +1732,20 @@ impl<'a> DefinitionBatchContext<'a> {
     fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
         self.trees
             .entry((file.clone(), language))
-            .or_insert_with(|| parse_tree_for_language(file, language, source))
+            .or_insert_with(|| {
+                // Semantic dispatch already obtained this exact analyzer
+                // snapshot while lowering the procedure. Reuse its immutable
+                // tree when the caller's source still matches; an explicitly
+                // supplied older source must keep the raw-source parse below.
+                if language == Language::Python
+                    && let Some(py) = resolve_analyzer::<PythonAnalyzer>(self.analyzer)
+                    && let Some(prepared) = py.prepared_syntax(self.token, file)
+                    && prepared.source() == source
+                {
+                    return Some(prepared.tree().clone());
+                }
+                parse_tree_for_language(file, language, source)
+            })
             .clone()
     }
 
@@ -1973,43 +1983,20 @@ impl<'a> DefinitionBatchContext<'a> {
         token: QueryToken<'_>,
         py: &PythonAnalyzer,
         file: &ProjectFile,
+        source: &str,
     ) -> Arc<python::PythonDefinitionContext> {
         self.python_contexts
             .entry(file.clone())
             .or_insert_with(|| {
-                let _scope = crate::profiling::scope("get_definition::python::batch_context");
-                #[cfg(test)]
-                self.python_build_counters
-                    .context_builds
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Arc::new(python::PythonDefinitionContext::build(
-                    py,
-                    self.analyzer,
-                    token,
-                    file,
-                    #[cfg(test)]
-                    Arc::clone(&self.python_build_counters),
-                ))
+                python::request_definition_context(py, self.analyzer, token, file, source)
             })
             .clone()
     }
 
     #[cfg(test)]
     fn python_build_counts(&self) -> (usize, usize, usize, usize) {
-        (
-            self.python_build_counters
-                .context_builds
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.python_build_counters
-                .scope_fact_builds
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.python_build_counters
-                .receiver_type_cache_misses
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.python_build_counters
-                .generic_receiver_type_fallbacks
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        let py = resolve_analyzer::<PythonAnalyzer>(self.analyzer).expect("Python analyzer");
+        python::request_definition_build_counts(py)
     }
 }
 
@@ -3114,6 +3101,74 @@ mod tests {
     }
 
     #[test]
+    fn python_call_target_batches_reuse_request_context_and_prepared_syntax() {
+        let source = Arc::<str>::from(
+            "from service import Service\n\ndef handle(service: Service):\n    service.run()\n",
+        );
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                ("app.py", source.as_ref()),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
+        let member_start = source.rfind("run").expect("receiver member in source");
+        let request = DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(member_start),
+            end_byte: Some(member_start + "run".len()),
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let prepared = py
+            .prepared_syntax(scope.token(), &file)
+            .expect("prepared Python syntax");
+        assert_eq!(prepared.source(), source.as_ref());
+        let mut ledgers = Vec::new();
+
+        for _ in 0..2 {
+            let ledger = Arc::new(crate::analyzer::ReadLedger::new());
+            let ledger_scope = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+            let outcomes = resolve_call_target_batch_with_source(
+                analyzer,
+                scope.token(),
+                vec![request.clone()],
+                file.clone(),
+                Arc::clone(&source),
+                None,
+            );
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome.status, DefinitionLookupStatus::Resolved);
+            assert_eq!(
+                outcomes[0].outcome.definitions[0].fq_name(),
+                "service.Service.run"
+            );
+            drop(ledger_scope);
+            ledgers.push(ledger);
+        }
+
+        assert_eq!(py.prepared_syntax_parse_count_for_test(&file), 1);
+        assert_eq!(python::request_definition_build_counts(py), (1, 1, 1, 0));
+        assert!(!ledgers[0].is_empty());
+        let cached_reads =
+            python::request_definition_cached_read_keys(py, analyzer, &file, source.as_ref());
+        let replayed_reads = ledgers[1].keys();
+        assert!(
+            cached_reads
+                .iter()
+                .all(|read| replayed_reads.contains(read)),
+            "cached Python definition reads were not replayed: cached={cached_reads:?}, replayed={replayed_reads:?}"
+        );
+    }
+
+    #[test]
     fn rust_batch_context_reuses_supplied_syntax_for_repeated_field_lookups() {
         let source = "struct Inner { value: i32 }\nstruct Outer { inner: Inner }\nfn first(outer: Outer) -> i32 { outer.inner.value }\nfn second(outer: Outer) -> i32 { outer.inner.value }\n";
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
@@ -3471,7 +3526,7 @@ mod tests {
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
-        let python_context = context.python_context(token, py, &file);
+        let python_context = context.python_context(token, py, &file, source);
         python_context.set_receiver_type_cache_limit(1);
         let member_offsets = [
             source

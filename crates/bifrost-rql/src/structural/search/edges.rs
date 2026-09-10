@@ -114,6 +114,7 @@ impl EdgeTraversalCache {
                             language.config_label(),
                             axis.label()
                         ),
+                    exhausted_roots: Vec::new(),
                     });
                 }
                 EdgeIncompleteReason::NoStructuralAdapter
@@ -134,6 +135,7 @@ impl EdgeTraversalCache {
                             "{subject} has an incomplete reference-edge derivation ({}); its edge rows are not the whole set",
                             incomplete_reason_label(reason)
                         ),
+                    exhausted_roots: Vec::new(),
                     });
                 }
             }

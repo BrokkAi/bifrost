@@ -14169,3 +14169,77 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
         "the unreached sink names the semantic budget: {origins:?}"
     );
 }
+
+/// #3194: a root that exhausts a budget must be attributable from the
+/// diagnostic alone. The diagnostic names each exhausting root's path and
+/// qualified name, the lane that stopped it, and the charge it could not pay,
+/// both as structured rows and in the message a policy report carries.
+#[test]
+fn an_exhausted_root_is_attributed_by_path_name_lane_and_charge() {
+    let (_project, workspace) = type_flow_workspace();
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["python"],
+        "match": { "kind": "function", "name": "normalize" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("class-set query");
+    let result = execute_workspace_with_limits(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+        CodeQueryExecutionLimits {
+            value_flow: CodeQueryValueFlowLimits {
+                solver_work: brokk_bifrost_flow::dataflow::SolverWork {
+                    reached_states: 1,
+                    ..brokk_bifrost_flow::dataflow::SolverWork::default_limits()
+                },
+                ..CodeQueryValueFlowLimits::default()
+            },
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let diagnostic = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
+        .unwrap_or_else(|| panic!("an incomplete root raises its diagnostic: {result:#?}"));
+    let attributed = diagnostic
+        .exhausted_roots
+        .iter()
+        .find(|root| root.lane == "solver/reached_states")
+        .unwrap_or_else(|| panic!("the solver lane is named: {diagnostic:#?}"));
+    assert!(
+        attributed.path.ends_with("app.py"),
+        "the root's path is carried: {attributed:#?}"
+    );
+    assert_eq!(
+        attributed.procedure.as_deref(),
+        Some("normalize"),
+        "the root's qualified name is carried: {attributed:#?}"
+    );
+    let charge = attributed
+        .charge
+        .unwrap_or_else(|| panic!("the failed charge is carried: {attributed:#?}"));
+    assert_eq!(charge.limit, 1, "{attributed:#?}");
+    assert!(charge.attempted > charge.limit, "{attributed:#?}");
+    assert_eq!(
+        attributed.feedback_iteration,
+        Some(0),
+        "the feedback iteration is carried: {attributed:#?}"
+    );
+    for expected in [
+        attributed.path.as_str(),
+        "normalize",
+        "solver/reached_states",
+        &format!("charged {} limit {}", charge.attempted, charge.limit),
+    ] {
+        assert!(
+            diagnostic.message.contains(expected),
+            "the message renders `{expected}`: {diagnostic:#?}"
+        );
+    }
+}

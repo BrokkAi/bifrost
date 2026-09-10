@@ -5667,15 +5667,17 @@ fn attach_model_relations_to_entries(
                 && whole_workspace
             {
                 let authored_name = entry.fq_name.as_deref().unwrap_or_default();
-                let mut reverse_relations = overlay
+                let mut inverse_relations = overlay
                     .relations()
                     .iter()
+                    // Navigation locates a modeled declaration's authored anchor; only an
+                    // explicit reference relation makes that declaration an inverse usage.
                     .filter(|relation| {
-                        relation.kind == "navigates_to" && relation.to == authored_name
+                        relation.kind == "references" && relation.to == authored_name
                     })
                     .collect::<Vec<_>>();
-                reverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
-                if reverse_relations
+                inverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
+                if inverse_relations
                     .iter()
                     .any(|relation| relation.provenance.ambiguous)
                 {
@@ -5686,7 +5688,7 @@ fn attach_model_relations_to_entries(
                     continue;
                 }
                 let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
-                for relation in &reverse_relations {
+                for relation in &inverse_relations {
                     let source = overlay.symbols_with_id(&relation.from);
                     if source.disposition
                         != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
@@ -5731,12 +5733,12 @@ fn attach_model_relations_to_entries(
                     );
                     entry.status = ScanUsagesStatus::Found;
                     entry.notes.push(
-                        "Generated accessors were matched through modeled navigation relations."
+                        "Generated declarations were matched through modeled reference relations."
                             .to_owned(),
                     );
                 }
-                let total_model_relations = reverse_relations.len();
-                entry.model_relations = reverse_relations
+                let total_model_relations = inverse_relations.len();
+                entry.model_relations = inverse_relations
                     .into_iter()
                     .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
                     .cloned()
@@ -5793,6 +5795,7 @@ fn attach_model_relations_to_entries(
                         .saturating_add(authored_hits),
                 );
                 entry.status = ScanUsagesStatus::Found;
+                entry.message = None;
                 entry.notes.push(
                     "Workspace references were matched through structured definition resolution."
                         .to_owned(),
@@ -5893,7 +5896,8 @@ fn authored_model_references(
                     continue;
                 }
                 if let Some(name) = node.name
-                    && name.text(facts.source()) == symbol.name
+                    && (crate::analyzer::is_rust_generated_function(symbol)
+                        || name.text(facts.source()) == symbol.name)
                 {
                     spans.push(name);
                 }

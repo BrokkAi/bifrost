@@ -244,7 +244,6 @@ policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
     Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
-    RowSelector { labels: ["row-selector"], layout: Mixed, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: "(row-selector :output NAME (bind|filter|project|join|call|call-argument) ...)", description: "Select one bounded typed relational endpoint relation from exact call and binding rows." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME (:query SELECTOR | :from NAME :step STEP))", description: "Bind one named typed row relation from a CodeQuery or an earlier binding expansion." }
     Filter { labels: ["filter"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(filter :over NAME :where ((BINDING.FIELD OP VALUE)...))", description: "Narrow one named row relation to the rows that satisfy every listed typed predicate. The relation keeps its name and its columns; only its rows change." }
     Project { labels: ["project"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(project :name NEW :from NAME :columns (BINDING.FIELD|(BINDING.FIELD NEW-FIELD)...))", description: "Publish a new named row relation holding chosen, optionally renamed, columns of an existing one. The projected relation takes the place of the one it reads." }
@@ -252,7 +251,7 @@ policy_records! {
     Group { labels: ["group"], layout: Mixed, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(group :name NAME :by (BINDING.FIELD...) (aggregate ...) ...)", description: "Group joined rows by registered fields and compute named aggregates." }
     Aggregate { labels: ["aggregate"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate :name NAME :op min|max|count|count-distinct|any|all|ordered-equal [:value BINDING.FIELD] [:left (BINDING.POSITION BINDING.VALUE) :right (BINDING.POSITION BINDING.VALUE)] [:where ((BINDING.FIELD OP VALUE)...)] )", description: "Compute one bounded typed aggregate within a row group." }
     CallArgument { labels: ["call-argument"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call-argument :over NAME :formal-name \"NAME\") | (call-argument :over NAME :formal-index N)", description: "Select actual call arguments bound exactly to one formal name or index. The in-place lowering also requires exhaustive coverage, a non-terminal row, and a source argument identity." }
-    Call { labels: ["call"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE])", description: "Select call-binding rows for one exact semantic-model callable family or a quoted qualified locator resolved to one workspace/model identity, optionally constrained to an exact receiver owner type. `exact` requires typed selector proof plus an exact formal layout, without requiring one overload record when a complete family shares that layout. `declared` additionally requires unambiguous semantic-model record provenance, a complete callable family, and one exact selected signature, while leaving runtime dispatch coverage independent; the containing pack may remain globally partial." }
+    Call { labels: ["call"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)])", description: "Select call-binding rows for one exact semantic-model callable family or a quoted qualified locator resolved to one workspace/model identity, optionally constrained by receiver owner. A scalar receiver names the exact owner; `(assignable-to ROOT)` also accepts proven descendants of the named owner. `exact` requires typed selector proof plus an exact formal layout, without requiring one overload record when a complete family shares that layout. `declared` additionally requires unambiguous semantic-model record provenance, a complete callable family, and one exact selected signature, while leaving runtime dispatch coverage independent; the containing pack may remain globally partial." }
     RowAssert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert [:id ID] :group NAME :value NAME :cardinality (exactly|at-least|at-most N))", description: "Assert a cardinality over one named aggregate in every row group." }
     RowAssertSelectedInWinningTier { labels: ["assert-selected-in-winning-tier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME [:cardinality (exactly|at-least|at-most N)])", description: "Require the selected candidate of every overload-selection row to sit in the winning applicability tier, meaning the set of candidates the resolver's own applicability check accepted. Authoring sugar: it lowers to one inner join on site_ast_id, one group keyed on the site, one counting aggregate over selected applicable candidates, and one cardinality assertion, and adds no evaluation rule of its own." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
@@ -321,6 +320,7 @@ policy_records! {
     TerminalExpectation { labels: ["terminal-expectation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(terminal-expectation :id ID (:matches MATCH-SET | :on SEMANTIC-EVENT) :expected-states [...])", description: "Require an accepting state after an explicit or implicit terminal observation." }
     NormalProcedureExit { labels: ["normal-procedure-exit"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(normal-procedure-exit :scope analysis-root)", description: "Observe normal completion of the outer analysis root." }
     ExceptionalProcedureExit { labels: ["exceptional-procedure-exit"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(exceptional-procedure-exit :scope analysis-root)", description: "Observe exceptional completion of the outer analysis root." }
+    SuspensionBoundary { labels: ["suspension-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(suspension-boundary :scope analysis-root)", description: "Observe suspension boundaries of the outer analysis root." }
     Classification { labels: ["classification"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(classification :fallback CLASSIFICATION [:refinements [...]] [:cvss CVSS])", description: "Declare a broad taxonomy classification, ordered refinements, and optional CVSS policy." }
     ClassificationId { labels: ["classification-id"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(classification-id :taxonomy \"NAME\" :id \"IDENTIFIER\" [:name \"DISPLAY NAME\"])", description: "Name one taxonomy classification without deriving semantics from its text." }
     Refinement { labels: ["refinement"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(refinement :when PREDICATE :add [CLASSIFICATION...])", description: "Add classifications when a typed evidence predicate holds." }
@@ -576,8 +576,7 @@ macro_rules! value_shapes {
                     | Self::AssertCardinality
                     | Self::AssertEntries
                     | Self::EdgeClassValues
-                    | Self::AssertionPlanEntries
-                    | Self::RowSelectorEntries => None,
+                    | Self::AssertionPlanEntries => None,
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -620,6 +619,8 @@ macro_rules! value_shapes {
                     | Self::CvssBaseMetricValue
                     | Self::PolicyTags
                     | Self::Categories
+                    | Self::SelectorLanguages
+                    | Self::SelectorWhereGlobs
                     | Self::EndpointIds
                     | Self::StateIds
                     | Self::EventIds
@@ -683,11 +684,7 @@ macro_rules! value_shapes {
                     Self::Message => &[PolicyRecord::GeneratedMessage],
                     Self::Severity => &[PolicyRecord::CvssSeverity],
                     Self::FixedOrUnratedSeverity => &[],
-                    Self::Selector => &[
-                        PolicyRecord::Rql,
-                        PolicyRecord::RqlFile,
-                        PolicyRecord::RowSelector,
-                    ],
+                    Self::Selector => &[PolicyRecord::Rql, PolicyRecord::RqlFile],
                     Self::EndpointBinding
                     | Self::PolicyPort
                     | Self::TypestateBinding
@@ -724,6 +721,7 @@ macro_rules! value_shapes {
                     Self::SemanticEvent => &[
                         PolicyRecord::NormalProcedureExit,
                         PolicyRecord::ExceptionalProcedureExit,
+                        PolicyRecord::SuspensionBoundary,
                     ],
                     Self::ClassificationSpec => &[PolicyRecord::Classification],
                     Self::TaxonomyClassification | Self::Classifications => {
@@ -807,14 +805,6 @@ macro_rules! value_shapes {
                         PolicyRecord::RowAssert,
                         PolicyRecord::RowAssertSelectedInWinningTier,
                     ],
-                    Self::RowSelectorEntries => &[
-                        PolicyRecord::Bind,
-                        PolicyRecord::Filter,
-                        PolicyRecord::Project,
-                        PolicyRecord::Join,
-                        PolicyRecord::CallArgument,
-                        PolicyRecord::Call,
-                    ],
                     Self::RowAggregates => &[PolicyRecord::Aggregate],
                     Self::AssertCardinality => &[
                         PolicyRecord::CardinalityExactly,
@@ -881,6 +871,8 @@ macro_rules! value_shapes {
                     | Self::CvssScope
                     | Self::PolicyTags
                     | Self::Categories
+                    | Self::SelectorLanguages
+                    | Self::SelectorWhereGlobs
                     | Self::EndpointIds
                     | Self::StateIds
                     | Self::EventIds
@@ -905,6 +897,8 @@ macro_rules! value_shapes {
 
 value_shapes! {
     SchemaVersion => "a supported positive schema version",
+    SelectorLanguages => "one or more public analyzer language labels or family aliases",
+    SelectorWhereGlobs => "one or more workspace-relative path globs",
     PolicyId => "a stable lowercase policy identifier",
     EndpointId => "a stable lowercase endpoint identifier",
     LocalEntryId => "a lowercase local entry identifier",
@@ -944,7 +938,6 @@ value_shapes! {
     EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
     AssertionPlanEntries => "bind, filter, project, join, group, call-argument, call, relational assert, and assert-selected-in-winning-tier records",
-    RowSelectorEntries => "bind, filter, project, join, call-argument, and call records",
     RowAggregates => "aggregate records",
     RowName => "a bounded row binding, group, or aggregate name",
     RowFieldRef => "a binding.field row reference",
@@ -988,7 +981,7 @@ value_shapes! {
     ExternalModelPort => "receiver, return-value, an indexed result record, or an argument record; matched-value is forbidden",
     ExternalModelWritePort => "an external-model call port, or a field record naming one written field of an argument or receiver; matched-value is forbidden",
     InconclusivePolicy => "the inconclusive uncertainty policy",
-    SemanticEvent => "a normal-procedure-exit or exceptional-procedure-exit record",
+    SemanticEvent => "a normal-procedure-exit, exceptional-procedure-exit, or suspension-boundary record",
     ExitScope => "the analysis-root exit scope",
     ClassificationSpec => "a classification record",
     TaxonomyClassification => "a classification-id record",
@@ -1193,12 +1186,13 @@ policy_fields! {
     AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each specialized assertion is evaluated at; required with :asserts." }
     AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare specialized occurrence, resolution, route, or identity invariants; required with :subject." }
     AnalysisPlanEntries { record: Analysis, labels: [], placement: FieldPlacement::VariadicPositional, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertionPlanEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind|filter|project|join|group|assert ...)...", description: "Declare a bounded source-ordered relational assertion plan." }
-    RowSelectorOutput { record: RowSelector, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: ":output NAME", description: "Name the live relation consumed as the endpoint selection output." }
-    RowSelectorEntries { record: RowSelector, labels: [], placement: FieldPlacement::VariadicPositional, required: Required, multiplicity: ValueMultiplicity::sequence(1, 64), shape: RowSelectorEntries, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: "(bind|filter|project|join|call|call-argument ...)...", description: "Declare source-ordered typed bindings and derivations for one endpoint selector." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
     AnalysisOnUnknown { record: Analysis, labels: ["on-unknown"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OnUnknownSpec, owner: OwnerApplicability::POLICY_ALL, signature: ":on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed)", description: "Choose what a verdict blocked by unknown evidence does; omission defaults to abstain." }
+    AnalysisLanguages { record: Analysis, labels: ["languages"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorLanguages, owner: OwnerApplicability::POLICY_ALL, signature: ":languages [LANGUAGE...]", description: "Conjoin one shared language scope with every inline RQL and referenced RQL selector in this analysis; `jvm` expands to [java, kotlin, scala] and `js-ts` expands to [javascript, typescript]." }
+    AnalysisWhereGlobs { record: Analysis, labels: ["where"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorWhereGlobs, owner: OwnerApplicability::POLICY_ALL, signature: ":where [\"GLOB\"...]", description: "Conjoin one shared workspace-relative path-glob scope with every inline RQL and referenced RQL selector in this analysis." }
+    AnalysisRqlSchemaVersion { record: Analysis, labels: ["rql-schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::POLICY_ALL, signature: ":rql-schema-version N", description: "Pin the RQL schema version for selectors that omit their own; explicit selector pins must agree. This is independent of the RQLP document schema version." }
     AnalysisSources { record: Analysis, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Compose the complete taint source set." }
     AnalysisSinks { record: Analysis, labels: ["sinks"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSinks, signature: ":sinks (endpoint-set ...)", description: "Compose the complete taint sink set." }
     AnalysisSanitizers { record: Analysis, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Compose optional sanitizer models; omission is empty." }
@@ -1242,7 +1236,7 @@ policy_fields! {
     CallOver { record: Call, labels: ["over"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":over NAME", description: "Name the call_binding relation to filter in place." }
     CallResolvesTo { record: Call, labels: ["resolves-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":resolves-to MODEL_ID|QUALIFIED_NAME", description: "Name a stable semantic-model identity, or quote one qualified callable locator for resolution at the loaded-policy boundary. A qualified locator is never compared as a rendered name." }
     CallProof { record: Call, labels: ["proof"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":proof exact|declared", description: "Require either typed exact callable-family and formal-layout proof or exact declared overload-record evidence. Declared proof does not claim runtime dispatch is closed." }
-    CallReceiverType { record: Call, labels: ["receiver-type"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE", description: "Constrain the exact receiver to a stable semantic-model type identity, or quote one qualified type locator for loaded-policy resolution. A qualified locator is never compared as a rendered name." }
+    CallReceiverType { record: Call, labels: ["receiver-type"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Name, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)", description: "Constrain the resolved receiver member owner. The scalar spelling requires that exact stable semantic-model type identity or quoted qualified locator; `(assignable-to ROOT)` also accepts proven descendants of the root. A qualified locator is never compared as a rendered name." }
     RowAssertId { record: RowAssert, labels: ["id"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id ID", description: "Optionally override the stable assertion identity derived from group and aggregate names." }
     RowAssertGroup { record: RowAssert, labels: ["group"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":group NAME", description: "Name the row group being asserted." }
     RowAssertValue { record: RowAssert, labels: ["value"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":value NAME", description: "Name the aggregate being asserted." }
@@ -1421,6 +1415,7 @@ policy_fields! {
     ExpectationSupersedes { record: TerminalExpectation, labels: ["supersedes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: ExpectationIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":supersedes [EXPECTATION...]", description: "Declare explicit same-terminal expectation dominance." }
     NormalExitScope { record: NormalProcedureExit, labels: ["scope"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExitScope, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":scope analysis-root", description: "Limit the implicit normal terminal to the outer analysis root." }
     ExceptionalExitScope { record: ExceptionalProcedureExit, labels: ["scope"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExitScope, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":scope analysis-root", description: "Limit the implicit exceptional terminal to the outer analysis root." }
+    SuspensionBoundaryScope { record: SuspensionBoundary, labels: ["scope"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: ExitScope, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":scope analysis-root", description: "Limit the suspension boundary to the outer analysis root." }
 
     ClassificationFallback { record: Classification, labels: ["fallback"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaxonomyClassification, owner: OwnerApplicability::POLICY_ALL, signature: ":fallback (classification-id ...)", description: "Preserve one broad taxonomy classification for every finding." }
     ClassificationRefinements { record: Classification, labels: ["refinements"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(0, 128), shape: ClassificationRefinements, owner: OwnerApplicability::POLICY_ALL, signature: ":refinements [(refinement ...)...]", description: "Apply bounded refinements in source order." }

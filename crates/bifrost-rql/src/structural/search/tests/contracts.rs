@@ -22,6 +22,7 @@ fn diagnostic(
         branch: Vec::new(),
         language: "workspace",
         message: "prose deliberately carries no classification words".to_string(),
+        exhausted_roots: Vec::new(),
     }
 }
 
@@ -414,6 +415,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
         branch: vec![1, 0],
         language: "typescript",
         message: "broad query".to_string(),
+        exhausted_roots: Vec::new(),
     };
     assert_eq!(
         diagnostic.presentation_label(),
@@ -456,18 +458,17 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
         end_line: 3,
         end_column: 10,
     };
-    let complete = CodeQuerySemanticEvidence {
-        proof: CodeQuerySemanticProof::Proven,
-        proof_reason: None,
-        completeness: CodeQuerySemanticCompleteness::Complete,
-        completeness_reason: None,
-    };
-    let partial = CodeQuerySemanticEvidence {
-        proof: CodeQuerySemanticProof::Unproven,
-        proof_reason: Some("ambiguous enclosing procedure".to_string()),
-        completeness: CodeQuerySemanticCompleteness::Partial,
-        completeness_reason: Some("exceptional control flow is unsupported".to_string()),
-    };
+    let complete = CodeQuerySemanticEvidence::new(
+        CodeQuerySemanticProof::Proven,
+        CodeQuerySemanticCompleteness::Complete,
+        None,
+    );
+    let partial = CodeQuerySemanticEvidence::from_axis_reasons(
+        CodeQuerySemanticProof::Unproven,
+        CodeQuerySemanticCompleteness::Partial,
+        Some("ambiguous enclosing procedure".to_string()),
+        Some("exceptional control flow is unsupported".to_string()),
+    );
     let point_ref = CodeQueryProgramPointRef {
         id: point_id.clone(),
         procedure_id: procedure_id.clone(),
@@ -555,9 +556,13 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
     assert!(!serialized.to_string().contains("control_edge_id"));
 
     let rendered = result.render_text();
-    assert!(rendered.contains("[procedure; function; proven/complete]"));
-    assert!(rendered.contains("[program point; entry; unproven/partial; 1 event]"));
-    assert!(rendered.contains("[control edge; conditional_true; proven/complete]"));
+    assert!(rendered.contains("[procedure; function; proof=proven; completeness=complete]"));
+    assert!(
+        rendered.contains("[program point; entry; proof=unproven; completeness=partial; 1 event]")
+    );
+    assert!(
+        rendered.contains("[control edge; conditional_true; proof=proven; completeness=complete]")
+    );
 
     for reference in [
         CodeQueryResultRef::Procedure {
@@ -593,7 +598,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
     let root = temp.path().canonicalize().expect("canonical root");
     let file = ProjectFile::new(root, path);
     let evidence_for = |index, domain, key: DetailedCodeQueryKey, id: &str| {
-        let candidate = CodeQueryStableOwnerCandidate {
+        let candidate = CodeQueryStableOwnerCandidate::Derived {
             namespace: "typescript".to_string(),
             derivation: CodeQueryStableOwnerDerivation::SemanticWireId,
             semantic_key: id.to_string(),
@@ -711,6 +716,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::SemanticCapabilityUnsupported, Impact::Incomplete),
         (Code::SemanticAnalysisPartial, Impact::Incomplete),
         (Code::CallBindingDispatchPartial, Impact::Incomplete),
+        (Code::CallBindingSelectorRejected, Impact::Incomplete),
         (Code::SemanticBudgetExhausted, Impact::Incomplete),
         (Code::SemanticProviderFailed, Impact::Incomplete),
         (Code::ReceiverAnalysisPartial, Impact::Incomplete),

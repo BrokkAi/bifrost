@@ -134,13 +134,6 @@ impl ResolvedSelectorSemanticHash {
         });
         Self(hash_canonical_value(SELECTOR_SEMANTIC_DOMAIN, &value))
     }
-
-    pub(crate) fn from_rows(plan: &super::definition::RowSelectorPlan) -> Self {
-        Self(hash_canonical_value(
-            SELECTOR_SEMANTIC_DOMAIN,
-            &super::canonical::row_selector_plan_to_json(plan),
-        ))
-    }
 }
 
 impl EndpointSemanticHash {
@@ -553,7 +546,7 @@ mod tests {
         let crate::PolicyAnalysis::Match { spec } = &definition.analysis else {
             panic!("fixture must be a match policy");
         };
-        let PolicySelector::Inline { schema, query } = &spec.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &spec.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(
@@ -589,7 +582,7 @@ mod tests {
             panic!("fixture must be an endpoint");
         };
         let definition: MatchEndpointDefinition = *definition;
-        let PolicySelector::Inline { schema, query } = &definition.selector else {
+        let PolicySelector::Inline { schema, query, .. } = &definition.selector else {
             panic!("fixture selector must be inline");
         };
         let selector = ResolvedPolicySelector::try_new(

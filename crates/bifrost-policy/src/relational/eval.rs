@@ -95,22 +95,6 @@ pub struct RelationalEvaluationWork {
     pub assertion_checks: u64,
 }
 
-/// The provenance selected by one endpoint row-selector plan.
-///
-/// `upstream_rows` names every row supplied by the output relation's producer
-/// before authored derivations ran. `selected_rows` names the rows that remain
-/// after those derivations. The distinction is semantic: an incomplete
-/// terminal call-binding row may be filtered out, but it still prevents the
-/// endpoint from treating the empty selected set as a clean negative.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationalRowSelection {
-    pub upstream_rows: Vec<RelationalViolationRow>,
-    pub selected_rows: Vec<RelationalViolationRow>,
-    pub upstream_coverage: RelationCoverage,
-    pub selected_coverage: RelationCoverage,
-    pub limit_exceeded: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalAssertionEvaluationError {
     MissingInput {
@@ -248,120 +232,6 @@ impl UnknownInputEvidence {
     const fn is_empty(&self) -> bool {
         self.reasons.is_empty()
     }
-}
-
-fn provenance_rows(relation: &EvalRelation) -> EvalResult<Vec<RelationalViolationRow>> {
-    let mut rows = Vec::with_capacity(relation.tuples.len());
-    for tuple in &relation.tuples {
-        let [contributors] = tuple.contributors.as_slice() else {
-            return Err(RelationalAssertionEvaluationError::InvalidPlan {
-                message: "row selector output contains grouped representatives".to_owned(),
-            });
-        };
-        let [row] = contributors.as_slice() else {
-            return Err(RelationalAssertionEvaluationError::InvalidPlan {
-                message: "row selector output depends on more than one source row".to_owned(),
-            });
-        };
-        rows.push(row.clone());
-    }
-    Ok(rows)
-}
-
-fn provenance_rows_for_binding(
-    relation: &EvalRelation,
-    binding: &RowBindingName,
-) -> EvalResult<Vec<RelationalViolationRow>> {
-    let mut rows = Vec::with_capacity(relation.tuples.len());
-    for tuple in &relation.tuples {
-        let [contributors] = tuple.contributors.as_slice() else {
-            return Err(RelationalAssertionEvaluationError::InvalidPlan {
-                message: "row selector output contains grouped representatives".to_owned(),
-            });
-        };
-        let mut matching = contributors.iter().filter(|row| row.binding == *binding);
-        let Some(row) = matching.next() else {
-            return Err(RelationalAssertionEvaluationError::InvalidPlan {
-                message: format!(
-                    "row selector output has no contributor for `{}`",
-                    binding.as_str()
-                ),
-            });
-        };
-        if matching.next().is_some() {
-            return Err(RelationalAssertionEvaluationError::InvalidPlan {
-                message: format!(
-                    "row selector output has ambiguous contributors for `{}`",
-                    binding.as_str()
-                ),
-            });
-        }
-        if !rows.contains(row) {
-            rows.push(row.clone());
-        }
-    }
-    Ok(rows)
-}
-
-/// Evaluate the upstream and filtered output of a validated row selector.
-pub fn evaluate_row_selector_ir(
-    plan: &RelationalPlanIr,
-    relation: IrRelationId,
-    upstream: IrRelationId,
-    upstream_binding: &RowBindingName,
-    inputs: &[RelationalInput<'_>],
-) -> EvalResult<RelationalRowSelection> {
-    let inputs_by_binding = inputs
-        .iter()
-        .map(|input| (input.binding.as_str(), input))
-        .collect::<HashMap<_, _>>();
-    let referenced = referenced_columns(plan);
-    let needed = needed_relations_for_targets(plan, [relation, upstream]);
-    let binding_order = binding_declaration_order(plan);
-    let mut state = EvalState {
-        limits: plan.limits,
-        comparisons: 0,
-        limit_exceeded: false,
-        work: RelationalEvaluationWork::default(),
-    };
-    let mut relations: Vec<Option<EvalRelation>> = Vec::with_capacity(plan.relations.len());
-    for relation in &plan.relations {
-        if !needed.contains(&relation.id) {
-            relations.push(None);
-            continue;
-        }
-        let evaluated = evaluate_relation(
-            plan,
-            relation.id,
-            &relations,
-            &inputs_by_binding,
-            &referenced,
-            &binding_order,
-            &mut state,
-        )?;
-        state.work.materialized_rows = state
-            .work
-            .materialized_rows
-            .saturating_add(u64::try_from(evaluated.tuples.len()).unwrap_or(u64::MAX));
-        relations.push(Some(evaluated));
-    }
-    let get = |id: IrRelationId| {
-        relations
-            .get(id.index())
-            .and_then(Option::as_ref)
-            .ok_or_else(|| RelationalAssertionEvaluationError::InvalidPlan {
-                message: format!("row selector relation {} was not evaluated", id.index()),
-            })
-    };
-    let upstream_relation = get(upstream)?;
-    let selected_relation = get(relation)?;
-    Ok(RelationalRowSelection {
-        upstream_rows: provenance_rows(upstream_relation)?,
-        selected_rows: provenance_rows_for_binding(selected_relation, upstream_binding)?,
-        upstream_coverage: upstream_relation.coverage.clone(),
-        selected_coverage: selected_relation.coverage.clone(),
-        limit_exceeded: state.limit_exceeded,
-    })
 }
 
 /// Evaluate a validated plan over already executed row sets.
@@ -589,7 +459,9 @@ fn referenced_columns(plan: &RelationalPlanIr) -> BTreeSet<IrColumn> {
                         columns.insert(right.clone());
                     }
                 }
-                IrPredicate::IsNull { column, .. } | IrPredicate::InSet { column, .. } => {
+                IrPredicate::IsNull { column, .. }
+                | IrPredicate::InSet { column, .. }
+                | IrPredicate::ResolvedIdentitySet { column, .. } => {
                     columns.insert(column.clone());
                 }
             }
@@ -659,19 +531,6 @@ fn needed_relations(plan: &RelationalPlanIr) -> HashSet<IrRelationId> {
             continue;
         }
         needed.extend(relation.op.inputs());
-    }
-    needed
-}
-
-fn needed_relations_for_targets(
-    plan: &RelationalPlanIr,
-    targets: impl IntoIterator<Item = IrRelationId>,
-) -> HashSet<IrRelationId> {
-    let mut needed = targets.into_iter().collect::<HashSet<_>>();
-    for relation in plan.relations.iter().rev() {
-        if needed.contains(&relation.id) {
-            needed.extend(relation.op.inputs());
-        }
     }
     needed
 }
@@ -1321,6 +1180,12 @@ fn predicates_match(
                     values
                         .iter()
                         .any(|literal| scalar_matches_literal(&actual, literal))
+                })
+            }
+            IrPredicate::ResolvedIdentitySet { column, identities } => {
+                let actual = read(relation, tuple, column)?;
+                actual.is_some_and(|actual| {
+                    matches!(actual, RowScalar::StableId(value) if identities.binary_search(&value).is_ok())
                 })
             }
         };

@@ -1230,6 +1230,32 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
                 .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer),
         }
     }
+
+    fn external_member_family(
+        &self,
+        identity: &brokk_bifrost_jvm::realm::JvmExternalMemberIdentity,
+        max_visits: usize,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::ExternalMemberFamilyAnswer {
+        if identity.language() != Language::Java {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+        }
+        if let Some(language) = [Language::Kotlin, Language::Scala]
+            .into_iter()
+            .find(|language| self.languages().contains(language))
+        {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::incomplete(
+                crate::analyzer::usages::ExternalMemberFamilyIncompleteReason::MixedJvmRealmUnsupported(
+                    language,
+                ),
+                0,
+            );
+        }
+        let Some(java) = resolve_analyzer::<JavaAnalyzer>(self) else {
+            return crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported();
+        };
+        java.resolve_external_member_family(self, identity, max_visits, cancellation)
+    }
 }
 
 impl TypeAliasProvider for MultiAnalyzer {

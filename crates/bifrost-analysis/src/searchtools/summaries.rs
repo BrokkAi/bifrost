@@ -680,14 +680,14 @@ fn summarize_symbol_targets_with_cancellation(
             }
         }
         let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
-        let resolution =
-            resolve_selectable_definitions_bounded(analyzer, token, &target, |analyzer, lookup| {
-                resolve_codeunit_fuzzy_bounded(
-                    analyzer,
-                    lookup,
-                    FuzzyResolveBudget::new(&keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES),
-                )
-            });
+        let budget = FuzzyResolveBudget::new(&keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES);
+        let resolution = resolve_selectable_definitions_bounded(
+            analyzer,
+            token,
+            &target,
+            budget,
+            |analyzer, lookup| resolve_codeunit_fuzzy_bounded(analyzer, lookup, budget),
+        );
         let resolution = match resolution {
             Ok(resolution) => resolution,
             // The selector names more declarations than this tool will

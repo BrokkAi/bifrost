@@ -39,7 +39,8 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::{
     CallDispatchBoundaryKind, CallDispatchLookup, CallDispatchSession, CallDispatchTarget,
-    CallRelationService, CallRelationWork, UsageProof, call_dispatch_equivalence_source,
+    CallRelationService, CallRelationWork, ExternalMemberFamilyStatus, UsageProof,
+    call_dispatch_equivalence_source,
 };
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
@@ -47,6 +48,7 @@ use crate::analyzer::{
     WorkspaceAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::realm::{JvmExternalMemberIdentity, JvmReceiverSemantics};
 
 /// Source-scoped callable identity used only while resolving dispatch. The
 /// location-first resolver may return both a C/C++ declaration and a related
@@ -291,6 +293,10 @@ impl PreparedWorkspaceDispatchSession<'_> {
                 work: SemanticWork::default(),
             });
         }
+        let _scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.oracle.workspace.analyzer(),
+            self.oracle.active_semantic_model_snapshot(),
+        );
         if !Arc::ptr_eq(call.procedure().artifact(), &self.artifact) {
             return Err(SemanticProviderError::invalid_identity(
                 "prepared dispatch call must belong to the exact semantic artifact allocation",
@@ -335,14 +341,10 @@ impl PreparedWorkspaceDispatchSession<'_> {
             .low_level
             .as_mut()
             .expect("the first real dispatch call initializes its source session");
-        let scope = AnalyzerQueryScope::with_semantic_model_overlay(
-            self.oracle.workspace.analyzer(),
-            self.oracle.semantic_model_overlay(),
-        );
         let source_was_paid = self.low_level_source_paid;
         let mut lookup = low_level.dispatch_at_bounded(
             self.oracle.workspace.analyzer(),
-            scope.token(),
+            _scope.token(),
             &call_span,
             request.budget.remaining().nested_entries.max(1),
             Some(request.cancellation),
@@ -360,7 +362,6 @@ impl PreparedWorkspaceDispatchSession<'_> {
         let outcome =
             self.oracle
                 .resolve_prepared_call(call, PreparedCallDispatch { lookup }, request);
-        drop(scope);
         if initialized_low_level {
             let source_bytes_committed = parsed_source
                 && request
@@ -821,6 +822,80 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let mut materialized_files: HashMap<ProjectFile, SemanticOutcome<Arc<SemanticArtifact>>> =
             HashMap::default();
         let mut staged_request = request.staged(&mut staged_budget);
+
+        // #2580: an external member has no workspace CodeUnit from which the
+        // ordinary member-family inversion can start. Ask the JVM hierarchy
+        // seam with the resolver-owned external identity before materializing
+        // targets. A complete answer queues its exact workspace members into
+        // the ordinary path below; complete-empty is recorded just as
+        // authoritatively. Every non-complete status is retained for the
+        // targetless boundary added after dispatch-gap refinement.
+        let mut external_workspace_families = HashMap::default();
+        if call_dispatch_gap.is_some() {
+            let mut external_targets = boundaries
+                .iter()
+                .filter_map(|boundary| boundary.unmaterialized_external_target.clone())
+                .collect::<Vec<_>>();
+            external_targets.sort();
+            external_targets.dedup();
+            for target in external_targets {
+                let Some(identity) = jvm_external_member_identity(&target) else {
+                    continue;
+                };
+                let answer = if staged_request.charge_execution_traversal(1) {
+                    let max_visits = staged_request.budget.remaining().nested_entries;
+                    self.workspace
+                        .analyzer()
+                        .member_family_provider()
+                        .map(|provider| {
+                            provider.external_member_family(
+                                &identity,
+                                max_visits,
+                                Some(request.cancellation),
+                            )
+                        })
+                        .unwrap_or_else(
+                            crate::analyzer::usages::ExternalMemberFamilyAnswer::unsupported,
+                        )
+                } else {
+                    crate::analyzer::usages::ExternalMemberFamilyAnswer {
+                        status: ExternalMemberFamilyStatus::BudgetExhausted,
+                        candidates: Vec::new(),
+                        visited: 0,
+                    }
+                };
+                let hierarchy_work = SemanticWork {
+                    nested_entries: answer.visited,
+                    ..SemanticWork::default()
+                };
+                if let Err(exceeded) = staged_request.budget.charge(hierarchy_work) {
+                    materialization_exceeded = Some(exceeded);
+                    external_workspace_families
+                        .insert(target, ExternalMemberFamilyStatus::BudgetExhausted);
+                    continue;
+                }
+                reported_work = reported_work.conservative_add(hierarchy_work);
+                if answer.is_complete() {
+                    for candidate in answer.candidates {
+                        if queued_declarations.insert(candidate.clone()) {
+                            target_groups.push_back(DispatchTargetGroup {
+                                representative: candidate,
+                                proof: ProofStatus::Unproven(
+                                    "dispatch target is a possible workspace implementation of the external member"
+                                        .into(),
+                                ),
+                                completeness: EvidenceCompleteness::Partial(
+                                    "dispatch cannot prove one runtime implementation target identity"
+                                        .into(),
+                                ),
+                                receiver_hint: false,
+                            });
+                        }
+                    }
+                }
+                external_workspace_families.insert(target, answer.status);
+            }
+        }
 
         while let Some(group) = target_groups.pop_front() {
             if request.cancellation.is_cancelled() {
@@ -1325,22 +1400,22 @@ impl<'a> WorkspaceSemanticOracle<'a> {
             );
         }
 
-        // #2371: the discharge rule for a call's residual dynamic-dispatch arm
+        // #2371/#2580: the discharge rule for a call's residual dynamic-dispatch arm
         // needs the workspace half proven -- workspace implementors of the
         // resolved declaring member enumerated, possibly empty -- before a
         // contract-claiming summary can answer the external half. A call whose
         // only named target is an unmaterialized external member never queues a
         // `DispatchTargetGroup` for it (there is no workspace `CodeUnit` to
         // queue), so the ordinary CHA expansion above never runs for it and
-        // "enumerated" is not satisfied by construction. Prove it here instead,
-        // or else refuse: see `external_member_workspace_override_proven_absent`.
+        // "enumerated" is not satisfied by construction. #2580 now asks the
+        // exact external-root member-family query above. Only its `Complete`
+        // status proves this workspace half, including a complete-empty set.
+        // Non-JVM languages retain the older refusing proof until they expose
+        // an equivalent structured capability.
         let mut workspace_hierarchy_unenumerated = false;
-        if call_dispatch_gap.is_some()
-            && !boundaries
-                .iter()
-                .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated)
-        {
-            let unenumerated = boundaries
+        if call_dispatch_gap.is_some() {
+            let mut classified_targets = HashSet::default();
+            let statuses = boundaries
                 .iter()
                 .filter_map(|boundary| match &boundary.kind {
                     DispatchBoundaryKind::External(Some(_)) => {
@@ -1348,14 +1423,26 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     }
                     _ => None,
                 })
-                .any(|target| {
-                    !external_member_workspace_override_proven_absent(
+                .filter(|target| classified_targets.insert((*target).clone()))
+                .filter_map(|target| {
+                    if let Some(status) = external_workspace_families.get(target) {
+                        return (*status != ExternalMemberFamilyStatus::Complete)
+                            .then_some(*status);
+                    }
+                    (!external_member_workspace_override_proven_absent(
                         self.workspace.analyzer(),
                         target,
-                    )
-                });
-            if unenumerated {
-                boundaries.push(workspace_hierarchy_unenumerated_boundary());
+                    ))
+                    .then_some(ExternalMemberFamilyStatus::Unsupported)
+                })
+                .collect::<Vec<_>>();
+            if !statuses.is_empty() {
+                for status in statuses {
+                    boundaries.push(workspace_hierarchy_unenumerated_boundary(status));
+                    if status == ExternalMemberFamilyStatus::Cancelled {
+                        materialization_quality = DispatchQuality::Cancelled;
+                    }
+                }
                 workspace_hierarchy_unenumerated = true;
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
@@ -1745,15 +1832,42 @@ fn virtual_dispatch_implementor_targets(
     Some(targets)
 }
 
-/// #2371: whether the analyzer's complete short-name index proves that no
-/// workspace declaration can override `target`'s external member.
+fn jvm_external_member_identity(
+    target: &UnmaterializedExternalTarget,
+) -> Option<JvmExternalMemberIdentity> {
+    let SemanticLanguage::Standard(language) = target.language() else {
+        return None;
+    };
+    if !matches!(
+        language,
+        Language::Java | Language::Kotlin | Language::Scala
+    ) {
+        return None;
+    }
+    Some(JvmExternalMemberIdentity::new(
+        language,
+        target.owner_fqn(),
+        target.member(),
+        usize::try_from(target.arity()).expect("u32 call arity fits usize"),
+        if target.has_receiver() {
+            JvmReceiverSemantics::Instance
+        } else {
+            JvmReceiverSemantics::Static
+        },
+    ))
+}
+
+/// #2371 fallback for non-JVM analyzers: whether the complete short-name index
+/// proves that no workspace declaration can override `target`'s external
+/// member.
 ///
 /// `virtual_dispatch_implementor_targets` above answers the same "workspace
 /// half" question for a *workspace* declaration with no body, by expanding its
 /// `CodeUnit` through class-hierarchy analysis. An unmaterialized external
 /// member has no such `CodeUnit` -- it is definitionally not indexed -- so
 /// that expansion never runs for it, and #2371's discharge rule cannot treat
-/// "never ran" as "enumerated and proven empty".
+/// "never ran" as "enumerated and proven empty". JVM calls no longer use this
+/// fallback: #2580 asks their exact external-root hierarchy query instead.
 ///
 /// The proof this asks instead: a workspace type overriding `target` must
 /// declare a member spelled exactly like it (the same terminal identifier), so
@@ -1769,9 +1883,8 @@ fn virtual_dispatch_implementor_targets(
 /// `getParameter` method, say -- costs a discharge, exactly like an
 /// incomplete index does: both fail closed rather than open. Neither
 /// manufactures a false discharge, which is what keeps the workspace-double
-/// fixture (#2371) from being skated past: a workspace type that actually
-/// implements the external interface and declares the member is exactly a
-/// declaration `lookup_candidates_by_identifier` finds.
+/// fixture (#2371) from being skated past in languages without the stronger
+/// capability.
 fn external_member_workspace_override_proven_absent(
     analyzer: &dyn IAnalyzer,
     target: &UnmaterializedExternalTarget,
@@ -1786,7 +1899,26 @@ fn external_member_workspace_override_proven_absent(
 /// dynamic-dispatch gap is not proven enumerated. Distinct from the generic
 /// [`truncated_dispatch_boundary`] reason so a corpus trace can tell the two
 /// causes apart; both are `Truncated`, so both refuse discharge identically.
-fn workspace_hierarchy_unenumerated_boundary() -> DispatchBoundary {
+fn workspace_hierarchy_unenumerated_boundary(
+    status: ExternalMemberFamilyStatus,
+) -> DispatchBoundary {
+    let completeness = match status {
+        ExternalMemberFamilyStatus::Complete => {
+            unreachable!("a complete external member family needs no refusing boundary")
+        }
+        ExternalMemberFamilyStatus::Incomplete(reason) => {
+            format!("external-root workspace hierarchy query was incomplete: {reason:?}")
+        }
+        ExternalMemberFamilyStatus::Unsupported => {
+            "external-root workspace hierarchy query is unsupported".to_owned()
+        }
+        ExternalMemberFamilyStatus::Cancelled => {
+            "external-root workspace hierarchy query was cancelled".to_owned()
+        }
+        ExternalMemberFamilyStatus::BudgetExhausted => {
+            "external-root workspace hierarchy query exhausted its caller budget".to_owned()
+        }
+    };
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
         external_callee_identity: None,
@@ -1795,10 +1927,7 @@ fn workspace_hierarchy_unenumerated_boundary() -> DispatchBoundary {
         proof: ProofStatus::Unproven(
             "workspace implementors of the external member are not proven enumerated".into(),
         ),
-        completeness: EvidenceCompleteness::Partial(
-            "no workspace declaration shares the external member's identifier, or the identifier index is not complete, so an absent workspace override is not proven"
-                .into(),
-        ),
+        completeness: EvidenceCompleteness::Partial(completeness.into()),
         provenance: Box::new([]),
     }
 }
@@ -4760,20 +4889,33 @@ mod tests {
     #[test]
     fn complete_receiver_hint_does_not_displace_an_active_modeled_external_arm() {
         let source = "class A:\n    def foo(self):\n        return 1\n\ndef caller(holder):\n    return holder.value.foo()\n";
-        let (fixture, call) =
-            semantic_call_fixture_for_language(Language::Python, "modeled.py", source);
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("modeled.py", source)]);
         activate_python_external_summary(&fixture.analyzer);
         let snapshot = fixture
             .analyzer
             .analyzer()
             .active_semantic_model_snapshot()
             .expect("external summary activation publishes a snapshot");
+        let file = ProjectFile::new(fixture.project_root(), "modeled.py");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("semantic artifact");
+        let call = first_call_in_artifact(&artifact);
         let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot_and_hints(
             &fixture.analyzer,
             Some(snapshot),
             python_workspace_member_hints(&fixture, &call, "modeled.py", "A", "foo", true),
         );
-        let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let outcome = provider
             .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))

@@ -127,24 +127,26 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::Procedure { value } => {
                         out.push_str(&format!(
-                            "{}:{}:{} [procedure; {}; {}] {}\n",
+                            "{}:{}:{} [procedure; {}; proof={}; completeness={}] {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
                             value.procedure_kind,
-                            value.evidence.status_label(),
+                            value.evidence.proof.label(),
+                            value.evidence.completeness.label(),
                             value.id,
                         ));
                     }
                     CodeQueryResultValue::ProgramPoint { value } => {
                         let boundary = CodeQueryProgramPointBoundary::row_label(value.boundary);
                         out.push_str(&format!(
-                            "{}:{}:{} [program point; {}; {}; {} event{}] {}\n",
+                            "{}:{}:{} [program point; {}; proof={}; completeness={}; {} event{}] {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
                             boundary,
-                            value.evidence.status_label(),
+                            value.evidence.proof.label(),
+                            value.evidence.completeness.label(),
                             value.event_count,
                             if value.event_count == 1 { "" } else { "s" },
                             value.id,
@@ -152,12 +154,13 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::ControlEdge { value } => {
                         out.push_str(&format!(
-                            "{}:{}:{} [control edge; {}; {}] {} -> {}\n",
+                            "{}:{}:{} [control edge; {}; proof={}; completeness={}] {} -> {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
                             value.edge_kind,
-                            value.evidence.status_label(),
+                            value.evidence.proof.label(),
+                            value.evidence.completeness.label(),
                             value.source.id,
                             value.target.id,
                         ));
@@ -187,13 +190,13 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::FlowEndpoint { value } => {
                         out.push_str(&format!(
-                            "{}:{}:{} [flow endpoint; {:?}; {:?}; {:?}{}] {}\n",
+                            "{}:{}:{} [flow endpoint; {:?}; {:?}; {}{}] {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,
                             value.reachability,
                             value.certainty,
-                            value.completion,
+                            value.status.label(),
                             if value.ambiguous { "; ambiguous" } else { "" },
                             value.id,
                         ));
