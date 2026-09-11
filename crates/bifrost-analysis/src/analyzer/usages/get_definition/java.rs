@@ -4760,8 +4760,12 @@ fn java_static_import_candidates(
     // Workspace candidates and competing owners remain a typed boundary; they
     // must not be converted into a name-only summary binding.
     let saw_external = !external_owners.is_empty();
+    // Sorted so the boundary message below names the same owners in the same
+    // order on every run, whatever order the import list produced them in.
+    let mut external_owners = external_owners.into_iter().collect::<Vec<_>>();
+    external_owners.sort();
     let external_owner = (candidates.is_empty() && external_owners.len() == 1)
-        .then(|| external_owners.into_iter().next())
+        .then(|| external_owners.first().cloned())
         .flatten();
     let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
     if arity.is_some() && !saw_external && !applicability.winners.is_empty() {
@@ -4785,12 +4789,22 @@ fn java_static_import_candidates(
     }
     // `saw_external` is set only when an import target is both unindexed and
     // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace
-    // gate (no double work — the flag already carries the check).
+    // gate (no double work -- the flag already carries the check).
+    //
+    // The claim names those owners, not the bare `member`. What the gate above
+    // proved unindexed is the import route; `member` is only its last segment,
+    // and a workspace that indexes nothing of the sort can still spell that
+    // segment elsewhere. butterknife's `import static
+    // com.android.tools.lint.checks.infrastructure.TestLintTask.lint` is the
+    // shape: the owner is genuinely external, but naming the claim `lint` read
+    // as a denial of the indexed package `butterknife.lint`, whose last
+    // segment is spelled the same way (#3293).
     JavaStaticImportResolution {
         outcome: gated_boundary(
             || !saw_external,
             format!(
-                "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
+                "`{member}` appears to cross a Java static import boundary at `{}` not indexed in this workspace",
+                external_owners.join(", ")
             ),
             "no_static_import_match",
             format!("`{member}` did not match an indexed Java static import"),

@@ -2339,45 +2339,6 @@ fn relational_run(
     let mut binding_coverage: Vec<RelationCoverage> = Vec::with_capacity(executed.len());
     let mut total_work: Option<CodeQueryExecutionWork> = None;
 
-    /// Whether this row states that the producer suppressed the row *set* it
-    /// heads, which is a different question from whether one of its fields is
-    /// unknown.
-    ///
-    /// A relational assertion counts rows, so it is sensitive to a set that is
-    /// empty because nobody could read it rather than because it is genuinely
-    /// empty. A call shape whose coverage is not `exact` is exactly that case:
-    /// the derivation deliberately emits zero argument-group and zero argument
-    /// rows for it (#1478 Milestone 1) so that a macro-expanded argument list
-    /// can never be byte-identical to a real zero-argument call. Counting those
-    /// absent rows and passing an exact cardinality would report the confident
-    /// answer the coverage field exists to prevent, so the run is inconclusive
-    /// instead.
-    ///
-    /// This is the bound-row half of that answer, and it is no longer the only
-    /// half. Deriving a suppressed shape also emits a
-    /// `call_shape_coverage_incomplete` diagnostic, so a plan that binds only a
-    /// family projected from the shape -- argument groups, arguments, bindings
-    /// -- reaches the same inconclusive verdict through the binding's
-    /// completion (#1949). What this check adds is the binding's own
-    /// `RelationCoverage`: the relation the producer refused to describe is
-    /// `unsupported_row_set`, not merely a non-exhaustive one.
-    ///
-    /// This is deliberately *not* the same judgement as the match-selector
-    /// path's per-row `selected_site_quality`. A row whose own coverage is
-    /// partial about the world it describes -- an open member-selection
-    /// candidate set, an undecided candidate verdict, an `unknown_shape`
-    /// overload summary -- still publishes exact values in its own fields and
-    /// still emits every row it heads, and poisoning a whole run because one
-    /// site in the file was undecidable would make almost every relational
-    /// policy inconclusive. A policy that must exclude undecided rows filters
-    /// them with `:where`, which is what the winning-tier sugar lowers to.
-    fn suppressed_row_set(item: &UnitRowItem) -> bool {
-        if item.domain != DetailedCodeQueryDomain::CallShape {
-            return false;
-        }
-        row_text(item, "coverage").expect("every call-shape row states its coverage") != "exact"
-    }
-
     for rows in executed {
         let reasons = incomplete_reasons(&rows.completion, rows.truncated);
         run_incomplete.extend(reasons.iter().copied());
@@ -2385,19 +2346,8 @@ fn relational_run(
         // about: `ProvenSubset` is not "not exhaustive", and a suppressed row
         // set is not a partial one -- it is a relation the producer refused to
         // describe at all.
-        let coverage = if rows.items.iter().any(suppressed_row_set) {
-            run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-            RelationCoverage::unsupported_row_set()
-        } else {
-            match &rows.completion {
-                CodeQueryCompletion::Complete if !rows.truncated => RelationCoverage::Exhaustive,
-                CodeQueryCompletion::ProvenSubset { .. } => RelationCoverage::ProvenSubset,
-                CodeQueryCompletion::Complete
-                | CodeQueryCompletion::Incomplete { .. }
-                | CodeQueryCompletion::Cancelled
-                | CodeQueryCompletion::Invalid { .. } => RelationCoverage::incomplete(reasons),
-            }
-        };
+        let coverage = RelationCoverage::from_query(&rows.items, &rows.completion, rows.truncated);
+        run_incomplete.extend(coverage.incomplete_reasons());
         binding_coverage.push(coverage);
         run_failures.extend(failure_reasons(&rows.completion));
         query_diagnostics.extend(rows.diagnostics.iter().cloned());

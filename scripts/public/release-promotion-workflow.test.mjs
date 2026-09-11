@@ -215,6 +215,15 @@ test("GitHub releases use the exact curated changelog entry", () => {
 });
 
 test("release readiness qualifies and assembles attributable semantic-pack partial bundles", () => {
+  const tool = jobBlock(readiness, "semantic-pack-tool");
+  assert.match(tool, /^    needs: preflight$/mu);
+  assert.match(
+    tool,
+    /cargo build --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack/u,
+  );
+  assert.match(tool, /sha256sum bifrost-semantic-pack > bifrost-semantic-pack\.sha256/u);
+  assert.match(tool, /name: semantic-pack-tool-\$\{\{ needs\.preflight\.outputs\.commit \}\}/u);
+
   for (const [jobName, scriptName] of [
     ["semantic-pack-jvm", "build-pinned-jvm-semantic-packs.sh"],
     ["semantic-pack-python", "build-pinned-python-semantic-packs.sh"],
@@ -222,20 +231,31 @@ test("release readiness qualifies and assembles attributable semantic-pack parti
     ["semantic-pack-rust", "build-pinned-rust-semantic-packs.sh"],
   ]) {
     const job = jobBlock(readiness, jobName);
+    assert.match(job, /^    needs: \[preflight, semantic-pack-tool\]$/mu);
     assert.match(job, new RegExp(`scripts/public/${scriptName.replaceAll(".", "\\.")}`, "u"));
-    assert.match(job, /-- verify/u);
+    assert.match(job, /Download exact semantic-pack tool/u);
+    assert.match(job, /sha256sum --check bifrost-semantic-pack\.sha256/u);
+    assert.match(job, /BIFROST_SEMANTIC_PACK_BIN/u);
+    assert.match(job, /verify/u);
     assert.match(job, /actions\/upload-artifact@/u);
   }
   const assembler = jobBlock(readiness, "semantic-pack-bundle");
   assert.match(
     assembler,
-    /needs: \[preflight, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust\]/u,
+    /needs: \[preflight, semantic-pack-tool, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust\]/u,
   );
   assert.match(assembler, /actions\/download-artifact@/u);
-  assert.match(assembler, /-- merge/u);
-  assert.match(assembler, /-- verify/u);
+  assert.match(assembler, /"\$BIFROST_SEMANTIC_PACK_BIN" merge/u);
+  assert.match(assembler, /"\$BIFROST_SEMANTIC_PACK_BIN" verify/u);
   assert.match(assembler, /measurements\.json/u);
   assert.match(assembler, /bifrost-semantic-packs-\$\{RELEASE_TAG\}\.tar\.gz/u);
+
+  const qualification = jobBlock(readiness, "qualification");
+  assert.match(qualification, /pattern: '!release-qualification-\*'/u);
+  assert.match(
+    qualification,
+    /rm -f qualification-bundle\/bifrost-semantic-pack qualification-bundle\/bifrost-semantic-pack\.sha256/u,
+  );
 });
 
 readinessTest("semantic-pack measurements stay in the tarball and are published separately", () => {
@@ -578,7 +598,7 @@ readinessTest("release readiness gives the Linux x86 binary an independent criti
   assert.doesNotMatch(jobBlock(readiness, "build"), /target: x86_64-unknown-linux-gnu/u);
 
   const policySmoke = jobBlock(readiness, "policy-scan-smoke");
-  assert.match(policySmoke, /^    needs: \[preflight, build-linux-x86-64, semantic-pack-python\]$/mu);
+  assert.match(policySmoke, /^    needs: \[preflight, semantic-pack-tool, build-linux-x86-64, semantic-pack-python\]$/mu);
   assert.doesNotMatch(policySmoke, /^    needs: \[preflight, build,/mu);
 
   for (const job of ["agent-plugin-package", "pi-package", "vscode-package", "npm-package"]) {

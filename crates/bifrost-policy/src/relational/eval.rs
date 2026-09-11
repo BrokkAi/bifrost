@@ -20,6 +20,10 @@
 //! A verdict that cannot be published is not silently dropped: it becomes an
 //! unmet obligation carrying the typed reasons that blocked it.
 
+#[path = "replay.rs"]
+mod replay;
+pub(crate) use replay::{ReplayConstraints, ReplayInput, replay_candidate_ir};
+
 use brokk_bifrost_analysis::CancellationToken;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -371,62 +375,29 @@ fn evaluate_plan(
             let witnessed = tuple.witness_sound;
             let exhaustive = relation.coverage.is_exhaustive();
 
-            let set_fold = aggregates.iter().any(|aggregate| {
-                aggregate.output == assertion.column
-                    && matches!(
-                        aggregate.op,
-                        IrAggregateOp::SetEqual | IrAggregateOp::Subset
-                    )
-            });
-            if set_fold && (!exhaustive || !witnessed) {
-                let mut reasons = relation.coverage.incomplete_reasons();
-                reasons.extend(relation.witness_reasons.iter().cloned());
-                reasons.sort();
-                reasons.dedup();
+            if let Some(kind) =
+                verdict_obligation(assertion, aggregates, witnessed, exhaustive, bounded)
+            {
+                let reasons = match kind {
+                    RelationalObligationKind::VerdictRequiresWitnessedRows => {
+                        relation.witness_reasons.clone()
+                    }
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage => {
+                        let mut reasons = relation.coverage.incomplete_reasons();
+                        reasons.extend(relation.witness_reasons.iter().copied());
+                        reasons
+                    }
+                };
                 obligations.push(RelationalObligation::new(
                     assertion.id.clone(),
-                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
+                    kind,
                     assertion.group.clone(),
                     key,
                     reasons,
                 ));
                 continue;
             }
-            if !witnessed {
-                // Neither verdict is publishable: the rows behind the number
-                // are not established.
-                obligations.push(RelationalObligation::new(
-                    assertion.id.clone(),
-                    RelationalObligationKind::VerdictRequiresWitnessedRows,
-                    assertion.group.clone(),
-                    key,
-                    relation.witness_reasons.clone(),
-                ));
-                continue;
-            }
             if satisfied {
-                if states_upper_bound(assertion.cardinality) && !exhaustive {
-                    obligations.push(RelationalObligation::new(
-                        assertion.id.clone(),
-                        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
-                        assertion.group.clone(),
-                        key,
-                        relation.coverage.incomplete_reasons(),
-                    ));
-                }
-                continue;
-            }
-            let positive = exceeds_upper_bound(assertion.cardinality, bounded);
-            if !positive && !exhaustive {
-                // Fewer rows than required is a claim that no further row
-                // exists, which a partial relation cannot support.
-                obligations.push(RelationalObligation::new(
-                    assertion.id.clone(),
-                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
-                    assertion.group.clone(),
-                    key,
-                    relation.coverage.incomplete_reasons(),
-                ));
                 continue;
             }
             violations.push(RelationalAssertionViolation {
@@ -480,8 +451,41 @@ fn evaluate_plan(
     })
 }
 
-/// Whether the cardinality states an upper bound, which is the property that
-/// makes a clean verdict a claim about rows that were never seen.
+/// The proof requirement is shared by ordinary assertion evaluation and
+/// candidate replay; neither adapter invents its own absence verdict rules.
+fn verdict_obligation(
+    assertion: &super::ir::IrAssertion,
+    aggregates: &[IrAggregate],
+    witnessed: bool,
+    exhaustive: bool,
+    actual: u32,
+) -> Option<RelationalObligationKind> {
+    let set_fold = aggregates.iter().any(|aggregate| {
+        aggregate.output == assertion.column
+            && matches!(
+                aggregate.op,
+                IrAggregateOp::SetEqual | IrAggregateOp::Subset
+            )
+    });
+    if set_fold && (!exhaustive || !witnessed) {
+        return Some(RelationalObligationKind::AbsenceRequiresExhaustiveCoverage);
+    }
+    if !witnessed {
+        return Some(RelationalObligationKind::VerdictRequiresWitnessedRows);
+    }
+    let absence = if assertion.cardinality.satisfied_by(actual) {
+        states_upper_bound(assertion.cardinality)
+    } else {
+        !exceeds_upper_bound(assertion.cardinality, actual)
+    };
+    if absence && !exhaustive {
+        Some(RelationalObligationKind::AbsenceRequiresExhaustiveCoverage)
+    } else {
+        None
+    }
+}
+
+/// Whether a clean cardinality verdict needs an absence proof.
 const fn states_upper_bound(cardinality: AssertCardinality) -> bool {
     matches!(
         cardinality,

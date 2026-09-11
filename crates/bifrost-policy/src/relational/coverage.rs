@@ -56,6 +56,34 @@ pub enum RelationCoverage {
 }
 
 impl RelationCoverage {
+    /// Apply the same row-set and query-completion contract to runs and replay.
+    pub(crate) fn from_query(
+        rows: &[UnitRowItem],
+        completion: &brokk_bifrost_rql::structural::CodeQueryCompletion,
+        truncated: bool,
+    ) -> Self {
+        use brokk_bifrost_rql::structural::{CodeQueryCompletion, DetailedCodeQueryDomain};
+        if rows.iter().any(|row| {
+            row.domain == DetailedCodeQueryDomain::CallShape
+                && !matches!(
+                    row.field("coverage")
+                        .expect("call-shape coverage is available"),
+                    Some(
+                        brokk_bifrost_rql::structural::CodeQueryRowScalarRef::ConstrainedEnum(
+                            "exact"
+                        )
+                    )
+                )
+        }) {
+            return Self::unsupported_row_set();
+        }
+        match completion {
+            CodeQueryCompletion::Complete if !truncated => Self::Exhaustive,
+            CodeQueryCompletion::ProvenSubset { .. } => Self::ProvenSubset,
+            _ => Self::incomplete(crate::evaluator::incomplete_reasons(completion, truncated)),
+        }
+    }
+
     /// The coverage of a relation whose rows were bounded by a plan limit.
     pub fn row_budget() -> Self {
         Self::incomplete(vec![PolicyIncompleteReason::PipelineRowBudget])

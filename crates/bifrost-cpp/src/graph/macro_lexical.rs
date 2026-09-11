@@ -8,8 +8,7 @@
 use super::resolver::{
     MacroLexicalBinding, MacroLexicalBindingKind, MacroLexicalReferences, MacroLocalBinding,
     ParsedReplacementBody, VisibilityIndex, argument_children, declaration_declarator,
-    declarator_name_node, declared_name_indirection, extract_variable_name,
-    macro_type_argument_node,
+    declarator_name_node, declared_name_binding, extract_variable_name, macro_type_argument_node,
 };
 use crate::declarations::node_text;
 use crate::graph::syntax::function_macro_replacement_span;
@@ -462,8 +461,8 @@ fn build_template(
                         .unwrap_or_default(),
                     pointer_depth: node
                         .child_by_field_name("type")
-                        .and_then(|ty| declared_name_indirection(node, ty, &name, &body.source))
-                        .unwrap_or(0),
+                        .and_then(|ty| declared_name_binding(node, ty, &name, &body.source))
+                        .map_or(0, |binding| binding.pointer_depth),
                 });
             }
         }

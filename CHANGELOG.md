@@ -15,18 +15,54 @@ projection and its commit history does not contain every source commit.
   per-operator cancellation.
 - Policies now support a treat-may-as-finding verdict on unknown evidence,
   reporting may-findings as findings when requested.
-- RQLP analyses can share explicit language and path constraints and an independent
-  RQL schema pin across their selectors. Hoisting equivalent wrappers preserves
-  canonical queries and policy hashes; nested scopes conjoin instead of overriding.
-- Rust call arguments now carry exact conversion and coercion facts proven
-  from typed bindings.
-- CSMI runtime values now integrate into analysis: reviewed runtime-value
-  facts from CSMI packs inform ICFG, value-flow, and heap reasoning.
 
 ### Changed
 
 - Kotlin overload selection now resolves through the shared call_binding
   relation.
+
+## [0.11.3] - 2026-09-11
+
+### Fixed
+
+- Release qualification now excludes its generated `dist/` artifacts from the
+  facade crate and rejects any crate archive above crates.io's upload limit
+  before a release is tagged.
+- Kotlin parameter-default extraction now uses the registered language-support
+  capability, preserving the framework boundary enforced by cross-language CI.
+- MCP discovery metadata validation now distinguishes generated query-step
+  entries from ordinary prose that happens to contain a step label.
+
+## [0.11.2] - 2026-09-10
+
+### Added
+
+- Call bindings now expose structured conversion evidence for Rust, Java, and
+  TypeScript. Exact argument binding remains separate from conversion proof,
+  unknown conversions stay explicitly unknown, and only supported identity and
+  reference adjustments participate in value flow. Rust call arguments carry
+  their exact proven conversion and coercion facts.
+- Rust value flow now models `Copy`, move, borrow, and coercion transfers, and
+  Go value flow preserves slice backing identity through parameters, `append`,
+  subslices, and callbacks.
+- CSMI runtime-value packs can describe runtime globals and keyed-read
+  observations. Code Query and the Python client expose activation-aware
+  `keyed_read_value` results with proof, completeness, and typed limitations.
+- CSMI collection-flow packs can carry typed collection behavior contracts.
+  The bundled Scala producer applies the new 0.1 profile to generic
+  `scala.collection.mutable.Map` identity, indexed reads and updates, and
+  Map-entry-to-tuple projection. Callback execution and the remaining
+  iteration and control-flow protocol stay explicitly incomplete.
+- Python type flow now refines values through ordered writes, receiver fields,
+  guards, reassignment, and reviewed small-workspace helper summaries. Unmodeled
+  guards remain explicit remainders, and resolved dispatch closes a remainder
+  only when receiver and target evidence are complete.
+- JavaScript and TypeScript value flow lowers exact declaration-style
+  `Object.entries` loops into allocation-rooted member loads and binder flow.
+  Shadowed, escaped, dynamic, and unmatched forms stay explicitly incomplete.
+
+### Changed
+
 - RQLP row-local `filter`, `project`, `call`, `call-argument`, and binding
   expansion records are now typed RQL pipeline steps. RQL gains `filter` with
   the existing typed row-predicate semantics and `project` with column
@@ -81,12 +117,40 @@ projection and its commit history does not contain every source commit.
   names. Consumers of `dispatch_outcome.exceeded_limit` must use the lane values.
   Canonical answers containing these failures intentionally change; built-in
   policy hashes and declaration and dispatch row identities are unchanged.
+- Scoped policy sessions now persist analyzer facts through isolated session
+  projections while sharing reusable content facts and honoring cache locks.
+- Compatible assertion policies share whole-workspace subject scans within a
+  batch while retaining independent work accounting, cancellation, and results.
+- Scala usage queries share source-fact parses within a generation instead of
+  retaining whole-workspace file facts for every query.
+- Analyzer reconciliation and cache garbage collection are serialized so
+  collection cannot observe a partially reconciled workspace.
+- Type-flow solving derives binding and field refinements once per root solve
+  and charges reuse per ledger, reducing repeated semantic-budget consumption
+  during plan rebuilds and feedback iterations.
+- `CodeUnit::fq_segments_debug` is available in every build profile as a
+  diagnostic accessor; extraction and declaration identity are unchanged.
 
 ### Fixed
 
-- JS/TS property reads now resolve through structured reaching stores instead
-  of source order, with CFG-evidenced property definitions and module scope
-  lowered.
+- JavaScript and TypeScript callable identity now includes omitted captures,
+  Java implicit receivers bind correctly, and Python class-qualified calls bind
+  the first actual argument to their explicit receiver.
+- Python class-set and absent-member analysis now preserves uncertainty across
+  annotation bounds, async returns, exact-class and truthiness guards, unions,
+  typing markers, assignment forms, variadic parameters, and dynamic members.
+- C++ lookup prunes empty delegates, reports missing compile-database sources,
+  and avoids unsafe parent traversal while building namespace scope indexes.
+- PHP collection-element inference no longer promotes incomplete prior writes.
+- JavaScript and TypeScript property reads and definitions follow structured
+  reaching stores and CFG evidence, including keyed property reads, instead of
+  treating source order as execution order. Unproven reaching-store cases
+  remain incomplete.
+- RQL result-contract provenance scopes completeness to the event axis each
+  operand uses, so an unrelated property-event gap no longer invalidates
+  otherwise complete binding evidence.
+- JavaScript and TypeScript import binding accepts unrecoverable parse roots as
+  roots with no imports instead of panicking during workspace usage analysis.
 
 ## [0.11.1] - 2026-09-09
 

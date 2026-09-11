@@ -102,6 +102,10 @@ pub enum UnknownReason {
     /// The receiver is a real scalar value, but the class-set domain does not
     /// model a nominal member-bearing class for it.
     ScalarReceiver,
+    /// The value is a class object; its member surface -- its metaclass's
+    /// members plus the class's own class-level attributes -- is not modeled
+    /// by the class-set domain.
+    ClassObject,
     /// Class creation can install members the declaration does not show: a
     /// metaclass writes them, a class-header keyword configures the same
     /// machinery, or a decorator returns a different class. The declared
@@ -143,6 +147,7 @@ impl UnknownReason {
             Self::IncompleteRoot => "incomplete_root",
             Self::OpenTypeBound => "open_type_bound",
             Self::ScalarReceiver => "scalar_receiver",
+            Self::ClassObject => "class_object",
             Self::ClassCreation => "class_creation",
             Self::UnmodeledGuard { .. } => "unmodeled_guard",
         }
@@ -174,6 +179,7 @@ impl UnknownReason {
             "incomplete_root" => Self::IncompleteRoot,
             "open_type_bound" => Self::OpenTypeBound,
             "scalar_receiver" => Self::ScalarReceiver,
+            "class_object" => Self::ClassObject,
             "class_creation" => Self::ClassCreation,
             label => Self::UnmodeledGuard {
                 class: label

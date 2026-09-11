@@ -436,15 +436,12 @@ impl<'a> PhpVisitor<'a> {
             short_name,
             fq,
         );
-        self.parsed.add_code_unit(
+        self.parsed.add_code_unit_with_range(
             code_unit.clone(),
-            node,
-            self.source,
+            php_declaration_range(node, self.source),
             scope.class_unit.clone(),
             None,
         );
-        self.parsed
-            .set_primary_range(&code_unit, php_declaration_range(node, self.source));
         self.parsed
             .add_signature(code_unit.clone(), php_type_signature(node, self.source));
         self.parsed
@@ -486,15 +483,12 @@ impl<'a> PhpVisitor<'a> {
             short_name,
             fq,
         );
-        self.parsed.add_code_unit(
+        self.parsed.add_code_unit_with_range(
             code_unit.clone(),
-            node,
-            self.source,
+            php_declaration_range(node, self.source),
             scope.class_unit.clone(),
             None,
         );
-        self.parsed
-            .set_primary_range(&code_unit, php_declaration_range(node, self.source));
         let signature = php_function_signature(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
@@ -539,15 +533,12 @@ impl<'a> PhpVisitor<'a> {
                     .clone()
                     .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
-            self.parsed.add_code_unit(
+            self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
-                node,
-                self.source,
+                php_declaration_range(node, self.source),
                 Some(parent.clone()),
                 None,
             );
-            self.parsed
-                .set_primary_range(&code_unit, php_declaration_range(node, self.source));
             let value = child
                 .child_by_field_name("default_value")
                 .filter(|value| php_is_literal(*value));
@@ -609,15 +600,12 @@ impl<'a> PhpVisitor<'a> {
                 short_name,
                 fq,
             );
-            self.parsed.add_code_unit(
+            self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
-                node,
-                self.source,
+                php_declaration_range(node, self.source),
                 scope.class_unit.clone(),
                 None,
             );
-            self.parsed
-                .set_primary_range(&code_unit, php_declaration_range(node, self.source));
             let value = php_const_value(child).filter(|value| php_is_literal(*value));
             let signature = if let Some(value) = value {
                 format!(
@@ -652,15 +640,12 @@ impl<'a> PhpVisitor<'a> {
                 .clone()
                 .with_pushed(php_segment(&name, SegmentKind::Member)),
         );
-        self.parsed.add_code_unit(
+        self.parsed.add_code_unit_with_range(
             code_unit.clone(),
-            node,
-            self.source,
+            php_declaration_range(node, self.source),
             Some(parent.clone()),
             None,
         );
-        self.parsed
-            .set_primary_range(&code_unit, php_declaration_range(node, self.source));
         self.parsed.add_signature(
             code_unit,
             normalize_php_snippet(&php_node_text(node, self.source)),
@@ -697,15 +682,12 @@ impl<'a> PhpVisitor<'a> {
                     .clone()
                     .with_pushed(php_segment(stripped_name, SegmentKind::Member)),
             );
-            self.parsed.add_code_unit(
+            self.parsed.add_code_unit_with_range(
                 code_unit.clone(),
-                parameter,
-                self.source,
+                php_declaration_range(parameter, self.source),
                 Some(parent.clone()),
                 None,
             );
-            self.parsed
-                .set_primary_range(&code_unit, php_declaration_range(parameter, self.source));
             let signature = format!(
                 "{};",
                 normalize_php_snippet(&php_node_text(parameter, self.source)).trim_end_matches(',')
@@ -1076,6 +1058,17 @@ fn php_raw_text_with_attributes(node: Node<'_>, source: &str) -> String {
     source[range.start_byte..range.end_byte].to_string()
 }
 
+/// One declaration node's range, extended back over the `attribute_list`
+/// siblings written directly above it.
+///
+/// Every declaration this walk records is registered with
+/// [`ParsedFile::add_code_unit_with_range`] under this range, which APPENDS an
+/// occurrence rather than replacing the list. PHP lets one name be declared
+/// more than once in a file -- a feature-detection stub writes the same class
+/// once per branch of an `if`/`elseif`/`else` and the branches' members merge
+/// into the one FQ name -- so a container that replaced its range with the
+/// last branch's node would no longer contain the members the earlier branches
+/// contributed (#3292).
 fn php_declaration_range(node: Node<'_>, source: &str) -> Range {
     let mut start_byte = node.start_byte();
     let mut start_point = node.start_position();

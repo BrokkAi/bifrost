@@ -8,6 +8,9 @@ fi
 
 output_dir=$1
 work_dir=$2
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/semantic-pack-tool.sh
+source "$script_directory/../lib/semantic-pack-tool.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 compiler_archive="${input_dir}/typescript-7.0.2.tgz"
 library_archive="${input_dir}/typescript-linux-x64-7.0.2.tgz"
@@ -39,10 +42,8 @@ find "${library_root}/package/lib" -type f -name '*.d.ts' \
   -exec cp '{}' "${source_dir}/lib/" \;
 
 cd - >/dev/null
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
+run_semantic_pack_tool generate \
   "${output_dir}" \
   semantic-packs/typescript/typescript-7.0.2.json "${source_dir}"
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
+run_semantic_pack_tool verify \
   "${output_dir}"

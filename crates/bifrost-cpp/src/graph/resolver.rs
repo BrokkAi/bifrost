@@ -1736,6 +1736,9 @@ impl CallArityEvidence {
 struct DeclaredFieldTypeFact {
     type_text: String,
     indirection: i32,
+    /// The member binds `type_text` through a pointer or a reference, so it
+    /// holds no subobject of that type (see [`DeclaredNameBinding`]).
+    binds_indirectly: bool,
     template_arguments: Option<Vec<CppTemplateExpression>>,
 }
 
@@ -2890,7 +2893,8 @@ impl<'a> VisibilityIndex<'a> {
                 })
             })?;
             let name = extract_variable_name(declarator, sentinel)?;
-            let pointer_depth = declared_name_indirection(declaration, type_node, &name, sentinel)?;
+            let pointer_depth =
+                declared_name_binding(declaration, type_node, &name, sentinel)?.pointer_depth;
             let type_text = node_text(type_node, sentinel).trim();
             let declared_type = parameters
                 .iter()
@@ -12624,7 +12628,22 @@ pub fn field_initializer_constructs_target(
     ctx.visibility
         .visible_identifier_candidates(ctx.file, field_name)
         .filter(|unit| unit.is_field() && unit.identifier() == field_name)
-        .any(|unit| field_declares_type(unit, ctx, owner))
+        .any(|unit| field_declares_type(unit, ctx, owner) && field_holds_subobject(unit, ctx))
+}
+
+/// Whether a member initializer for `unit` runs a constructor of the type the
+/// member declares.
+///
+/// Only a member that holds the type by value does. `Owner* p` initialized as
+/// `p(nullptr)` binds a pointer and `Owner& r` as `r(other)` binds a
+/// reference; neither runs an `Owner` constructor, even though both declare
+/// `Owner` as the receiver type a member access through them resolves (#3286).
+/// A member whose declaration the index cannot decode keeps the by-value
+/// reading, which is what the declared-type match already assumed.
+fn field_holds_subobject(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    ctx.visibility
+        .field_declared_type_fact(&ctx.analyzer, unit)
+        .is_none_or(|fact| !fact.binds_indirectly)
 }
 
 fn qualified_base_initializer_constructs_target(
@@ -12740,8 +12759,7 @@ fn anonymous_aggregate_field_owner(
                 .or_else(|| first_type_child(node))
             && matches!(type_node.kind(), "struct_specifier" | "union_specifier")
             && type_node.child_by_field_name("name").is_none()
-            && declared_name_indirection(node, type_node, field.identifier(), &declaration)
-                .is_some()
+            && declared_name_binding(node, type_node, field.identifier(), &declaration).is_some()
         {
             let matches = visibility
                 .visible_members_for_owner_name(visible_from, &owner, field.identifier())
@@ -12918,6 +12936,7 @@ fn decode_field_declared_type_fact(
             return Some(DeclaredFieldTypeFact {
                 type_text: node_text(recovered.type_node, &contextual_declaration).to_string(),
                 indirection: recovered.pointer_depth(),
+                binds_indirectly: recovered.pointer_depth() > 0,
                 template_arguments: None,
             });
         }
@@ -12931,6 +12950,9 @@ fn decode_field_declared_type_fact(
             return Some(DeclaredFieldTypeFact {
                 type_text: node_text(type_node, &contextual_declaration).to_string(),
                 indirection: recovered.pointer_depth(),
+                // A function-like declarator names a callable member, never a
+                // subobject of the declared return type.
+                binds_indirectly: true,
                 template_arguments: cpp_template_reference_arguments(
                     type_node,
                     &contextual_declaration,
@@ -12997,7 +13019,7 @@ fn decode_declared_field_type_node(
     let type_node = node
         .child_by_field_name("type")
         .or_else(|| first_type_child(node))?;
-    let indirection = declared_name_indirection(node, type_node, field_name, source)?;
+    let binding = declared_name_binding(node, type_node, field_name, source)?;
     let declared_type = if matches!(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier"
@@ -13011,7 +13033,8 @@ fn decode_declared_field_type_node(
             || field_name.to_string(),
             |declared_type| node_text(declared_type, source).to_string(),
         ),
-        indirection,
+        indirection: binding.pointer_depth,
+        binds_indirectly: binding.indirect,
         template_arguments: declared_type
             .and_then(|declared_type| cpp_template_reference_arguments(declared_type, source)),
     })
@@ -13354,12 +13377,23 @@ fn append_structured_type_components(
     }
 }
 
-pub(crate) fn declared_name_indirection(
+/// How the declarator that names a declared entity binds the declaration's
+/// type.
+pub(crate) struct DeclaredNameBinding {
+    /// Pointer declarators between the type and the name.
+    pub pointer_depth: i32,
+    /// The name binds the declared type through a pointer or a reference, so
+    /// the declared entity holds no subobject of that type. An array of the
+    /// type does hold subobjects, so it is not indirect.
+    pub indirect: bool,
+}
+
+pub(crate) fn declared_name_binding(
     declaration: Node<'_>,
     type_node: Node<'_>,
     field_name: &str,
     source: &str,
-) -> Option<i32> {
+) -> Option<DeclaredNameBinding> {
     let mut stack = Vec::new();
     let mut cursor = declaration.walk();
     stack.extend(
@@ -13371,14 +13405,22 @@ pub(crate) fn declared_name_indirection(
         if matches!(node.kind(), "identifier" | "field_identifier")
             && node_text(node, source) == field_name
         {
-            let mut indirection = 0;
+            let mut binding = DeclaredNameBinding {
+                pointer_depth: 0,
+                indirect: false,
+            };
             let mut current = node.parent();
             while let Some(parent) = current {
                 if same_node(parent, declaration) {
-                    return Some(indirection);
+                    return Some(binding);
                 }
-                if parent.kind() == "pointer_declarator" {
-                    indirection += 1;
+                match parent.kind() {
+                    "pointer_declarator" => {
+                        binding.pointer_depth += 1;
+                        binding.indirect = true;
+                    }
+                    "reference_declarator" => binding.indirect = true,
+                    _ => {}
                 }
                 current = parent.parent();
             }

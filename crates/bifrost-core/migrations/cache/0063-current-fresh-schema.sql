@@ -1589,7 +1589,7 @@ CREATE TABLE IF NOT EXISTS "class_set_finding_free_root_rows" (
         'dynamic_attributes', 'pack_incomplete', 'uncertain_flow',
         'field_slot_incomplete', 'solver_budget', 'semantic_budget',
         'incomplete_root', 'open_type_bound', 'scalar_receiver',
-        'class_creation'))
+        'class_creation', 'class_object'))
     OR
     (atom_kind = 'unknown' AND class_name IS NULL
       AND unknown_reason IS NOT NULL AND unknown_reason = 'unmodeled_guard'

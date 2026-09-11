@@ -4770,6 +4770,15 @@ fn scala_focused_qualified_path<'tree>(
                 }
             }
             "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
+            // A call or infix application below the path root means the chain
+            // continues through a computed value, not a stable selection:
+            // `a.b(c).d` or `a.b + c` offers no qualified owner for its
+            // terminal. The climb never crosses these nodes, so one reachable
+            // here is always mid-chain. Treating its identifiers as segments
+            // once minted an unbounded vocabulary of fake owner paths
+            // (`a.map.filter` from `a.map(f).filter(g)`), each queried and
+            // permanently interned (#3268).
+            "call_expression" | "infix_expression" => return None,
             _ => {
                 let mut cursor = current.walk();
                 let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
@@ -6275,30 +6284,6 @@ fn scala_exact_singleton_apply_outcome(
         .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
         .collect::<Vec<_>>();
     sort_units(&mut units);
-    if let Some(call_shape) = call_shape
-        && let [arguments] = call_shape.lists.as_slice()
-        && arguments.kind == ScalaCallArgumentListKind::Ordinary
-    {
-        let exact_arity = units
-            .iter()
-            .filter(|candidate| {
-                method_signature_arity(ctx.scala, candidate) == Some(arguments.arity)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        match exact_arity.len() {
-            0 => {}
-            1 => units = exact_arity,
-            _ => {
-                return no_definition(
-                    "ambiguous_scala_callable",
-                    format!(
-                        "`{reference}` has multiple same-arity lexical singleton `apply` overloads"
-                    ),
-                );
-            }
-        }
-    }
     let candidates = scala_filter_callable_units(
         ctx.scala,
         units,

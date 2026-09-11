@@ -55,7 +55,7 @@ pub(super) const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 ///
 /// - a `match` policy answers through [`explain_match_candidate`];
 /// - an `assertion` policy that carries a relational row plan answers through
-///   the relational adapter, which decides per-binding row membership.
+///   the relational adapter, which replays candidate joins and group keys.
 ///
 /// # Errors
 ///
@@ -343,6 +343,9 @@ pub(super) struct StageWalk {
     executed: usize,
     prefixes_truncated: bool,
     omitted_prefixes: u64,
+    pub(super) terminal_rows: Vec<brokk_bifrost_rql::structural::search::UnitRowItem>,
+    pub(super) terminal_coverage: crate::relational::RelationCoverage,
+    pub(super) candidate_rows: Vec<usize>,
 }
 
 impl StageWalk {
@@ -440,6 +443,55 @@ pub(super) fn run_prefixes(
             lineage.target_retained.then_some(lineage)
         })
         .unwrap_or_default();
+    let terminal = executed_prefixes
+        .iter()
+        .find(|(prefix, _)| *prefix == step_count);
+    let terminal_rows: Vec<_> = terminal
+        .into_iter()
+        .flat_map(|(_, result)| {
+            result
+                .result
+                .results
+                .iter()
+                .map(brokk_bifrost_rql::structural::search::UnitRowItem::project)
+        })
+        .collect();
+    let terminal_coverage = terminal.map_or_else(
+        || {
+            crate::relational::RelationCoverage::incomplete(vec![
+                PolicyIncompleteReason::ReportRetentionBudget,
+            ])
+        },
+        |(_, result)| {
+            crate::relational::RelationCoverage::from_query(
+                &terminal_rows,
+                &result.result.completion(),
+                result.result.truncated,
+            )
+        },
+    );
+    let candidate_rows = terminal
+        .into_iter()
+        .flat_map(|(prefix, result)| {
+            result
+                .evidence
+                .iter()
+                .filter(|evidence| {
+                    if lineage.target_retained {
+                        lineage_covering(
+                            *prefix,
+                            &result.result.results,
+                            std::slice::from_ref(*evidence),
+                            &lineage,
+                        )
+                        .is_some()
+                    } else {
+                        evidence_covers_candidate(evidence, candidate)
+                    }
+                })
+                .map(|evidence| evidence.result_index)
+        })
+        .collect();
     executed_prefixes.reverse();
 
     // An absent source-span fallback is not conclusive when a later prefix was
@@ -626,6 +678,9 @@ pub(super) fn run_prefixes(
         executed: executed_count,
         prefixes_truncated: omitted_prefixes > 0,
         omitted_prefixes,
+        terminal_rows,
+        terminal_coverage,
+        candidate_rows,
     }
 }
 

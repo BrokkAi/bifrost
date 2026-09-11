@@ -32,7 +32,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 62;
+const CURRENT_MIGRATION_VERSION: i64 = 63;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -122,8 +122,10 @@ const CLASS_SET_UNMODELED_GUARDS_SQL: &str =
     include_str!("../migrations/cache/0061-class-set-unmodeled-guards.sql");
 const CLASS_SET_CLASS_CREATION_REMAINDER_SQL: &str =
     include_str!("../migrations/cache/0062-class-set-class-creation-remainder.sql");
+const CLASS_SET_CLASS_OBJECT_SQL: &str =
+    include_str!("../migrations/cache/0063-class-set-class-object.sql");
 const CURRENT_FRESH_SCHEMA_SQL: &str =
-    include_str!("../migrations/cache/0062-current-fresh-schema.sql");
+    include_str!("../migrations/cache/0063-current-fresh-schema.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -144,7 +146,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 44] = [
+const CACHE_MIGRATIONS: [CacheMigration; 45] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -321,6 +323,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 44] = [
         version: 62,
         sql: CLASS_SET_CLASS_CREATION_REMAINDER_SQL,
     },
+    CacheMigration {
+        version: 63,
+        sql: CLASS_SET_CLASS_OBJECT_SQL,
+    },
 ];
 
 // The store file is named for the schema version that wrote it, so the list
@@ -367,8 +373,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    0x7f, 0x9d, 0x32, 0xd3, 0x77, 0xac, 0x41, 0x15, 0x6a, 0x55, 0x08, 0x7f, 0x7c, 0x21, 0x3a, 0xda,
-    0xbe, 0x86, 0x45, 0x97, 0x44, 0x39, 0xfa, 0xd9, 0x5a, 0xe0, 0x80, 0xbd, 0x1c, 0xce, 0x4a, 0xbc,
+    0x64, 0xb0, 0x34, 0x50, 0xe2, 0xeb, 0xdd, 0xed, 0xbc, 0x22, 0xe5, 0x7f, 0xf5, 0x09, 0x80, 0x9f,
+    0x48, 0xcc, 0xd6, 0xce, 0x59, 0x25, 0x91, 0xd9, 0x70, 0xfd, 0x4c, 0x24, 0x3c, 0x7c, 0x3f, 0x62,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -5813,6 +5819,16 @@ mod tests {
             .is_err(),
             "schema 56 must reject the reason added by schema 62"
         );
+        assert!(
+            conn.execute(
+                "INSERT INTO class_set_finding_free_root_rows VALUES(
+                   ?1,4,'src/app.py',38,2,8,39,2,9,'class','unknown',NULL,
+                   'class_object','partial')",
+                [result_id],
+            )
+            .is_err(),
+            "schema 56 must reject the reason added by schema 63"
+        );
 
         migrate(&mut conn).unwrap();
         assert_eq!(
@@ -5872,6 +5888,15 @@ mod tests {
             "INSERT INTO class_set_finding_free_root_rows VALUES(
                ?1,5,'src/app.py',36,2,6,37,2,7,'created','unknown',NULL,
                'class_creation','partial',NULL)",
+            [result_id],
+        )
+        .unwrap();
+
+        // The class-object remainder schema 63 admits.
+        conn.execute(
+            "INSERT INTO class_set_finding_free_root_rows VALUES(
+               ?1,6,'src/app.py',38,2,8,39,2,9,'class','unknown',NULL,
+               'class_object','partial',NULL)",
             [result_id],
         )
         .unwrap();

@@ -13,6 +13,8 @@ pub enum PythonLexicalNameResolution {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PythonDirectScopeBindingKind {
     ClassDeclaration,
+    FunctionDeclaration,
+    Import,
     Other,
 }
 
@@ -683,7 +685,11 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
             if let Some(name) = node.child_by_field_name("name") {
                 bindings.push(PythonDirectScopeBinding {
                     declaration: name,
-                    kind: PythonDirectScopeBindingKind::Other,
+                    kind: if is_direct_module_definition_bounded(node, &mut scope_step)? {
+                        PythonDirectScopeBindingKind::FunctionDeclaration
+                    } else {
+                        PythonDirectScopeBindingKind::Other
+                    },
                 });
             }
         }
@@ -700,10 +706,15 @@ pub fn python_direct_scope_bindings_bounded<'tree>(
             }
         }
         "import_statement" | "import_from_statement" => {
+            let module_level = is_direct_module_definition_bounded(node, &mut scope_step)?;
             collect_import_bindings(node, &mut scope_step, |declaration| {
                 bindings.push(PythonDirectScopeBinding {
                     declaration,
-                    kind: PythonDirectScopeBindingKind::Other,
+                    kind: if module_level {
+                        PythonDirectScopeBindingKind::Import
+                    } else {
+                        PythonDirectScopeBindingKind::Other
+                    },
                 });
             })?;
         }
@@ -844,29 +855,47 @@ pub fn python_unambiguous_module_class_binding_bounded(
     root: Node<'_>,
     source: &str,
     target_name: &str,
-    mut scope_step: impl FnMut() -> bool,
+    scope_step: impl FnMut() -> bool,
 ) -> Option<bool> {
+    Some(
+        python_unambiguous_module_binding_bounded(root, source, target_name, scope_step)?
+            == Some(PythonDirectScopeBindingKind::ClassDeclaration),
+    )
+}
+
+/// The kind of the module scope's one binding of `target_name`.
+///
+/// `Some(None)` says the module does not bind the name, binds it more than
+/// once, or leaves its identity open through a wildcard import; the name is
+/// then not a proven reference to one module-level declaration. `None` says the
+/// bounded walk ran out of work.
+pub fn python_unambiguous_module_binding_bounded(
+    root: Node<'_>,
+    source: &str,
+    target_name: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Option<PythonDirectScopeBindingKind>> {
     let mut matched = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if !scope_step() {
             return None;
         }
-        // A later unconditional class declaration replaces an earlier
-        // wildcard binding; a wildcard after the class leaves its identity open.
+        // A later unconditional declaration replaces an earlier wildcard
+        // binding; a wildcard after it leaves its identity open.
         if node.kind() == "wildcard_import" && matched.is_some() {
-            return Some(false);
+            return Some(None);
         }
         for binding in python_direct_scope_bindings_bounded(node, source, &mut scope_step)? {
             if node_text(binding.declaration, source) != target_name {
                 continue;
             }
             if matched.is_some() {
-                return Some(false);
+                return Some(None);
             }
             matched = Some(binding.kind);
             if binding.kind == PythonDirectScopeBindingKind::Other {
-                return Some(false);
+                return Some(Some(PythonDirectScopeBindingKind::Other));
             }
         }
 
@@ -887,7 +916,7 @@ pub fn python_unambiguous_module_class_binding_bounded(
             stack.push(child);
         }
     }
-    Some(matched == Some(PythonDirectScopeBindingKind::ClassDeclaration))
+    Some(matched)
 }
 
 fn is_direct_module_definition_bounded(

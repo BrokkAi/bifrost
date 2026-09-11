@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
 use brokk_bifrost_python::bindings::{
-    PythonLexicalNameResolution, python_comprehension_binds_name_at,
+    PythonDirectScopeBindingKind, PythonLexicalNameResolution, python_comprehension_binds_name_at,
     python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
-    python_unambiguous_module_class_binding_bounded,
+    python_unambiguous_module_binding_bounded, python_unambiguous_module_class_binding_bounded,
 };
 use brokk_bifrost_python::declarations::{python_base_origin_node, python_first_parameter_name};
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
@@ -41,6 +41,7 @@ use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
     SemanticModelOverlay, SemanticModelSymbolKind, semantic_model_callable_family_id,
 };
+use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::get_definition::{
     PythonDefinitionProvider, ResolutionSession, python_attribute_callee_reads_a_field_bounded,
     python_external_imported_symbol_bounded, python_namespace_imported_class_name_bounded,
@@ -1189,6 +1190,205 @@ fn identifier_reads_an_enclosing_local(reference: Node<'_>, source: &str) -> boo
     false
 }
 
+/// The seed for a bare name that denotes a module-level declaration or import.
+///
+/// A name that denotes a class evaluates to the class object itself, not to an
+/// instance of it, and a name that denotes a function evaluates to the function
+/// object. Answering `NotApplicable` contributed no atom at all, so such a
+/// value reaching a parameter let that parameter's class set close without it
+/// and the absent-member policy proved a member absent on the classes that did
+/// survive (issue #3282).
+///
+/// The class-set domain cannot name a class object's member surface -- its
+/// metaclass's members plus the class's own class-level attributes -- which is
+/// what `ClassObject` says. A function object's class is likewise not a class
+/// this domain names, and no reason states that specifically, so it keeps the
+/// unnamed-flow remainder. An import whose target neither the workspace nor the
+/// active model names keeps that remainder too: what it binds is unknown, which
+/// is not the same as binding nothing.
+///
+/// The name denotes that declaration only when this module binds it exactly
+/// once and nothing between the reference and that binding rebinds it. A name
+/// a closer binding holds is a value read rather than a seed site: the flow
+/// engine already carries whatever atoms that value has. A `global`
+/// declaration does not shadow, it names the module binding, so a read under
+/// one is seeded like any other.
+fn declaration_reference_seed(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> ClassSeed {
+    debug_assert_eq!(
+        reference.kind(),
+        "identifier",
+        "a declaration reference seed reads a bare name"
+    );
+    let source = prepared.source();
+    let Ok(name) = reference.utf8_text(source.as_bytes()) else {
+        return ClassSeed::NotApplicable;
+    };
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let binding = match python_unambiguous_module_binding_bounded(
+        prepared.tree().root_node(),
+        source,
+        name,
+        || session.scope_step(),
+    ) {
+        None => return ClassSeed::Unknown(UnknownReason::SemanticBudget),
+        Some(Some(
+            binding @ (PythonDirectScopeBindingKind::ClassDeclaration
+            | PythonDirectScopeBindingKind::FunctionDeclaration
+            | PythonDirectScopeBindingKind::Import),
+        )) => binding,
+        Some(Some(PythonDirectScopeBindingKind::Other)) | Some(None) => {
+            return ClassSeed::NotApplicable;
+        }
+    };
+    match module_binding_reaches_reference(reference, name, source, &session) {
+        None => return ClassSeed::Unknown(UnknownReason::SemanticBudget),
+        // A closer binding holds the name, so this reference reads that local,
+        // parameter or comprehension target rather than the module's. That is
+        // an ordinary value read and not a seed site: whatever produced the
+        // closer binding already supplies the value's atoms through dataflow,
+        // and an atom added here would only turn an exact row partial.
+        Some(false) => return ClassSeed::NotApplicable,
+        Some(true) => {}
+    }
+    if binding == PythonDirectScopeBindingKind::FunctionDeclaration {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
+    if binding == PythonDirectScopeBindingKind::Import
+        && import_binds_a_module(workspace, file, name)
+    {
+        return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+    }
+    match resolve_class_at_span(workspace, file.clone(), span_for_node(reference), prepared) {
+        ClassSeed::Class(_)
+        | ClassSeed::ClassWithOpenBound(_)
+        | ClassSeed::ClassesWithOpenBound(_) => ClassSeed::Unknown(UnknownReason::ClassObject),
+        ClassSeed::Unknown(reason) => ClassSeed::Unknown(reason),
+        ClassSeed::NotApplicable
+            if binding == PythonDirectScopeBindingKind::Import
+                && imported_external_class(workspace, file, prepared, reference).is_some() =>
+        {
+            ClassSeed::Unknown(UnknownReason::ClassObject)
+        }
+        ClassSeed::NotApplicable => ClassSeed::Unknown(UnknownReason::UncertainFlow),
+    }
+}
+
+/// Whether the import that binds `name` binds a module object.
+///
+/// `import os`, `import pkg.child as alias`, and a `from pkg import child`
+/// whose target is itself a module all record `ImportKind::Namespace`, and what
+/// they bind is a module, which is never a class. Reading the binder's kind
+/// settles that without the bounded type lookup and overlay read a class
+/// reference needs. The saving is the point: `logging.getLogger` and
+/// `os.path.join` put a namespace-bound base on a large share of the lines in a
+/// real repository, and the binder is memoized per file while each lookup is
+/// not.
+fn import_binds_a_module(workspace: &WorkspaceAnalyzer, file: &ProjectFile, name: &str) -> bool {
+    let python = python_analyzer(workspace);
+    let scope = AnalyzerQueryScope::new(python);
+    python
+        .import_binder_of(scope.token(), file)
+        .bindings
+        .get(name)
+        .is_some_and(|binding| binding.kind == ImportKind::Namespace)
+}
+
+/// The modeled external class an import-bound name denotes.
+///
+/// A dependency's class has no workspace declaration, so the type lookup in
+/// [`resolve_class_at_span`] answers nothing for `JSONDecoder` in `from json
+/// import JSONDecoder`. The import binder is what names the module and the
+/// member the statement binds, and the active model is what says whether that
+/// pair is a class; this is the route the adapter already uses for external
+/// callees and bases.
+fn imported_external_class(
+    workspace: &WorkspaceAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    reference: Node<'_>,
+) -> Option<ClassIdentity> {
+    let python = python_analyzer(workspace);
+    let scope = AnalyzerQueryScope::new(python);
+    let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+    let support = PythonDefinitionProvider::new(python, &session);
+    let (module, member) = python_external_imported_symbol_bounded(
+        &support,
+        scope.token(),
+        file,
+        prepared.source(),
+        prepared.tree().root_node(),
+        reference,
+    )?;
+    external_class_identity(
+        overlay_of(workspace).as_deref(),
+        Language::Python,
+        &format!("{module}.{member}"),
+        None,
+        &mut ExternalClassCache::default(),
+    )
+}
+
+/// Whether the module-scope binding of `name` is what `reference` reads.
+///
+/// A closer binding defeats the proof: a local, a parameter, a `nonlocal` that
+/// names an enclosing callable's binding, a comprehension target, a type
+/// parameter, or a class body that binds the name -- the last only while no
+/// callable body has been crossed, because a class scope is invisible to a
+/// callable nested inside it.
+///
+/// A `global` declaration is the opposite: it says the module binding is
+/// exactly what this reference reads, whatever any enclosing scope binds, so it
+/// proves the question outright.
+fn module_binding_reaches_reference(
+    reference: Node<'_>,
+    name: &str,
+    source: &str,
+    session: &ResolutionSession,
+) -> Option<bool> {
+    if python_comprehension_binds_name_at(name, reference, source)
+        || python_type_parameter_binds_name_at(name, reference, source)
+    {
+        return Some(false);
+    }
+    let mut current = reference;
+    let mut crossed_callable_body = false;
+    while let Some(scope) = current.parent() {
+        if !session.scope_step() {
+            return None;
+        }
+        let inside_body = scope.child_by_field_name("body").is_some_and(|body| {
+            body.start_byte() <= reference.start_byte() && reference.end_byte() <= body.end_byte()
+        });
+        if inside_body && matches!(scope.kind(), "function_definition" | "lambda") {
+            let inventory =
+                python_lexical_scope_inventory_bounded(scope, source, || session.scope_step())?;
+            match inventory.name_resolution_at(name, reference) {
+                PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                    return Some(false);
+                }
+                PythonLexicalNameResolution::Global => return Some(true),
+                PythonLexicalNameResolution::Unbound => {}
+            }
+            crossed_callable_body = true;
+        } else if inside_body
+            && !crossed_callable_body
+            && scope.kind() == "class_definition"
+            && python_module_or_class_scope_binds_name_bounded(scope, name, source, || {
+                session.scope_step()
+            })?
+        {
+            return Some(false);
+        }
+        current = scope;
+    }
+    Some(true)
+}
+
 /// The builtin class a Python string literal produces.
 ///
 /// The grammar gives `"text"` and `b"text"` the same `string` kind and carries
@@ -1674,10 +1874,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
         // Keep cached class sets in step with program-point refinement,
-        // guard remainders, scoped writes, and open builtin call results.
+        // guard remainders, scoped writes, open builtin call results, and the
+        // class-object remainder a declared or imported class reference now
+        // seeds.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-v32",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-v35",
         )
         .expect("adapter name is non-empty")
     }
@@ -1861,11 +2063,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             }
             return ClassSeed::Unknown(UnknownReason::UncertainFlow);
         }
-        if !matches!(node.kind(), "string" | "concatenated_string") {
-            return ClassSeed::NotApplicable;
+        match node.kind() {
+            "string" | "concatenated_string" => {
+                let mut cache = ExternalClassCache::default();
+                external_seed(overlay_of(workspace).as_deref(), "builtins.str", &mut cache)
+            }
+            "identifier" => declaration_reference_seed(workspace, &file, &prepared, node),
+            _ => ClassSeed::NotApplicable,
         }
-        let mut cache = ExternalClassCache::default();
-        external_seed(overlay_of(workspace).as_deref(), "builtins.str", &mut cache)
     }
 
     fn constructed_class(
@@ -1893,13 +2098,18 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         };
         let span = mapping.locator.anchor().span();
         let seed = resolve_class_at_span(workspace, file.clone(), span, &prepared);
-        if let ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) = &seed
-            && matches!(qualified_name.as_ref(), "builtins.super" | "builtins.type")
-        {
-            // `super()` returns a proxy bound to the enclosing class and
-            // `type(value)` returns a class object. Neither result has the
-            // instance member surface declared by the builtin class itself.
-            return ClassSeed::Unknown(UnknownReason::UncertainFlow);
+        if let ClassSeed::Class(ClassIdentity::External { qualified_name, .. }) = &seed {
+            // Neither result has the instance member surface declared by the
+            // builtin class itself.
+            match qualified_name.as_ref() {
+                // `type(value)` returns a class object, which is exactly what
+                // `ClassObject` names.
+                "builtins.type" => return ClassSeed::Unknown(UnknownReason::ClassObject),
+                // `super()` returns a proxy bound to the enclosing class. It is
+                // not a class object, so it keeps the unnamed-flow remainder.
+                "builtins.super" => return ClassSeed::Unknown(UnknownReason::UncertainFlow),
+                _ => {}
+            }
         }
         if matches!(seed, ClassSeed::Class(_))
             && callee_reads_a_value(workspace, &file, &prepared, span)

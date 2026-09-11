@@ -20,6 +20,7 @@ source "$script_directory/../lib/fail.sh"
 : "${RELEASE_VERSION:?RELEASE_VERSION is required}"
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 dist_dir="${DIST_DIR:-dist}"
+max_crates_io_upload_bytes=10485760
 
 cd "$repository_root"
 
@@ -37,6 +38,9 @@ for package in "${RELEASE_CRATES[@]}"; do
     --manifest-path Cargo.toml "${RELEASE_CRATE_PATCH_ARGS[@]}"
   archive="${RUNNER_TEMP}/crate-target/package/${package}-${RELEASE_VERSION}.crate"
   [[ -f "$archive" ]] || die "cargo package produced no $archive"
+  archive_bytes=$(wc -c < "$archive")
+  ((archive_bytes <= max_crates_io_upload_bytes)) ||
+    die "$archive is ${archive_bytes} bytes; crates.io accepts at most ${max_crates_io_upload_bytes} bytes"
   archive_name="$(basename "$archive")"
   cp "$archive" "$dist_dir/"
   sha256sum "$archive" > "$dist_dir/${archive_name}.sha256"

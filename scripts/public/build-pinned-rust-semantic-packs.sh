@@ -8,6 +8,9 @@ fi
 
 output_dir=$1
 work_dir=$2
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/semantic-pack-tool.sh
+source "$script_directory/../lib/semantic-pack-tool.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 archive_dir="${input_dir}/rust-docs-json-nightly-x86_64-unknown-linux-gnu"
 source_dir="${input_dir}/rust-docs-json-nightly-2026-08-24"
@@ -32,10 +35,8 @@ for crate in core alloc std; do
 done
 
 cd - >/dev/null
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
+run_semantic_pack_tool generate \
   "${output_dir}" \
   semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json "${source_dir}"
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
+run_semantic_pack_tool verify \
   "${output_dir}"

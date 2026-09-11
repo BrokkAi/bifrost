@@ -8,6 +8,9 @@ fi
 
 output_dir=$1
 work_dir=$2
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/semantic-pack-tool.sh
+source "$script_directory/../lib/semantic-pack-tool.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 temurin_dir="${work_dir}/temurin"
 
@@ -38,12 +41,10 @@ shasum -a 256 --check <<'CHECKSUMS'
 CHECKSUMS
 
 cd - >/dev/null
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
+run_semantic_pack_tool generate \
   "${output_dir}" \
   semantic-packs/jvm/temurin-jdk-21.0.8+9.json "${input_dir}/src.zip" \
   semantic-packs/jvm/kotlin-stdlib-2.2.20.json "${input_dir}/kotlin-stdlib-2.2.20-sources.jar" \
   semantic-packs/jvm/scala-library-2.13.16.json "${input_dir}/scala-library-2.13.16-sources.jar"
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
+run_semantic_pack_tool verify \
   "${output_dir}"

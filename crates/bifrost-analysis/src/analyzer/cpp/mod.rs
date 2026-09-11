@@ -1804,12 +1804,28 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.indexed_source(file)
     }
 
+    /// #1970/#3287: the `cpp` row-set answers for a header's C++ reading only,
+    /// so a declaration site the C reading alone names -- the members of an
+    /// anonymous aggregate, and the receiver its declarator names -- is
+    /// addressable at no location without this union.
     fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.inner.location_declarations(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let mut declarations = self.inner.location_declarations(file);
+        declarations.extend(self.c_reading_only_site_declarations(token, file));
+        declarations
     }
 
     fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
-        self.inner.location_ranges(code_unit)
+        let ranges = self.inner.location_ranges(code_unit);
+        if !ranges.is_empty() {
+            return ranges;
+        }
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        // #1970: a unit only the C reading of a header mints has no `cpp` rows
+        // at all, so the store cannot answer for it.
+        self.c_reading_ranges(token, code_unit).unwrap_or(ranges)
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {

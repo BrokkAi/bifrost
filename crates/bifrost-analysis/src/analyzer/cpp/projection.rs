@@ -306,6 +306,34 @@ impl CppAnalyzer {
         reading.ranges.get(code_unit).cloned()
     }
 
+    /// The published C reading's declarations that no C++ identity shares a
+    /// declaration site with.
+    ///
+    /// A location query enumerates the `cpp` row-set, so a unit only the C
+    /// reading mints is addressable at no location at all. Where both
+    /// readings name one site, the C++ identity is the addressable one by
+    /// this module's reading-selector decision and
+    /// [`Self::site_equivalent_units`] already unions inverse results across
+    /// the pair, so offering the second identity there would only make the
+    /// site ambiguous. What is left is a site the C++ walk mints nothing for
+    /// -- the members of an anonymous aggregate and their generated receiver
+    /// -- which is reachable under no other identity (#3287).
+    pub(crate) fn c_reading_only_site_declarations(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<CodeUnit> {
+        let Some(reading) = self.published_c_reading(token, file) else {
+            return Vec::new();
+        };
+        reading
+            .c_only
+            .iter()
+            .filter(|unit| !reading.site_equivalents.contains_key(*unit))
+            .cloned()
+            .collect()
+    }
+
     /// The C reading's child edges for `code_unit`, for the same reason.
     pub(crate) fn c_reading_children(
         &self,

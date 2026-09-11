@@ -747,6 +747,33 @@ impl ScanCtx<'_> {
         })
     }
 
+    fn module_binding_targets_module(&self, ident: &str, node: Node<'_>) -> bool {
+        self.module_binding_matches_query(ident, node, false, |kind| {
+            kind == ModuleBindingKind::TargetModuleImport
+        })
+    }
+
+    /// Whether a bare read of `ident` at `node` reaches a non-module target
+    /// that an import edge brings into this file under that name.
+    ///
+    /// An import of the target's own name reaches it, and so does a later
+    /// local rebinding of that name (`f = wrap(f)`), which still carries the
+    /// imported value. A module binding never does: `from pkg import models`,
+    /// and `from pkg import reexport` where `reexport.py` says
+    /// `from base import *`, both bind the module object. Only the attribute
+    /// path `models.Target` / `reexport.target` reaches the target, and
+    /// `handle_attribute_candidate` records that (#3294). A guarded import
+    /// whose `except` arm rebinds the local (`reexport = None`) leaves an
+    /// `Other` event beside the module import, which is why the module
+    /// question decides after the local-rebinding one.
+    fn bare_read_binds_target(&self, ident: &str, node: Node<'_>) -> bool {
+        if self.module_binding_targets_symbol(ident, node) {
+            return true;
+        }
+        self.module_binding_is_local_at(ident, node)
+            && !self.module_binding_targets_module(ident, node)
+    }
+
     /// Whether the class enclosing `node` is the target member's owner (or a
     /// subclass of it, for inherited members). Used to resolve `self`/`cls`
     /// receivers, whose type is the lexically enclosing class.
@@ -1169,8 +1196,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if !ctx.target_is_module
         && ctx.edges.iter().any(|edge| edge.local_name == text)
-        && !ctx.module_binding_is_local_at(text, node)
-        && !ctx.module_binding_targets_symbol(text, node)
+        && !ctx.bare_read_binds_target(text, node)
     {
         return;
     }

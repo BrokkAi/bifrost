@@ -9,6 +9,9 @@ fi
 output_dir=$1
 work_dir=$2
 cache_root=${3:-}
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/semantic-pack-tool.sh
+source "$script_directory/../lib/semantic-pack-tool.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 typeshed_dir="${work_dir}/typeshed"
 
@@ -35,16 +38,13 @@ cp -R \
   "${input_dir}/typeshed-stdlib-1620e2254765/"
 
 cd - >/dev/null
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
+run_semantic_pack_tool generate \
   "${output_dir}" \
   semantic-packs/python/typeshed-stdlib-2026.8.31.json \
   "${input_dir}/typeshed-stdlib-1620e2254765" \
   semantic-packs/python/unittest-assertions-2026.9.7.spec.json \
   semantic-packs/python/unittest-assertions-2026.9.7.json
-cargo run --locked --release --features release-tooling \
-  -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
-  "${output_dir}"
+run_semantic_pack_tool verify "${output_dir}"
 
 if [[ -n "${cache_root}" ]]; then
   catalog_version=$(sed -nE \
@@ -56,8 +56,7 @@ if [[ -n "${cache_root}" ]]; then
   fi
   catalog_directory="semantic-pack-catalog.v${catalog_version}"
   mkdir -p "${cache_root}"
-  cargo run --locked --release --features release-tooling \
-    -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- install \
+  run_semantic_pack_tool install \
     "${output_dir}" "${cache_root}/${catalog_directory}"
   python3 - \
     "${output_dir}" "${cache_root}" "${catalog_version}" "${catalog_directory}" <<'PY'

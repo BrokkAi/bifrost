@@ -2156,9 +2156,6 @@ fn csharp_reference_node<'tree>(
     if !definitions.scope_step() {
         return None;
     }
-    if let Some(name) = csharp_attribute_name_node(node) {
-        return Some(CSharpReferenceNode::Attribute(name));
-    }
     // A named-argument label is a leaf in its argument's `name` field, so the
     // walk below never reaches it, and every shape it could otherwise fall
     // through to -- type reference, unqualified member, bare identifier --
@@ -2209,6 +2206,22 @@ fn csharp_reference_node<'tree>(
         } else {
             break;
         }
+    }
+
+    // An attribute name is a type reference the grammar spells outside the
+    // type roles, so the per-segment contract that #3118 gave qualified type
+    // names has to reach it too: only the segment the climb stopped on is
+    // being asked about. The whole `name` node is the attribute type and takes
+    // the attribute-specific resolution (shorthand `Attribute` suffix,
+    // attribute-applicability); a shorter prefix is an ordinary focused type
+    // segment, which must answer for itself and never for the attribute class
+    // spelled after the dot (#3289).
+    if let Some(name) = csharp_attribute_name_node(current) {
+        return Some(if same_node(name, current) {
+            CSharpReferenceNode::Attribute(name)
+        } else {
+            CSharpReferenceNode::Type(CSharpTypeReference::FocusedSegment(current))
+        });
     }
 
     match current.kind() {

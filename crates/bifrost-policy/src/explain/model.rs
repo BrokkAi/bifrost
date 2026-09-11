@@ -90,7 +90,7 @@ pub enum ExplanationNodeKind {
     /// travelled through, one representative row behind an assertion, or one
     /// origin a tracked value entered at.
     SourceFact,
-    /// One stage of the selector pipeline: the plan source, or one typed step.
+    /// One selector or relational-plan stage: a source or typed operator.
     SelectorStage,
     /// One authored relational row binding: a named relation and what its
     /// executed query said. Its children are that binding's selector stages.
@@ -486,6 +486,7 @@ pub struct ExplanationLimits {
     max_retained_bytes: usize,
     max_text_bytes: usize,
     max_prefix_executions: usize,
+    max_relation_executions: usize,
     max_near_miss_candidates: usize,
     max_near_miss_executions: usize,
 }
@@ -498,11 +499,10 @@ impl Default for ExplanationLimits {
             max_children_per_node: 64,
             max_retained_bytes: 64 * 1024,
             max_text_bytes: 512,
-            // MAX_QUERY_STEPS is 16, so one selector's source plus every step
-            // fits in 17 executions. A relational plan's row bindings share
-            // this one total, so the default holds three full-depth bindings
-            // and truncates honestly beyond that.
+            // Source-prefix walks and key-scoped relational queries share
+            // one total. Each query also obeys the policy's execution bounds.
             max_prefix_executions: 64,
+            max_relation_executions: 64,
             // A ranking is read by a human refining a rule, so the default
             // retains a page of subjects rather than a corpus.
             max_near_miss_candidates: 16,
@@ -531,9 +531,18 @@ impl ExplanationLimits {
     pub const fn max_text_bytes(&self) -> usize {
         self.max_text_bytes
     }
-    /// How many bounded prefix queries `why-not` may execute.
+    /// How many source-prefix and relational key queries `why-not` may execute.
     pub const fn max_prefix_executions(&self) -> usize {
         self.max_prefix_executions
+    }
+    /// Bounded key-scoped source queries shared by joins and group replay.
+    pub const fn max_relation_executions(&self) -> usize {
+        self.max_relation_executions
+    }
+    #[must_use]
+    pub const fn with_max_relation_executions(mut self, value: usize) -> Self {
+        self.max_relation_executions = value;
+        self
     }
     /// How many ranked subjects a near-miss ranking retains.
     pub const fn max_near_miss_candidates(&self) -> usize {

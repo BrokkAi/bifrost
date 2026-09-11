@@ -268,6 +268,29 @@ impl ParsedFile {
         }
     }
 
+    /// Grows the recorded range of `code_unit` that opens nearest before
+    /// `range` so it also contains `range`.
+    ///
+    /// A parse error can truncate a container's node while the declarations
+    /// the source nests inside it survive as siblings of that node. An
+    /// adapter that re-parents those siblings onto the container (Scala's
+    /// recovery owners, `scala/declarations.rs`) must grow the container's
+    /// range with them, or the container ends up not containing the members
+    /// it claims (#3291).
+    pub fn extend_declaration_range(&mut self, code_unit: &CodeUnit, range: Range) {
+        let ranges = self
+            .ranges
+            .get_mut(code_unit)
+            .expect("a declaration whose range is extended was recorded with one");
+        let opening = ranges
+            .iter_mut()
+            .filter(|recorded| recorded.start_byte <= range.start_byte)
+            .max_by_key(|recorded| recorded.start_byte)
+            .expect("a container's recorded range opens before the member it adopts");
+        opening.end_byte = opening.end_byte.max(range.end_byte);
+        opening.end_line = opening.end_line.max(range.end_line);
+    }
+
     /// Registers a source-backed lookup fact without exposing it through the
     /// public declaration surface.
     pub fn add_definition_lookup_unit(
@@ -563,10 +586,6 @@ impl ParsedFile {
 
     pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
         self.type_aliases.insert(code_unit);
-    }
-
-    pub fn set_primary_range(&mut self, code_unit: &CodeUnit, range: Range) {
-        self.ranges.insert(code_unit.clone(), vec![range]);
     }
 
     pub fn first_range_start(&self, code_unit: &CodeUnit) -> Option<usize> {

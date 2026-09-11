@@ -52,3 +52,5 @@ pub use validate::{RelationalAssertionPlanError, validate_limits, validate_plan_
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use eval::{ReplayConstraints, ReplayInput, replay_candidate_ir};

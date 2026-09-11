@@ -1542,7 +1542,7 @@ fn why_not_reports_the_binding_the_candidate_is_absent_from() {
 }
 
 #[test]
-fn why_not_stops_short_of_claiming_a_finding_when_every_binding_retains_the_row() {
+fn why_not_replays_the_group_when_the_binding_retains_the_row() {
     let fixture = relational_fixture();
     let explanation = relational_why_not(
         &fixture,
@@ -1550,27 +1550,21 @@ fn why_not_stops_short_of_claiming_a_finding_when_every_binding_retains_the_row(
         &relational_candidate("render;"),
         &ExplanationLimits::default(),
     );
-
     assert_eq!(
         binding_labels(&explanation),
         vec![(String::from("read"), ExplanationOutcome::Satisfied)]
     );
     assert_eq!(
         explanation.outcome(),
-        ExplanationOutcome::Unknown,
-        "membership in every binding is not a finding; the joins are not replayed"
+        ExplanationOutcome::Satisfied,
+        "{explanation:#?}"
     );
-    let gap = explanation
-        .root()
-        .children()
-        .iter()
-        .find(|node| node.label() == "join_replay_unavailable")
-        .expect("the unreplayed join is stated as a node, not only as prose");
-    assert_eq!(gap.kind(), ExplanationNodeKind::CoverageObligation);
-    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
-    assert_eq!(
-        gap.reasons(),
-        [PolicyIncompleteReason::CapabilityIncomplete]
+    assert!(
+        explanation
+            .root()
+            .children()
+            .iter()
+            .any(|node| node.label() == "group:by-read:reads")
     );
 }
 
@@ -1624,7 +1618,7 @@ fn why_not_names_the_rql_filter_step_that_removed_the_candidates_row() {
 }
 
 #[test]
-fn why_not_still_defers_to_the_unreplayed_join_when_a_filter_keeps_the_row() {
+fn why_not_replays_the_group_when_a_filter_keeps_the_row() {
     let fixture = relational_fixture();
     let explanation = relational_why_not(
         &fixture,
@@ -1632,12 +1626,11 @@ fn why_not_still_defers_to_the_unreplayed_join_when_a_filter_keeps_the_row() {
         &relational_candidate("render;"),
         &ExplanationLimits::default(),
     );
-
     assert_eq!(
-        binding_labels(&explanation),
-        vec![(String::from("read"), ExplanationOutcome::Satisfied)]
+        explanation.outcome(),
+        ExplanationOutcome::Satisfied,
+        "{explanation:#?}"
     );
-    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
     assert_eq!(
         child_labels(
             &explanation.root().children()[0],
@@ -1645,19 +1638,13 @@ fn why_not_still_defers_to_the_unreplayed_join_when_a_filter_keeps_the_row() {
         ),
         vec![
             (String::from("occurrences"), ExplanationOutcome::Satisfied),
-            (String::from("filter"), ExplanationOutcome::Satisfied),
+            (String::from("filter"), ExplanationOutcome::Satisfied)
         ]
-    );
-    let gap = join_replay_gap(&explanation).expect("the unreplayed join is still stated");
-    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
-    assert_eq!(
-        gap.reasons(),
-        [PolicyIncompleteReason::CapabilityIncomplete]
     );
 }
 
 #[test]
-fn why_not_executes_each_bindings_own_rql_filter_step() {
+fn why_not_executes_the_right_bindings_filter_under_the_join_key() {
     let fixture = relational_fixture();
     let explanation = relational_why_not(
         &fixture,
@@ -1665,31 +1652,18 @@ fn why_not_executes_each_bindings_own_rql_filter_step() {
         &relational_candidate("render;"),
         &ExplanationLimits::default(),
     );
-
     assert_eq!(
         binding_labels(&explanation),
-        vec![
-            (String::from("read"), ExplanationOutcome::Satisfied),
-            (String::from("other"), ExplanationOutcome::Failed),
-        ]
+        vec![(String::from("read"), ExplanationOutcome::Satisfied)]
     );
     assert_eq!(
-        child_labels(
-            &explanation.root().children()[0],
-            ExplanationNodeKind::SelectorStage
-        ),
-        vec![(String::from("occurrences"), ExplanationOutcome::Satisfied)]
+        explanation.outcome(),
+        ExplanationOutcome::Failed,
+        "{explanation:#?}"
     );
-    assert_eq!(
-        child_labels(
-            &explanation.root().children()[1],
-            ExplanationNodeKind::SelectorStage
-        ),
-        vec![
-            (String::from("occurrences"), ExplanationOutcome::Satisfied),
-            (String::from("filter"), ExplanationOutcome::Failed),
-        ]
-    );
+    let join = &explanation.root().children()[1];
+    assert_eq!(join.label(), "inner_join");
+    assert_eq!(join.outcome(), ExplanationOutcome::Failed);
 }
 
 #[test]
@@ -1741,30 +1715,22 @@ fn why_not_reports_a_filter_drop_over_a_non_exhaustive_binding_as_unknown() {
 }
 
 #[test]
-fn why_not_replays_receiver_outcome_query_step_but_defers_the_join() {
+fn why_not_replays_receiver_outcome_query_step_and_join() {
     let fixture = Fixture::with_source(MEMBER_FIXTURE);
     let explanation = relational_why_not(
         &fixture,
         TWO_BINDING_RELATIONAL,
         &candidate_in(MEMBER_FIXTURE, "run();"),
-        &ExplanationLimits::default().with_max_prefix_executions(3),
+        &ExplanationLimits::default(),
     );
-
+    let join = &explanation.root().children()[1];
+    assert_eq!(join.label(), "anti_join");
     assert_eq!(
-        binding_labels(&explanation),
-        vec![
-            (String::from("site"), ExplanationOutcome::Satisfied),
-            (String::from("receiver"), ExplanationOutcome::Satisfied),
-        ]
+        join.outcome(),
+        ExplanationOutcome::Satisfied,
+        "{explanation:#?}"
     );
-    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
-    let gap = join_replay_gap(&explanation).expect("the join remains outside this adapter");
-    assert_eq!(gap.kind(), ExplanationNodeKind::CoverageObligation);
-    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
-    assert_eq!(
-        gap.reasons(),
-        [PolicyIncompleteReason::CapabilityIncomplete]
-    );
+    assert!(join_replay_gap(&explanation).is_none());
 }
 
 #[test]
@@ -1800,7 +1766,7 @@ fn why_not_reports_a_candidate_absent_from_the_expansion_source_before_expanding
 }
 
 #[test]
-fn why_not_reports_a_candidate_dropped_by_the_hierarchy_query_step() {
+fn why_not_reports_a_candidate_without_a_matching_hierarchy_row() {
     let fixture = relational_fixture();
     let explanation = relational_why_not(
         &fixture,
@@ -1808,39 +1774,26 @@ fn why_not_reports_a_candidate_dropped_by_the_hierarchy_query_step() {
         &relational_candidate("render"),
         &ExplanationLimits::default(),
     );
-
     assert_eq!(
-        binding_labels(&explanation),
-        vec![
-            (String::from("site"), ExplanationOutcome::Satisfied),
-            (String::from("hop"), ExplanationOutcome::Failed),
-        ]
+        explanation.outcome(),
+        ExplanationOutcome::Satisfied,
+        "{explanation:#?}"
     );
-    assert_eq!(explanation.outcome(), ExplanationOutcome::Failed);
-    let binding = &explanation.root().children()[1];
-    assert_eq!(binding.outcome(), ExplanationOutcome::Failed);
-    assert_eq!(
-        child_labels(binding, ExplanationNodeKind::SelectorStage),
-        vec![
-            (String::from("occurrences"), ExplanationOutcome::Satisfied),
-            (
-                String::from("candidate_hierarchy"),
-                ExplanationOutcome::Failed
-            ),
-        ]
-    );
+    let join = &explanation.root().children()[1];
+    assert_eq!(join.label(), "anti_join");
+    assert_eq!(join.outcome(), ExplanationOutcome::Failed);
 }
 
 #[test]
-fn why_not_keeps_a_dropped_query_step_unknown_when_its_source_is_truncated() {
+fn why_not_keeps_a_missing_join_row_unknown_when_its_source_is_truncated() {
     let budget = PolicyBudget::builder()
         .with_query_limits(CodeQueryExecutionLimits {
             max_pipeline_rows: 1,
             ..CodeQueryExecutionLimits::default()
         })
-        .expect("query limits")
+        .unwrap()
         .build()
-        .expect("budget");
+        .unwrap();
     let fixture = Fixture::with_source(RELATIONAL_TWO_DECLARATIONS);
     let explanation = relational_why_not_with_budget(
         &fixture,
@@ -1849,69 +1802,33 @@ fn why_not_keeps_a_dropped_query_step_unknown_when_its_source_is_truncated() {
         &ExplanationLimits::default(),
         &budget,
     );
-
     assert_eq!(
-        binding_labels(&explanation),
-        vec![
-            (String::from("site"), ExplanationOutcome::Satisfied),
-            (String::from("hop"), ExplanationOutcome::Unknown),
-        ]
+        explanation.outcome(),
+        ExplanationOutcome::Unknown,
+        "{explanation:#?}"
     );
-    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
-    let binding = &explanation.root().children()[1];
-    assert_eq!(
-        binding.reasons(),
-        [PolicyIncompleteReason::PipelineRowBudget]
+    let join = &explanation.root().children()[1];
+    assert_eq!(join.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        join.reasons()
+            .contains(&PolicyIncompleteReason::PipelineRowBudget)
     );
-    let step = binding
-        .children()
-        .iter()
-        .find(|node| node.label() == "candidate_hierarchy")
-        .expect("the query step is retained");
-    assert_eq!(step.kind(), ExplanationNodeKind::SelectorStage);
-    assert_eq!(step.outcome(), ExplanationOutcome::Unknown);
-    assert_eq!(step.reasons(), [PolicyIncompleteReason::PipelineRowBudget]);
 }
 
 #[test]
 fn why_not_reports_prefix_budget_between_query_source_and_step() {
     let fixture = relational_fixture();
-    let limits = ExplanationLimits::default().with_max_prefix_executions(2);
     let explanation = relational_why_not(
         &fixture,
-        CANDIDATE_HIERARCHY_RELATIONAL,
-        &relational_candidate("render"),
-        &limits,
-    );
-
-    assert_eq!(
-        binding_labels(&explanation),
-        vec![
-            (String::from("site"), ExplanationOutcome::Satisfied),
-            (String::from("hop"), ExplanationOutcome::Unknown),
-        ]
+        FILTERED_READS_RELATIONAL,
+        &relational_candidate("render;"),
+        &ExplanationLimits::default().with_max_prefix_executions(1),
     );
     assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
-    let binding = &explanation.root().children()[1];
-    assert_eq!(
-        binding.reasons(),
-        [PolicyIncompleteReason::ReportRetentionBudget]
-    );
-    assert_eq!(binding.children().len(), 1);
-    assert!(binding.children_truncated());
-    assert_eq!(
-        binding.children()[0].kind(),
-        ExplanationNodeKind::SelectorStage
-    );
-    assert_eq!(
-        binding.children()[0].outcome(),
-        ExplanationOutcome::Satisfied
-    );
-    assert_eq!(binding.omitted_children_lower_bound(), 1);
+    assert!(explanation.root().children_truncated());
+    assert_eq!(explanation.root().children()[0].children().len(), 1);
 }
 
-/// An unrelated occurrence with the same member name reaches member selection.
-/// It must not make the candidate survive the later row-local filter.
 #[test]
 fn why_not_filters_only_the_candidates_query_rows() {
     let fixture = Fixture::with_source(MEMBER_FIXTURE);
@@ -1950,15 +1867,9 @@ fn why_not_filters_only_the_candidates_query_rows() {
             &ExplanationLimits::default(),
         );
         assert_eq!(dropped.outcome(), outcome, "{source_query}: {dropped:#?}");
-        let binding = &dropped.root().children()[1];
-        assert_eq!(binding.label(), "selection");
-        let filter = binding
-            .children()
-            .iter()
-            .find(|node| node.label() == "filter")
-            .expect("the row-local filter stage is reported");
-        assert_eq!(filter.kind(), ExplanationNodeKind::SelectorStage);
-        assert_eq!(filter.outcome(), outcome);
+        let join = &dropped.root().children()[1];
+        assert_eq!(join.label(), "inner_join");
+        assert_eq!(join.outcome(), outcome);
         let survived = relational_why_not(
             &fixture,
             &policy,
@@ -1966,7 +1877,7 @@ fn why_not_filters_only_the_candidates_query_rows() {
             &ExplanationLimits::default(),
         );
         assert!(
-            join_replay_gap(&survived).is_some(),
+            join_replay_gap(&survived).is_none(),
             "{source_query}: {survived:#?}"
         );
     }
@@ -1990,7 +1901,7 @@ fn why_not_shares_one_prefix_budget_across_relational_bindings() {
     );
     assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
     assert!(explanation.root().children_truncated());
-    assert_eq!(explanation.root().omitted_children_lower_bound(), 1);
+    assert!(explanation.root().omitted_children_lower_bound() >= 1);
     assert!(
         explanation
             .root()
@@ -3475,5 +3386,444 @@ fn a_relational_ranking_executes_the_row_local_rql_binding() {
     assert!(
         saw_receiver_failure,
         "the receiver binding decides at least one scoped candidate"
+    );
+}
+
+#[test]
+fn why_not_replays_join_witness_at_a_different_source_position() {
+    let fixture = Fixture::with_source(TWO_RENDER_REFERENCES);
+    let candidate = candidate_in(TWO_RENDER_REFERENCES, "render;\nexport const second");
+    let ast_id = with_policy(FORBID_READS_RELATIONAL, |policy| {
+        let (_, query) = policy.resolved_selectors()[0].as_query().unwrap();
+        let walk = run_prefixes(
+            query,
+            &fixture.context(),
+            &candidate,
+            &PolicyBudget::default(),
+            64,
+            PrefixExecution::PreferWorkspace,
+            1024,
+        );
+        let value = walk.terminal_rows[walk.candidate_rows[0]]
+            .field("ast_id")
+            .unwrap()
+            .unwrap();
+        crate::relational::RowScalar::from(value).to_string()
+    });
+    // The other binding explicitly excludes the candidate's AST identity.
+    // The second reference still has the same declaration target.
+    let policy = SCOPED_FILTER_RELATIONAL
+        .replace("((ast_id ast_id))", "((target_id target_id))")
+        .replace(
+            "role eq declaration_name",
+            &format!("ast_id ne \"{ast_id}\""),
+        );
+    let explanation =
+        relational_why_not(&fixture, &policy, &candidate, &ExplanationLimits::default());
+    assert_eq!(
+        explanation.outcome(),
+        ExplanationOutcome::Satisfied,
+        "{explanation:#?}"
+    );
+    let join = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "inner_join")
+        .expect("join replay");
+    assert_eq!(join.outcome(), ExplanationOutcome::Satisfied);
+    assert!(
+        join.children()
+            .iter()
+            .any(|node| node.label() == "representative")
+    );
+    assert!(!fixture.run(&policy).findings().is_empty());
+}
+
+/// Build IR directly: left joins are deliberately not authored policy syntax.
+fn replay_ir_plan(kind: crate::relational::IrJoinKind) -> crate::relational::RelationalPlanIr {
+    use crate::relational::*;
+    use brokk_bifrost_rql::structural::DetailedCodeQueryDomain;
+    let mut plan = with_policy(SCOPED_FILTER_RELATIONAL, |policy| {
+        let crate::definition::PolicyAnalysis::Assertion { spec } = &policy.definition().analysis
+        else {
+            panic!("assertion")
+        };
+        lower_relational_assertion_plan(spec.relational.as_ref().unwrap()).unwrap()
+    });
+    let left_schema = domain_schema("read", DetailedCodeQueryDomain::Occurrence);
+    let mut right_schema = domain_schema("other", DetailedCodeQueryDomain::Occurrence);
+    if kind == IrJoinKind::Left {
+        right_schema = crate::relational::IrSchema::new(
+            right_schema
+                .fields()
+                .iter()
+                .cloned()
+                .map(|mut field| {
+                    field.nullable = true;
+                    field
+                })
+                .collect(),
+        );
+    }
+    let joined = &mut plan.relations[2];
+    let IrRelationOp::Join {
+        kind: actual, on, ..
+    } = &mut joined.op
+    else {
+        panic!("join")
+    };
+    *actual = kind;
+    *on = vec![IrEquiKey {
+        left: IrColumn::new("read", "target_id"),
+        right: IrColumn::new("other", "target_id"),
+    }];
+    joined.schema = IrSchema::new(
+        left_schema
+            .fields()
+            .iter()
+            .cloned()
+            .chain(
+                right_schema
+                    .fields()
+                    .iter()
+                    .filter(|_| matches!(kind, IrJoinKind::Inner | IrJoinKind::Left))
+                    .cloned(),
+            )
+            .collect(),
+    );
+    validate_plan_ir(&plan).unwrap();
+    plan
+}
+
+fn replay_occurrence(
+    path: &str,
+    ast: &str,
+    role: &str,
+) -> brokk_bifrost_rql::structural::search::UnitRowItem {
+    use brokk_bifrost_rql::structural::search::{UnitRowField, UnitRowItem, UnitRowScalar};
+    UnitRowItem {
+        domain: brokk_bifrost_rql::structural::DetailedCodeQueryDomain::Occurrence,
+        path: path.into(),
+        range: None,
+        evidence: None,
+        fields: vec![
+            UnitRowField {
+                name: "target_id".into(),
+                value: UnitRowScalar::DeclarationIdentity(path.into()),
+            },
+            UnitRowField {
+                name: "ast_id".into(),
+                value: UnitRowScalar::StableId(ast.into()),
+            },
+            UnitRowField {
+                name: "role".into(),
+                value: UnitRowScalar::ConstrainedEnum(role.into()),
+            },
+        ],
+        projected_field_names: Vec::new(),
+        unknown_fields: Vec::new(),
+        terminal: None,
+        provenance: Vec::new(),
+        provenance_truncated: false,
+    }
+}
+
+#[test]
+fn why_not_ir_replays_each_join_kind_and_absence_coverage() {
+    use crate::relational::*;
+    for kind in [
+        IrJoinKind::Inner,
+        IrJoinKind::Semi,
+        IrJoinKind::Anti,
+        IrJoinKind::Left,
+    ] {
+        for matched in [false, true] {
+            for exhaustive in [false, true] {
+                let plan = replay_ir_plan(kind);
+                let seed = || ReplayInput {
+                    rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
+                    coverage: RelationCoverage::Exhaustive,
+                };
+                let mut queried = Vec::new();
+                let replay = replay_candidate_ir(
+                    &plan,
+                    seed(),
+                    &[0],
+                    &mut |binding, constraints| {
+                        if binding.as_str() == "read" {
+                            return Ok(seed());
+                        }
+                        queried.push(constraints.clone());
+                        assert_eq!(
+                            constraints,
+                            &vec![(
+                                IrColumn::new("other", "target_id"),
+                                Some(RowScalar::DeclarationIdentity("app.ts".into()))
+                            )]
+                        );
+                        Ok(ReplayInput {
+                            rows: if matched {
+                                vec![replay_occurrence(
+                                    "app.ts",
+                                    "other-position",
+                                    "declaration_name",
+                                )]
+                            } else {
+                                Vec::new()
+                            },
+                            coverage: if exhaustive {
+                                RelationCoverage::Exhaustive
+                            } else {
+                                RelationCoverage::ProvenSubset
+                            },
+                        })
+                    },
+                    None,
+                )
+                .unwrap();
+                let expected = match (kind, matched, exhaustive) {
+                    (IrJoinKind::Anti, true, _) => ExplanationOutcome::Failed,
+                    (IrJoinKind::Inner | IrJoinKind::Semi, false, true) => {
+                        ExplanationOutcome::Failed
+                    }
+                    (_, false, false) => ExplanationOutcome::Unknown,
+                    _ => ExplanationOutcome::Satisfied,
+                };
+                assert_eq!(
+                    replay.outcome, expected,
+                    "{kind:?}, matched={matched}, exhaustive={exhaustive}: {replay:#?}"
+                );
+                let join = &replay.observations[0];
+                assert_eq!(
+                    join.outcome,
+                    if matched {
+                        ExplanationOutcome::Satisfied
+                    } else if exhaustive {
+                        ExplanationOutcome::Failed
+                    } else {
+                        ExplanationOutcome::Unknown
+                    }
+                );
+                assert_eq!(join.representative.is_some(), matched);
+                assert!(!queried.is_empty());
+                if !exhaustive {
+                    assert_eq!(join.reasons, vec![PolicyIncompleteReason::PartialDiscovery]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn why_not_ir_group_counts_peers_and_proves_zero_only_with_coverage() {
+    use crate::relational::*;
+    for exhaustive in [false, true] {
+        for zero in [false, true] {
+            let mut plan = replay_ir_plan(IrJoinKind::Semi);
+            let IrRelationOp::Group { by, aggregates, .. } = &mut plan.relations[3].op else {
+                panic!("group")
+            };
+            *by = vec![IrColumn::new("read", "target_id")];
+            if zero {
+                aggregates[0].predicates = vec![IrPredicate::Compare {
+                    left: IrColumn::new("read", "role"),
+                    op: IrCompareOp::Eq,
+                    right: IrOperand::Literal(crate::definition::RowLiteral::ConstrainedEnum(
+                        "declaration_name".into(),
+                    )),
+                }];
+            }
+            plan.assertions[0].cardinality =
+                crate::definition::AssertCardinality::Exactly(if zero { 0 } else { 1 });
+            let mut fields = vec![
+                plan.relations[2]
+                    .schema
+                    .field(&IrColumn::new("read", "target_id"))
+                    .unwrap()
+                    .clone(),
+            ];
+            fields.extend_from_slice(&plan.relations[3].schema.fields()[1..]);
+            plan.relations[3].schema = IrSchema::new(fields);
+            validate_plan_ir(&plan).unwrap();
+
+            let seed = || ReplayInput {
+                rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
+                coverage: RelationCoverage::Exhaustive,
+            };
+            let replay = replay_candidate_ir(
+                &plan,
+                seed(),
+                &[0],
+                &mut |binding, _| {
+                    Ok(ReplayInput {
+                        rows: if binding.as_str() == "read" {
+                            vec![
+                                replay_occurrence("app.ts", "candidate", "value_reference"),
+                                replay_occurrence("app.ts", "peer", "value_reference"),
+                            ]
+                        } else {
+                            vec![replay_occurrence("app.ts", "right", "declaration_name")]
+                        },
+                        coverage: if exhaustive {
+                            RelationCoverage::Exhaustive
+                        } else {
+                            RelationCoverage::ProvenSubset
+                        },
+                    })
+                },
+                None,
+            )
+            .unwrap();
+            let expected = if zero {
+                if exhaustive {
+                    ExplanationOutcome::Failed
+                } else {
+                    ExplanationOutcome::Unknown
+                }
+            } else {
+                ExplanationOutcome::Satisfied
+            };
+            assert_eq!(replay.outcome, expected, "{replay:#?}");
+            assert!(
+                replay
+                    .observations
+                    .last()
+                    .unwrap()
+                    .actual
+                    .contains(if zero { "Integer(0)" } else { "Integer(2)" })
+            );
+        }
+    }
+}
+
+#[test]
+fn why_not_relation_query_limit_cannot_prove_absence() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        SCOPED_FILTER_RELATIONAL,
+        &relational_candidate("render;"),
+        &ExplanationLimits::default().with_max_relation_executions(0),
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    assert!(explanation.root().children().iter().any(|node| {
+        node.reasons()
+            .contains(&PolicyIncompleteReason::ReportRetentionBudget)
+    }));
+}
+
+#[test]
+fn why_not_ir_replay_honors_comparison_and_group_budgets() {
+    use crate::relational::*;
+    for bound in [
+        |limits: &mut IrLimits| limits.max_join_comparisons = 1,
+        |limits: &mut IrLimits| limits.max_values_per_group = 1,
+    ] {
+        let mut plan = replay_ir_plan(IrJoinKind::Semi);
+        bound(&mut plan.limits);
+        let seed = || ReplayInput {
+            rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
+            coverage: RelationCoverage::Exhaustive,
+        };
+        let replay = replay_candidate_ir(
+            &plan,
+            seed(),
+            &[0],
+            &mut |binding, _| {
+                let mut input = seed();
+                if binding.as_str() == "read" {
+                    input.rows.push(input.rows[0].clone());
+                }
+                Ok(input)
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, ExplanationOutcome::Unknown, "{replay:#?}");
+        assert!(replay.observations.iter().any(|node| {
+            node.reasons
+                .contains(&PolicyIncompleteReason::PipelineRowBudget)
+        }));
+    }
+}
+
+#[test]
+fn why_not_ir_replay_preserves_composite_nullable_key_equality() {
+    use crate::relational::*;
+    let mut plan = replay_ir_plan(IrJoinKind::Inner);
+    let IrRelationOp::Join { on, .. } = &mut plan.relations[2].op else {
+        panic!("join")
+    };
+    on.push(IrEquiKey {
+        left: IrColumn::new("read", "ast_id"),
+        right: IrColumn::new("other", "ast_id"),
+    });
+    for matched in [false, true] {
+        let seed = || {
+            let mut row = replay_occurrence("app.ts", "candidate", "value_reference");
+            row.fields
+                .retain(|field| field.name.as_ref() != "target_id");
+            ReplayInput {
+                rows: vec![row],
+                coverage: RelationCoverage::Exhaustive,
+            }
+        };
+        let replay = replay_candidate_ir(
+            &plan,
+            seed(),
+            &[0],
+            &mut |binding, constraints| {
+                let mut input = seed();
+                if binding.as_str() == "other" {
+                    assert_eq!(
+                        constraints,
+                        &vec![
+                            (IrColumn::new("other", "target_id"), None),
+                            (
+                                IrColumn::new("other", "ast_id"),
+                                Some(RowScalar::StableId("candidate".into()))
+                            )
+                        ]
+                    );
+                    if !matched {
+                        input.rows[0] = replay_occurrence("app.ts", "candidate", "value_reference");
+                    }
+                }
+                Ok(input)
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            replay.outcome,
+            if matched {
+                ExplanationOutcome::Satisfied
+            } else {
+                ExplanationOutcome::Failed
+            },
+            "{replay:#?}"
+        );
+    }
+}
+
+#[test]
+fn why_not_ir_replay_propagates_cancellation() {
+    use crate::relational::*;
+    let token = brokk_bifrost_analysis::CancellationToken::new();
+    token.cancel();
+    let result = replay_candidate_ir(
+        &replay_ir_plan(IrJoinKind::Left),
+        ReplayInput {
+            rows: vec![replay_occurrence("app.ts", "candidate", "value_reference")],
+            coverage: RelationCoverage::Exhaustive,
+        },
+        &[0],
+        &mut |_, _| panic!("cancelled replay must not execute another source"),
+        Some(&token),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        RelationalAssertionEvaluationError::Cancelled
     );
 }

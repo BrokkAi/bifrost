@@ -7007,12 +7007,16 @@ impl<'a> CppVisitor<'a> {
                 continue;
             };
             self.visit_variable_declaration(node, declarator, scope, true, ancestry);
+            // The receiver type's identity is the declarator's name, so its
+            // range is the field declaration that carries that name token.
+            // The inner specifier ends at the closing brace, which leaves the
+            // name the unit is known by outside its own text (#3287).
             self.visit_named_class_like_shape(
                 aggregate,
                 name,
                 Some(body),
                 true,
-                None,
+                Some(cpp_declaration_range(node)),
                 None,
                 scope,
                 stack,

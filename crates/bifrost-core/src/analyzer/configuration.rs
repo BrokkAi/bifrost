@@ -693,10 +693,26 @@ mod tests {
 
     #[test]
     fn non_utf8_and_hidden_paths_are_unsupported() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
+        #[cfg(unix)]
+        let path = {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
 
-        let path = Path::new("config").join(OsStr::from_bytes(b"file.\xffjson"));
+            Path::new("config").join(OsStr::from_bytes(b"file.\xffjson"))
+        };
+        #[cfg(windows)]
+        let path = {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+
+            let file_name = "file."
+                .encode_utf16()
+                .chain([0xd800])
+                .chain("json".encode_utf16())
+                .collect::<Vec<_>>();
+            Path::new("config").join(OsString::from_wide(&file_name))
+        };
+        #[cfg(any(unix, windows))]
         assert_eq!(
             classify_configuration_path(&path),
             super::ConfigurationPathClassification::Unsupported

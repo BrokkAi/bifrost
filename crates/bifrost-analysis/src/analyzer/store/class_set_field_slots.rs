@@ -402,6 +402,7 @@ fn valid_unknown_reason(reason: &str) -> bool {
             | "open_type_bound"
             | "scalar_receiver"
             | "class_creation"
+            | "class_object"
     )
 }
 

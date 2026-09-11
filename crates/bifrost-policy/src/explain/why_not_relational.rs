@@ -1,74 +1,37 @@
-//! `why-not` for a relational assertion policy: decide, per authored row
-//! binding, whether one explicit candidate's row is a member of that binding's
-//! relation.
+//! Replay the candidate's initial binding, then its joins and group keys.
 //!
-//! # What this adapter answers, and what it does not
-//!
-//! A relational plan is a set of named row relations, joined and grouped, with
-//! assertions over the aggregates. A candidate can fail to produce a finding at
-//! three different levels:
-//!
-//! 1. its row is not in some binding's relation because the binding's query,
-//!    including any row-local RQL steps, did not return it;
-//! 2. its row is in every binding but the join or the group key does not put it
-//!    in a violated group;
-//! 3. the aggregate over its group satisfies the authored cardinality.
-//!
-//! This adapter answers level 1 exactly. It re-executes each binding's complete
-//! RQL pipeline the way the relational driver executes it, reusing the
-//! milestone-5 prefix walk to name the *stage inside that binding* that dropped
-//! the candidate. Levels 2 and 3 need a join-level
-//! replay, which this adapter does not attempt; when every binding retains the
-//! candidate the root outcome is `unknown` and carries an explicit
-//! `join_replay_unavailable` node, never a `satisfied` that would overclaim.
-//!
-//! # Failed versus unknown
-//!
-//! Exactly the milestone-5 rule, applied per binding: a binding is `failed`
-//! only when its query completed and declared itself exhaustive, every
-//! relevant later prefix was exhaustive, and the candidate was still not there.
-//! A non-exhaustive prefix or a prefix omitted by the execution budget is
-//! `unknown`.
-//!
-//! # Bounds
-//!
-//! Every binding's RQL prefix walk draws on one shared execution budget
-//! (`ExplanationLimits::max_prefix_executions`), one unit per prefix, and the
-//! walk stops at the first binding that does not retain the candidate. What the
-//! budget cut is reported through the root's `children_truncated` pair.
+//! Only the initial binding must cover the candidate's source position. Right
+//! bindings are addressed by typed join keys; a row at a different position is
+//! a valid witness. Query coverage and row-engine bounds remain proof
+//! obligations, including when an anti join retained an unwitnessed row.
 
 use crate::budget::PolicyBudget;
 use crate::definition::{
-    PolicyAnalysisType, RelationalAssertionPlan, RowBinding, RowBindingSource,
-    relational_binding_selector_path,
+    PolicyAnalysisType, RelationalAssertionPlan, RowBinding, relational_binding_selector_path,
 };
 use crate::evaluator::PolicyEvaluationContext;
 use crate::finding::{PolicyIncompleteReason, PolicySourceLocation};
+use crate::relational::{
+    RelationCoverage, RelationalAssertionEvaluationError, ReplayConstraints, ReplayInput,
+    RowScalar, lower_relational_assertion_plan, replay_candidate_ir,
+};
 use crate::resolved::LoadedPolicy;
+use brokk_bifrost_rql::structural::search::{
+    UnitRowItem, execute_code_query_detailed_eager_index,
+    execute_code_query_detailed_eager_index_workspace,
+};
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryResultDetail};
+use brokk_bifrost_rql::{
+    QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand, QueryStep,
+};
 
 use super::model::{
     ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNodeKind,
     ExplanationOutcome, ExplanationQuestion, ExplanationSubject, PolicyExplanation, RawNode,
     build_explanation,
 };
-use super::why_not::{ExplanationCandidate, PrefixExecution, StageWalk, run_prefixes, stage_node};
+use super::why_not::{ExplanationCandidate, PrefixExecution, run_prefixes, stage_node};
 
-/// Explain why one explicit candidate is not reported by a relational
-/// assertion policy.
-///
-/// The tree is rooted at the candidate and carries one `relation_binding` node
-/// per authored binding, in plan order, each holding that binding's own
-/// selector stages as children. The walk stops at the first binding that does
-/// not retain the candidate.
-///
-/// # Errors
-///
-/// - [`ExplainError::RelationalPlanUnavailable`] when the assertion policy has
-///   no row plan (the capture-oriented assertion families are a later slice).
-/// - [`ExplainError::BindingSelectorUnavailable`] when the plan names a query
-///   binding whose resolved selector the loaded policy does not carry.
-/// - [`ExplainError::BudgetExhausted`] when `limits` allow no prefix execution
-///   or cannot hold a root node.
 pub(super) fn explain_relational_candidate(
     policy: &LoadedPolicy,
     plan: &RelationalAssertionPlan,
@@ -82,8 +45,224 @@ pub(super) fn explain_relational_candidate(
             limit: ExplanationBudgetLimit::PrefixExecutions,
         });
     }
-    let walk = walk_bindings(policy, plan, context, candidate, budget, limits)?;
-    let root = candidate_root(candidate, plan, walk);
+    let binding = plan
+        .bindings
+        .first()
+        .expect("validated row plan has an initial binding");
+    let mut walk = run_prefixes(
+        binding_query(policy, binding)?,
+        context,
+        candidate,
+        budget,
+        limits.max_prefix_executions(),
+        PrefixExecution::PreferWorkspace,
+        budget.query_limits().max_pipeline_rows,
+    );
+    let remaining_prefixes = limits
+        .max_prefix_executions()
+        .saturating_sub(walk.executed());
+    let decided = walk.decided();
+    let binding_outcome = decided.map_or_else(
+        || {
+            if walk.prefixes_truncated() {
+                ExplanationOutcome::Unknown
+            } else {
+                ExplanationOutcome::Satisfied
+            }
+        },
+        |stage| stage.outcome(),
+    );
+    let binding_actual = decided.map_or_else(
+        || format!("binding `{}` retains the candidate", binding.name),
+        |stage| {
+            format!(
+                "binding `{}`: stage {} {}",
+                binding.name,
+                stage.label(),
+                if stage.outcome() == ExplanationOutcome::Failed {
+                    "dropped it"
+                } else {
+                    "could not decide the candidate"
+                }
+            )
+        },
+    );
+    let mut root = RawNode::new(
+        ExplanationNodeKind::FindingProjection,
+        binding_outcome,
+        "relational_candidate",
+    )
+    .with_expected("the candidate reaches a group with a violated assertion")
+    .with_actual(if binding_outcome == ExplanationOutcome::Failed {
+        format!(
+            "the candidate's row is absent from row binding `{}`",
+            binding.name
+        )
+    } else {
+        binding_actual.clone()
+    })
+    .with_location(Some(PolicySourceLocation::artifact(
+        candidate.path().clone(),
+    )))
+    .with_source_truncation(walk.prefixes_truncated(), walk.omitted_prefixes());
+    let binding_reasons = decided.map_or_else(Vec::new, |stage| stage.reasons().to_vec());
+    let seed = ReplayInput {
+        rows: std::mem::take(&mut walk.terminal_rows),
+        coverage: walk.terminal_coverage.clone(),
+    };
+    let candidate_rows = std::mem::take(&mut walk.candidate_rows);
+    let mut binding_node = RawNode::new(
+        ExplanationNodeKind::RelationBinding,
+        binding_outcome,
+        binding.name.as_str(),
+    )
+    .with_actual(binding_actual)
+    .with_reasons(binding_reasons);
+    for stage in walk.into_stages() {
+        binding_node.push_child(stage_node(stage, candidate));
+    }
+    root.push_child(binding_node);
+
+    if binding_outcome == ExplanationOutcome::Satisfied {
+        let ir = lower_relational_assertion_plan(plan).map_err(|error| {
+            ExplainError::PolicyUnavailable {
+                message: error.to_string(),
+            }
+        })?;
+        let mut remaining = limits.max_relation_executions().min(remaining_prefixes);
+        let mut omitted_queries = 0u64;
+        let mut load = |name: &crate::definition::RowBindingName,
+                        constraints: &ReplayConstraints| {
+            if remaining == 0 {
+                omitted_queries = omitted_queries.saturating_add(1);
+                return Ok(ReplayInput {
+                    rows: Vec::new(),
+                    coverage: RelationCoverage::incomplete(vec![
+                        PolicyIncompleteReason::ReportRetentionBudget,
+                    ]),
+                });
+            }
+            remaining -= 1;
+            let binding = plan
+                .bindings
+                .iter()
+                .find(|binding| binding.name == *name)
+                .expect("IR source has an authored binding");
+            let mut query = binding_query(policy, binding)
+                .map_err(|error| RelationalAssertionEvaluationError::InvalidPlan {
+                    message: error.to_string(),
+                })?
+                .clone();
+            let predicates = constraints
+                .iter()
+                .map(|(column, value)| key_predicate(&column.name, value))
+                .collect::<Vec<_>>();
+            if !predicates.is_empty() {
+                if let Some(QueryStep::Filter(existing)) = query.plan.steps.last_mut() {
+                    existing.extend(predicates);
+                } else {
+                    query.plan.steps.push(QueryStep::Filter(predicates));
+                }
+            }
+            query.result_detail = CodeQueryResultDetail::Full;
+            query.limit = budget.query_limits().max_pipeline_rows;
+            let detailed = if let Some(workspace) = context.workspace {
+                execute_code_query_detailed_eager_index_workspace(
+                    workspace,
+                    &query,
+                    budget.query_limits(),
+                    context.cancellation,
+                )
+            } else {
+                execute_code_query_detailed_eager_index(
+                    context.analyzer,
+                    &query,
+                    budget.query_limits(),
+                    context.cancellation,
+                )
+            };
+            let rows = detailed
+                .result
+                .results
+                .iter()
+                .map(UnitRowItem::project)
+                .collect::<Vec<_>>();
+            let coverage = RelationCoverage::from_query(
+                &rows,
+                &detailed.result.completion(),
+                detailed.result.truncated,
+            );
+            Ok(ReplayInput { rows, coverage })
+        };
+        let replay =
+            replay_candidate_ir(&ir, seed, &candidate_rows, &mut load, context.cancellation);
+        match replay {
+            Ok(replay) => {
+                root.outcome = replay.outcome;
+                root.actual = Some(match replay.outcome {
+                    ExplanationOutcome::Satisfied => "the candidate reaches a witnessed violated group",
+                    ExplanationOutcome::Failed => "a join removes the candidate or its group satisfies the assertion",
+                    ExplanationOutcome::Unknown => "coverage or a replay limit prevents deciding the candidate's violated group",
+                }.to_string());
+                for observation in replay.observations {
+                    let reasons = observation.reasons;
+                    let mut node = RawNode::new(
+                        ExplanationNodeKind::SelectorStage,
+                        observation.outcome,
+                        observation.label,
+                    )
+                    .with_actual(observation.actual)
+                    .with_reasons(reasons.clone());
+                    if let Some(representative) = observation.representative {
+                        node.push_child(
+                            RawNode::new(
+                                ExplanationNodeKind::SourceFact,
+                                ExplanationOutcome::Satisfied,
+                                "representative",
+                            )
+                            .with_actual(representative),
+                        );
+                    }
+                    if !reasons.is_empty() {
+                        node.push_child(
+                            RawNode::new(
+                                ExplanationNodeKind::CoverageObligation,
+                                ExplanationOutcome::Unknown,
+                                "relation_coverage",
+                            )
+                            .with_expected("exhaustive coverage for the requested key")
+                            .with_reasons(reasons),
+                        );
+                    }
+                    root.push_child(node);
+                }
+            }
+            Err(RelationalAssertionEvaluationError::Cancelled) => {
+                root = RawNode::new(
+                    ExplanationNodeKind::FindingProjection,
+                    ExplanationOutcome::Unknown,
+                    "relational_candidate",
+                )
+                .with_actual("candidate replay was cancelled")
+                .with_reasons(vec![PolicyIncompleteReason::Cancelled]);
+            }
+            Err(error) => {
+                return Err(ExplainError::PolicyUnavailable {
+                    message: error.to_string(),
+                });
+            }
+        }
+        if omitted_queries > 0 {
+            root.children_truncated = true;
+            root.omitted_children_lower_bound = omitted_queries;
+            root.actual
+                .as_mut()
+                .expect("root has a conclusion")
+                .push_str(
+                    "; the prefix-execution limit or relation-execution limit omitted key queries",
+                );
+        }
+    }
     build_explanation(
         ExplanationQuestion::WhyNot,
         policy.definition().metadata.id.clone(),
@@ -99,88 +278,10 @@ pub(super) fn explain_relational_candidate(
     )
 }
 
-/// What one binding concluded about the candidate.
-#[derive(Debug)]
-struct BindingOutcome {
-    name: String,
-    outcome: ExplanationOutcome,
-    actual: String,
-    reasons: Vec<PolicyIncompleteReason>,
-    /// The binding's source prefix walk.
-    walk: StageWalk,
-}
-
-/// Every binding that was decided, plus what the shared execution budget cut.
-#[derive(Debug)]
-struct BindingWalk {
-    bindings: Vec<BindingOutcome>,
-    /// Bindings the plan declares that were never reached.
-    omitted_bindings: u64,
-}
-
-impl BindingWalk {
-    fn decided(&self) -> Option<&BindingOutcome> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.outcome != ExplanationOutcome::Satisfied)
-    }
-    const fn truncated(&self) -> bool {
-        self.omitted_bindings > 0
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_bindings(
-    policy: &LoadedPolicy,
-    plan: &RelationalAssertionPlan,
-    context: &PolicyEvaluationContext<'_>,
-    candidate: &ExplanationCandidate,
-    budget: &PolicyBudget,
-    limits: &ExplanationLimits,
-) -> Result<BindingWalk, ExplainError> {
-    let mut remaining = limits.max_prefix_executions();
-    let mut bindings = Vec::with_capacity(plan.bindings.len());
-    let mut index = 0;
-    while index < plan.bindings.len() {
-        let binding = &plan.bindings[index];
-        if remaining == 0 {
-            break;
-        }
-        let RowBindingSource::Query(_) = &binding.source;
-        let query = binding_query(policy, binding)?;
-        let walk = run_prefixes(
-            query,
-            context,
-            candidate,
-            budget,
-            remaining,
-            PrefixExecution::PreferWorkspace,
-            // The relational driver bounds every binding query by the
-            // pipeline row budget, not by the finding budget.
-            budget.query_limits().max_pipeline_rows,
-        );
-        remaining = remaining.saturating_sub(walk.executed());
-        let outcome = query_binding_outcome(binding, walk);
-        let decided = outcome.outcome != ExplanationOutcome::Satisfied;
-        bindings.push(outcome);
-        index += 1;
-        if decided {
-            break;
-        }
-    }
-    let omitted_bindings =
-        u64::try_from(plan.bindings.len().saturating_sub(index)).unwrap_or(u64::MAX);
-    Ok(BindingWalk {
-        bindings,
-        omitted_bindings,
-    })
-}
-
-/// The resolved query one authored query binding executes.
 fn binding_query<'a>(
     policy: &'a LoadedPolicy,
     binding: &RowBinding,
-) -> Result<&'a brokk_bifrost_rql::structural::CodeQuery, ExplainError> {
+) -> Result<&'a CodeQuery, ExplainError> {
     let path = relational_binding_selector_path(&binding.name);
     policy
         .resolved_selectors()
@@ -192,131 +293,25 @@ fn binding_query<'a>(
         })
 }
 
-fn query_binding_outcome(binding: &RowBinding, walk: StageWalk) -> BindingOutcome {
-    let name = binding.name.as_str().to_string();
-    let decided = walk.decided();
-    let (outcome, actual, reasons) = match decided {
-        Some(stage) => (
-            stage.outcome(),
-            match stage.outcome() {
-                ExplanationOutcome::Failed => format!(
-                    "the candidate's row is not in binding `{name}`: stage {} dropped it",
-                    stage.label()
-                ),
-                _ => format!(
-                    "binding `{name}` could not decide the candidate at stage {}",
-                    stage.label()
-                ),
-            },
-            stage.reasons().to_vec(),
-        ),
-        None if walk.prefixes_truncated() => (
-            ExplanationOutcome::Unknown,
-            format!(
-                "the prefix-execution budget stopped binding `{name}` before its query was exhausted"
-            ),
-            vec![PolicyIncompleteReason::ReportRetentionBudget],
-        ),
-        None => (
-            ExplanationOutcome::Satisfied,
-            format!("binding `{name}` contains a row covering the candidate"),
-            Vec::new(),
-        ),
+fn key_predicate(field: &str, value: &Option<RowScalar>) -> QueryRowPredicate {
+    let Some(value) = value else {
+        return QueryRowPredicate {
+            field: field.to_string(),
+            op: QueryRowPredicateOp::IsNull,
+            operand: QueryRowPredicateOperand::None,
+        };
     };
-    BindingOutcome {
-        name,
-        outcome,
-        actual,
-        reasons,
-        walk,
-    }
-}
-
-fn candidate_root(
-    candidate: &ExplanationCandidate,
-    plan: &RelationalAssertionPlan,
-    walk: BindingWalk,
-) -> RawNode {
-    let decided = walk.decided();
-    let all_retained = decided.is_none() && !walk.truncated();
-    let root_outcome = match decided {
-        Some(binding) => binding.outcome,
-        // Membership in every binding is not a finding: the join, the group key
-        // and the aggregate still stand between the row and a violation, and
-        // this slice replays none of them.
-        None => ExplanationOutcome::Unknown,
+    let literal = match value {
+        RowScalar::StableId(value)
+        | RowScalar::String(value)
+        | RowScalar::DeclarationIdentity(value) => QueryRowLiteral::String(value.clone()),
+        RowScalar::ConstrainedEnum(value) => QueryRowLiteral::ConstrainedEnum(value.clone()),
+        RowScalar::Integer(value) => QueryRowLiteral::Integer(*value),
+        RowScalar::Boolean(value) => QueryRowLiteral::Boolean(*value),
     };
-    let actual = match decided {
-        Some(binding) => match binding.outcome {
-            ExplanationOutcome::Failed => format!(
-                "the candidate's row is absent from row binding `{}`",
-                binding.name
-            ),
-            _ => format!(
-                "row binding `{}` could not decide the candidate",
-                binding.name
-            ),
-        },
-        None if walk.truncated() => String::from(
-            "the prefix-execution limit stopped the walk before every row binding was tested",
-        ),
-        None => String::from(
-            "every row binding contains a row covering the candidate; whether those rows join \
-             into a violated group is not replayed by this slice",
-        ),
-    };
-
-    let mut root = RawNode::new(
-        ExplanationNodeKind::FindingProjection,
-        root_outcome,
-        "relational_candidate",
-    )
-    .with_expected(format!(
-        "the candidate's row is a member of each of the plan's {} row binding(s)",
-        plan.bindings.len()
-    ))
-    .with_actual(actual)
-    .with_location(Some(PolicySourceLocation::artifact(
-        candidate.path().clone(),
-    )))
-    .with_source_truncation(walk.truncated(), walk.omitted_bindings);
-
-    for binding in walk.bindings {
-        root.push_child(binding_node(binding, candidate));
+    QueryRowPredicate {
+        field: field.to_string(),
+        op: QueryRowPredicateOp::Eq,
+        operand: QueryRowPredicateOperand::Literal(literal),
     }
-    if all_retained {
-        root.push_child(
-            RawNode::new(
-                ExplanationNodeKind::CoverageObligation,
-                ExplanationOutcome::Unknown,
-                "join_replay_unavailable",
-            )
-            .with_expected("the plan's joins, group keys and aggregates are replayed")
-            .with_actual(
-                "this adapter decides row-binding membership only, so it cannot state whether \
-                 the candidate's row reaches a violated group",
-            )
-            .with_reasons(vec![PolicyIncompleteReason::CapabilityIncomplete]),
-        );
-    }
-    root
-}
-
-fn binding_node(binding: BindingOutcome, candidate: &ExplanationCandidate) -> RawNode {
-    let outcome = binding.outcome;
-    let reasons = binding.reasons;
-    let mut node = RawNode::new(ExplanationNodeKind::RelationBinding, outcome, binding.name)
-        .with_expected("the binding's relation contains a row covering the candidate")
-        .with_actual(binding.actual)
-        .with_location(Some(PolicySourceLocation::artifact(
-            candidate.path().clone(),
-        )))
-        .with_reasons(reasons.clone());
-    let prefixes_truncated = binding.walk.prefixes_truncated();
-    let omitted_prefixes = binding.walk.omitted_prefixes();
-    for stage in binding.walk.into_stages() {
-        node.push_child(stage_node(stage, candidate));
-    }
-    node = node.with_source_truncation(prefixes_truncated, omitted_prefixes);
-    node
 }

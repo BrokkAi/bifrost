@@ -3209,7 +3209,6 @@ fn resolve_cpp_type(
 ) -> DefinitionLookupOutcome {
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
-    let node = cpp_expand_tagged_type_scope_reference(node).unwrap_or(node);
     let text = normalize_cpp_type_text(cpp_node_text(node, source));
     let recovered_declarator_type = recovered_macro_decorated_declarator_type(node).is_some();
     if text.is_empty() {
@@ -3296,6 +3295,11 @@ fn resolve_cpp_type(
             // `gated_boundary` makes the workspace-internal check structural: if the
             // namespace-outward net finds a *visible* indexed declaration for the
             // qualifier, the honest outcome is no_definition, never a boundary.
+            if let Some(outcome) =
+                cpp_indexed_same_file_outcome(context.bounded_support(), file, &reference, "type")
+            {
+                return outcome;
+            }
             return gated_boundary(
                 || {
                     cpp_resolve_qualified_via_enclosing_namespaces(
@@ -3545,9 +3549,19 @@ fn resolve_cpp_type(
             ));
         }
         if cpp_unresolved_include_boundary(visibility, file, &qualifier.reference, node) {
+            if let Some(outcome) = cpp_indexed_same_file_outcome(
+                context.bounded_support(),
+                file,
+                &qualifier.reference,
+                "type qualifier",
+            ) {
+                return outcome;
+            }
             // gated upstream: the enclosing-scope parameter probe above returned
-            // early for any workspace-declared qualifier; only an external one
-            // (with an unresolved include) reaches here.
+            // early for any workspace-declared qualifier, and the same-file
+            // honesty probe above rules out an indexed name of its own
+            // spelling; only an external one (with an unresolved include)
+            // reaches here.
             return boundary_unchecked(format!(
                 "`{}` appears to cross a C++ include boundary not indexed in this workspace",
                 qualifier.reference
@@ -3575,6 +3589,7 @@ fn resolve_cpp_type(
     );
     cpp_type_candidates_outcome(
         candidates,
+        context.bounded_support(),
         &context.cpp_read_scope,
         visibility,
         file,
@@ -3585,6 +3600,7 @@ fn resolve_cpp_type(
 
 fn cpp_type_candidates_outcome(
     candidates: Result<CppTypeCandidates, crate::analyzer::QueryReadIncomplete>,
+    support: &dyn BoundedDefinitionLookup,
     read_scope: &AnalyzerQueryScope<'_>,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
@@ -3599,6 +3615,12 @@ fn cpp_type_candidates_outcome(
                 return cpp_incomplete_type_outcome(reason);
             }
             if boundary {
+                // gated upstream: the candidate resolution above is exhausted,
+                // and the same-file honesty probe keeps the claim off a name
+                // this very file declares (#3285).
+                if let Some(outcome) = cpp_indexed_same_file_outcome(support, file, text, "type") {
+                    return outcome;
+                }
                 boundary_unchecked(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ))
@@ -4111,6 +4133,9 @@ fn cpp_type_candidates_without_focused_qualifier(
         // boundary. `gated_boundary` makes the workspace-internal check structural:
         // if the namespace-outward net finds a *visible* indexed declaration for the
         // qualifier, the honest outcome is no_definition, never a boundary.
+        if let Some(outcome) = cpp_indexed_same_file_outcome(support, file, text, "type") {
+            return CppTypeCandidates::outcome(outcome);
+        }
         return CppTypeCandidates::outcome(gated_boundary(
             || {
                 cpp_resolve_qualified_via_enclosing_namespaces(
@@ -5597,8 +5622,15 @@ fn resolve_cpp_call(
             }
             // gated upstream: the owner/member candidate resolution above is the
             // workspace check; a workspace-declared callable resolves there, so
-            // only an external one (with an unresolved include) reaches here.
+            // only an external one (with an unresolved include) reaches here,
+            // and the same-file honesty probe keeps the claim off a name this
+            // very file declares (#3285).
             if cpp_unresolved_include_boundary(ctx.visibility, ctx.file, &text, function) {
+                if let Some(outcome) =
+                    cpp_indexed_same_file_outcome(ctx.support, ctx.file, &text, "callable")
+                {
+                    return outcome;
+                }
                 return boundary_unchecked(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
@@ -6356,6 +6388,7 @@ fn resolve_cpp_construction_type(
     );
     cpp_type_candidates_outcome(
         candidates,
+        ctx.support,
         &read_scope,
         ctx.visibility,
         ctx.file,
@@ -6716,22 +6749,6 @@ fn cpp_is_non_reference_type_declaration_site(mut node: Node<'_>) -> bool {
             )
             && cpp_tag_specifier_declares_name(parent);
     }
-}
-
-fn cpp_expand_tagged_type_scope_reference(node: Node<'_>) -> Option<Node<'_>> {
-    let qualified = node.parent().filter(|parent| {
-        matches!(
-            parent.kind(),
-            "qualified_identifier" | "scoped_type_identifier"
-        ) && parent.child_by_field_name("scope") == Some(node)
-    })?;
-    let specifier = qualified.parent()?;
-    (matches!(
-        specifier.kind(),
-        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-    ) && specifier.child_by_field_name("name") == Some(qualified)
-        && !cpp_tag_specifier_declares_name(specifier))
-    .then_some(qualified)
 }
 
 fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
@@ -11010,6 +11027,53 @@ fn cpp_unresolved_include_boundary(
         return false;
     }
     visibility.has_unresolved_include_visible_before(file, node.start_byte())
+}
+
+/// The honest outcome when an include-boundary claim about `reference` would
+/// contradict the index, or `None` when the claim stands.
+///
+/// [`cpp_unresolved_include_boundary`] is a *file-level* signal: one
+/// unresolved include above the reference makes every capitalized name a
+/// boundary suspect. It says nothing about the name itself, so the confident
+/// claim "`X` appears to cross a C++ include boundary not indexed in this
+/// workspace" kept firing for names the index plainly contains -- fastfetch's
+/// `UINT`, a typedef the file's own `#else` arm declares, and znc's
+/// `CConfig`, forward-declared above the reference and defined below it in
+/// the same header (#3285). A declaration in the reference's own file is not
+/// across an include boundary by construction, so the claim is false there;
+/// the honest answer names what the index holds and leaves the caller
+/// something to act on.
+///
+/// The reference's own file is the whole scope on purpose. An unqualified C++
+/// name is scope-relative, and every resolver above has already proved it
+/// cannot select this one from this reference's context, so a same-named
+/// declaration in an unrelated translation unit is no evidence against a
+/// boundary claim -- while one in this very file always is. The declarations
+/// are named, never returned: those resolvers declined them on visibility,
+/// guard state, declaration order or kind, and this only decides which
+/// failure is truthful.
+fn cpp_indexed_same_file_outcome(
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    reference: &str,
+    subject: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let declarations = support.file_identifier(file, reference);
+    if declarations.is_empty() {
+        return None;
+    }
+    let named = declarations
+        .iter()
+        .map(|unit| format!("`{}`", unit.fq_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(no_definition(
+        "indexed_declaration_not_selected",
+        format!(
+            "`{reference}` did not resolve to an indexed C++ {subject} here; {} declares {named}, which this reference site cannot select",
+            rel_path_string(file)
+        ),
+    ))
 }
 
 fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {

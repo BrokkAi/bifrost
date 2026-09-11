@@ -7,7 +7,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::analyzer::tree_walk::{node_range, subtree_contains};
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
@@ -450,6 +450,17 @@ impl<'a> ScalaVisitor<'a> {
                     .is_some_and(|owner| owner.indentation >= indentation)
                 {
                     recovery_owners.pop();
+                }
+                // Every owner still on the stack lexically encloses this
+                // child: the indentation rule above is what kept it there.
+                // Their own ranges came from the nodes the parse error
+                // truncated, so they stop short of what this scope adopts.
+                // Grow them with each adopted sibling, or a container ends up
+                // not containing its own members (#3291).
+                let adopted = node_range(child);
+                for owner in &recovery_owners {
+                    self.parsed
+                        .extend_declaration_range(&owner.declaration, adopted);
                 }
             }
             let recovery_parent = recovery_owners
