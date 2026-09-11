@@ -29,7 +29,7 @@ use brokk_bifrost_rql::structural::search::UnitRowItem;
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
 };
-use crate::finding::PolicyIncompleteReason;
+use crate::finding::{CertaintyReason, FindingCertainty, PolicyIncompleteReason};
 
 use super::coverage::{
     MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput, RelationalObligation,
@@ -61,6 +61,7 @@ pub struct RelationalAssertionViolation {
     pub group: RowGroupName,
     pub key: Vec<Option<RowScalar>>,
     pub actual: u64,
+    pub certainty: FindingCertainty,
     /// Bounded contributing tuples of the violated group. Each tuple lists its
     /// rows in binding declaration order.
     pub representatives: Vec<Vec<RelationalViolationRow>>,
@@ -184,6 +185,9 @@ struct EvalTuple {
     contributors: Vec<Vec<RelationalViolationRow>>,
     /// Whether this tuple's presence is established. See `coverage`.
     witness_sound: bool,
+    // Independent of coverage and kept across every operator, including rows
+    // omitted from the bounded representative list.
+    may_reasons: Vec<CertaintyReason>,
 }
 
 /// One materialized relation.
@@ -430,6 +434,13 @@ fn evaluate_plan(
                 group: assertion.group.clone(),
                 key,
                 actual,
+                certainty: if tuple.may_reasons.is_empty() {
+                    FindingCertainty::Definite
+                } else {
+                    FindingCertainty::Possible {
+                        reasons: tuple.may_reasons.clone(),
+                    }
+                },
                 representatives: tuple.contributors.clone(),
             });
         }
@@ -702,6 +713,7 @@ fn evaluate_relation(
                             .collect(),
                         contributors: tuple.contributors.clone(),
                         witness_sound: tuple.witness_sound,
+                        may_reasons: tuple.may_reasons.clone(),
                     })
                 })
                 .collect::<EvalResult<Vec<_>>>()?;
@@ -818,6 +830,7 @@ fn load_rows(
                 row,
             }]],
             witness_sound: true,
+            may_reasons: row_may_reasons(item),
         });
     }
     if !unknown_inputs.is_empty() {
@@ -944,6 +957,7 @@ fn evaluate_join(
                     values,
                     contributors: vec![rows],
                     witness_sound: tuple.witness_sound && right_tuple.witness_sound,
+                    may_reasons: merge_may_reasons([tuple, *right_tuple]),
                 });
             }
         }
@@ -965,6 +979,16 @@ fn evaluate_join(
             joined.push(EvalTuple {
                 values,
                 contributors: tuple.contributors.clone(),
+                may_reasons: if kind == IrJoinKind::Semi
+                    && matches
+                        .is_some_and(|rows| rows.iter().all(|row| !row.may_reasons.is_empty()))
+                {
+                    merge_may_reasons(
+                        std::iter::once(tuple).chain(matches.into_iter().flatten().copied()),
+                    )
+                } else {
+                    tuple.may_reasons.clone()
+                },
                 witness_sound: tuple.witness_sound
                     && (!matches!(kind, IrJoinKind::Anti | IrJoinKind::Left)
                         || right_is_exhaustive),
@@ -1086,6 +1110,7 @@ fn evaluate_group(
             values,
             contributors,
             witness_sound,
+            may_reasons: merge_may_reasons(rows.tuples.iter().copied()),
         });
     }
     // One sort over group keys is the plan's only ordering decision: hash order
@@ -1374,4 +1399,46 @@ fn row_field(
                 field: field.to_string(),
             },
         })
+}
+
+/// Explicit modeled certainty is independent of relation coverage. Missing,
+/// unsupported, or truncated input alone never manufactures may evidence.
+fn row_may_reasons(row: &UnitRowItem) -> Vec<CertaintyReason> {
+    use brokk_bifrost_rql::structural::search::UnitRowScalar;
+    let field = |name| {
+        row.fields
+            .iter()
+            .find(|field| field.name.as_ref() == name)
+            .map(|field| &field.value)
+    };
+    let Some(UnitRowScalar::ConstrainedEnum(certainty)) = field("certainty") else {
+        return Vec::new();
+    };
+    if !matches!(certainty.as_ref(), "may" | "possible") {
+        return Vec::new();
+    }
+    let reason = row
+        .evidence
+        .as_ref()
+        .and_then(|evidence| evidence.reason.as_deref())
+        .or_else(|| match field("reason") {
+            Some(UnitRowScalar::String(reason) | UnitRowScalar::ConstrainedEnum(reason)) => {
+                Some(reason.as_ref())
+            }
+            _ => None,
+        })
+        .unwrap_or("explicit may row");
+    vec![CertaintyReason::MayEvidence {
+        reason: reason.to_string(),
+    }]
+}
+
+fn merge_may_reasons<'a>(tuples: impl IntoIterator<Item = &'a EvalTuple>) -> Vec<CertaintyReason> {
+    let mut reasons = tuples
+        .into_iter()
+        .flat_map(|tuple| tuple.may_reasons.iter().cloned())
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }

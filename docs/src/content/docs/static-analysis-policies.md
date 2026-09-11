@@ -2284,7 +2284,7 @@ reach:
 
 ```lisp
 (analysis :type taint
-  :on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed)
+  :on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)
   ...)
 ```
 
@@ -2293,6 +2293,17 @@ reach:
 | `abstain` (default) | Retained; the run stays `inconclusive` with its typed reasons | Unreliable (2) |
 | `warn-unreliable` | Retained unchanged; the run also carries `unknown_verdict` in its report JSON | Whatever the findings alone produce |
 | `fail-closed` | Retained unchanged, plus an `unknown_verdict_fail_closed` diagnostic naming the reasons | As if a finding at the policy's severity were present |
+| `treat-may-as-finding` | Explicit assertion may evidence is published as possible; coverage obligations remain inconclusive | Unreliable (2) if inconclusive; otherwise the findings determine the exit |
+
+`treat-may-as-finding` publishes explicit may evidence from assertion rows as
+findings with `certainty: possible`, retaining the reasons. Flow and taint
+already publish possible findings under every verdict; this spelling does not
+change their publication or hide findings under the other verdicts. Unsupported
+relations, budget-truncated aggregates, and unmet absence obligations do not
+become possible findings. Unmet coverage obligations still make the run
+`inconclusive` and its exit status unreliable (2), even when findings are present.
+Human and JSON output retain possible certainty and reasons; SARIF marks possible
+findings as `review` results and retains `bifrost.certainty`.
 
 Omitting the record is exactly `abstain`, so a policy written before this
 vocabulary existed behaves identically and keeps its canonical semantic hash.

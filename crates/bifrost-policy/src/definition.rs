@@ -1932,6 +1932,9 @@ pub enum UnknownVerdict {
     /// Treat the blocked verdict as a gate failure at the policy's own
     /// severity, and say in a diagnostic which unknown caused it.
     FailClosed,
+    /// Publish explicit may evidence as possible findings without discharging
+    /// coverage obligations. Existing flow and taint publication is unchanged.
+    TreatMayAsFinding,
 }
 
 impl UnknownVerdict {
@@ -1942,6 +1945,7 @@ impl UnknownVerdict {
             Self::Abstain => "abstain",
             Self::WarnUnreliable => "warn-unreliable",
             Self::FailClosed => "fail-closed",
+            Self::TreatMayAsFinding => "treat-may-as-finding",
         }
     }
 }

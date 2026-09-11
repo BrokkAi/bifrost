@@ -25,8 +25,13 @@ use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
 use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBehavior};
 
-pub const SUMMARY_SCHEMA_VERSION: u32 =
-    crate::analyzer::semantic_model::PROCEDURE_SUMMARY_CONTRACT_VERSION;
+/// Schema revision for Bifrost's internal reusable summary carrier.
+///
+/// This is deliberately independent from the authored model-pack wire
+/// contract. Embedded procedure summaries remain
+/// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; version 2 invalidates only
+/// carriers whose keys embed this module's internal summary schema.
+pub const SUMMARY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1706,6 +1711,257 @@ impl SummaryCompleteness {
     }
 }
 
+/// An independently produced family of procedure behavior covered by one
+/// reusable summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryDimension {
+    ValueTransfer,
+    Effect,
+    AccessPath,
+    Protocol,
+    Callback,
+}
+
+impl SummaryDimension {
+    /// Canonical enumeration order used for storage and stable digests.
+    pub const ALL: [Self; 5] = [
+        Self::ValueTransfer,
+        Self::Effect,
+        Self::AccessPath,
+        Self::Protocol,
+        Self::Callback,
+    ];
+
+    pub const fn stable_label(self) -> &'static str {
+        match self {
+            Self::ValueTransfer => "value_transfer",
+            Self::Effect => "effect",
+            Self::AccessPath => "access_path",
+            Self::Protocol => "protocol",
+            Self::Callback => "callback",
+        }
+    }
+}
+
+/// The producer's typed claim about one [`SummaryDimension`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SummaryDimensionStatus {
+    Complete,
+    Incomplete(Box<[SummaryIncompleteReason]>),
+}
+
+impl SummaryDimensionStatus {
+    pub fn incomplete(
+        reasons: Vec<SummaryIncompleteReason>,
+    ) -> Result<Self, SummaryValidationError> {
+        let SummaryCompleteness::Partial(reasons) = SummaryCompleteness::partial(reasons)? else {
+            unreachable!("non-empty canonical reasons remain partial");
+        };
+        Ok(Self::Incomplete(reasons))
+    }
+
+    fn from_completeness(completeness: &SummaryCompleteness) -> Self {
+        match completeness {
+            SummaryCompleteness::Complete => Self::Complete,
+            SummaryCompleteness::Partial(reasons) => Self::Incomplete(reasons.clone()),
+        }
+    }
+
+    fn as_completeness(&self) -> SummaryCompleteness {
+        match self {
+            Self::Complete => SummaryCompleteness::Complete,
+            Self::Incomplete(reasons) => SummaryCompleteness::Partial(reasons.clone()),
+        }
+    }
+
+    fn validate(&self) -> Result<(), SummaryValidationError> {
+        match self {
+            Self::Complete => Ok(()),
+            Self::Incomplete(reasons) => {
+                let normalized = SummaryCompleteness::partial(reasons.to_vec())?;
+                if normalized.reasons() != reasons.as_ref() {
+                    return Err(SummaryValidationError::NonCanonicalIncompleteReasons);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn join_alternatives(&self, other: &Self) -> Result<Self, SummaryValidationError> {
+        self.as_completeness()
+            .join_alternatives(&other.as_completeness())
+            .map(|completeness| Self::from_completeness(&completeness))
+    }
+
+    fn conjoin(&self, other: &Self) -> Result<Self, SummaryValidationError> {
+        self.as_completeness()
+            .conjoin(&other.as_completeness())
+            .map(|completeness| Self::from_completeness(&completeness))
+    }
+
+    fn digest_parts(&self, bytes: &mut Vec<u8>) {
+        match self {
+            Self::Complete => push_digest_part(bytes, b"complete"),
+            Self::Incomplete(reasons) => {
+                push_digest_part(bytes, b"incomplete");
+                push_digest_part(bytes, &(reasons.len() as u64).to_le_bytes());
+                for reason in reasons {
+                    push_digest_part(bytes, reason.stable_label().as_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// The typed coverage state of one dimension. Absence means unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryDimensionState<'a> {
+    Complete,
+    Incomplete(&'a [SummaryIncompleteReason]),
+    Unsupported,
+}
+
+/// One independently claimed dimension and its bounded coverage status.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SummaryDimensionClaim {
+    dimension: SummaryDimension,
+    status: SummaryDimensionStatus,
+}
+
+impl SummaryDimensionClaim {
+    pub fn new(
+        dimension: SummaryDimension,
+        status: SummaryDimensionStatus,
+    ) -> Result<Self, SummaryValidationError> {
+        status.validate()?;
+        Ok(Self { dimension, status })
+    }
+
+    pub const fn dimension(&self) -> SummaryDimension {
+        self.dimension
+    }
+
+    pub const fn status(&self) -> &SummaryDimensionStatus {
+        &self.status
+    }
+}
+
+/// Canonical, independently typed coverage for every summary dimension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryDimensionCoverage {
+    rows: Box<[SummaryDimensionClaim]>,
+}
+
+impl SummaryDimensionCoverage {
+    pub fn try_new(mut rows: Vec<SummaryDimensionClaim>) -> Result<Self, SummaryValidationError> {
+        rows.sort_unstable_by_key(|row| row.dimension);
+        if let Some(index) = rows
+            .windows(2)
+            .position(|pair| pair[0].dimension == pair[1].dimension)
+        {
+            return Err(SummaryValidationError::DuplicateSummaryDimension {
+                dimension: rows[index].dimension,
+            });
+        }
+        Ok(Self {
+            rows: rows.into_boxed_slice(),
+        })
+    }
+
+    fn for_value_transfer(
+        completeness: &SummaryCompleteness,
+    ) -> Result<Self, SummaryValidationError> {
+        Self::try_new(vec![SummaryDimensionClaim {
+            dimension: SummaryDimension::ValueTransfer,
+            status: SummaryDimensionStatus::from_completeness(completeness),
+        }])
+    }
+
+    pub fn state(&self, dimension: SummaryDimension) -> SummaryDimensionState<'_> {
+        match self
+            .rows
+            .binary_search_by(|row| row.dimension.cmp(&dimension))
+        {
+            Ok(index) => match &self.rows[index].status {
+                SummaryDimensionStatus::Complete => SummaryDimensionState::Complete,
+                SummaryDimensionStatus::Incomplete(reasons) => {
+                    SummaryDimensionState::Incomplete(reasons)
+                }
+            },
+            Err(_) => SummaryDimensionState::Unsupported,
+        }
+    }
+
+    fn status_for(&self, dimension: SummaryDimension) -> Option<&SummaryDimensionStatus> {
+        self.rows
+            .binary_search_by(|row| row.dimension.cmp(&dimension))
+            .ok()
+            .map(|index| &self.rows[index].status)
+    }
+
+    fn join_alternatives(&self, other: &Self) -> Result<Self, SummaryValidationError> {
+        let mut rows = Vec::with_capacity(self.rows.len() + other.rows.len());
+        for dimension in SummaryDimension::ALL {
+            match (self.status_for(dimension), other.status_for(dimension)) {
+                (None, None) => {}
+                (Some(status), None) | (None, Some(status)) => {
+                    rows.push(SummaryDimensionClaim {
+                        dimension,
+                        status: status.clone(),
+                    });
+                }
+                (Some(left), Some(right)) => rows.push(SummaryDimensionClaim {
+                    dimension,
+                    status: left.join_alternatives(right)?,
+                }),
+            }
+        }
+        Self::try_new(rows)
+    }
+
+    fn conjoin(&self, other: &Self) -> Result<Self, SummaryValidationError> {
+        let mut rows = Vec::with_capacity(self.rows.len().max(other.rows.len()));
+        for dimension in SummaryDimension::ALL {
+            match (self.status_for(dimension), other.status_for(dimension)) {
+                (None, None) => {}
+                // Sequential flow can corroborate a dimension only when both
+                // stages actually attempted it. One stage's absent dimension
+                // must not make a present stage's complete claim pass through.
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(left), Some(right)) => rows.push(SummaryDimensionClaim {
+                    dimension,
+                    status: left.conjoin(right)?,
+                }),
+            }
+        }
+        Self::try_new(rows)
+    }
+
+    fn digest_parts(&self, bytes: &mut Vec<u8>) {
+        for dimension in SummaryDimension::ALL {
+            push_digest_part(bytes, dimension.stable_label().as_bytes());
+            match self.status_for(dimension) {
+                Some(status) => status.digest_parts(bytes),
+                None => push_digest_part(bytes, b"unsupported"),
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        size_of_val(self.rows.as_ref()).saturating_add(
+            self.rows
+                .iter()
+                .map(|row| match &row.status {
+                    SummaryDimensionStatus::Complete => 0_usize,
+                    SummaryDimensionStatus::Incomplete(reasons) => {
+                        incomplete_reasons_heap_bytes(reasons)
+                    }
+                })
+                .fold(0_usize, usize::saturating_add),
+        )
+    }
+}
+
 /// Stable reusable semantic effects for one exact procedure validity key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticProcedureSummary {
@@ -1716,6 +1972,7 @@ pub struct SemanticProcedureSummary {
     effects: Box<[SummaryEffect]>,
     dependencies: Box<[SummaryDependencyKey]>,
     completeness: SummaryCompleteness,
+    coverage: SummaryDimensionCoverage,
 }
 
 impl SemanticProcedureSummary {
@@ -1726,6 +1983,7 @@ impl SemanticProcedureSummary {
         dependencies: Vec<SummaryDependencyKey>,
         completeness: SummaryCompleteness,
     ) -> Result<Self, SummaryValidationError> {
+        let coverage = SummaryDimensionCoverage::for_value_transfer(&completeness)?;
         let recursive_topology = recursive_edges_for_dependencies(key.identity(), &dependencies);
         Self::try_new_with_root(
             key.clone(),
@@ -1734,7 +1992,39 @@ impl SemanticProcedureSummary {
             transfers,
             effects,
             dependencies,
-            completeness,
+            coverage,
+        )
+    }
+
+    /// Build a summary whose independently produced dimensions are explicit.
+    ///
+    /// `completeness` remains the legacy value-transfer publication claim while
+    /// existing callers migrate. The explicit value-transfer coverage must make
+    /// exactly that claim; all other dimensions may be absent.
+    pub fn try_new_with_coverage(
+        key: ProcedureSummaryKey,
+        transfers: Vec<SummaryTransfer>,
+        effects: Vec<SummaryEffect>,
+        dependencies: Vec<SummaryDependencyKey>,
+        completeness: SummaryCompleteness,
+        coverage_rows: Vec<SummaryDimensionClaim>,
+    ) -> Result<Self, SummaryValidationError> {
+        let coverage = SummaryDimensionCoverage::try_new(coverage_rows)?;
+        let Some(value_transfer) = coverage.status_for(SummaryDimension::ValueTransfer) else {
+            return Err(SummaryValidationError::MissingValueTransferCoverage);
+        };
+        if SummaryDimensionStatus::from_completeness(&completeness) != *value_transfer {
+            return Err(SummaryValidationError::ValueTransferCoverageMismatch);
+        }
+        let recursive_topology = recursive_edges_for_dependencies(key.identity(), &dependencies);
+        Self::try_new_with_root(
+            key.clone(),
+            key,
+            recursive_topology,
+            transfers,
+            effects,
+            dependencies,
+            coverage,
         )
     }
 
@@ -1745,8 +2035,12 @@ impl SemanticProcedureSummary {
         transfers: Vec<SummaryTransfer>,
         effects: Vec<SummaryEffect>,
         dependencies: Vec<SummaryDependencyKey>,
-        completeness: SummaryCompleteness,
+        coverage: SummaryDimensionCoverage,
     ) -> Result<Self, SummaryValidationError> {
+        let completeness = coverage
+            .status_for(SummaryDimension::ValueTransfer)
+            .ok_or(SummaryValidationError::MissingValueTransferCoverage)?
+            .as_completeness();
         if transfers.len() > MAX_SUMMARY_TRANSFERS {
             return Err(SummaryValidationError::TooManyTransfers {
                 actual: transfers.len(),
@@ -1761,6 +2055,10 @@ impl SemanticProcedureSummary {
         }
         validate_raw_effect_reference_bound(&effects)?;
         completeness.validate()?;
+        coverage
+            .rows
+            .iter()
+            .try_for_each(|row| row.status.validate())?;
         if key.identity() != composition_root.identity() {
             return Err(SummaryValidationError::CompositionRootIdentityMismatch);
         }
@@ -1807,6 +2105,7 @@ impl SemanticProcedureSummary {
             effects,
             dependencies,
             completeness,
+            coverage,
         })
     }
 
@@ -1847,6 +2146,10 @@ impl SemanticProcedureSummary {
         &self.completeness
     }
 
+    pub const fn coverage(&self) -> &SummaryDimensionCoverage {
+        &self.coverage
+    }
+
     /// Conservative retained heap estimate including the repository's cloned map key.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>()
@@ -1883,6 +2186,7 @@ impl SemanticProcedureSummary {
                     .fold(0_usize, usize::saturating_add),
             )
             .saturating_add(completeness_heap_bytes(&self.completeness))
+            .saturating_add(self.coverage.retained_bytes())
     }
 
     /// Whether two revisions of one procedure publish the same summary output.
@@ -1908,6 +2212,7 @@ impl SemanticProcedureSummary {
         self.transfers == other.transfers
             && self.effects == other.effects
             && self.completeness == other.completeness
+            && self.coverage == other.coverage
     }
 
     /// A checkout-independent digest of what this summary answers, for a read
@@ -1941,7 +2246,7 @@ impl SemanticProcedureSummary {
     /// verification would report a change that is not one.
     pub fn public_content_digest(&self) -> StableDigest {
         let mut bytes = Vec::new();
-        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-content-v2");
+        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-content-v3");
         push_digest_part(&mut bytes, self.key.identity.read_fingerprint().as_bytes());
         push_digest_part(&mut bytes, &(self.dependencies.len() as u64).to_le_bytes());
         for dependency in &self.dependencies {
@@ -1971,6 +2276,7 @@ impl SemanticProcedureSummary {
         );
         push_digest_part(&mut bytes, &(self.transfers.len() as u64).to_le_bytes());
         push_digest_part(&mut bytes, &(self.effects.len() as u64).to_le_bytes());
+        self.coverage.digest_parts(&mut bytes);
         match &self.completeness {
             SummaryCompleteness::Complete => push_digest_part(&mut bytes, b"complete"),
             SummaryCompleteness::Partial(reasons) => {
@@ -2014,8 +2320,8 @@ impl SemanticProcedureSummary {
             transfers.into_vec(),
             effects.into_vec(),
             self.dependencies.to_vec(),
-            self.completeness
-                .join_alternatives(&other.completeness)
+            self.coverage
+                .join_alternatives(&other.coverage)
                 .map_err(SummaryCompositionError::InvalidResult)?,
         )
         .map_err(SummaryCompositionError::InvalidResult)
@@ -2037,7 +2343,7 @@ impl SemanticProcedureSummary {
         let mut effects = self.effects.to_vec();
         let mut dependencies = self.dependencies.to_vec();
         let invoked = invocation_evidence.is_some();
-        let completeness = if let Some(invocation_evidence) = invocation_evidence {
+        if let Some(invocation_evidence) = invocation_evidence {
             let next_dependency = if self.key.recursive_group().is_some()
                 && self.key.recursive_group() == next.key.recursive_group()
             {
@@ -2062,11 +2368,13 @@ impl SemanticProcedureSummary {
                         .map_err(SummaryCompositionError::InvalidResult)?,
                 ));
             }
-            self.completeness
-                .conjoin(&next.completeness)
+        }
+        let coverage = if invoked {
+            self.coverage
+                .conjoin(&next.coverage)
                 .map_err(SummaryCompositionError::InvalidResult)?
         } else {
-            self.completeness.clone()
+            self.coverage.clone()
         };
         let effects =
             canonicalize_effects(effects).map_err(SummaryCompositionError::InvalidResult)?;
@@ -2096,7 +2404,7 @@ impl SemanticProcedureSummary {
             transfers.into_vec(),
             effects.into_vec(),
             dependencies.into_vec(),
-            completeness,
+            coverage,
         )
         .map_err(SummaryCompositionError::InvalidResult)
     }
@@ -3333,6 +3641,9 @@ pub enum SummaryValidationError {
     InvalidBoundaryInputPort,
     EmptyIncompleteReasons,
     NonCanonicalIncompleteReasons,
+    DuplicateSummaryDimension { dimension: SummaryDimension },
+    MissingValueTransferCoverage,
+    ValueTransferCoverageMismatch,
     TooManyTransfers { actual: usize, limit: usize },
     TooManyEffects { actual: usize, limit: usize },
     CompleteSummaryHasIncompleteTransfer,
@@ -3371,6 +3682,15 @@ impl fmt::Display for SummaryValidationError {
             Self::InvalidBoundaryInputPort => formatter.write_str("summary boundary inputs cannot be return ports"),
             Self::EmptyIncompleteReasons => formatter.write_str("a partial summary requires at least one incomplete reason"),
             Self::NonCanonicalIncompleteReasons => formatter.write_str("partial summary reasons must be sorted and unique"),
+            Self::DuplicateSummaryDimension { dimension } => {
+                write!(formatter, "summary coverage repeats the {dimension:?} dimension")
+            }
+            Self::MissingValueTransferCoverage => {
+                formatter.write_str("summary coverage must include the value-transfer dimension")
+            }
+            Self::ValueTransferCoverageMismatch => formatter.write_str(
+                "summary value-transfer coverage must match the legacy completeness claim",
+            ),
             Self::TooManyTransfers { actual, limit } => write!(formatter, "summary has {actual} transfers, limit is {limit}"),
             Self::TooManyEffects { actual, limit } => write!(formatter, "summary has {actual} effects, limit is {limit}"),
             Self::CompleteSummaryHasIncompleteTransfer => formatter.write_str("a complete summary cannot contain an incomplete transfer"),
@@ -4061,7 +4381,11 @@ fn completeness_heap_bytes(completeness: &SummaryCompleteness) -> usize {
     let SummaryCompleteness::Partial(reasons) = completeness else {
         return 0;
     };
-    size_of_val(reasons.as_ref()).saturating_add(
+    incomplete_reasons_heap_bytes(reasons)
+}
+
+fn incomplete_reasons_heap_bytes(reasons: &[SummaryIncompleteReason]) -> usize {
+    size_of_val(reasons).saturating_add(
         reasons
             .iter()
             .map(|reason| match reason {

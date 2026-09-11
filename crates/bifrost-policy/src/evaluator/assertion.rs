@@ -2745,25 +2745,48 @@ fn relational_run(
             );
         };
 
-        let completeness = if related_truncated {
-            FindingCompleteness::partial(vec![FindingIncompleteReason::RelatedLocationsTruncated])
-                .expect("one typed finding-incomplete reason is canonical")
+        let certainty = if policy.definition().on_unknown.verdict
+            == super::super::definition::UnknownVerdict::TreatMayAsFinding
+        {
+            violation.certainty.clone()
         } else {
-            FindingCompleteness::Complete
+            FindingCertainty::Definite
         };
-        let proof = ProofMetadata::try_new(
-            ProofState::Proven,
-            vec![ProofReason::DirectStructuralMatch],
-            Vec::new(),
-        )
-        .expect("a proven direct structural match is a canonical proof");
+        let mut incomplete = Vec::new();
+        if related_truncated {
+            incomplete.push(FindingIncompleteReason::RelatedLocationsTruncated);
+        }
+        if matches!(certainty, FindingCertainty::Possible { .. }) {
+            incomplete.push(FindingIncompleteReason::ProofPartial);
+        }
+        let completeness = if incomplete.is_empty() {
+            FindingCompleteness::Complete
+        } else {
+            FindingCompleteness::partial(incomplete)
+                .expect("typed finding-incomplete reasons are canonical")
+        };
+        let proof = match &certainty {
+            FindingCertainty::Definite => ProofMetadata::try_new(
+                ProofState::Proven,
+                vec![ProofReason::DirectStructuralMatch],
+                Vec::new(),
+            ),
+            FindingCertainty::Possible { .. } => ProofMetadata::try_new(
+                ProofState::Unproven,
+                vec![ProofReason::AnalyzerEvidence {
+                    code: "explicit-may-row".to_string(),
+                }],
+                Vec::new(),
+            ),
+        }
+        .expect("relational row evidence has canonical proof metadata");
         let finding = PolicyFinding::try_new(
             metadata.id.clone(),
             policy.semantic_hash(),
             severity,
             message.clone(),
             classification.clone(),
-            FindingCertainty::Definite,
+            certainty,
             completeness,
             primary_location,
             related,

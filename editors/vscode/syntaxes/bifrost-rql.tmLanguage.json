@@ -33,6 +33,10 @@
       }
     },
     {
+      "name": "support.constant.unknown-verdict.bifrost-rql",
+      "match": "(?<![A-Za-z0-9_-])(?:abstain|warn-unreliable|fail-closed|treat-may-as-finding)(?=[\\s)\\]])"
+    },
+    {
       "name": "support.constant.aggregate-operation.bifrost-rql",
       "match": "(?<![A-Za-z0-9_-])(?:set-equal|subset)(?=[\\s)\\]])"
     },

@@ -2268,6 +2268,10 @@ fn write_certainty_detail<W: Write>(
                 write!(output, "analyzer ambiguity {}", escape_terminal_text(code),)
                     .map_err(map_io_error)?
             }
+            CertaintyReason::MayEvidence { reason } => {
+                write!(output, "may evidence {}", escape_terminal_text(reason))
+                    .map_err(map_io_error)?;
+            }
             _ => write!(output, "{}", reason.label()).map_err(map_io_error)?,
         }
         writeln!(output).map_err(map_io_error)?;

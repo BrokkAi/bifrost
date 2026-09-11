@@ -2871,6 +2871,7 @@ impl Decoder {
             PolicyAtomValue::UnknownVerdictAbstain => UnknownVerdict::Abstain,
             PolicyAtomValue::UnknownVerdictWarnUnreliable => UnknownVerdict::WarnUnreliable,
             PolicyAtomValue::UnknownVerdictFailClosed => UnknownVerdict::FailClosed,
+            PolicyAtomValue::UnknownVerdictTreatMayAsFinding => UnknownVerdict::TreatMayAsFinding,
             atom => unreachable!("UnknownVerdict registry returned {atom:?}"),
         };
         Ok(OnUnknownSpec { verdict })
@@ -7628,6 +7629,10 @@ mod tests {
             (Some("abstain"), UnknownVerdict::Abstain),
             (Some("warn-unreliable"), UnknownVerdict::WarnUnreliable),
             (Some("fail-closed"), UnknownVerdict::FailClosed),
+            (
+                Some("treat-may-as-finding"),
+                UnknownVerdict::TreatMayAsFinding,
+            ),
         ] {
             let extra = authored
                 .map(|verdict| format!(":on-unknown (on-unknown :verdict {verdict})"))
@@ -7662,7 +7667,7 @@ mod tests {
         assert_eq!(
             error.message,
             "invalid unknown-result verdict `shrug`; accepted values are abstain, \
-             warn-unreliable, fail-closed"
+             warn-unreliable, fail-closed, treat-may-as-finding"
         );
     }
 
@@ -7673,7 +7678,7 @@ mod tests {
             .expect("registered record has hover help");
         assert_eq!(
             record.signature,
-            "(on-unknown :verdict abstain|warn-unreliable|fail-closed)"
+            "(on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)"
         );
         assert!(
             record
@@ -7691,6 +7696,15 @@ mod tests {
             "{}",
             atom.description
         );
+    }
+
+    #[test]
+    fn treat_may_as_finding_has_atom_hover_help() {
+        let source = taint_policy(":on-unknown (on-unknown :verdict treat-may-as-finding)");
+        let atom =
+            rqlp_source_help_at(&source, source.find("treat-may-as-finding").unwrap() + 2).unwrap();
+        assert_eq!(atom.signature, "treat-may-as-finding");
+        assert!(atom.description.contains("unmet coverage obligations"));
     }
 
     #[test]

@@ -23,7 +23,8 @@ use crate::dataflow::{
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SummaryCompleteness,
     SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect,
     SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
-    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryEffect, SummaryEffectKey,
+    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryDimension,
+    SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect, SummaryEffectKey,
     SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
     SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
     SummaryTransfer, SummaryValidationError,
@@ -34,8 +35,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledAtomicOperation, CompiledConcurrencyEffect, CompiledLockMode, CompiledProcedureSummary,
     CompiledProcedureTarget, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
     CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
-    ProcedureSummaryMatch, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition,
+    PROCEDURE_SUMMARY_CONTRACT_VERSION, ProcedureSummaryMatch, ProcedureSummaryMemberKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -678,7 +679,11 @@ fn verify_target(
             summary_id: summary.id.clone(),
         });
     }
-    if summary.contract_version != compatibility.schema().get()
+    // The compiled payload is authored against the semantic-pack wire
+    // contract. `compatibility.schema()` identifies the lowered reusable
+    // carrier and can advance independently when its internal representation
+    // changes without changing authored pack bytes or meaning.
+    if summary.contract_version != PROCEDURE_SUMMARY_CONTRACT_VERSION
         || binding.artifact.dependencies() != compatibility.dependencies()
     {
         return Err(ProcedureSummaryBindingError::IncompatibleCompatibilityKey {
@@ -944,7 +949,23 @@ fn build_summary_set(
                 ])
                 .map_err(|source| invalid_summary(summary, source))?,
             };
-            let lowered = SemanticProcedureSummary::try_new(
+            let coverage_status = match &completeness {
+                SummaryCompleteness::Complete => SummaryDimensionStatus::Complete,
+                SummaryCompleteness::Partial(reasons) => {
+                    SummaryDimensionStatus::incomplete(reasons.to_vec())
+                        .map_err(|source| invalid_summary(summary, source))?
+                }
+            };
+            let coverage_rows = vec![
+                SummaryDimensionClaim::new(
+                    SummaryDimension::ValueTransfer,
+                    coverage_status.clone(),
+                )
+                .map_err(|source| invalid_summary(summary, source))?,
+                SummaryDimensionClaim::new(SummaryDimension::Effect, coverage_status)
+                    .map_err(|source| invalid_summary(summary, source))?,
+            ];
+            let lowered = SemanticProcedureSummary::try_new_with_coverage(
                 key_by_node[member]
                     .clone()
                     .expect("member key created before lowering"),
@@ -952,6 +973,7 @@ fn build_summary_set(
                 effects,
                 dependencies,
                 completeness,
+                coverage_rows,
             )
             .map_err(|source| invalid_summary(summary, source))?;
             summaries.push(lowered);

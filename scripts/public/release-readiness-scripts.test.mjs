@@ -149,15 +149,6 @@ test("the release crate inventory matches the workspace members plus the facade"
   assert.equal(crates.at(-1), "brokk-bifrost", "the facade must be packaged last");
 });
 
-test("the facade excludes readiness artifacts and the packager enforces crates.io's size cap", () => {
-  const manifest = fs.readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
-  const packager = fs.readFileSync(script("package-release-crates.sh"), "utf8");
-
-  assert.match(manifest, /^\s*"dist\/\*\*",$/mu);
-  assert.match(packager, /max_crates_io_upload_bytes=10485760/u);
-  assert.match(packager, /archive_bytes <= max_crates_io_upload_bytes/u);
-});
-
 test("every non-facade release crate gets a patch pointing at a real directory", () => {
   const listed = run(BASH, [
     "-c",

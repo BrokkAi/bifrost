@@ -2814,15 +2814,25 @@ fn rust_visible_import_resolution(
                         if !identities.is_empty() {
                             // A namespace imported through a facade can name a
                             // different physical crate/module than its spelling.
-                            // Validate against the canonical declaration route,
-                            // not a reconstructed package plus identifier.
+                            // Validate against the exact declarations behind
+                            // the canonical identities. Rendering an identity
+                            // loses the `_module_` CodeUnit segment for
+                            // module-scope values in Cargo target roots.
+                            let walks = RustUsageWalks::new(rust, token);
                             for identity in identities {
-                                let fqn = identity.fq_name();
-                                expected_routes
-                                    .entry(fqn.clone())
-                                    .or_default()
-                                    .push(identity.file);
-                                expected_fqns.insert(fqn);
+                                let declarations = walks.declarations_of_identity(&identity);
+                                assert!(
+                                    !declarations.is_empty(),
+                                    "forward import identity has no source declaration: {identity:?}"
+                                );
+                                for declaration in declarations {
+                                    let fqn = declaration.fq_name();
+                                    expected_routes
+                                        .entry(fqn.clone())
+                                        .or_default()
+                                        .push(declaration.source().clone());
+                                    expected_fqns.insert(fqn);
+                                }
                             }
                             continue;
                         }

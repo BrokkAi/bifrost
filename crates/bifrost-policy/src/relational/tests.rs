@@ -2235,3 +2235,39 @@ fn cancellation_without_assertions_still_reports_cancelled() {
         vec![PolicyIncompleteReason::Cancelled]
     );
 }
+
+/// Certainty must come from all contributing rows, not the bounded source
+/// locations retained for display. Coverage limits remain independent.
+#[test]
+fn may_evidence_survives_grouping_beyond_retained_representatives() {
+    let mut rows = two_rows_at_one_site();
+    rows[1].fields.push(UnitRowField {
+        name: "certainty".into(),
+        value: UnitRowScalar::ConstrainedEnum("possible".into()),
+    });
+    rows[1].fields.push(UnitRowField {
+        name: "reason".into(),
+        value: UnitRowScalar::String("An explicitly modeled alternative".into()),
+    });
+    let mut plan = counting_plan(AssertCardinality::AtMost(0));
+    plan.limits.max_representative_tuples = 1;
+    let result = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    assert_eq!(result.violations.len(), 1);
+    assert_eq!(result.violations[0].representatives.len(), 1);
+    assert_eq!(
+        result.violations[0].certainty,
+        crate::finding::FindingCertainty::possible(vec![
+            crate::finding::CertaintyReason::MayEvidence {
+                reason: "An explicitly modeled alternative".to_string(),
+            }
+        ])
+        .unwrap()
+    );
+    assert!(result.exhaustive);
+
+    plan.limits.max_values_per_group = 1;
+    let truncated = evaluate(&plan, &[("arg", &rows, RelationCoverage::Exhaustive)]);
+    assert!(truncated.violations.is_empty());
+    assert!(!truncated.unmet_obligations.is_empty());
+    assert!(!truncated.exhaustive);
+}

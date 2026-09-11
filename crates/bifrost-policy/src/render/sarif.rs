@@ -357,7 +357,11 @@ impl<'a> SarifResult<'a> {
                 text: finding.message(),
             },
             level,
-            kind: unrated.then_some("informational"),
+            kind: if matches!(finding.certainty(), FindingCertainty::Possible { .. }) {
+                Some("review")
+            } else {
+                unrated.then_some("informational")
+            },
             baseline_state: finding.diff().map(|diff| match diff.disposition() {
                 FindingDiffDisposition::New => "new",
                 FindingDiffDisposition::Persisting => "unchanged",

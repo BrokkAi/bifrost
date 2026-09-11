@@ -2355,6 +2355,18 @@ impl<'a> RustUsageWalks<'a> {
             .next_back()
     }
 
+    /// The exact source declarations that introduce `identity`.
+    pub fn declarations_of_identity(&self, identity: &RustSymbolIdentity) -> Vec<CodeUnit> {
+        let facts = self.queries.declaration_facts_of(&identity.file);
+        facts
+            .identities
+            .iter()
+            .chain(&facts.value_constructors)
+            .filter(|(_, candidate)| candidate == identity)
+            .map(|(declaration, _)| declaration.clone())
+            .collect()
+    }
+
     /// The value-namespace identity a tuple struct or tuple variant's
     /// constructor introduces.
     pub fn value_constructor_identity_of(

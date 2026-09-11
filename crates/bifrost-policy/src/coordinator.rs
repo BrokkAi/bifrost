@@ -4576,6 +4576,8 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
     // (#2506) has already had that declaration applied: `warn-unreliable` asked
     // for the findings' own status and `fail-closed` already contributed to the
     // finding gate, so neither may also condemn the batch for being incomplete.
+    // TreatMayAsFinding changes publication only; its marker never waives
+    // coverage obligations or the unreliable exit status.
     // The marker is set only on an `Inconclusive` run, so a failed or
     // unsupported run still exits unreliable whatever the policy declared.
     let unreliable = report.execution().termination().is_some()
@@ -4584,13 +4586,20 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
             .iter()
             .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
         || report.diagnostics_truncated()
-        || report
-            .runs()
-            .iter()
-            .any(|run| !run.completion().is_reliable() && run.unknown_verdict().is_none())
+        || report.runs().iter().any(|run| {
+            !run.completion().is_reliable()
+                && !matches!(
+                    run.unknown_verdict(),
+                    Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
+                )
+        })
         || (!threshold_exceeded
             && report.runs().iter().any(|run| {
-                !run.completion().permits_clean_negative() && run.unknown_verdict().is_none()
+                !run.completion().permits_clean_negative()
+                    && !matches!(
+                        run.unknown_verdict(),
+                        Some(UnknownVerdict::WarnUnreliable | UnknownVerdict::FailClosed)
+                    )
             }));
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;

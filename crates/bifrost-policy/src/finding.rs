@@ -344,7 +344,13 @@ pub enum CertaintyReason {
     AmbiguousDispatch,
     NameBasedResolution,
     MultipleCandidateDeclarations,
-    AnalyzerAmbiguity { code: String },
+    AnalyzerAmbiguity {
+        code: String,
+    },
+    /// The row explicitly models a may relation, with its producer's reason.
+    MayEvidence {
+        reason: String,
+    },
 }
 
 impl CertaintyReason {
@@ -357,6 +363,7 @@ impl CertaintyReason {
             Self::NameBasedResolution => "name_based_resolution",
             Self::MultipleCandidateDeclarations => "multiple_candidate_declarations",
             Self::AnalyzerAmbiguity { code } => code.as_str(),
+            Self::MayEvidence { reason } => reason.as_str(),
         }
     }
 
@@ -368,8 +375,10 @@ impl CertaintyReason {
     }
 
     fn validate(&self) -> Result<(), ReportValueError> {
-        if let Self::AnalyzerAmbiguity { code } = self {
-            validate_report_identifier(code)?;
+        match self {
+            Self::AnalyzerAmbiguity { code } => validate_report_identifier(code)?,
+            Self::MayEvidence { reason } => validate_report_prose(reason)?,
+            _ => {}
         }
         Ok(())
     }
@@ -3464,8 +3473,9 @@ impl PolicyRun {
     /// Apply the policy's declared handling of a verdict blocked by unknown or
     /// incomplete evidence (#2506).
     ///
-    /// A declaration only ever applies to an `Inconclusive` run. A `Failed` or
-    /// `Unsupported` run is an engine outcome rather than a policy verdict, and
+    /// This run-level marker only applies to an `Inconclusive` run. The
+    /// evaluator handles explicit may publication before finalizing completion.
+    /// A `Failed` or `Unsupported` run is an engine outcome rather than a policy verdict, and
     /// no authored preference may launder one into a gate the batch passes.
     pub(crate) fn apply_unknown_verdict(
         &mut self,
@@ -3477,7 +3487,7 @@ impl PolicyRun {
         };
         match verdict {
             UnknownVerdict::Abstain => return Ok(()),
-            UnknownVerdict::WarnUnreliable => {}
+            UnknownVerdict::WarnUnreliable | UnknownVerdict::TreatMayAsFinding => {}
             UnknownVerdict::FailClosed => {
                 let named = reasons
                     .iter()
@@ -4354,6 +4364,7 @@ impl RetainedSize for CertaintyReason {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
             Self::AnalyzerAmbiguity { code } => code.capacity(),
+            Self::MayEvidence { reason } => reason.capacity(),
             _ => 0,
         })
     }
