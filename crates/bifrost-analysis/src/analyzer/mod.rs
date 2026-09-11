@@ -5,6 +5,7 @@ pub mod cognitive_complexity;
 mod cognitive_complexity_tests;
 mod comment_density;
 pub mod common;
+pub mod configuration;
 pub mod content_identity;
 pub mod correspondence;
 mod cpp;

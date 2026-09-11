@@ -11,6 +11,7 @@ use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_rql::query::{CapabilityEvaluation, QueryInputDomain, UnsupportedReason};
 use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
 use super::baseline::PolicyFindingBaseline;
@@ -74,6 +75,40 @@ pub enum PolicyRunCompletion {
 }
 
 impl PolicyRunCompletion {
+    /// Map the canonical query-domain support decision without re-evaluating
+    /// it or laundering unavailable coverage into a clean policy run.
+    pub fn from_query_capability_evaluation(evaluation: &CapabilityEvaluation) -> Self {
+        match evaluation {
+            CapabilityEvaluation::Supported { .. } => Self::Complete,
+            CapabilityEvaluation::Unsupported { evidence, reason } => Self::Unsupported {
+                capability: PolicyCapability::QueryDomain {
+                    domain: match evidence.selected_input() {
+                        QueryInputDomain::Single(domain) => domain.kind().label().to_owned(),
+                        QueryInputDomain::CrossDomain { .. } => "cross_domain".to_owned(),
+                    },
+                    capability: evidence.capability().map(|value| value.as_str().to_owned()),
+                    reason: match reason {
+                        UnsupportedReason::CapabilityUnavailable => "capability_unavailable",
+                        UnsupportedReason::ProviderUnavailable => "provider_unavailable",
+                        UnsupportedReason::PackUnavailable => "pack_unavailable",
+                        UnsupportedReason::CrossDomainOperatorUnavailable => {
+                            "cross_domain_operator_unavailable"
+                        }
+                    }
+                    .to_owned(),
+                },
+            },
+            CapabilityEvaluation::Incomplete { .. } => {
+                Self::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+                    .expect("one typed incomplete reason is canonical")
+            }
+            CapabilityEvaluation::Invalid { .. } => {
+                Self::failed(vec![PolicyFailureReason::InvalidExecutionPlan])
+                    .expect("one typed failure reason is canonical")
+            }
+        }
+    }
+
     pub fn inconclusive(
         mut reasons: Vec<PolicyIncompleteReason>,
     ) -> Result<Self, CompletionReasonError> {
@@ -159,7 +194,15 @@ impl PolicyRunCompletion {
 pub enum PolicyCapability {
     TaintEvaluation,
     TypestateEvaluation,
-    QueryFeature { language: String, feature: String },
+    QueryFeature {
+        language: String,
+        feature: String,
+    },
+    QueryDomain {
+        domain: String,
+        capability: Option<String>,
+        reason: String,
+    },
 }
 
 impl PolicyCapability {
@@ -177,11 +220,86 @@ impl PolicyCapability {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ReportValueError> {
-        if let Self::QueryFeature { language, feature } = self {
-            validate_report_identifier(language)?;
-            validate_report_identifier(feature)?;
+        match self {
+            Self::QueryFeature { language, feature } => {
+                validate_report_identifier(language)?;
+                validate_report_identifier(feature)?;
+            }
+            Self::QueryDomain {
+                domain,
+                capability,
+                reason,
+            } => {
+                validate_report_identifier(domain)?;
+                if let Some(capability) = capability {
+                    validate_report_identifier(capability)?;
+                }
+                validate_report_identifier(reason)?;
+            }
+            Self::TaintEvaluation | Self::TypestateEvaluation => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod query_domain_completion_tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::Language;
+    use brokk_bifrost_rql::query::{
+        CapabilityId, EvaluationEvidence, IncompleteReason, InvalidReason, ProviderId, QueryDomain,
+        Version,
+    };
+
+    fn evidence() -> EvaluationEvidence {
+        EvaluationEvidence::new(
+            "policy.analysis.selector",
+            QueryDomain::code([Language::Rust]).expect("code domain"),
+            ProviderId::new("rust-analyzer").expect("provider"),
+            Version::new("1").expect("provider version"),
+            CapabilityId::new("structural-query").expect("capability"),
+            Version::new("2").expect("capability version"),
+            [],
+        )
+        .expect("evidence")
+    }
+
+    #[test]
+    fn query_capability_outcomes_remain_fail_closed_in_policy_completion() {
+        let supported = CapabilityEvaluation::supported(evidence()).expect("supported evidence");
+        assert_eq!(
+            PolicyRunCompletion::from_query_capability_evaluation(&supported),
+            PolicyRunCompletion::Complete
+        );
+
+        let unsupported =
+            CapabilityEvaluation::unsupported(evidence(), UnsupportedReason::CapabilityUnavailable);
+        assert!(matches!(
+            PolicyRunCompletion::from_query_capability_evaluation(&unsupported),
+            PolicyRunCompletion::Unsupported {
+                capability: PolicyCapability::QueryDomain { .. }
+            }
+        ));
+
+        let incomplete =
+            CapabilityEvaluation::incomplete(evidence(), IncompleteReason::DiscoveryIncomplete);
+        assert_eq!(
+            PolicyRunCompletion::from_query_capability_evaluation(&incomplete),
+            PolicyRunCompletion::Inconclusive {
+                reasons: vec![PolicyIncompleteReason::CapabilityIncomplete]
+            }
+        );
+
+        let invalid = CapabilityEvaluation::invalid(
+            evidence(),
+            InvalidReason::ContradictoryDomainRequirements,
+        );
+        assert_eq!(
+            PolicyRunCompletion::from_query_capability_evaluation(&invalid),
+            PolicyRunCompletion::Failed {
+                reasons: vec![PolicyFailureReason::InvalidExecutionPlan]
+            }
+        );
     }
 }
 
@@ -4338,6 +4456,14 @@ impl RetainedSize for PolicyCapability {
             Self::QueryFeature { language, feature } => {
                 language.capacity().saturating_add(feature.capacity())
             }
+            Self::QueryDomain {
+                domain,
+                capability,
+                reason,
+            } => domain
+                .capacity()
+                .saturating_add(capability.as_ref().map_or(0, String::capacity))
+                .saturating_add(reason.capacity()),
         })
     }
 }

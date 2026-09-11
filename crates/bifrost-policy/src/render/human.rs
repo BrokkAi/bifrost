@@ -2891,6 +2891,18 @@ fn write_capability<W: Write>(
             )
             .map_err(map_io_error)?;
         }
+        PolicyCapability::QueryDomain {
+            domain,
+            capability,
+            reason,
+        } => {
+            write!(output, "query domain {}", escape_terminal_text(domain))
+                .map_err(map_io_error)?;
+            if let Some(capability) = capability {
+                write!(output, ":{}", escape_terminal_text(capability)).map_err(map_io_error)?;
+            }
+            write!(output, " ({})", escape_terminal_text(reason)).map_err(map_io_error)?;
+        }
     }
     Ok(())
 }

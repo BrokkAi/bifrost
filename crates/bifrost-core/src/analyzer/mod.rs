@@ -11,6 +11,7 @@ pub mod code_unit_index;
 pub mod cognitive_complexity;
 pub mod common;
 pub mod config;
+pub mod configuration;
 pub mod definition_lookup;
 pub mod dense_id;
 pub mod exception_handling;

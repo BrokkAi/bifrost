@@ -9,6 +9,7 @@
 //! validation, not shape.
 
 mod decode;
+pub mod domain;
 mod features;
 mod ir;
 mod json;
@@ -17,6 +18,7 @@ pub mod schema;
 pub mod sexp;
 mod source;
 
+pub use domain::*;
 pub use ir::{
     ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
     CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
