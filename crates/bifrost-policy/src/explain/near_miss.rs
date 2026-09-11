@@ -102,7 +102,7 @@ use brokk_bifrost_rql::{CodeQueryPlanSource, CodeQuerySeed, Pattern};
 use crate::budget::PolicyBudget;
 use crate::definition::{
     PolicyAnalysis, PolicyAnalysisType, PolicyId, RelationalAssertionPlan, RowBinding,
-    RowBindingSource, relational_binding_selector_path,
+    relational_binding_selector_path,
 };
 use crate::evaluator::PolicyEvaluationContext;
 use crate::finding::PolicyIncompleteReason;
@@ -717,15 +717,12 @@ enum LadderVerdict {
     MembershipOnly,
 }
 
-/// One executable rung: a selector, or a conjunct this adapter cannot replay.
+/// One executable selector rung.
 struct LadderRung {
     label: String,
-    /// The query this rung runs. `None` for a conjunct that is not replayable,
-    /// such as a row-expansion binding.
-    query: Option<CodeQuery>,
+    /// The query this rung runs.
+    query: CodeQuery,
     execution: PrefixExecution,
-    /// Set for a rung that cannot run at all, carrying the reason.
-    unreplayable: Option<(String, PolicyIncompleteReason)>,
 }
 
 /// The ladder before it runs.
@@ -778,15 +775,6 @@ impl LadderPlan {
         let Some(first) = plan.bindings.first() else {
             return Err(ExplainError::RelationalPlanUnavailable);
         };
-        if !matches!(first.source, RowBindingSource::Query(_)) {
-            return Err(ExplainError::NearMissScopeUnavailable {
-                reason: format!(
-                    "the relational plan's first row binding `{}` is a row expansion, so it \
-                     carries no source query to scope a bounded search by",
-                    first.name.as_str()
-                ),
-            });
-        }
         let query = binding_query(policy, first)?;
         // The enumeration is the first binding's source query, as issue 2500
         // specifies for a relational plan. When that query is a structural
@@ -813,33 +801,16 @@ impl LadderPlan {
                 ),
                 vec![LadderRung {
                     label: format!("binding:{}/scope", first.name.as_str()),
-                    query: Some(with_seed_unchanged(query)),
+                    query: with_seed_unchanged(query),
                     execution: PrefixExecution::PreferWorkspace,
-                    unreplayable: None,
                 }],
             ),
         };
         for binding in plan.bindings.iter().skip(1) {
-            rungs.push(match &binding.source {
-                RowBindingSource::Query(_) => LadderRung {
-                    label: format!("binding:{}", binding.name.as_str()),
-                    query: Some(binding_query(policy, binding)?.clone()),
-                    execution: PrefixExecution::PreferWorkspace,
-                    unreplayable: None,
-                },
-                RowBindingSource::Expansion { from, step } => LadderRung {
-                    label: format!("binding:{}", binding.name.as_str()),
-                    query: None,
-                    execution: PrefixExecution::PreferWorkspace,
-                    unreplayable: Some((
-                        format!(
-                            "the row expansion `{}` of binding `{from}` is not replayed by this \
-                             adapter",
-                            step.label()
-                        ),
-                        PolicyIncompleteReason::CapabilityIncomplete,
-                    )),
-                },
+            rungs.push(LadderRung {
+                label: format!("binding:{}", binding.name.as_str()),
+                query: binding_query(policy, binding)?.clone(),
+                execution: PrefixExecution::PreferWorkspace,
             });
         }
         Ok(Self {
@@ -888,9 +859,8 @@ fn relaxation_rungs(
     let mut relaxed = scope;
     let mut rungs = vec![LadderRung {
         label: format!("{prefix}scope"),
-        query: Some(with_seed(authored, relaxed.clone())),
+        query: with_seed(authored, relaxed.clone()),
         execution,
-        unreplayable: None,
     }];
     for predicate in SeedPredicate::ALL
         .iter()
@@ -899,9 +869,8 @@ fn relaxation_rungs(
         predicate.restore(&mut relaxed, seed);
         rungs.push(LadderRung {
             label: format!("{prefix}{}", predicate.label()),
-            query: Some(with_seed(authored, relaxed.clone())),
+            query: with_seed(authored, relaxed.clone()),
             execution,
-            unreplayable: None,
         });
     }
     rungs
@@ -974,20 +943,7 @@ fn execute_rung(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> ExecutedRung {
-    if let Some((message, reason)) = &rung.unreplayable {
-        return ExecutedRung {
-            label: rung.label.clone(),
-            rows: HashMap::new(),
-            ordered: Vec::new(),
-            exhaustive: false,
-            reasons: vec![*reason],
-            unreplayable: Some(message.clone()),
-        };
-    }
-    let mut query = rung
-        .query
-        .clone()
-        .expect("a replayable rung carries its query");
+    let mut query = rung.query.clone();
     // A relaxed rung returns strictly more rows than the authored selector, so
     // the ranking bounds every rung by the caller's pipeline-row budget rather
     // than by the finding budget, and reports the truncation honestly instead

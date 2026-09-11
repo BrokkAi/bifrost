@@ -5,6 +5,8 @@
 //! installs the copied pre-lowering oracle so complete policy reports can be
 //! compared byte-for-byte.
 
+use crate::finding::PolicyIncompleteReason;
+use brokk_bifrost_analysis::CancellationToken;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -18,6 +20,8 @@ type OccurrenceEvaluator = for<'rows> fn(
     &[&str],
     &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
     &RelationalPlanIr,
+    Option<&CancellationToken>,
+    &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>>;
 
 thread_local! {
@@ -30,8 +34,19 @@ pub(super) fn evaluate<'rows>(
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
     lowered: &RelationalPlanIr,
+    cancellation: Option<&CancellationToken>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
-    EVALUATOR.with(|slot| (slot.get())(assertion, ast_ids, rows_by_ast_id, lowered))
+    EVALUATOR.with(|slot| {
+        (slot.get())(
+            assertion,
+            ast_ids,
+            rows_by_ast_id,
+            lowered,
+            cancellation,
+            late_incomplete,
+        )
+    })
 }
 
 /// Run `body` against the copied pre-lowering oracle, restoring the prior
@@ -53,8 +68,17 @@ fn evaluate_lowered<'rows>(
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
     lowered: &RelationalPlanIr,
+    cancellation: Option<&CancellationToken>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
-    super::evaluate_lowered_occurrence_assert(assertion, ast_ids, rows_by_ast_id, lowered)
+    super::evaluate_lowered_occurrence_assert(
+        assertion,
+        ast_ids,
+        rows_by_ast_id,
+        lowered,
+        cancellation,
+        late_incomplete,
+    )
 }
 
 /// The pre-relational occurrence evaluator, retained solely as an independent
@@ -65,6 +89,8 @@ fn evaluate_legacy<'rows>(
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
     _lowered: &RelationalPlanIr,
+    _cancellation: Option<&CancellationToken>,
+    _late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let mut actual: Vec<&CodeQueryOccurrence> = Vec::new();
     for ast_id in ast_ids {

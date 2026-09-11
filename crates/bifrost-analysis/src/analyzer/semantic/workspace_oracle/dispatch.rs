@@ -956,6 +956,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     let (has_match, truncated) = retain_artifact_candidates(
                         self.workspace.analyzer(),
                         &definition,
+                        semantic_call.arguments.len(),
                         &value,
                         &mut candidates,
                         &mut candidate_indexes,
@@ -974,6 +975,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                     let (has_match, truncated) = retain_artifact_candidates(
                         self.workspace.analyzer(),
                         &definition,
+                        semantic_call.arguments.len(),
                         &value,
                         &mut candidates,
                         &mut candidate_indexes,
@@ -1000,6 +1002,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         let (has_match, truncated) = retain_artifact_candidates(
                             self.workspace.analyzer(),
                             &definition,
+                            semantic_call.arguments.len(),
                             value,
                             &mut candidates,
                             &mut candidate_indexes,
@@ -1032,6 +1035,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         let (has_match, truncated) = retain_artifact_candidates(
                             self.workspace.analyzer(),
                             &definition,
+                            semantic_call.arguments.len(),
                             value,
                             &mut candidates,
                             &mut candidate_indexes,
@@ -1066,6 +1070,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         let (has_match, truncated) = retain_artifact_candidates(
                             self.workspace.analyzer(),
                             &definition,
+                            semantic_call.arguments.len(),
                             &value,
                             &mut candidates,
                             &mut candidate_indexes,
@@ -1090,6 +1095,7 @@ impl<'a> WorkspaceSemanticOracle<'a> {
                         let (has_match, truncated) = retain_artifact_candidates(
                             self.workspace.analyzer(),
                             &definition,
+                            semantic_call.arguments.len(),
                             &value,
                             &mut candidates,
                             &mut candidate_indexes,
@@ -3672,6 +3678,7 @@ fn apply_procedure_call_gap(
 fn retain_artifact_candidates(
     analyzer: &dyn IAnalyzer,
     definition: &CodeUnit,
+    actual_count: usize,
     artifact: &Arc<SemanticArtifact>,
     candidates: &mut Vec<DispatchCandidate>,
     indexes: &mut HashMap<ProcedureHandle, usize>,
@@ -3679,7 +3686,21 @@ fn retain_artifact_candidates(
     completeness: EvidenceCompleteness,
     max_candidates: usize,
 ) -> (bool, bool) {
-    let targets = procedures_for_definition(analyzer, definition, artifact);
+    let mut targets = procedures_for_definition(analyzer, definition, artifact);
+    if !targets.is_empty()
+        && analyzer.ranges_of(definition).len() > 1
+        && let Some(range) = crate::analyzer::usages::call_relations::selected_callable_range(
+            analyzer,
+            definition,
+            actual_count,
+        )
+    {
+        targets.retain(|target| {
+            let span = target.semantics().locator().anchor().span();
+            range.start_byte <= span.start_byte() as usize
+                && range.end_byte >= span.end_byte() as usize
+        });
+    }
     let matched = !targets.is_empty();
     let mut truncated = false;
     for target in targets {

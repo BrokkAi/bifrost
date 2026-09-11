@@ -216,6 +216,8 @@ Steps execute in array order and are validated before the workspace is searched:
 
 | Operation | Input | Output | Meaning |
 | --- | --- | --- | --- |
+| `filter` | any typed row | same row schema | Retain rows satisfying every typed predicate in `where`. |
+| `project` | any typed row | selected dynamic row schema | Publish the fields selected by `columns`, optionally renamed, while preserving source and evidence anchors. Only another `project` or `filter` may follow. |
 | `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
 | `procedure_of` | structural match or declaration | procedure | Unique smallest source-backed executable procedure enclosing the exact input range. |
 | `cfg_entry` | procedure | program point | Validated entry boundary. |
@@ -239,8 +241,8 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, expression site, or occurrence | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, expression site, or occurrence | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match, reference site, or occurrence | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `receiver_outcome` | receiver analysis | receiver outcome | The mandatory terminal row per analyzed site: outcome, coverage, candidate accounting, and stable `site_id`/`site_ast_id`. |
-| `receiver_evidence` | receiver analysis | receiver evidence | One flat row per retained receiver observation, parent-linked for factory chains and keyed by `site_id`. |
+| `receiver_outcome` | structural match, reference site, call site, expression site, occurrence, receiver analysis, or member-target analysis | receiver outcome | Analyze an ordinary call/member site directly, or project an existing analysis, into the mandatory terminal row: outcome, coverage, candidate accounting, and stable `site_id`/`site_ast_id`. |
+| `receiver_evidence` | structural match, reference site, call site, expression site, occurrence, or receiver analysis | receiver evidence | Analyze an ordinary call/member site directly, or project an existing analysis, into one flat row per retained observation, parent-linked for factory chains and keyed by `site_id`. |
 | `member_selection` | occurrence | member selection | The mandatory selection summary per reference occurrence, projected from the production resolver's candidate trace. |
 | `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, class-set row, absent-member finding, absent-member witness, reference site, call site, expression site, receiver analysis, receiver outcome, receiver evidence, occurrence, lexical scope, or binding | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
@@ -274,6 +276,50 @@ Steps execute in array order and are validated before the workspace is searched:
 | `rewrite_paths_of` | file | rewrite path | The bounded rewrite chases the file engages in a declared finite domain, with their steps, declared bound, and terminal outcome; accepts `domain` and `rewrite_outcome`. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
+
+### Typed row predicates and columns
+
+The `filter` and `project` steps read the same public row-schema tables used by
+relational policies. Those tables define each field's stable name, scalar type,
+nullability, and constrained enum labels. Canonical JSON tags literal types
+explicitly, so an enum label is never an internal Rust enum name and can never
+be confused with an arbitrary string:
+
+```json
+{
+  "schema_version": 1,
+  "occurrences": { "class": "reference" },
+  "steps": [
+    {
+      "op": "filter",
+      "where": [
+        { "field": "class", "op": "in", "values": [
+          { "enum": "reference" }, { "enum": "declaration" }
+        ] },
+        { "field": "target_count", "op": "ge", "value": { "integer": 1 } },
+        { "field": "target_count", "op": "le", "value": { "field": "target_count" } },
+        { "field": "target_id", "op": "is_not_null" }
+      ]
+    },
+    {
+      "op": "project",
+      "columns": [
+        { "source": "ast_id", "name": "site" },
+        { "source": "target_count", "name": "candidates" }
+      ]
+    }
+  ]
+}
+```
+
+Comparison `value` accepts exactly one of `string`, `integer`, `boolean`, or
+`enum`, or the object `{ "field": "OTHER_FIELD" }`. The public operators are
+`eq`, `ne`, `lt`, `le`, `gt`, `ge`, `is_null`, `is_not_null`, and `in`.
+`is_null` and `is_not_null` have no operand; `in` uses `values`, a non-empty
+array of at most 64 typed literals. A filter carries 1 through 16 predicates.
+A projection carries 1 through 32 `{ "source", "name" }` entries with unique
+output names. Its output schema contains exactly those names in that order,
+with the source fields' public types, nullability, and enum domains.
 
 ### Procedure-local CFG inspection
 
@@ -602,13 +648,13 @@ Call traversal is direct by default. `callers` and `callees` accept a positive f
 
 `call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
 
-The three receiver steps return a tagged `receiver_analysis` row for every input, including unknown and unsupported cases. Each row includes `analysis_kind`, input path/language/range/text/kind, and `outcome`. `receiver_targets` and `points_to` use recursive `values`; `member_targets` uses exact `CodeQueryDeclaration` values under `member_targets`. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
+The three receiver-analysis steps return a tagged `receiver_analysis` row for every input, including unknown and unsupported cases. Each row includes `analysis_kind`, input path/language/range/text/kind, and `outcome`. `receiver_targets` and `points_to` use recursive `values`; `member_targets` uses exact `CodeQueryDeclaration` values under `member_targets`. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
 
 The `member_selection` projection emits exactly one summary row per input occurrence, from the same resolver candidate trace `candidates_of` exposes: a stable domain-separated `id`, the exact `site_ast_id` join key, the decoded `member` spelling and `role`, an `outcome` of `selected`/`unresolved`/`untraced`, `selected_count` and `candidate_count`, `trace_completeness` (`full`, `selection_only`, or `absent`), and `coverage` (`exhaustive` only for a full trace, `open` for a selection-only trace, `unsupported` when the language records no trace). Selected `resolution_candidate` rows additionally carry `canonical_member_id`, a digest of the structured canonical identity (kind-tagged segments, namespace, language, recorded generic arity) -- same-spelling members of different owners always hash apart. Member-position occurrence support is per language: Rust records a full trace; TypeScript and Python record selection-only traces; Java summarizes its trace; Go, C#, C++, PHP, and Ruby do not classify member-position occurrences yet and state that as an `occurrence_role_unsupported` incomplete diagnostic, which makes policies over their rows unreliable rather than clean.
 
-The `receiver_outcome` and `receiver_evidence` projections expose the same analysis as flat typed rows for policy correlation. `receiver_outcome` always emits exactly one row per analyzed site with `outcome`, `coverage` (`exhaustive`, `open`, `truncated`, `unknown`, or `unsupported`), `candidate_count`, `candidates_truncated`, and stable `site_id`/`site_ast_id` keys. `receiver_evidence` emits zero or more rows keyed by `site_id`, each with its own stable `id`, source `range`, `ordinal`, `chain_hop`, `evidence_kind`, resolved declaration identity, and per-row `proof`/`completeness`; model-backed declarations also expose exact `model_id` and `pack_id` string fields for policy predicates. Factory chains are parent-linked through `parent_evidence_id` instead of nesting. An empty evidence set is meaningful only next to its outcome row. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/#typed-receiver-rows) for executed examples.
+The `receiver_outcome` and `receiver_evidence` steps expose the same analysis as flat typed rows for policy correlation. They may consume an existing receiver-analysis row or perform `receiver_targets` analysis directly from an ordinary call/member site, so a relational binding needs only the one authored step. `receiver_outcome` always emits exactly one row per analyzed site with `outcome`, `coverage` (`exhaustive`, `open`, `truncated`, `unknown`, or `unsupported`), `candidate_count`, `candidates_truncated`, and stable `site_id`/`site_ast_id` keys. `receiver_evidence` emits zero or more rows keyed by `site_id`, each with its own stable `id`, source `range`, `ordinal`, `chain_hop`, `evidence_kind`, resolved declaration identity, and per-row `proof`/`completeness`; model-backed declarations also expose exact `model_id` and `pack_id` string fields for policy predicates. Factory chains are parent-linked through `parent_evidence_id` instead of nesting. An empty evidence set is meaningful only next to its outcome row. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/#typed-receiver-rows) for executed examples.
 
-Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Adapters return structured candidates where their neutral facts prove them and preserve dynamic, unmodeled, or non-receiver source forms as `ambiguous`, `unknown`, or `unsupported`. Receiver-analysis rows are terminal except for `file_of`.
+Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Adapters return structured candidates where their neutral facts prove them and preserve dynamic, unmodeled, or non-receiver source forms as `ambiguous`, `unknown`, or `unsupported`. Receiver-analysis rows may feed `file_of`, `receiver_outcome`, or `receiver_evidence`; the flat terminal rows may feed `file_of`.
 
 An optional `capture` is valid only when the preceding domain is a structural match. It must be between 1 and 128 bytes and name a positive capture declared by the structural query; every unique bound range is analyzed. Without a capture, `points_to` analyzes the match or the normalized `right` side of assignment/binding shapes, `receiver_targets` extracts the call `receiver` or field-access `object`, and `member_targets` extracts the receiver plus terminal member. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for exact JSON/RQL/output triples.
 

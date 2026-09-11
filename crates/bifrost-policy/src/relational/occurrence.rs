@@ -27,7 +27,7 @@ pub(crate) fn lower_occurrence_assert(assertion: &OccurrenceAssert) -> Relationa
         name: binding.as_str().to_owned(),
         op: IrRelationOp::Source {
             binding: binding.clone(),
-            domain,
+            schema: domain_schema(binding.as_str(), domain),
         },
         schema: domain_schema(binding.as_str(), domain),
     };
@@ -78,6 +78,7 @@ pub(crate) fn lower_occurrence_assert(assertion: &OccurrenceAssert) -> Relationa
         op: IrAggregateOp::Count,
         value: None,
         sequences: None,
+        sets: None,
         predicates: vec![IrPredicate::IsNull {
             column: IrColumn::new("occurrence", "ast_id"),
             negated: true,

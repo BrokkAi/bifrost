@@ -18,25 +18,24 @@
     :type assertion
     (bind :name conflict
       :query (rql :schema-version 1
-        (union
-          (language go
-            (concurrent-access-conflicts
-              (procedure-of
-                (concurrent_spawn))))
-          (language go
-            (concurrent-access-conflicts
-              (procedure-of
-                (call :callee "Go"))))
-          (language go
-            (concurrent-access-conflicts
-              (procedure-of
-                (call :callee "AfterFunc")))))))
-    (filter :over conflict
-      :where ((conflict.verdict eq conflict)
-              (conflict.ordering eq unordered)
-              (conflict.protection eq unprotected)
-              (conflict.proof eq proven)
-              (conflict.coverage eq exhaustive)))
+        (filter :where ((verdict eq conflict)
+                        (ordering eq unordered)
+                        (protection eq unprotected)
+                        (proof eq proven)
+                        (coverage eq exhaustive))
+          (union
+            (language go
+              (concurrent-access-conflicts
+                (procedure-of
+                  (concurrent_spawn))))
+            (language go
+              (concurrent-access-conflicts
+                (procedure-of
+                  (call :callee "Go"))))
+            (language go
+              (concurrent-access-conflicts
+                (procedure-of
+                  (call :callee "AfterFunc"))))))))
     (group :name by-shared-location :by (conflict.location_id)
       (aggregate :name conflicts :op count))
     (assert :group by-shared-location :value conflicts :cardinality (exactly 0))))

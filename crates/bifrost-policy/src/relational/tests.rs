@@ -63,6 +63,7 @@ fn argument(site: &str, id: &str, index: usize, name: Option<&str>, spread: bool
         },
         provenance: Vec::new(),
         provenance_truncated: false,
+        row_projection: Vec::new(),
     })
 }
 
@@ -126,6 +127,7 @@ fn call_binding(
         evidence: None,
         fields,
         unknown_fields,
+        projected_field_names: Vec::new(),
         terminal: None,
         provenance: Vec::new(),
         provenance_truncated: false,
@@ -138,7 +140,7 @@ fn call_binding_source(id: usize, name: &str) -> IrRelation {
         name: name.to_string(),
         op: IrRelationOp::Source {
             binding: binding(name),
-            domain: DetailedCodeQueryDomain::CallBinding,
+            schema: domain_schema(name, DetailedCodeQueryDomain::CallBinding),
         },
         schema: domain_schema(name, DetailedCodeQueryDomain::CallBinding),
     }
@@ -150,7 +152,7 @@ fn source(id: usize, name: &str) -> IrRelation {
         name: name.to_string(),
         op: IrRelationOp::Source {
             binding: binding(name),
-            domain: DOMAIN,
+            schema: domain_schema(name, DOMAIN),
         },
         schema: domain_schema(name, DOMAIN),
     }
@@ -194,6 +196,7 @@ fn fold(group: &str, name: &str, op: IrAggregateOp, value: Option<IrColumn>) -> 
         op,
         value,
         sequences: None,
+        sets: None,
         predicates: Vec::new(),
         output: column(group, name),
     }
@@ -276,7 +279,7 @@ fn evaluate(
             coverage: coverage.clone(),
         })
         .collect::<Vec<_>>();
-    evaluate_plan_ir(plan, &inputs).expect("evaluation concludes")
+    evaluate_plan_ir(plan, &inputs, None).expect("evaluation concludes")
 }
 
 /// The observed key/value pairs of every published violation.
@@ -1327,64 +1330,6 @@ fn an_inner_join_meets_both_coverages() {
     );
 }
 
-/// An expansion is no better covered than the rows it expands: its own query
-/// can be complete while the sites it expanded were a subset.
-#[test]
-fn an_expansion_inherits_the_coverage_of_the_rows_it_expands() {
-    let site = IrRelation {
-        id: IrRelationId(0),
-        name: "site".to_string(),
-        op: IrRelationOp::Source {
-            binding: binding("site"),
-            domain: DetailedCodeQueryDomain::Occurrence,
-        },
-        schema: domain_schema("site", DetailedCodeQueryDomain::Occurrence),
-    };
-    let selection = IrRelation {
-        id: IrRelationId(1),
-        name: "sel".to_string(),
-        op: IrRelationOp::Expand {
-            input: site.id,
-            binding: binding("sel"),
-            step: crate::definition::RowExpansionStep::MemberSelection,
-            domain: DetailedCodeQueryDomain::MemberSelection,
-        },
-        schema: domain_schema("sel", DetailedCodeQueryDomain::MemberSelection),
-    };
-    let grouped = group(
-        2,
-        "by-site",
-        &selection,
-        vec![column("sel", "site_ast_id")],
-        vec![fold("by-site", "rows", IrAggregateOp::Count, None)],
-    );
-    let assert = assertion("rows", &grouped, "rows", AssertCardinality::AtMost(0));
-    let plan = plan(vec![site, selection, grouped], vec![assert]);
-
-    let empty: Vec<UnitRowItem> = Vec::new();
-    let complete = evaluate(
-        &plan,
-        &[
-            ("site", &empty, RelationCoverage::Exhaustive),
-            ("sel", &empty, RelationCoverage::Exhaustive),
-        ],
-    );
-    assert!(complete.unmet_obligations.is_empty());
-
-    let partial_sites = evaluate(
-        &plan,
-        &[
-            ("site", &empty, RelationCoverage::ProvenSubset),
-            ("sel", &empty, RelationCoverage::Exhaustive),
-        ],
-    );
-    assert_eq!(
-        partial_sites.unmet_obligations.len(),
-        1,
-        "an expansion of a subset of sites is itself a subset"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Bounds.
 // ---------------------------------------------------------------------------
@@ -2111,5 +2056,182 @@ fn a_zero_representative_bound_is_rejected() {
         Err(RelationalAssertionPlanError::ZeroLimit {
             name: "max_representative_tuples"
         })
+    );
+}
+
+/// Cancel at each checkpoint until execution completes. The work ledger shows
+/// which operator was interrupted, without timers or races with another thread.
+fn cancellation_witness(
+    plan: &RelationalPlanIr,
+    inputs: &[RelationalInput<'_>],
+    interrupted: impl Fn(&super::eval::RelationalEvaluationWork) -> bool,
+) -> usize {
+    use brokk_bifrost_analysis::CancellationToken;
+    validate_plan_ir(plan).unwrap();
+    let mut witnessed = 0;
+    for checks in 1..2048 {
+        let token = CancellationToken::cancel_after_checks_for_test(checks);
+        let result = evaluate_plan_ir(plan, inputs, Some(&token)).unwrap();
+        if result.exhaustive {
+            assert!(witnessed > 0, "never cancelled during the target operator");
+            return witnessed;
+        }
+        assert!(
+            result.violations.is_empty(),
+            "cancelled evaluation leaked findings: {result:?}"
+        );
+        assert!(!result.limit_exceeded);
+        assert!(!result.unmet_obligations.is_empty());
+        assert!(
+            result
+                .unmet_obligations
+                .iter()
+                .all(|o| o.reasons == vec![PolicyIncompleteReason::Cancelled])
+        );
+        witnessed += usize::from(interrupted(&result.work));
+    }
+    panic!("bounded fixture never completed");
+}
+
+#[test]
+fn cancellation_during_source_discards_partial_rows() {
+    let plan = counting_plan(AssertCardinality::Exactly(0));
+    let rows = two_rows_at_one_site();
+    let name = binding("arg");
+    let inputs = [RelationalInput {
+        binding: &name,
+        rows: &rows,
+        coverage: RelationCoverage::Exhaustive,
+    }];
+    cancellation_witness(&plan, &inputs, |work| {
+        work.input_rows == 1 && work.materialized_rows == 0
+    });
+}
+
+#[test]
+fn cancellation_during_filter_discards_partial_rows() {
+    let arg = source(0, "arg");
+    let filtered = filter(
+        1,
+        "filtered",
+        &arg,
+        vec![IrPredicate::Compare {
+            left: column("arg", "spread"),
+            op: IrCompareOp::Eq,
+            right: IrOperand::Literal(RowLiteral::Boolean(false)),
+        }],
+    );
+    let grouped = group(
+        2,
+        "site",
+        &filtered,
+        vec![column("arg", "site_id")],
+        vec![fold("site", "count", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("empty", &grouped, "count", AssertCardinality::Exactly(0));
+    let plan = plan(vec![arg, filtered, grouped], vec![assertion]);
+    let rows = two_rows_at_one_site();
+    let name = binding("arg");
+    let inputs = [RelationalInput {
+        binding: &name,
+        rows: &rows,
+        coverage: RelationCoverage::Exhaustive,
+    }];
+    let checkpoints = cancellation_witness(&plan, &inputs, |work| {
+        work.input_rows == 2 && work.materialized_rows == 2
+    });
+    assert!(checkpoints >= 3, "filter must check within the row loop");
+}
+
+#[test]
+fn cancellation_during_join_discards_partial_matches() {
+    let left = source(0, "left");
+    let right = source(1, "right");
+    let joined = join(
+        2,
+        &left,
+        &right,
+        IrJoinKind::Inner,
+        vec![IrEquiKey {
+            left: column("left", "site_id"),
+            right: column("right", "site_id"),
+        }],
+    );
+    let grouped = group(
+        3,
+        "site",
+        &joined,
+        vec![column("left", "site_id")],
+        vec![fold("site", "count", IrAggregateOp::Count, None)],
+    );
+    let assertion = assertion("empty", &grouped, "count", AssertCardinality::Exactly(0));
+    let plan = plan(vec![left, right, joined, grouped], vec![assertion]);
+    let rows = two_rows_at_one_site();
+    let left = binding("left");
+    let right = binding("right");
+    let inputs = [
+        RelationalInput {
+            binding: &left,
+            rows: &rows,
+            coverage: RelationCoverage::Exhaustive,
+        },
+        RelationalInput {
+            binding: &right,
+            rows: &rows,
+            coverage: RelationCoverage::Exhaustive,
+        },
+    ];
+    let checkpoints = cancellation_witness(&plan, &inputs, |work| {
+        work.join_key_probes == 1 && work.materialized_rows == 4
+    });
+    assert!(
+        checkpoints >= 3,
+        "join must check while emitting one key's matches"
+    );
+}
+
+#[test]
+fn cancellation_during_group_discards_partial_groups() {
+    let plan = counting_plan(AssertCardinality::Exactly(0));
+    let rows = two_rows_at_one_site();
+    let name = binding("arg");
+    let inputs = [RelationalInput {
+        binding: &name,
+        rows: &rows,
+        coverage: RelationCoverage::Exhaustive,
+    }];
+    cancellation_witness(&plan, &inputs, |work| {
+        work.produced_groups == 1 && work.materialized_rows == 2
+    });
+}
+
+#[test]
+fn cancellation_during_assertion_discards_already_computed_violations() {
+    let plan = counting_plan(AssertCardinality::Exactly(0));
+    let rows = vec![
+        argument("first", "a", 0, None, false),
+        argument("second", "b", 0, None, false),
+    ];
+    let name = binding("arg");
+    let inputs = [RelationalInput {
+        binding: &name,
+        rows: &rows,
+        coverage: RelationCoverage::Exhaustive,
+    }];
+    cancellation_witness(&plan, &inputs, |work| work.assertion_checks == 1);
+}
+
+#[test]
+fn cancellation_without_assertions_still_reports_cancelled() {
+    let mut plan = counting_plan(AssertCardinality::Exactly(0));
+    plan.assertions.clear();
+    let token = brokk_bifrost_analysis::CancellationToken::new();
+    token.cancel();
+    let result = evaluate_plan_ir(&plan, &[], Some(&token)).unwrap();
+    assert!(!result.exhaustive);
+    assert!(result.violations.is_empty());
+    assert_eq!(
+        result.incomplete_reasons,
+        vec![PolicyIncompleteReason::Cancelled]
     );
 }

@@ -87,6 +87,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
             steps: vec![],
         }],
         provenance_truncated: false,
+        row_projection: Vec::new(),
     };
     assert!(
         !semantic_row_seed_generations_current(&mut semantic, &composed_row),

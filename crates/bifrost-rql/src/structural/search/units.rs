@@ -197,7 +197,7 @@ fn execute_seed_union_unit(
     for (leaf, branch_path) in leaves {
         let leaf_query = CodeQuery {
             schema_version: query.schema_version,
-            plan: leaf.clone(),
+            plan: leaf,
             // A branch cannot apply the union's global result cap. The
             // physical pipeline cap still bounds intermediate output.
             limit: usize::MAX,
@@ -1029,6 +1029,10 @@ pub struct UnitRowItem {
     /// same answer the live row gives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<UnitRowField>,
+    /// Projected output names in schema order. Empty means the domain's native
+    /// public schema; a non-empty list is the exact query projection schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_field_names: Vec<Box<str>>,
     /// Registered fields whose evidence is unavailable. Preserve this across
     /// unit reuse so a cached unknown cannot become an ordinary absent value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1047,15 +1051,32 @@ impl UnitRowItem {
         let row = item.value.row();
         let mut fields = Vec::new();
         let mut unknown_fields = Vec::new();
-        for field in domain.row_fields() {
-            match row.field(field.name) {
+        let projected_field_names = item
+            .row_projection
+            .iter()
+            .map(|column| boxed(&column.name))
+            .collect::<Vec<_>>();
+        let columns = if item.row_projection.is_empty() {
+            domain
+                .row_fields()
+                .iter()
+                .map(|field| (field.name, field.name))
+                .collect::<Vec<_>>()
+        } else {
+            item.row_projection
+                .iter()
+                .map(|column| (column.source.as_str(), column.name.as_str()))
+                .collect()
+        };
+        for (source, name) in columns {
+            match row.field(source) {
                 Ok(Some(value)) => fields.push(UnitRowField {
-                    name: boxed(field.name),
+                    name: boxed(name),
                     value: UnitRowScalar::project(value),
                 }),
                 Ok(None) => {}
                 Err(error) => unknown_fields.push(UnitRowUnknownField {
-                    name: boxed(field.name),
+                    name: boxed(name),
                     reason: error
                         .unknown_reason()
                         .expect("registered fields fail only for unavailable evidence"),
@@ -1068,6 +1089,7 @@ impl UnitRowItem {
             range: item.value.display_range(),
             evidence: row_semantic_evidence(&item.value).cloned(),
             fields,
+            projected_field_names,
             unknown_fields,
             terminal: UnitRowItemTerminal::project(&item.value),
             provenance: item
@@ -1089,12 +1111,17 @@ impl UnitRowItem {
         &self,
         name: &str,
     ) -> Result<Option<CodeQueryRowScalarRef<'_>>, CodeQueryRowFieldError> {
-        if !self
-            .domain
-            .row_fields()
-            .iter()
-            .any(|field| field.name == name)
-        {
+        let registered = if self.projected_field_names.is_empty() {
+            self.domain
+                .row_fields()
+                .iter()
+                .any(|field| field.name == name)
+        } else {
+            self.projected_field_names
+                .iter()
+                .any(|field| field.as_ref() == name)
+        };
+        if !registered {
             return Err(CodeQueryRowFieldError::unregistered(self.domain, name));
         }
         if let Some(field) = self
@@ -2000,7 +2027,7 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
         let mut accepts_all_languages = false;
         let mut structural = None;
         for (leaf, _) in leaves {
-            let (leaf_languages, leaf_structural) = seed_languages(leaf);
+            let (leaf_languages, leaf_structural) = seed_languages(&leaf);
             structural.get_or_insert(leaf_structural);
             if leaf_languages.is_empty() {
                 accepts_all_languages = true;

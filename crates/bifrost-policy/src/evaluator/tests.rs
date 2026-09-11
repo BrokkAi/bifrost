@@ -1455,6 +1455,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         },
         provenance: Vec::new(),
         provenance_truncated: false,
+        row_projection: Vec::new(),
     };
     let evidence = DetailedCodeQueryEvidence {
         result_index: 0,

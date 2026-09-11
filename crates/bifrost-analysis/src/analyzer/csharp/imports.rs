@@ -12,6 +12,7 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::CSharpAnalyzer;
@@ -237,13 +238,81 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         imports: &[crate::analyzer::ImportInfo],
         target: &ProjectFile,
     ) -> ImportReachability {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        csharp_import_reachability(self, token, source_file, imports, target)
+        let index = self.reachability_index();
+        match (index.get(source_file), index.get(target)) {
+            (Some(source), Some(target)) => csharp_import_reachability(source, imports, target),
+            _ => ImportReachability::Unknown,
+        }
     }
 }
 
 impl CSharpAnalyzer {
+    fn reachability_index(
+        &self,
+    ) -> Arc<HashMap<ProjectFile, super::graph_support::CSharpReachabilityFacts>> {
+        self.memo_caches
+            .reachability
+            .get_or_build_on_dedicated_pool(|| {
+                let scope = AnalyzerQueryScope::new(self);
+                let files = self.inner.all_files();
+                let mut identifiers = self.inner.bulk_type_identifiers(files.iter().cloned());
+                let imports = self.inner.bulk_import_infos(files.iter().cloned());
+                let mut declarations: HashMap<ProjectFile, Vec<CodeUnit>> = HashMap::default();
+                for unit in self.inner.all_declarations() {
+                    declarations
+                        .entry(unit.source().clone())
+                        .or_default()
+                        .push(unit);
+                }
+                files
+                    .into_iter()
+                    .map(|file| {
+                        let facts = super::graph_support::CSharpReachabilityFacts::build(
+                            self,
+                            scope.token(),
+                            &file,
+                            declarations.remove(&file).unwrap_or_default(),
+                            identifiers.remove(&file),
+                            imports.get(&file).map(Vec::as_slice).unwrap_or_default(),
+                        );
+                        (file, facts)
+                    })
+                    .collect()
+            })
+    }
+
+    pub(super) fn referencing_candidate_files(
+        &self,
+        seed_files: &BTreeSet<ProjectFile>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<HashSet<ProjectFile>> {
+        let mut candidates = HashSet::default();
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Some(candidates);
+        }
+        let index = self.reachability_index();
+        let targets = seed_files
+            .iter()
+            .map(|file| index.get(file))
+            .collect::<Option<Vec<_>>>()?;
+        for (file, source) in index.iter() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            // This reproduces the generic importer's final candidate set,
+            // without strengthening the public three-valued reachability proof.
+            // Its Unknown backstop imports only namespace classes and resolved
+            // type aliases. Both are already positive cases of Reaches, so
+            // expanding those classes cannot add a target after this check.
+            if targets.iter().any(|target| {
+                csharp_import_reachability(source, &[], target) == ImportReachability::Reaches
+            }) {
+                candidates.insert(file.clone());
+            }
+        }
+        Some(candidates)
+    }
+
     fn file_dependencies_by_namespace(&self) -> Arc<HashMap<String, Arc<Vec<ProjectFile>>>> {
         self.memo_caches
             .file_dependencies_by_namespace

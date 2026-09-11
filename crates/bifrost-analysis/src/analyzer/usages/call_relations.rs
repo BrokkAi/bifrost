@@ -327,7 +327,7 @@ pub(crate) fn call_relation_answer_digest(
 #[derive(Default)]
 pub struct CallBindingCache {
     conversions: super::call_conversion::CallConversionCache,
-    formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
+    formals: HashMap<(CodeUnit, usize), Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
     /// One batch-resolved outcome per call site's callee range, keyed by
     /// file and filled by [`Self::resolved_call_target`]'s one-shot per-file
@@ -362,10 +362,11 @@ impl CallBindingCache {
         &mut self,
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
+        actual_count: usize,
     ) -> Option<FormalParameterLayout> {
         self.formals
-            .entry(unit.clone())
-            .or_insert_with(|| formal_slots_for_unit(analyzer, unit))
+            .entry((unit.clone(), actual_count))
+            .or_insert_with(|| formal_slots_for_unit(analyzer, unit, actual_count))
             .clone()
     }
 
@@ -2136,7 +2137,7 @@ pub fn bind_call_site_arguments(
     else {
         return CallBindingStatus::Unavailable;
     };
-    let Some(layout) = cache.formal_layout(analyzer, &formal_owner) else {
+    let Some(layout) = cache.formal_layout(analyzer, &formal_owner, site.arguments.len()) else {
         return CallBindingStatus::Unavailable;
     };
     let Some(bind_first) = python_first_formal_is_bound(
@@ -2188,6 +2189,7 @@ pub fn formal_owner_for_callee(
     {
         Language::Python => ("__init__", true),
         Language::JavaScript | Language::TypeScript => ("constructor", false),
+        Language::Kotlin => (callee.identifier(), false),
         _ => return None,
     };
     let mut constructors = analyzer
@@ -2355,18 +2357,71 @@ fn python_receiver_is_call_expression(
     node.kind() == "call"
 }
 
-fn formal_slots_for_unit(
+/// Locate the source body belonging to the same persisted signature selection
+/// used by call bindings. Overloads sharing a CodeUnit must not inherit the
+/// first declaration's formals or semantic body.
+pub fn selected_callable_range(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
-) -> Option<FormalParameterLayout> {
+    actual_count: usize,
+) -> Option<Range> {
+    selected_callable_layout(analyzer, unit, actual_count).map(|(range, _)| range)
+}
+
+fn selected_callable_layout(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    actual_count: usize,
+) -> Option<(Range, FormalParameterLayout)> {
+    use super::callable_signature::{callable_signature_reports, signature_choice};
     if unit.is_class() {
+        return None;
+    }
+    let ranges = analyzer.ranges_of(unit);
+    let entries = analyzer.signature_metadata(unit);
+    let reports = callable_signature_reports("selection-only", unit, &entries);
+    let selection = signature_choice(&reports, actual_count);
+    if selection.ambiguous {
         return None;
     }
     let source = analyzer.indexed_source(unit.source())?;
     let language = language_for_file(unit.source());
     let tree = parse_tree_for_language(unit.source(), language, &source)?;
-    let range = analyzer.ranges_of(unit).into_iter().min_by_key(range_key)?;
-    formal_parameter_slots(language, tree.root_node(), &source, &range)
+    if let [range] = ranges.as_slice() {
+        return formal_parameter_slots(language, tree.root_node(), &source, range)
+            .map(|layout| (*range, layout));
+    }
+    let arity = entries.get(selection.ordinal?)?.callable_arity()?;
+    // ParameterMetadata offsets are signature-relative in some adapters and
+    // file-relative in others. Read each declaration's AST-owned layout instead.
+    // The shared selector has already refused different accepting signatures;
+    // several matching ranges here are equivalent declarations of that signature.
+    ranges
+        .into_iter()
+        .filter_map(|range| {
+            let layout = formal_parameter_slots(language, tree.root_node(), &source, &range)?;
+            let ordinary = layout
+                .slots
+                .iter()
+                .filter(|slot| !slot.receiver)
+                .collect::<Vec<_>>();
+            let required = ordinary
+                .iter()
+                .filter(|slot| slot.default_range.is_none() && slot.variadic.is_none())
+                .count();
+            let repeated = ordinary.iter().any(|slot| slot.variadic.is_some());
+            (crate::analyzer::CallableArity::new(required, ordinary.len(), repeated) == arity)
+                .then_some((range, layout))
+        })
+        .min_by_key(|(range, _)| range_key(range))
+}
+
+fn formal_slots_for_unit(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    actual_count: usize,
+) -> Option<FormalParameterLayout> {
+    selected_callable_layout(analyzer, unit, actual_count).map(|(_, layout)| layout)
 }
 
 pub fn nearest_call_relation_unit(

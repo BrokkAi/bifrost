@@ -14,7 +14,6 @@ use crate::relational::{RelationalPlanIr, lower_occurrence_assert, validate_plan
 #[cfg(test)]
 mod occurrence_parity;
 
-use super::super::definition::RowExpansionStep;
 use super::super::units::AssertFileProduct;
 use super::*;
 
@@ -1724,14 +1723,22 @@ fn evaluate_assert_file(
                         .get(&assertion.id)
                         .expect("every occurrence assertion was lowered before file execution");
                     #[cfg(test)]
-                    let violation =
-                        occurrence_parity::evaluate(assertion, &ast_ids, &rows_by_ast_id, lowered);
+                    let violation = occurrence_parity::evaluate(
+                        assertion,
+                        &ast_ids,
+                        &rows_by_ast_id,
+                        lowered,
+                        context.cancellation,
+                        &mut late_incomplete,
+                    );
                     #[cfg(not(test))]
                     let violation = evaluate_lowered_occurrence_assert(
                         assertion,
                         &ast_ids,
                         &rows_by_ast_id,
                         lowered,
+                        context.cancellation,
+                        &mut late_incomplete,
                     );
                     violation
                 }
@@ -2102,55 +2109,8 @@ fn retain_unconcluded_files_diagnostic(
     }
 }
 
-/// Lower a relational row expansion onto the source query's execution plan.
-///
-/// `MemberCandidates` remains unsupported because there is no admitted
-/// executable relational row domain for it. Every other row expansion step is
-/// lowered here, including the prerequisite receiver analysis for receiver
-/// projections.
-pub(crate) fn relational_expansion_query(
-    source: &CodeQuery,
-    step: RowExpansionStep,
-) -> Option<CodeQuery> {
-    let mut query = source.clone();
-    match step {
-        RowExpansionStep::ReceiverOutcome | RowExpansionStep::ReceiverEvidence => {
-            // The receiver row projections consume a receiver analysis. A
-            // source binding that is not already a receiver analysis is
-            // lowered through the production receiver analysis first, so
-            // the expansion rows are projections of the same solver run
-            // the ordinary receiver queries use.
-            let source_is_receiver_analysis = query
-                .validate_steps()
-                .map(|kind| kind == QueryValueKind::ReceiverAnalysis)
-                .unwrap_or(false);
-            if !source_is_receiver_analysis {
-                query
-                    .plan
-                    .steps
-                    .push(QueryStep::ReceiverTargets(Default::default()));
-            }
-            query.plan.steps.push(match step {
-                RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
-                RowExpansionStep::ReceiverEvidence => QueryStep::ReceiverEvidence,
-                _ => unreachable!("receiver expansion match is exhaustive"),
-            });
-        }
-        RowExpansionStep::MemberSelection => query.plan.steps.push(QueryStep::MemberSelection),
-        RowExpansionStep::MemberCandidates => return None,
-        RowExpansionStep::CandidateHierarchy => {
-            query.plan.steps.push(QueryStep::CandidateHierarchy)
-        }
-        RowExpansionStep::MemberFamily => query.plan.steps.push(QueryStep::MemberFamily),
-        RowExpansionStep::FamilyEdges => query.plan.steps.push(QueryStep::FamilyEdges),
-        RowExpansionStep::DispatchOutcome => query.plan.steps.push(QueryStep::DispatchOutcome),
-        RowExpansionStep::DispatchTargets => query.plan.steps.push(QueryStep::DispatchTargets),
-    }
-    Some(query)
-}
-
 /// Execute a decoded relational assertion plan: run every named query and
-/// expansion binding as a CodeQuery, evaluate the bounded join/group/aggregate
+/// binding as a CodeQuery, evaluate the bounded join/group/aggregate
 /// plan over the returned rows, and assemble each violated group into one
 /// finding anchored at exact source ranges.
 ///
@@ -2205,32 +2165,6 @@ fn evaluate_relational_assertion_policy(
                 query.limit = budget.query_limits().max_pipeline_rows;
                 query
             }
-            RowBindingSource::Expansion { from, step } => {
-                let Some(&source_index) = binding_index_by_name.get(from) else {
-                    return failed_policy_run(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        &format!(
-                            "relational binding `{}` expands `{from}` before it is declared",
-                            binding.name
-                        ),
-                        budget,
-                    );
-                };
-                let Some(query) = relational_expansion_query(&binding_queries[source_index], *step)
-                else {
-                    return failed_policy_run(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        &format!(
-                            "row expansion `{}` has no executable row domain yet",
-                            step.label()
-                        ),
-                        budget,
-                    );
-                };
-                query
-            }
         };
         binding_index_by_name.insert(&binding.name, index);
         binding_queries.push(query);
@@ -2252,7 +2186,14 @@ fn evaluate_relational_assertion_policy(
                 policy.definition().metadata.id
             )
         });
-        return relational_run(policy, plan, &binding_index_by_name, &executed, budget);
+        return relational_run(
+            policy,
+            plan,
+            &binding_index_by_name,
+            &executed,
+            budget,
+            context.cancellation,
+        );
     };
     let mut attempt = UnitAttempt::default();
     let sliced = sliced_relational_bindings(
@@ -2274,7 +2215,14 @@ fn evaluate_relational_assertion_policy(
     let review = attempt.into_run(policy.definition().metadata.id.clone(), reason);
     note_incremental_run(&review, incremental);
     incremental.record_run(review);
-    relational_run(policy, plan, &binding_index_by_name, &executed, budget)
+    relational_run(
+        policy,
+        plan,
+        &binding_index_by_name,
+        &executed,
+        budget,
+        context.cancellation,
+    )
 }
 
 /// Execute every row binding of a relational plan over the whole workspace.
@@ -2378,6 +2326,7 @@ fn relational_run(
     binding_index_by_name: &HashMap<&super::super::definition::RowBindingName, usize>,
     executed: &[ExecutedQueryRows],
     budget: &PolicyBudget,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyRun, PolicyRunError> {
     use super::super::assertion_policy::{
         RelationalInput, RelationalViolationRow, evaluate_relational_assertion_rows,
@@ -2498,7 +2447,7 @@ fn relational_run(
             coverage: coverage.clone(),
         })
         .collect::<Vec<_>>();
-    let evaluation = match evaluate_relational_assertion_rows(plan, &inputs) {
+    let evaluation = match evaluate_relational_assertion_rows(plan, &inputs, cancellation) {
         Ok(evaluation) => evaluation,
         Err(error) => {
             return failed_policy_run_with_reason(
@@ -2530,9 +2479,7 @@ fn relational_run(
         );
     }
 
-    if evaluation.limit_exceeded {
-        run_incomplete.push(PolicyIncompleteReason::PipelineRowBudget);
-    }
+    run_incomplete.extend(evaluation.incomplete_reasons.iter().copied());
     // An assertion whose verdict the coverage rules blocked makes the run
     // non-reliable, which is what keeps status 0 impossible. It does not
     // discard the verdicts the same evaluation did prove.
@@ -3176,6 +3123,8 @@ fn evaluate_lowered_occurrence_assert<'rows>(
     ast_ids: &[&str],
     rows_by_ast_id: &HashMap<&str, Vec<&'rows CodeQueryOccurrence>>,
     lowered: &RelationalPlanIr,
+    cancellation: Option<&CancellationToken>,
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     use crate::relational::{
         IrLimits, IrRelationId, RelationCoverage, RelationalInput, evaluate_plan_ir,
@@ -3208,6 +3157,7 @@ fn evaluate_lowered_occurrence_assert<'rows>(
                 },
                 provenance: Vec::new(),
                 provenance_truncated: false,
+                row_projection: Vec::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -3233,6 +3183,7 @@ fn evaluate_lowered_occurrence_assert<'rows>(
                 },
             ],
             unknown_fields: Vec::new(),
+            projected_field_names: Vec::new(),
             terminal: None,
             provenance: Vec::new(),
             provenance_truncated: false,
@@ -3271,8 +3222,16 @@ fn evaluate_lowered_occurrence_assert<'rows>(
                 coverage: RelationCoverage::Exhaustive,
             },
         ],
+        cancellation,
     )
     .expect("validated occurrence IR reads its declared row fields");
+    if evaluation
+        .incomplete_reasons
+        .contains(&PolicyIncompleteReason::Cancelled)
+    {
+        late_incomplete.push(PolicyIncompleteReason::Cancelled);
+        return None;
+    }
     assert!(
         evaluation.exhaustive
             && !evaluation.limit_exceeded

@@ -25,8 +25,7 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_rql::structural::search::{
-    DetailedCodeQueryResult, execute_code_query_detailed_eager_index,
-    execute_code_query_detailed_eager_index_workspace, execute_code_query_expansion,
+    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
 };
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, CodeQueryResultValue,
@@ -303,7 +302,7 @@ pub fn explain_match_candidate(
 /// A faithful re-execution must use the same path the evaluator that produced
 /// the real verdict uses. The match evaluator reads the analyzer directly; the
 /// relational driver prefers the generation-bound workspace oracles when the
-/// evaluation context carries a workspace, because its row expansions need
+/// evaluation context carries a workspace, because semantic RQL steps need
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrefixExecution {
@@ -331,108 +330,6 @@ impl StageOutcome {
     pub(super) fn label(&self) -> &str {
         &self.label
     }
-}
-
-/// What the deepest executed prefix -- the complete selector, which is a row
-/// binding's own relation -- returned for the candidate.
-///
-/// A caller that replays plan-level operators over the candidate's row needs
-/// the row itself, not a second query for it, and needs to know whether the
-/// query that produced it saw everything: a row absent from a non-exhaustive
-/// row set is undecided, so a negative replayed over one is `unknown`.
-#[derive(Debug, Default)]
-pub(super) struct LocatedRows {
-    rows: Vec<CodeQueryResultValue>,
-    evidence: Vec<DetailedCodeQueryEvidence>,
-    exhaustive: bool,
-    reasons: Vec<PolicyIncompleteReason>,
-}
-
-impl LocatedRows {
-    /// The rows the query returned for the candidate, judged against what that
-    /// same query proved about its own row set.
-    fn new(
-        executed: DetailedCodeQueryResult,
-        covers: impl Fn(&DetailedCodeQueryEvidence) -> bool,
-    ) -> Self {
-        let completion = executed.result.completion();
-        let truncated = executed.result.truncated;
-        let evidence = executed
-            .evidence
-            .into_iter()
-            .filter(covers)
-            .collect::<Vec<_>>();
-        let rows = executed
-            .result
-            .results
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| evidence.iter().any(|item| item.result_index == *index))
-            .map(|(_, item)| item.value)
-            .collect();
-        Self {
-            rows,
-            evidence,
-            exhaustive: !truncated && matches!(completion, CodeQueryCompletion::Complete),
-            reasons: absence_reasons(&completion, truncated),
-        }
-    }
-
-    /// Apply the evaluator's expansion suffix only to these source rows.
-    /// The executor selects the source prefix by exact detailed row identity
-    /// before running its ordinary pipeline steps. This also works for seeds
-    /// that do not retain derivation traces.
-    pub(super) fn expand(
-        &self,
-        query: &CodeQuery,
-        source_steps: usize,
-        context: &PolicyEvaluationContext<'_>,
-        budget: &PolicyBudget,
-    ) -> Self {
-        let mut query = query.clone();
-        query.result_detail = CodeQueryResultDetail::Full;
-        query.limit = budget.query_limits().max_pipeline_rows;
-        let analyzer = context
-            .workspace
-            .map_or(context.analyzer, |workspace| workspace.analyzer());
-        let executed = execute_code_query_expansion(
-            analyzer,
-            context.workspace,
-            &query,
-            source_steps,
-            &self.evidence,
-            budget.query_limits(),
-            context.cancellation,
-        );
-        let mut expanded = Self::new(executed, |_| true);
-        expanded.reasons.extend_from_slice(&self.reasons);
-        // A prefix can retain the candidate through lineage without its own
-        // output rows covering the candidate. There is then no located row to
-        // select for expansion, so an empty replay cannot establish a drop.
-        if self.evidence.is_empty() {
-            expanded
-                .reasons
-                .push(PolicyIncompleteReason::CapabilityIncomplete);
-        }
-        expanded.exhaustive &= self.exhaustive && !self.evidence.is_empty();
-        expanded.reasons.sort();
-        expanded.reasons.dedup();
-        expanded
-    }
-
-    pub(super) fn keys(&self) -> Vec<&brokk_bifrost_rql::structural::DetailedCodeQueryKey> {
-        self.evidence.iter().map(|row| &row.key).collect()
-    }
-
-    pub(super) fn rows(&self) -> &[CodeQueryResultValue] {
-        &self.rows
-    }
-    /// Whether the query returned every row it could, which is what licenses a
-    /// `failed` verdict over the rows it did return.
-    pub(super) const fn exhaustive(&self) -> bool {
-        self.exhaustive
-    }
-    /// Why it did not, when it did not.
     pub(super) fn reasons(&self) -> &[PolicyIncompleteReason] {
         &self.reasons
     }
@@ -446,18 +343,9 @@ pub(super) struct StageWalk {
     executed: usize,
     prefixes_truncated: bool,
     omitted_prefixes: u64,
-    located: LocatedRows,
 }
 
 impl StageWalk {
-    /// The candidate's rows after the complete selector and any replayed
-    /// expansion, empty unless every presented stage retained it.
-    pub(super) const fn located(&self) -> &LocatedRows {
-        &self.located
-    }
-    pub(super) fn replace_located(&mut self, located: LocatedRows) {
-        self.located = located;
-    }
     pub(super) const fn prefixes_truncated(&self) -> bool {
         self.prefixes_truncated
     }
@@ -578,7 +466,6 @@ pub(super) fn run_prefixes(
     }
     later_prefix_state.reverse();
 
-    let mut located = LocatedRows::default();
     for ((prefix, executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
         executed_prefixes.into_iter().zip(later_prefix_state)
     {
@@ -588,7 +475,13 @@ pub(super) fn run_prefixes(
         };
         let completion = executed.result.completion();
         let covering = if lineage.target_retained {
-            lineage_covering(prefix, &executed.evidence, &lineage).map(describe_lineage_covering)
+            lineage_covering(
+                prefix,
+                &executed.result.results,
+                &executed.evidence,
+                &lineage,
+            )
+            .map(describe_lineage_covering)
         } else {
             executed
                 .evidence
@@ -716,17 +609,6 @@ pub(super) fn run_prefixes(
             }
         }
         let decided = stage.outcome != ExplanationOutcome::Satisfied;
-        if !decided && prefix == step_count {
-            // The complete selector is the relation a row binding stands for,
-            // so its rows -- and only its rows -- are the candidate's rows.
-            debug_assert!(
-                !prefixes_omitted,
-                "the complete selector runs only when the budget omitted no prefix"
-            );
-            located = LocatedRows::new(executed, |evidence| {
-                evidence_covers_candidate(evidence, candidate)
-            });
-        }
         stages.push(stage);
         if decided {
             break;
@@ -744,7 +626,6 @@ pub(super) fn run_prefixes(
         executed: executed_count,
         prefixes_truncated: omitted_prefixes > 0,
         omitted_prefixes,
-        located,
     }
 }
 
@@ -754,7 +635,15 @@ struct CandidateLineage {
     source_prefix: Option<usize>,
     provenance_truncated: bool,
     targets: Vec<DetailedRowIdentity>,
+    anchors: Vec<RowLineageAnchor>,
     traces: Vec<DetailedCodeQueryProvenanceEvidence>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RowLineageAnchor {
+    SiteAst(String),
+    Candidate(String),
+    Member(String),
 }
 
 #[derive(PartialEq, Eq)]
@@ -791,10 +680,106 @@ impl CandidateLineage {
                 identities: evidence.identities.clone(),
                 source_slice_sha256: evidence.source_slice_sha256,
             });
+            lineage.anchors.extend(row_lineage_anchors(&item.value));
             lineage.traces.extend(evidence.provenance.iter().cloned());
         }
+        lineage.anchors.sort();
+        lineage.anchors.dedup();
         lineage
     }
+}
+
+/// Structured identities that adjacent row-domain steps intentionally share.
+/// These are the public join keys of the row schemas, not source-text guesses:
+/// site AST identity connects occurrence-derived rows, candidate identity
+/// connects hierarchy hops, and canonical member identity connects families.
+fn row_lineage_anchors(value: &CodeQueryResultValue) -> Vec<RowLineageAnchor> {
+    let mut anchors = Vec::new();
+    match value {
+        CodeQueryResultValue::Occurrence { value } => {
+            anchors.push(RowLineageAnchor::SiteAst(value.ast_id.clone()));
+        }
+        CodeQueryResultValue::ReceiverAnalysis { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::MemberTargetAnalysis { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::ReceiverOutcome { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::ReceiverEvidence { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::MemberSelection { value } => {
+            anchors.push(RowLineageAnchor::SiteAst(value.site_ast_id.clone()));
+        }
+        CodeQueryResultValue::ResolutionCandidate { value } => {
+            anchors.push(RowLineageAnchor::SiteAst(value.ast_id.clone()));
+            anchors.push(RowLineageAnchor::Candidate(value.id.clone()));
+            anchors.extend(
+                value
+                    .canonical_member_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::Member),
+            );
+        }
+        CodeQueryResultValue::CandidateHop { value } => {
+            anchors.push(RowLineageAnchor::SiteAst(value.ast_id.clone()));
+            anchors.push(RowLineageAnchor::Candidate(value.candidate_id.clone()));
+        }
+        CodeQueryResultValue::DispatchOutcome { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::DispatchTarget { value } => {
+            anchors.extend(
+                value
+                    .site_ast_id
+                    .iter()
+                    .cloned()
+                    .map(RowLineageAnchor::SiteAst),
+            );
+        }
+        CodeQueryResultValue::MemberFamily { value } => {
+            anchors.push(RowLineageAnchor::Member(value.member_id.clone()));
+        }
+        CodeQueryResultValue::MemberFamilyEdge { value } => {
+            anchors.push(RowLineageAnchor::Member(value.member_id.clone()));
+        }
+        _ => {}
+    }
+    anchors
 }
 
 fn evidence_covers_candidate(
@@ -842,16 +827,12 @@ fn describe_lineage_covering(evidence: &DetailedCodeQueryEvidence) -> String {
 
 fn lineage_covering<'a>(
     prefix: usize,
+    results: &[brokk_bifrost_rql::structural::CodeQueryResultItem],
     evidence: &'a [DetailedCodeQueryEvidence],
     lineage: &CandidateLineage,
 ) -> Option<&'a DetailedCodeQueryEvidence> {
-    if lineage
-        .source_prefix
-        .is_some_and(|source_prefix| prefix > source_prefix)
-    {
-        return None;
-    }
-    evidence.iter().find(|candidate| {
+    let covering = evidence.iter().find(|candidate| {
+        let anchors = row_lineage_anchors(&results[candidate.result_index].value);
         lineage.targets.iter().any(|target| {
             candidate.domain == target.domain
                 && candidate.key == target.key
@@ -859,14 +840,26 @@ fn lineage_covering<'a>(
                 && candidate.byte_span == target.byte_span
                 && candidate.identities == target.identities
                 && candidate.source_slice_sha256 == target.source_slice_sha256
-        }) || lineage.traces.iter().any(|terminal| {
-            evidence_matches_ref(candidate, &terminal.seed)
-                || candidate
-                    .provenance
-                    .iter()
-                    .any(|prefix| provenance_is_prefix(prefix, terminal))
-        })
-    })
+        }) || anchors
+            .iter()
+            .any(|anchor| lineage.anchors.contains(anchor))
+            || lineage.traces.iter().any(|terminal| {
+                evidence_matches_ref(candidate, &terminal.seed)
+                    || candidate
+                        .provenance
+                        .iter()
+                        .any(|prefix| provenance_is_prefix(prefix, terminal))
+            })
+    });
+    if covering.is_some()
+        || !lineage
+            .source_prefix
+            .is_some_and(|source_prefix| prefix > source_prefix)
+    {
+        covering
+    } else {
+        None
+    }
 }
 
 fn evidence_matches_ref(

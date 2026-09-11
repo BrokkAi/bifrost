@@ -2654,13 +2654,12 @@ fn validate_authored_policy_selectors(
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
                 for binding in &plan.bindings {
-                    if let RowBindingSource::Query(query) = &binding.source {
-                        validate_authored_selector_at(
-                            &relational_binding_selector_path(&binding.name),
-                            query,
-                            selectors,
-                        )?;
-                    }
+                    let RowBindingSource::Query(query) = &binding.source;
+                    validate_authored_selector_at(
+                        &relational_binding_selector_path(&binding.name),
+                        query,
+                        selectors,
+                    )?;
                 }
             } else {
                 validate_authored_selector_at(

@@ -2936,7 +2936,7 @@ mod tests {
         assert!(argument.contains("name: string (nullable)"), "{argument}");
         let occurrence = doc_text("occurrence");
         assert!(
-            occurrence.contains("expansions: member-selection -> member_selection"),
+            occurrence.contains("expansions: member_selection -> member_selection"),
             "{occurrence}"
         );
         // `occurrence` is an RQL form label and `declaration` a structural kind;
@@ -3232,6 +3232,7 @@ mod tests {
                     },
                     provenance: Vec::new(),
                     provenance_truncated: false,
+                    row_projection: Vec::new(),
                 }],
                 truncated: false,
                 diagnostics: Vec::new(),
@@ -3300,6 +3301,7 @@ mod tests {
                     },
                     provenance: Vec::new(),
                     provenance_truncated: false,
+                    row_projection: Vec::new(),
                 }],
                 truncated: false,
                 diagnostics: Vec::new(),
@@ -3353,6 +3355,7 @@ mod tests {
                     },
                     provenance: Vec::new(),
                     provenance_truncated: false,
+                    row_projection: Vec::new(),
                 }],
                 truncated: false,
                 diagnostics: Vec::new(),

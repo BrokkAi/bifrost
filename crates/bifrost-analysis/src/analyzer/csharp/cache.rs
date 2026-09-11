@@ -107,6 +107,11 @@ where
 
 pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,
+    /// Immutable candidate and target facts, shared by all queries in this
+    /// generation. Updates and project overlays replace the entire memo bundle.
+    pub(super) reachability: PoolSafeMemo<
+        HashMap<ProjectFile, brokk_bifrost_csharp::graph_support::CSharpReachabilityFacts>,
+    >,
     /// Shared by `namespace_of_file` and `namespace_of_file_limited`. Sound
     /// only because both answer the one rule in
     /// `file_namespace_from_top_level_declarations`; a spelling that computed
@@ -188,6 +193,7 @@ impl CSharpMemoCaches {
     pub(super) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
+            reachability: PoolSafeMemo::new(),
             namespace_by_file: build_weighted_cache(budget_bytes / 16, weight_string),
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
             file_using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),

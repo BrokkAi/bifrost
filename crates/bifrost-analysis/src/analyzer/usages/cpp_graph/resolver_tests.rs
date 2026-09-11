@@ -951,6 +951,70 @@ ABSL_NAMESPACE_END
         );
     }
 
+    #[test]
+    fn bounded_visibility_walks_shared_declaration_dependencies_once() {
+        const ROOT_COUNT: usize = 8;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(
+            root.join("types.h"),
+            "struct Leaf {};\nstruct Selected { Leaf value; };\n",
+        )
+        .expect("write shared declarations");
+        let mut roots = HashSet::default();
+        for index in 0..ROOT_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("consumer_{index}.cpp"));
+            file.write(format!("#include \"types.h\"\nSelected value_{index};\n"))
+                .expect("write consumer");
+            roots.insert(file);
+        }
+
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, query_token);
+
+        reset_bounded_visibility_dependency_ast_node_count_for_test();
+        let one_root = HashSet::from_iter([roots.iter().next().expect("one root").clone()]);
+        let one_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &one_root);
+        let one_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
+        assert_eq!(
+            one_visibility
+                .visible_identifier_candidates(one_root.iter().next().unwrap(), "Leaf")
+                .count(),
+            1
+        );
+        assert!(
+            one_root_nodes > 0,
+            "the fixture must walk dependency syntax"
+        );
+
+        reset_bounded_visibility_dependency_ast_node_count_for_test();
+        reset_bounded_visibility_declaration_read_count_for_test();
+        let all_visibility = VisibilityIndex::build(&cpp, query_token, &graph, &roots);
+        let all_root_nodes = bounded_visibility_dependency_ast_node_count_for_test();
+        for file in &roots {
+            assert_eq!(
+                all_visibility
+                    .visible_identifier_candidates(file, "Leaf")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            all_root_nodes, one_root_nodes,
+            "dependency syntax is a property of the selected CodeUnit, not of each root that sees it"
+        );
+        assert_eq!(
+            bounded_visibility_declaration_read_count_for_test(),
+            ROOT_COUNT + 1,
+            "each root and the shared donor source must be read once per visibility build"
+        );
+    }
+
     #[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
     #[test]
     fn bounded_visibility_ignores_ordinary_identifiers_in_selected_function_bodies() {

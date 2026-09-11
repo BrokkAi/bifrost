@@ -272,6 +272,119 @@ fn receiver_contract_of(unit: &CodeUnit, metadata: &SignatureMetadata) -> Option
     }
 }
 
+/// What the callee's published signature entries say about this call site.
+pub struct SelectedSignature {
+    /// The `callable_signature` row this binding selects, when the entries name
+    /// exactly one.
+    pub signature_id: Option<String>,
+    /// Ordinal of the selected persisted entry.
+    pub ordinal: Option<usize>,
+    /// More than one structurally different signature accepts the written
+    /// arity. Without a language-owned applicability/type verdict, no formal
+    /// layout may be selected from that set.
+    pub ambiguous: bool,
+    /// The receiver contract the selected entry declares, or the one every
+    /// entry agrees on when selection did not narrow to one.
+    pub receiver_contract: Option<ReceiverContract>,
+}
+
+pub fn signature_choice(
+    reports: &[CallableSignatureReport],
+    actual_count: usize,
+) -> SelectedSignature {
+    let (selected, mut ambiguous) = match reports {
+        [] => (None, false),
+        [only] => (Some(only), false),
+        several
+            if several
+                .iter()
+                .all(|report| report.signature.arity.is_some()) =>
+        {
+            let accepting = several
+                .iter()
+                .filter(|report| {
+                    report
+                        .signature
+                        .arity
+                        .is_some_and(|arity| arity.accepts(actual_count))
+                })
+                .collect::<Vec<_>>();
+            match accepting.as_slice() {
+                [only] => (Some(*only), false),
+                [first, rest @ ..]
+                    if rest
+                        .iter()
+                        .all(|report| declares_the_same_parameters(first, report)) =>
+                {
+                    (
+                        accepting
+                            .iter()
+                            .copied()
+                            .find(|report| !report.signature.declaration_only)
+                            .or(Some(*first)),
+                        false,
+                    )
+                }
+                [_, _, ..] => (None, true),
+                [] => (None, false),
+            }
+        }
+        _ => (None, false),
+    };
+    if selected.is_none() && !ambiguous {
+        ambiguous = reports
+            .iter()
+            .filter(|report| {
+                report.signature.declaration_only
+                    && report.signature.parameter_count == actual_count
+            })
+            .take(2)
+            .count()
+            == 2;
+    }
+    SelectedSignature {
+        ordinal: selected.map(|report| report.signature.ordinal),
+        signature_id: selected.map(|report| report.signature.id.clone()),
+        ambiguous,
+        receiver_contract: selected
+            .map(|report| report.signature.receiver_contract)
+            .unwrap_or_else(|| agreed_receiver_contract(reports)),
+    }
+}
+
+/// Whether two published entries describe the same declared parameter list,
+/// which is what makes a header and its definition one signature rather than
+/// two overloads. The comparison is over the recorded parameter labels and
+/// declared type spellings, both of which the adapter published; nothing here
+/// parses either.
+fn declares_the_same_parameters(
+    left: &CallableSignatureReport,
+    right: &CallableSignatureReport,
+) -> bool {
+    left.parameters.len() == right.parameters.len()
+        && left
+            .parameters
+            .iter()
+            .zip(&right.parameters)
+            .all(|(left, right)| {
+                left.label == right.label && left.declared_type == right.declared_type
+            })
+}
+
+/// The receiver contract every published entry declares, when they all declare
+/// the same one. Which overload a call selects cannot change whether the
+/// callable is instance-bound, so an unselected overload set still answers
+/// this; entries that disagree answer nothing.
+fn agreed_receiver_contract(reports: &[CallableSignatureReport]) -> Option<ReceiverContract> {
+    let mut contracts = reports
+        .iter()
+        .map(|report| report.signature.receiver_contract);
+    let first = contracts.next().flatten()?;
+    contracts
+        .all(|contract| contract == Some(first))
+        .then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

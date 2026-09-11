@@ -5,6 +5,18 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.11.3] - 2026-09-11
+
+### Fixed
+
+- Release qualification now excludes its generated `dist/` artifacts from the
+  facade crate and rejects any crate archive above crates.io's upload limit
+  before a release is tagged.
+- Kotlin parameter-default extraction now uses the registered language-support
+  capability, preserving the framework boundary enforced by cross-language CI.
+- MCP discovery metadata validation now distinguishes generated query-step
+  entries from ordinary prose that happens to contain a step label.
+
 ## [0.11.2] - 2026-09-10
 
 ### Added
@@ -32,12 +44,21 @@ projection and its commit history does not contain every source commit.
 - JavaScript and TypeScript value flow lowers exact declaration-style
   `Object.entries` loops into allocation-rooted member loads and binder flow.
   Shadowed, escaped, dynamic, and unmatched forms stay explicitly incomplete.
-- RQLP analyses can share explicit language and path constraints and an independent
-  RQL schema pin across their selectors. Hoisting equivalent wrappers preserves
-  canonical queries and policy hashes; nested scopes conjoin instead of overriding.
 
 ### Changed
 
+- RQLP row-local `filter`, `project`, `call`, `call-argument`, and binding
+  expansion records are now typed RQL pipeline steps. RQL gains `filter` with
+  the existing typed row-predicate semantics and `project` with column
+  renaming; cross-binding joins, grouping, aggregation, and assertions remain
+  in RQLP. The `bifrost.correctness.go-data-race` semantic hash rotates from
+  `1a32c1957d1e55260e9506c216f0b0cbdd854b8264436d7d06005a08dcd2c800` to
+  `eb5432400ec0b5edecfb9a1f6485f6a29bb5ce8fb67a878c92c27e127cb22ed5`, and
+  `bifrost.correctness.go-nil-dereference` rotates from
+  `1ba11d2cee5c025a03683f037e07509ab70752b058710bcba350d050a7ba78a0` to
+  `e933fbff9821bbcc4883af11a2532440d2de04d75ab7784ff1b51d73e2184896`.
+  The already-migrated Python absent-member and Go wrong-error policies, and
+  the P0 reference-policy pins, retain their existing semantic hashes.
 - RQL semantic rows now publish one `evidence` object with typed `proof`,
   `completeness`, and an optional `reason`; the composite quality label and
   separate proof/completeness reason fields are removed. Value-flow endpoints

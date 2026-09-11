@@ -272,6 +272,24 @@ void test("highlights call-binding selector pipeline forms and options", async (
   }
 });
 
+void test("highlights typed row filter and projection forms", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(project :columns (site_id (formal_name parameter)) " +
+      "(filter :where ((terminal eq false) (formal_name is-not-null) " +
+      "(formal_index ge 0) (formal_index le (field formal_index))) (call-bindings (call))))"
+  );
+  for (const form of ["project", "filter", "field"]) {
+    assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
+  }
+  for (const option of [":columns", ":where"]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+  for (const predicate of ["eq", "is-not-null", "ge", "le"]) {
+    assertScoped(tokens, predicate, "support.function.predicate.bifrost-rql");
+  }
+});
+
 void test("highlights schema-v3 CFG forms and aliases", async () => {
   const forms = [
     "procedure-of",

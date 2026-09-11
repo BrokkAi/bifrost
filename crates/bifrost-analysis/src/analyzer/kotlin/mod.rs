@@ -1195,6 +1195,10 @@ impl LanguageSupport for KotlinSupport {
         }
     }
 
+    fn positional_parameter_default<'t>(&self, parameter: Node<'t>) -> Option<Node<'t>> {
+        syntax::kotlin_parameter_default(parameter)
+    }
+
     fn signature_metadata_limited(
         &self,
         analyzer: &dyn IAnalyzer,

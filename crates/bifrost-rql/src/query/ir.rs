@@ -1,5 +1,6 @@
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
+use crate::structural::{CodeQueryRowField, CodeQueryRowScalarType, DetailedCodeQueryDomain};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ControlExitPartition, ControlRelationKind,
@@ -194,6 +195,10 @@ pub const MAX_STRING_PREDICATE_LENGTH: usize = 4096;
 pub const MAX_CAPTURE_LENGTH: usize = 128;
 pub const MAX_KWARG_NAME_LENGTH: usize = 128;
 pub const MAX_QUERY_STEPS: usize = 16;
+pub const MAX_ROW_PREDICATES: usize = 16;
+pub const MAX_ROW_PREDICATE_SET_MEMBERS: usize = 64;
+pub const MAX_ROW_PROJECTION_COLUMNS: usize = 32;
+pub const MAX_ROW_FIELD_NAME_LENGTH: usize = 256;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
@@ -786,6 +791,82 @@ pub struct ResolvedCallFilter {
     pub receiver_type: Option<ResolvedCallReceiverType>,
 }
 
+/// One typed scalar literal in a row-local query predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum QueryRowLiteral {
+    String(String),
+    Integer(u64),
+    Boolean(bool),
+    /// A public label from the selected field's constrained value domain.
+    ConstrainedEnum(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueryRowPredicateOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    IsNull,
+    IsNotNull,
+    In,
+}
+
+impl QueryRowPredicateOp {
+    pub const ALL: &'static [Self] = &[
+        Self::Eq,
+        Self::Ne,
+        Self::Lt,
+        Self::Le,
+        Self::Gt,
+        Self::Ge,
+        Self::IsNull,
+        Self::IsNotNull,
+        Self::In,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Lt => "lt",
+            Self::Le => "le",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+            Self::IsNull => "is-null",
+            Self::IsNotNull => "is-not-null",
+            Self::In => "in",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.label() == label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryRowPredicateOperand {
+    Literal(QueryRowLiteral),
+    Field(String),
+    Set(Vec<QueryRowLiteral>),
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRowPredicate {
+    pub field: String,
+    pub op: QueryRowPredicateOp,
+    pub operand: QueryRowPredicateOperand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRowProjectionColumn {
+    pub source: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallArgumentSelector {
     FormalName(String),
@@ -801,6 +882,8 @@ pub enum HierarchyTraversal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryStep {
+    Filter(Vec<QueryRowPredicate>),
+    Project(Vec<QueryRowProjectionColumn>),
     EnclosingDecl,
     ProcedureOf,
     CfgEntry,
@@ -1340,6 +1423,8 @@ impl QueryStep {
 
     pub fn op(&self) -> QueryStepOp {
         match self {
+            Self::Filter(_) => QueryStepOp::Filter,
+            Self::Project(_) => QueryStepOp::Project,
             Self::EnclosingDecl => QueryStepOp::EnclosingDecl,
             Self::ProcedureOf => QueryStepOp::ProcedureOf,
             Self::CfgEntry => QueryStepOp::CfgEntry,
@@ -1442,6 +1527,7 @@ impl QueryStep {
 
     pub fn from_label(label: &str) -> Option<Self> {
         match QueryStepOp::from_label(label)? {
+            QueryStepOp::Filter | QueryStepOp::Project => None,
             QueryStepOp::EnclosingDecl => Some(Self::EnclosingDecl),
             QueryStepOp::ProcedureOf => Some(Self::ProcedureOf),
             QueryStepOp::CfgEntry => Some(Self::CfgEntry),
@@ -1567,6 +1653,7 @@ impl QueryStep {
 
     pub fn output_kind(&self, input: QueryValueKind) -> Option<QueryValueKind> {
         match (self, input) {
+            (Self::Filter(_) | Self::Project(_), input) => Some(input),
             (Self::EnclosingDecl, QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::Declaration)
             }
@@ -1706,11 +1793,23 @@ impl QueryStep {
             }
             (
                 Self::ReceiverOutcome,
-                QueryValueKind::ReceiverAnalysis | QueryValueKind::MemberTargetAnalysis,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::CallSite
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence
+                | QueryValueKind::ReceiverAnalysis
+                | QueryValueKind::MemberTargetAnalysis,
             ) => Some(QueryValueKind::ReceiverOutcome),
-            (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
-                Some(QueryValueKind::ReceiverEvidence)
-            }
+            (
+                Self::ReceiverEvidence,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::CallSite
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence
+                | QueryValueKind::ReceiverAnalysis,
+            ) => Some(QueryValueKind::ReceiverEvidence),
             (
                 Self::CallShape,
                 QueryValueKind::StructuralMatch
@@ -1875,11 +1974,14 @@ impl QueryStep {
     }
 }
 
-pub(super) fn validate_query_steps(
+type ProjectedRowFields = Vec<(String, CodeQueryRowField)>;
+
+fn validate_query_steps(
     steps: &[QueryStep],
     input: QueryValueKind,
+    input_projected_fields: Option<&[(String, CodeQueryRowField)]>,
     path: &str,
-) -> Result<QueryValueKind, QueryError> {
+) -> Result<(QueryValueKind, Option<ProjectedRowFields>), QueryError> {
     if steps.len() > MAX_QUERY_STEPS {
         return Err(QueryError::new(
             path,
@@ -1888,8 +1990,32 @@ pub(super) fn validate_query_steps(
     }
 
     let mut value_kind = input;
+    let mut projected_fields = input_projected_fields.map(<[_]>::to_vec);
     for (index, step) in steps.iter().enumerate() {
         let step_path = format!("{path}[{index}]");
+        match step {
+            QueryStep::Filter(predicates) => validate_row_predicates(
+                predicates,
+                projected_fields.as_deref(),
+                value_kind,
+                &step_path,
+            )?,
+            QueryStep::Project(columns) => {
+                projected_fields = Some(validate_row_projection(
+                    columns,
+                    projected_fields.as_deref(),
+                    value_kind,
+                    &step_path,
+                )?);
+            }
+            _ if projected_fields.is_some() => {
+                return Err(QueryError::new(
+                    step_path,
+                    "after project, only further filter or project steps are allowed",
+                ));
+            }
+            _ => {}
+        }
         if let QueryStep::Callers(filter) | QueryStep::Callees(filter) = step
             && filter.completeness == CallTraversalCompleteness::ProvenSubset
         {
@@ -1907,6 +2033,7 @@ pub(super) fn validate_query_steps(
             }
         }
         let expected_input = match step {
+            QueryStep::Filter(_) | QueryStep::Project(_) => "a typed row",
             QueryStep::EnclosingDecl => "structural_match",
             QueryStep::ProcedureOf => "structural_match or declaration",
             QueryStep::CfgEntry | QueryStep::CfgExits => "procedure",
@@ -1942,8 +2069,12 @@ pub(super) fn validate_query_steps(
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
             QueryStep::KeyedReadValue(_) => "structural_match",
             QueryStep::FieldWriteValue(_) => "member_target_analysis",
-            QueryStep::ReceiverOutcome => "receiver_analysis or member_target_analysis",
-            QueryStep::ReceiverEvidence => "receiver_analysis",
+            QueryStep::ReceiverOutcome => {
+                "structural_match, reference_site, call_site, expression_site, occurrence, receiver_analysis, or member_target_analysis"
+            }
+            QueryStep::ReceiverEvidence => {
+                "structural_match, reference_site, call_site, expression_site, occurrence, or receiver_analysis"
+            }
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallResults => "call_shape",
             QueryStep::CallArgumentGroups => "call_shape",
@@ -2011,7 +2142,275 @@ pub(super) fn validate_query_steps(
             )
         })?;
     }
-    Ok(value_kind)
+    Ok((value_kind, projected_fields))
+}
+
+fn input_row_fields(
+    projected: Option<&[(String, CodeQueryRowField)]>,
+    kind: QueryValueKind,
+) -> Vec<(String, CodeQueryRowField)> {
+    projected.map_or_else(
+        || {
+            DetailedCodeQueryDomain::from_query_value_kind(kind)
+                .row_fields()
+                .iter()
+                .map(|field| (field.name.to_string(), *field))
+                .collect()
+        },
+        <[(String, CodeQueryRowField)]>::to_vec,
+    )
+}
+
+fn validate_row_predicates(
+    predicates: &[QueryRowPredicate],
+    projected: Option<&[(String, CodeQueryRowField)]>,
+    kind: QueryValueKind,
+    path: &str,
+) -> Result<(), QueryError> {
+    if predicates.is_empty() || predicates.len() > MAX_ROW_PREDICATES {
+        return Err(QueryError::new(
+            path,
+            format!("row predicates must contain from 1 through {MAX_ROW_PREDICATES} entries"),
+        ));
+    }
+    let fields = input_row_fields(projected, kind);
+    for (index, predicate) in predicates.iter().enumerate() {
+        let predicate_path = format!("{path}.where[{index}]");
+        validate_row_field_name(
+            &predicate.field,
+            &format!("{predicate_path}.field"),
+            "row predicate field",
+        )?;
+        let Some((_, field)) = fields.iter().find(|(name, _)| name == &predicate.field) else {
+            return Err(QueryError::new(
+                format!("{predicate_path}.field"),
+                format!(
+                    "unknown row field {:?}; expected one of {:?}",
+                    predicate.field,
+                    fields.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                ),
+            ));
+        };
+        match (predicate.op, &predicate.operand) {
+            (
+                QueryRowPredicateOp::IsNull | QueryRowPredicateOp::IsNotNull,
+                QueryRowPredicateOperand::None,
+            ) => {
+                if !field.nullable {
+                    return Err(QueryError::new(
+                        predicate_path,
+                        format!("row field {:?} is not nullable", predicate.field),
+                    ));
+                }
+            }
+            (QueryRowPredicateOp::In, QueryRowPredicateOperand::Set(values)) => {
+                if values.is_empty() || values.len() > MAX_ROW_PREDICATE_SET_MEMBERS {
+                    return Err(QueryError::new(
+                        format!("{predicate_path}.values"),
+                        format!(
+                            "row membership set must contain from 1 through {MAX_ROW_PREDICATE_SET_MEMBERS} literals"
+                        ),
+                    ));
+                }
+                for (value_index, value) in values.iter().enumerate() {
+                    validate_row_literal(
+                        value,
+                        *field,
+                        &format!("{predicate_path}.values[{value_index}]"),
+                    )?;
+                }
+            }
+            (op, QueryRowPredicateOperand::Literal(value))
+                if matches!(
+                    op,
+                    QueryRowPredicateOp::Eq
+                        | QueryRowPredicateOp::Ne
+                        | QueryRowPredicateOp::Lt
+                        | QueryRowPredicateOp::Le
+                        | QueryRowPredicateOp::Gt
+                        | QueryRowPredicateOp::Ge
+                ) =>
+            {
+                validate_ordered_row_operator(op, *field, &predicate_path)?;
+                validate_row_literal(value, *field, &format!("{predicate_path}.value"))?;
+            }
+            (op, QueryRowPredicateOperand::Field(other))
+                if matches!(
+                    op,
+                    QueryRowPredicateOp::Eq
+                        | QueryRowPredicateOp::Ne
+                        | QueryRowPredicateOp::Lt
+                        | QueryRowPredicateOp::Le
+                        | QueryRowPredicateOp::Gt
+                        | QueryRowPredicateOp::Ge
+                ) =>
+            {
+                validate_row_field_name(
+                    other,
+                    &format!("{predicate_path}.value.field"),
+                    "row operand field",
+                )?;
+                let Some((_, other_field)) = fields.iter().find(|(name, _)| name == other) else {
+                    return Err(QueryError::new(
+                        format!("{predicate_path}.value.field"),
+                        format!("unknown row field {other:?}"),
+                    ));
+                };
+                if field.scalar_type != other_field.scalar_type {
+                    return Err(QueryError::new(
+                        format!("{predicate_path}.value.field"),
+                        "compared row fields must have the same scalar type",
+                    ));
+                }
+                validate_ordered_row_operator(op, *field, &predicate_path)?;
+            }
+            _ => {
+                return Err(QueryError::new(
+                    predicate_path,
+                    "row predicate operator and operand have incompatible shapes",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ordered_row_operator(
+    op: QueryRowPredicateOp,
+    field: CodeQueryRowField,
+    path: &str,
+) -> Result<(), QueryError> {
+    if matches!(
+        op,
+        QueryRowPredicateOp::Lt
+            | QueryRowPredicateOp::Le
+            | QueryRowPredicateOp::Gt
+            | QueryRowPredicateOp::Ge
+    ) && field.scalar_type != CodeQueryRowScalarType::Integer
+    {
+        return Err(QueryError::new(
+            path,
+            "lt, le, gt, and ge are defined only for integer row fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_row_literal(
+    literal: &QueryRowLiteral,
+    field: CodeQueryRowField,
+    path: &str,
+) -> Result<(), QueryError> {
+    if let QueryRowLiteral::ConstrainedEnum(label) = literal
+        && label.is_empty()
+    {
+        return Err(QueryError::new(
+            path,
+            "constrained-enum labels must not be empty",
+        ));
+    }
+    let type_matches = matches!(
+        (field.scalar_type, literal),
+        (
+            CodeQueryRowScalarType::StableId
+                | CodeQueryRowScalarType::String
+                | CodeQueryRowScalarType::DeclarationIdentity,
+            QueryRowLiteral::String(_)
+        ) | (CodeQueryRowScalarType::Integer, QueryRowLiteral::Integer(_))
+            | (CodeQueryRowScalarType::Boolean, QueryRowLiteral::Boolean(_))
+            | (
+                CodeQueryRowScalarType::ConstrainedEnum,
+                QueryRowLiteral::ConstrainedEnum(_)
+            )
+    );
+    if !type_matches {
+        return Err(QueryError::new(
+            path,
+            format!(
+                "literal does not match {} row field",
+                field.scalar_type.label()
+            ),
+        ));
+    }
+    if let QueryRowLiteral::ConstrainedEnum(label) = literal {
+        let domain = field
+            .value_domain
+            .expect("constrained-enum row fields declare a value domain");
+        if !domain.admits(label) {
+            // Name the accepted labels: the author is choosing from a closed
+            // public vocabulary, and the editor diagnostic is where they see it.
+            let accepted = domain
+                .labels()
+                .expect("a domain that rejects a label enumerates its labels")
+                .join(", ");
+            return Err(QueryError::new(
+                path,
+                format!(
+                    "`{label}` is not a value of `{}`; the accepted values are {accepted}",
+                    field.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_row_projection(
+    columns: &[QueryRowProjectionColumn],
+    projected: Option<&[(String, CodeQueryRowField)]>,
+    kind: QueryValueKind,
+    path: &str,
+) -> Result<Vec<(String, CodeQueryRowField)>, QueryError> {
+    if columns.is_empty() || columns.len() > MAX_ROW_PROJECTION_COLUMNS {
+        return Err(QueryError::new(
+            path,
+            format!(
+                "row projection columns must contain from 1 through {MAX_ROW_PROJECTION_COLUMNS} entries"
+            ),
+        ));
+    }
+    let fields = input_row_fields(projected, kind);
+    let mut output = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let column_path = format!("{path}.columns[{index}]");
+        validate_row_field_name(
+            &column.source,
+            &format!("{column_path}.source"),
+            "row projection source",
+        )?;
+        validate_row_field_name(
+            &column.name,
+            &format!("{column_path}.name"),
+            "row projection output",
+        )?;
+        let Some((_, field)) = fields.iter().find(|(name, _)| name == &column.source) else {
+            return Err(QueryError::new(
+                format!("{column_path}.source"),
+                format!("unknown row field {:?}", column.source),
+            ));
+        };
+        if output
+            .iter()
+            .any(|(name, _): &(String, CodeQueryRowField)| name == &column.name)
+        {
+            return Err(QueryError::new(
+                format!("{column_path}.name"),
+                format!("duplicate projected row field {:?}", column.name),
+            ));
+        }
+        output.push((column.name.clone(), *field));
+    }
+    Ok(output)
+}
+
+fn validate_row_field_name(name: &str, path: &str, what: &str) -> Result<(), QueryError> {
+    if name.is_empty() || name.len() > MAX_ROW_FIELD_NAME_LENGTH {
+        return Err(QueryError::new(
+            path,
+            format!("{what} must contain from 1 through {MAX_ROW_FIELD_NAME_LENGTH} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2177,8 +2576,23 @@ impl CodeQuery {
     /// Embedders may construct this public IR directly, so execution cannot
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
+        self.validate_row_fields().map(|(kind, _)| kind)
+    }
+
+    /// Validate the complete plan and return its visible terminal row schema.
+    /// Field names are query-local projection names; metadata remains the
+    /// public type, nullability, and constrained-value domain of each source
+    /// field.
+    pub fn validate_row_fields(
+        &self,
+    ) -> Result<(QueryValueKind, Vec<(String, CodeQueryRowField)>), QueryError> {
         let mut nodes = 0;
-        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.kind)
+        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| {
+            (
+                domain.kind,
+                input_row_fields(domain.projected_fields.as_deref(), domain.kind),
+            )
+        })
     }
 }
 
@@ -2186,6 +2600,7 @@ impl CodeQuery {
 struct ValidatedDomain {
     kind: QueryValueKind,
     captures: Option<std::collections::HashSet<String>>,
+    projected_fields: Option<Vec<(String, CodeQueryRowField)>>,
 }
 
 fn validate_plan(
@@ -2212,30 +2627,37 @@ fn validate_plan(
         CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
             kind: QueryValueKind::StructuralMatch,
             captures: Some(seed.positive_capture_names()),
+            projected_fields: None,
         },
         CodeQueryPlanSource::Occurrences(_) => ValidatedDomain {
             kind: QueryValueKind::Occurrence,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::Paths(_) => ValidatedDomain {
             kind: QueryValueKind::QualifiedPath,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::Scopes(_) => ValidatedDomain {
             kind: QueryValueKind::LexicalScope,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::Bindings(_) => ValidatedDomain {
             kind: QueryValueKind::Binding,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::GenerationSites(_) => ValidatedDomain {
             kind: QueryValueKind::GenerationSite,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::Exports(_) => ValidatedDomain {
             kind: QueryValueKind::Export,
             captures: None,
+            projected_fields: None,
         },
         CodeQueryPlanSource::Set { op, branches } => {
             let op_path = child_query_path(path, op.label());
@@ -2269,6 +2691,21 @@ fn validate_plan(
                         ),
                     ));
                 }
+                let expected_fields =
+                    input_row_fields(branch_domains[0].projected_fields.as_deref(), expected);
+                let actual_fields =
+                    input_row_fields(branch.projected_fields.as_deref(), branch.kind);
+                if !row_schemas_compatible(&expected_fields, &actual_fields) {
+                    return Err(QueryError::new(
+                        format!("{op_path}[{index}]"),
+                        format!(
+                            "{} branch row schema {:?} differs from the first branch schema {:?}",
+                            op.label(),
+                            public_row_schema(&actual_fields),
+                            public_row_schema(&expected_fields)
+                        ),
+                    ));
+                }
             }
             let captures = if expected == QueryValueKind::StructuralMatch {
                 let mut common = branch_domains[0].captures.clone().unwrap_or_default();
@@ -2289,12 +2726,18 @@ fn validate_plan(
             ValidatedDomain {
                 kind: expected,
                 captures,
+                projected_fields: branch_domains[0].projected_fields.clone(),
             }
         }
     };
 
     let steps_path = child_query_path(path, "steps");
-    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path)?;
+    let (output, projected_fields) = validate_query_steps(
+        &plan.steps,
+        domain.kind,
+        domain.projected_fields.as_deref(),
+        &steps_path,
+    )?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
         let filter = match step {
@@ -2346,10 +2789,34 @@ fn validate_plan(
             .expect("typed steps were validated above");
     }
     domain.kind = output;
+    domain.projected_fields = projected_fields;
     if output != QueryValueKind::StructuralMatch {
         domain.captures = None;
     }
     Ok(domain)
+}
+
+fn row_schemas_compatible(
+    left: &[(String, CodeQueryRowField)],
+    right: &[(String, CodeQueryRowField)],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_name, left), (right_name, right))| {
+                left_name == right_name
+                    && left.scalar_type == right.scalar_type
+                    && left.nullable == right.nullable
+                    && left.value_domain == right.value_domain
+            })
+}
+
+fn public_row_schema(fields: &[(String, CodeQueryRowField)]) -> Vec<(&str, &'static str, bool)> {
+    fields
+        .iter()
+        .map(|(name, field)| (name.as_str(), field.scalar_type.label(), field.nullable))
+        .collect()
 }
 
 fn child_query_path(path: &str, field: &str) -> String {

@@ -917,30 +917,32 @@ pub fn receiver_is_declared_parameter(language: Language) -> bool {
 /// Every entry below is a grammar field whose only content is the written
 /// default: Python's `value`, TypeScript's `value`, JavaScript's
 /// `assignment_pattern` right-hand side, and the `default_value` field Scala,
-/// C++ and PHP all spell the same way. Nothing here scans for `=`, so a
-/// language whose grammar does not name the default -- Kotlin, whose parameter
-/// nodes carry no fields at all, and C#, whose default is an unnamed
-/// `expression` child among modifiers and attributes -- reports `None` rather
-/// than a guess, and simply mints no `defaulted` binding row.
+/// C++ and PHP all spell the same way. A positional grammar shape is handled
+/// structurally by its registered language capability. A language without
+/// either form -- C#, whose default is an
+/// unnamed `expression` child among modifiers and attributes -- reports
+/// `None` rather than a guess, and simply mints no `defaulted` binding row.
 ///
 /// Java, Go and Rust have no parameter defaults in the language, so `None`
 /// there is the complete answer rather than a gap.
 fn parameter_default_range(language: Language, parameter: Node<'_>) -> Option<Range> {
-    let value = match language {
-        Language::Python | Language::Ruby => parameter.child_by_field_name("value"),
-        Language::JavaScript | Language::TypeScript => parameter
-            .child_by_field_name("value")
-            .or_else(|| parameter.child_by_field_name("right")),
-        Language::Scala | Language::Cpp | Language::Php => {
-            parameter.child_by_field_name("default_value")
-        }
-        Language::Java
-        | Language::Go
-        | Language::Rust
-        | Language::CSharp
-        | Language::Kotlin
-        | Language::None => None,
-    };
+    let value = language_support(language)
+        .and_then(|support| support.positional_parameter_default(parameter))
+        .or_else(|| match language {
+            Language::Python | Language::Ruby => parameter.child_by_field_name("value"),
+            Language::JavaScript | Language::TypeScript => parameter
+                .child_by_field_name("value")
+                .or_else(|| parameter.child_by_field_name("right")),
+            Language::Scala | Language::Cpp | Language::Php => {
+                parameter.child_by_field_name("default_value")
+            }
+            Language::Java
+            | Language::Go
+            | Language::Rust
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::None => None,
+        });
     value.map(node_range)
 }
 

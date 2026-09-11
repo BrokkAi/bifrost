@@ -4,6 +4,9 @@ use crate::analyzer::semantic::{
     RuntimeKeyedReadEndpoint, RuntimeKeyedReadFilter, RuntimeKeyedReadResult, SemanticOutcome,
 };
 use crate::query::ResolvedCallReceiverType;
+use crate::query::{
+    QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> {
@@ -155,6 +158,137 @@ fn call_argument_filter_matches(value: &CallBindingValue, selector: &CallArgumen
             CallArgumentSelector::FormalName(name) => row.formal_name.as_ref() == Some(name),
             CallArgumentSelector::FormalIndex(index) => row.formal_index == Some(*index),
         }
+}
+
+fn row_literal_matches(actual: CodeQueryRowScalarRef<'_>, literal: &QueryRowLiteral) -> bool {
+    match (actual, literal) {
+        (CodeQueryRowScalarRef::StableId(actual), QueryRowLiteral::String(expected))
+        | (CodeQueryRowScalarRef::String(actual), QueryRowLiteral::String(expected))
+        | (CodeQueryRowScalarRef::DeclarationIdentity(actual), QueryRowLiteral::String(expected))
+        | (
+            CodeQueryRowScalarRef::ConstrainedEnum(actual),
+            QueryRowLiteral::ConstrainedEnum(expected),
+        ) => actual == expected,
+        (CodeQueryRowScalarRef::Integer(actual), QueryRowLiteral::Integer(expected)) => {
+            actual == *expected
+        }
+        (CodeQueryRowScalarRef::Boolean(actual), QueryRowLiteral::Boolean(expected)) => {
+            actual == *expected
+        }
+        _ => false,
+    }
+}
+
+fn row_field_source<'a>(row: &'a PipelineRow, visible: &'a str) -> &'a str {
+    row.row_projection
+        .iter()
+        .find(|column| column.name == visible)
+        .map_or(visible, |column| column.source.as_str())
+}
+
+fn row_predicates_match(
+    analyzer: &dyn IAnalyzer,
+    row: &PipelineRow,
+    predicates: &[QueryRowPredicate],
+) -> Result<bool, String> {
+    let mut cache = PipelineRenderCache::default();
+    let rendered = render_pipeline_item(
+        analyzer,
+        row.clone(),
+        CodeQueryResultDetail::Full,
+        &mut cache,
+    );
+    let public = rendered.value.row();
+    for predicate in predicates {
+        let left = public
+            .field(row_field_source(row, &predicate.field))
+            .map_err(|error| error.to_string())?;
+        let holds = match (predicate.op, &predicate.operand) {
+            (QueryRowPredicateOp::IsNull, QueryRowPredicateOperand::None) => left.is_none(),
+            (QueryRowPredicateOp::IsNotNull, QueryRowPredicateOperand::None) => left.is_some(),
+            (QueryRowPredicateOp::In, QueryRowPredicateOperand::Set(values)) => {
+                left.is_some_and(|actual| {
+                    values
+                        .iter()
+                        .any(|value| row_literal_matches(actual, value))
+                })
+            }
+            (op, QueryRowPredicateOperand::Literal(value)) => left.is_some_and(|actual| match op {
+                QueryRowPredicateOp::Eq => row_literal_matches(actual, value),
+                QueryRowPredicateOp::Ne => !row_literal_matches(actual, value),
+                QueryRowPredicateOp::Lt
+                | QueryRowPredicateOp::Le
+                | QueryRowPredicateOp::Gt
+                | QueryRowPredicateOp::Ge => {
+                    let CodeQueryRowScalarRef::Integer(actual) = actual else {
+                        unreachable!("ordered row predicates are validated over integers")
+                    };
+                    let QueryRowLiteral::Integer(expected) = value else {
+                        unreachable!("ordered row predicate literal is validated as an integer")
+                    };
+                    match op {
+                        QueryRowPredicateOp::Lt => actual < *expected,
+                        QueryRowPredicateOp::Le => actual <= *expected,
+                        QueryRowPredicateOp::Gt => actual > *expected,
+                        QueryRowPredicateOp::Ge => actual >= *expected,
+                        _ => unreachable!("ordered operator matched above"),
+                    }
+                }
+                _ => unreachable!("predicate operand shape is validated before execution"),
+            }),
+            (op, QueryRowPredicateOperand::Field(field)) => {
+                let right = public
+                    .field(row_field_source(row, field))
+                    .map_err(|error| error.to_string())?;
+                match (left, right) {
+                    (Some(left), Some(right)) => match op {
+                        QueryRowPredicateOp::Eq => left == right,
+                        QueryRowPredicateOp::Ne => left != right,
+                        QueryRowPredicateOp::Lt
+                        | QueryRowPredicateOp::Le
+                        | QueryRowPredicateOp::Gt
+                        | QueryRowPredicateOp::Ge => {
+                            let (
+                                CodeQueryRowScalarRef::Integer(left),
+                                CodeQueryRowScalarRef::Integer(right),
+                            ) = (left, right)
+                            else {
+                                unreachable!(
+                                    "ordered row field comparison is validated over integers"
+                                )
+                            };
+                            match op {
+                                QueryRowPredicateOp::Lt => left < right,
+                                QueryRowPredicateOp::Le => left <= right,
+                                QueryRowPredicateOp::Gt => left > right,
+                                QueryRowPredicateOp::Ge => left >= right,
+                                _ => unreachable!("ordered operator matched above"),
+                            }
+                        }
+                        _ => unreachable!("predicate operand shape is validated before execution"),
+                    },
+                    _ => false,
+                }
+            }
+            _ => unreachable!("predicate operator and operand are validated before execution"),
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn record_row_local_step(row: &mut PipelineRow, step: &QueryStep) {
+    let value = pipeline_trace_value(&row.value)
+        .expect("every typed row domain has a detailed provenance value");
+    for trace in &mut row.traces {
+        trace.steps.push(PipelineTraceStep {
+            op: step.clone(),
+            value: value.clone(),
+            via: None,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1177,7 +1311,11 @@ pub(super) fn apply_pipeline_step(
     let mut filter_selected_candidate = false;
     let receiver_service = matches!(
         step,
-        QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
+        QueryStep::ReceiverTargets(_)
+            | QueryStep::PointsTo(_)
+            | QueryStep::MemberTargets(_)
+            | QueryStep::ReceiverOutcome
+            | QueryStep::ReceiverEvidence
     )
     .then(|| {
         workspace.map_or_else(
@@ -1259,7 +1397,7 @@ pub(super) fn apply_pipeline_step(
 
     let mut indexed_declarations = indexed_declarations;
     let mut rows = rows.into_iter();
-    'rows: while let Some(row) = rows.next() {
+    'rows: while let Some(mut row) = rows.next() {
         if output.len() >= max_step_outputs {
             break;
         }
@@ -1315,6 +1453,53 @@ pub(super) fn apply_pipeline_step(
         }
         if let Some(instrumentation) = instrumentation.as_deref_mut() {
             instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
+        }
+        if let QueryStep::Project(columns) = step {
+            let prior = std::mem::take(&mut row.row_projection);
+            row.row_projection = columns
+                .iter()
+                .map(|column| QueryRowProjectionColumn {
+                    source: prior
+                        .iter()
+                        .find(|prior| prior.name == column.source)
+                        .map_or_else(|| column.source.clone(), |prior| prior.source.clone()),
+                    name: column.name.clone(),
+                })
+                .collect();
+            record_row_local_step(&mut row, step);
+            if budget.pipeline_rows >= max_pipeline_rows {
+                exhausted = true;
+                break;
+            }
+            budget.pipeline_rows += 1;
+            output.push(row);
+            continue;
+        }
+        if let QueryStep::Filter(predicates) = step {
+            match row_predicates_match(analyzer, &row, predicates) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(message) => {
+                    exhausted = true;
+                    diagnostics.push(CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message: format!("filter could not read typed row evidence: {message}"),
+                        exhausted_roots: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+            record_row_local_step(&mut row, step);
+            if budget.pipeline_rows >= max_pipeline_rows {
+                exhausted = true;
+                break;
+            }
+            budget.pipeline_rows += 1;
+            output.push(row);
+            continue;
         }
         if query_step_requires_semantic(step)
             && semantic
@@ -2207,10 +2392,39 @@ pub(super) fn apply_pipeline_step(
                 )
             }
             (
+                PipelineValue::StructuralMatch(seed),
+                QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence,
+            ) => {
+                let operation = receiver_operation(step);
+                let (ranges, input) = structural_receiver_ranges(seed, operation, None);
+                receiver_analysis_expansions(
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    analyzer,
+                    operation,
+                    &seed.file,
+                    Some(&seed.facts),
+                    ranges,
+                    input,
+                    None,
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    &mut receiver_diagnostics,
+                    &mut row_exhausted,
+                    &mut receiver_truncated,
+                )
+            }
+            (
                 PipelineValue::ReferenceSite(site),
                 QueryStep::ReceiverTargets(_)
                 | QueryStep::PointsTo(_)
-                | QueryStep::MemberTargets(_),
+                | QueryStep::MemberTargets(_)
+                | QueryStep::ReceiverOutcome
+                | QueryStep::ReceiverEvidence,
             ) => receiver_analysis_expansions_for_pipeline_row(
                 analyzer,
                 receiver_service
@@ -2237,33 +2451,39 @@ pub(super) fn apply_pipeline_step(
                 &mut row_exhausted,
                 &mut receiver_truncated,
             ),
-            (PipelineValue::CallSite(site), QueryStep::ReceiverTargets(_)) => {
-                receiver_analysis_expansions_for_pipeline_row(
-                    analyzer,
-                    receiver_service
-                        .as_ref()
-                        .expect("receiver query service exists for receiver steps"),
-                    ReceiverQueryOperation::ReceiverTargets,
-                    &site.0.file,
-                    &row.traces,
-                    vec![site.0.range],
-                    ReceiverQueryInput::ContainingSite,
-                    receiver_facts,
-                    budget,
-                    limits,
-                    receiver_budget_override,
-                    max_step_outputs.saturating_sub(output.len()),
-                    cancellation,
-                    diagnostics,
-                    cache_profile,
-                    &mut receiver_diagnostics,
-                    &mut row_exhausted,
-                    &mut receiver_truncated,
-                )
-            }
+            (
+                PipelineValue::CallSite(site),
+                QueryStep::ReceiverTargets(_)
+                | QueryStep::ReceiverOutcome
+                | QueryStep::ReceiverEvidence,
+            ) => receiver_analysis_expansions_for_pipeline_row(
+                analyzer,
+                receiver_service
+                    .as_ref()
+                    .expect("receiver query service exists for receiver steps"),
+                ReceiverQueryOperation::ReceiverTargets,
+                &site.0.file,
+                &row.traces,
+                vec![site.0.range],
+                ReceiverQueryInput::ContainingSite,
+                receiver_facts,
+                budget,
+                limits,
+                receiver_budget_override,
+                max_step_outputs.saturating_sub(output.len()),
+                cancellation,
+                diagnostics,
+                cache_profile,
+                &mut receiver_diagnostics,
+                &mut row_exhausted,
+                &mut receiver_truncated,
+            ),
             (
                 PipelineValue::ExpressionSite(site),
-                QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_),
+                QueryStep::ReceiverTargets(_)
+                | QueryStep::PointsTo(_)
+                | QueryStep::ReceiverOutcome
+                | QueryStep::ReceiverEvidence,
             ) => receiver_analysis_expansions_for_pipeline_row(
                 analyzer,
                 receiver_service
@@ -2290,7 +2510,9 @@ pub(super) fn apply_pipeline_step(
                 PipelineValue::Occurrence(value),
                 QueryStep::ReceiverTargets(_)
                 | QueryStep::PointsTo(_)
-                | QueryStep::MemberTargets(_),
+                | QueryStep::MemberTargets(_)
+                | QueryStep::ReceiverOutcome
+                | QueryStep::ReceiverEvidence,
             ) => {
                 let operation = receiver_operation(step);
                 let input = if value.row.role == OccurrenceRole::ReceiverPosition
@@ -3427,6 +3649,7 @@ pub(super) fn apply_pipeline_step(
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
+        let expansions = project_direct_receiver_terminal(step, expansions);
         // The base and summary result-contract projections are total relations. The base step
         // emits a modeled contract or terminal uncertainty row for every call
         // shape, and optional use validation preserves every contract row even

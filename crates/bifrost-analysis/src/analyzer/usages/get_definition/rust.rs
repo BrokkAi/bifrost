@@ -31,7 +31,7 @@ use brokk_bifrost_rust::graph::ast::{
 };
 use brokk_bifrost_rust::graph::resolver::{RustBareTokenTreeRole, RustTokenTreeRoleCache};
 use brokk_bifrost_rust::graph_support::{
-    RustFactSource, RustSource, is_rust_export_visible_declaration,
+    RustFactSource, RustSource, forward_imported_identities, is_rust_export_visible_declaration,
     is_rust_macro_export_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration, rust_declaration_node, rust_declaration_node_is,
 };
@@ -2798,6 +2798,34 @@ fn rust_visible_import_resolution(
                 match binding.kind {
                     ImportKind::Named => {
                         let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                        let package = lexical_scope::lexical_package_at(
+                            &rust_package_name(file),
+                            source,
+                            scope_start,
+                        );
+                        let identities = forward_imported_identities(
+                            rust,
+                            token,
+                            file,
+                            &package,
+                            &binding.module_specifier,
+                            imported,
+                        );
+                        if !identities.is_empty() {
+                            // A namespace imported through a facade can name a
+                            // different physical crate/module than its spelling.
+                            // Validate against the canonical declaration route,
+                            // not a reconstructed package plus identifier.
+                            for identity in identities {
+                                let fqn = identity.fq_name();
+                                expected_routes
+                                    .entry(fqn.clone())
+                                    .or_default()
+                                    .push(identity.file);
+                                expected_fqns.insert(fqn);
+                            }
+                            continue;
+                        }
                         if let Some(package) = resolve_rust_import_package_scoped(
                             rust,
                             token,

@@ -504,9 +504,7 @@ impl PolicyRegistry {
                 PolicyAnalysis::Assertion { spec } => {
                     if let Some(plan) = &spec.relational {
                         for binding in &plan.bindings {
-                            let RowBindingSource::Query(query) = &binding.source else {
-                                continue;
-                            };
+                            let RowBindingSource::Query(query) = &binding.source;
                             let path =
                                 selector_path(relational_binding_selector_path(&binding.name))?;
                             let selector = self.resolve_selector(

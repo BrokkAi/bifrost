@@ -1294,7 +1294,6 @@ impl Decoder {
         _path: &str,
     ) -> Result<AssertionPolicySpec, PolicySourceError> {
         let mut bindings = Vec::new();
-        let mut derivations = Vec::new();
         let mut joins = Vec::new();
         let mut sugar_joins = Vec::new();
         let mut groups = Vec::new();
@@ -1304,32 +1303,16 @@ impl Decoder {
                 entry,
                 &[
                     PolicyRecord::Bind,
-                    PolicyRecord::Filter,
-                    PolicyRecord::Project,
                     PolicyRecord::Join,
                     PolicyRecord::Group,
-                    PolicyRecord::CallArgument,
-                    PolicyRecord::Call,
                     PolicyRecord::RowAssert,
                     PolicyRecord::RowAssertSelectedInWinningTier,
                 ],
                 "relational assertion plan entry",
             )? {
                 PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry)?),
-                PolicyRecord::Filter => {
-                    derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
-                }
-                PolicyRecord::Project => {
-                    derivations.push(RowDerivation::Project(decode_row_projection(entry)?));
-                }
                 PolicyRecord::Join => joins.push(decode_row_join(entry)?),
                 PolicyRecord::Group => groups.push(decode_row_group(entry)?),
-                PolicyRecord::CallArgument => {
-                    derivations.push(RowDerivation::Filter(decode_call_argument(entry)?));
-                }
-                PolicyRecord::Call => {
-                    derivations.push(RowDerivation::Filter(decode_call(entry)?));
-                }
                 PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
                 PolicyRecord::RowAssertSelectedInWinningTier => {
                     lower_selected_in_winning_tier(
@@ -1346,10 +1329,9 @@ impl Decoder {
         // the sugar can only extend a tuple set the author already connected.
         joins.extend(sugar_joins);
         let subject = bindings
-            .iter()
-            .find_map(|binding| match &binding.source {
-                RowBindingSource::Query(selector) => Some(selector.clone()),
-                RowBindingSource::Expansion { .. } => None,
+            .first()
+            .map(|binding| match &binding.source {
+                RowBindingSource::Query(selector) => selector.clone(),
             })
             .ok_or_else(|| {
                 source_error(
@@ -1360,7 +1342,6 @@ impl Decoder {
             })?;
         let plan = RelationalAssertionPlan {
             bindings,
-            derivations,
             joins,
             groups,
             assertions,
@@ -1390,24 +1371,11 @@ impl Decoder {
         )?;
         let name = parse_identifier(fields.required("name"), "row binding name")?;
         let selector_path = relational_binding_selector_path(&name);
-        let source = match (fields.get("query"), fields.get("from"), fields.get("step")) {
-            (Some(query), None, None) => RowBindingSource::Query(self.decode_selector(
-                query,
-                DecodeContext::policy(PolicyAnalysisKind::Assertion),
-                &selector_path,
-            )?),
-            (None, Some(from), Some(step)) => RowBindingSource::Expansion {
-                from: parse_identifier(from, "source row binding name")?,
-                step: decode_row_expansion_step(step)?,
-            },
-            _ => {
-                return Err(source_error(
-                    "invalid-row-binding-source",
-                    expr.range.clone(),
-                    "bind requires exactly :query or the pair :from and :step",
-                ));
-            }
-        };
+        let source = RowBindingSource::Query(self.decode_selector(
+            fields.required("query"),
+            DecodeContext::policy(PolicyAnalysisKind::Assertion),
+            &selector_path,
+        )?);
         Ok(RowBinding {
             name,
             source,
@@ -4384,26 +4352,13 @@ fn relational_error_range(
     let qualified = |field: &RowFieldRef| format!("{}.{}", field.binding, field.field);
     let mut authored_fields = Vec::new();
     let mut authored_predicates = Vec::new();
-    for derivation in &plan.derivations {
-        match derivation {
-            RowDerivation::Filter(filter) => {
-                for predicate in &filter.predicates {
-                    authored_predicates.push(predicate);
-                    authored_fields.push(&predicate.field);
-                    if let RowPredicateOperand::Field(field) = &predicate.operand {
-                        authored_fields.push(field);
-                    }
-                }
-            }
-            RowDerivation::Project(projection) => {
-                authored_fields.extend(projection.columns.iter().map(|column| &column.source));
-            }
-        }
-    }
     for group in &plan.groups {
         authored_fields.extend(&group.by);
         for aggregate in &group.aggregates {
             authored_fields.extend(aggregate.value.iter());
+            if let Some((left, right)) = &aggregate.sets {
+                authored_fields.extend([left, right]);
+            }
             if let Some(sequences) = &aggregate.sequences {
                 authored_fields.extend([
                     &sequences.left.position,
@@ -4434,19 +4389,6 @@ fn relational_error_range(
                     .find(|join| join.left.as_str() == name || join.right.as_str() == name)
                     .and_then(|join| join.source_range.clone())
             })
-            .or_else(|| {
-                plan.derivations
-                    .iter()
-                    .rev()
-                    .find(|derivation| match derivation {
-                        RowDerivation::Filter(filter) => filter.over.as_str() == name,
-                        RowDerivation::Project(projection) => projection.from.as_str() == name,
-                    })
-                    .and_then(|derivation| match derivation {
-                        RowDerivation::Filter(filter) => filter.source_range.clone(),
-                        RowDerivation::Project(projection) => projection.source_range.clone(),
-                    })
-            })
     };
     let predicate = |rendered_field: &str| {
         authored_predicates
@@ -4471,9 +4413,7 @@ fn relational_error_range(
 
     match error {
         Error::DuplicateBinding { name }
-        | Error::ForwardBinding { binding: name, .. }
         | Error::DeferredSelectorDomain { binding: name }
-        | Error::ExpansionDomainUnavailable { binding: name, .. }
         | Error::InvalidQuery { binding: name, .. }
         | Error::DisconnectedBinding { binding: name } => binding_definition(name),
         Error::UnknownBinding { name } => {
@@ -4497,6 +4437,11 @@ fn relational_error_range(
             ..
         }
         | Error::InvalidAggregateValueType {
+            group,
+            aggregate: name,
+            ..
+        }
+        | Error::InvalidSetOperands {
             group,
             aggregate: name,
             ..
@@ -4544,37 +4489,14 @@ fn relational_error_range(
         | Error::UnknownEnumLabel { field: name, .. }
         | Error::InvalidSetMembership { field: name, .. }
         | Error::MalformedPredicate { field: name, .. } => predicate(name),
-        Error::DuplicateProjectionColumn { relation, column } => plan
-            .derivations
-            .iter()
-            .rev()
-            .filter_map(|derivation| match derivation {
-                RowDerivation::Project(projection) if projection.name.as_str() == relation => {
-                    Some(projection)
-                }
-                _ => None,
-            })
-            .flat_map(|projection| projection.columns.iter().rev())
-            .find(|candidate| candidate.name == *column)
-            .and_then(|candidate| candidate.source_range.clone()),
+        Error::DuplicateProjectionColumn { relation, .. } => binding_definition(relation),
         Error::RepeatedJoinBinding { binding } => plan
             .joins
             .iter()
             .rev()
             .find(|join| join.right.as_str() == binding)
             .and_then(|join| join.source_range.clone()),
-        Error::RelationCycle { relation } => plan
-            .derivations
-            .iter()
-            .rev()
-            .find(|derivation| match derivation {
-                RowDerivation::Filter(filter) => filter.over.as_str() == relation,
-                RowDerivation::Project(projection) => projection.name.as_str() == relation,
-            })
-            .and_then(|derivation| match derivation {
-                RowDerivation::Filter(filter) => filter.source_range.clone(),
-                RowDerivation::Project(projection) => projection.source_range.clone(),
-            }),
+        Error::RelationCycle { relation } => binding_definition(relation),
         Error::ZeroLimit { .. } | Error::EmptyPlan => None,
     }
 }
@@ -5649,23 +5571,6 @@ fn decode_boolean(expr: &Expr, what: &str) -> Result<bool, PolicySourceError> {
     }
 }
 
-fn decode_row_expansion_step(expr: &Expr) -> Result<RowExpansionStep, PolicySourceError> {
-    Ok(
-        match expect_atom(expr, AtomDomain::RowExpansionStep, "row expansion step")? {
-            PolicyAtomValue::RowReceiverOutcome => RowExpansionStep::ReceiverOutcome,
-            PolicyAtomValue::RowReceiverEvidence => RowExpansionStep::ReceiverEvidence,
-            PolicyAtomValue::RowMemberSelection => RowExpansionStep::MemberSelection,
-            PolicyAtomValue::RowMemberCandidates => RowExpansionStep::MemberCandidates,
-            PolicyAtomValue::RowCandidateHierarchy => RowExpansionStep::CandidateHierarchy,
-            PolicyAtomValue::RowMemberFamily => RowExpansionStep::MemberFamily,
-            PolicyAtomValue::RowFamilyEdges => RowExpansionStep::FamilyEdges,
-            PolicyAtomValue::RowDispatchOutcome => RowExpansionStep::DispatchOutcome,
-            PolicyAtomValue::RowDispatchTargets => RowExpansionStep::DispatchTargets,
-            value => unreachable!("RowExpansionStep registry returned {value:?}"),
-        },
-    )
-}
-
 fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -5745,6 +5650,8 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         PolicyAtomValue::RowAggregateAny => RowAggregateOp::Any,
         PolicyAtomValue::RowAggregateAll => RowAggregateOp::All,
         PolicyAtomValue::RowAggregateOrderedEqual => RowAggregateOp::OrderedEqual,
+        PolicyAtomValue::RowAggregateSetEqual => RowAggregateOp::SetEqual,
+        PolicyAtomValue::RowAggregateSubset => RowAggregateOp::Subset,
         value => unreachable!("RowAggregateOp registry returned {value:?}"),
     };
     let value = fields
@@ -5753,18 +5660,49 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         .transpose()?;
     // `:left` and `:right` are one unit: an ordered comparison needs both
     // sequences, and half a comparison has no meaning to report.
-    let sequences = match (fields.get("left"), fields.get("right")) {
-        (None, None) => None,
-        (Some(left), Some(right)) => Some(RowOrderedSequencePair {
-            left: decode_row_ordered_sequence(left, "left ordered sequence")?,
-            right: decode_row_ordered_sequence(right, "right ordered sequence")?,
-        }),
-        (left, _) => {
-            return Err(source_error(
-                "incomplete-ordered-sequence-pair",
-                left.unwrap_or(expr).range.clone(),
-                "an ordered aggregate requires both :left and :right",
-            ));
+    let is_set = matches!(op, RowAggregateOp::SetEqual | RowAggregateOp::Subset);
+    let sets = if is_set {
+        Some((
+            decode_row_field_ref(
+                fields.get("left").ok_or_else(|| {
+                    source_error(
+                        "missing-set-column",
+                        expr.range.clone(),
+                        "a set aggregate requires :left",
+                    )
+                })?,
+                "left set column",
+            )?,
+            decode_row_field_ref(
+                fields.get("right").ok_or_else(|| {
+                    source_error(
+                        "missing-set-column",
+                        expr.range.clone(),
+                        "a set aggregate requires :right",
+                    )
+                })?,
+                "right set column",
+            )?,
+        ))
+    } else {
+        None
+    };
+    let sequences = if is_set {
+        None
+    } else {
+        match (fields.get("left"), fields.get("right")) {
+            (None, None) => None,
+            (Some(left), Some(right)) => Some(RowOrderedSequencePair {
+                left: decode_row_ordered_sequence(left, "left ordered sequence")?,
+                right: decode_row_ordered_sequence(right, "right ordered sequence")?,
+            }),
+            (left, _) => {
+                return Err(source_error(
+                    "incomplete-ordered-sequence-pair",
+                    left.unwrap_or(expr).range.clone(),
+                    "an ordered aggregate requires both :left and :right",
+                ));
+            }
         }
     };
     let predicate = fields
@@ -5777,6 +5715,7 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         op,
         value,
         sequences,
+        sets,
         predicate,
         source_range: Some(expr.range.clone()),
     })
@@ -5791,410 +5730,6 @@ fn decode_row_ordered_sequence(
     Ok(RowOrderedSequence {
         position: decode_row_field_ref(&values[0], "ordered sequence position field")?,
         value: decode_row_field_ref(&values[1], "ordered sequence value field")?,
-    })
-}
-
-/// Decode one `(filter :over NAME :where (...))` record.
-fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
-    let fields = RecordCursor::parse(
-        expr,
-        PolicyRecord::Filter,
-        DecodeContext::policy(PolicyAnalysisKind::Assertion),
-    )?;
-    let over = parse_identifier(fields.required("over"), "filtered row relation name")?;
-    let predicates = decode_row_predicates(fields.required("where"))?;
-    if predicates.is_empty() {
-        return Err(source_error(
-            "empty-row-filter",
-            expr.range.clone(),
-            "a filter must state at least one predicate",
-        ));
-    }
-    Ok(RowFilter {
-        over,
-        predicates,
-        evidence: None,
-        call_locator: None,
-        receiver_constraint: None,
-        resolved_locators: Vec::new(),
-        source_range: Some(expr.range.clone()),
-    })
-}
-
-/// Lower `(call-argument ...)` into the ordinary in-place row filter it
-/// abbreviates. The exact formal selector is only useful for a source actual,
-/// so the generated predicates also require the binding row's exact mapping,
-/// exhaustive call coverage, non-terminal status, and argument identity.
-fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
-    let fields = RecordCursor::parse(
-        expr,
-        PolicyRecord::CallArgument,
-        DecodeContext::policy(PolicyAnalysisKind::Assertion),
-    )?;
-    let over: RowBindingName =
-        parse_identifier(fields.required("over"), "call argument row binding name")?;
-    let formal_predicate = match (fields.get("formal-name"), fields.get("formal-index")) {
-        (Some(name), None) => RowPredicate {
-            field: RowFieldRef {
-                binding: over.clone(),
-                field: "formal_name".to_string(),
-                source_range: Some(name.range.clone()),
-            },
-            op: RowPredicateOp::Eq,
-            operand: RowPredicateOperand::Literal(RowLiteral::String(expect_string(
-                name,
-                "formal name",
-                MAX_HUMAN_NAME_BYTES,
-            )?)),
-            source_range: Some(expr.range.clone()),
-        },
-        (None, Some(index)) => RowPredicate {
-            field: RowFieldRef {
-                binding: over.clone(),
-                field: "formal_index".to_string(),
-                source_range: Some(index.range.clone()),
-            },
-            op: RowPredicateOp::Eq,
-            operand: RowPredicateOperand::Literal(RowLiteral::Integer(
-                expect_u32(index, "formal index", true)?.into(),
-            )),
-            source_range: Some(expr.range.clone()),
-        },
-        (None, None) => {
-            return Err(source_error(
-                "missing-call-argument-selector",
-                expr.range.clone(),
-                "call-argument requires exactly one of :formal-name or :formal-index",
-            ));
-        }
-        (Some(_), Some(index)) => {
-            return Err(source_error(
-                "conflicting-call-argument-selector",
-                index.range.clone(),
-                "call-argument :formal-name and :formal-index are mutually exclusive",
-            ));
-        }
-    };
-    let field = |name: &str| RowFieldRef {
-        binding: over.clone(),
-        field: name.to_string(),
-        source_range: Some(expr.range.clone()),
-    };
-    Ok(RowFilter {
-        over: over.clone(),
-        predicates: vec![
-            formal_predicate,
-            RowPredicate {
-                field: field("mapping"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
-                    "exact".to_string(),
-                )),
-                source_range: Some(expr.range.clone()),
-            },
-            RowPredicate {
-                field: field("coverage"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
-                    "exhaustive".to_string(),
-                )),
-                source_range: Some(expr.range.clone()),
-            },
-            RowPredicate {
-                field: field("terminal"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
-                source_range: Some(expr.range.clone()),
-            },
-            RowPredicate {
-                field: field("argument_id"),
-                op: RowPredicateOp::IsNotNull,
-                operand: RowPredicateOperand::None,
-                source_range: Some(expr.range.clone()),
-            },
-        ],
-        evidence: None,
-        call_locator: None,
-        receiver_constraint: None,
-        resolved_locators: Vec::new(),
-        source_range: Some(expr.range.clone()),
-    })
-}
-
-/// Lower `(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof PROOF)`
-/// into one ordinary in-place filter. An unquoted value is an existing stable
-/// semantic-model identity. A quoted value is retained as a qualified locator
-/// until the loaded-policy boundary can resolve it against typed workspace or
-/// active-model identities. `exact` consumes the analyzer's typed
-/// selector proof, which may be derived or backed by one exact authored
-/// summary. `declared` proves one exact semantic-model declaration, a complete
-/// callable-family surface, and an exact actual-to-formal mapping while
-/// leaving runtime dispatch as an independent axis for the taint solver and
-/// summaries. The pack may remain globally partial when the selected callable
-/// family carries its narrower completeness proof.
-fn decode_receiver_type(
-    expr: &Expr,
-) -> Result<(Option<String>, Option<ReceiverTypeLocator>), PolicySourceError> {
-    fn identity(expr: &Expr, what: &str) -> Result<String, PolicySourceError> {
-        match &expr.kind {
-            ExprKind::String(value) | ExprKind::Symbol(value) => {
-                if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
-                    Err(source_error(
-                        "invalid-call-receiver-type-id",
-                        expr.range.clone(),
-                        format!(
-                            "call receiver semantic-model type identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
-                        ),
-                    ))
-                } else {
-                    Ok(value.clone())
-                }
-            }
-            _ => Err(source_error(
-                "invalid-call-receiver-type-id",
-                expr.range.clone(),
-                format!("call {what} requires a stable identity or quoted qualified locator"),
-            )),
-        }
-    }
-
-    match &expr.kind {
-        ExprKind::String(_) => {
-            let receiver_type = identity(expr, ":receiver-type")?;
-            let locator = PolicyLocator {
-                value: receiver_type.clone(),
-                range: expr.range.clone(),
-            };
-            Ok((
-                Some(receiver_type.clone()),
-                Some(ReceiverTypeLocator {
-                    locator,
-                    constraint: ReceiverTypeConstraintKind::Exact,
-                }),
-            ))
-        }
-        ExprKind::Symbol(_) => {
-            identity(expr, ":receiver-type").map(|receiver_type| (Some(receiver_type), None))
-        }
-        ExprKind::List(items) if items.len() == 2 => {
-            if items[0].as_symbol() != Some("assignable-to") {
-                return Err(source_error(
-                    "invalid-call-receiver-type-id",
-                    expr.range.clone(),
-                    "call :receiver-type family must use (assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)",
-                ));
-            }
-            let receiver_type = identity(&items[1], "receiver family")?;
-            let locator = PolicyLocator {
-                value: receiver_type.clone(),
-                range: items[1].range.clone(),
-            };
-            Ok((
-                Some(receiver_type),
-                Some(ReceiverTypeLocator {
-                    locator,
-                    constraint: ReceiverTypeConstraintKind::AssignableTo,
-                }),
-            ))
-        }
-        _ => Err(source_error(
-            "invalid-call-receiver-type-id",
-            expr.range.clone(),
-            "call :receiver-type requires a stable identity, quoted qualified locator, or (assignable-to ...)",
-        )),
-    }
-}
-
-fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
-    let fields = RecordCursor::parse(
-        expr,
-        PolicyRecord::Call,
-        DecodeContext::policy(PolicyAnalysisKind::Assertion),
-    )?;
-    let over: RowBindingName = parse_identifier(fields.required("over"), "call row binding name")?;
-    let model_id_expr = fields.required("resolves-to");
-    let (model_id, target_field, target_locator) = match &model_id_expr.kind {
-        ExprKind::String(value) => {
-            if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
-                return Err(source_error(
-                    "invalid-call-model-id",
-                    model_id_expr.range.clone(),
-                    format!(
-                        "call semantic-model symbol identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
-                    ),
-                ));
-            }
-            (
-                value.clone(),
-                "model_callable_id",
-                Some(PolicyLocator {
-                    value: value.clone(),
-                    range: model_id_expr.range.clone(),
-                }),
-            )
-        }
-        ExprKind::Symbol(value) if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES => {
-            (value.clone(), "model_id", None)
-        }
-        _ => {
-            return Err(source_error(
-                "invalid-call-model-id",
-                model_id_expr.range.clone(),
-                "call :resolves-to requires a stable identity or quoted qualified locator",
-            ));
-        }
-    };
-    let (receiver_type_id, receiver_type) = fields
-        .get("receiver-type")
-        .map(decode_receiver_type)
-        .transpose()?
-        .unwrap_or((None, None));
-    let receiver_constraint = receiver_type.as_ref().map(|receiver| receiver.constraint);
-    let proof_expr = fields.required("proof");
-    let proof = expect_token(proof_expr, "call proof")?;
-    if !matches!(proof, "exact" | "declared") {
-        return Err(source_error(
-            "unsupported-call-proof",
-            proof_expr.range.clone(),
-            "call :proof must be exact or declared",
-        ));
-    }
-
-    let field = |name: &str| RowFieldRef {
-        binding: over.clone(),
-        field: name.to_string(),
-        source_range: Some(expr.range.clone()),
-    };
-    let not_null = |name: &str| RowPredicate {
-        field: field(name),
-        op: RowPredicateOp::IsNotNull,
-        operand: RowPredicateOperand::None,
-        source_range: Some(expr.range.clone()),
-    };
-    let constrained = |name: &str, value: &str| RowPredicate {
-        field: field(name),
-        op: RowPredicateOp::Eq,
-        operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(value.to_owned())),
-        source_range: Some(expr.range.clone()),
-    };
-    let mut predicates = vec![
-        RowPredicate {
-            field: field(target_field),
-            op: RowPredicateOp::Eq,
-            operand: RowPredicateOperand::Literal(RowLiteral::String(model_id)),
-            source_range: Some(expr.range.clone()),
-        },
-        not_null("semantic_target_id"),
-        not_null("formal_layout_id"),
-    ];
-    let evidence = if proof == "exact" {
-        predicates.push(RowPredicate {
-            field: field("selector_exact"),
-            op: RowPredicateOp::Eq,
-            operand: RowPredicateOperand::Literal(RowLiteral::Boolean(true)),
-            source_range: Some(expr.range.clone()),
-        });
-        None
-    } else {
-        predicates.extend([
-            not_null("model_id"),
-            not_null("signature_id"),
-            not_null("pack_id"),
-            not_null("model_record_id"),
-            not_null("model_proof"),
-            RowPredicate {
-                field: field("model_ambiguous"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
-                source_range: Some(expr.range.clone()),
-            },
-            constrained("mapping", "exact"),
-            constrained("coverage", "exhaustive"),
-            RowPredicate {
-                field: field("terminal"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
-                source_range: Some(expr.range.clone()),
-            },
-            not_null("argument_id"),
-        ]);
-        Some(RowFilterEvidence::DeclaredCall)
-    };
-    if let Some(receiver_type_id) = receiver_type_id {
-        if receiver_constraint != Some(ReceiverTypeConstraintKind::AssignableTo) {
-            predicates.push(RowPredicate {
-                field: field("receiver_type_id"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::String(receiver_type_id)),
-                source_range: Some(expr.range.clone()),
-            });
-            predicates.push(not_null("receiver_type_id"));
-        } else {
-            predicates.push(RowPredicate {
-                field: field("receiver_type_id"),
-                op: RowPredicateOp::In,
-                operand: RowPredicateOperand::ResolvedIdentitySet(Vec::new()),
-                source_range: Some(expr.range.clone()),
-            });
-        }
-    }
-    let receiver_has_locator = receiver_type.is_some();
-    Ok(RowFilter {
-        over: over.clone(),
-        predicates,
-        evidence,
-        receiver_constraint,
-        call_locator: (target_locator.is_some() || receiver_has_locator).then_some({
-            CallLocator {
-                target: target_locator,
-                receiver_type,
-            }
-        }),
-        resolved_locators: Vec::new(),
-        source_range: Some(expr.range.clone()),
-    })
-}
-
-/// Decode one `(project :name NEW :from NAME :columns (...))` record.
-fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError> {
-    let fields = RecordCursor::parse(
-        expr,
-        PolicyRecord::Project,
-        DecodeContext::policy(PolicyAnalysisKind::Assertion),
-    )?;
-    let name = parse_identifier(fields.required("name"), "projected row relation name")?;
-    let from = parse_identifier(fields.required("from"), "projected row relation source")?;
-    let entries = expect_sequence(fields.required("columns"), "row projection columns", 1, 32)?;
-    let mut columns = Vec::with_capacity(entries.len());
-    for entry in entries {
-        // A bare `BINDING.FIELD` keeps its field name; a two-element list
-        // renames it. Keeping the bare form is what makes the common
-        // select-and-requalify case readable.
-        let column = match &entry.kind {
-            ExprKind::List(_) | ExprKind::Vector(_) => {
-                let pair = expect_sequence(entry, "row projection column", 2, 2)?;
-                RowProjectionColumn {
-                    source: decode_row_field_ref(&pair[0], "row projection source field")?,
-                    name: decode_row_field_name(&pair[1], "row projection column name")?,
-                    source_range: Some(entry.range.clone()),
-                }
-            }
-            _ => {
-                let source = decode_row_field_ref(entry, "row projection source field")?;
-                RowProjectionColumn {
-                    name: source.field.clone(),
-                    source,
-                    source_range: Some(entry.range.clone()),
-                }
-            }
-        };
-        columns.push(column);
-    }
-    Ok(RowProjection {
-        name,
-        from,
-        columns,
-        source_range: Some(expr.range.clone()),
     })
 }
 
@@ -6405,6 +5940,7 @@ fn lower_selected_in_winning_tier(
             op: RowAggregateOp::Count,
             value: None,
             sequences: None,
+            sets: None,
             predicate: vec![
                 RowPredicate {
                     field: RowFieldRef {
@@ -7492,6 +7028,7 @@ fn validate_named_graph(values: &[NamedGraphNode], what: &str) -> Result<(), Pol
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
+    use brokk_bifrost_rql::QueryStep;
 
     fn parse(source: &str) -> Result<ParsedRqlpDocument, PolicySourceError> {
         parse_rqlp_source(source, PolicySourceIdentity::new("test.rqlp"))
@@ -7573,31 +7110,7 @@ mod tests {
 
     /// One inner-joined plan whose fold carries the predicate under test, so
     /// a predicate can name a field of either joined relation.
-    fn extended_plan(predicate: &str) -> String {
-        format!(
-            r#"(policy
-              :id "test.relational.extended"
-              :name "Extended relational assertion"
-              :message "M"
-              :severity warning
-              :analysis
-                (analysis :type assertion
-                  (bind :name site :query
-                    (rql (occurrences :role [member_position])))
-                  (bind :name cand :query
-                    (rql (occurrences :role [member_position])))
-                  (join :left site :right cand :on ((ast_id ast_id)))
-                  (group :name by-site :by (site.ast_id)
-                    (aggregate :name reach :op max :value site.target_count
-                      :where (({predicate}))))
-                  (assert :group by-site :value reach
-                    :cardinality (at-most 1))))"#
-        )
-    }
-
-    /// The same invariant written with a standalone filter and a semi join. A
-    /// filter reads only the relation it narrows, so its predicates name that
-    /// relation and nothing else.
+    /// The same invariant written with a row-local RQL filter and a semi join.
     fn filter_plan(predicate: &str) -> String {
         format!(
             r#"(policy
@@ -7610,8 +7123,8 @@ mod tests {
                   (bind :name site :query
                     (rql (occurrences :role [member_position])))
                   (bind :name cand :query
-                    (rql (occurrences :role [member_position])))
-                  (filter :over cand :where (({predicate})))
+                    (rql (filter :where (({predicate}))
+                      (occurrences :role [member_position]))))
                   (join :left site :right cand :kind semi :on ((ast_id ast_id)))
                   (group :name by-site :by (site.ast_id)
                     (aggregate :name reach :op max :value site.target_count))
@@ -7631,313 +7144,76 @@ mod tests {
         spec.relational.expect("relational plan")
     }
 
-    /// A semi join, a standalone filter, and the `max` fold decode into the
-    /// authored model the lowering reads, and nothing about them is inferred.
     #[test]
-    fn decodes_semi_joins_standalone_filters_and_the_new_folds() {
-        let plan = extended_relational_plan(&filter_plan("cand.target_count gt 0"));
-
-        assert_eq!(plan.joins.len(), 1);
+    fn decodes_rql_filter_and_projection_steps_inside_bindings() {
+        let plan = extended_relational_plan(&filter_plan("target_count gt 0"));
         assert_eq!(plan.joins[0].kind, RowJoinKind::Semi);
         assert_eq!(plan.groups[0].aggregates[0].op, RowAggregateOp::Max);
-
-        assert_eq!(plan.derivations.len(), 1);
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("expected a filter derivation");
-        };
-        assert_eq!(filter.over.as_str(), "cand");
-        assert_eq!(filter.predicates.len(), 1);
-        assert_eq!(filter.predicates[0].op, RowPredicateOp::Gt);
-        assert_eq!(filter.predicates[0].field.field, "target_count");
-        assert!(matches!(
-            filter.predicates[0].operand,
-            RowPredicateOperand::Literal(RowLiteral::Integer(0))
-        ));
-    }
-
-    /// The operator alone decides the operand: a comparison takes a literal or
-    /// a second field, `in` takes a set, and the null tests take nothing.
-    #[test]
-    fn decodes_every_extended_predicate_operand_form() {
-        let cases: &[(&str, RowPredicateOp, &str)] = &[
-            ("cand.target_count ne 0", RowPredicateOp::Ne, "literal"),
-            ("cand.target_count lt 2", RowPredicateOp::Lt, "literal"),
-            ("cand.target_count le 2", RowPredicateOp::Le, "literal"),
-            ("cand.target_count gt 2", RowPredicateOp::Gt, "literal"),
-            ("cand.target_count ge 2", RowPredicateOp::Ge, "literal"),
-            // A symbol carrying a dot is the second field of the same tuple,
-            // and the two relations the join brought in are both addressable.
-            ("cand.ast_id eq site.ast_id", RowPredicateOp::Eq, "field"),
-            (
-                "cand.target_count lt site.target_count",
-                RowPredicateOp::Lt,
-                "field",
-            ),
-            ("cand.target_id is-null", RowPredicateOp::IsNull, "none"),
-            (
-                "cand.target_id is-not-null",
-                RowPredicateOp::IsNotNull,
-                "none",
-            ),
-            (
-                "cand.role in (member_position value_reference)",
-                RowPredicateOp::In,
-                "set",
-            ),
-        ];
-        for (spelling, op, operand) in cases {
-            let plan = extended_relational_plan(&extended_plan(spelling));
-            let predicate = &plan.groups[0].aggregates[0].predicate[0];
-            assert_eq!(&predicate.op, op, "{spelling}");
-            let actual = match &predicate.operand {
-                RowPredicateOperand::Literal(_) => "literal",
-                RowPredicateOperand::Field(_) => "field",
-                RowPredicateOperand::Set(_) => "set",
-                RowPredicateOperand::ResolvedIdentitySet(_) => "resolved-identities",
-                RowPredicateOperand::None => "none",
-            };
-            assert_eq!(&actual, operand, "{spelling}");
-        }
-
-        // A membership set keeps its authored order and every literal.
-        let plan = extended_relational_plan(&extended_plan(
-            "cand.role in (member_position value_reference)",
-        ));
-        let RowPredicateOperand::Set(values) = &plan.groups[0].aggregates[0].predicate[0].operand
+        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
+            &plan.bindings[1].source
         else {
-            panic!("expected a membership set");
+            panic!("fixture uses an inline query")
         };
+        assert!(matches!(
+            query.plan.steps.last(),
+            Some(QueryStep::Filter(_))
+        ));
+
+        let source = r#"(policy
+          :id "test.relational.project" :name "Project" :message "M" :severity warning
+          :analysis (analysis :type assertion
+            (bind :name narrow :query
+              (rql (project :columns (ast_id (hits total))
+                (project :columns (ast_id (target_count hits))
+                  (occurrences :role [member_position])))))
+            (group :name by-site :by (narrow.ast_id)
+              (aggregate :name reach :op max :value narrow.total))
+            (assert :group by-site :value reach :cardinality (at-most 1))))"#;
+        let plan = extended_relational_plan(source);
+        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
+            &plan.bindings[0].source
+        else {
+            panic!("fixture uses an inline query")
+        };
+        assert!(matches!(
+            query.plan.steps.last(),
+            Some(QueryStep::Project(_))
+        ));
+        let ir = crate::relational::lower_relational_assertion_plan(&plan)
+            .expect("projected query schema should lower");
         assert_eq!(
-            values,
-            &vec![
-                RowLiteral::ConstrainedEnum("member_position".to_string()),
-                RowLiteral::ConstrainedEnum("value_reference".to_string()),
-            ]
+            ir.relations[0]
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.column.to_string())
+                .collect::<Vec<_>>(),
+            vec!["narrow.ast_id", "narrow.total"]
         );
     }
 
-    /// Issue #2515, the policy-authoring dogfood reproduction. A `ConstrainedEnum`
-    /// column compared against a label the row can never hold is an authoring
-    /// error reported at load time, naming the field, the bad label, and the
-    /// legal set.
-    ///
-    /// Before this check, the filter simply matched nothing: the plan produced
-    /// no groups, and the run reported `1 complete policy run; clean` with exit
-    /// 0 forever.
     #[test]
-    fn an_unknown_enum_label_in_a_relational_filter_fails_to_load() {
-        let policy = |predicate: &str| {
-            format!(
-                r#"(policy
-                  :id "test.relational.enum" :name "Enum" :message "M" :severity warning
-                  :analysis (analysis :type assertion
-                    (bind :name shape :query
-                      (rql (call-shape (occurrences :role [member_position]))))
-                    (filter :over shape :where (({predicate})))
-                    (group :name by-site :by (shape.site_id)
-                      (aggregate :name hits :op count))
-                    (assert :group by-site :value hits :cardinality (at-most 1))))"#
-            )
-        };
-
-        let error = parse(&policy("shape.call_kind eq zzz_totally_bogus_value_xyz"))
-            .unwrap_err()
-            .diagnostic;
-        assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert_eq!(
-            error.message,
-            "`zzz_totally_bogus_value_xyz` is not a value of `shape.call_kind`; \
-             the accepted values are function, method, constructor, extractor, infix, \
-             operator, method_value"
-        );
-        assert_eq!(
-            &policy("shape.call_kind eq zzz_totally_bogus_value_xyz")[error.range],
-            "(shape.call_kind eq zzz_totally_bogus_value_xyz)"
-        );
-
-        // The same rule holds for every member of a set membership test: one
-        // bad member would silently shrink the set.
-        let error = parse(&policy(
-            "shape.call_kind in [method zzz_totally_bogus_value_xyz]",
-        ))
-        .unwrap_err()
-        .diagnostic;
-        assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert!(
-            error
-                .message
-                .contains("`zzz_totally_bogus_value_xyz` is not a value of `shape.call_kind`"),
-            "{}",
-            error.message
-        );
-
-        // A correct label still loads, through both operators.
-        for predicate in [
-            "shape.call_kind eq method",
-            "shape.call_kind in [method function]",
+    fn legacy_per_binding_policy_records_are_rejected() {
+        for record in [
+            r#"(filter :over cand :where ((cand.target_count gt 0)))"#,
+            r#"(project :name narrow :from cand :columns (cand.ast_id))"#,
+            r#"(call :over cand :resolves-to member.widget.create :proof exact)"#,
+            r#"(call-argument :over cand :formal-index 0)"#,
         ] {
-            parse(&policy(predicate))
-                .unwrap_or_else(|error| panic!("{predicate}: {}", error.diagnostic.message));
-        }
-    }
-
-    /// A projection publishes a new relation and takes the place of the one it
-    /// reads: the projected columns are addressable under the new name, and
-    /// the old name is not addressable at all.
-    #[test]
-    fn a_projection_replaces_the_relation_it_reads() {
-        let policy = |plan: &str| {
-            format!(
-                r#"(policy
-                  :id "test.relational.project" :name "Project" :message "M" :severity warning
+            let source = format!(
+                r#"(policy :id "test.legacy" :name "Legacy" :message "M" :severity warning
                   :analysis (analysis :type assertion
-                    (bind :name site :query
-                      (rql (occurrences :role [member_position])))
-                    (bind :name cand :query
-                      (rql (occurrences :role [member_position])))
-                    {plan}))"#
-            )
-        };
-        let source = policy(
-            r#"(project :name narrow :from cand :columns (cand.ast_id (cand.target_count hits)))
-                    (join :left site :right narrow :on ((ast_id ast_id)))
-                    (group :name by-site :by (site.ast_id)
-                      (aggregate :name reach :op max :value narrow.hits))
-                    (assert :group by-site :value reach :cardinality (at-most 1))"#,
-        );
-        let plan = extended_relational_plan(&source);
-        let RowDerivation::Project(projection) = &plan.derivations[0] else {
-            panic!("expected a projection derivation");
-        };
-        assert_eq!(projection.name.as_str(), "narrow");
-        assert_eq!(projection.from.as_str(), "cand");
-        assert_eq!(projection.columns.len(), 2);
-        assert_eq!(projection.columns[0].source.field, "ast_id");
-        assert_eq!(projection.columns[0].name, "ast_id");
-        assert_eq!(projection.columns[1].source.field, "target_count");
-        assert_eq!(projection.columns[1].name, "hits");
-
-        // The consumed name is gone, so a later record that still uses it is
-        // an authoring error reported at load time.
-        let stale = policy(
-            r#"(project :name narrow :from cand :columns (cand.ast_id))
-                    (join :left site :right cand :on ((ast_id ast_id)))
-                    (group :name by-site :by (site.ast_id)
-                      (aggregate :name reach :op count))
-                    (assert :group by-site :value reach :cardinality (at-most 1))"#,
-        );
-        let error = parse(&stale).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert!(
-            error.message.contains("unknown binding `cand`"),
-            "{}",
-            error.message
-        );
-    }
-
-    /// The IR validator's typing rules reach the author through the ordinary
-    /// invalid-plan diagnostic, so a mistyped new predicate or fold is a load
-    /// error and never a runtime surprise.
-    #[test]
-    fn extended_predicate_and_fold_typing_is_rejected_at_load() {
-        let cases: &[(&str, &str)] = &[
-            // No registry scalar but Integer carries an order.
-            ("cand.role gt member_position", "is not defined over"),
-            // A null test over a field the registry always populates would be
-            // a constant, not a question.
-            ("cand.ast_id is-null", "always present"),
-            // Comparing two different scalar types is false at every row.
-            ("cand.ast_id eq site.target_count", "predicate compares"),
-        ];
-        for (spelling, needle) in cases {
-            let error = parse(&extended_plan(spelling)).unwrap_err().diagnostic;
-            assert_eq!(
-                error.code, "invalid-relational-assertion-plan",
-                "{spelling}"
+                    (bind :name cand :query (rql (occurrences))) {record}))"#
             );
-            assert!(
-                error.message.contains(needle),
-                "{spelling}: {}",
-                error.message
-            );
+            let error = parse(&source).expect_err(record).diagnostic;
+            assert_eq!(error.code, "wrong-record-kind", "{record}: {error:?}");
         }
 
-        // `max` folds an integer column, so an enum one is refused.
-        let mistyped = extended_plan("cand.target_count gt 0").replace(
-            ":op max :value site.target_count",
-            ":op max :value site.role",
-        );
-        let error = parse(&mistyped).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert!(error.message.contains("Integer"), "{}", error.message);
-
-        // `any` and `all` fold a boolean column, so an integer one is refused.
-        let mistyped = extended_plan("cand.target_count gt 0").replace(
-            ":op max :value site.target_count",
-            ":op any :value site.target_count",
-        );
-        let error = parse(&mistyped).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-relational-assertion-plan");
-        assert!(error.message.contains("Boolean"), "{}", error.message);
-    }
-
-    /// An unknown operator names every operator that exists, at the token that
-    /// was written.
-    #[test]
-    fn an_unknown_row_predicate_operator_is_reported_at_its_token() {
-        assert_error_token(
-            &extended_plan("cand.target_count between 0"),
-            "unknown-row-predicate-operator",
-            "between",
-        );
-    }
-
-    /// A membership test is bounded by the registry, and an empty one states
-    /// nothing at all.
-    #[test]
-    fn a_membership_test_is_bounded_and_non_empty() {
-        let error = parse(&extended_plan("cand.role in ()"))
-            .unwrap_err()
-            .diagnostic;
-        assert_eq!(error.code, "collection-size");
-
-        let members = (0..65)
-            .map(|index| format!("value{index}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let error = parse(&extended_plan(&format!("cand.role in ({members})")))
-            .unwrap_err()
-            .diagnostic;
-        assert_eq!(error.code, "collection-size");
-    }
-
-    /// The new vocabulary is registered, so hover and completion describe it
-    /// the same way the documentation does.
-    #[test]
-    fn the_extended_relational_vocabulary_is_registered_for_hover() {
-        let source = filter_plan("cand.target_count gt 0");
-        for (spelling, needle) in [("semi", "left rows"), ("max", "maximum")] {
-            let offset = source.find(spelling).expect("spelling is present") + 1;
-            let help =
-                rqlp_source_help_at(&source, offset).expect("registered atom has hover help");
-            assert_eq!(help.signature, spelling);
-            assert!(
-                help.description.to_lowercase().contains(needle),
-                "{spelling}: {}",
-                help.description
-            );
-        }
-
-        let offset = source
-            .find("(filter")
-            .expect("the filter record is present")
-            + 2;
-        let help = rqlp_source_help_at(&source, offset).expect("registered record has hover help");
-        assert!(
-            help.signature.starts_with("(filter :over NAME"),
-            "{}",
-            help.signature
-        );
+        let source = r#"(policy :id "test.legacy-bind" :name "Legacy" :message "M" :severity warning
+          :analysis (analysis :type assertion
+            (bind :name cand :from site :step member-selection)))"#;
+        let error = parse(source).unwrap_err().diagnostic;
+        assert_eq!(error.code, "unknown-field");
     }
 
     /// The ordered-list predicate the #1478 Milestone 4 requires: two ordered
@@ -7963,25 +7239,25 @@ mod tests {
         )
     }
 
-    fn call_argument_policy(entry: &str) -> String {
+    fn call_argument_policy(step: &str) -> String {
         format!(
             r#"(policy
               :id "test.call-argument" :name "Call argument" :message "M" :severity warning
               :analysis (analysis :type assertion
                 (bind :name args :query
-                  (rql (call-bindings (call-shape (call :callee "run")))))
-                {entry}))"#
+                  (rql ({step}
+                    (call-bindings (call-shape (call :callee "run"))))))))"#
         )
     }
 
-    fn exact_call_policy(entry: &str) -> String {
+    fn exact_call_policy(step: &str) -> String {
         format!(
             r#"(policy
               :id "test.call" :name "Call" :message "M" :severity warning
               :analysis (analysis :type assertion
                 (bind :name calls :query
-                  (rql (call-bindings (call-shape (call :callee "run")))))
-                {entry}))"#
+                  (rql ({step}
+                    (call-bindings (call-shape (call :callee "run"))))))))"#
         )
     }
 
@@ -8046,7 +7322,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("compares a Boolean value with a String value"),
+                .contains("compares a boolean value with a string value"),
             "{}",
             error.message
         );
@@ -8069,410 +7345,33 @@ mod tests {
     }
 
     #[test]
-    fn call_argument_lowers_to_an_equivalent_typed_filter() {
-        let sugar = parse(&call_argument_policy(
-            r#"(call-argument :over args :formal-name "timeout")"#,
-        ))
-        .unwrap();
-        let hand_written = parse(&call_argument_policy(
-            r#"(filter :over args :where
-              ((args.formal_name eq "timeout")
-               (args.mapping eq exact)
-               (args.coverage eq exhaustive)
-               (args.terminal eq false)
-               (args.argument_id is-not-null)))"#,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
-            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_vec(
-                &sugar
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-            serde_json::to_vec(
-                &hand_written
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-
-        let RqlpDocument::Policy { definition } = sugar.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        assert_eq!(plan.derivations.len(), 1);
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call-argument must lower to a filter")
-        };
-        assert_eq!(filter.over.as_str(), "args");
-        assert_eq!(filter.predicates.len(), 5);
-        assert_eq!(filter.predicates[0].field.field, "formal_name");
-        assert!(matches!(
-            &filter.predicates[0].operand,
-            RowPredicateOperand::Literal(RowLiteral::String(value)) if value == "timeout"
-        ));
-        assert_eq!(filter.predicates[1].field.field, "mapping");
-        assert_eq!(filter.predicates[2].field.field, "coverage");
-        assert_eq!(filter.predicates[3].field.field, "terminal");
-        assert_eq!(filter.predicates[4].field.field, "argument_id");
-        assert_eq!(filter.predicates[4].op, RowPredicateOp::IsNotNull);
-    }
-
-    #[test]
-    fn call_argument_accepts_a_formal_index() {
-        let parsed = parse(&call_argument_policy(
-            r#"(call-argument :over args :formal-index 2)"#,
-        ))
-        .unwrap();
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call-argument must lower to a filter")
+    fn row_local_call_steps_decode_inside_policy_bindings() {
+        let argument = call_argument_policy(r#"call-argument :formal-name "timeout""#);
+        let plan = extended_relational_plan(&argument);
+        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
+            &plan.bindings[0].source
+        else {
+            panic!("fixture uses an inline query")
         };
         assert!(matches!(
-            filter.predicates[0].operand,
-            RowPredicateOperand::Literal(RowLiteral::Integer(2))
+            query.plan.steps.last(),
+            Some(QueryStep::CallArgument(_))
         ));
-    }
 
-    #[test]
-    fn call_argument_requires_exactly_one_formal_selector() {
-        let missing = parse(&call_argument_policy(r#"(call-argument :over args)"#)).unwrap_err();
-        assert_eq!(missing.diagnostic.code, "missing-call-argument-selector");
-
-        let conflicting = parse(&call_argument_policy(
-            r#"(call-argument :over args :formal-name "timeout" :formal-index 2)"#,
-        ))
-        .unwrap_err();
-        assert_eq!(
-            conflicting.diagnostic.code,
-            "conflicting-call-argument-selector"
+        let call = exact_call_policy(
+            r#"resolved-call :resolves-to "Widget.create" :proof exact
+              :receiver-type (assignable-to "Widget")"#,
         );
-    }
-
-    #[test]
-    fn call_argument_vocabulary_is_registered_for_hover() {
-        let source = call_argument_policy(r#"(call-argument :over args :formal-index 2)"#);
-        let record_offset = source.find("(call-argument").unwrap() + 4;
-        let record_help = rqlp_source_help_at(&source, record_offset)
-            .expect("registered call-argument record has hover help");
-        assert_eq!(
-            record_help.signature,
-            "(call-argument :over NAME :formal-name \"NAME\") | (call-argument :over NAME :formal-index N)"
-        );
-        let field_help = rqlp_source_help_at(&source, source.find(":formal-index").unwrap() + 3)
-            .expect("registered formal-index field has hover help");
-        assert_eq!(field_help.signature, ":formal-index N");
-    }
-
-    #[test]
-    fn exact_call_lowers_to_an_equivalent_typed_filter() {
-        let sugar = parse(&exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact)"#,
-        ))
-        .unwrap();
-        let hand_written = parse(&exact_call_policy(
-            r#"(filter :over calls :where
-              ((calls.model_id eq "member.widget.create")
-               (calls.semantic_target_id is-not-null)
-               (calls.formal_layout_id is-not-null)
-               (calls.selector_exact eq true)))"#,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
-            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_vec(
-                &sugar
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-            serde_json::to_vec(
-                &hand_written
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-
-        let RqlpDocument::Policy { definition } = sugar.document else {
-            panic!("expected policy")
+        let plan = extended_relational_plan(&call);
+        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
+            &plan.bindings[0].source
+        else {
+            panic!("fixture uses an inline query")
         };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call must lower to a filter")
-        };
-        assert_eq!(filter.over.as_str(), "calls");
-        assert_eq!(filter.predicates.len(), 4);
-        let fields: Vec<_> = filter
-            .predicates
-            .iter()
-            .map(|predicate| predicate.field.field.as_str())
-            .collect();
-        assert_eq!(
-            fields,
-            vec![
-                "model_id",
-                "semantic_target_id",
-                "formal_layout_id",
-                "selector_exact",
-            ]
-        );
         assert!(matches!(
-            &filter.predicates[0].operand,
-            RowPredicateOperand::Literal(RowLiteral::String(value))
-                if value == "member.widget.create"
+            query.plan.steps.last(),
+            Some(QueryStep::ResolvedCall(_))
         ));
-    }
-
-    #[test]
-    fn exact_call_receiver_type_lowers_to_an_equivalent_typed_filter() {
-        let sugar = parse(&exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact
-                 :receiver-type type.widget)"#,
-        ))
-        .unwrap();
-        let hand_written = parse(&exact_call_policy(
-            r#"(filter :over calls :where
-              ((calls.model_id eq "member.widget.create")
-               (calls.semantic_target_id is-not-null)
-               (calls.formal_layout_id is-not-null)
-               (calls.selector_exact eq true)
-               (calls.receiver_type_id eq "type.widget")
-               (calls.receiver_type_id is-not-null)))"#,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
-            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_vec(
-                &sugar
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-            serde_json::to_vec(
-                &hand_written
-                    .document
-                    .to_inline_local_canonical_semantic_json()
-                    .unwrap(),
-            )
-            .unwrap(),
-        );
-
-        let RqlpDocument::Policy { definition } = sugar.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call must lower to a filter")
-        };
-        assert_eq!(filter.predicates.len(), 6);
-        assert_eq!(filter.predicates[4].field.field, "receiver_type_id");
-        assert!(matches!(
-            &filter.predicates[4].operand,
-            RowPredicateOperand::Literal(RowLiteral::String(value)) if value == "type.widget"
-        ));
-        assert_eq!(filter.predicates[5].field.field, "receiver_type_id");
-        assert_eq!(filter.predicates[5].op, RowPredicateOp::IsNotNull);
-    }
-
-    #[test]
-    fn qualified_call_locators_are_retained_until_loaded_policy_resolution() {
-        let source = exact_call_policy(
-            r#"(call :over calls :resolves-to "Widget.create" :proof exact
-                 :receiver-type "Widget")"#,
-        );
-        let parsed = parse(&source).unwrap();
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call must lower to a filter")
-        };
-        let locator = filter.call_locator.as_ref().expect("pending locators");
-        let target = locator.target.as_ref().expect("call locator");
-        assert_eq!(target.value, "Widget.create");
-        assert_eq!(&source[target.range.clone()], "\"Widget.create\"");
-        let receiver = locator.receiver_type.as_ref().expect("receiver locator");
-        assert_eq!(receiver.constraint, ReceiverTypeConstraintKind::Exact);
-        assert_eq!(receiver.locator.value, "Widget");
-        assert_eq!(&source[receiver.locator.range.clone()], "\"Widget\"");
-        assert!(filter.resolved_locators.is_empty());
-    }
-
-    #[test]
-    fn assignable_call_receiver_is_a_typed_unresolved_family() {
-        let source = exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact
-                 :receiver-type (assignable-to "pkg.Base"))"#,
-        );
-        let parsed = parse(&source).unwrap();
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call must lower to a filter")
-        };
-        assert_eq!(
-            filter.receiver_constraint,
-            Some(ReceiverTypeConstraintKind::AssignableTo)
-        );
-        let locator = filter.call_locator.as_ref().expect("pending locator");
-        let receiver = locator.receiver_type.as_ref().expect("receiver locator");
-        assert_eq!(
-            receiver.constraint,
-            ReceiverTypeConstraintKind::AssignableTo
-        );
-        assert_eq!(receiver.locator.value, "pkg.Base");
-        assert_eq!(&source[receiver.locator.range.clone()], "\"pkg.Base\"");
-        assert_eq!(
-            filter.predicates.last().unwrap().field.field,
-            "receiver_type_id"
-        );
-        assert!(matches!(
-            &filter.predicates.last().unwrap().operand,
-            RowPredicateOperand::ResolvedIdentitySet(identities) if identities.is_empty()
-        ));
-    }
-
-    #[test]
-    fn exact_call_rejects_a_weaker_proof() {
-        let error = parse(&exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof possible)"#,
-        ))
-        .unwrap_err();
-        assert_eq!(error.diagnostic.code, "unsupported-call-proof");
-    }
-
-    #[test]
-    fn declared_call_requires_exact_model_signature_and_binding_evidence() {
-        let parsed = parse(&exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof declared)"#,
-        ))
-        .unwrap();
-        let canonical = parsed.document.to_normalized_authored_json();
-        assert_eq!(
-            canonical["analysis"]["plan"]["derivations"][0]["evidence"],
-            "declared_call"
-        );
-
-        let RqlpDocument::Policy { definition } = parsed.document else {
-            panic!("expected policy")
-        };
-        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
-            panic!("expected assertion policy")
-        };
-        let plan = spec.relational.expect("relational plan");
-        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
-            panic!("call must lower to a filter")
-        };
-        assert_eq!(filter.evidence, Some(RowFilterEvidence::DeclaredCall));
-        assert_eq!(filter.predicates.len(), 13);
-        assert_eq!(
-            filter
-                .predicates
-                .iter()
-                .map(|predicate| predicate.field.field.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "model_id",
-                "semantic_target_id",
-                "formal_layout_id",
-                "model_id",
-                "signature_id",
-                "pack_id",
-                "model_record_id",
-                "model_proof",
-                "model_ambiguous",
-                "mapping",
-                "coverage",
-                "terminal",
-                "argument_id",
-            ]
-        );
-    }
-
-    #[test]
-    fn exact_call_vocabulary_is_registered_for_hover() {
-        let source = exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact)"#,
-        );
-        let record_help = rqlp_source_help_at(&source, source.find("(call :over").unwrap() + 2)
-            .expect("registered call record has hover help");
-        assert_eq!(
-            record_help.signature,
-            "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)])"
-        );
-        let field_help = rqlp_source_help_at(&source, source.find(":resolves-to").unwrap() + 3)
-            .expect("registered resolves-to field has hover help");
-        assert_eq!(field_help.signature, ":resolves-to MODEL_ID|QUALIFIED_NAME");
-
-        let receiver_source = exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact
-                 :receiver-type type.widget)"#,
-        );
-        let receiver_type_help = rqlp_source_help_at(
-            &receiver_source,
-            receiver_source.find(":receiver-type").unwrap() + 3,
-        )
-        .expect("registered receiver-type field has hover help");
-        assert_eq!(
-            receiver_type_help.signature,
-            ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE|(assignable-to MODEL_TYPE_ID|QUALIFIED_TYPE)"
-        );
-    }
-
-    #[test]
-    fn exact_call_rejects_an_invalid_receiver_type_identity() {
-        let source = exact_call_policy(
-            r#"(call :over calls :resolves-to member.widget.create :proof exact
-                 :receiver-type ())"#,
-        );
-        let error = parse(&source).unwrap_err().diagnostic;
-        assert_eq!(error.code, "invalid-call-receiver-type-id");
-        assert_eq!(&source[error.range], "()");
     }
 
     #[test]

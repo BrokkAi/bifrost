@@ -49,6 +49,17 @@ use tree_sitter::Node;
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub static LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    static TYPE_REFERENCE_CANDIDATE_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_type_reference_candidate_scan_count_for_test() {
+    TYPE_REFERENCE_CANDIDATE_SCAN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn type_reference_candidate_scan_count_for_test() -> usize {
+    TYPE_REFERENCE_CANDIDATE_SCAN_COUNT.with(Cell::get)
 }
 
 pub struct ScanState<'a> {
@@ -77,6 +88,7 @@ pub struct ScanCtx<'a> {
     pub spec: &'a TargetSpec,
     pub target_group: &'a HashSet<CodeUnit>,
     pub has_proven_visible_type_target: bool,
+    uses_c_semantics: bool,
     type_reference_component_names: HashSet<String>,
     pub target_declaration_ranges: Vec<Range>,
     target_macro_declaration_bytes: Vec<usize>,
@@ -195,6 +207,24 @@ pub fn scan_prepared_file(
     } else {
         Vec::new()
     };
+    let type_reference_component_names = if spec.kind == TargetKind::Type {
+        visibility.visible_type_reference_component_names_for_target(analyzer, file, &spec.target)
+    } else {
+        HashSet::default()
+    };
+    if spec.kind == TargetKind::Type
+        && !file_may_reference_type_target(
+            prepared.tree().root_node(),
+            prepared.source(),
+            analyzer,
+            visibility,
+            file,
+            &spec.target,
+            &type_reference_component_names,
+        )
+    {
+        return;
+    }
     let ordinary_type_imports = initialized_ordinary_type_imports(
         prepared.tree().root_node(),
         analyzer,
@@ -202,11 +232,6 @@ pub fn scan_prepared_file(
         file,
         prepared.source(),
     );
-    let type_reference_component_names = if spec.kind == TargetKind::Type {
-        visibility.visible_type_reference_component_names_for_target(analyzer, file, &spec.target)
-    } else {
-        HashSet::default()
-    };
     let external_hit_count = state
         .hits
         .iter()
@@ -225,6 +250,7 @@ pub fn scan_prepared_file(
         spec,
         target_group,
         has_proven_visible_type_target,
+        uses_c_semantics: analyzer.reference_uses_c_semantics(file),
         type_reference_component_names,
         target_declaration_ranges,
         target_macro_declaration_bytes,
@@ -1086,17 +1112,14 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if recovered_c_new_expression_argument_at(
-        node,
-        node.start_byte(),
-        node.end_byte(),
-        ctx.analyzer.reference_uses_c_semantics(ctx.file),
-    )
-    .is_some()
+    let kind = node.kind();
+    if ctx.uses_c_semantics
+        && recovered_c_new_expression_argument_at(node, node.start_byte(), node.end_byte(), true)
+            .is_some()
     {
         return;
     }
-    if node.kind() == "preproc_arg" {
+    if kind == "preproc_arg" {
         maybe_record_object_macro_replacement_type_hits(node, ctx);
         return;
     }
@@ -1130,12 +1153,19 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let recovered_exported_class_base =
-        is_recovered_exported_class_base_type_node(node, ctx.source);
-    if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
+        matches!(
+            kind,
+            "qualified_identifier" | "scoped_type_identifier" | "template_type"
+        ) && is_recovered_exported_class_base_type_node(node, ctx.source);
+    if kind == "field_declaration"
+        && let Some(return_type) = recovered_macro_return_type_node(node, ctx.source)
+    {
         maybe_record_recovered_macro_return_type_hit(return_type, ctx);
         return;
     }
-    if let Some((owner, _member_pointer)) = member_pointer_owner_components(node, ctx.source) {
+    if kind == "qualified_identifier"
+        && let Some((owner, _member_pointer)) = member_pointer_owner_components(node, ctx.source)
+    {
         // A member-pointer owner can itself end in a nested alias, as in
         // `type_identity<T>::type::*`. Resolving the complete owner
         // canonicalizes that alias to its underlying type and loses the alias
@@ -1181,7 +1211,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    if node.kind() == "pointer_expression"
+    if kind == "pointer_expression"
         && let Some(value) = qualified_callable_value(node)
         && let Some(scope) =
             target_guided_unproven_qualified_value_owner_scope(value.qualified, ctx)
@@ -1190,8 +1220,37 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_unproven_hit(scope, ctx);
         return;
     }
-    if node.kind() == "call_expression" {
+    if kind == "call_expression" {
         maybe_record_direct_temporary_type_hit(node, ctx);
+        return;
+    }
+    if !matches!(
+        kind,
+        "identifier"
+            | "namespace_identifier"
+            | "qualified_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "template_function"
+            | "template_type"
+            | "type_descriptor"
+            | "type_identifier"
+            | "using_declaration"
+    ) {
+        return;
+    }
+    let recovered_type = recovered_macro_decorated_declarator_type(node).is_some();
+    let recovered_qualified_friend =
+        is_recovered_qualified_friend_class_type_reference(node, ctx.source);
+    if !recovered_type
+        && !recovered_qualified_friend
+        && !recovered_exported_class_base
+        && matches!(
+            kind,
+            "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type"
+        )
+        && !type_reference_components_may_name_target(node, ctx)
+    {
         return;
     }
     if ctx.ancestry.parent(node).is_some_and(|parent| {
@@ -1207,12 +1266,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_type_hit(hit, ctx);
         return;
     }
-    if matches!(node.kind(), "identifier" | "template_function")
-        && call_for_function_node(node).is_some()
+    if matches!(kind, "identifier" | "template_function") && call_for_function_node(node).is_some()
     {
         return;
     }
-    if node.kind() == "using_declaration" {
+    if kind == "using_declaration" {
         let (resolution, type_node) =
             if let Some(type_node) = using_enum_declaration_type_node(node) {
                 (
@@ -1248,7 +1306,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    if is_c_sizeof_expression_type_candidate(ctx.file, node) {
+    if ctx.uses_c_semantics && is_c_sizeof_expression_type_candidate(ctx.file, node) {
         if ctx.local_shadows.is_shadowed(node_text(node, ctx.source))
             || local_type_name_shadows(node, ctx)
         {
@@ -1316,12 +1374,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             _ => return,
         }
     }
-    let recovered_type = recovered_macro_decorated_declarator_type(node).is_some();
-    let recovered_qualified_friend =
-        is_recovered_qualified_friend_class_type_reference(node, ctx.source);
     if !recovered_type
         && !matches!(
-            node.kind(),
+            kind,
             "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type"
         )
     {
@@ -1335,7 +1390,21 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !recovered_type
         && !recovered_qualified_friend
         && !recovered_exported_class_base
-        && matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        && ctx.ancestry.parent(node).is_some_and(|parent| {
+            parent.kind() == "alias_declaration"
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| same_node(name, node))
+        })
+    {
+        return;
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    TYPE_REFERENCE_CANDIDATE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+    if !recovered_type
+        && !recovered_qualified_friend
+        && !recovered_exported_class_base
+        && matches!(kind, "qualified_identifier" | "scoped_identifier")
         && is_declaration_name(node)
         && let Some(owners) = out_of_line_member_definition_owner(
             &ctx.analyzer,
@@ -1533,9 +1602,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 });
             push_type_hit(hit, ctx);
         }
-        return;
-    }
-    if !recovered_type && !type_reference_components_may_name_target(node, ctx) {
         return;
     }
     if !recovered_type && let Some(call) = call_for_function_node(node) {
@@ -2685,28 +2751,153 @@ fn resolve_nested_template_type_for_target(
 }
 
 fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some((components, _)) = type_reference_components(node, ctx.source) else {
+    let mut reference = node;
+    while let Some(parent) = ctx.ancestry.parent(reference) {
+        let owns_component = matches!(parent.kind(), "template_type" | "template_function")
+            && parent.child_by_field_name("name") == Some(reference)
+            || matches!(
+                parent.kind(),
+                "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+            ) && (parent.child_by_field_name("scope") == Some(reference)
+                || parent.child_by_field_name("name") == Some(reference));
+        if !owns_component {
+            break;
+        }
+        reference = parent;
+    }
+    let Some((components, global)) = type_reference_components(reference, ctx.source) else {
         return false;
     };
-    components.iter().any(|component| {
-        ctx.type_reference_component_names.contains(component)
-            || ctx.visibility.parser_alias_name_may_resolve_to_target(
-                ctx.file,
-                component,
-                &ctx.spec.target,
-            )
-            || (component == ctx.spec.target.identifier()
-                && matches!(
-                    node.kind(),
-                    "qualified_identifier" | "scoped_type_identifier"
-                )
-                && cpp_template_reference_arguments(node, ctx.source).is_some()
-                && ctx
-                    .analyzer
-                    .type_alias_provider()
-                    .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
-                && physically_visible_type_target(ctx).is_some())
+    type_reference_component_list_may_name_target(
+        &components,
+        global,
+        &ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        &ctx.spec.target,
+        &ctx.type_reference_component_names,
+    )
+}
+
+fn type_reference_component_list_may_name_target(
+    components: &[String],
+    global: bool,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    target: &CodeUnit,
+    reference_component_names: &HashSet<String>,
+) -> bool {
+    if components.iter().any(|component| {
+        visibility.type_reference_component_directly_names_target(component, target)
+    }) {
+        return true;
+    }
+    if components.iter().any(|component| {
+        visibility.parser_alias_name_may_resolve_to_target(file, component, target)
+    }) {
+        return true;
+    }
+    if components.len() > 1 {
+        return visibility.qualified_alias_reference_may_reach_target(
+            analyzer, file, components, global, target,
+        );
+    }
+    components
+        .iter()
+        .any(|component| reference_component_names.contains(component))
+}
+
+/// Fast structured admission before a type scan builds its parent and lexical
+/// indexes. Most inverse candidates merely include the target's header and do
+/// not contain a reference spelling; the full stateful scan has no work in
+/// those files. Only maximal grammar type names are tested so a common nested
+/// alias terminal such as `type` is considered together with its owner.
+fn file_may_reference_type_target(
+    root: Node<'_>,
+    source: &str,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    target: &CodeUnit,
+    reference_component_names: &HashSet<String>,
+) -> bool {
+    visit_file_type_reference_spellings(root, source, |components, global| {
+        type_reference_component_list_may_name_target(
+            components,
+            global,
+            analyzer,
+            visibility,
+            file,
+            target,
+            reference_component_names,
+        )
     })
+}
+
+fn visit_file_type_reference_spellings(
+    root: Node<'_>,
+    source: &str,
+    mut visit: impl FnMut(&[String], bool) -> bool,
+) -> bool {
+    let mut stopped = false;
+    walk_named_tree_preorder(root, true, |node| {
+        if node.kind() == "comment" {
+            return WalkControl::SkipChildren;
+        }
+        if node.kind() == "preproc_arg" {
+            stopped = object_macro_replacement_type_references(node, source)
+                .into_iter()
+                .any(|reference| visit(&reference.components, reference.global));
+            return if stopped {
+                WalkControl::Break
+            } else {
+                WalkControl::SkipChildren
+            };
+        }
+        if node.kind() == "field_declaration"
+            && let Some(return_type) = recovered_macro_return_type_node(node, source)
+        {
+            let components = [node_text(return_type, source).to_string()];
+            stopped = visit(&components, false);
+            if stopped {
+                return WalkControl::Break;
+            }
+        }
+        if let Some((type_node, _)) = recovered_macro_decorated_type_node(node) {
+            for candidate in [node, type_node] {
+                let Some((components, global)) = type_reference_components(candidate, source)
+                else {
+                    continue;
+                };
+                stopped = visit(&components, global);
+                if stopped {
+                    return WalkControl::Break;
+                }
+            }
+        }
+        let Some((components, global)) = type_reference_components(node, source) else {
+            return WalkControl::Continue;
+        };
+        if node.parent().is_some_and(|parent| {
+            (matches!(parent.kind(), "template_type" | "template_function")
+                && parent.child_by_field_name("name") == Some(node))
+                || (matches!(
+                    parent.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                ) && (parent.child_by_field_name("scope") == Some(node)
+                    || parent.child_by_field_name("name") == Some(node)))
+        }) {
+            return WalkControl::Continue;
+        }
+        stopped = visit(&components, global);
+        if stopped {
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    stopped
 }
 
 /// Whether this file decides the reference against the scan target.

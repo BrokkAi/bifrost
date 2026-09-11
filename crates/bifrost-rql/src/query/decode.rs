@@ -10,8 +10,10 @@ use super::ir::{
     MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
     MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES,
+    MAX_ROW_PROJECTION_COLUMNS, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter,
+    OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral,
+    QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn,
     QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter,
     ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
     ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate,
@@ -1430,6 +1432,238 @@ fn decode_receiver_type(
         .map(|identity| identity.map(ResolvedCallReceiverType::Exact))
 }
 
+fn decode_row_name(value: &Value, path: &str, what: &str) -> Result<String, QueryError> {
+    let Some(name) = value.as_str() else {
+        return Err(QueryError::new(path, format!("{what} must be a string")));
+    };
+    if name.is_empty() || name.len() > super::ir::MAX_ROW_FIELD_NAME_LENGTH {
+        return Err(QueryError::new(
+            path,
+            format!(
+                "{what} must contain from 1 through {} bytes",
+                super::ir::MAX_ROW_FIELD_NAME_LENGTH
+            ),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn decode_row_literal(value: &Value, path: &str) -> Result<QueryRowLiteral, QueryError> {
+    let object = as_object(value, path)?;
+    if object.len() != 1 {
+        return Err(QueryError::new(
+            path,
+            "row literal must contain exactly one of string, integer, boolean, or enum",
+        ));
+    }
+    if let Some(value) = object.get("string") {
+        return value
+            .as_str()
+            .map(|value| QueryRowLiteral::String(value.to_owned()))
+            .ok_or_else(|| QueryError::new(child_path(path, "string"), "expected a string"));
+    }
+    if let Some(value) = object.get("integer") {
+        return value.as_u64().map(QueryRowLiteral::Integer).ok_or_else(|| {
+            QueryError::new(
+                child_path(path, "integer"),
+                "expected a non-negative integer",
+            )
+        });
+    }
+    if let Some(value) = object.get("boolean") {
+        return value
+            .as_bool()
+            .map(QueryRowLiteral::Boolean)
+            .ok_or_else(|| QueryError::new(child_path(path, "boolean"), "expected a boolean"));
+    }
+    if let Some(value) = object.get("enum") {
+        return value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(|value| QueryRowLiteral::ConstrainedEnum(value.to_owned()))
+            .ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "enum"),
+                    "expected a non-empty constrained-enum label",
+                )
+            });
+    }
+    Err(QueryError::new(
+        path,
+        "unknown row literal; expected string, integer, boolean, or enum",
+    ))
+}
+
+fn decode_row_predicates(value: &Value, path: &str) -> Result<Vec<QueryRowPredicate>, QueryError> {
+    let entries = value.as_array().ok_or_else(|| {
+        QueryError::new(path, "row predicates must be an array of predicate objects")
+    })?;
+    if entries.is_empty() || entries.len() > MAX_ROW_PREDICATES {
+        return Err(QueryError::new(
+            path,
+            format!("row predicates must contain from 1 through {MAX_ROW_PREDICATES} entries"),
+        ));
+    }
+    let mut predicates = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let object = as_object(entry, &entry_path)?;
+        for key in object.keys() {
+            if !matches!(key.as_str(), "field" | "op" | "value" | "values") {
+                return Err(QueryError::new(
+                    child_path(&entry_path, key),
+                    "unknown field in row predicate",
+                ));
+            }
+        }
+        let field = decode_row_name(
+            object.get("field").ok_or_else(|| {
+                QueryError::new(
+                    child_path(&entry_path, "field"),
+                    "required field is missing",
+                )
+            })?,
+            &child_path(&entry_path, "field"),
+            "row predicate field",
+        )?;
+        let op_path = child_path(&entry_path, "op");
+        let op_label = object
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| QueryError::new(&op_path, "required operator string is missing"))?;
+        let op = QueryRowPredicateOp::from_label(&op_label.replace('_', "-")).ok_or_else(|| {
+            QueryError::new(
+                &op_path,
+                format!(
+                    "row predicate operator must be one of {}",
+                    QueryRowPredicateOp::ALL
+                        .iter()
+                        .map(|op| op.label().replace('-', "_"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        })?;
+        let operand = match op {
+            QueryRowPredicateOp::IsNull | QueryRowPredicateOp::IsNotNull => {
+                if object.contains_key("value") || object.contains_key("values") {
+                    return Err(QueryError::new(
+                        &entry_path,
+                        "null row predicates take no operand",
+                    ));
+                }
+                QueryRowPredicateOperand::None
+            }
+            QueryRowPredicateOp::In => {
+                if object.contains_key("value") {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "value"),
+                        "in takes values, not value",
+                    ));
+                }
+                let values_path = child_path(&entry_path, "values");
+                let values = object
+                    .get("values")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| QueryError::new(&values_path, "in requires a literal array"))?;
+                if values.is_empty() || values.len() > MAX_ROW_PREDICATE_SET_MEMBERS {
+                    return Err(QueryError::new(
+                        &values_path,
+                        format!(
+                            "row membership set must contain from 1 through {MAX_ROW_PREDICATE_SET_MEMBERS} literals"
+                        ),
+                    ));
+                }
+                QueryRowPredicateOperand::Set(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            decode_row_literal(value, &index_path(&values_path, index))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            _ => {
+                if object.contains_key("values") {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "values"),
+                        "comparison takes value, not values",
+                    ));
+                }
+                let value_path = child_path(&entry_path, "value");
+                let value = object.get("value").ok_or_else(|| {
+                    QueryError::new(&value_path, "comparison requires an operand")
+                })?;
+                if let Some(field) = value
+                    .as_object()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.get("field"))
+                {
+                    QueryRowPredicateOperand::Field(decode_row_name(
+                        field,
+                        &child_path(&value_path, "field"),
+                        "row operand field",
+                    )?)
+                } else {
+                    QueryRowPredicateOperand::Literal(decode_row_literal(value, &value_path)?)
+                }
+            }
+        };
+        predicates.push(QueryRowPredicate { field, op, operand });
+    }
+    Ok(predicates)
+}
+
+fn decode_row_projection_columns(
+    value: &Value,
+    path: &str,
+) -> Result<Vec<QueryRowProjectionColumn>, QueryError> {
+    let entries = value.as_array().ok_or_else(|| {
+        QueryError::new(path, "row projection columns must be an array of objects")
+    })?;
+    if entries.is_empty() || entries.len() > MAX_ROW_PROJECTION_COLUMNS {
+        return Err(QueryError::new(
+            path,
+            format!(
+                "row projection columns must contain from 1 through {MAX_ROW_PROJECTION_COLUMNS} entries"
+            ),
+        ));
+    }
+    let mut columns = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let object = as_object(entry, &entry_path)?;
+        for key in object.keys() {
+            if !matches!(key.as_str(), "source" | "name") {
+                return Err(QueryError::new(
+                    child_path(&entry_path, key),
+                    "unknown field in row projection column",
+                ));
+            }
+        }
+        let source = decode_row_name(
+            object.get("source").ok_or_else(|| {
+                QueryError::new(
+                    child_path(&entry_path, "source"),
+                    "required field is missing",
+                )
+            })?,
+            &child_path(&entry_path, "source"),
+            "row projection source",
+        )?;
+        let name = decode_row_name(
+            object.get("name").ok_or_else(|| {
+                QueryError::new(child_path(&entry_path, "name"), "required field is missing")
+            })?,
+            &child_path(&entry_path, "name"),
+            "row projection output",
+        )?;
+        columns.push(QueryRowProjectionColumn { source, name });
+    }
+    Ok(columns)
+}
+
 fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError> {
     let entries = value
         .as_array()
@@ -1463,6 +1697,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             )
         })?;
         let mut step = match op {
+            super::schema::QueryStepOp::Filter => QueryStep::Filter(Vec::new()),
+            super::schema::QueryStepOp::Project => QueryStep::Project(Vec::new()),
             super::schema::QueryStepOp::Typestate => {
                 let protocol_ref_path = child_path(&entry_path, "protocol_ref");
                 let protocol_ref = object
@@ -1540,6 +1776,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let call_input = matches!(step, QueryStep::CallInput(_));
         let resolved_call = matches!(step, QueryStep::ResolvedCall(_));
         let call_argument = matches!(step, QueryStep::CallArgument(_));
+        let row_filter = matches!(step, QueryStep::Filter(_));
+        let row_project = matches!(step, QueryStep::Project(_));
         let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
         let field_write_value = matches!(step, QueryStep::FieldWriteValue(_));
         let keyed_read_value = matches!(step, QueryStep::KeyedReadValue(_));
@@ -1587,6 +1825,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 ) if resolved_call => {}
                 Some(QueryStepField::FormalName | QueryStepField::FormalIndex) if call_argument => {
                 }
+                Some(QueryStepField::RowWhere) if row_filter => {}
+                Some(QueryStepField::Columns) if row_project => {}
                 Some(
                     QueryStepField::Identity
                     | QueryStepField::ElementName
@@ -1715,7 +1955,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CallProof
                     | QueryStepField::ReceiverType
                     | QueryStepField::FormalName
-                    | QueryStepField::FormalIndex,
+                    | QueryStepField::FormalIndex
+                    | QueryStepField::RowWhere
+                    | QueryStepField::Columns,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -1725,7 +1967,27 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
             }
         }
-        if resolved_call {
+        if row_filter {
+            step = QueryStep::Filter(decode_row_predicates(
+                object.get("where").ok_or_else(|| {
+                    QueryError::new(
+                        child_path(&entry_path, "where"),
+                        "required field is missing",
+                    )
+                })?,
+                &child_path(&entry_path, "where"),
+            )?);
+        } else if row_project {
+            step = QueryStep::Project(decode_row_projection_columns(
+                object.get("columns").ok_or_else(|| {
+                    QueryError::new(
+                        child_path(&entry_path, "columns"),
+                        "required field is missing",
+                    )
+                })?,
+                &child_path(&entry_path, "columns"),
+            )?);
+        } else if resolved_call {
             let resolves_to = decode_call_identity(object, &entry_path, "resolves_to", true)?
                 .expect("required call identity decoded");
             let proof_path = child_path(&entry_path, "call_proof");

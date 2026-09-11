@@ -35,6 +35,8 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 
 | RQL wrapper | JSON step | Input → output | Use it to |
 | --- | --- | --- | --- |
+| `filter` | `filter` | typed row → same row | Retain rows satisfying a bounded conjunction over the public row schema. |
+| `project` | `project` | typed row → selected row fields | Select and rename the exact fields a relational binding publishes, preserving their public type, nullability, enum domain, source, and evidence anchor. |
 | `enclosing-decl` | `enclosing_decl` | structural match → indexed declaration | Find the smallest real declaration that contains a matching expression. |
 | `procedure-of` | `procedure_of` | structural match or declaration → procedure | Resolve the unique smallest executable procedure enclosing the exact input range. |
 | `cfg-entry` | `cfg_entry` | procedure → program point | Return the validated entry boundary. |
@@ -56,6 +58,10 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `receiver-targets` | `receiver_targets` | structural match, reference site, call site, or expression site → receiver analysis | Analyze the receiver extracted from a call/member site or an exact receiver expression. |
 | `points-to` | `points_to` | structural match, reference site, or expression site → receiver analysis | Return bounded value/allocation/factory provenance for an expression. |
 | `member-targets` | `member_targets` | structural match or reference site → receiver analysis | Return exact member declarations selected through the receiver candidates. |
+| `receiver-outcome` | `receiver_outcome` | ordinary call/member site or receiver analysis → receiver outcome | Analyze a site directly, or project an existing analysis, into one mandatory terminal outcome row. |
+| `receiver-evidence` | `receiver_evidence` | ordinary call/member site or receiver analysis → receiver evidence | Analyze a site directly, or project an existing analysis, into parent-linked evidence rows. |
+| `receiver-outcome` | `receiver_outcome` | ordinary call/member site or receiver analysis → receiver outcome | Analyze a site directly, or project an existing analysis, into one mandatory terminal outcome row. |
+| `receiver-evidence` | `receiver_evidence` | ordinary call/member site or receiver analysis → receiver evidence | Analyze a site directly, or project an existing analysis, into parent-linked evidence rows. |
 | `occurrences` | `occurrences` | (source) → occurrence | Seed classified identifier occurrences straight from workspace facts, filtered by `class`, `role`, and `namespace`. |
 | `occurrences-in` | `occurrences_in` | structural match or file → occurrence | Return the occurrences lexically inside a matching node or a file. |
 | `occurrences-of` | `occurrences_of` | declaration → occurrence | Return the declaration's own name occurrence plus every reference-class occurrence resolving to it. |
@@ -80,6 +86,14 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, input expression, or receiver analysis to its project file. |
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
+
+Row-local steps are schema checked before execution. In RQL, `(filter :where
+((target_count gt 0)) QUERY)` uses unqualified field names because the pipeline
+has one current row. `(project :columns (ast_id (target_count candidates))
+QUERY)` publishes `ast_id` and renamed `candidates` fields to a relational
+binding; later filters use those projected names. JSON uses typed literal
+objects and `{ "field": "NAME" }` for a second-field operand. See the RQL and
+JSON references for the full operator, literal, and bound tables.
 
 For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Typed Set Composition](/code-query-tutorials/set-composition/) for executable union, intersection, and subtraction over import traversal, and [Reference Traversal](/code-query-tutorials/reference-traversal/) for exact declaration edges. For bounded receiver values and members, see the executable [Receiver Traversal](/code-query-tutorials/receiver-traversal/) cookbook.
 

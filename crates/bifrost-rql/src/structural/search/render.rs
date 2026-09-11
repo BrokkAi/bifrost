@@ -35,6 +35,7 @@ pub(super) fn insert_pipeline_row(
         value,
         traces,
         provenance_truncated: truncated,
+        row_projection: Vec::new(),
     });
 }
 
@@ -247,6 +248,7 @@ pub(super) fn render_pipeline_item(
         value,
         provenance,
         provenance_truncated: row.provenance_truncated,
+        row_projection: row.row_projection,
     }
 }
 
@@ -265,6 +267,7 @@ pub(super) fn render_provenance(
             .map(|step| CodeQueryProvenanceStep {
                 op: step.op.label(),
                 result: match &step.value {
+                    PipelineTraceValue::StructuralMatch(seed) => render_seed_ref(seed, detail),
                     PipelineTraceValue::Declaration(declaration) => {
                         render_declaration_ref(analyzer, declaration, detail, cache)
                     }
@@ -1843,6 +1846,7 @@ pub(super) fn augment_public_result_with_semantic_overlay(
             },
             provenance: Vec::new(),
             provenance_truncated: false,
+            row_projection: Vec::new(),
         });
         retained = retained.saturating_add(1);
     }

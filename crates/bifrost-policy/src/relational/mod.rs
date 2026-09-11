@@ -30,7 +30,6 @@ pub use coverage::{
     MAX_RETAINED_RELATIONAL_OBLIGATIONS, RelationCoverage, RelationalInput, RelationalObligation,
     RelationalObligationKind,
 };
-pub(crate) use eval::ReplayRow;
 pub use eval::{
     MAX_VIOLATION_REPRESENTATIVE_TUPLES, RelationalAssertionEvaluation,
     RelationalAssertionEvaluationError, RelationalAssertionViolation, RelationalEvaluationWork,
@@ -41,10 +40,11 @@ pub use introspect::{
     RelationSchemaCatalog, admitted_expansions, relation_domain_schema, relation_schema_catalog,
 };
 pub use ir::{
-    ALL_ROW_EXPANSION_STEPS, IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp,
-    IrEquiKey, IrField, IrJoinKind, IrLimits, IrOperand, IrOrderedSequence, IrOrderedSequencePair,
-    IrPredicate, IrProjection, IrRelation, IrRelationId, IrRelationOp, IrSchema,
-    MAX_IR_SET_MEMBERS, RelationalPlanIr, RowScalar, domain_schema, expansion_result_domain,
+    ALL_RQL_RELATION_EXPANSION_STEPS, IrAggregate, IrAggregateOp, IrAssertion, IrColumn,
+    IrCompareOp, IrEquiKey, IrField, IrJoinKind, IrLimits, IrOperand, IrOrderedSequence,
+    IrOrderedSequencePair, IrPredicate, IrProjection, IrRelation, IrRelationId, IrRelationOp,
+    IrSchema, MAX_IR_SET_MEMBERS, RelationalPlanIr, RowScalar, domain_schema,
+    expansion_result_domain, query_schema,
 };
 pub use lower::lower_relational_assertion_plan;
 pub(crate) use occurrence::lower_occurrence_assert;

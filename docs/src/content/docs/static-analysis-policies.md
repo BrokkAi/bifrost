@@ -448,9 +448,9 @@ only languages that provably have no intersection are rejected statically.
 
 ### Receiver-Type Constraints
 
-In an endpoint selector, `resolved-call :receiver-type` constrains the resolved
-declaring owner of the selected member. Assertion plans provide the same
-constraint on their relational `call` record. In both places it is an
+In an endpoint selector or a relational binding query, `resolved-call
+:receiver-type` constrains the resolved declaring owner of the selected member.
+In both places it is an
 owner-membership constraint, not a constraint on the syntactic receiver
 expression or on the complete set of runtime values that might arrive at the
 call.
@@ -473,7 +473,7 @@ by that language's typed hierarchy:
 ```
 
 Inside an assertion plan, put the same scalar or `(assignable-to ROOT)` value
-on `(call :over calls ... :receiver-type ...)`.
+on the `resolved-call` step inside the binding's `(rql ...)` query.
 
 For Java, `com.acme.Base` therefore matches a member owned by `Base` and by
 proven subclasses or interface implementations. It does not match an unrelated
@@ -1017,10 +1017,11 @@ requirement over an absent binding is simply skipped.
 
 The asserts above each address one captured token. An assertion policy can
 instead state an invariant over named relations of typed rows. It replaces
-`:subject` and `:asserts` with a plan: `(bind ...)` names one relation, either
-an RQL query or an expansion of an earlier binding; `(filter ...)` and
-`(project ...)` refine a named relation; `(join ...)` relates two relations by
-equal-typed registered fields; `(group ...)` groups the joined rows by
+`:subject` and `:asserts` with a plan: `(bind :name NAME :query (rql ...))`
+names the rows produced by one RQL query; row-local filtering, projection,
+call selection, argument selection, and analyzer expansion are steps inside
+that query; `(join ...)` relates two bindings by equal-typed registered fields;
+`(group ...)` groups the joined rows by
 registered fields and computes named `(aggregate ...)` values; and `(assert
 :group NAME :value NAME :cardinality ...)` bounds one aggregate in every group.
 A group that violates its assertion becomes one finding anchored at the exact
@@ -1048,8 +1049,11 @@ site_id: stable_id (join key)
 argument_index: integer
 ```
 
-Enum columns list their admitted values, and each domain ends with the
-`expansions: STEP -> DOMAIN` steps `(bind :from ... :step ...)` accepts.
+Enum columns list their admitted public values, and each domain ends with the
+`expansions: STEP -> DOMAIN` RQL steps that may extend a query producing that
+domain. The catalog prints canonical underscore step names such as
+`receiver_outcome`; authored RQL also accepts its hyphenated
+`receiver-outcome` spelling.
 
 The catalog is the source of truth; this page does not restate it. A field
 reference the catalog does not carry fails at policy load time, and the
@@ -1058,22 +1062,24 @@ carry.
 
 ##### Row predicates
 
-`:where` takes a bounded conjunction of typed row tests. Each test is one list,
+The RQL `(filter :where (...) QUERY)` step takes a bounded conjunction of typed
+row tests. Its field names are unqualified because the query carries exactly
+one current row schema. An aggregate's existing `:where` uses the same
+operators over qualified `BINDING.FIELD` references. Each test is one list,
 and the operator decides its shape:
 
-- `(BINDING.FIELD eq|ne|lt|le|gt|ge VALUE)` compares a field with a literal.
+- `(FIELD eq|ne|lt|le|gt|ge VALUE)` compares a query-row field with a literal.
   `eq` and `ne` are defined for every field; the four ordered operators need an
   integer field, because no other registry scalar carries an order that
   survives a rename.
-- `(BINDING.FIELD eq|ne|lt|le|gt|ge OTHER.FIELD)` compares two fields of the
-  same row instead. A symbol carrying a `.` is always a field reference, so
-  writing a bare registry value never becomes one by accident. Both fields must
-  hold the same scalar type.
-- `(BINDING.FIELD is-null)` and `(BINDING.FIELD is-not-null)` test presence.
+- `(FIELD eq|ne|lt|le|gt|ge (field OTHER-FIELD))` compares two fields of the
+  same query row instead. The explicit `field` form keeps a bare public enum
+  label unambiguous. Both fields must hold the same scalar type.
+- `(FIELD is-null)` and `(FIELD is-not-null)` test presence.
   They are admitted only over fields the row registry marks optional; over a
   field the registry always populates they would be constants, so they are an
   authoring error rather than a question.
-- `(BINDING.FIELD in (VALUE ...))` tests membership in a bounded literal set of
+- `(FIELD in (VALUE ...))` tests membership in a bounded literal set of
   one through 64 values.
 
 Every comparison against an absent value is false, including `ne`. Three-valued
@@ -1083,18 +1089,17 @@ when you mean absent.
 
 ##### Filtering and projecting a relation
 
-`(filter :over NAME :where (...))` narrows one named relation to the rows that
-satisfy every listed predicate. The relation keeps its name and its columns, so
-every later record reads the same `NAME.FIELD` columns whether or not a filter
-stands between them and the binding. A filter reads only the relation it
-narrows, so its predicates name that relation and nothing else.
+`(filter :where ((FIELD OP OPERAND) ...) QUERY)` keeps only rows satisfying
+every listed predicate. It preserves the query's row schema and its source and
+evidence anchors.
 
-`(project :name NEW :from NAME :columns (...))` publishes a new relation
-holding chosen columns of an existing one. Each column entry is either
-`NAME.FIELD`, which keeps the field name, or `(NAME.FIELD NEW-FIELD)`, which
-renames it. The projected columns are addressable under the projection's own
-name, and the relation it read is no longer addressable at all: a projection
-takes the place of its input rather than sitting beside it.
+`(project :columns (FIELD (FIELD NEW-FIELD) ...) QUERY)` selects the fields a
+relational binding publishes. A bare entry keeps its field name; a two-item
+entry renames it. The resulting schema contains exactly those fields, in the
+authored order, with each source field's scalar type, nullability, and public
+enum value domain. A later filter reads the projected names. A projection must
+be terminal apart from more projection or filter steps because analyzer steps
+consume a registered domain, not an arbitrary dynamic record.
 
 ##### Joins
 
@@ -1114,7 +1119,7 @@ the run reports an unmet obligation instead of a clean pass.
 ##### Aggregates
 
 The aggregate operations are `count`, `count-distinct`, `min`, `max`, `any`,
-`all`, and `ordered-equal`. `count` folds rows; `count-distinct` folds any
+`all`, `ordered-equal`, `set-equal`, and `subset`. `count` folds rows; `count-distinct` folds any
 column; `min` and `max` fold an integer column; `any` and `all` fold a boolean
 column to one or zero, so one cardinality assertion can state every fold. `any`
 is one when some contributing row is true, `all` is one when every contributing
@@ -1143,6 +1148,35 @@ matched on both sides, and two such projections have equal length by
 construction; joining on a correlation key instead -- one call site to one
 callable -- puts both complete sequences in the group.
 
+`set-equal` and `subset` compare two columns from the contributing rows as
+sets of distinct present values. Both columns must have the same stable-key
+type (`stable_id` or `declaration_identity`); display strings, integers,
+booleans, and enum labels are not identity keys. Duplicates and row order do
+not affect the result. Absent values do not contribute a set member.
+
+```lisp
+(aggregate :name same-targets :op set-equal
+  :left observed.target_id :right expected.target_id)
+(aggregate :name allowed-targets :op subset
+  :left observed.target_id :right expected.target_id)
+```
+
+`set-equal` yields one when the sets are equal. `subset` yields one when every
+left value occurs on the right. Otherwise they yield zero. Two empty sets are
+equal, and an empty left set is a subset of every right set. An empty source
+creates no group; a group's `:where` filter can leave an empty fold. Join on
+the group correlation key, not the compared values, to avoid discarding the
+very differences the assertion should find.
+
+The existing `max_values_per_group` bound limits contributing tuples before
+set construction, including duplicates. Truncation makes the result incomplete.
+An incomplete set comparison cannot publish a verdict; it reports
+`absence_requires_exhaustive_coverage` with the reasons that prevented a
+complete comparison. Relational execution also checks cancellation while
+loading rows, projecting, filtering, indexing and probing joins, building and
+folding groups, and checking assertions. Cancellation discards partial
+findings and reports an incomplete result with the `cancelled` reason.
+
 ##### A plan that uses the whole surface
 
 The rule below states that no member access rejects a candidate: the semi join
@@ -1158,9 +1192,12 @@ candidates the offending site actually weighed.
   :severity error
   :analysis (analysis
     :type assertion
-    (bind :name site :query (rql (occurrences :role [member_position])))
-    (bind :name outcome :from site :step receiver-outcome)
-    (bind :name selection :from site :step member-selection)
+    (bind :name site :query
+      (rql (occurrences :role [member_position])))
+    (bind :name outcome :query
+      (rql (receiver-outcome (occurrences :role [member_position]))))
+    (bind :name selection :query
+      (rql (member-selection (occurrences :role [member_position]))))
     (join :left site :right outcome :kind semi :on ((ast_id site_ast_id)))
     (join :left site :right selection :on ((ast_id site_ast_id)))
     (group :name by-site :by (site.ast_id)
@@ -2119,13 +2156,11 @@ read `unknown` as evidence of absence.
 `explain_finding` serves `match`, `assertion`, `flow`, and `taint` findings; a
 relational assertion finding explains its assertion, group key, contributing
 rows, and any coverage obligations. `explain_candidate` serves `match` and
-`assertion` policies, and a relational candidate reports the first row binding
-it is absent from. When a binding's query does return the candidate's row, the
-answer also replays every `filter` the plan attaches directly to that binding,
-and a filter that removed the row is reported as a `filter_predicate` node
-naming the predicate and the value the row carried. Joins, group keys, and
-aggregates are still not replayed, so a candidate that survives every binding
-and every such filter is `unknown`, never `satisfied`. The families each entry point does not serve — `typestate`
+`assertion` policies, and a relational candidate reports the first complete
+binding query it is absent from. Row-local RQL filters and projections execute
+as part of that binding query and are not a second policy-level replay stage.
+Joins, group keys, and aggregates are still not replayed, so a candidate that
+survives every binding is `unknown`, never `satisfied`. The families each entry point does not serve — `typestate`
 for `why`, and `flow`, `taint`, and `typestate` for `why-not` — are refused
 with an explicit adapter-unavailable answer that names the supported analysis
 types. `why-not` over a flow or taint policy is not a projection of anything
@@ -2222,7 +2257,7 @@ than explained from a differently-modeled run.
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
 | Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
-| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered; a relational `why-not` replays row-binding membership and the `filter` records attached to a binding, and reports the plan's joins, group keys, and aggregates as unreplayed |
+| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered; a relational `why-not` replays each complete RQL binding query as one membership decision and reports the plan's joins, group keys, and aggregates as unreplayed |
 | Near-miss ranking | `rank_near_misses` over `match` and `assertion` policies, published as `bifrost_policy_near_miss/v1`, plus the MCP `explain_policy` `near_misses` form and the CLI `--explain-near-misses N` flag | Distance is the count of unsatisfied declared predicates and nothing else; candidates are the caller's list or the policy's own seed scope, never a repository scan, and a seed with no kind union is refused; a relational subject that clears every row binding is `unknown`, because the joins, group keys, and aggregates are not replayed |
 | Model activation | Two routes, above; the CLI policy runner activates both | A `review_required` workspace model stays inert without an `enable` entry, reported as a warning |
 

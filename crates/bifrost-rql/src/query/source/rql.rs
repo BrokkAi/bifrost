@@ -187,17 +187,64 @@ fn validate_wrapper(
     let Some(query) = args.last() else {
         return;
     };
+    let mut step_path = None;
     if form.query_step_op().is_some() {
         let steps = query_to_json(query)
             .ok()
             .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
             .unwrap_or(0);
-        analysis.path(
-            format!("{}[{steps}]", rql_query_child_path(path, "steps")),
-            head_range.clone(),
-        );
+        let path = format!("{}[{steps}]", rql_query_child_path(path, "steps"));
+        analysis.path(&path, head_range.clone());
+        step_path = Some(path);
     }
     match form {
+        RqlForm::Filter | RqlForm::Project => {
+            let expected = if form == RqlForm::Filter {
+                ":where"
+            } else {
+                ":columns"
+            };
+            if args.len() != 3 || args[0].as_symbol() != Some(expected) {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    format!(
+                        "{} expects {expected}, a bounded value list, and a query",
+                        form.label()
+                    ),
+                );
+                return;
+            }
+            // Record the paths the typed validator reports against, so an
+            // error in one predicate or column lands on that source range and
+            // not on the step keyword.
+            let step_path = step_path.expect("filter and project are query steps");
+            let Some(entries) = args[1].as_list() else {
+                return;
+            };
+            for (index, entry) in entries.iter().enumerate() {
+                if form == RqlForm::Filter {
+                    let predicate_path = format!("{step_path}.where[{index}]");
+                    analysis.path(&predicate_path, entry.range.clone());
+                    let Some(parts) = entry.as_list() else {
+                        continue;
+                    };
+                    for (part, label) in parts.iter().zip(["field", "op", "value"]) {
+                        analysis.path(format!("{predicate_path}.{label}"), part.range.clone());
+                    }
+                    if let Some(members) = parts.get(2).and_then(|value| value.as_list()) {
+                        for (member_index, member) in members.iter().enumerate() {
+                            analysis.path(
+                                format!("{predicate_path}.values[{member_index}]"),
+                                member.range.clone(),
+                            );
+                        }
+                    }
+                } else {
+                    analysis.path(format!("{step_path}.columns[{index}]"), entry.range.clone());
+                }
+            }
+        }
         RqlForm::Where => {
             let values = &args[..args.len().saturating_sub(1)];
             if values.is_empty() {
@@ -2511,6 +2558,8 @@ fn validate_property_value(
         | super::schema::ValueShape::CallIdentity
         | super::schema::ValueShape::ReceiverTypeConstraint
         | super::schema::ValueShape::CallProof
+        | super::schema::ValueShape::RowPredicates
+        | super::schema::ValueShape::RowProjectionColumns
         | super::schema::ValueShape::JsxElementIdentity => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }

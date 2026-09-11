@@ -14,6 +14,7 @@ use crate::definition::RelationalAssertionPlan;
 use crate::relational::{
     IrLimits, evaluate_plan_ir, lower_relational_assertion_plan, validate_limits, validate_plan_ir,
 };
+use brokk_bifrost_analysis::CancellationToken;
 
 pub use crate::relational::{
     RelationalAssertionEvaluation, RelationalAssertionEvaluationError,
@@ -43,6 +44,7 @@ pub fn validate_relational_assertion_plan(
 pub fn evaluate_relational_assertion_rows(
     plan: &RelationalAssertionPlan,
     inputs: &[RelationalInput<'_>],
+    cancellation: Option<&CancellationToken>,
 ) -> Result<RelationalAssertionEvaluation, RelationalAssertionEvaluationError> {
     let invalid =
         |error: RelationalAssertionPlanError| RelationalAssertionEvaluationError::InvalidPlan {
@@ -50,7 +52,7 @@ pub fn evaluate_relational_assertion_rows(
         };
     let ir = lower_relational_assertion_plan(plan).map_err(invalid)?;
     validate_plan_ir(&ir).map_err(invalid)?;
-    evaluate_plan_ir(&ir, inputs)
+    evaluate_plan_ir(&ir, inputs, cancellation)
 }
 
 #[cfg(test)]
@@ -59,6 +61,7 @@ mod tests {
     use std::str::FromStr;
 
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_rql::QueryStep;
     use brokk_bifrost_rql::structural::search::{
         CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem, UnitRowItem,
     };
@@ -142,6 +145,7 @@ mod tests {
             value,
             provenance: Vec::new(),
             provenance_truncated: false,
+            row_projection: Vec::new(),
         })
     }
 
@@ -184,7 +188,6 @@ mod tests {
                     source_range: None,
                 },
             ],
-            derivations: Vec::new(),
             joins: vec![RowJoin {
                 left: site.clone(),
                 right: candidate.clone(),
@@ -208,6 +211,7 @@ mod tests {
                     op: RowAggregateOp::Count,
                     value: None,
                     sequences: None,
+                    sets: None,
                     predicate: Vec::new(),
                     source_range: None,
                 }],
@@ -230,16 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn validates_occurrence_to_receiver_evidence_expansion() {
+    fn validates_occurrence_to_receiver_evidence_query_steps() {
         let mut plan = valid_plan();
-        let site = plan.bindings[0].name.clone();
-        plan.bindings[1].source = RowBindingSource::Expansion {
-            from: site,
-            step: crate::definition::RowExpansionStep::ReceiverEvidence,
+        let RowBindingSource::Query(PolicySelector::Inline { query, .. }) =
+            &mut plan.bindings[1].source
+        else {
+            panic!("test binding uses an inline query")
         };
+        query
+            .plan
+            .steps
+            .push(QueryStep::ReceiverTargets(Default::default()));
+        query.plan.steps.push(QueryStep::ReceiverEvidence);
         plan.joins[0].on[0].right_field = "site_ast_id".to_string();
         validate_relational_assertion_plan(&plan)
-            .expect("member occurrences expand into receiver evidence rows");
+            .expect("member occurrences query receiver evidence rows");
     }
 
     /// The diagnostic must carry the complete alternative set and the flag that
@@ -325,32 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forward_expansion_binding() {
-        let plan = RelationalAssertionPlan {
-            bindings: vec![RowBinding {
-                name: name("receiver"),
-                source: RowBindingSource::Expansion {
-                    from: name("site"),
-                    step: crate::definition::RowExpansionStep::ReceiverEvidence,
-                },
-                source_range: None,
-            }],
-            derivations: Vec::new(),
-            joins: Vec::new(),
-            groups: Vec::new(),
-            assertions: Vec::new(),
-            limits: RelationalAssertionLimits::default(),
-        };
-        assert_eq!(
-            validate_relational_assertion_plan(&plan),
-            Err(RelationalAssertionPlanError::ForwardBinding {
-                binding: "receiver".to_string(),
-                referenced: "site".to_string(),
-            })
-        );
-    }
-
-    #[test]
     fn rejects_min_over_non_integer_field() {
         let mut plan = valid_plan();
         plan.groups[0].aggregates[0].op = RowAggregateOp::Min;
@@ -395,6 +378,7 @@ mod tests {
                     coverage: RelationCoverage::Exhaustive,
                 },
             ],
+            None,
         )
         .unwrap();
         assert!(clean.violations.is_empty());
@@ -414,6 +398,7 @@ mod tests {
                     coverage: RelationCoverage::Exhaustive,
                 },
             ],
+            None,
         )
         .unwrap();
         assert_eq!(finding.violations.len(), 1);
@@ -433,98 +418,11 @@ mod tests {
                     coverage: RelationCoverage::incomplete(Vec::new()),
                 },
             ],
+            None,
         )
         .unwrap();
         assert!(incomplete.violations.is_empty());
         assert!(!incomplete.exhaustive);
-    }
-
-    /// The authored `(filter ...)` and `(project ...)` records change what the
-    /// evaluation sees, not only what the plan says.
-    ///
-    /// Both plans read the same two rows. Without a derivation the group
-    /// counts both and violates; a filter that keeps one row makes the same
-    /// group satisfy the same assertion, and a projection that renames the
-    /// filtered relation's columns changes nothing about the answer.
-    #[test]
-    fn authored_filters_and_projections_change_the_evaluated_rows() {
-        fn plan_with(derivation: &str, right: &str) -> RelationalAssertionPlan {
-            let source = format!(
-                r#"(policy
-                  :id "test.relational.derivation" :name "Derivation" :message "M"
-                  :severity warning
-                  :analysis (analysis :type assertion
-                    (bind :name site :query
-                      (rql (occurrences :role [member_position])))
-                    (bind :name cand :query
-                      (rql (occurrences :role [member_position])))
-                    {derivation}
-                    (join :left site :right {right} :on ((ast_id ast_id)))
-                    (group :name by-site :by (site.ast_id)
-                      (aggregate :name winners :op count))
-                    (assert :group by-site :value winners
-                      :cardinality (exactly 1))))"#
-            );
-            let parsed = crate::parse_rqlp_source(
-                &source,
-                crate::PolicySourceIdentity::new("test:derivation"),
-            )
-            .expect("the derivation policy parses");
-            let crate::RqlpDocument::Policy { definition } = parsed.document() else {
-                panic!("expected policy")
-            };
-            let crate::PolicyAnalysis::Assertion { spec } = &definition.analysis else {
-                panic!("expected assertion policy")
-            };
-            spec.relational.clone().expect("relational plan")
-        }
-
-        let site_rows = vec![occurrence("site", "ast-1")];
-        let candidate_rows = vec![
-            occurrence("candidate-1", "ast-1"),
-            occurrence("candidate-2", "ast-1"),
-        ];
-        let evaluate = |plan: &RelationalAssertionPlan| {
-            let inputs = vec![
-                RelationalInput {
-                    binding: &plan.bindings[0].name,
-                    rows: &site_rows,
-                    coverage: RelationCoverage::Exhaustive,
-                },
-                RelationalInput {
-                    binding: &plan.bindings[1].name,
-                    rows: &candidate_rows,
-                    coverage: RelationCoverage::Exhaustive,
-                },
-            ];
-            evaluate_relational_assertion_rows(plan, &inputs).expect("evaluation")
-        };
-
-        let plain = evaluate(&plan_with("", "cand"));
-        assert_eq!(plain.violations.len(), 1);
-        assert_eq!(plain.violations[0].actual, 2, "both rows reach the group");
-
-        let filtered = evaluate(&plan_with(
-            r#"(filter :over cand :where ((cand.id eq "candidate-1")))"#,
-            "cand",
-        ));
-        assert!(
-            filtered.violations.is_empty(),
-            "the filter removed the second row before the join: {:?}",
-            filtered.violations
-        );
-        assert!(filtered.exhaustive);
-
-        let projected = evaluate(&plan_with(
-            r#"(filter :over cand :where ((cand.id eq "candidate-1")))
-                    (project :name narrow :from cand :columns (cand.ast_id (cand.id key)))"#,
-            "narrow",
-        ));
-        assert!(
-            projected.violations.is_empty(),
-            "a projection carries the filtered rows under its own name: {:?}",
-            projected.violations
-        );
     }
 
     fn call_argument(site: &str, index: usize, name: &str) -> UnitRowItem {
@@ -591,7 +489,6 @@ mod tests {
                     source_range: None,
                 },
             ],
-            derivations: Vec::new(),
             joins: vec![RowJoin {
                 left: arg.clone(),
                 right: param.clone(),
@@ -613,6 +510,7 @@ mod tests {
                 aggregates: vec![RowAggregate {
                     name: parity.clone(),
                     op: RowAggregateOp::OrderedEqual,
+                    sets: None,
                     value: None,
                     sequences: Some(crate::definition::RowOrderedSequencePair {
                         left: crate::definition::RowOrderedSequence {
@@ -681,6 +579,7 @@ mod tests {
                     coverage: RelationCoverage::Exhaustive,
                 },
             ],
+            None,
         )
         .unwrap();
         // The assertion demands parity, so a violation carries the aggregate's
@@ -780,6 +679,7 @@ mod tests {
                     coverage: RelationCoverage::Exhaustive,
                 },
             ],
+            None,
         )
         .unwrap();
         assert!(outcome.limit_exceeded);

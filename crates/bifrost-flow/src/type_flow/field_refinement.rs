@@ -65,35 +65,16 @@ struct State {
 }
 
 impl State {
-    fn copy(
-        &mut self,
-        source: ValueId,
-        target: ValueId,
-        tracked: &HashSet<ValueId>,
-        budget: &mut SemanticBudget,
-        cancellation: &CancellationToken,
-    ) -> Result<(), CorrelationError> {
+    fn copy(&mut self, source: ValueId, target: ValueId, tracked: &HashSet<ValueId>) {
         if source == target || !tracked.contains(&target) {
-            return Ok(());
+            return;
         }
-        if self.origins.contains_key(&source) {
-            check_cancelled(cancellation)?;
-            let origin_count = self
-                .origins
-                .get(&source)
-                .expect("the source origin remains present")
-                .len();
-            charge_entries(budget, origin_count.saturating_add(1))?;
-            let origins = self
-                .origins
-                .get(&source)
-                .expect("the source origin remains present")
-                .clone();
+        if let Some(origins) = self.origins.get(&source) {
+            let origins = origins.clone();
             self.origins.insert(target, origins);
         } else {
             self.origins.remove(&target);
         }
-        Ok(())
     }
 
     fn is_receiver(&self, value: ValueId) -> bool {
@@ -102,27 +83,18 @@ impl State {
             .is_some_and(|origins| origins.len() == 1 && origins.contains(&Origin::Receiver))
     }
 
-    fn open(
-        &mut self,
-        point: ProgramPointId,
-        event: usize,
-        budget: &mut SemanticBudget,
-        cancellation: &CancellationToken,
-    ) -> Result<(), CorrelationError> {
+    fn open(&mut self, point: ProgramPointId, event: usize) {
         self.origins.retain(|_, origins| {
             origins
                 .iter()
                 .all(|origin| matches!(origin, Origin::Receiver | Origin::PureTruthiness))
         });
         for field in &mut self.fields {
-            check_cancelled(cancellation)?;
-            charge_entries(budget, 1)?;
             *field = vec![FieldAlternative {
                 version: FieldVersion::Open { point, event },
                 guards: Vec::new(),
             }];
         }
-        Ok(())
     }
 
     fn join(
@@ -132,9 +104,7 @@ impl State {
         cancellation: &CancellationToken,
     ) -> Result<bool, CorrelationError> {
         check_cancelled(cancellation)?;
-        charge_entries(budget, self.size().saturating_add(1))?;
-        let incoming_origin_count = other.origins.values().map(HashSet::len).sum::<usize>();
-        charge_entries(budget, incoming_origin_count)?;
+        let before_size = self.size();
         let before = self.clone();
         self.origins.retain(|value, origins| {
             if let Some(incoming) = other.origins.get(value) {
@@ -163,10 +133,13 @@ impl State {
                             .iter()
                             .all(|guard| old.guards.contains(guard))
                 });
-                charge_entries(budget, 1usize.saturating_add(alternative.guards.len()))?;
                 field.push(alternative.clone());
             }
         }
+        // The join keeps this state, so it is charged for what it now holds
+        // beyond what it held before.  A join that only removes entries
+        // retains nothing new.
+        charge_entries(budget, self.size().saturating_sub(before_size))?;
         Ok(*self != before)
     }
 
@@ -194,6 +167,11 @@ struct FieldAccesses {
     /// carrying its versions costs state that no answer depends on.
     version_slots: Vec<Option<usize>>,
     version_slot_count: usize,
+    /// The `guard_facts()` indexes of the guards that test at each point.
+    /// An edge refines only the guards at the point it leaves, so scanning
+    /// every guard fact per edge repeats the whole guard list once per edge
+    /// traversal for the same answer.
+    guards_by_point: HashMap<ProgramPointId, Vec<usize>>,
 }
 
 impl FieldAccesses {
@@ -302,6 +280,15 @@ impl FieldAccesses {
                 }
             }
         }
+        let mut guards_by_point = HashMap::<ProgramPointId, Vec<usize>>::default();
+        for (guard_index, guard) in procedure.semantics().guard_facts().iter().enumerate() {
+            check_cancelled(cancellation)?;
+            charge_entries(budget, 1)?;
+            guards_by_point
+                .entry(guard.point)
+                .or_default()
+                .push(guard_index);
+        }
         Ok(Self {
             members,
             tracked,
@@ -311,6 +298,7 @@ impl FieldAccesses {
             locations,
             version_slots,
             version_slot_count,
+            guards_by_point,
         })
     }
 }
@@ -387,13 +375,17 @@ fn tracked_values(
     Ok(tracked)
 }
 
+/// One point's effect on the flow state, and the loads it refines.
+///
+/// Nothing here is charged: the working state is the visit's own copy, and
+/// the caller charges what it keeps -- the state it stores and the load
+/// refinements it returns to the plan.
 fn transfer(
     procedure: &ProcedureHandle,
     snapshot: Option<&ValueFlowSnapshot>,
     accesses: &FieldAccesses,
     point: ProgramPointId,
     state: &mut State,
-    budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<Vec<FieldLoadRefinement>, CorrelationError> {
     let semantics = procedure.semantics();
@@ -406,10 +398,9 @@ fn transfer(
         .enumerate()
     {
         check_cancelled(cancellation)?;
-        charge_entries(budget, 1)?;
         match event.effect {
             SemanticEffect::Assignment { target, value } => {
-                state.copy(value, target, &accesses.tracked, budget, cancellation)?;
+                state.copy(value, target, &accesses.tracked);
             }
             SemanticEffect::ValueFlow {
                 source,
@@ -417,7 +408,7 @@ fn transfer(
                 kind,
             } => {
                 if kind.preserves_runtime_class() {
-                    state.copy(source, target, &accesses.tracked, budget, cancellation)?;
+                    state.copy(source, target, &accesses.tracked);
                 } else {
                     state.origins.remove(&target);
                 }
@@ -430,10 +421,8 @@ fn transfer(
                 {
                     let slot = accesses.version_slots[field]
                         .expect("a loaded member carries version state");
-                    charge_entries(budget, state.fields[slot].len().saturating_add(1))?;
                     let alternatives = state.fields[slot].clone();
                     if accesses.tracked.contains(&result) {
-                        charge_entries(budget, alternatives.len().saturating_add(1))?;
                         state.origins.insert(
                             result,
                             alternatives
@@ -445,7 +434,6 @@ fn transfer(
                                 .collect(),
                         );
                     }
-                    charge_entries(budget, 1)?;
                     loads.push(FieldLoadRefinement {
                         point,
                         result,
@@ -466,7 +454,7 @@ fn transfer(
                     // A descriptor can execute arbitrary code. The value it
                     // returns is distinct from any earlier receiver-field read.
                     if !pure {
-                        state.open(point, event_index, budget, cancellation)?;
+                        state.open(point, event_index);
                     }
                 }
             }
@@ -489,7 +477,6 @@ fn transfer(
                             })
                         });
                         check_cancelled(cancellation)?;
-                        charge_entries(budget, 1)?;
                         state.fields[slot] = vec![FieldAlternative {
                             version: FieldVersion::Store {
                                 point,
@@ -500,24 +487,24 @@ fn transfer(
                         }];
                     }
                 } else {
-                    state.open(point, event_index, budget, cancellation)?;
+                    state.open(point, event_index);
                 }
             }
             SemanticEffect::Invoke { call_site } => {
-                state.open(point, event_index, budget, cancellation)?;
+                state.open(point, event_index);
                 if let Some(result) = semantics.call_site(call_site).expect("a live call").result {
                     state.origins.remove(&result);
                 }
             }
             SemanticEffect::AsyncSuspend { .. } | SemanticEffect::Synchronization { .. } => {
-                state.open(point, event_index, budget, cancellation)?
+                state.open(point, event_index)
             }
             SemanticEffect::Gap { gap } => {
                 let gap = semantics.gap(gap).expect("a live gap");
                 if gap.impacts.contains(SemanticGapImpact::HeapWrite)
                     && !snapshot.is_some_and(|snapshot| snapshot.gap_is_discharged(gap.id))
                 {
-                    state.open(point, event_index, budget, cancellation)?;
+                    state.open(point, event_index);
                 }
             }
             _ => {}
@@ -526,21 +513,29 @@ fn transfer(
     Ok(loads)
 }
 
+/// One edge's guard refinement of the visit's working state.
+///
+/// Like [`transfer`], this charges nothing: the caller charges the state it
+/// keeps.
 fn refine_edge(
     procedure: &ProcedureHandle,
     accesses: &FieldAccesses,
     point: ProgramPointId,
     edge_id: crate::analyzer::semantic::ControlEdgeId,
     state: &mut State,
-    budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(), CorrelationError> {
-    for (guard_index, guard) in procedure.semantics().guard_facts().iter().enumerate() {
+    let Some(guard_indexes) = accesses.guards_by_point.get(&point) else {
+        return Ok(());
+    };
+    let guards = procedure.semantics().guard_facts();
+    for &guard_index in guard_indexes {
         check_cancelled(cancellation)?;
-        charge_entries(budget, 1)?;
-        if guard.point != point {
-            continue;
-        }
+        let guard = &guards[guard_index];
+        debug_assert_eq!(
+            guard.point, point,
+            "the guard index at a point tests at that point"
+        );
         let truth = if guard.true_edge == Some(edge_id) {
             true
         } else if guard.false_edge == Some(edge_id) {
@@ -560,7 +555,7 @@ fn refine_edge(
                     })
             })
         {
-            state.open(point, usize::MAX, budget, cancellation)?;
+            state.open(point, usize::MAX);
             continue;
         }
         let Some(origins) = origins else {
@@ -585,7 +580,6 @@ fn refine_edge(
                 version: alternative.version,
             }) && !alternative.guards.contains(&(guard_index, truth))
             {
-                charge_entries(budget, 1)?;
                 alternative.guards.push((guard_index, truth));
                 alternative.guards.sort_unstable();
             }
@@ -625,6 +619,14 @@ fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), Correla
     Ok(())
 }
 
+/// Derive the version alternatives each receiver-field load can observe.
+///
+/// `nested_entries` is charged for retained state alone: the entries stored
+/// per point for the fixpoint, whatever a join adds to a stored state, the
+/// per-procedure indexes, and the alternatives the returned refinements
+/// carry. The copy a visit and an edge work on is transient and is not
+/// charged; the propagation that makes those visits is charged one
+/// `control_edges` unit per edge traversal.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn derive(
     workspace: &WorkspaceAnalyzer,
@@ -685,11 +687,8 @@ pub(super) fn derive(
     while let Some(point) = pending.pop_front() {
         check_cancelled(cancellation)?;
         queued[point.index()] = false;
-        let state_size = incoming[point.index()]
-            .as_ref()
-            .expect("a scheduled point is reachable")
-            .size();
-        charge_entries(budget, state_size.saturating_add(1))?;
+        // The visit's working copy is transient.  What this fixpoint keeps is
+        // the state stored per point, charged where it is stored.
         let mut state = incoming[point.index()]
             .as_ref()
             .expect("a scheduled point is reachable")
@@ -700,14 +699,11 @@ pub(super) fn derive(
             &accesses,
             point,
             &mut state,
-            budget,
             cancellation,
         )?;
         for (edge_id, edge) in semantics.successor_edges(point) {
             check_cancelled(cancellation)?;
             charge_edges(budget, 1)?;
-            let state_size = state.size();
-            charge_entries(budget, state_size.saturating_add(1))?;
             let mut next = state.clone();
             refine_edge(
                 procedure,
@@ -715,19 +711,17 @@ pub(super) fn derive(
                 point,
                 edge_id,
                 &mut next,
-                budget,
                 cancellation,
             )?;
-            charge_entries(budget, next.size().saturating_sub(state_size))?;
             let changed = if let Some(old) = &mut incoming[edge.target_point.index()] {
                 old.join(&next, budget, cancellation)?
             } else {
+                charge_entries(budget, next.size())?;
                 incoming[edge.target_point.index()] = Some(next);
                 true
             };
             if changed && !queued[edge.target_point.index()] {
                 queued[edge.target_point.index()] = true;
-                charge_entries(budget, 1)?;
                 pending.push_back(edge.target_point);
             }
         }
@@ -735,21 +729,21 @@ pub(super) fn derive(
     let mut loads = Vec::new();
     for point in semantics.points() {
         check_cancelled(cancellation)?;
-        charge_entries(budget, 1)?;
-        if let Some(state) = incoming[point.id.index()].as_ref() {
-            charge_entries(budget, state.size().saturating_add(1))?;
-            let mut state = incoming[point.id.index()]
-                .take()
-                .expect("the state remained live after its size charge");
-            loads.extend(transfer(
+        if let Some(mut state) = incoming[point.id.index()].take() {
+            let refined = transfer(
                 procedure,
                 snapshot,
                 &accesses,
                 point.id,
                 &mut state,
-                budget,
                 cancellation,
-            )?);
+            )?;
+            // The refinements leave with the result, so they are charged for
+            // what they carry.
+            for refinement in &refined {
+                charge_entries(budget, refinement.alternatives.len().saturating_add(1))?;
+            }
+            loads.extend(refined);
         }
     }
     Ok(loads)

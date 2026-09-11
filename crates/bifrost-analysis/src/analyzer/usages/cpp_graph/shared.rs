@@ -200,6 +200,12 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
         let files = self.scan_files(overloads, scan_scope);
+        // Seed the request's immutable live-source and file-state snapshots
+        // before visibility asks the same declaration questions file by file.
+        // The authoritative batch path does this for its fixed roots already;
+        // a single-target query has the same fixed root set here.
+        let _ = self.cpp.analyzed_files();
+        self.cpp.bulk_file_states_for_query(files.iter().cloned());
         #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
         let dispatch = CppDispatch::new(analyzer, token);

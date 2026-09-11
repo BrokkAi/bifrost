@@ -166,7 +166,7 @@ impl TargetSpec {
             .as_ref()
             .is_some_and(|owner| target.identifier() == owner.identifier())
         {
-            // Kotlin constructors are indexed as synthetic `Owner.Owner`
+            // Kotlin constructors are indexed as source `Owner.Owner`
             // callables, so sharing the owner's spelling is what identifies one.
             TargetKind::Constructor
         } else {
@@ -234,6 +234,18 @@ impl TargetSpec {
             .as_ref()
             .is_none_or(|arities| arities.is_empty() || arities.iter().any(|a| a.accepts(arity)))
     }
+}
+
+/// Ordinary member lookup excludes constructors even though their declarations
+/// have real source ranges. Type-call resolution owns constructor selection.
+fn ordinary_callable(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> bool {
+    !unit.is_synthetic()
+        && (unit.is_function() || unit.is_field())
+        && !graph
+            .index
+            .signature_metadata(unit)
+            .iter()
+            .any(SignatureMetadata::callable_is_constructor)
 }
 
 /// Every arity `unit`'s recorded signatures accept.
@@ -680,7 +692,7 @@ pub fn bare_callable_unit(
     ctx.graph()
         .index
         .definitions(&fqn)
-        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+        .find(|unit| ordinary_callable(ctx.graph(), unit))
 }
 
 /// The member declaration `member_name` names on a receiver of type
@@ -742,8 +754,7 @@ fn declared_member_unit(
         .structural_members(owner.fq(), member_name)
         .into_iter()
         .find(|unit| {
-            !unit.is_synthetic()
-                && (unit.is_function() || unit.is_field())
+            ordinary_callable(graph, unit)
                 && arity.is_none_or(|arity| {
                     if !unit.is_function() {
                         return true;
@@ -782,7 +793,7 @@ pub fn visible_extension_unit(
     let unit = graph
         .index
         .definitions(&fqn)
-        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))?;
+        .find(|unit| ordinary_callable(graph, unit))?;
     (extension_receiver_fq_name(graph, token, &unit)? == owner_fqn).then_some(unit)
 }
 
@@ -880,8 +891,7 @@ pub fn owner_declares_member(
         .structural_members(owner.fq(), member_name)
         .into_iter()
         .any(|unit| {
-            !unit.is_synthetic()
-                && (unit.is_function() || unit.is_field())
+            ordinary_callable(graph, &unit)
                 && arity.is_none_or(|arity| {
                     if !unit.is_function() {
                         return true;
@@ -1041,10 +1051,8 @@ impl<'a> KotlinNameResolver<'a> {
         components: &[String],
         byte: usize,
     ) -> Option<String> {
-        self.resolve_components(components, byte, |unit| {
-            !unit.is_synthetic() && (unit.is_function() || unit.is_field())
-        })
-        .resolved()
+        self.resolve_components(components, byte, |unit| ordinary_callable(self.graph, unit))
+            .resolved()
     }
 
     pub fn new(

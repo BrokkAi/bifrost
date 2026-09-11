@@ -54,7 +54,7 @@
     {
       "path": "policies/go-data-race.rqlp",
       "id": "bifrost.correctness.go-data-race",
-      "semantic_hash": "1a32c1957d1e55260e9506c216f0b0cbdd854b8264436d7d06005a08dcd2c800",
+      "semantic_hash": "eb5432400ec0b5edecfb9a1f6485f6a29bb5ce8fb67a878c92c27e127cb22ed5",
       "category": "correctness",
       "supported_languages": [
         "go"
@@ -73,7 +73,7 @@
     {
       "path": "policies/go-nil-dereference.rqlp",
       "id": "bifrost.correctness.go-nil-dereference",
-      "semantic_hash": "1ba11d2cee5c025a03683f037e07509ab70752b058710bcba350d050a7ba78a0",
+      "semantic_hash": "e933fbff9821bbcc4883af11a2532440d2de04d75ab7784ff1b51d73e2184896",
       "category": "correctness",
       "supported_languages": [
         "go"

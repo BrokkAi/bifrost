@@ -442,6 +442,32 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             query.insert(head.to_string(), Value::Array(branches));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Filter => {
+            if items.len() != 4 || items[1].as_symbol() != Some(":where") {
+                return Err(lower_error(
+                    expr,
+                    "(filter ...) expects :where, a bounded predicate list, and a query",
+                ));
+            }
+            let predicates = row_predicates_value(&items[2])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("filter".to_string()));
+            step.insert("where".to_string(), predicates);
+            append_step(expr, &items[3], step)
+        }
+        RqlForm::Project => {
+            if items.len() != 4 || items[1].as_symbol() != Some(":columns") {
+                return Err(lower_error(
+                    expr,
+                    "(project ...) expects :columns, a bounded column list, and a query",
+                ));
+            }
+            let columns = row_projection_columns_value(&items[2])?;
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("project".to_string()));
+            step.insert("columns".to_string(), columns);
+            append_step(expr, &items[3], step)
+        }
         RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
         | RqlForm::CfgEntry
@@ -1982,6 +2008,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Union
         | RqlForm::Intersect
         | RqlForm::Except
+        | RqlForm::Filter
+        | RqlForm::Project
         | RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
         | RqlForm::CfgEntry
@@ -2508,6 +2536,175 @@ fn symbol_or_string(expr: &Expr) -> LowerResult<String> {
                 format!("expected symbol or string, got {}", describe_expr(expr)),
             )
         })
+}
+
+fn row_field_name(expr: &Expr, what: &str) -> LowerResult<String> {
+    let name = symbol_or_string(expr)?;
+    if name.is_empty() || name.len() > super::ir::MAX_ROW_FIELD_NAME_LENGTH {
+        return Err(lower_error(
+            expr,
+            format!(
+                "{what} must contain from 1 through {} bytes",
+                super::ir::MAX_ROW_FIELD_NAME_LENGTH
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+fn row_literal_value(expr: &Expr) -> LowerResult<Value> {
+    let mut literal = Map::new();
+    match &expr.kind {
+        ExprKind::String(value) => {
+            literal.insert("string".to_string(), Value::String(value.clone()));
+        }
+        ExprKind::Number(value) => {
+            literal.insert("integer".to_string(), Value::Number((*value).into()));
+        }
+        ExprKind::Symbol(value) if value == "true" || value == "false" => {
+            literal.insert("boolean".to_string(), Value::Bool(value == "true"));
+        }
+        ExprKind::Symbol(value) => {
+            literal.insert("enum".to_string(), Value::String(value.clone()));
+        }
+        ExprKind::List(_) | ExprKind::Vector(_) => {
+            return Err(lower_error(
+                expr,
+                "row literal must be a string, non-negative integer, boolean, or constrained-enum label",
+            ));
+        }
+    }
+    Ok(Value::Object(literal))
+}
+
+fn row_predicates_value(expr: &Expr) -> LowerResult<Value> {
+    let entries = expr
+        .as_sequence()
+        .ok_or_else(|| lower_error(expr, "row predicates must be a list or vector"))?;
+    if entries.is_empty() || entries.len() > super::ir::MAX_ROW_PREDICATES {
+        return Err(lower_error(
+            expr,
+            format!(
+                "row predicates must contain from 1 through {} entries",
+                super::ir::MAX_ROW_PREDICATES
+            ),
+        ));
+    }
+    let mut predicates = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let values = entry
+            .as_sequence()
+            .ok_or_else(|| lower_error(entry, "row predicate must be a list or vector"))?;
+        if !(2..=3).contains(&values.len()) {
+            return Err(lower_error(
+                entry,
+                "row predicate must contain two or three values",
+            ));
+        }
+        let field = row_field_name(&values[0], "row predicate field")?;
+        let operator = values[1]
+            .as_symbol()
+            .and_then(super::ir::QueryRowPredicateOp::from_label)
+            .ok_or_else(|| lower_error(&values[1], "unknown row predicate operator"))?;
+        let mut predicate = Map::new();
+        predicate.insert("field".to_string(), Value::String(field));
+        predicate.insert(
+            "op".to_string(),
+            Value::String(operator.label().replace('-', "_")),
+        );
+        match operator {
+            super::ir::QueryRowPredicateOp::IsNull | super::ir::QueryRowPredicateOp::IsNotNull => {
+                if values.len() != 2 {
+                    return Err(lower_error(entry, "null row predicates take no operand"));
+                }
+            }
+            super::ir::QueryRowPredicateOp::In => {
+                let Some(operand) = values.get(2) else {
+                    return Err(lower_error(entry, "in requires a bounded literal set"));
+                };
+                let members = operand.as_sequence().ok_or_else(|| {
+                    lower_error(operand, "row membership set must be a list or vector")
+                })?;
+                if members.is_empty() || members.len() > super::ir::MAX_ROW_PREDICATE_SET_MEMBERS {
+                    return Err(lower_error(
+                        operand,
+                        format!(
+                            "row membership set must contain from 1 through {} literals",
+                            super::ir::MAX_ROW_PREDICATE_SET_MEMBERS
+                        ),
+                    ));
+                }
+                predicate.insert(
+                    "values".to_string(),
+                    Value::Array(
+                        members
+                            .iter()
+                            .map(row_literal_value)
+                            .collect::<LowerResult<Vec<_>>>()?,
+                    ),
+                );
+            }
+            _ => {
+                let Some(operand) = values.get(2) else {
+                    return Err(lower_error(
+                        entry,
+                        "comparison row predicate requires an operand",
+                    ));
+                };
+                let value = if let Some(field_operand) = operand.as_sequence() {
+                    if field_operand.len() != 2 || field_operand[0].as_symbol() != Some("field") {
+                        return Err(lower_error(
+                            operand,
+                            "row field operand must use (field FIELD)",
+                        ));
+                    }
+                    json!({ "field": row_field_name(&field_operand[1], "row operand field")? })
+                } else {
+                    row_literal_value(operand)?
+                };
+                predicate.insert("value".to_string(), value);
+            }
+        }
+        predicates.push(Value::Object(predicate));
+    }
+    Ok(Value::Array(predicates))
+}
+
+fn row_projection_columns_value(expr: &Expr) -> LowerResult<Value> {
+    let entries = expr
+        .as_sequence()
+        .ok_or_else(|| lower_error(expr, "row projection columns must be a list or vector"))?;
+    if entries.is_empty() || entries.len() > super::ir::MAX_ROW_PROJECTION_COLUMNS {
+        return Err(lower_error(
+            expr,
+            format!(
+                "row projection columns must contain from 1 through {} entries",
+                super::ir::MAX_ROW_PROJECTION_COLUMNS
+            ),
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let (source, name) = if let Some(pair) = entry.as_sequence() {
+                if pair.len() != 2 {
+                    return Err(lower_error(
+                        entry,
+                        "renamed row projection column must contain source and output name",
+                    ));
+                }
+                (
+                    row_field_name(&pair[0], "row projection source")?,
+                    row_field_name(&pair[1], "row projection output")?,
+                )
+            } else {
+                let source = row_field_name(entry, "row projection source")?;
+                (source.clone(), source)
+            };
+            Ok(json!({ "source": source, "name": name }))
+        })
+        .collect::<LowerResult<Vec<_>>>()
+        .map(Value::Array)
 }
 
 fn call_identity_value(expr: &Expr, context: &str) -> LowerResult<Value> {

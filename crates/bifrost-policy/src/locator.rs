@@ -124,11 +124,11 @@ pub(super) fn resolve_policy_definition_locators(
     match &mut definition.analysis {
         PolicyAnalysis::Match { spec } => resolve_selector_locators(&mut spec.selector, analyzer),
         PolicyAnalysis::Assertion { spec } => {
-            resolve_selector_locators(&mut spec.subject, analyzer)?;
             if let Some(plan) = &mut spec.relational {
-                resolve_relational_assertion_plan(plan, analyzer)?;
+                resolve_relational_assertion_plan(plan, analyzer)
+            } else {
+                resolve_selector_locators(&mut spec.subject, analyzer)
             }
-            Ok(())
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
             resolve_taint_set(&mut spec.sources, analyzer)?;
@@ -272,14 +272,13 @@ pub(super) fn resolved_locator_metadata(
     match &definition.analysis {
         PolicyAnalysis::Match { spec } => collect_selector_locators(&spec.selector, &mut locators),
         PolicyAnalysis::Assertion { spec } => {
-            collect_selector_locators(&spec.subject, &mut locators);
             if let Some(plan) = &spec.relational {
                 for binding in &plan.bindings {
-                    if let RowBindingSource::Query(selector) = &binding.source {
-                        collect_selector_locators(selector, &mut locators);
-                    }
+                    let RowBindingSource::Query(selector) = &binding.source;
+                    collect_selector_locators(selector, &mut locators);
                 }
-                collect_row_derivation_locators(&plan.derivations, &mut locators);
+            } else {
+                collect_selector_locators(&spec.subject, &mut locators);
             }
         }
         PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
@@ -334,27 +333,15 @@ fn collect_selector_locators<'a>(
     }
 }
 
-fn collect_row_derivation_locators<'a>(
-    derivations: &'a [RowDerivation],
-    locators: &mut Vec<&'a ResolvedPolicyLocator>,
-) {
-    for derivation in derivations {
-        if let RowDerivation::Filter(filter) = derivation {
-            locators.extend(&filter.resolved_locators);
-        }
-    }
-}
-
 fn resolve_relational_assertion_plan(
     plan: &mut RelationalAssertionPlan,
     analyzer: Option<&dyn IAnalyzer>,
 ) -> Result<(), PolicySourceError> {
     for binding in &mut plan.bindings {
-        if let RowBindingSource::Query(selector) = &mut binding.source {
-            resolve_selector_locators(selector, analyzer)?;
-        }
+        let RowBindingSource::Query(selector) = &mut binding.source;
+        resolve_selector_locators(selector, analyzer)?;
     }
-    resolve_row_derivations(&mut plan.derivations, analyzer)
+    Ok(())
 }
 
 pub(super) fn resolve_selector_locators(
@@ -436,6 +423,9 @@ fn resolve_query_identity(
     else {
         return Ok(());
     };
+    if resolved.is_some() {
+        return Ok(());
+    }
     let policy_locator = PolicyLocator {
         value: value.clone(),
         range: source_range.clone().unwrap_or(0..0),
@@ -479,6 +469,15 @@ fn resolve_query_receiver_family(
     analyzer: Option<&dyn IAnalyzer>,
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
 ) -> Result<(), PolicySourceError> {
+    if matches!(
+        root,
+        CallIdentity::Qualified {
+            resolved: Some(_),
+            ..
+        }
+    ) {
+        return Ok(());
+    }
     let policy_locator = match root {
         CallIdentity::Stable(value) => PolicyLocator {
             value: value.clone(),
@@ -517,125 +516,6 @@ fn resolve_query_receiver_family(
         provenance: identity.provenance(),
     });
     Ok(())
-}
-
-fn resolve_row_derivations(
-    derivations: &mut [RowDerivation],
-    analyzer: Option<&dyn IAnalyzer>,
-) -> Result<(), PolicySourceError> {
-    for derivation in derivations {
-        if let RowDerivation::Filter(filter) = derivation {
-            resolve_row_filter(filter, analyzer)?;
-        }
-    }
-    Ok(())
-}
-
-fn resolve_row_filter(
-    filter: &mut RowFilter,
-    analyzer: Option<&dyn IAnalyzer>,
-) -> Result<(), PolicySourceError> {
-    let Some(locator) = filter.call_locator.take() else {
-        return Ok(());
-    };
-    let mut resolved = Vec::with_capacity(2);
-    if let Some(target) = locator.target {
-        let identity = resolve_qualified_locator(analyzer, &target, LocatorRole::Callable)?;
-        if matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall))
-            && matches!(identity, ResolvedLocatorIdentity::Workspace { .. })
-        {
-            return Err(source_error(
-                "invalid-call-proof-for-source-locator",
-                target.range,
-                "call :proof declared requires an active semantic-model callable, not a workspace declaration",
-            ));
-        }
-        let target_field = match &identity {
-            ResolvedLocatorIdentity::Workspace { .. } => "declared_target_id",
-            ResolvedLocatorIdentity::ActiveSemanticModel { .. } => "model_callable_id",
-        };
-        replace_locator_predicate(
-            filter,
-            &target.value,
-            "model_callable_id",
-            target_field,
-            identity.identity(),
-        );
-        if matches!(identity, ResolvedLocatorIdentity::Workspace { .. })
-            && filter.evidence.is_none()
-        {
-            // The resolver-proven workspace declaration identity is the exact
-            // callee proof. Runtime dispatch remains a separate completeness
-            // axis, so an open dispatch set must not erase a positive row.
-            filter.predicates.retain(|predicate| {
-                !((predicate.field.field == "selector_exact"
-                    && predicate.op == RowPredicateOp::Eq
-                    && matches!(
-                        predicate.operand,
-                        RowPredicateOperand::Literal(RowLiteral::Boolean(true))
-                    ))
-                    || (predicate.field.field == "semantic_target_id"
-                        && predicate.op == RowPredicateOp::IsNotNull))
-            });
-        }
-        resolved.push(ResolvedPolicyLocator {
-            role: LocatorRole::Callable.public(),
-            kind: identity.kind(),
-            identity: identity.identity().to_owned(),
-            constraint: ReceiverTypeConstraintKind::Exact,
-            provenance: identity.provenance(),
-        });
-    }
-    if let Some(receiver_type) = locator.receiver_type {
-        let identity =
-            resolve_qualified_locator(analyzer, &receiver_type.locator, LocatorRole::ReceiverType)?;
-        match receiver_type.constraint {
-            ReceiverTypeConstraintKind::Exact => {
-                replace_locator_predicate(
-                    filter,
-                    &receiver_type.locator.value,
-                    "receiver_type_id",
-                    "receiver_type_id",
-                    identity.identity(),
-                );
-            }
-            ReceiverTypeConstraintKind::AssignableTo => {
-                let identities =
-                    materialize_receiver_family(analyzer, &identity, &receiver_type.locator)?;
-                fill_receiver_family_predicate(filter, &identities);
-            }
-        }
-        resolved.push(ResolvedPolicyLocator {
-            role: LocatorRole::ReceiverType.public(),
-            kind: identity.kind(),
-            identity: identity.identity().to_owned(),
-            constraint: receiver_type.constraint,
-            provenance: identity.provenance(),
-        });
-    }
-    filter.resolved_locators.extend(resolved);
-    Ok(())
-}
-
-fn fill_receiver_family_predicate(filter: &mut RowFilter, identities: &[String]) {
-    let predicate = filter
-        .predicates
-        .iter_mut()
-        .find(|predicate| {
-            predicate.op == RowPredicateOp::In
-                && predicate.field.field == "receiver_type_id"
-                && matches!(
-                    &predicate.operand,
-                    RowPredicateOperand::ResolvedIdentitySet(values) if values.is_empty()
-                )
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "assignable receiver locator `{}` lost its unresolved family predicate before loaded-policy resolution",
-                identities.first().map(String::as_str).unwrap_or_default()
-            )
-        });
-    predicate.operand = RowPredicateOperand::ResolvedIdentitySet(identities.to_vec());
 }
 
 fn materialize_receiver_family(
@@ -703,35 +583,6 @@ fn materialize_receiver_family(
     identities.sort();
     identities.dedup();
     Ok(identities)
-}
-
-fn replace_locator_predicate(
-    filter: &mut RowFilter,
-    authored_value: &str,
-    authored_field: &str,
-    field: &str,
-    resolved_identity: &str,
-) {
-    let predicate = filter
-        .predicates
-        .iter_mut()
-        .find(|predicate| {
-            predicate.op == RowPredicateOp::Eq
-                && predicate.field.field == authored_field
-                && matches!(
-                    &predicate.operand,
-                    RowPredicateOperand::Literal(RowLiteral::String(value))
-                        if value == authored_value
-                )
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "qualified locator `{authored_value}` lost its decoder predicate before loaded-policy resolution"
-            )
-        });
-    predicate.field.field = field.to_owned();
-    predicate.operand =
-        RowPredicateOperand::Literal(RowLiteral::String(resolved_identity.to_owned()));
 }
 
 fn resolve_qualified_locator(

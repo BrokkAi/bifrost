@@ -32,17 +32,18 @@ pub use ir::{
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
     MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
     OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope,
-    QueryPathScopeError, QueryStep, QueryValueKind, ReceiverTraversalFilter,
-    ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallIdentity, ResolvedCallIdentityKind,
-    ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
-    SCHEMA_VERSION, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
-    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
-    ValueFlowTraversal, WitnessTraversal, compile_path_glob, exact_path_globs,
-    intersect_language_scopes,
+    QueryPathScopeError, QueryRowLiteral, QueryRowPredicate, QueryRowPredicateOp,
+    QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep, QueryValueKind,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallIdentity,
+    ResolvedCallIdentityKind, ResolvedCallProof, ResolvedCallReceiverType,
+    ResultContractFailureUseFilter, RewritePathFilter, SCHEMA_VERSION, ScopeFilter, ScopeSeed,
+    SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
+    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    compile_path_glob, exact_path_globs, intersect_language_scopes,
 };
 pub use partition::PlanPartitioning;
 pub use schema::{
-    ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,
+    ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp,
     QueryStepShape,
 };
 pub use source::{

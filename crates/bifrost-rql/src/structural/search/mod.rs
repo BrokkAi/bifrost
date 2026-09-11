@@ -82,8 +82,8 @@ use brokk_bifrost_rql::{
     CallArgumentSelector, CallIdentity, CallInputSelector, CallSiteTraversalFilter,
     CallTraversalFilter, CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource,
     CodeQueryResultDetail, CodeQuerySeed, FieldWriteValueTraversal, HierarchyTraversal, PathFilter,
-    Pattern, QueryError, QueryStep, ReferenceTraversalFilter, ResolvedCallFilter,
-    ResolvedCallIdentityKind, ResolvedCallProof, SetOperator,
+    Pattern, QueryError, QueryRowProjectionColumn, QueryStep, ReferenceTraversalFilter,
+    ResolvedCallFilter, ResolvedCallIdentityKind, ResolvedCallProof, SetOperator,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1530,6 +1530,7 @@ struct PipelineTraceStep {
 
 #[derive(Debug, Clone)]
 enum PipelineTraceValue {
+    StructuralMatch(Arc<SeedMatch>),
     Declaration(DeclarationValue),
     Semantic(SemanticPipelineValue),
     File(ProjectFile),
@@ -1636,6 +1637,9 @@ struct PipelineRow {
     value: PipelineValue,
     traces: Vec<PipelineTrace>,
     provenance_truncated: bool,
+    /// The visible-to-source field mapping established by terminal row
+    /// projection steps. Empty means the row publishes its native schema.
+    row_projection: Vec<QueryRowProjectionColumn>,
 }
 
 struct CachedSourceCoordinates {
@@ -5629,6 +5633,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
 
 fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTreeSet<ProjectFile>) {
     match value {
+        PipelineTraceValue::StructuralMatch(seed) => {
+            files.insert(seed.file.clone());
+        }
         PipelineTraceValue::Declaration(declaration) => {
             files.insert(declaration.unit.source().clone());
         }
@@ -5963,6 +5970,7 @@ fn detailed_trace_provenance_ref(
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     match value {
+        PipelineTraceValue::StructuralMatch(seed) => detailed_seed_provenance_ref(seed),
         PipelineTraceValue::Declaration(value) => detailed_declaration_provenance_ref(value, cache),
         PipelineTraceValue::Semantic(value) => {
             let projection = value.detailed_projection();
@@ -7022,7 +7030,9 @@ fn budgeted_declaration_expansion(declaration: DeclarationValue) -> PipelineExpa
 
 fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
     match value {
-        PipelineValue::StructuralMatch(_) => None,
+        PipelineValue::StructuralMatch(seed) => {
+            Some(PipelineTraceValue::StructuralMatch(seed.clone()))
+        }
         PipelineValue::Declaration(declaration) => {
             Some(PipelineTraceValue::Declaration(declaration.clone()))
         }

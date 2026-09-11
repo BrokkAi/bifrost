@@ -21,14 +21,13 @@
     :type assertion
     (bind :name nil-use
       :query (rql :schema-version 1
-        (language go
-          (nilness-operations
-            (procedure-of
-              (callable))))))
-    (filter :over nil-use
-      :where ((nil-use.fact in (nil maybe_nil))
-              (nil-use.proof eq exact)
-              (nil-use.coverage eq exhaustive)))
+        (filter :where ((fact in (nil maybe_nil))
+                        (proof eq exact)
+                        (coverage eq exhaustive))
+          (language go
+            (nilness-operations
+              (procedure-of
+                (callable)))))))
     (group :name by-nil-operation :by (nil-use.id)
       (aggregate :name nil-violations :op count))
     (assert :group by-nil-operation :value nil-violations :cardinality (exactly 0))))

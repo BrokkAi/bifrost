@@ -380,6 +380,16 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The default expression of a formal parameter whose grammar does not
+    /// expose that expression through a named field. `None` leaves the shared
+    /// named-field lookup in charge.
+    fn positional_parameter_default<'t>(
+        &self,
+        _parameter: tree_sitter::Node<'t>,
+    ) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
     /// Whether a lexical definition may be resolved from the focused node at all. Rust
     /// says no for struct-field names, whose owning type -- not the enclosing scope --
     /// decides what they denote, so resolving them lexically would answer with the wrong

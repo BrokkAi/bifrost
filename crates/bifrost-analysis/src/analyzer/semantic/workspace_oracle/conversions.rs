@@ -167,7 +167,7 @@ impl WorkspaceSemanticOracle<'_> {
                 return None;
             };
             let mut bindings = CallBindingCache::default();
-            let layout = bindings.formal_layout(analyzer, target)?;
+            let layout = bindings.formal_layout(analyzer, target, shape.arguments.len())?;
             // Java receivers do not consume an ordinary parameter slot. The
             // semantic binder retains their separate receiver evidence.
             let mut report = call_binding_report(

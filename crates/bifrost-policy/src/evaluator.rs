@@ -11,7 +11,6 @@ mod typestate_compilation;
 
 pub(crate) use assertion::SubjectQueryBatch;
 use assertion::evaluate_assertion_policy;
-pub(crate) use assertion::relational_expansion_query;
 use cvss_evidence::*;
 pub(crate) use typestate_compilation::TypestateCompilationFailure;
 

@@ -162,27 +162,7 @@ pub(super) fn property_initializer(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-/// The default expression of a primary-constructor `class_parameter`.
-///
-/// The grammar spells `class C(val x: Int = compute())` as
-/// `class_parameter(binding_pattern_kind, simple_identifier, user_type, expr)`
-/// with no field naming the default, so the expression is the first named child
-/// after the parameter's own name and declared type.
-pub(super) fn class_parameter_default(node: Node<'_>) -> Option<Node<'_>> {
-    let mut seen_name = false;
-    for child in named_children(node) {
-        match child.kind() {
-            "modifiers" | "binding_pattern_kind" => continue,
-            _ if is_type_syntax(child.kind()) => continue,
-            "simple_identifier" if !seen_name => {
-                seen_name = true;
-            }
-            _ if seen_name => return Some(child),
-            _ => continue,
-        }
-    }
-    None
-}
+pub(super) use brokk_bifrost_jvm::kotlin::syntax::kotlin_parameter_default as class_parameter_default;
 
 /// The delegate expression of a `val x by expr` property.
 pub(super) fn property_delegate_expression(node: Node<'_>) -> Option<Node<'_>> {

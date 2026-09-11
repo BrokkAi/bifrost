@@ -307,6 +307,8 @@ pub enum ValueShape {
     CallIdentity,
     ReceiverTypeConstraint,
     CallProof,
+    RowPredicates,
+    RowProjectionColumns,
 }
 
 impl ValueShape {
@@ -395,6 +397,8 @@ impl ValueShape {
                 "an exact call identity or an assignable-to workspace receiver family"
             }
             Self::CallProof => "exact or declared",
+            Self::RowPredicates => "one or more typed row predicates",
+            Self::RowProjectionColumns => "one or more row fields, optionally renamed",
         }
     }
 
@@ -694,6 +698,8 @@ pub enum QuerySemanticFacet {
 }
 
 query_step_ops! {
+    Filter { shape: RowLocal, label: "filter", signature: "row -> row", description: "Retain rows satisfying every typed predicate over the input row's public field schema." }
+    Project { shape: RowLocal, label: "project", signature: "row -> projected_row", description: "Publish selected public row fields, optionally under new field names, while preserving the row's source and evidence anchor." }
     EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
     ProcedureOf { shape: RowLocal, label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
     CfgEntry { shape: RowLocal, label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
@@ -730,8 +736,8 @@ query_step_ops! {
     MemberTargets { shape: DerivedValue, label: "member_targets", signature: "structural_match|reference_site|occurrence -> member_target_analysis", description: "Resolve exact static member identities together with the receiver owner and model provenance used by bounded structured receiver analysis." }
     KeyedReadValue { shape: DerivedValue, label: "keyed_read_value", signature: "structural_match -> keyed_read_value", description: "Resolve a runtime-global keyed load to its exact executable value observation under the active runtime model, retaining incomplete and exclusion evidence.", semantic: [Procedures, ProgramPoints, ValueFlow] }
     FieldWriteValue { shape: RowLocal, label: "field_write_value", signature: "member_target_analysis -> field_write_value", description: "Project the exact right-hand expression of a simple assignment whose static member and receiver identities were proven by member_targets, optionally retaining only exact receiver/member identities." }
-    ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "receiver_analysis|member_target_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver or member-target analysis." }
-    ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    ReceiverOutcome { shape: RowLocal, label: "receiver_outcome", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis|member_target_analysis -> receiver_outcome", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into its mandatory terminal outcome row." }
+    ReceiverEvidence { shape: RowLocal, label: "receiver_evidence", signature: "structural_match|reference_site|call_site|expression_site|occurrence|receiver_analysis -> receiver_evidence", description: "Analyze an ordinary call or member site directly, or project an existing receiver analysis, into zero or more parent-linked evidence rows." }
     CallShape { shape: RowLocal, label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site, including its structurally decoded callee token and written argument count when available." }
     CallResults { shape: RowLocal, label: "call_results", signature: "call_shape -> call_result", description: "Project the ordered normal result ports of each exact semantic call represented by a call-shape row. Each row carries the structural site identity, semantic call and procedure identities, zero-based result ordinal, procedure-local value identity, result point, and evidence quality so it can join assignments and guards without inferring source order.", semantic: [Procedures, ProgramPoints] }
     CallArgumentGroups { shape: RowLocal, label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
@@ -922,6 +928,8 @@ macro_rules! rql_forms {
                     | Self::Union
                     | Self::Intersect
                     | Self::Except
+                    | Self::Filter
+                    | Self::Project
                     | Self::EnclosingDecl
                     | Self::ProcedureOf
                     | Self::CfgEntry
@@ -1127,6 +1135,22 @@ rql_forms! {
         shape: QueryList,
         signature: "(except query query ...)",
         description: "Return first-branch endpoints not reached by any later branch.",
+    }
+    Filter {
+        labels: ["filter"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(filter :where ((FIELD OP OPERAND) ...) query)",
+        description: (QueryStepOp::Filter),
+        step: Filter,
+    }
+    Project {
+        labels: ["project"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(project :columns (FIELD|(FIELD NEW-FIELD) ...) query)",
+        description: (QueryStepOp::Project),
+        step: Project,
     }
     EnclosingDecl {
         labels: ["enclosing-decl"],
@@ -2304,6 +2328,8 @@ json_fields! {
     ReceiverType { label: "receiver_type", shape: ReceiverTypeConstraint, signature: "\"receiver_type\": call identity | { \"assignable_to\": call identity, \"resolved_identities\": [\"stable-id\", ...] }", description: "Require one exact receiver-type identity or the inclusive workspace family rooted at one type." }
     FormalName { label: "formal_name", shape: ParameterName, signature: "\"formal_name\": \"name\"", description: "Select one exact declared formal name." }
     FormalIndex { label: "formal_index", shape: NonNegativeInteger, signature: "\"formal_index\": non-negative integer", description: "Select one zero-based formal index." }
+    RowWhere { label: "where", shape: RowPredicates, signature: "\"where\": [{ \"field\": FIELD, \"op\": OP, ... }]", description: "State a bounded conjunction of typed predicates over this step's input row." }
+    Columns { label: "columns", shape: RowProjectionColumns, signature: "\"columns\": [{ \"source\": FIELD, \"name\": NEW_FIELD }, ...]", description: "Select and optionally rename public input-row fields." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -2447,6 +2473,14 @@ const CALL_ARGUMENT_STEP_OPTIONS: &[QueryStepOption] = &[
         &[":formal-index", ":formal_index"],
     ),
 ];
+const FILTER_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::RowWhere,
+    &[":where"],
+)];
+const PROJECT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::Columns,
+    &[":columns"],
+)];
 /// Shared by the two occurrence-producing steps and by the `occurrences` seed,
 /// so an author spells the same filter the same way wherever it appears.
 pub const OCCURRENCE_STEP_OPTIONS: &[QueryStepOption] = &[
@@ -2615,6 +2649,8 @@ pub fn candidate_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
 impl QueryStepOp {
     pub const fn options(self) -> &'static [QueryStepOption] {
         match self {
+            Self::Filter => FILTER_STEP_OPTIONS,
+            Self::Project => PROJECT_STEP_OPTIONS,
             Self::Typestate => TYPESTATE_STEP_OPTIONS,
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
             Self::Taint => TAINT_STEP_OPTIONS,

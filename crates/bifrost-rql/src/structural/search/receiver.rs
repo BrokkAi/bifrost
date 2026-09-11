@@ -2,11 +2,60 @@ use super::*;
 
 pub(super) fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
     match step {
-        QueryStep::ReceiverTargets(_) => ReceiverQueryOperation::ReceiverTargets,
+        QueryStep::ReceiverTargets(_)
+        | QueryStep::ReceiverOutcome
+        | QueryStep::ReceiverEvidence => ReceiverQueryOperation::ReceiverTargets,
         QueryStep::PointsTo(_) => ReceiverQueryOperation::PointsTo,
         QueryStep::MemberTargets(_) => ReceiverQueryOperation::MemberTargets,
         _ => unreachable!("receiver operation requested for a non-receiver step"),
     }
+}
+
+/// Project receiver analyses produced as the prerequisite of a direct
+/// `receiver_outcome` or `receiver_evidence` step. Inputs that were already a
+/// receiver analysis are projected by the ordinary pipeline match arms and
+/// pass through unchanged here.
+pub(super) fn project_direct_receiver_terminal(
+    step: &QueryStep,
+    expansions: Vec<PipelineExpansion>,
+) -> Vec<PipelineExpansion> {
+    if !matches!(
+        step,
+        QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence
+    ) {
+        return expansions;
+    }
+    let mut projected = Vec::new();
+    for expansion in expansions {
+        let PipelineValue::ReceiverAnalysis(value) = expansion.value else {
+            projected.push(expansion);
+            continue;
+        };
+        match step {
+            QueryStep::ReceiverOutcome => {
+                let mut trace = expansion.trace;
+                trace.push((PipelineTraceValue::ReceiverOutcome(value.clone()), None));
+                projected.push(PipelineExpansion {
+                    value: PipelineValue::ReceiverOutcome(value),
+                    trace,
+                    budgeted: false,
+                });
+            }
+            QueryStep::ReceiverEvidence => {
+                for evidence in receiver_evidence_expansions(&value) {
+                    let mut trace = expansion.trace.clone();
+                    trace.extend(evidence.trace);
+                    projected.push(PipelineExpansion {
+                        value: evidence.value,
+                        trace,
+                        budgeted: false,
+                    });
+                }
+            }
+            _ => unreachable!("direct receiver terminal checked above"),
+        }
+    }
+    projected
 }
 
 pub(super) const RECEIVER_EVIDENCE_ID_DOMAIN: &[u8] = b"bifrost.code_query.receiver_evidence.v1";

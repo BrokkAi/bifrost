@@ -488,3 +488,18 @@ pub fn kotlin_declaration_node<'tree>(root: Node<'tree>, range: &Range) -> Optio
     }
     Some(node)
 }
+
+/// The default expression attached to a Kotlin function or constructor parameter.
+/// Function defaults are siblings of the hidden parameter rule; constructor
+/// defaults are children of the visible class_parameter rule.
+pub fn kotlin_parameter_default(parameter: Node<'_>) -> Option<Node<'_>> {
+    let equals = if parameter.kind() == "parameter" {
+        parameter.next_sibling().filter(|node| node.kind() == "=")
+    } else {
+        let mut cursor = parameter.walk();
+        parameter
+            .children(&mut cursor)
+            .find(|node| node.kind() == "=")
+    }?;
+    equals.next_named_sibling()
+}

@@ -20,10 +20,11 @@
 //! A verdict that cannot be published is not silently dropped: it becomes an
 //! unmet obligation carrying the typed reasons that blocked it.
 
+use brokk_bifrost_analysis::CancellationToken;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use brokk_bifrost_rql::structural::CodeQueryRowFieldUnknownReason;
 use brokk_bifrost_rql::structural::search::UnitRowItem;
-use brokk_bifrost_rql::structural::{CodeQueryRowFieldUnknownReason, CodeQueryRowRef};
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
@@ -81,6 +82,8 @@ pub struct RelationalAssertionEvaluation {
     /// tripped. A false value never invalidates a published violation; it makes
     /// the run non-reliable.
     pub exhaustive: bool,
+    /// Plan-wide coverage reasons, including stops before any assertion exists.
+    pub incomplete_reasons: Vec<PolicyIncompleteReason>,
     pub limit_exceeded: bool,
     /// Row-engine work beyond the CodeQuery scans that produced the inputs.
     pub work: RelationalEvaluationWork,
@@ -97,10 +100,9 @@ pub struct RelationalEvaluationWork {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalAssertionEvaluationError {
+    /// Cooperative stop, consumed by the plan evaluation boundary.
+    Cancelled,
     MissingInput {
-        binding: String,
-    },
-    UnsupportedExpansion {
         binding: String,
     },
     DisconnectedJoin {
@@ -135,11 +137,9 @@ pub enum RelationalAssertionEvaluationError {
 impl std::fmt::Display for RelationalAssertionEvaluationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("relational evaluation cancelled"),
             Self::MissingInput { binding } => {
                 write!(formatter, "no executed rows for binding `{binding}`")
-            }
-            Self::UnsupportedExpansion { binding } => {
-                write!(formatter, "binding `{binding}` cannot seed a row plan")
             }
             Self::DisconnectedJoin { binding } => {
                 write!(formatter, "join reads unjoined binding `{binding}`")
@@ -238,7 +238,48 @@ impl UnknownInputEvidence {
 pub fn evaluate_plan_ir(
     plan: &RelationalPlanIr,
     inputs: &[RelationalInput<'_>],
+    cancellation: Option<&CancellationToken>,
 ) -> EvalResult<RelationalAssertionEvaluation> {
+    let mut state = EvalState {
+        limits: plan.limits,
+        comparisons: 0,
+        limit_exceeded: false,
+        work: RelationalEvaluationWork::default(),
+        cancellation,
+    };
+    match evaluate_plan(plan, inputs, &mut state) {
+        Err(RelationalAssertionEvaluationError::Cancelled) => {
+            let mut obligations = Obligations::default();
+            for assertion in &plan.assertions {
+                obligations.push(RelationalObligation::new(
+                    assertion.id.clone(),
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
+                    assertion.group.clone(),
+                    Vec::new(),
+                    vec![PolicyIncompleteReason::Cancelled],
+                ));
+            }
+            Ok(RelationalAssertionEvaluation {
+                violations: Vec::new(),
+                unmet_obligations: obligations.retained,
+                obligations_truncated: obligations.truncated,
+                omitted_obligations_lower_bound: obligations.omitted,
+                exhaustive: false,
+                incomplete_reasons: vec![PolicyIncompleteReason::Cancelled],
+                limit_exceeded: state.limit_exceeded,
+                work: state.work,
+            })
+        }
+        result => result,
+    }
+}
+
+fn evaluate_plan(
+    plan: &RelationalPlanIr,
+    inputs: &[RelationalInput<'_>],
+    state: &mut EvalState<'_>,
+) -> EvalResult<RelationalAssertionEvaluation> {
+    state.check_cancelled()?;
     let inputs_by_binding = inputs
         .iter()
         .map(|input| (input.binding.as_str(), input))
@@ -247,18 +288,13 @@ pub fn evaluate_plan_ir(
     let needed = needed_relations(plan);
     let binding_order = binding_declaration_order(plan);
 
-    let mut state = EvalState {
-        limits: plan.limits,
-        comparisons: 0,
-        limit_exceeded: false,
-        work: RelationalEvaluationWork::default(),
-    };
     let mut relations: Vec<Option<EvalRelation>> = Vec::with_capacity(plan.relations.len());
     for relation in &plan.relations {
         if !needed.contains(&relation.id) {
             relations.push(None);
             continue;
         }
+        state.check_cancelled()?;
         let evaluated = evaluate_relation(
             plan,
             relation.id,
@@ -266,7 +302,7 @@ pub fn evaluate_plan_ir(
             &inputs_by_binding,
             &referenced,
             &binding_order,
-            &mut state,
+            state,
         )?;
         state.work.materialized_rows = state
             .work
@@ -278,13 +314,14 @@ pub fn evaluate_plan_ir(
     let mut violations = Vec::new();
     let mut obligations = Obligations::default();
     for assertion in &plan.assertions {
+        state.check_cancelled()?;
         let Some(Some(relation)) = relations.get(assertion.relation.index()) else {
             return Err(RelationalAssertionEvaluationError::MissingAggregate {
                 group: assertion.group.as_str().to_string(),
                 aggregate: assertion.aggregate.as_str().to_string(),
             });
         };
-        let IrRelationOp::Group { by, .. } = &plan
+        let IrRelationOp::Group { by, aggregates, .. } = &plan
             .relation(assertion.relation)
             .expect("a validated assertion reads a relation of its own plan")
             .op
@@ -315,6 +352,7 @@ pub fn evaluate_plan_ir(
         }
 
         for tuple in &relation.tuples {
+            state.check_cancelled()?;
             state.work.assertion_checks = state.work.assertion_checks.saturating_add(1);
             let key = tuple.values[..key_width].to_vec();
             let Some(RowScalar::Integer(actual)) = tuple.values.get(value_index).cloned().flatten()
@@ -329,6 +367,27 @@ pub fn evaluate_plan_ir(
             let witnessed = tuple.witness_sound;
             let exhaustive = relation.coverage.is_exhaustive();
 
+            let set_fold = aggregates.iter().any(|aggregate| {
+                aggregate.output == assertion.column
+                    && matches!(
+                        aggregate.op,
+                        IrAggregateOp::SetEqual | IrAggregateOp::Subset
+                    )
+            });
+            if set_fold && (!exhaustive || !witnessed) {
+                let mut reasons = relation.coverage.incomplete_reasons();
+                reasons.extend(relation.witness_reasons.iter().cloned());
+                reasons.sort();
+                reasons.dedup();
+                obligations.push(RelationalObligation::new(
+                    assertion.id.clone(),
+                    RelationalObligationKind::AbsenceRequiresExhaustiveCoverage,
+                    assertion.group.clone(),
+                    key,
+                    reasons,
+                ));
+                continue;
+            }
             if !witnessed {
                 // Neither verdict is publishable: the rows behind the number
                 // are not established.
@@ -376,13 +435,30 @@ pub fn evaluate_plan_ir(
         }
     }
 
+    state.check_cancelled()?;
     let exhaustive = inputs.iter().all(|input| input.coverage.is_exhaustive())
         && relations
             .iter()
             .filter_map(Option::as_ref)
             .all(|relation| relation.coverage.is_exhaustive())
         && !state.limit_exceeded;
+    let mut incomplete_reasons = inputs
+        .iter()
+        .flat_map(|input| input.coverage.incomplete_reasons())
+        .chain(
+            relations
+                .iter()
+                .filter_map(Option::as_ref)
+                .flat_map(|relation| relation.coverage.incomplete_reasons()),
+        )
+        .collect::<Vec<_>>();
+    if state.limit_exceeded {
+        incomplete_reasons.push(PolicyIncompleteReason::PipelineRowBudget);
+    }
+    incomplete_reasons.sort();
+    incomplete_reasons.dedup();
     Ok(RelationalAssertionEvaluation {
+        incomplete_reasons,
         violations,
         unmet_obligations: obligations.retained,
         obligations_truncated: obligations.truncated,
@@ -429,14 +505,25 @@ impl Obligations {
     }
 }
 
-struct EvalState {
+struct EvalState<'a> {
+    cancellation: Option<&'a CancellationToken>,
     limits: super::ir::IrLimits,
     comparisons: usize,
     limit_exceeded: bool,
     work: RelationalEvaluationWork,
 }
 
-impl EvalState {
+impl EvalState<'_> {
+    fn check_cancelled(&self) -> EvalResult<()> {
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(RelationalAssertionEvaluationError::Cancelled);
+        }
+        Ok(())
+    }
+
     /// Record that a bound truncated a relation, and degrade its coverage.
     fn truncate(&mut self, coverage: RelationCoverage) -> RelationCoverage {
         self.limit_exceeded = true;
@@ -469,7 +556,7 @@ fn referenced_columns(plan: &RelationalPlanIr) -> BTreeSet<IrColumn> {
     };
     for relation in &plan.relations {
         match &relation.op {
-            IrRelationOp::Source { .. } | IrRelationOp::Expand { .. } => {}
+            IrRelationOp::Source { .. } => {}
             IrRelationOp::Project { columns: list, .. } => {
                 for projection in list {
                     columns.insert(projection.source.clone());
@@ -491,6 +578,10 @@ fn referenced_columns(plan: &RelationalPlanIr) -> BTreeSet<IrColumn> {
                     columns.insert(aggregate.output.clone());
                     if let Some(value) = &aggregate.value {
                         columns.insert(value.clone());
+                    }
+                    if let Some((left, right)) = &aggregate.sets {
+                        columns.insert(left.clone());
+                        columns.insert(right.clone());
                     }
                     if let Some(sequences) = &aggregate.sequences {
                         for sequence in [&sequences.left, &sequences.right] {
@@ -518,12 +609,7 @@ fn needed_relations(plan: &RelationalPlanIr) -> HashSet<IrRelationId> {
     let mut needed = plan
         .relations
         .iter()
-        .filter(|relation| {
-            !matches!(
-                relation.op,
-                IrRelationOp::Source { .. } | IrRelationOp::Expand { .. }
-            )
-        })
+        .filter(|relation| !matches!(relation.op, IrRelationOp::Source { .. }))
         .map(|relation| relation.id)
         .collect::<HashSet<_>>();
     for relation in plan.relations.iter().rev() {
@@ -540,9 +626,7 @@ fn needed_relations(plan: &RelationalPlanIr) -> HashSet<IrRelationId> {
 fn binding_declaration_order(plan: &RelationalPlanIr) -> HashMap<String, usize> {
     let mut order = HashMap::new();
     for relation in &plan.relations {
-        if let IrRelationOp::Source { binding, .. } | IrRelationOp::Expand { binding, .. } =
-            &relation.op
-        {
+        if let IrRelationOp::Source { binding, .. } = &relation.op {
             let next = order.len();
             order.entry(binding.as_str().to_string()).or_insert(next);
         }
@@ -558,7 +642,7 @@ fn evaluate_relation(
     inputs: &HashMap<&str, &RelationalInput<'_>>,
     referenced: &BTreeSet<IrColumn>,
     binding_order: &HashMap<String, usize>,
-    state: &mut EvalState,
+    state: &mut EvalState<'_>,
 ) -> EvalResult<EvalRelation> {
     let relation = plan
         .relation(id)
@@ -588,24 +672,6 @@ fn evaluate_relation(
             referenced,
             state,
         ),
-        IrRelationOp::Expand { input, binding, .. } => {
-            let source = input_relation(*input)?;
-            let coverage = source.coverage.clone();
-            let witness_reasons = source.witness_reasons.clone();
-            let unknown_inputs = source.unknown_inputs.clone();
-            load_rows(
-                plan,
-                id,
-                binding,
-                state.limits.max_expanded_rows,
-                coverage,
-                witness_reasons,
-                unknown_inputs,
-                inputs,
-                referenced,
-                state,
-            )
-        }
         IrRelationOp::Project { input, columns } => {
             let source = input_relation(*input)?;
             let layout = columns
@@ -627,15 +693,18 @@ fn evaluate_relation(
             let tuples = source
                 .tuples
                 .iter()
-                .map(|tuple| EvalTuple {
-                    values: sources
-                        .iter()
-                        .map(|index| tuple.values[*index].clone())
-                        .collect(),
-                    contributors: tuple.contributors.clone(),
-                    witness_sound: tuple.witness_sound,
+                .map(|tuple| {
+                    state.check_cancelled()?;
+                    Ok(EvalTuple {
+                        values: sources
+                            .iter()
+                            .map(|index| tuple.values[*index].clone())
+                            .collect(),
+                        contributors: tuple.contributors.clone(),
+                        witness_sound: tuple.witness_sound,
+                    })
                 })
-                .collect();
+                .collect::<EvalResult<Vec<_>>>()?;
             Ok(EvalRelation {
                 layout,
                 tuples,
@@ -648,6 +717,7 @@ fn evaluate_relation(
             let source = input_relation(*input)?;
             let mut tuples = Vec::new();
             for tuple in &source.tuples {
+                state.check_cancelled()?;
                 if predicates_match(source, tuple, predicates)? {
                     tuples.push(tuple.clone());
                 }
@@ -698,7 +768,7 @@ fn load_rows(
     mut unknown_inputs: UnknownInputEvidence,
     inputs: &HashMap<&str, &RelationalInput<'_>>,
     referenced: &BTreeSet<IrColumn>,
-    state: &mut EvalState,
+    state: &mut EvalState<'_>,
 ) -> EvalResult<EvalRelation> {
     let Some(input) = inputs.get(binding.as_str()) else {
         return Err(RelationalAssertionEvaluationError::MissingInput {
@@ -718,15 +788,13 @@ fn load_rows(
 
     let mut coverage = inherited.meet(input.coverage.clone());
     let count = input.rows.len().min(max_rows);
-    state.work.input_rows = state
-        .work
-        .input_rows
-        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     if count < input.rows.len() {
         coverage = state.truncate(coverage);
     }
     let mut tuples = Vec::with_capacity(count);
     for (row, item) in input.rows[..count].iter().enumerate() {
+        state.check_cancelled()?;
+        state.work.input_rows = state.work.input_rows.saturating_add(1);
         let mut values = Vec::with_capacity(layout.len());
         let mut unavailable = false;
         for column in &layout {
@@ -771,7 +839,7 @@ fn evaluate_join(
     right: &EvalRelation,
     kind: IrJoinKind,
     on: &[super::ir::IrEquiKey],
-    state: &mut EvalState,
+    state: &mut EvalState<'_>,
 ) -> EvalResult<EvalRelation> {
     let keys = on
         .iter()
@@ -826,6 +894,7 @@ fn evaluate_join(
     // is never iterated, which keeps output order independent of hash seeding.
     let mut right_index: HashMap<Vec<Option<RowScalar>>, Vec<&EvalTuple>> = HashMap::new();
     for right_tuple in &right.tuples {
+        state.check_cancelled()?;
         let key = keys
             .iter()
             .map(|(_, right_index)| right_tuple.values[*right_index].clone())
@@ -835,6 +904,7 @@ fn evaluate_join(
 
     let mut joined = Vec::new();
     'left: for tuple in &left.tuples {
+        state.check_cancelled()?;
         // This is a plan-wide one-unit-per-left-key-probe budget. The lookup
         // replaces the old per-pair comparison loop, while output remains
         // independently bounded by max_joined_rows below.
@@ -855,6 +925,7 @@ fn evaluate_join(
             && matches!(kind, IrJoinKind::Inner | IrJoinKind::Left)
         {
             for right_tuple in matches {
+                state.check_cancelled()?;
                 if joined.len() == state.limits.max_joined_rows {
                     coverage = state.truncate(coverage);
                     break 'left;
@@ -923,7 +994,7 @@ fn evaluate_group(
     by: &[IrColumn],
     aggregates: &[IrAggregate],
     binding_order: &HashMap<String, usize>,
-    state: &mut EvalState,
+    state: &mut EvalState<'_>,
 ) -> EvalResult<EvalRelation> {
     let key_indices = by
         .iter()
@@ -946,6 +1017,7 @@ fn evaluate_group(
     let mut grouped: HashMap<Vec<Option<RowScalar>>, GroupRows<'_>> = HashMap::new();
     let mut any_group_truncated = false;
     for tuple in &input.tuples {
+        state.check_cancelled()?;
         let key = key_indices
             .iter()
             .map(|index| tuple.values[*index].clone())
@@ -981,8 +1053,10 @@ fn evaluate_group(
         .saturating_add(u64::try_from(grouped.len()).unwrap_or(u64::MAX));
     let mut tuples = Vec::with_capacity(grouped.len());
     for (key, rows) in grouped {
+        state.check_cancelled()?;
         let mut values = key;
         for aggregate in aggregates {
+            state.check_cancelled()?;
             values.push(Some(RowScalar::Integer(fold(
                 input,
                 &rows.tuples,
@@ -1075,6 +1149,26 @@ fn fold(
         }
         IrAggregateOp::All => {
             u64::from(values().all(|value| value == Some(RowScalar::Boolean(true))))
+        }
+        IrAggregateOp::SetEqual | IrAggregateOp::Subset => {
+            let (left, right) = aggregate.sets.as_ref().expect("validated set operands");
+            let left_index = relation.index_of(left).expect("validated left set column");
+            let right_index = relation
+                .index_of(right)
+                .expect("validated right set column");
+            let left = matching
+                .iter()
+                .filter_map(|tuple| tuple.values[left_index].as_ref())
+                .collect::<HashSet<_>>();
+            let right = matching
+                .iter()
+                .filter_map(|tuple| tuple.values[right_index].as_ref())
+                .collect::<HashSet<_>>();
+            u64::from(match aggregate.op {
+                IrAggregateOp::SetEqual => left == right,
+                IrAggregateOp::Subset => left.is_subset(&right),
+                _ => unreachable!("set fold"),
+            })
         }
         IrAggregateOp::OrderedEqual => {
             let sequences = aggregate
@@ -1194,79 +1288,6 @@ fn predicates_match(
         }
     }
     Ok(true)
-}
-
-/// One located CodeQuery row, materialized under the column names one
-/// relation's predicates address it by.
-///
-/// The `why-not` explainer replays a single located row through the filters a
-/// plan attaches directly to a row binding. Deciding a predicate is the
-/// evaluator's semantics -- two-valued null handling, ordered comparison only
-/// over integers, literal matching by scalar type -- so the explainer builds
-/// this and asks, instead of re-deriving what a comparison means.
-pub(crate) struct ReplayRow {
-    relation: EvalRelation,
-    tuple: EvalTuple,
-}
-
-impl ReplayRow {
-    /// Read one CodeQuery row under `columns`, each pair naming a column of the
-    /// replayed relation and the row field that column reads. A projection
-    /// between the binding and the filter is what makes the two names differ.
-    pub(crate) fn new(
-        columns: &[(IrColumn, String)],
-        row: CodeQueryRowRef<'_>,
-    ) -> EvalResult<Self> {
-        let mut values = Vec::with_capacity(columns.len());
-        for (column, field) in columns {
-            let value = row
-                .field(field)
-                .map_err(|error| match error.unknown_reason() {
-                    Some(reason) => RelationalAssertionEvaluationError::RowFieldUnavailable {
-                        binding: column.qualifier.clone(),
-                        field: field.clone(),
-                        reason,
-                    },
-                    None => RelationalAssertionEvaluationError::RowField {
-                        binding: column.qualifier.clone(),
-                        field: field.clone(),
-                    },
-                })?;
-            values.push(value.map(RowScalar::from));
-        }
-        Ok(Self {
-            relation: EvalRelation {
-                layout: columns.iter().map(|(column, _)| column.clone()).collect(),
-                tuples: Vec::new(),
-                coverage: RelationCoverage::Exhaustive,
-                witness_reasons: Vec::new(),
-                unknown_inputs: UnknownInputEvidence::default(),
-            },
-            tuple: EvalTuple {
-                values,
-                contributors: Vec::new(),
-                witness_sound: true,
-            },
-        })
-    }
-
-    /// This row's value for one column of the replayed relation.
-    pub(crate) fn value(&self, column: &IrColumn) -> EvalResult<Option<RowScalar>> {
-        read(&self.relation, &self.tuple, column)
-    }
-
-    /// The first test of `predicates` this row does not satisfy, if any.
-    pub(crate) fn first_failed_predicate<'a>(
-        &self,
-        predicates: &'a [IrPredicate],
-    ) -> EvalResult<Option<&'a IrPredicate>> {
-        for predicate in predicates {
-            if !predicates_match(&self.relation, &self.tuple, std::slice::from_ref(predicate))? {
-                return Ok(Some(predicate));
-            }
-        }
-        Ok(None)
-    }
 }
 
 fn read(

@@ -222,11 +222,6 @@ pub struct AssertionPolicySpec {
 #[derive(Debug, Clone)]
 pub struct RelationalAssertionPlan {
     pub bindings: Vec<RowBinding>,
-    /// Source-ordered `(filter ...)` and `(project ...)` records, each of which
-    /// refines one already named relation. Empty for every plan authored
-    /// before the derivation records existed, which is what keeps those plans'
-    /// canonical projection byte-identical.
-    pub derivations: Vec<RowDerivation>,
     pub joins: Vec<RowJoin>,
     pub groups: Vec<RowGroup>,
     pub assertions: Vec<RowAssertion>,
@@ -245,85 +240,6 @@ pub struct RowBinding {
 #[derive(Debug, Clone)]
 pub enum RowBindingSource {
     Query(PolicySelector),
-    Expansion {
-        from: RowBindingName,
-        step: RowExpansionStep,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RowExpansionStep {
-    ReceiverOutcome,
-    ReceiverEvidence,
-    MemberSelection,
-    MemberCandidates,
-    CandidateHierarchy,
-    MemberFamily,
-    FamilyEdges,
-    DispatchOutcome,
-    DispatchTargets,
-}
-
-impl RowExpansionStep {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::ReceiverOutcome => "receiver-outcome",
-            Self::ReceiverEvidence => "receiver-evidence",
-            Self::MemberSelection => "member-selection",
-            Self::MemberCandidates => "member-candidates",
-            Self::CandidateHierarchy => "candidate-hierarchy",
-            Self::MemberFamily => "member-family",
-            Self::FamilyEdges => "family-edges",
-            Self::DispatchOutcome => "dispatch-outcome",
-            Self::DispatchTargets => "dispatch-targets",
-        }
-    }
-}
-
-/// One record that refines an already named relation.
-///
-/// A derivation takes the refined relation's place in the plan: the name it
-/// publishes is what later joins and groups read, and the name it consumed is
-/// no longer addressable. That is what lets a filtered or projected relation
-/// stand exactly where the relation it refines stood.
-#[derive(Debug, Clone)]
-pub enum RowDerivation {
-    Filter(RowFilter),
-    Project(RowProjection),
-}
-
-impl RowDerivation {
-    /// The record spelling, which is also the tag its canonical projection
-    /// carries.
-    pub const fn label(&self) -> &'static str {
-        match self {
-            Self::Filter(_) => "filter",
-            Self::Project(_) => "project",
-        }
-    }
-}
-
-/// Narrow one named relation to the rows satisfying every listed predicate.
-#[derive(Debug, Clone)]
-pub struct RowFilter {
-    pub over: RowBindingName,
-    pub predicates: Vec<RowPredicate>,
-    /// Policy-specific evidence interpretation attached by a typed shorthand.
-    /// Generic `(filter ...)` records never set this marker.
-    pub evidence: Option<RowFilterEvidence>,
-    /// A qualified `(call ...)` locator retained until a loaded policy has an
-    /// analyzer and active semantic-model context. Symbol-shaped stable IDs
-    /// do not use this field and remain ordinary relational literals.
-    pub call_locator: Option<CallLocator>,
-    /// The receiver-family comparison represented by the authored `(call ...)`
-    /// shorthand. Exact constraints are fully represented by ordinary
-    /// predicates and remain `None` here for stable canonical bytes.
-    pub receiver_constraint: Option<ReceiverTypeConstraintKind>,
-    /// Typed identity/provenance produced when `call_locator` is resolved.
-    /// Source ranges and authored spellings are deliberately not retained.
-    pub resolved_locators: Vec<ResolvedPolicyLocator>,
-    /// Exact authored filter or typed-shorthand record range.
-    pub source_range: Option<Range<usize>>,
 }
 
 /// One qualified callable/type spelling and its authored source range.
@@ -337,21 +253,6 @@ pub struct PolicyLocator {
 pub enum ReceiverTypeConstraintKind {
     Exact,
     AssignableTo,
-}
-
-/// One qualified receiver spelling and whether it names the exact owner or an
-/// inclusive assignable-to family root.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiverTypeLocator {
-    pub locator: PolicyLocator,
-    pub constraint: ReceiverTypeConstraintKind,
-}
-
-/// Pending values from a qualified `(call ...)` record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallLocator {
-    pub target: Option<PolicyLocator>,
-    pub receiver_type: Option<ReceiverTypeLocator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,32 +277,6 @@ pub struct ResolvedPolicyLocator {
     pub identity: String,
     pub constraint: ReceiverTypeConstraintKind,
     pub provenance: Option<SemanticModelProvenance>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowFilterEvidence {
-    DeclaredCall,
-}
-
-/// Publish a new named relation holding chosen, optionally renamed, columns of
-/// an existing one.
-#[derive(Debug, Clone)]
-pub struct RowProjection {
-    pub name: RowBindingName,
-    pub from: RowBindingName,
-    pub columns: Vec<RowProjectionColumn>,
-    /// Exact authored projection record range.
-    pub source_range: Option<Range<usize>>,
-}
-
-/// One projected column: the field it reads, and the field name it publishes
-/// under the projection's own relation name.
-#[derive(Debug, Clone)]
-pub struct RowProjectionColumn {
-    pub source: RowFieldRef,
-    pub name: String,
-    /// Exact authored column expression range.
-    pub source_range: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,8 +331,10 @@ pub struct RowAggregate {
     pub op: RowAggregateOp,
     pub value: Option<RowFieldRef>,
     /// The two ordered sequences compared by `ordered-equal`, and nothing
-    /// else. Every other operation folds one column, so it carries `None`.
+    /// else. Set comparisons carry `sets` instead; all other operations carry `None`.
     pub sequences: Option<RowOrderedSequencePair>,
+    /// Stable-key columns compared as distinct sets, ignoring absent values.
+    pub sets: Option<(RowFieldRef, RowFieldRef)>,
     pub predicate: Vec<RowPredicate>,
     /// Exact authored aggregate record range.
     pub source_range: Option<Range<usize>>,
@@ -502,6 +379,10 @@ pub enum RowAggregateOp {
     /// sequences that hold the same values in a different order are equal as
     /// sets and different as argument lists.
     OrderedEqual,
+    /// One when the two distinct sets of present stable-key values are equal.
+    SetEqual,
+    /// One when every distinct present left key occurs on the right.
+    Subset,
 }
 
 impl RowAggregateOp {
@@ -514,6 +395,8 @@ impl RowAggregateOp {
             Self::Any => "any",
             Self::All => "all",
             Self::OrderedEqual => "ordered-equal",
+            Self::SetEqual => "set-equal",
+            Self::Subset => "subset",
         }
     }
 }

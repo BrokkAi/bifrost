@@ -143,7 +143,7 @@ impl RustSymbolIdentity {
         &self.name
     }
 
-    fn fq_name(&self) -> String {
+    pub fn fq_name(&self) -> String {
         let package = self.module.package();
         if package.is_empty() {
             self.name.clone()

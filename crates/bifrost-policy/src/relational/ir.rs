@@ -12,6 +12,7 @@
 
 use std::fmt;
 
+use brokk_bifrost_rql::query::{QueryStep, QueryStepOp};
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 use brokk_bifrost_rql::structural::{
     CodeQueryEnumDomain, CodeQueryRowScalarRef, CodeQueryRowScalarType,
@@ -19,7 +20,7 @@ use brokk_bifrost_rql::structural::{
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RelationalAssertionLimits, RowAggregateName, RowBindingName,
-    RowExpansionStep, RowGroupName, RowLiteral,
+    RowGroupName, RowLiteral,
 };
 
 /// One owned scalar read from a CodeQuery row.
@@ -100,6 +101,14 @@ impl fmt::Display for IrRelationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "r{}", self.0)
     }
+}
+
+/// Identity-bearing scalar types admitted by stable-key relational operations.
+pub(super) const fn is_stable_key(scalar_type: CodeQueryRowScalarType) -> bool {
+    matches!(
+        scalar_type,
+        CodeQueryRowScalarType::StableId | CodeQueryRowScalarType::DeclarationIdentity
+    )
 }
 
 /// One column of a relation schema.
@@ -378,6 +387,10 @@ pub enum IrAggregateOp {
     Any,
     All,
     OrderedEqual,
+    /// One when the two distinct sets of present stable-key values are equal.
+    SetEqual,
+    /// One when every distinct present left key occurs on the right.
+    Subset,
 }
 
 impl IrAggregateOp {
@@ -390,6 +403,8 @@ impl IrAggregateOp {
             Self::Any => "any",
             Self::All => "all",
             Self::OrderedEqual => "ordered-equal",
+            Self::SetEqual => "set-equal",
+            Self::Subset => "subset",
         }
     }
 
@@ -407,7 +422,11 @@ impl IrAggregateOp {
         match self {
             Self::Min | Self::Max => Some(CodeQueryRowScalarType::Integer),
             Self::Any | Self::All => Some(CodeQueryRowScalarType::Boolean),
-            Self::Count | Self::CountDistinct | Self::OrderedEqual => None,
+            Self::Count
+            | Self::CountDistinct
+            | Self::OrderedEqual
+            | Self::SetEqual
+            | Self::Subset => None,
         }
     }
 }
@@ -434,6 +453,7 @@ pub struct IrAggregate {
     pub op: IrAggregateOp,
     pub value: Option<IrColumn>,
     pub sequences: Option<IrOrderedSequencePair>,
+    pub sets: Option<(IrColumn, IrColumn)>,
     /// Rows that fail any of these tests do not contribute to this fold. The
     /// group itself still exists, which is what lets a policy count a subset of
     /// a group without losing the group's key.
@@ -447,16 +467,7 @@ pub enum IrRelationOp {
     /// Rows executed for one named binding.
     Source {
         binding: RowBindingName,
-        domain: DetailedCodeQueryDomain,
-    },
-    /// Rows executed for one binding that expands another binding through an
-    /// analyzer-owned step. The input relation is named so the expansion
-    /// inherits its coverage as well as its own.
-    Expand {
-        input: IrRelationId,
-        binding: RowBindingName,
-        step: RowExpansionStep,
-        domain: DetailedCodeQueryDomain,
+        schema: IrSchema,
     },
     Project {
         input: IrRelationId,
@@ -485,8 +496,7 @@ impl IrRelationOp {
     pub fn inputs(&self) -> Vec<IrRelationId> {
         match self {
             Self::Source { .. } => Vec::new(),
-            Self::Expand { input, .. }
-            | Self::Project { input, .. }
+            Self::Project { input, .. }
             | Self::Filter { input, .. }
             | Self::Group { input, .. } => vec![*input],
             Self::Join { left, right, .. } => vec![*left, *right],
@@ -496,7 +506,6 @@ impl IrRelationOp {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Source { .. } => "source",
-            Self::Expand { .. } => "expand",
             Self::Project { .. } => "project",
             Self::Filter { .. } => "filter",
             Self::Join { .. } => "join",
@@ -584,79 +593,38 @@ impl RelationalPlanIr {
         self.relations.get(id.index())
     }
 
-    /// The binding each source or expansion relation reads rows for.
+    /// The binding each source relation reads rows for.
     pub fn source_binding(&self, id: IrRelationId) -> Option<&RowBindingName> {
         match &self.relation(id)?.op {
-            IrRelationOp::Source { binding, .. } | IrRelationOp::Expand { binding, .. } => {
-                Some(binding)
-            }
+            IrRelationOp::Source { binding, .. } => Some(binding),
             _ => None,
         }
     }
 }
 
-/// Every row expansion step the authoring model can name.
-///
-/// The relational module owns this list rather than `definition`, because the
-/// authored enum is projected into canonical JSON and must stay a plain data
-/// declaration.
-pub const ALL_ROW_EXPANSION_STEPS: &[RowExpansionStep] = &[
-    RowExpansionStep::ReceiverOutcome,
-    RowExpansionStep::ReceiverEvidence,
-    RowExpansionStep::MemberSelection,
-    RowExpansionStep::MemberCandidates,
-    RowExpansionStep::CandidateHierarchy,
-    RowExpansionStep::MemberFamily,
-    RowExpansionStep::FamilyEdges,
-    RowExpansionStep::DispatchOutcome,
-    RowExpansionStep::DispatchTargets,
+/// The RQL expansion steps published by the relation-schema catalog.
+pub const ALL_RQL_RELATION_EXPANSION_STEPS: &[QueryStepOp] = &[
+    QueryStepOp::ReceiverOutcome,
+    QueryStepOp::ReceiverEvidence,
+    QueryStepOp::MemberSelection,
+    QueryStepOp::CandidatesOf,
+    QueryStepOp::CandidateHierarchy,
+    QueryStepOp::MemberFamily,
+    QueryStepOp::FamilyEdges,
+    QueryStepOp::DispatchOutcome,
+    QueryStepOp::DispatchTargets,
 ];
 
-/// The single table of admitted row expansions: which analyzer step may be
-/// applied to which source row domain, and what row domain it produces.
-///
-/// Validation, lowering and the introspection catalog all read this one
-/// function, so a step that becomes executable cannot be admitted by the
-/// validator while staying invisible to the published schema.
+/// Project the RQL validator's typed step contract into the relation-schema
+/// catalog. The authoring layer keeps no separate expansion type table.
 pub fn expansion_result_domain(
     source: DetailedCodeQueryDomain,
-    step: RowExpansionStep,
+    step: QueryStepOp,
 ) -> Option<DetailedCodeQueryDomain> {
-    use DetailedCodeQueryDomain as Domain;
-    use RowExpansionStep as Step;
-    match (source, step) {
-        (
-            Domain::StructuralMatch
-            | Domain::ReferenceSite
-            | Domain::CallSite
-            | Domain::ExpressionSite
-            | Domain::Occurrence
-            | Domain::ReceiverAnalysis,
-            Step::ReceiverOutcome,
-        ) => Some(Domain::ReceiverOutcome),
-        (
-            Domain::StructuralMatch
-            | Domain::ReferenceSite
-            | Domain::CallSite
-            | Domain::ExpressionSite
-            | Domain::Occurrence
-            | Domain::ReceiverAnalysis,
-            Step::ReceiverEvidence,
-        ) => Some(Domain::ReceiverEvidence),
-        (Domain::Occurrence, Step::MemberSelection) => Some(Domain::MemberSelection),
-        (Domain::Occurrence, Step::CandidateHierarchy) => Some(Domain::CandidateHop),
-        (
-            Domain::Occurrence | Domain::CallSite | Domain::ReferenceSite | Domain::StructuralMatch,
-            Step::DispatchOutcome,
-        ) => Some(Domain::DispatchOutcome),
-        (
-            Domain::Occurrence | Domain::CallSite | Domain::ReferenceSite | Domain::StructuralMatch,
-            Step::DispatchTargets,
-        ) => Some(Domain::DispatchTarget),
-        (Domain::Declaration, Step::MemberFamily) => Some(Domain::MemberFamily),
-        (Domain::Declaration, Step::FamilyEdges) => Some(Domain::MemberFamilyEdge),
-        _ => None,
-    }
+    let step = QueryStep::from_label(step.label())
+        .expect("the relation expansion catalog contains only defaultable RQL steps");
+    step.output_kind(source.query_value_kind())
+        .map(DetailedCodeQueryDomain::from_query_value_kind)
 }
 
 /// The schema a join publishes: an inner join concatenates both sides, a left
@@ -714,34 +682,37 @@ pub fn domain_schema(qualifier: &str, domain: DetailedCodeQueryDomain) -> IrSche
     )
 }
 
+/// The schema published by a query binding after all RQL projections.
+pub fn query_schema(
+    qualifier: &str,
+    fields: &[(String, brokk_bifrost_rql::structural::CodeQueryRowField)],
+) -> IrSchema {
+    IrSchema::new(
+        fields
+            .iter()
+            .map(|(name, field)| IrField {
+                column: IrColumn::new(qualifier, name.clone()),
+                scalar_type: field.scalar_type,
+                nullable: field.nullable,
+                value_domain: field.value_domain,
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The expansion list must name every authored step. An added step fails to
-    /// compile here before it can silently drop out of the catalog.
+    /// The expansion list must not contain duplicate public RQL spellings.
     #[test]
-    fn every_authored_expansion_step_is_listed() {
-        for step in ALL_ROW_EXPANSION_STEPS {
-            let named = match step {
-                RowExpansionStep::ReceiverOutcome
-                | RowExpansionStep::ReceiverEvidence
-                | RowExpansionStep::MemberSelection
-                | RowExpansionStep::MemberCandidates
-                | RowExpansionStep::CandidateHierarchy
-                | RowExpansionStep::MemberFamily
-                | RowExpansionStep::FamilyEdges
-                | RowExpansionStep::DispatchOutcome
-                | RowExpansionStep::DispatchTargets => step.label(),
-            };
-            assert!(!named.is_empty());
-        }
-        let mut labels = ALL_ROW_EXPANSION_STEPS
+    fn every_cataloged_rql_expansion_step_has_a_unique_spelling() {
+        let mut labels = ALL_RQL_RELATION_EXPANSION_STEPS
             .iter()
             .map(|step| step.label())
             .collect::<Vec<_>>();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), ALL_ROW_EXPANSION_STEPS.len());
+        assert_eq!(labels.len(), ALL_RQL_RELATION_EXPANSION_STEPS.len());
     }
 }

@@ -79,6 +79,177 @@ fn error_of(json: Value) -> QueryError {
 }
 
 #[test]
+fn row_filter_and_projection_round_trip_across_rql_and_json() {
+    let rql = CodeQuery::from_sexp(
+        r#"(project :columns (id (target_count candidates) role)
+              (filter :where (
+                (class in [reference declaration])
+                (target_count ge 0)
+                (target_count le (field target_count))
+                (target_id is-not-null)
+                (id ne "missing"))
+                (occurrences)))"#,
+    )
+    .expect("typed row steps should parse");
+    let canonical = json!({
+        "schema_version": 1,
+        "occurrences": {},
+        "steps": [
+            {
+                "op": "filter",
+                "where": [
+                    {
+                        "field": "class",
+                        "op": "in",
+                        "values": [{ "enum": "reference" }, { "enum": "declaration" }]
+                    },
+                    {
+                        "field": "target_count",
+                        "op": "ge",
+                        "value": { "integer": 0 }
+                    },
+                    {
+                        "field": "target_count",
+                        "op": "le",
+                        "value": { "field": "target_count" }
+                    },
+                    { "field": "target_id", "op": "is_not_null" },
+                    {
+                        "field": "id",
+                        "op": "ne",
+                        "value": { "string": "missing" }
+                    }
+                ]
+            },
+            {
+                "op": "project",
+                "columns": [
+                    { "source": "id", "name": "id" },
+                    { "source": "target_count", "name": "candidates" },
+                    { "source": "role", "name": "role" }
+                ]
+            }
+        ],
+        "limit": 100,
+        "result_detail": "compact",
+        "execution_mode": "results"
+    });
+
+    assert_eq!(rql.to_canonical_json(), canonical);
+    assert_eq!(parse_ok(canonical.clone()).to_canonical_json(), canonical);
+}
+
+#[test]
+fn row_steps_validate_public_types_domains_and_projected_schema() {
+    for (step, path, message) in [
+        (
+            json!({
+                "op": "filter",
+                "where": [{
+                    "field": "target_count",
+                    "op": "eq",
+                    "value": { "string": "one" }
+                }]
+            }),
+            "steps[0].where[0].value",
+            "does not match",
+        ),
+        (
+            json!({
+                "op": "filter",
+                "where": [{
+                    "field": "role",
+                    "op": "eq",
+                    "value": { "enum": "Reference" }
+                }]
+            }),
+            "steps[0].where[0].value",
+            "is not a value of `role`; the accepted values are",
+        ),
+        (
+            json!({
+                "op": "filter",
+                "where": [{ "field": "id", "op": "is_null" }]
+            }),
+            "steps[0].where[0]",
+            "not nullable",
+        ),
+        (
+            json!({
+                "op": "project",
+                "columns": [
+                    { "source": "id", "name": "key" },
+                    { "source": "ast_id", "name": "key" }
+                ]
+            }),
+            "steps[0].columns[1].name",
+            "duplicate projected row field",
+        ),
+    ] {
+        let error = error_of(json!({
+            "occurrences": {},
+            "steps": [step]
+        }));
+        assert_eq!(error.path, path);
+        assert!(error.message.contains(message), "{error:?}");
+    }
+
+    let error = error_of(json!({
+        "occurrences": {},
+        "steps": [
+            {
+                "op": "project",
+                "columns": [{ "source": "target_count", "name": "count" }]
+            },
+            {
+                "op": "filter",
+                "where": [{
+                    "field": "target_count",
+                    "op": "ge",
+                    "value": { "integer": 1 }
+                }]
+            }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].where[0].field");
+    assert!(error.message.contains("count"), "{error:?}");
+}
+
+#[test]
+fn set_branches_require_the_same_visible_projected_row_schema() {
+    let branch = |name: &str| {
+        json!({
+            "occurrences": { "class": "reference" },
+            "steps": [{
+                "op": "project",
+                "columns": [{ "source": "target_count", "name": name }]
+            }]
+        })
+    };
+    let compatible = parse_ok(json!({
+        "union": [branch("count"), branch("count")],
+        "steps": [{
+            "op": "filter",
+            "where": [{
+                "field": "count",
+                "op": "ge",
+                "value": { "integer": 1 }
+            }]
+        }]
+    }));
+    assert_eq!(compatible.validate_row_fields().unwrap().1[0].0, "count");
+
+    let incompatible = error_of(json!({
+        "union": [branch("count"), branch("total")]
+    }));
+    assert_eq!(incompatible.path, "union[1]");
+    assert!(
+        incompatible.message.contains("row schema"),
+        "{incompatible:?}"
+    );
+}
+
+#[test]
 fn parses_the_issue_example_query() {
     let query = parse_ok(json!({
         "where": ["src/**/*.py", "src/**/*.ts"],
@@ -1822,9 +1993,8 @@ fn composed_structural_capture_must_exist_in_every_branch() {
 
 #[test]
 fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
-    let outcome =
-        CodeQuery::from_sexp(r#"(receiver-outcome (receiver-targets (call :callee "run")))"#)
-            .expect("receiver outcome RQL");
+    let outcome = CodeQuery::from_sexp(r#"(receiver-outcome (call :callee "run"))"#)
+        .expect("receiver outcome RQL");
     assert_eq!(
         outcome.validate_steps().unwrap(),
         QueryValueKind::ReceiverOutcome
@@ -1834,17 +2004,14 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
     let evidence = parse_ok(json!({
         "schema_version": SCHEMA_VERSION,
         "match": { "kind": "call", "callee": { "name": "run" } },
-        "steps": [
-            { "op": "receiver_targets" },
-            { "op": "receiver_evidence" }
-        ]
+        "steps": [{ "op": "receiver_evidence" }]
     }));
     assert_eq!(
         evidence.validate_steps().unwrap(),
         QueryValueKind::ReceiverEvidence
     );
     assert_eq!(
-        evidence.to_canonical_json()["steps"][1]["op"],
+        evidence.to_canonical_json()["steps"][0]["op"],
         "receiver_evidence"
     );
 }

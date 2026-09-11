@@ -16,6 +16,140 @@ use crate::cancellation::CancellationToken;
 use semver::Version;
 
 #[test]
+fn row_filter_and_projection_execute_over_public_occurrence_fields() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "fn helper() {}\nfn run() { helper(); helper(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        r#"(filter :where (
+                (class eq reference)
+                (class ne declaration)
+                (class in [reference])
+                (candidates eq (field candidates))
+                (candidates lt 2)
+                (candidates le 1)
+                (candidates gt 0)
+                (candidates ge 1)
+                (site ne "missing"))
+              (project :columns ((ast_id site) (target_count candidates) class)
+                (filter :where ((target_count is-not-null))
+                  (occurrences :class reference))))"#,
+    )
+    .expect("typed row query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+
+    assert_eq!(result.results.len(), 2, "{}", result.render_text());
+    for item in &result.results {
+        assert_eq!(
+            item.row_projection
+                .iter()
+                .map(|column| (column.source.as_str(), column.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ast_id", "site"),
+                ("target_count", "candidates"),
+                ("class", "class"),
+            ]
+        );
+        let projected = UnitRowItem::project(item);
+        assert!(projected.field("site").expect("site field").is_some());
+        assert_eq!(
+            projected.field("candidates").expect("candidate count"),
+            Some(CodeQueryRowScalarRef::Integer(1))
+        );
+        assert_eq!(
+            projected.field("class").expect("class field"),
+            Some(CodeQueryRowScalarRef::ConstrainedEnum("reference"))
+        );
+        assert!(projected.field("ast_id").is_err());
+    }
+
+    let null_query = CodeQuery::from_source(
+        "(filter :where ((target_id is-null)) (occurrences :class declaration))",
+    )
+    .expect("nullable row query");
+    let null_result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &null_query,
+    );
+    assert!(
+        !null_result.results.is_empty(),
+        "{}",
+        null_result.render_text()
+    );
+
+    let absent_ne_query = CodeQuery::from_source(
+        r#"(filter :where ((target_id ne "missing")) (occurrences :class declaration))"#,
+    )
+    .expect("absent comparison query");
+    let absent_ne_result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &absent_ne_query,
+    );
+    assert!(
+        absent_ne_result.results.is_empty(),
+        "absent values must not satisfy ne: {}",
+        absent_ne_result.render_text()
+    );
+}
+
+#[test]
+fn direct_receiver_terminal_steps_match_explicit_receiver_analysis() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "struct Service;\nimpl Service { fn run(&self) {} }\nfn caller(service: Service) { service.run(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let execute_values = |source: &str| {
+        let query = CodeQuery::from_source(source).expect("receiver row query");
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+        .results
+        .into_iter()
+        .map(|item| {
+            let mut value = serde_json::to_value(item.value).expect("serializable row value");
+            let object = value.as_object_mut().expect("result values are objects");
+            object.remove("scope_nodes");
+            object.remove("setup_nodes");
+            value
+        })
+        .collect::<Vec<_>>()
+    };
+
+    let direct_outcomes =
+        execute_values("(receiver-outcome (occurrences :role [member_position]))");
+    let explicit_outcomes = execute_values(
+        "(receiver-outcome (receiver-targets (occurrences :role [member_position])))",
+    );
+    assert!(!direct_outcomes.is_empty());
+    assert_eq!(direct_outcomes, explicit_outcomes);
+
+    let direct_evidence =
+        execute_values("(receiver-evidence (occurrences :role [member_position]))");
+    let explicit_evidence = execute_values(
+        "(receiver-evidence (receiver-targets (occurrences :role [member_position])))",
+    );
+    assert!(!direct_evidence.is_empty());
+    assert_eq!(direct_evidence, explicit_evidence);
+}
+
+#[test]
 fn row_family_session_reuses_complete_occurrences_and_environment_across_queries() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");

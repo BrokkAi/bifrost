@@ -269,7 +269,20 @@ pub(crate) fn render_skeleton(
                     }
                 }
 
-                let all_children = analyzer.direct_children(&unit);
+                // Kotlin class skeletons omit separate constructor children;
+                // the primary constructor is already in the type header. Use
+                // the declared role, not synthetic identity, for presentation.
+                let all_children = analyzer
+                    .direct_children(&unit)
+                    .into_iter()
+                    .filter(|child| {
+                        language_for_target(child) != Language::Kotlin
+                            || !analyzer
+                                .signature_metadata(child)
+                                .iter()
+                                .any(|entry| entry.callable_is_constructor())
+                    })
+                    .collect::<Vec<_>>();
                 let all_child_count = all_children.len();
                 let is_class = unit.is_class();
                 let children: Vec<CodeUnit> = if header_only {

@@ -1593,6 +1593,7 @@ pub(super) fn execute_seed(
                     steps: Vec::new(),
                 }],
                 provenance_truncated: false,
+                row_projection: Vec::new(),
             }
         })
         .collect::<Vec<_>>();

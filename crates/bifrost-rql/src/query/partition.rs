@@ -25,13 +25,16 @@ pub enum PlanPartitioning {
 impl PlanPartitioning {
     /// Classify `plan` from its source kind and its steps.
     ///
-    /// Set plans are `Whole` unless they are suffix-free unions whose leaves
-    /// are all seed-partitionable and use one comparator family. The remaining
-    /// shapes are `Whole`:
+    /// Set plans are `Whole` unless they are unions whose leaves are all
+    /// seed-partitionable, use one comparator family, and whose only set-node
+    /// suffixes are typed row filters or projections. Those two operations
+    /// distribute over union because they inspect or rename one row without
+    /// consulting any other row. The remaining shapes are `Whole`:
     ///
-    /// - An intersect/except source, or a union with a suffix. Those operators
-    ///   consume cross-seed membership or a deduplicated set of branch rows,
-    ///   so their result cannot be reconstructed from independent seed rows.
+    /// - An intersect/except source, or a union with a non-distributive suffix.
+    ///   Those operators consume cross-seed membership or a deduplicated set
+    ///   of branch rows, so their result cannot be reconstructed from
+    ///   independent seed rows.
     ///   A union with an `absent_member` step is also whole because its root
     ///   evidence payload is merged by representative selection rather than by
     ///   traces alone. Eligible unions handle their fair-budget retry boundary
@@ -78,8 +81,9 @@ impl PlanPartitioning {
     }
 
     /// Validate the restricted union shape and return its checked fair-share
-    /// divisor. Every set node must be a suffix-free union, and every leaf must
-    /// be a seed-partitionable plan with the same seed ordering family.
+    /// divisor. Every set node must be a union with only distributive row-local
+    /// suffixes, and every leaf must be a seed-partitionable plan with the same
+    /// seed ordering family.
     pub(crate) fn classify_union(plan: &CodeQueryPlan) -> Option<usize> {
         let CodeQueryPlanSource::Set { .. } = &plan.source else {
             return None;
@@ -92,7 +96,11 @@ impl PlanPartitioning {
         while let Some((current, divisor)) = pending.pop() {
             match &current.source {
                 CodeQueryPlanSource::Set { op, branches } => {
-                    if *op != super::ir::SetOperator::Union || !current.steps.is_empty() {
+                    if *op != super::ir::SetOperator::Union
+                        || current.steps.iter().any(|step| {
+                            !matches!(step.op(), QueryStepOp::Filter | QueryStepOp::Project)
+                        })
+                    {
                         return None;
                     }
                     let next_divisor = divisor.checked_mul(branches.len())?;
@@ -126,24 +134,32 @@ impl PlanPartitioning {
     }
 
     /// Return the non-set leaves and their full branch paths for an eligible
-    /// union. The traversal is iterative so query depth cannot consume the
-    /// Rust call stack.
+    /// union. Distributive set-node suffixes are appended to each descendant
+    /// leaf in execution order, so unit execution applies the same row-local
+    /// transformation before the global branch-order merge. The traversal is
+    /// iterative so query depth cannot consume the Rust call stack.
     pub(crate) fn union_leaf_plans(
         plan: &CodeQueryPlan,
-    ) -> Option<Vec<(&CodeQueryPlan, Vec<usize>)>> {
+    ) -> Option<Vec<(CodeQueryPlan, Vec<usize>)>> {
         Self::classify_union(plan)?;
-        let mut pending = vec![(plan, Vec::new())];
+        let mut pending = vec![(plan, Vec::new(), Vec::new())];
         let mut leaves = Vec::new();
-        while let Some((current, path)) = pending.pop() {
+        while let Some((current, path, inherited_steps)) = pending.pop() {
             match &current.source {
                 CodeQueryPlanSource::Set { branches, .. } => {
+                    let mut suffix = current.steps.clone();
+                    suffix.extend(inherited_steps);
                     for (index, branch) in branches.iter().enumerate().rev() {
                         let mut branch_path = path.clone();
                         branch_path.push(index);
-                        pending.push((branch, branch_path));
+                        pending.push((branch, branch_path, suffix.clone()));
                     }
                 }
-                _ => leaves.push((current, path)),
+                _ => {
+                    let mut leaf = current.clone();
+                    leaf.steps.extend(inherited_steps);
+                    leaves.push((leaf, path));
+                }
             }
         }
         assert!(
@@ -338,6 +354,38 @@ mod tests {
             PlanPartitioning::classify(&plan),
             PlanPartitioning::BySeedUnion
         );
+    }
+
+    #[test]
+    fn typed_row_steps_on_a_union_are_distributed_to_its_leaves() {
+        let plan = plan(json!({
+            "union": [
+                { "occurrences": { "class": "reference" } },
+                { "occurrences": { "class": "reference" } }
+            ],
+            "steps": [
+                {
+                    "op": "filter",
+                    "where": [{ "field": "target_id", "op": "is_not_null" }]
+                },
+                {
+                    "op": "project",
+                    "columns": [{ "source": "id", "name": "site" }]
+                }
+            ]
+        }));
+        assert_eq!(
+            PlanPartitioning::classify(&plan),
+            PlanPartitioning::BySeedUnion
+        );
+        let leaves = PlanPartitioning::union_leaf_plans(&plan).expect("union is sliceable");
+        assert_eq!(leaves.len(), 2);
+        for (leaf, _) in leaves {
+            assert_eq!(
+                leaf.steps.iter().map(|step| step.op()).collect::<Vec<_>>(),
+                vec![QueryStepOp::Filter, QueryStepOp::Project]
+            );
+        }
     }
 
     #[test]

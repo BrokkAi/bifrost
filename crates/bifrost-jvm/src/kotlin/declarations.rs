@@ -405,8 +405,7 @@ impl<'a> KotlinVisitor<'a> {
                     .fq()
                     .clone()
                     .with_pushed(kotlin_segment(class_name, SegmentKind::Member)),
-            )
-            .with_synthetic(true);
+            );
             self.parsed.add_code_unit(
                 constructor.clone(),
                 primary,
@@ -468,7 +467,7 @@ impl<'a> KotlinVisitor<'a> {
 
     fn visit_secondary_constructor(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
         // A secondary constructor is only meaningful inside a class body. All
-        // of a class's constructors share one synthetic callable identity
+        // of a class's constructors share one source callable identity
         // named after the class (`Owner.Owner`, the Scala precedent): each
         // constructor declaration accumulates its own range and signature on
         // that unit, exactly like ordinary overloads sharing a spelling.
@@ -485,8 +484,7 @@ impl<'a> KotlinVisitor<'a> {
                 .fq()
                 .clone()
                 .with_pushed(kotlin_segment(&class_name, SegmentKind::Member)),
-        )
-        .with_synthetic(true);
+        );
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         let parameter_list = first_named_child(node, "function_value_parameters");

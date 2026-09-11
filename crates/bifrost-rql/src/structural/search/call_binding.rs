@@ -46,7 +46,7 @@ use crate::analyzer::usages::call_relations::{
     formal_owner_for_callee, python_first_formal_is_bound,
 };
 use crate::analyzer::usages::callable_signature::{
-    CallableSignatureReport, callable_signature_reports,
+    SelectedSignature, callable_signature_reports, signature_choice,
 };
 use crate::analyzer::usages::effects::ModeledProcedureKey;
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
@@ -770,9 +770,9 @@ pub(super) fn call_binding_expansions(
             // A layout nobody recorded is stated, never defaulted to "no
             // parameters": an empty parameter list and an unread one are
             // different answers about the same callable.
-            let layout = owner
-                .as_ref()
-                .and_then(|(owner, _)| bindings.formal_layout(analyzer, owner));
+            let layout = owner.as_ref().and_then(|(owner, _)| {
+                bindings.formal_layout(analyzer, owner, shape.report.arguments.len())
+            });
             let target = if signature_ambiguous {
                 CallBindingTarget::Ambiguous
             } else {
@@ -1000,6 +1000,7 @@ pub(super) fn call_binding_expansions(
         {
             receiver_type_id = analyzer
                 .parent_of(source_target)
+                .filter(CodeUnit::is_class)
                 .map(|parent| parent.declaration_id().to_string());
         }
     } else {
@@ -1158,20 +1159,6 @@ fn resolve_call_target(
     }
 }
 
-/// What the callee's published signature entries say about this call site.
-struct SelectedSignature {
-    /// The `callable_signature` row this binding selects, when the entries name
-    /// exactly one.
-    signature_id: Option<String>,
-    /// More than one structurally different signature accepts the written
-    /// arity. Without a language-owned applicability/type verdict, no formal
-    /// layout may be selected from that set.
-    ambiguous: bool,
-    /// The receiver contract the selected entry declares, or the one every
-    /// entry agrees on when selection did not narrow to one.
-    receiver_contract: Option<ReceiverContract>,
-}
-
 /// Select the `callable_signature` row this binding names, out of every entry
 /// the target publishes.
 ///
@@ -1218,99 +1205,6 @@ fn signature_set_is_ambiguous(
     let entries = analyzer.signature_metadata(unit);
     let reports = callable_signature_reports("unprojected-source-target", unit, &entries);
     signature_choice(&reports, actual_count).ambiguous
-}
-
-fn signature_choice(reports: &[CallableSignatureReport], actual_count: usize) -> SelectedSignature {
-    let (selected, mut ambiguous) = match reports {
-        [] => (None, false),
-        [only] => (Some(only), false),
-        several
-            if several
-                .iter()
-                .all(|report| report.signature.arity.is_some()) =>
-        {
-            let accepting = several
-                .iter()
-                .filter(|report| {
-                    report
-                        .signature
-                        .arity
-                        .is_some_and(|arity| arity.accepts(actual_count))
-                })
-                .collect::<Vec<_>>();
-            match accepting.as_slice() {
-                [only] => (Some(*only), false),
-                [first, rest @ ..]
-                    if rest
-                        .iter()
-                        .all(|report| declares_the_same_parameters(first, report)) =>
-                {
-                    (
-                        accepting
-                            .iter()
-                            .copied()
-                            .find(|report| !report.signature.declaration_only)
-                            .or(Some(*first)),
-                        false,
-                    )
-                }
-                [_, _, ..] => (None, true),
-                [] => (None, false),
-            }
-        }
-        _ => (None, false),
-    };
-    if selected.is_none() && !ambiguous {
-        ambiguous = reports
-            .iter()
-            .filter(|report| {
-                report.signature.declaration_only
-                    && report.signature.parameter_count == actual_count
-            })
-            .take(2)
-            .count()
-            == 2;
-    }
-    SelectedSignature {
-        signature_id: selected.map(|report| report.signature.id.clone()),
-        ambiguous,
-        receiver_contract: selected
-            .map(|report| report.signature.receiver_contract)
-            .unwrap_or_else(|| agreed_receiver_contract(reports)),
-    }
-}
-
-/// Whether two published entries describe the same declared parameter list,
-/// which is what makes a header and its definition one signature rather than
-/// two overloads. The comparison is over the recorded parameter labels and
-/// declared type spellings, both of which the adapter published; nothing here
-/// parses either.
-fn declares_the_same_parameters(
-    left: &CallableSignatureReport,
-    right: &CallableSignatureReport,
-) -> bool {
-    left.parameters.len() == right.parameters.len()
-        && left
-            .parameters
-            .iter()
-            .zip(&right.parameters)
-            .all(|(left, right)| {
-                left.label == right.label && left.declared_type == right.declared_type
-            })
-}
-
-/// The receiver contract every published entry declares, when they all declare
-/// the same one. Which overload a call selects cannot change whether the
-/// callable is instance-bound, so an unselected overload set still answers
-/// this; entries that disagree answer nothing.
-fn agreed_receiver_contract(reports: &[CallableSignatureReport]) -> Option<ReceiverContract> {
-    let mut contracts = reports
-        .iter()
-        .map(|report| report.signature.receiver_contract);
-    let first = contracts.next().flatten()?;
-    contracts
-        .all(|contract| contract == Some(first))
-        .then_some(first)
 }
 
 /// What fills the resolved callee's receiver position at this call site.
@@ -1374,7 +1268,15 @@ fn receiver_binding(
     }
     let declares_receiver_slot = layout.slots.iter().any(|slot| slot.receiver);
     Some(
-        if declares_receiver_slot || contract == Some(ReceiverContract::Instance) {
+        if declares_receiver_slot
+            || contract == Some(ReceiverContract::Instance)
+            // Kotlin declares the extension receiver outside the ordinary
+            // parameter list. Other extension adapters (such as C#'s `this`
+            // parameter) must establish their own consumed-slot convention.
+            || (contract == Some(ReceiverContract::Extension)
+                && crate::analyzer::common::language_for_file(formal_owner.source())
+                    == Language::Kotlin)
+        {
             CallReceiverBinding::Actual {
                 range,
                 declared_first_ordinary: false,

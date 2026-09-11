@@ -33,6 +33,10 @@
       }
     },
     {
+      "name": "support.constant.aggregate-operation.bifrost-rql",
+      "match": "(?<![A-Za-z0-9_-])(?:set-equal|subset)(?=[\\s)\\]])"
+    },
+    {
       "name": "support.constant.language-family.bifrost-rql",
       "match": "(?<![A-Za-z0-9_-])(?:jvm|js-ts)(?=[\\s)\\]])"
     },
@@ -58,11 +62,11 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|arity|attributes|boolean[-_]value|callee|capture|children|class(?:es)?|completeness|config[-_]gated|consumers?|declaration[-_]only|decorators|depth|domains?|element[-_]name|elements|field|formal[-_](?:index|name)|forms?|has|global|identity|index|inputs?|iterable|key|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|resolves[-_]to|max-(?:bytes|steps)|max|min|member[-_]target[-_]id|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name|type(?:/regex)?)|plan-ref|proof|property|property[-_]name|provenances?|protocol-ref|receiver(?:[-_](?:identity[-_]id|type))?|reference-kinds|relation(?:s)?|right|roles?|runtime|site[-_]class|source[-_]origin|subjects?|tag|value|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage|visibility)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|arity|attributes|boolean[-_]value|callee|capture|children|class(?:es)?|columns|completeness|config[-_]gated|consumers?|declaration[-_]only|decorators|depth|domains?|element[-_]name|elements|field|formal[-_](?:index|name)|forms?|has|global|identity|index|inputs?|iterable|key|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|resolves[-_]to|max-(?:bytes|steps)|max|min|member[-_]target[-_]id|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name|type(?:/regex)?)|plan-ref|proof|property|property[-_]name|provenances?|protocol-ref|receiver(?:[-_](?:identity[-_]id|type))?|reference-kinds|relation(?:s)?|right|roles?|runtime|site[-_]class|source[-_]origin|subjects?|tag|value|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage|visibility|where)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
-      "match": "\\b(?:absent[-_]member|assignable[-_]to|call-input|call[-_]shape|class[-_]set|call[-_]results|call[-_]argument[-_]groups|call[-_]arguments|call[-_]argument|call[-_]bindings|call[-_]result[-_]contracts|callable[-_]signature|signature[-_]parameters|callable[-_]applicability|overload[-_]selection|resolved[-_]call|jsx[-_]attribute[-_]value|field[-_]write[-_]value|call-sites-from|call-sites-to|callees|callers|cfg-edge-source|cfg-edge-target|cfg-entry|cfg-exits|cfg-predecessor-edges|cfg-successor-edges|cfg_edge_source|cfg_edge_target|cfg_entry|cfg_exits|cfg_predecessor_edges|cfg_successor_edges|concurrent[-_]access[-_]conflicts|enclosing-decl|except|explain|file-of|importers-of|imports-of|inside-decl|inside_decl|inside|intersect|keyed[-_]read[-_]value|language|languages|limit|member-targets|member[-_]selection|members|generation[-_]sites|generates|generated[-_]by|dispatch[-_]outcome|dispatch[-_]targets|member[-_]family|family[-_]edges|declaration[-_]state[-_]of|implementation[-_]of|stubs[-_]of|export[-_]target|exports|export|binding[-_]of|binding[-_]occurrence|bindings[-_]in|bindings|binding|candidate[-_]hierarchy|candidate[-_]target|candidates[-_]of|edge[-_]target|edges[-_]from|edges[-_]of|state[-_]events[-_]of|control[-_]relations|guards[-_]of|flow[-_]relations[-_]of|flow[-_]source|flow[-_]target|result[-_]contract[-_](?:calls|uses|operation[-_]uses|failure[-_]uses)|rewrite[-_]paths[-_]of|not-inside|occurrences[-_]of|occurrences[-_]in|occurrence[-_]target|occurrences|occurrence|owner|points-to|scope[-_]ancestors|scope[-_]of|scopes|scope|paths|path|segments[-_]of|segment[-_]target|procedure-of|procedure_of|profile|receiver-targets|receiver[-_]outcome|receiver[-_]evidence|references-of|result-detail|subtypes|supertypes|taint|typestate|union|used-by|uses|value-flow|value_flow|where|witness)\\b"
+      "match": "\\b(?:absent[-_]member|assignable[-_]to|call-input|call[-_]shape|class[-_]set|call[-_]results|call[-_]argument[-_]groups|call[-_]arguments|call[-_]argument|call[-_]bindings|call[-_]result[-_]contracts|callable[-_]signature|signature[-_]parameters|callable[-_]applicability|overload[-_]selection|resolved[-_]call|jsx[-_]attribute[-_]value|field[-_]write[-_]value|call-sites-from|call-sites-to|callees|callers|cfg-edge-source|cfg-edge-target|cfg-entry|cfg-exits|cfg-predecessor-edges|cfg-successor-edges|cfg_edge_source|cfg_edge_target|cfg_entry|cfg_exits|cfg_predecessor_edges|cfg_successor_edges|concurrent[-_]access[-_]conflicts|enclosing-decl|except|explain|field|file-of|filter|importers-of|imports-of|inside-decl|inside_decl|inside|intersect|keyed[-_]read[-_]value|language|languages|limit|member-targets|member[-_]selection|members|generation[-_]sites|generates|generated[-_]by|dispatch[-_]outcome|dispatch[-_]targets|member[-_]family|family[-_]edges|declaration[-_]state[-_]of|implementation[-_]of|stubs[-_]of|export[-_]target|exports|export|binding[-_]of|binding[-_]occurrence|bindings[-_]in|bindings|binding|candidate[-_]hierarchy|candidate[-_]target|candidates[-_]of|edge[-_]target|edges[-_]from|edges[-_]of|state[-_]events[-_]of|control[-_]relations|guards[-_]of|flow[-_]relations[-_]of|flow[-_]source|flow[-_]target|result[-_]contract[-_](?:calls|uses|operation[-_]uses|failure[-_]uses)|rewrite[-_]paths[-_]of|not-inside|occurrences[-_]of|occurrences[-_]in|occurrence[-_]target|occurrences|occurrence|owner|points-to|project|scope[-_]ancestors|scope[-_]of|scopes|scope|paths|path|segments[-_]of|segment[-_]target|procedure-of|procedure_of|profile|receiver-targets|receiver[-_]outcome|receiver[-_]evidence|references-of|result-detail|subtypes|supertypes|taint|typestate|union|used-by|uses|value-flow|value_flow|where|witness)\\b"
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",
@@ -70,7 +74,7 @@
     },
     {
       "name": "support.function.predicate.bifrost-rql",
-      "match": "\\b(?:arity|boolean[-_]value|capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|parameter-type(?:/regex)?|text/regex|visibility)\\b"
+      "match": "\\b(?:arity|boolean[-_]value|capture|eq|ge|gt|has|in|is[-_]not[-_]null|is[-_]null|le|lt|name(?:/regex)?|ne|not[-_]has|not[-_]kind|parameter-type(?:/regex)?|text/regex|visibility)\\b"
     },
     {
       "name": "constant.language.boolean.bifrost-rql",

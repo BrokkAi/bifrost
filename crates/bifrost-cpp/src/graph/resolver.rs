@@ -59,6 +59,7 @@ use tree_sitter::{Node, Parser, Tree};
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static BOUNDED_VISIBILITY_DECLARATION_READ_COUNT: Cell<usize> = const { Cell::new(0) };
+    static BOUNDED_VISIBILITY_DEPENDENCY_AST_NODE_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8062,6 +8063,104 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    fn alias_candidate_structurally_reaches_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidate: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let mut current = candidate.clone();
+        let mut seen = HashSet::default();
+        loop {
+            if same_visible_symbol(&current, target)
+                || self.compatible_primary_template_redeclarations(&current, target)
+                || self
+                    .cpp_template_metadata
+                    .get(&current)
+                    .zip(self.cpp_template_metadata.get(target))
+                    .is_some_and(|(current, target)| {
+                        current.primary_fq_name == target.primary_fq_name
+                    })
+            {
+                return true;
+            }
+            if !seen.insert(current.clone()) {
+                return false;
+            }
+            let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
+                return false;
+            };
+            if let StructuredAliasTarget::Named { components, .. } = &alias_target
+                && components[..components.len().saturating_sub(1)]
+                    .iter()
+                    .any(|component| {
+                        self.type_reference_component_directly_names_target(component, target)
+                    })
+                && self.structured_class_alias_path_preserves_target(
+                    analyzer,
+                    visible_from,
+                    &current,
+                    target,
+                )
+            {
+                return true;
+            }
+            if matches!(alias_target, StructuredAliasTarget::Builtin) {
+                return false;
+            }
+            let Some(primary) =
+                self.resolve_structured_alias_primary(visible_from, &current, &alias_target)
+            else {
+                return false;
+            };
+            current = primary;
+        }
+    }
+
+    /// Whether one indexed alias component in a qualified type reference has
+    /// a structured path to `target`.
+    ///
+    /// Alias terminal names such as `type` are deliberately common. A
+    /// file-wide name set cannot distinguish `Gen<T>::type`, whose indexed RHS
+    /// names the target, from thousands of unrelated `Traits<T>::type`
+    /// references. Match every qualified prefix against the alias's canonical
+    /// scope before following its structured RHS. An unresolved dependent RHS
+    /// fails this coarse gate only when no other component names the target;
+    /// references such as `Identity<Target>::type` are admitted by that target
+    /// component before this helper is called.
+    pub fn qualified_alias_reference_may_reach_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        target: &CodeUnit,
+    ) -> bool {
+        for end in 0..components.len() {
+            let spelled = &components[..=end];
+            for candidate in self
+                .visible_identifier_candidates(file, &components[end])
+                .filter(|candidate| declared_type_alias(analyzer, candidate))
+            {
+                let candidate_components = canonical_cpp_scope_components(candidate);
+                let shape_matches = if global {
+                    candidate_components == spelled
+                } else {
+                    candidate_components.ends_with(spelled)
+                };
+                if shape_matches
+                    && self.alias_candidate_structurally_reaches_target(
+                        analyzer, file, candidate, target,
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Every indexed type declaration `raw_name` names when it is written in
     /// `declaration`'s namespace: the innermost enclosing namespace that holds
     /// the name wins, otherwise the name is looked up unqualified.
@@ -8737,6 +8836,23 @@ impl<'a> VisibilityIndex<'a> {
             .flatten()
     }
 
+    /// Whether a grammar component is the direct spelling of `target`.
+    ///
+    /// Concrete template specializations are indexed with their arguments in
+    /// `identifier`, while a reference's name component contains only the
+    /// primary name. Argument matching remains the later resolver's job.
+    pub fn type_reference_component_directly_names_target(
+        &self,
+        component: &str,
+        target: &CodeUnit,
+    ) -> bool {
+        component == target.identifier()
+            || self
+                .cpp_template_metadata
+                .get(target)
+                .is_some_and(|metadata| component == metadata.primary_name)
+    }
+
     /// Return terminal reference names that can denote `target` from `file`.
     ///
     /// The indexed candidate table covers ordinary declarations and aliases;
@@ -8762,7 +8878,7 @@ impl<'a> VisibilityIndex<'a> {
                         && (same_visible_symbol(candidate, target)
                             || self.compatible_primary_template_redeclarations(candidate, target)))
                         || (declared_type_alias(analyzer, candidate)
-                            && self.alias_candidate_may_preserve_target(
+                            && self.alias_candidate_structurally_reaches_target(
                                 analyzer, file, candidate, target,
                             ))
                 }) {
@@ -9350,17 +9466,25 @@ fn build_bounded_visible_declarations(
     stats: &mut BoundedVisibilityStats,
 ) -> HashMap<ProjectFile, HashSet<CodeUnit>> {
     let mut candidates_by_identifier = HashMap::default();
+    let mut declarations_by_source_and_reading: HashMap<
+        (ProjectFile, bool),
+        BoundedVisibilityDeclarations,
+    > = HashMap::default();
+    let mut dependency_names_by_unit: HashMap<CodeUnit, HashSet<String>> = HashMap::default();
     roots
         .iter()
         .map(|root| {
             let reading_is_c = analyzer.reference_uses_c_semantics(root);
-            let declarations_started = Instant::now();
-            let root_declarations =
-                bounded_visibility_declarations_in_reading(analyzer, root, reading_is_c);
-            stats.declaration_elapsed += declarations_started.elapsed();
-            stats.declaration_reads += 1;
-            stats.declaration_units += root_declarations.len();
-            let mut visible = root_declarations.into_iter().collect::<HashSet<_>>();
+            let root_declarations = declarations_by_source_and_reading
+                .entry((root.clone(), reading_is_c))
+                .or_insert_with(|| {
+                    bounded_visibility_declarations(cpp, analyzer, root, reading_is_c, stats)
+                });
+            let mut visible = root_declarations
+                .all
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
             let mut pending_names = HashSet::default();
             if let Some(prepared) = cpp.prepared_syntax(token, root) {
                 // One cursor for the whole file walk: `named_child(index)`
@@ -9451,57 +9575,65 @@ fn build_bounded_visible_declarations(
                 }
                 stats.candidate_sources += requested_names_by_source.len();
                 for (source, requested_names) in requested_names_by_source {
-                    let declarations_started = Instant::now();
-                    let declarations =
-                        bounded_visibility_declarations_in_reading(analyzer, &source, reading_is_c);
-                    stats.declaration_elapsed += declarations_started.elapsed();
-                    stats.declaration_reads += 1;
-                    stats.declaration_units += declarations.len();
-                    for unit in declarations {
-                        let template_metadata = unit
-                            .is_class()
-                            .then(|| cpp.template_metadata(&unit))
-                            .flatten();
-                        if !requested_names.contains(unit.identifier())
-                            && !template_metadata.as_ref().is_some_and(|metadata| {
-                                requested_names.contains(&metadata.primary_name)
-                            })
-                        {
-                            continue;
+                    let declarations = declarations_by_source_and_reading
+                        .entry((source.clone(), reading_is_c))
+                        .or_insert_with(|| {
+                            bounded_visibility_declarations(
+                                cpp,
+                                analyzer,
+                                &source,
+                                reading_is_c,
+                                stats,
+                            )
+                        });
+                    let mut selected = HashSet::default();
+                    for name in requested_names {
+                        if let Some(units) = declarations.by_identifier.get(&name) {
+                            selected.extend(units.iter().cloned());
                         }
+                    }
+                    for unit in selected {
                         stats.selected_units += 1;
-                        if let Some(prepared) = cpp.prepared_syntax(token, &source) {
-                            let ast_started = Instant::now();
-                            let mut cursor = prepared.tree().walk();
-                            for range in analyzer.ranges(&unit) {
-                                let Some(declaration) =
-                                    node_for_exact_range(prepared.tree().root_node(), &range)
-                                else {
-                                    continue;
-                                };
-                                let mut pending_nodes = vec![declaration];
-                                while let Some(node) = pending_nodes.pop() {
-                                    stats.dependency_ast_nodes += 1;
-                                    if matches!(
-                                        node.kind(),
-                                        "type_identifier" | "namespace_identifier"
-                                    ) {
-                                        let name = node_text(node, prepared.source());
-                                        if !completed_names.contains(name)
-                                            && pending_names.insert(name.to_string())
-                                        {
-                                            stats.dependency_names += 1;
+                        let dependency_names = dependency_names_by_unit
+                            .entry(unit.clone())
+                            .or_insert_with(|| {
+                                let mut dependency_names = HashSet::default();
+                                if let Some(prepared) = cpp.prepared_syntax(token, &source) {
+                                    let ast_started = Instant::now();
+                                    let mut cursor = prepared.tree().walk();
+                                    for range in analyzer.ranges(&unit) {
+                                        let Some(declaration) = node_for_exact_range(
+                                            prepared.tree().root_node(),
+                                            &range,
+                                        ) else {
+                                            continue;
+                                        };
+                                        let mut pending_nodes = vec![declaration];
+                                        while let Some(node) = pending_nodes.pop() {
+                                            stats.dependency_ast_nodes += 1;
+                                            #[cfg(any(test, feature = "test-support"))]
+                                            BOUNDED_VISIBILITY_DEPENDENCY_AST_NODE_COUNT
+                                                .with(|count| count.set(count.get() + 1));
+                                            if matches!(
+                                                node.kind(),
+                                                "type_identifier" | "namespace_identifier"
+                                            ) {
+                                                dependency_names.insert(
+                                                    node_text(node, prepared.source()).into(),
+                                                );
+                                            }
+                                            pending_nodes.extend(node.named_children(&mut cursor));
                                         }
                                     }
-                                    pending_nodes.extend(node.named_children(&mut cursor));
+                                    stats.dependency_ast_elapsed += ast_started.elapsed();
                                 }
+                                dependency_names
+                            });
+                        for name in dependency_names.iter() {
+                            if !completed_names.contains(name) && pending_names.insert(name.clone())
+                            {
+                                stats.dependency_names += 1;
                             }
-                            stats.dependency_ast_elapsed += ast_started.elapsed();
-                        }
-                        if let Some(metadata) = template_metadata
-                            && !completed_names.contains(&metadata.primary_name)
-                        {
-                            pending_names.insert(metadata.primary_name);
                         }
                         visible.insert(unit);
                     }
@@ -9510,6 +9642,45 @@ fn build_bounded_visible_declarations(
             (root.clone(), visible)
         })
         .collect()
+}
+
+struct BoundedVisibilityDeclarations {
+    all: Vec<CodeUnit>,
+    by_identifier: HashMap<String, Vec<CodeUnit>>,
+}
+
+fn bounded_visibility_declarations(
+    cpp: &dyn CppSource,
+    analyzer: &CppGraphSource<'_>,
+    file: &ProjectFile,
+    c_semantics: bool,
+    stats: &mut BoundedVisibilityStats,
+) -> BoundedVisibilityDeclarations {
+    let declarations_started = Instant::now();
+    let all = bounded_visibility_declarations_in_reading(analyzer, file, c_semantics)
+        .into_iter()
+        .collect::<Vec<_>>();
+    stats.declaration_elapsed += declarations_started.elapsed();
+    stats.declaration_reads += 1;
+    stats.declaration_units += all.len();
+
+    let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+    for unit in &all {
+        by_identifier
+            .entry(unit.identifier().to_string())
+            .or_default()
+            .push(unit.clone());
+        if unit.is_class()
+            && let Some(metadata) = cpp.template_metadata(unit)
+            && metadata.primary_name != unit.identifier()
+        {
+            by_identifier
+                .entry(metadata.primary_name)
+                .or_default()
+                .push(unit.clone());
+        }
+    }
+    BoundedVisibilityDeclarations { all, by_identifier }
 }
 
 #[derive(Default)]
@@ -9548,6 +9719,16 @@ pub fn reset_bounded_visibility_declaration_read_count_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn bounded_visibility_declaration_read_count_for_test() -> usize {
     BOUNDED_VISIBILITY_DECLARATION_READ_COUNT.with(Cell::get)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_bounded_visibility_dependency_ast_node_count_for_test() {
+    BOUNDED_VISIBILITY_DEPENDENCY_AST_NODE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn bounded_visibility_dependency_ast_node_count_for_test() -> usize {
+    BOUNDED_VISIBILITY_DEPENDENCY_AST_NODE_COUNT.with(Cell::get)
 }
 
 pub struct VisibilityData {

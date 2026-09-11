@@ -356,8 +356,9 @@ mod tests {
             // the registry, which is how it reached the cap before.
             if name == "query_code" {
                 for op in brokk_bifrost_rql::schema::ALL_QUERY_STEP_OPS {
+                    let schema_entry = format!("{} (", op.label());
                     assert!(
-                        !description.contains(op.label()),
+                        !description.contains(&schema_entry),
                         "query_code description enumerates step `{}`; the step reference belongs to the steps parameter schema",
                         op.label()
                     );

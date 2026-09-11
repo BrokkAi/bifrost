@@ -613,7 +613,30 @@ pub(super) fn resolve_cpp<'a>(
             &declaration_range,
         ) == CppOccurrenceRole::DeclarationOnly
     {
-        return candidates_outcome(vec![declaration]);
+        // The exact prototype establishes the callable, but its body may be
+        // indexed in another file. Expand only to declarations of that same
+        // callable with source relationship evidence; navigation then selects
+        // the body occurrences. Same-file evidence alone cannot distinguish
+        // overloads, so signature agreement is required independently.
+        let dispatch = CppDispatch::new(analyzer, token);
+        let graph = dispatch.source();
+        let mut candidates = analyzer
+            .definitions_by_structured_name(declaration.fq(), Language::Cpp)
+            .into_iter()
+            .filter(|candidate| {
+                visibility.same_logical_callable(&graph, &declaration, candidate)
+                    && cpp_callable_definitions_share_identity_evidence_with_visibility(
+                        analyzer,
+                        token,
+                        &graph,
+                        &visibility,
+                        &declaration,
+                        candidate,
+                    )
+            })
+            .collect::<Vec<_>>();
+        candidates.push(declaration);
+        return candidates_outcome(candidates);
     }
     if node.kind() == "this" && is_c_source_file(file) {
         let support = context.bounded_support();

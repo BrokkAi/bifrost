@@ -1,7 +1,7 @@
 //! Lowering the authored plan into the internal IR.
 //!
-//! The authored model is a flat record set: named bindings, derivations that
-//! refine them, a join list, group records, assertions. The IR is a dependency
+//! The authored model is a flat record set: named query bindings, a join list,
+//! group records, and assertions. The IR is a dependency
 //! graph. Lowering is where that translation happens once, so neither the
 //! validator nor the evaluator has to re-derive "which rows does this group
 //! actually see".
@@ -12,39 +12,30 @@
 
 use std::collections::HashSet;
 
-use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
-
 use crate::definition::{
     PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBinding,
-    RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowJoin, RowJoinKind, RowPredicate,
-    RowPredicateOp, RowPredicateOperand, RowProjection,
+    RowBindingSource, RowFieldRef, RowJoin, RowJoinKind, RowPredicate, RowPredicateOp,
+    RowPredicateOperand,
 };
 
 use super::ir::{
-    IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp, IrEquiKey, IrField, IrJoinKind,
-    IrLimits, IrOperand, IrOrderedSequence, IrOrderedSequencePair, IrPredicate, IrProjection,
-    IrRelation, IrRelationId, IrRelationOp, IrSchema, RelationalPlanIr, domain_schema,
-    expansion_result_domain, group_schema, join_schema,
+    IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp, IrEquiKey, IrJoinKind,
+    IrLimits, IrOperand, IrOrderedSequence, IrOrderedSequencePair, IrPredicate, IrRelation,
+    IrRelationId, IrRelationOp, IrSchema, RelationalPlanIr, group_schema, join_schema,
+    query_schema,
 };
 use super::validate::RelationalAssertionPlanError;
 
 /// One name the plan can still address, and the relation it currently stands
 /// for.
 ///
-/// A derivation replaces its input's slot in place rather than appending a new
-/// one, so a refined relation keeps the position the relation it refines held.
-/// That is what keeps the join chain's seed -- the first slot -- the same
-/// relation before and after a filter, and what makes the name a derivation
-/// consumed unaddressable afterwards.
 struct RelationSlot {
     name: String,
     id: IrRelationId,
-    domain: Option<DetailedCodeQueryDomain>,
 }
 
-fn lower_bindings_and_derivations(
+fn lower_bindings(
     bindings: &[RowBinding],
-    derivations: &[RowDerivation],
 ) -> Result<(Vec<IrRelation>, Vec<RelationSlot>), RelationalAssertionPlanError> {
     let mut relations: Vec<IrRelation> = Vec::new();
     let mut slots: Vec<RelationSlot> = Vec::new();
@@ -55,80 +46,38 @@ fn lower_bindings_and_derivations(
             return Err(RelationalAssertionPlanError::DuplicateBinding { name });
         }
         let id = IrRelationId(relations.len());
-        let (op, domain) = match &binding.source {
+        let (op, schema) = match &binding.source {
             RowBindingSource::Query(PolicySelector::Inline { query, .. }) => {
-                let domain = query
-                    .validate_steps()
-                    .map(DetailedCodeQueryDomain::from_query_value_kind)
-                    .map_err(|error| RelationalAssertionPlanError::InvalidQuery {
+                let (_, fields) = query.validate_row_fields().map_err(|error| {
+                    RelationalAssertionPlanError::InvalidQuery {
                         binding: name.clone(),
                         message: error.to_string(),
-                    })?;
+                    }
+                })?;
+                let schema = query_schema(&name, &fields);
                 (
                     IrRelationOp::Source {
                         binding: binding.name.clone(),
-                        domain,
+                        schema: schema.clone(),
                     },
-                    domain,
+                    schema,
                 )
             }
             RowBindingSource::Query(PolicySelector::File { .. }) => {
                 return Err(RelationalAssertionPlanError::DeferredSelectorDomain { binding: name });
-            }
-            RowBindingSource::Expansion { from, step } => {
-                let Some((source_id, source_domain)) = slots
-                    .iter()
-                    .find(|slot| slot.name == from.as_str())
-                    .and_then(|slot| slot.domain.map(|domain| (slot.id, domain)))
-                else {
-                    return Err(RelationalAssertionPlanError::ForwardBinding {
-                        binding: name,
-                        referenced: from.as_str().to_string(),
-                    });
-                };
-                let Some(domain) = expansion_result_domain(source_domain, *step) else {
-                    return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
-                        binding: name,
-                        step: step.label(),
-                    });
-                };
-                (
-                    IrRelationOp::Expand {
-                        input: source_id,
-                        binding: binding.name.clone(),
-                        step: *step,
-                        domain,
-                    },
-                    domain,
-                )
             }
         };
         relations.push(IrRelation {
             id,
             name: name.clone(),
             op,
-            schema: domain_schema(&name, domain),
+            schema,
         });
-        slots.push(RelationSlot {
-            name,
-            id,
-            domain: Some(domain),
-        });
+        slots.push(RelationSlot { name, id });
     }
 
     if bindings.is_empty() {
         return Err(RelationalAssertionPlanError::EmptyPlan);
-    }
-
-    for derivation in derivations {
-        match derivation {
-            RowDerivation::Filter(filter) => {
-                lower_filter(&mut relations, &mut slots, filter)?;
-            }
-            RowDerivation::Project(projection) => {
-                lower_projection(&mut relations, &mut slots, projection)?;
-            }
-        }
     }
 
     Ok((relations, slots))
@@ -199,14 +148,13 @@ fn lower_joins(
 /// Lower one authored relational plan into its IR.
 ///
 /// The lowering is total over well-formed authored plans: every authored
-/// binding becomes a source or expansion relation, every derivation refines
-/// one of those relations in place, the authored join list becomes one
+/// binding becomes a source relation, the authored join list becomes one
 /// left-deep join chain seeded by the first remaining relation, and every
 /// authored group becomes one group relation over that chain.
 pub fn lower_relational_assertion_plan(
     plan: &RelationalAssertionPlan,
 ) -> Result<RelationalPlanIr, RelationalAssertionPlanError> {
-    let (mut relations, slots) = lower_bindings_and_derivations(&plan.bindings, &plan.derivations)?;
+    let (mut relations, slots) = lower_bindings(&plan.bindings)?;
 
     let (chain, chain_schema) = lower_joins(&mut relations, &slots, &plan.joins)?;
 
@@ -295,111 +243,6 @@ pub fn lower_relational_assertion_plan(
     })
 }
 
-/// Lower one `(filter ...)` record.
-///
-/// The filtered relation keeps its name, its columns and its column
-/// qualifier: a filter states which rows belong, and nothing else. Later
-/// records therefore read the same `NAME.FIELD` columns whether or not a
-/// filter stands between them and the binding.
-fn lower_filter(
-    relations: &mut Vec<IrRelation>,
-    slots: &mut [RelationSlot],
-    filter: &RowFilter,
-) -> Result<(), RelationalAssertionPlanError> {
-    let name = filter.over.as_str();
-    let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) else {
-        return Err(RelationalAssertionPlanError::UnknownBinding {
-            name: name.to_string(),
-        });
-    };
-    let input = slot.id;
-    let schema = relations[input.index()].schema.clone();
-    let predicates = filter
-        .predicates
-        .iter()
-        .map(|predicate| lower_predicate(&schema, predicate))
-        .collect::<Result<Vec<_>, _>>()?;
-    let id = IrRelationId(relations.len());
-    relations.push(IrRelation {
-        id,
-        name: name.to_string(),
-        op: IrRelationOp::Filter { input, predicates },
-        schema,
-    });
-    slot.id = id;
-    // A filtered relation is no longer an expandable row domain: the analyzer
-    // steps consume a query's own rows, not a policy-narrowed subset of them.
-    slot.domain = None;
-    Ok(())
-}
-
-/// Lower one `(project ...)` record.
-///
-/// The projection publishes its own name, so every column it carries is
-/// requalified under that name and the relation it read is no longer
-/// addressable. One relation name is one column qualifier throughout the IR,
-/// and a projection that kept its input's qualifier would break that.
-fn lower_projection(
-    relations: &mut Vec<IrRelation>,
-    slots: &mut [RelationSlot],
-    projection: &RowProjection,
-) -> Result<(), RelationalAssertionPlanError> {
-    let from = projection.from.as_str();
-    let name = projection.name.as_str();
-    if slots.iter().any(|slot| slot.name == name) {
-        return Err(RelationalAssertionPlanError::DuplicateBinding {
-            name: name.to_string(),
-        });
-    }
-    let Some(index) = slots.iter().position(|slot| slot.name == from) else {
-        return Err(RelationalAssertionPlanError::UnknownBinding {
-            name: from.to_string(),
-        });
-    };
-    let input = slots[index].id;
-    let input_schema = relations[input.index()].schema.clone();
-
-    let mut columns = Vec::with_capacity(projection.columns.len());
-    let mut fields = Vec::with_capacity(projection.columns.len());
-    for column in &projection.columns {
-        let source = lower_field(&input_schema, &column.source)?;
-        let output = IrColumn::new(name, column.name.clone());
-        if fields
-            .iter()
-            .any(|field: &IrField| field.column.name == output.name)
-        {
-            return Err(RelationalAssertionPlanError::DuplicateProjectionColumn {
-                relation: name.to_string(),
-                column: output.name.clone(),
-            });
-        }
-        let field = input_schema
-            .field(&source)
-            .expect("a lowered projection source is a column of its input");
-        fields.push(IrField {
-            column: output.clone(),
-            scalar_type: field.scalar_type,
-            nullable: field.nullable,
-            value_domain: field.value_domain,
-        });
-        columns.push(IrProjection { source, output });
-    }
-
-    let id = IrRelationId(relations.len());
-    relations.push(IrRelation {
-        id,
-        name: name.to_string(),
-        op: IrRelationOp::Project { input, columns },
-        schema: IrSchema::new(fields),
-    });
-    slots[index] = RelationSlot {
-        name: name.to_string(),
-        id,
-        domain: None,
-    };
-    Ok(())
-}
-
 /// Whether any column of this schema comes from the named binding.
 fn schema_binds(schema: &IrSchema, qualifier: &str) -> bool {
     schema
@@ -447,6 +290,8 @@ fn lower_aggregate(
         RowAggregateOp::Any => IrAggregateOp::Any,
         RowAggregateOp::All => IrAggregateOp::All,
         RowAggregateOp::OrderedEqual => IrAggregateOp::OrderedEqual,
+        RowAggregateOp::SetEqual => IrAggregateOp::SetEqual,
+        RowAggregateOp::Subset => IrAggregateOp::Subset,
     };
     let value = aggregate
         .value
@@ -479,6 +324,16 @@ fn lower_aggregate(
         op,
         value,
         sequences,
+        sets: aggregate
+            .sets
+            .as_ref()
+            .map(|(left, right)| {
+                Ok((
+                    lower_field(chain_schema, left)?,
+                    lower_field(chain_schema, right)?,
+                ))
+            })
+            .transpose()?,
         predicates,
         output: IrColumn::new(group, aggregate.name.as_str()),
     })

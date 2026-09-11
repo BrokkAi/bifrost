@@ -241,6 +241,20 @@ pub enum CodeQueryRowScalarType {
     DeclarationIdentity,
 }
 
+impl CodeQueryRowScalarType {
+    /// Stable public spelling used by row-schema catalogs and diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StableId => "stable_id",
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Boolean => "boolean",
+            Self::ConstrainedEnum => "constrained_enum",
+            Self::DeclarationIdentity => "declaration_identity",
+        }
+    }
+}
+
 /// The value domain of one `ConstrainedEnum` row field: every label the
 /// producing vocabulary can write.
 ///
@@ -879,6 +893,14 @@ macro_rules! detailed_row_domains {
             pub const fn from_query_value_kind(kind: $kind) -> Self {
                 match kind {
                     $(detailed_query_kind_pattern!($kind, $variant) => Self::$variant,)+
+                }
+            }
+
+            /// The query planner's typed endpoint corresponding to this public
+            /// row domain.
+            pub const fn query_value_kind(self) -> $kind {
+                match self {
+                    $(Self::$variant => detailed_query_kind_pattern!($kind, $variant),)+
                 }
             }
 
@@ -5541,6 +5563,10 @@ mod toy_domain {
             ToyDomain::from_query_value_kind(ToyKind::Widget),
             ToyDomain::Widget
         );
+        assert!(matches!(
+            ToyDomain::Widget.query_value_kind(),
+            ToyKind::Widget
+        ));
         assert_eq!(
             ToyDomain::Widget.terminal_identities(),
             DetailedTerminalIdentities::None

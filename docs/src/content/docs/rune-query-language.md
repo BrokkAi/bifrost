@@ -85,6 +85,8 @@ RQL uses compact S-expressions. The following are independent forms, not one mul
 (profile (call :callee (name "eval")))
 (inside (function :name "handler") (call :callee (name "eval")))
 (inside-decl (loop) (call :callee (name "open")))
+(filter :where ((target_count gt 0)) (occurrences :class reference))
+(project :columns (ast_id (target_count candidates)) (occurrences))
 ```
 
 ## Comments
@@ -199,9 +201,51 @@ Typed set forms combine complete compatible pipelines and may themselves be wrap
 
 All operands at one node must produce the same terminal domain. Union preserves first appearance by operand order; intersection and except preserve the first operand's order. Branch provenance and diagnostics use zero-based paths. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `callers :proof proven :completeness proven-subset` is the one explicit non-exhaustive contract: it returns only resolved proven caller edges and labels the result as a proven subset, never as all callers. It remains diagnostic-visible when a caller cannot be rendered as an indexed declaration, and is rejected without `:proof proven` or on `callees`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `resolved-call` consumes `call_binding` rows and retains only rows for one stable callable identity with `exact` or `declared` proof. Its optional `:receiver-type` accepts either one exact receiver identity or `(assignable-to ROOT)`, which accepts the source-backed workspace root and every descendant produced by the analyzer's complete typed hierarchy. An incomplete, cancelled, external, or model-only hierarchy fails closed. Unquoted identities are stable IDs. Quoted qualified locators are resolved at a loaded-policy boundary and cannot execute as unresolved standalone queries. `call-argument` also consumes and returns `call_binding` rows, selects exactly one formal by name or zero-based index, and requires exact mapping, exhaustive coverage, a non-terminal row, and a present argument identity. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. Procedure, program-point, control-edge, and receiver-analysis rows may all be projected through `file-of`. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `callers :proof proven :completeness proven-subset` is the one explicit non-exhaustive contract: it returns only resolved proven caller edges and labels the result as a proven subset, never as all callers. It remains diagnostic-visible when a caller cannot be rendered as an indexed declaration, and is rejected without `:proof proven` or on `callees`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `resolved-call` consumes `call_binding` rows and retains only rows for one stable callable identity with `exact` or `declared` proof. Its optional `:receiver-type` accepts either one exact receiver identity or `(assignable-to ROOT)`, which accepts the source-backed workspace root and every descendant produced by the analyzer's complete typed hierarchy. An incomplete, cancelled, external, or model-only hierarchy fails closed. Unquoted identities are stable IDs. Quoted qualified locators are resolved at a loaded-policy boundary and cannot execute as unresolved standalone queries. `call-argument` also consumes and returns `call_binding` rows, selects exactly one formal by name or zero-based index, and requires exact mapping, exhaustive coverage, a non-terminal row, and a present argument identity. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver-analysis wrappers produce `receiver_analysis` rows; `file-of`, `receiver-outcome`, and `receiver-evidence` may wrap them. The two terminal receiver steps also accept structural matches, reference sites, call sites, expression sites, and occurrence rows directly, performing the same `receiver-targets` analysis internally. A receiver wrapper's optional `:capture name` is legal only over a structural match and must name a declared positive capture. Procedure, program-point, control-edge, receiver-analysis, receiver-outcome, and receiver-evidence rows may all be projected through `file-of`. `:json` renders every wrapper as an ordered `steps` array.
 
 Receiver wrappers consume the structured facts exposed by the selected adapter. Availability is not defined by a static language list: unsupported source forms preserve an explicit `unsupported` row and capability diagnostic. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for allocation, factory, ambiguity, reference-site, and call-input examples with exact output.
+
+### Typed row filtering and projection
+
+Every terminal query domain publishes a row schema: ordered field names,
+scalar types, nullability, and the accepted public labels of constrained enum
+fields. `(filter :where (...) QUERY)` reads that schema and retains a row only
+when every predicate holds:
+
+```lisp
+(filter :where (
+    (class in [reference declaration])
+    (target_count ge 1)
+    (target_count le (field target_count))
+    (target_id is-not-null))
+  (occurrences))
+```
+
+The operators are `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `is-null`,
+`is-not-null`, and `in`. Quoted values are strings and stable identities;
+non-negative numbers and booleans keep their types; bare values are checked
+against the selected field's published enum labels. `(field NAME)` is the
+unambiguous second-field operand. Ordered comparison is defined only for
+integer fields. Comparison against an absent nullable field is false,
+including `ne`; use `is-null` to select absence. One filter accepts 1 through
+16 predicates, and an `in` set accepts 1 through 64 literals.
+
+`(project :columns (...) QUERY)` publishes exactly the selected row fields to
+a relational binding, in order. A bare field keeps its name and `(FIELD
+NEW-FIELD)` renames it:
+
+```lisp
+(filter :where ((candidates gt 0))
+  (project :columns (ast_id (target_count candidates) role)
+    (occurrences)))
+```
+
+The projected schema preserves every source field's scalar type, nullability,
+and constrained value domain; it also preserves the row's source and evidence
+anchor. Later filters use projected names. More projections may compose, but
+no analyzer traversal may follow a projection because a dynamic record is not
+a registered analyzer input domain. A projection accepts 1 through 32 unique
+output names.
 
 ## Procedure-Local CFG Inspection
 

@@ -404,6 +404,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
             },
         ],
         provenance_truncated: true,
+        row_projection: Vec::new(),
     };
     assert_eq!(
         item.provenance_summary().as_deref(),
@@ -500,6 +501,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
                 },
                 provenance: Vec::new(),
                 provenance_truncated: false,
+                row_projection: Vec::new(),
             },
             CodeQueryResultItem {
                 value: CodeQueryResultValue::ProgramPoint {
@@ -516,6 +518,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
                 },
                 provenance: Vec::new(),
                 provenance_truncated: false,
+                row_projection: Vec::new(),
             },
             CodeQueryResultItem {
                 value: CodeQueryResultValue::ControlEdge {
@@ -533,6 +536,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
                 },
                 provenance: Vec::new(),
                 provenance_truncated: false,
+                row_projection: Vec::new(),
             },
         ],
         truncated: false,

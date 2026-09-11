@@ -156,9 +156,8 @@ fn ensure_inline_local_policy(
         PolicyAnalysis::Assertion { spec } => {
             if let Some(plan) = &spec.relational {
                 for binding in &plan.bindings {
-                    if let RowBindingSource::Query(selector) = &binding.source {
-                        ensure_inline_selector(selector)?;
-                    }
+                    let RowBindingSource::Query(selector) = &binding.source;
+                    ensure_inline_selector(selector)?;
                 }
             } else {
                 ensure_inline_selector(&spec.subject)?;
@@ -857,11 +856,6 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
 }
 
 /// The canonical projection of one relational plan.
-///
-/// `derivations` is omitted entirely when the plan declares none, which is
-/// what keeps every document authored before filter and project records
-/// existed byte-identical under this projection, and therefore keeps its
-/// semantic hash, its baselines and its suppressions valid.
 fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
     let mut object = Map::new();
     insert(
@@ -869,18 +863,6 @@ fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
         "bindings",
         Value::Array(plan.bindings.iter().map(row_binding_to_json).collect()),
     );
-    if !plan.derivations.is_empty() {
-        insert(
-            &mut object,
-            "derivations",
-            Value::Array(
-                plan.derivations
-                    .iter()
-                    .map(row_derivation_to_json)
-                    .collect(),
-            ),
-        );
-    }
     insert(
         &mut object,
         "joins",
@@ -911,54 +893,11 @@ fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
     Value::Object(object)
 }
 
-/// Every derivation is tagged with its record kind, so two families can never
-/// collapse into one projected object if their field sets ever coincide.
-fn row_derivation_to_json(derivation: &RowDerivation) -> Value {
-    match derivation {
-        RowDerivation::Filter(filter) => {
-            let mut object = Map::new();
-            object.insert("type".to_owned(), json!(derivation.label()));
-            object.insert("over".to_owned(), json!(filter.over.as_str()));
-            object.insert(
-                "where".to_owned(),
-                json!(
-                    filter
-                        .predicates
-                        .iter()
-                        .map(row_predicate_to_json)
-                        .collect::<Vec<_>>()
-                ),
-            );
-            if matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall)) {
-                object.insert("evidence".to_owned(), json!("declared_call"));
-            }
-            if filter.receiver_constraint == Some(ReceiverTypeConstraintKind::AssignableTo) {
-                object.insert("receiver_constraint".to_owned(), json!("assignable_to"));
-            }
-            Value::Object(object)
-        }
-        RowDerivation::Project(projection) => json!({
-            "type": derivation.label(),
-            "name": projection.name.as_str(),
-            "from": projection.from.as_str(),
-            "columns": projection.columns.iter().map(|column| json!({
-                "source": row_field_ref_to_json(&column.source),
-                "name": column.name,
-            })).collect::<Vec<_>>(),
-        }),
-    }
-}
-
 fn row_binding_to_json(binding: &RowBinding) -> Value {
     match &binding.source {
         RowBindingSource::Query(selector) => json!({
             "name": binding.name.as_str(),
             "query": selector_to_json(selector),
-        }),
-        RowBindingSource::Expansion { from, step } => json!({
-            "name": binding.name.as_str(),
-            "from": from.as_str(),
-            "step": step.label(),
         }),
     }
 }
@@ -987,8 +926,8 @@ fn row_aggregate_to_json(aggregate: &RowAggregate) -> Value {
         "name": aggregate.name.as_str(),
         "op": aggregate.op.label(),
         "value": aggregate.value.as_ref().map(row_field_ref_to_json),
-        "left": aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.left)),
-        "right": aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.right)),
+        "left": aggregate.sets.as_ref().map(|(left, _)| row_field_ref_to_json(left)).or_else(|| aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.left))),
+        "right": aggregate.sets.as_ref().map(|(_, right)| row_field_ref_to_json(right)).or_else(|| aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.right))),
         "where": aggregate.predicate.iter().map(row_predicate_to_json).collect::<Vec<_>>(),
     })
 }
@@ -3337,12 +3276,12 @@ mod tests {
   :id "test.receiver.family.canonical"
   :name "Receiver family canonical"
   :message "M"
-  :severity warning
+    :severity warning
   :analysis (analysis :type assertion
     (bind :name calls :query
-      (rql (call-bindings (call-shape (call :callee "run")))))
-    (call :over calls :resolves-to member.widget.create :proof exact
-      :receiver-type (assignable-to "pkg.Base"))))"#;
+      (rql (resolved-call :resolves-to member.widget.create :proof exact
+        :receiver-type (assignable-to "pkg.Base")
+        (call-bindings (call-shape (call :callee "run"))))))))"#;
         let parsed = crate::parse_rqlp_source(
             source,
             crate::PolicySourceIdentity::new("test:receiver-family-canonical"),
@@ -3352,10 +3291,10 @@ mod tests {
             .document()
             .to_inline_local_canonical_semantic_json()
             .unwrap();
-        let derivation = &value["analysis"]["plan"]["derivations"][0];
-        assert_eq!(derivation["receiver_constraint"], "assignable_to");
+        let step = &value["analysis"]["plan"]["bindings"][0]["query"]["query"]["steps"][2];
+        assert_eq!(step["op"], "resolved_call");
         assert_eq!(
-            derivation["where"].as_array().unwrap().last().unwrap()["resolved_identities"],
+            step["receiver_type"]["resolved_identities"],
             serde_json::json!([])
         );
     }
@@ -3452,15 +3391,17 @@ mod tests {
             ),
             (
                 "predicate operator",
-                relational_policy(
-                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.role ne member_position)"),
-                ),
+                relational_policy(&LEGACY_PLAN.replace(
+                    "(cand.role eq member_position)",
+                    "(cand.role ne member_position)",
+                )),
             ),
             (
                 "field-to-field operand",
-                relational_policy(
-                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.ast_id eq site.ast_id)"),
-                ),
+                relational_policy(&LEGACY_PLAN.replace(
+                    "(cand.role eq member_position)",
+                    "(cand.ast_id eq site.ast_id)",
+                )),
             ),
             (
                 "membership operand",
@@ -3471,14 +3412,16 @@ mod tests {
             ),
             (
                 "null test",
-                relational_policy(
-                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.target_id is-not-null)"),
-                ),
+                relational_policy(&LEGACY_PLAN.replace(
+                    "(cand.role eq member_position)",
+                    "(cand.target_id is-not-null)",
+                )),
             ),
             (
                 "negated null test",
                 relational_policy(
-                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.target_id is-null)"),
+                    &LEGACY_PLAN
+                        .replace("(cand.role eq member_position)", "(cand.target_id is-null)"),
                 ),
             ),
             (
@@ -3487,24 +3430,6 @@ mod tests {
                     ":name reads :op count :where",
                     ":name reads :op max :value cand.target_count :where",
                 )),
-            ),
-            (
-                "filter record",
-                relational_policy(&LEGACY_PLAN.replace(
-                    "    (join :left site",
-                    "    (filter :over cand :where ((cand.role eq member_position)))\n    (join :left site",
-                )),
-            ),
-            (
-                "projection record",
-                relational_policy(
-                    &LEGACY_PLAN
-                        .replace(
-                            "    (join :left site :right cand",
-                            "    (project :name narrow :from cand :columns (cand.ast_id cand.role))\n    (join :left site :right narrow",
-                        )
-                        .replace("(cand.role eq member_position)", "(narrow.role eq member_position)"),
-                ),
             ),
         ];
 
@@ -3521,24 +3446,26 @@ mod tests {
         }
     }
 
-    /// A filter's predicate list and a projection's column list are semantic
+    /// An RQL filter's predicate list and projection's column list are semantic
     /// content, not decoration: changing one changes the hash.
     #[test]
-    fn derivation_contents_change_the_semantic_hash() {
+    fn query_row_step_contents_change_the_semantic_hash() {
         let with_filter = |predicate: &str| {
             relational_policy(&LEGACY_PLAN.replace(
-                "    (join :left site",
-                &format!("    (filter :over cand :where (({predicate})))\n    (join :left site"),
+                "(bind :name cand :query (rql (occurrences :role [member_position])))",
+                &format!(
+                    "(bind :name cand :query (rql (filter :where (({predicate})) (occurrences :role [member_position]))))"
+                ),
             ))
         };
         assert_ne!(
-            canonical_semantic_sha256(&with_filter("cand.role eq member_position")),
-            canonical_semantic_sha256(&with_filter("cand.role eq value_reference")),
+            canonical_semantic_sha256(&with_filter("role eq member_position")),
+            canonical_semantic_sha256(&with_filter("role eq value_reference")),
             "a filter literal is semantic content"
         );
         assert_ne!(
-            canonical_semantic_sha256(&with_filter("cand.target_count gt 0")),
-            canonical_semantic_sha256(&with_filter("cand.target_count ge 0")),
+            canonical_semantic_sha256(&with_filter("target_count gt 0")),
+            canonical_semantic_sha256(&with_filter("target_count ge 0")),
             "a filter operator is semantic content"
         );
 
@@ -3546,24 +3473,23 @@ mod tests {
             relational_policy(
                 &LEGACY_PLAN
                     .replace(
-                        "    (join :left site :right cand",
+                        "(bind :name cand :query (rql (occurrences :role [member_position])))",
                         &format!(
-                            "    (project :name narrow :from cand :columns ({columns}))\n    (join :left site :right narrow"
+                            "(bind :name narrow :query (rql (project :columns ({columns}) (occurrences :role [member_position]))))"
                         ),
                     )
-                    .replace("(cand.role eq member_position)", "(narrow.role eq member_position)"),
+                    .replace("right cand", "right narrow")
+                    .replace("cand.", "narrow."),
             )
         };
         assert_ne!(
-            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role")),
-            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role cand.target_count")),
+            canonical_semantic_sha256(&with_projection("ast_id role")),
+            canonical_semantic_sha256(&with_projection("ast_id role target_count")),
             "a projected column set is semantic content"
         );
         assert_ne!(
-            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role cand.target_count")),
-            canonical_semantic_sha256(&with_projection(
-                "cand.ast_id cand.role (cand.target_count hits)"
-            )),
+            canonical_semantic_sha256(&with_projection("ast_id role target_count")),
+            canonical_semantic_sha256(&with_projection("ast_id role (target_count hits)")),
             "a projected column rename is semantic content"
         );
     }

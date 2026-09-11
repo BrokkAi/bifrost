@@ -137,6 +137,12 @@ impl State {
 /// The result is indexed by the procedure's validated `guard_facts()` order.
 /// A missing entry means that the subject was never an identity read, was
 /// overwritten, or did not survive every incoming CFG path.
+///
+/// `nested_entries` is charged for retained state alone: the entries stored
+/// per point for the fixpoint, the entries kept in the exit map at a queried
+/// point, and the per-procedure indexes. The copy a visit works on is
+/// transient and is not charged; the propagation that makes those visits is
+/// charged one `control_edges` unit per edge traversal.
 pub(super) fn derive(
     workspace: &WorkspaceAnalyzer,
     adapter: &dyn TypeFlowAdapter,
@@ -177,11 +183,12 @@ pub(super) fn derive(
     while let Some(point_id) = worklist.pop_front() {
         check_cancelled(cancellation)?;
         queued[point_id.index()] = false;
-        let incoming_state = incoming[point_id.index()]
+        // The visit's working copy is transient: it is charged only where it
+        // becomes retained state, below and at the exit map.
+        let mut state = incoming[point_id.index()]
             .as_ref()
-            .expect("a scheduled binding-refinement point is reachable");
-        charge_entries(budget, incoming_state.size().saturating_add(1))?;
-        let mut state = incoming_state.clone();
+            .expect("a scheduled binding-refinement point is reachable")
+            .clone();
         transfer_point(
             semantics,
             point_id,
@@ -189,11 +196,11 @@ pub(super) fn derive(
             &tracked,
             &open,
             &mut state,
-            budget,
             cancellation,
         )?;
         if retained.contains(&point_id) {
-            charge_entries(budget, state.size().saturating_add(1))?;
+            let previous = exits.get(&point_id).map_or(0, State::size);
+            charge_entries(budget, state.size().saturating_sub(previous))?;
             exits.insert(point_id, state.clone());
         }
 
@@ -202,16 +209,11 @@ pub(super) fn derive(
             charge_edges(budget, 1)?;
             let target = edge.target_point.index();
             let changed = if let Some(existing) = &mut incoming[target] {
-                charge_entries(
-                    budget,
-                    existing
-                        .size()
-                        .saturating_add(state.size())
-                        .saturating_add(1),
-                )?;
+                // Intersection only removes entries, so this join retains
+                // nothing new and charges nothing new.
                 existing.intersect(&state)
             } else {
-                charge_entries(budget, state.size().saturating_add(1))?;
+                charge_entries(budget, state.size())?;
                 incoming[target] = Some(state.clone());
                 true
             };
@@ -244,7 +246,6 @@ pub(super) fn derive(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn transfer_point(
     semantics: &ProcedureSemantics,
     point_id: ProgramPointId,
@@ -252,13 +253,11 @@ fn transfer_point(
     tracked: &HashSet<ValueId>,
     open: &HashSet<ValueId>,
     state: &mut State,
-    budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(), CorrelationError> {
     let point = semantics
         .point(point_id)
         .expect("a validated binding-refinement point remains live");
-    charge_entries(budget, point.events.len().saturating_add(1))?;
     for (event_index, event) in point.events.iter().enumerate() {
         check_cancelled(cancellation)?;
         match &event.effect {

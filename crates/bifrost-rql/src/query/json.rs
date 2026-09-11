@@ -741,6 +741,23 @@ fn query_step_to_json(step: &QueryStep) -> Value {
     let mut object = Map::new();
     object.insert("op".to_string(), json!(step.label()));
     match step {
+        QueryStep::Filter(predicates) => {
+            object.insert(
+                "where".to_string(),
+                Value::Array(predicates.iter().map(row_predicate_to_json).collect()),
+            );
+        }
+        QueryStep::Project(columns) => {
+            object.insert(
+                "columns".to_string(),
+                Value::Array(
+                    columns
+                        .iter()
+                        .map(|column| json!({ "source": column.source, "name": column.name }))
+                        .collect(),
+                ),
+            );
+        }
         QueryStep::Supertypes(HierarchyTraversal::Depth(depth))
         | QueryStep::Subtypes(HierarchyTraversal::Depth(depth)) => {
             object.insert("depth".to_string(), json!(depth.get()));
@@ -1012,6 +1029,40 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("source_origin".to_string(), json!("pristine_input"));
             }
         }
+    }
+    Value::Object(object)
+}
+
+fn row_literal_to_json(literal: &super::ir::QueryRowLiteral) -> Value {
+    match literal {
+        super::ir::QueryRowLiteral::String(value) => json!({ "string": value }),
+        super::ir::QueryRowLiteral::Integer(value) => json!({ "integer": value }),
+        super::ir::QueryRowLiteral::Boolean(value) => json!({ "boolean": value }),
+        super::ir::QueryRowLiteral::ConstrainedEnum(value) => json!({ "enum": value }),
+    }
+}
+
+fn row_predicate_to_json(predicate: &super::ir::QueryRowPredicate) -> Value {
+    let mut object = Map::new();
+    object.insert("field".to_string(), json!(predicate.field));
+    object.insert(
+        "op".to_string(),
+        json!(predicate.op.label().replace('-', "_")),
+    );
+    match &predicate.operand {
+        super::ir::QueryRowPredicateOperand::Literal(value) => {
+            object.insert("value".to_string(), row_literal_to_json(value));
+        }
+        super::ir::QueryRowPredicateOperand::Field(field) => {
+            object.insert("value".to_string(), json!({ "field": field }));
+        }
+        super::ir::QueryRowPredicateOperand::Set(values) => {
+            object.insert(
+                "values".to_string(),
+                Value::Array(values.iter().map(row_literal_to_json).collect()),
+            );
+        }
+        super::ir::QueryRowPredicateOperand::None => {}
     }
     Value::Object(object)
 }

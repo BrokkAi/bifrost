@@ -1409,6 +1409,17 @@ impl LanguageSupport for CSharpSupport {
         Language::CSharp
     }
 
+    fn referencing_candidate_files(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        _target: &CodeUnit,
+        seed_files: &BTreeSet<ProjectFile>,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<HashSet<ProjectFile>> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)?
+            .referencing_candidate_files(seed_files, cancellation)
+    }
+
     fn display_symbol_name(&self, symbol: &str) -> String {
         csharp_normalize_full_name(symbol)
     }

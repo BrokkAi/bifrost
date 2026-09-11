@@ -10,13 +10,13 @@
 //! The catalog is data, not prose: it is deterministic, versioned, and carries
 //! no evaluation state.
 
+use brokk_bifrost_rql::structural::CodeQueryEnumDomain;
 use brokk_bifrost_rql::structural::search::{
     ALL_DETAILED_CODE_QUERY_DOMAINS, DetailedCodeQueryDomain,
 };
-use brokk_bifrost_rql::structural::{CodeQueryEnumDomain, CodeQueryRowScalarType};
 use serde::Serialize;
 
-use super::ir::{ALL_ROW_EXPANSION_STEPS, expansion_result_domain};
+use super::ir::{ALL_RQL_RELATION_EXPANSION_STEPS, expansion_result_domain};
 
 /// The versioned format string of the relation-schema catalog. Consumers pin
 /// this exact value; a shape change bumps the version.
@@ -105,9 +105,9 @@ fn published_schema(domain: DetailedCodeQueryDomain) -> RelationDomainSchema {
             .iter()
             .map(|field| RelationFieldSchema {
                 name: field.name,
-                scalar_type: scalar_type_label(field.scalar_type),
+                scalar_type: field.scalar_type.label(),
                 nullable: field.nullable,
-                stable_join_key: is_stable_join_key(field.scalar_type),
+                stable_join_key: super::ir::is_stable_key(field.scalar_type),
                 values: match field.value_domain {
                     Some(CodeQueryEnumDomain::Labels(labels)) => Some(labels),
                     Some(CodeQueryEnumDomain::Unenumerable(_)) | None => None,
@@ -122,9 +122,9 @@ fn published_schema(domain: DetailedCodeQueryDomain) -> RelationDomainSchema {
     }
 }
 
-/// The expansions the validator admits from one domain, ordered by step label.
+/// The cataloged RQL expansion steps admitted from one domain, ordered by step label.
 pub fn admitted_expansions(domain: DetailedCodeQueryDomain) -> Vec<RelationExpansionSchema> {
-    let mut expansions = ALL_ROW_EXPANSION_STEPS
+    let mut expansions = ALL_RQL_RELATION_EXPANSION_STEPS
         .iter()
         .filter_map(|step| {
             expansion_result_domain(domain, *step).map(|result| RelationExpansionSchema {
@@ -135,24 +135,6 @@ pub fn admitted_expansions(domain: DetailedCodeQueryDomain) -> Vec<RelationExpan
         .collect::<Vec<_>>();
     expansions.sort_by_key(|expansion| expansion.step);
     expansions
-}
-
-const fn scalar_type_label(scalar_type: CodeQueryRowScalarType) -> &'static str {
-    match scalar_type {
-        CodeQueryRowScalarType::StableId => "stable_id",
-        CodeQueryRowScalarType::String => "string",
-        CodeQueryRowScalarType::Integer => "integer",
-        CodeQueryRowScalarType::Boolean => "boolean",
-        CodeQueryRowScalarType::ConstrainedEnum => "constrained_enum",
-        CodeQueryRowScalarType::DeclarationIdentity => "declaration_identity",
-    }
-}
-
-const fn is_stable_join_key(scalar_type: CodeQueryRowScalarType) -> bool {
-    matches!(
-        scalar_type,
-        CodeQueryRowScalarType::StableId | CodeQueryRowScalarType::DeclarationIdentity
-    )
 }
 
 #[cfg(test)]
@@ -186,7 +168,7 @@ mod tests {
         let admitted = ALL_DETAILED_CODE_QUERY_DOMAINS
             .iter()
             .flat_map(|domain| {
-                ALL_ROW_EXPANSION_STEPS
+                ALL_RQL_RELATION_EXPANSION_STEPS
                     .iter()
                     .filter(move |step| expansion_result_domain(*domain, **step).is_some())
             })
@@ -201,7 +183,7 @@ mod tests {
             occurrence
                 .expansions
                 .iter()
-                .any(|expansion| expansion.step == "member-selection"),
+                .any(|expansion| expansion.step == "member_selection"),
             "{:?}",
             occurrence.expansions
         );

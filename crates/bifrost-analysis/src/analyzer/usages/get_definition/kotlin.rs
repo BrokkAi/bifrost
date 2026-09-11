@@ -941,16 +941,19 @@ impl<'a> KotlinCtx<'a> {
         }
     }
 
-    /// Ordinary callables declared at `fqn`.
-    ///
-    /// Synthetic units are excluded: Kotlin's constructors are synthetic
-    /// `Owner.Owner` callables, and a call spelled without a receiver reaches
-    /// them through the type tier, never by looking up a function of that name.
+    fn is_constructor(&self, unit: &CodeUnit) -> bool {
+        self.signature_metadata(unit)
+            .iter()
+            .any(SignatureMetadata::callable_is_constructor)
+    }
+
+    /// Ordinary callables declared at `fqn`. Constructors are excluded by
+    /// their recorded role: a bare call reaches them through the type tier.
     fn callables_named(&self, fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
-            .filter(|unit| unit.is_function() && !unit.is_synthetic())
+            .filter(|unit| unit.is_function() && !unit.is_synthetic() && !self.is_constructor(unit))
             .collect()
     }
 
@@ -977,6 +980,7 @@ impl<'a> KotlinCtx<'a> {
             .into_iter()
             .filter(|unit| {
                 !unit.is_synthetic()
+                    && !self.is_constructor(unit)
                     && (unit.is_field()
                         || unit.is_function()
                         || (unit.is_class() && !self.is_type_alias(unit)))
@@ -1061,7 +1065,11 @@ impl<'a> KotlinCtx<'a> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
-            .filter(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+            .filter(|unit| {
+                !unit.is_synthetic()
+                    && !self.is_constructor(unit)
+                    && (unit.is_function() || unit.is_field())
+            })
             .collect()
     }
 
@@ -1658,7 +1666,7 @@ fn kotlin_bare_call_outcome(
 
 /// The declarations a constructor call `Type(...)` names.
 ///
-/// Kotlin indexes a primary constructor as a synthetic `Owner.Owner` callable,
+/// Kotlin indexes a primary constructor as a source `Owner.Owner` callable,
 /// but only when it declares parameters: `class Base` has no constructor
 /// declaration at all, and the class itself is then the only physical thing the
 /// call can point at.

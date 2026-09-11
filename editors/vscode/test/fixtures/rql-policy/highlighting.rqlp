@@ -96,7 +96,7 @@
           (call-bindings (call-shape (call :callee "send"))))))
   :binding (argument :name "timeout"))
 
-; Relational call records remain available to assertion plans.
+; Row-local call selection belongs to the bound query.
 (policy
   :id "bifrost.assertions.modeled-call"
   :name "Modeled call assertion"
@@ -108,7 +108,10 @@
       :rql-schema-version 1
       :type assertion
       (bind :name calls :query
-        (rql (call-bindings (call-shape (call :callee "send")))))
-      (call :over calls :resolves-to "Widget.send" :proof exact
-        :receiver-type (assignable-to "Widget"))
-      (call-argument :over calls :formal-name "timeout")))
+        (rql
+          (project :columns (site_id (formal_name parameter))
+            (filter :where ((terminal eq false) (formal_name is-not-null))
+              (call-argument :formal-name "timeout"
+                (resolved-call :resolves-to "Widget.send" :proof exact
+                  :receiver-type (assignable-to "Widget")
+                  (call-bindings (call-shape (call :callee "send")))))))))))

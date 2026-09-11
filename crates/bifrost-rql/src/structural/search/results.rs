@@ -297,6 +297,11 @@ pub struct CodeQueryResultItem {
     pub provenance: Vec<CodeQueryProvenance>,
     #[serde(skip_serializing_if = "is_false")]
     pub provenance_truncated: bool,
+    /// Query-local projected field names used by typed row consumers. The
+    /// ordinary result value retains its stable domain-specific wire shape.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub row_projection: Vec<crate::query::QueryRowProjectionColumn>,
 }
 
 impl CodeQueryResultItem {

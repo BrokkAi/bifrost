@@ -27,10 +27,6 @@ pub enum RelationalAssertionPlanError {
     DuplicateBinding {
         name: String,
     },
-    ForwardBinding {
-        binding: String,
-        referenced: String,
-    },
     DuplicateGroup {
         name: String,
     },
@@ -92,6 +88,11 @@ pub enum RelationalAssertionPlanError {
         aggregate_op: &'static str,
         expected: CodeQueryRowScalarType,
         actual: CodeQueryRowScalarType,
+    },
+    InvalidSetOperands {
+        group: String,
+        aggregate: String,
+        message: &'static str,
     },
     OrderedSequencesRequired {
         group: String,
@@ -165,10 +166,6 @@ pub enum RelationalAssertionPlanError {
     DeferredSelectorDomain {
         binding: String,
     },
-    ExpansionDomainUnavailable {
-        binding: String,
-        step: &'static str,
-    },
     InvalidQuery {
         binding: String,
         message: String,
@@ -198,13 +195,6 @@ impl fmt::Display for RelationalAssertionPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateBinding { name } => write!(formatter, "duplicate binding `{name}`"),
-            Self::ForwardBinding {
-                binding,
-                referenced,
-            } => write!(
-                formatter,
-                "binding `{binding}` references `{referenced}` before it is declared"
-            ),
             Self::DuplicateGroup { name } => write!(formatter, "duplicate group `{name}`"),
             Self::DuplicateAggregate { group, name } => {
                 write!(formatter, "duplicate aggregate `{group}.{name}`")
@@ -235,7 +225,9 @@ impl fmt::Display for RelationalAssertionPlanError {
                 right_type,
             } => write!(
                 formatter,
-                "join fields `{left}` ({left_type:?}) and `{right}` ({right_type:?}) have incompatible types"
+                "join fields `{left}` ({}) and `{right}` ({}) have incompatible types",
+                left_type.label(),
+                right_type.label()
             ),
             Self::EmptyJoin { left, right } => {
                 write!(
@@ -260,7 +252,8 @@ impl fmt::Display for RelationalAssertionPlanError {
                 actual,
             } => write!(
                 formatter,
-                "aggregate `{group}.{aggregate}` requires an integer value, found {actual:?}"
+                "aggregate `{group}.{aggregate}` requires an integer value, found {}",
+                actual.label()
             ),
             Self::InvalidAggregateValueType {
                 group,
@@ -270,8 +263,15 @@ impl fmt::Display for RelationalAssertionPlanError {
                 actual,
             } => write!(
                 formatter,
-                "aggregate `{group}.{aggregate}` (`{aggregate_op}`) requires a {expected:?} value, found {actual:?}"
+                "aggregate `{group}.{aggregate}` (`{aggregate_op}`) requires a {} value, found {}",
+                expected.label(),
+                actual.label()
             ),
+            Self::InvalidSetOperands {
+                group,
+                aggregate,
+                message,
+            } => write!(formatter, "aggregate `{group}.{aggregate}`: {message}"),
             Self::OrderedSequencesRequired { group, aggregate } => write!(
                 formatter,
                 "aggregate `{group}.{aggregate}` requires both :left and :right ordered sequences"
@@ -287,7 +287,8 @@ impl fmt::Display for RelationalAssertionPlanError {
                 actual,
             } => write!(
                 formatter,
-                "aggregate `{group}.{aggregate}` position field `{field}` must be an integer, found {actual:?}"
+                "aggregate `{group}.{aggregate}` position field `{field}` must be an integer, found {}",
+                actual.label()
             ),
             Self::OrderedValueTypeMismatch {
                 group,
@@ -296,7 +297,9 @@ impl fmt::Display for RelationalAssertionPlanError {
                 right_type,
             } => write!(
                 formatter,
-                "aggregate `{group}.{aggregate}` compares a {left_type:?} value with a {right_type:?} value"
+                "aggregate `{group}.{aggregate}` compares a {} value with a {} value",
+                left_type.label(),
+                right_type.label()
             ),
             Self::PredicateTypeMismatch {
                 field,
@@ -304,7 +307,8 @@ impl fmt::Display for RelationalAssertionPlanError {
                 literal,
             } => write!(
                 formatter,
-                "predicate field `{field}` ({actual:?}) cannot be compared with a {literal} literal"
+                "predicate field `{field}` ({}) cannot be compared with a {literal} literal",
+                actual.label()
             ),
             Self::ComparisonTypeMismatch {
                 left,
@@ -313,7 +317,9 @@ impl fmt::Display for RelationalAssertionPlanError {
                 right_type,
             } => write!(
                 formatter,
-                "predicate compares `{left}` ({left_type:?}) with `{right}` ({right_type:?})"
+                "predicate compares `{left}` ({}) with `{right}` ({})",
+                left_type.label(),
+                right_type.label()
             ),
             Self::UnorderedComparison {
                 field,
@@ -321,7 +327,8 @@ impl fmt::Display for RelationalAssertionPlanError {
                 actual,
             } => write!(
                 formatter,
-                "predicate operator `{operator}` is not defined over `{field}` ({actual:?})"
+                "predicate operator `{operator}` is not defined over `{field}` ({})",
+                actual.label()
             ),
             Self::NullTestOnRequiredField { field } => write!(
                 formatter,
@@ -351,10 +358,6 @@ impl fmt::Display for RelationalAssertionPlanError {
             Self::DeferredSelectorDomain { binding } => write!(
                 formatter,
                 "binding `{binding}` uses an RQL file whose row domain is not resolved yet"
-            ),
-            Self::ExpansionDomainUnavailable { binding, step } => write!(
-                formatter,
-                "binding `{binding}` uses row expansion `{step}`, whose result domain is not registered yet"
             ),
             Self::InvalidQuery { binding, message } => {
                 write!(
@@ -475,35 +478,12 @@ fn validate_relation(
     relation: &IrRelation,
 ) -> Result<(), RelationalAssertionPlanError> {
     match &relation.op {
-        IrRelationOp::Source { binding, domain } => {
-            let expected = super::ir::domain_schema(binding.as_str(), *domain);
-            if expected != relation.schema {
+        IrRelationOp::Source { binding, schema } => {
+            if schema != &relation.schema {
                 return Err(RelationalAssertionPlanError::UnknownField {
                     binding: binding.as_str().to_string(),
                     field: "<schema>".to_string(),
-                    known_fields: expected.field_names_of(binding.as_str()),
-                });
-            }
-        }
-        IrRelationOp::Expand {
-            input,
-            binding,
-            step,
-            domain,
-        } => {
-            let source = plan
-                .relation(*input)
-                .expect("input ids are checked before the operator is validated");
-            let source_domain = relation_domain(source).ok_or_else(|| {
-                RelationalAssertionPlanError::ExpansionDomainUnavailable {
-                    binding: binding.as_str().to_string(),
-                    step: step.label(),
-                }
-            })?;
-            if super::ir::expansion_result_domain(source_domain, *step) != Some(*domain) {
-                return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
-                    binding: binding.as_str().to_string(),
-                    step: step.label(),
+                    known_fields: schema.field_names_of(binding.as_str()),
                 });
             }
         }
@@ -566,17 +546,6 @@ fn validate_relation(
         }
     }
     Ok(())
-}
-
-/// The row domain a relation publishes, when it is a row-domain relation at
-/// all. Only source and expansion relations are expandable further.
-fn relation_domain(
-    relation: &IrRelation,
-) -> Option<brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain> {
-    match &relation.op {
-        IrRelationOp::Source { domain, .. } | IrRelationOp::Expand { domain, .. } => Some(*domain),
-        _ => None,
-    }
 }
 
 fn input_relation(plan: &RelationalPlanIr, id: super::ir::IrRelationId) -> &IrRelation {
@@ -768,6 +737,29 @@ fn validate_aggregate(
                 }
             });
         }
+    }
+    let set_error = |message| RelationalAssertionPlanError::InvalidSetOperands {
+        group: group.to_string(),
+        aggregate: aggregate.name.as_str().to_string(),
+        message,
+    };
+    let is_set = matches!(
+        aggregate.op,
+        super::ir::IrAggregateOp::SetEqual | super::ir::IrAggregateOp::Subset
+    );
+    match (is_set, &aggregate.sets) {
+        (true, Some((left, right))) => {
+            let left_type = column_type(schema, left)?;
+            let right_type = column_type(schema, right)?;
+            if !super::ir::is_stable_key(left_type) || left_type != right_type {
+                return Err(set_error(
+                    "set operands must be stable-key columns of the same scalar type",
+                ));
+            }
+        }
+        (true, None) => return Err(set_error("set aggregate requires :left and :right columns")),
+        (false, Some(_)) => return Err(set_error("only set-equal and subset accept set columns")),
+        (false, None) => {}
     }
     validate_ordered_sequences(schema, group, aggregate)?;
     for predicate in &aggregate.predicates {

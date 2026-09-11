@@ -980,7 +980,7 @@ fn resolve_imported_export_from_binder_with_mode(
                 let imported = binding.imported_name.as_deref().unwrap_or(reference);
                 let files = resolve_module_files(rust, token, file, &binding.module_specifier);
                 targets.extend(if forward {
-                    forward_exported_targets_from_files(rust, token, &files, imported)
+                    forward_imported_targets(rust, token, file, &binding.module_specifier, imported)
                 } else {
                     exported_targets_from_files(rust, token, &files, imported)
                 });
@@ -997,7 +997,7 @@ fn resolve_imported_export_from_binder_with_mode(
                 let module_specifier = module_segments.join("::");
                 let files = resolve_module_files(rust, token, file, &module_specifier);
                 targets.extend(if forward {
-                    forward_exported_targets_from_files(rust, token, &files, imported)
+                    forward_imported_targets(rust, token, file, &module_specifier, imported)
                 } else {
                     exported_targets_from_files(rust, token, &files, imported)
                 });
@@ -1021,7 +1021,7 @@ fn resolve_imported_export_from_binder_with_mode(
         if matches!(binding.kind, ImportKind::Glob) {
             let files = resolve_module_files(rust, token, file, &binding.module_specifier);
             targets.extend(if forward {
-                forward_exported_targets_from_files(rust, token, &files, reference)
+                forward_imported_targets(rust, token, file, &binding.module_specifier, reference)
             } else {
                 exported_targets_from_files(rust, token, &files, reference)
             });
@@ -1030,6 +1030,56 @@ fn resolve_imported_export_from_binder_with_mode(
     let mut sorted: Vec<_> = targets.into_iter().collect();
     sorted.sort();
     sorted
+}
+
+/// Compose imports against module identities, including namespaces brought into
+/// scope by another import. A file-only export walk loses inline module scope
+/// and cannot follow a crate namespace re-exported through a prelude (#3186).
+fn forward_imported_targets(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    module_specifier: &str,
+    name: &str,
+) -> BTreeSet<(ProjectFile, String)> {
+    forward_imported_identities(
+        rust,
+        token,
+        file,
+        &rust_package_name(file),
+        module_specifier,
+        name,
+    )
+    .into_iter()
+    .map(|identity| (identity.file, identity.name))
+    .collect()
+}
+
+/// Canonical declarations bound by a module import, with the original module
+/// and namespace retained for consumers that must validate exact identities.
+pub fn forward_imported_identities(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    package: &str,
+    module_specifier: &str,
+    name: &str,
+) -> HashSet<crate::usage::RustSymbolIdentity> {
+    let walks = crate::usage_walks::RustUsageWalks::new(rust, token);
+    let importer = walks.queries().module_key_of(file, package);
+    let segments = parse_symbol_path(Language::Rust, module_specifier);
+    let mut targets = HashSet::default();
+    for route in walks.resolve_segments(file, package, &segments) {
+        for binding in walks
+            .bindings_at(&route.target_file, &route.target_module)
+            .iter()
+        {
+            if binding.name == name && binding.domain.contains_module(&importer) {
+                targets.insert(binding.origin.clone());
+            }
+        }
+    }
+    targets
 }
 
 pub fn resolve_imported_export_from_binder_forward(

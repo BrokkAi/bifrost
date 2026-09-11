@@ -433,6 +433,7 @@ pub(super) fn search_symbols_with_cap(
         let _scope = profiling::scope("searchtools::search_symbols.filter_ranged");
         let mut seen = HashSet::default();
         let mut filtered = Vec::new();
+        let mut cpp_identity = CppIdentityRenderCache::default();
         for candidate in definitions.rows {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 complete = false;
@@ -444,10 +445,23 @@ pub(super) fn search_symbols_with_cap(
             if !seen.insert(candidate.code_unit.clone()) {
                 continue;
             }
-            let Some(range) = candidate
-                .primary_range
-                .or_else(|| primary_range(analyzer, &candidate.code_unit))
-            else {
+            // The persisted primary range is ordinal zero, which is the
+            // prototype when one C++ callable has a same-file prototype and a
+            // later body. Use the same structured occurrence classification as
+            // forward navigation so symbol search offers the physical
+            // definition without changing the declarations the pattern named.
+            let selected_range = if language_for_target(&candidate.code_unit) == Language::Cpp
+                && candidate.code_unit.is_callable()
+            {
+                cpp_identity
+                    .primary_range(analyzer, &candidate.code_unit)
+                    .or(candidate.primary_range)
+            } else {
+                candidate
+                    .primary_range
+                    .or_else(|| primary_range(analyzer, &candidate.code_unit))
+            };
+            let Some(range) = selected_range else {
                 continue;
             };
             // Symbol-level test filtering (#1102): a declaration is treated as
@@ -2362,6 +2376,9 @@ pub(super) fn rank_search_symbol_candidates(
             complete = false;
             break;
         }
+        // The range arrives already selected by the filter above: for a C++
+        // callable it is the structured definition-preferred range (#3183,
+        // #3185), so no further classification happens here.
         ranked.push(RankedSearchCandidate {
             line: primary_range.start_line,
             score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
