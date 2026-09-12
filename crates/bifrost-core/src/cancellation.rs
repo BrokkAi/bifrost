@@ -18,6 +18,10 @@ pub struct CancellationToken {
     /// What the work under this token is doing right now. See
     /// [`CancellationToken::enter_phase`].
     phase: Arc<Mutex<Option<String>>>,
+    /// Where each phase change is published as it happens, for a host that
+    /// reports the request's progress while it runs. See
+    /// [`CancellationToken::with_phase_sink`].
+    phase_sink: Option<PhaseSink>,
     #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -32,11 +36,40 @@ pub struct CancellationToken {
 pub struct PhaseGuard {
     phase: Arc<Mutex<Option<String>>>,
     previous: Option<String>,
+    sink: Option<PhaseSink>,
 }
 
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
-        *self.phase.lock().expect("cancellation phase lock poisoned") = self.previous.take();
+        let restored = self.previous.take();
+        // The outer phase is current again, so a host reporting this request's
+        // phases has to hear it. There is nothing to report when the work goes
+        // back to having no phase at all: the request is between phases, not in
+        // a new one.
+        if let (Some(sink), Some(restored)) = (&self.sink, &restored) {
+            sink.publish(restored);
+        }
+        *self.phase.lock().expect("cancellation phase lock poisoned") = restored;
+    }
+}
+
+/// Delivers each phase a token enters to the host that owns the request.
+///
+/// A callback rather than a channel, so the core crate stays independent of the
+/// host's async runtime: the MCP host installs a sink that hands the phase to
+/// its own task, which turns it into a progress notification (issue #3170).
+#[derive(Clone)]
+struct PhaseSink(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl PhaseSink {
+    fn publish(&self, phase: &str) {
+        (self.0)(phase);
+    }
+}
+
+impl std::fmt::Debug for PhaseSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PhaseSink")
     }
 }
 
@@ -65,12 +98,41 @@ impl CancellationToken {
     /// inside it ends. Enter one only for work whose duration a person would
     /// want named; this is a diagnostic channel, not a trace.
     pub fn enter_phase(&self, phase: impl Into<String>) -> PhaseGuard {
-        let mut current = self.phase.lock().expect("cancellation phase lock poisoned");
-        let previous = current.replace(phase.into());
+        let phase = phase.into();
+        // Published before it is recorded, so the string can then move into the
+        // token instead of being cloned. Nothing observes the gap: the sink and
+        // `phase()` are two views of one diagnostic, and publishing outside the
+        // lock keeps a host's callback off the token's mutex.
+        if let Some(sink) = &self.phase_sink {
+            sink.publish(&phase);
+        }
+        let previous = self
+            .phase
+            .lock()
+            .expect("cancellation phase lock poisoned")
+            .replace(phase);
         PhaseGuard {
             phase: Arc::clone(&self.phase),
             previous,
+            sink: self.phase_sink.clone(),
         }
+    }
+
+    /// Also deliver every phase entered under this token to `sink`, so a host
+    /// can report what a request is doing while it runs instead of only when
+    /// its budget expires.
+    ///
+    /// `sink` runs on whatever thread enters the phase, which is a synchronous
+    /// analyzer thread, so it must not block: hand the phase to another task
+    /// and return. Clones taken after this carry the sink, exactly as they
+    /// carry the phase.
+    pub fn with_phase_sink(mut self, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        debug_assert!(
+            self.phase_sink.is_none(),
+            "a token reports its phases to one host, so a second sink would silence the first"
+        );
+        self.phase_sink = Some(PhaseSink(Arc::new(sink)));
+        self
     }
 
     /// The phase this token's work last entered, if any.
@@ -201,6 +263,35 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert!(!token.is_timed_out());
+    }
+
+    #[test]
+    fn issue_3170_a_phase_sink_hears_every_entry_and_every_restore() {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&reported);
+        let token = CancellationToken::default().with_phase_sink(move |phase| {
+            recorder
+                .lock()
+                .expect("recorded phases lock poisoned")
+                .push(phase.to_string())
+        });
+        // The host installs the sink and the work runs under a clone, exactly
+        // as a tool call reaches the analyzer.
+        let worker = token.clone();
+
+        let outer = worker.enter_phase("executing a tool");
+        {
+            let _inner = worker.enter_phase("waiting for a lock");
+            assert_eq!(worker.phase().as_deref(), Some("waiting for a lock"));
+        }
+        assert_eq!(worker.phase().as_deref(), Some("executing a tool"));
+        drop(outer);
+        assert_eq!(worker.phase(), None);
+
+        assert_eq!(
+            *reported.lock().expect("recorded phases lock poisoned"),
+            ["executing a tool", "waiting for a lock", "executing a tool"]
+        );
     }
 
     #[test]

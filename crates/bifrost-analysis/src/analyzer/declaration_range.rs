@@ -299,6 +299,19 @@ fn node_for_smallest_containing_range<'tree>(
     best
 }
 
+/// The declaration a persisted `range` names, located by the lines it carries
+/// rather than by its byte offsets.
+///
+/// The search is bounded to the nodes that span those lines, which is the case
+/// this recovery exists for: the offsets come from another representation of
+/// the same text, where a line span survives and a byte offset does not. The
+/// bound is exact, because a node's line interval contains every descendant's,
+/// so a subtree that misses the range holds nothing that meets it. Reading the
+/// whole file instead answered with whatever token elsewhere in it happened to
+/// share the name, and cost a walk of every named node per request: 113 s of a
+/// 204 s `search_symbols` query over the 7.7 MB amalgamated `simdjson.h`, whose
+/// unparsed region holds no candidate at all, so nothing bounded that walk and
+/// every request paid for the whole file (#3214).
 fn declaration_name_node_for_line_range<'tree>(
     root: Node<'tree>,
     range: &Range,
@@ -306,63 +319,72 @@ fn declaration_name_node_for_line_range<'tree>(
     content: &str,
     support: Option<&'static dyn crate::analyzer::languages::LanguageSupport>,
 ) -> Option<Node<'tree>> {
-    // Ranked by line distance, then structural before spelling, then span and
-    // start. A structural answer -- the language's positional reader naming the
-    // node -- identifies the declaration the stale range belonged to, while a
-    // spelling answer only says some token inside the range shares the name.
-    // The distinction decides when the true name token cannot compete as a
-    // spelling candidate on its own: the anonymous `default` keyword of
-    // `export default ...` is invisible to the named-node walk, so every
-    // in-body `{ default: x }` key ties the statement on line distance and
-    // would win on span (#2733).
-    let mut best: Option<(usize, bool, usize, usize, Node<'tree>)> = None;
+    if !node_lines_meet_range(root, range) {
+        return None;
+    }
+    // Ranked structural before spelling, then span and start. A structural
+    // answer -- the language's positional reader naming the node -- identifies
+    // the declaration the stale range belonged to, while a spelling answer only
+    // says some token inside the range shares the name. The distinction decides
+    // when the true name token cannot compete as a spelling candidate on its
+    // own: the anonymous `default` keyword of `export default ...` is invisible
+    // to the named-node walk, so every in-body `{ default: x }` key shares the
+    // statement's lines and would win on span (#2733).
+    let mut best: Option<(bool, usize, usize, Node<'tree>)> = None;
     let mut stack = vec![root];
+    // One cursor for the whole descent. `Node::walk` allocates, so a cursor per
+    // visited node was a malloc per node (#3097).
+    let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
         if let Some((name_node, structural)) =
             declaration_name_node_from_fields(node, identifier, content, support)
         {
-            let line_distance = declaration_line_distance(node, range);
             let span = node.end_byte().saturating_sub(node.start_byte());
-            let start_byte = node.start_byte();
-            let candidate = (line_distance, structural, span, start_byte, name_node);
+            let candidate = (structural, span, node.start_byte(), name_node);
             if best.is_none_or(|current| {
-                (candidate.0, !candidate.1, candidate.2, candidate.3)
-                    < (current.0, !current.1, current.2, current.3)
+                (!candidate.0, candidate.1, candidate.2) < (!current.0, current.1, current.2)
             }) {
                 best = Some(candidate);
             }
         }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                // Children are in source order, so once one starts past the
+                // range's last line no later sibling meets the range either.
+                if child.start_position().row > range.end_line {
+                    break;
+                }
+                if child.is_named() && node_lines_meet_range(child, range) {
+                    stack.push(child);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
     }
-    best.map(|(_, _, _, _, name_node)| name_node)
+    best.map(|(_, _, _, name_node)| name_node)
 }
 
-fn declaration_line_distance(node: Node<'_>, range: &Range) -> usize {
+/// Whether `node` spans a line of `range`, under either line convention.
+/// Declaration ranges number lines from one and tree-sitter rows from zero, and
+/// a persisted range can carry either, so a node one line ahead still meets it.
+fn node_lines_meet_range(node: Node<'_>, range: &Range) -> bool {
     let start = node.start_position().row;
     let end = node.end_position().row;
-    [
-        line_interval_distance(start, end, range.start_line, range.end_line),
-        line_interval_distance(start + 1, end + 1, range.start_line, range.end_line),
-    ]
-    .into_iter()
-    .min()
-    .expect("line distance candidates are non-empty")
+    line_intervals_meet(start, end, range.start_line, range.end_line)
+        || line_intervals_meet(start + 1, end + 1, range.start_line, range.end_line)
 }
 
-fn line_interval_distance(
+fn line_intervals_meet(
     left_start: usize,
     left_end: usize,
     right_start: usize,
     right_end: usize,
-) -> usize {
-    if left_end < right_start {
-        right_start.saturating_sub(left_end)
-    } else if right_end < left_start {
-        left_start.saturating_sub(right_end)
-    } else {
-        0
-    }
+) -> bool {
+    left_start <= right_end && right_start <= left_end
 }
 
 /// The node naming `identifier` inside `declaration_node`, paired with whether
@@ -759,6 +781,104 @@ mod tests {
         .expect("declaration name");
 
         assert_eq!(name.start_byte, expected_start);
+    }
+
+    /// #3214: the line recovery exists for a persisted range whose byte offsets
+    /// came from another representation of the same text, where the line span
+    /// still identifies the declaration. Lines that hold no candidate identify
+    /// nothing, and must answer nothing rather than the nearest token elsewhere
+    /// in the file that shares the name, which is what the whole-file walk
+    /// answered with for hits inside `simdjson.h`'s unparsed region.
+    #[test]
+    fn declaration_name_ignores_candidates_off_the_persisted_lines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "document.cpp");
+        let source = "class Document {\n  int size;\n};\n\nint main() {\n  return 0;\n}\n";
+        let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("cpp tree");
+        let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Class, "", "Document");
+        // Byte offsets past the end of the current source, as a range persisted
+        // from a different line-ending representation carries.
+        let stale_bytes = (source.len(), source.len() + 3);
+
+        let recovered = code_unit_declaration_name_range_for_range(
+            source,
+            tree.root_node(),
+            &unit,
+            Range {
+                start_byte: stale_bytes.0,
+                end_byte: stale_bytes.1,
+                start_line: 1,
+                end_line: 3,
+            },
+        )
+        .expect("declaration name from line range");
+        assert_eq!(
+            &source[recovered.start_byte..recovered.end_byte],
+            "Document"
+        );
+
+        let off_the_declaration = code_unit_declaration_name_range_for_range(
+            source,
+            tree.root_node(),
+            &unit,
+            Range {
+                start_byte: stale_bytes.0,
+                end_byte: stale_bytes.1,
+                start_line: 6,
+                end_line: 7,
+            },
+        );
+        assert_eq!(
+            off_the_declaration, None,
+            "lines holding no declaration of this name must not answer with one elsewhere"
+        );
+    }
+
+    /// #3214: the recovery walked every named node of the file for each request
+    /// that reached it. One `search_symbols` query over the 7.7 MB amalgamated
+    /// `simdjson.h` spent 113 s that way, because the region its hits live in
+    /// holds no candidate at all and so nothing bounded the walk.
+    #[test]
+    fn line_recovery_cost_does_not_scale_with_the_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "amalgamated.cpp");
+        let mut source = String::new();
+        for index in 0..8_000 {
+            source.push_str(&format!(
+                "int filler_{index}(int value) {{ return value; }}\n"
+            ));
+        }
+        let context = DeclarationNameRangeContext::new(&file, source.clone());
+        let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Class, "", "Document");
+        let requests: Vec<(&CodeUnit, Range)> = (0..100)
+            .map(|index| {
+                (
+                    &unit,
+                    Range {
+                        start_byte: source.len() + index,
+                        end_byte: source.len() + index + 4,
+                        start_line: index * 70 + 1,
+                        end_line: index * 70 + 1,
+                    },
+                )
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let answers = context.name_ranges_for_declarations(&requests);
+        let elapsed = started.elapsed();
+
+        assert!(
+            answers.iter().all(Option::is_none),
+            "no filler declaration names Document: {answers:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "line recovery over {} requests took {elapsed:?}; expected a walk bounded to each request's lines",
+            requests.len()
+        );
     }
 
     #[test]

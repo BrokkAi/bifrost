@@ -1175,6 +1175,11 @@ impl RetainedSize for PolicyQueryProvenanceStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyQueryResultRef {
+    ConfigurationFact {
+        location: PolicySourceLocation,
+        id: String,
+        fact_id: String,
+    },
     StructuralMatch {
         kind: String,
         location: PolicySourceLocation,
@@ -1255,6 +1260,7 @@ impl PolicyQueryResultRef {
 
     pub const fn result_domain(&self) -> Option<MatchResultDomain> {
         match self {
+            Self::ConfigurationFact { .. } => Some(MatchResultDomain::ConfigurationFact),
             Self::StructuralMatch { .. } => Some(MatchResultDomain::StructuralMatch),
             Self::Declaration { .. } => Some(MatchResultDomain::Declaration),
             Self::File { .. } => Some(MatchResultDomain::File),
@@ -1271,7 +1277,8 @@ impl PolicyQueryResultRef {
 
     pub const fn location(&self) -> Option<&PolicySourceLocation> {
         match self {
-            Self::StructuralMatch { location, .. }
+            Self::ConfigurationFact { location, .. }
+            | Self::StructuralMatch { location, .. }
             | Self::Declaration { location, .. }
             | Self::ReferenceSite { location, .. }
             | Self::CallSite { location, .. }
@@ -1294,6 +1301,15 @@ impl PolicyQueryResultRef {
 
     pub fn validate(&self) -> Result<(), ReportValueError> {
         match self {
+            Self::ConfigurationFact {
+                location,
+                id,
+                fact_id,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                validate_report_identifier(fact_id)?;
+            }
             Self::StructuralMatch {
                 kind,
                 location,
@@ -1423,6 +1439,10 @@ impl PolicyQueryResultRef {
 
     fn tighten_owned_storage(&mut self) {
         match self {
+            Self::ConfigurationFact { id, fact_id, .. } => {
+                tighten_string(id);
+                tighten_string(fact_id);
+            }
             Self::StructuralMatch { kind, .. } => tighten_string(kind),
             Self::Declaration { kind, fq_name, .. } => {
                 tighten_string(kind);
@@ -1519,6 +1539,13 @@ impl PolicyQueryResultRef {
 impl RetainedSize for PolicyQueryResultRef {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
+            Self::ConfigurationFact {
+                location,
+                id,
+                fact_id,
+            } => retained_extra(location)
+                .saturating_add(id.capacity())
+                .saturating_add(fact_id.capacity()),
             Self::StructuralMatch {
                 kind,
                 location,

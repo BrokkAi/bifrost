@@ -172,7 +172,8 @@ fn validate_wrapper(
             RqlForm::Scopes => ("scopes", EnvironmentOptionKind::Scope),
             RqlForm::Bindings => ("bindings", EnvironmentOptionKind::Binding),
             RqlForm::GenerationSites => ("generation_sites", EnvironmentOptionKind::GenerationSite),
-            _ => ("exports", EnvironmentOptionKind::Export),
+            RqlForm::Exports => ("exports", EnvironmentOptionKind::Export),
+            _ => unreachable!("other source forms are handled separately"),
         };
         analysis.path(rql_query_child_path(path, label), head_range.clone());
         validate_environment_options(form, args, kind, analysis);
@@ -182,6 +183,14 @@ fn validate_wrapper(
     if form == RqlForm::Paths {
         analysis.path(rql_query_child_path(path, "paths"), head_range.clone());
         validate_path_source_options(args, analysis);
+        return;
+    }
+    if form == RqlForm::ConfigurationFacts {
+        analysis.path(
+            rql_query_child_path(path, "configuration_facts"),
+            head_range.clone(),
+        );
+        validate_configuration_facts_options(form, args, analysis);
         return;
     }
     let Some(query) = args.last() else {
@@ -198,6 +207,7 @@ fn validate_wrapper(
         step_path = Some(path);
     }
     match form {
+        RqlForm::ConfigurationFacts => unreachable!("configuration-facts is handled as a source"),
         RqlForm::Filter | RqlForm::Project => {
             let expected = if form == RqlForm::Filter {
                 ":where"
@@ -2551,6 +2561,16 @@ fn validate_property_value(
         | super::schema::ValueShape::ExportFormList
         | super::schema::ValueShape::ExportNameList
         | super::schema::ValueShape::DeclarationOriginList
+        | super::schema::ValueShape::ConfigurationFormatList
+        | super::schema::ValueShape::ConfigurationNodeKindList
+        | super::schema::ValueShape::ConfigurationRoleList
+        | super::schema::ValueShape::ConfigurationScalarKindList
+        | super::schema::ValueShape::ConfigurationKeyList
+        | super::schema::ValueShape::ConfigurationRouteList
+        | super::schema::ValueShape::ConfigurationFactOrdinalList
+        | super::schema::ValueShape::ConfigurationProvenanceList
+        | super::schema::ValueShape::ConfigurationCompletenessList
+        | super::schema::ValueShape::ConfigurationFactsFilter
         | super::schema::ValueShape::RuntimeFamily
         | super::schema::ValueShape::RuntimeGlobal
         | super::schema::ValueShape::RuntimeContainer
@@ -2970,5 +2990,186 @@ fn validate_result_detail(value: &Expr, analysis: &mut Analysis) {
             result_detail_candidates(),
             |suggestion| replacement_for_rql_label(value, suggestion),
         );
+    }
+}
+
+fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysis: &mut Analysis) {
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .expect("an odd option count has a last element")
+                .range
+                .clone(),
+            "wrong-value-shape",
+            format!(
+                "{} expects :format, :node-kind, :role, :scalar-kind, :key, :route, :fact-ordinal, :provenance, and :completeness option/value pairs",
+                form.label()
+            ),
+        );
+        return;
+    }
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "configuration-facts option names must be keywords",
+            );
+            continue;
+        };
+        let Some(field) = configuration_facts_field_for_rql_label(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                format!(
+                    "{} accepts one configuration-facts filter axis",
+                    form.label()
+                ),
+            );
+            continue;
+        };
+        if !seen.insert(field) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate configuration-facts filter option '{label}'"),
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            field.signature(),
+            field.description(),
+        );
+        if field == ConfigurationFactsFilterField::Routes {
+            validate_configuration_routes(&pair[1], analysis);
+            continue;
+        }
+        let values = pair[1]
+            .as_sequence()
+            .map_or_else(|| vec![&pair[1]], |items| items.iter().collect());
+        for value in values {
+            match field {
+                ConfigurationFactsFilterField::Keys => {
+                    let valid = value.as_string().is_some_and(|key| {
+                        !key.is_empty() && key.len() <= MAX_CONFIGURATION_KEY_LENGTH
+                    });
+                    if !valid {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            format!(
+                                ":key values must contain 1 to {MAX_CONFIGURATION_KEY_LENGTH} bytes"
+                            ),
+                        );
+                    }
+                }
+                ConfigurationFactsFilterField::FactOrdinals => {
+                    if !matches!(value.kind, ExprKind::Number(number) if u32::try_from(number).is_ok())
+                    {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            ":fact-ordinal must be a non-negative 32-bit integer",
+                        );
+                    }
+                }
+                ConfigurationFactsFilterField::Formats
+                | ConfigurationFactsFilterField::NodeKinds
+                | ConfigurationFactsFilterField::Roles
+                | ConfigurationFactsFilterField::ScalarKinds
+                | ConfigurationFactsFilterField::Provenances
+                | ConfigurationFactsFilterField::Completenesses => {
+                    let Some(text) = value.as_symbol().or_else(|| value.as_string()) else {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            format!(":{} values must be symbols or strings", field.label()),
+                        );
+                        continue;
+                    };
+                    let known = match field {
+                        ConfigurationFactsFilterField::Formats => {
+                            crate::query::domain::ConfigurationFormat::from_label(text).is_some()
+                        }
+                        ConfigurationFactsFilterField::NodeKinds => {
+                            ConfigurationNodeKindFilter::from_label(text).is_some()
+                        }
+                        ConfigurationFactsFilterField::Roles => {
+                            configuration_member_role_from_label(text).is_some()
+                        }
+                        ConfigurationFactsFilterField::ScalarKinds => {
+                            configuration_scalar_kind_from_label(text).is_some()
+                        }
+                        ConfigurationFactsFilterField::Provenances => {
+                            configuration_provenance_from_label(text).is_some()
+                        }
+                        ConfigurationFactsFilterField::Completenesses => {
+                            ConfigurationCompletenessFilter::from_label(text).is_some()
+                        }
+                        _ => unreachable!("only enum-like axes remain in this branch"),
+                    };
+                    if !known {
+                        analysis.error(
+                            value.range.clone(),
+                            "unknown-value",
+                            format!("unknown {} value '{text}'", field.label()),
+                        );
+                    }
+                }
+                ConfigurationFactsFilterField::Routes => {
+                    unreachable!("handled before value decoding")
+                }
+            }
+        }
+    }
+}
+
+fn validate_configuration_routes(route: &Expr, analysis: &mut Analysis) {
+    let Some(alternatives) = route.as_sequence() else {
+        analysis.error(
+            route.range.clone(),
+            "wrong-value-shape",
+            ":route must be a sequence of route alternatives",
+        );
+        return;
+    };
+    for alternative in alternatives {
+        let Some(segments) = alternative.as_sequence() else {
+            analysis.error(
+                alternative.range.clone(),
+                "wrong-value-shape",
+                "each :route alternative must be a sequence of segments",
+            );
+            continue;
+        };
+        for segment in segments {
+            let Some((kind, range, args)) = list_head(segment) else {
+                analysis.error(
+                    segment.range.clone(),
+                    "wrong-value-shape",
+                    "a route segment must be a key, index, or any list",
+                );
+                continue;
+            };
+            let valid = match (kind, args.len()) {
+                ("key", 1) => args[0].as_string().is_some(),
+                ("index", 1) => {
+                    matches!(args[0].kind, ExprKind::Number(number) if u32::try_from(number).is_ok())
+                }
+                ("any", 0) => true,
+                ("key" | "index", _) | ("any", _) => false,
+                _ => false,
+            };
+            if !valid {
+                analysis.error(
+                    range,
+                    "wrong-value-shape",
+                    "route segments are (key \"text\"), (index ordinal), or (any)",
+                );
+            }
+        }
     }
 }

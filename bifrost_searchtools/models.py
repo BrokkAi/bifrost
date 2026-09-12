@@ -5418,6 +5418,62 @@ class CodeQueryTopologyEdge:
         )
 
 
+@dataclass(frozen=True)
+class CodeQueryConfigurationFact:
+    """One authored fact from a configuration document."""
+
+    id: str
+    fact_id: str
+    path: str
+    format: str
+    node_kind: str
+    provenance: str
+    completeness: str
+    route: str
+    ordinal: int
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    parent_id: str | None = None
+    value_id: str | None = None
+    role: str | None = None
+    scalar_kind: str | None = None
+    key: str | None = None
+    occurrence: int | None = None
+    index: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryConfigurationFact:
+        return cls(
+            id=data["id"],
+            fact_id=data["fact_id"],
+            path=data["path"],
+            format=data["format"],
+            node_kind=data["node_kind"],
+            provenance=data["provenance"],
+            completeness=data["completeness"],
+            route=data["route"],
+            ordinal=_strict_nonnegative_int(data, "ordinal"),
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=_strict_nonnegative_int(data, "start_byte"),
+            end_byte=_strict_nonnegative_int(data, "end_byte"),
+            parent_id=data.get("parent_id"),
+            value_id=data.get("value_id"),
+            role=data.get("role"),
+            scalar_kind=data.get("scalar_kind"),
+            key=data.get("key"),
+            occurrence=_optional_int(data, "occurrence"),
+            index=_optional_int(data, "index"),
+        )
+
+    def render_text(self) -> str:
+        key = self.key if self.key is not None else "<document>"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[configuration; {self.format} {self.node_kind}.{key}] {self.route}"
+        )
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -5486,6 +5542,7 @@ CodeQueryResultItem = (
     | CodeQuerySourceSet
     | CodeQueryBuildTarget
     | CodeQueryTopologyEdge
+    | CodeQueryConfigurationFact
 )
 
 _CODE_QUERY_RESULT_ITEM_TYPES = {
@@ -5556,6 +5613,7 @@ _CODE_QUERY_RESULT_ITEM_TYPES = {
     "source_set": CodeQuerySourceSet,
     "build_target": CodeQueryBuildTarget,
     "topology_edge": CodeQueryTopologyEdge,
+    "configuration_fact": CodeQueryConfigurationFact,
 }
 
 

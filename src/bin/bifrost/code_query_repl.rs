@@ -920,6 +920,24 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             }
             parts
         }
+        CodeQueryPlanSource::ConfigurationFacts(seed) => {
+            let mut parts = vec!["configuration facts query".to_string()];
+            if !seed.where_globs.is_empty() {
+                parts.push(format!("where {}", path_scope_summary(&seed.where_globs)));
+            }
+            if !seed.filter.formats.is_empty() {
+                parts.push(format!(
+                    "format {}",
+                    seed.filter
+                        .formats
+                        .iter()
+                        .map(|format| format.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            parts
+        }
         CodeQueryPlanSource::Set { op, branches } => {
             vec![format!("{} of {} queries", op.label(), branches.len())]
         }
@@ -2345,6 +2363,24 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.true_edge_id.as_deref().unwrap_or("none"),
                         value.false_edge_id.as_deref().unwrap_or("none"),
                         value.proof,
+                        value.completeness,
+                    ));
+                }
+                CodeQueryResultValue::ConfigurationFact { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} ({}, {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "configuration fact:",
+                            use_color
+                        ),
+                        value.node_kind,
+                        paint(Style::new().bold(), &value.route, use_color),
+                        value.format,
                         value.completeness,
                     ));
                 }

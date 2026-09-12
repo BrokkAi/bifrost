@@ -669,7 +669,8 @@ impl RootsActivations {
 ///
 /// Truthful and low volume by construction: one notification per phase the
 /// call actually enters -- workspace readiness, analyzer admission, tool
-/// execution, and cooperative cancellation when the request budget expires.
+/// execution, every phase the analyzer itself enters while it runs (issue
+/// #3170), and cooperative cancellation when the request budget expires.
 /// The progress value is a per-request monotonic counter and `total` is never
 /// set, because no phase has a known item count to report: the analyzer
 /// exposes no per-item counters at this boundary, and inventing percentages
@@ -1347,6 +1348,30 @@ impl BifrostMcpHandler {
             Some(deadline) => crate::CancellationToken::default().with_deadline(deadline),
             None => crate::CancellationToken::default(),
         };
+        // How the analyzer's phases reach the client while the call is still
+        // running. The analyzer thread is synchronous and cannot send a
+        // notification itself, so it publishes each phase into this channel and
+        // the select loop below -- this request's own task -- reports it
+        // (issue #3170). The receiver and this sender both live as long as that
+        // loop, so `recv` cannot return `None` while the call is running.
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let bifrost_cancellation = match progress {
+            Some(_) => {
+                let phases = phase_tx.clone();
+                bifrost_cancellation.with_phase_sink(move |phase| {
+                    // Sending never blocks the analyzer thread. Its one failure
+                    // is the receiver being gone, which says the request has
+                    // already answered: a phase entered while the cancelled
+                    // work unwinds has nobody left to report it to, and must
+                    // not be reported after the answer anyway.
+                    match phases.send(phase.to_string()) {
+                        Ok(()) => {}
+                        Err(_after_the_answer) => {}
+                    }
+                })
+            }
+            None => bifrost_cancellation,
+        };
         let in_flight = self.in_flight.register(
             workspace_scope.unwrap_or_else(|| WorkspaceRequestScope {
                 workspace_id: 0,
@@ -1418,37 +1443,53 @@ impl BifrostMcpHandler {
                 output
             })
         });
-        let output = tokio::select! {
-            output = &mut output => output.map_err(|error| {
-                ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
-            })?,
-            () = async {
-                match deadline {
-                    Some(deadline) => {
-                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+        let output = loop {
+            tokio::select! {
+                // Phases first, and not at random: a phase already published
+                // describes work this request really did, so it is reported
+                // before the result that would end this loop. Reporting them
+                // from this task, rather than from one of their own, is what
+                // keeps them ordered with the request's other phase
+                // notifications and stops any of them following the answer.
+                biased;
+                Some(phase) = phase_rx.recv() => {
+                    progress
+                        .expect("the phase sink is installed only when the caller opted into progress")
+                        .phase(phase)
+                        .await;
+                }
+                output = &mut output => break output.map_err(|error| {
+                    ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
+                })?,
+                () = async {
+                    match deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending().await,
                     }
-                    None => std::future::pending().await,
+                } => {
+                    bifrost_cancellation.cancel();
+                    // The truthful last phase for this request: its analyzer
+                    // work is now cooperatively cancelling. Sent before the
+                    // error response, and never again after it -- the loop
+                    // that forwards the analyzer's phases ends here.
+                    if let Some(progress) = progress {
+                        progress.phase(format!("cancelling {name}")).await;
+                    }
+                    let budget = mcp_analyzer_request_budget()
+                        .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
+                    let phase = bifrost_cancellation.phase().expect(
+                        "the request entered its execution phase before the budget could fire",
+                    );
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "{name} exhausted its {budget:?} request budget while {phase}; \
+                             cancellation continues in the background"
+                        ),
+                        None,
+                    ));
                 }
-            } => {
-                bifrost_cancellation.cancel();
-                // The truthful last phase for this request: its analyzer work
-                // is now cooperatively cancelling. Sent before the error
-                // response, and never again after it.
-                if let Some(progress) = progress {
-                    progress.phase(format!("cancelling {name}")).await;
-                }
-                let budget = mcp_analyzer_request_budget()
-                    .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
-                let phase = bifrost_cancellation
-                    .phase()
-                    .expect("the request entered its execution phase before the budget could fire");
-                return Err(ErrorData::internal_error(
-                    format!(
-                        "{name} exhausted its {budget:?} request budget while {phase}; \
-                         cancellation continues in the background"
-                    ),
-                    None,
-                ));
             }
         };
 
@@ -2364,9 +2405,11 @@ impl ServerHandler for BifrostMcpHandler {
             ));
         }
 
-        if let Some(progress) = &progress {
-            progress.phase(format!("executing {name}")).await;
-        }
+        // No "executing {name}" notification from here: `execute_tool` records
+        // that phase on the request's cancellation token, and the token now
+        // reports every phase it enters to this client, so sending one as well
+        // would report the phase twice. One publisher keeps the client's
+        // progress and the budget error's phase saying the same thing.
         let response = self
             .execute_tool(
                 Arc::clone(&service),

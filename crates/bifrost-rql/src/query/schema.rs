@@ -6,6 +6,9 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use brokk_bifrost_core::analyzer::configuration::{
+    ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
+};
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ALL_CONTROL_EXIT_PARTITIONS, ALL_CONTROL_RELATION_KINDS, ControlExitPartition,
     ControlRelationKind,
@@ -285,6 +288,16 @@ pub enum ValueShape {
     ExportFormList,
     ExportNameList,
     DeclarationOriginList,
+    ConfigurationFormatList,
+    ConfigurationNodeKindList,
+    ConfigurationRoleList,
+    ConfigurationScalarKindList,
+    ConfigurationKeyList,
+    ConfigurationRouteList,
+    ConfigurationFactOrdinalList,
+    ConfigurationProvenanceList,
+    ConfigurationCompletenessList,
+    ConfigurationFactsFilter,
     Boolean,
     UsageKindList,
     OwnerRelationList,
@@ -373,6 +386,20 @@ impl ValueShape {
             Self::ExportFormList => "one or more export forms",
             Self::ExportNameList => "one or more exact exported names",
             Self::DeclarationOriginList => "one or more declaration origins",
+            Self::ConfigurationFormatList => "one or more configuration formats",
+            Self::ConfigurationNodeKindList => "one or more configuration node kinds",
+            Self::ConfigurationRoleList => "one or more configuration member roles",
+            Self::ConfigurationScalarKindList => "one or more configuration scalar kinds",
+            Self::ConfigurationKeyList => "one or more exact configuration keys",
+            Self::ConfigurationRouteList => {
+                "ordered route alternatives; each is a sequence of key or index segments"
+            }
+            Self::ConfigurationFactOrdinalList => "one or more zero-based fact ordinals",
+            Self::ConfigurationProvenanceList => "one or more configuration value provenances",
+            Self::ConfigurationCompletenessList => "complete or incomplete",
+            Self::ConfigurationFactsFilter => {
+                "a configuration-fact format/node/role/key/route/provenance filter object"
+            }
             Self::Boolean => "a boolean",
             Self::UsageKindList => "one or more usage kinds",
             Self::OwnerRelationList => "one or more owner relations",
@@ -1013,6 +1040,7 @@ macro_rules! rql_forms {
                     | Self::CandidateHierarchy
                     | Self::GenerationSites
                     | Self::Exports
+                    | Self::ConfigurationFacts
                     | Self::Generates
                     | Self::GeneratedBy
                     | Self::DeclarationStateOf
@@ -1818,6 +1846,13 @@ rql_forms! {
         signature: "(exports [:form ...] [:name ...])",
         description: "Seed export rows directly from recorded materialization provenance.",
     }
+    ConfigurationFacts {
+        labels: ["configuration-facts", "configuration_facts"],
+        class: Wrapper,
+        shape: ConfigurationFactsFilter,
+        signature: "(configuration-facts [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...])",
+        description: "Seed authored configuration-document facts with exact key, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers.",
+    }
     Generates {
         labels: ["generates"],
         class: Wrapper,
@@ -2262,6 +2297,7 @@ json_fields! {
     Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
     GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
     Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
+    ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
 }
 
 json_fields! {
@@ -2357,6 +2393,20 @@ json_fields! {
     ALL_EXPORT_FILTER_FIELDS,
     Forms { label: "form", shape: ExportFormList, signature: "\"form\": [\"default_anonymous\", ...]", description: "Restrict export rows to one or more export forms." }
     Names { label: "name", shape: ExportNameList, signature: "\"name\": [\"default\", ...]", description: "Restrict export rows to one or more exact exported names." }
+}
+
+json_fields! {
+    ConfigurationFactsFilterField,
+    ALL_CONFIGURATION_FACTS_FILTER_FIELDS,
+    Formats { label: "formats", shape: ConfigurationFormatList, signature: "\"formats\": [\"json\", ...]", description: "Restrict facts to one or more structured configuration formats." }
+    NodeKinds { label: "node_kinds", shape: ConfigurationNodeKindList, signature: "\"node_kinds\": [\"member\", ...]", description: "Restrict facts to one or more configuration node kinds." }
+    Roles { label: "roles", shape: ConfigurationRoleList, signature: "\"roles\": [\"object_member\", ...]", description: "Restrict member facts to one or more configuration roles." }
+    ScalarKinds { label: "scalar_kinds", shape: ConfigurationScalarKindList, signature: "\"scalar_kinds\": [\"string\", ...]", description: "Restrict scalar facts to one or more scalar kinds." }
+    Keys { label: "keys", shape: ConfigurationKeyList, signature: "\"keys\": [\"host\", ...]", description: "Restrict facts to one or more exact configuration keys." }
+    Routes { label: "routes", shape: ConfigurationRouteList, signature: "\"routes\": [[{ \"kind\": \"key\", \"key\": \"server\" }, ...], ...]", description: "Restrict facts to one or more exact-length ordered route alternatives; an empty route selects the document fact." }
+    FactOrdinals { label: "fact_ordinals", shape: ConfigurationFactOrdinalList, signature: "\"fact_ordinals\": [0, ...]", description: "Select one or more zero-based fact occurrences, including duplicate-key occurrences." }
+    Provenances { label: "provenances", shape: ConfigurationProvenanceList, signature: "\"provenances\": [\"authored\", ...]", description: "Restrict facts to one or more authored-value provenance classes." }
+    Completenesses { label: "completenesses", shape: ConfigurationCompletenessList, signature: "\"completenesses\": [\"complete\", ...]", description: "Restrict facts to complete or recovered documents; recovery detail remains typed." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -2630,6 +2680,90 @@ pub fn export_field_for_rql_label(label: &str) -> Option<ExportFilterField> {
         ":name" | ":names" => Some(ExportFilterField::Names),
         _ => None,
     }
+}
+
+/// The RQL option spellings of the `configuration-facts` seed, mapped to its
+/// own field registry.
+pub fn configuration_facts_field_for_rql_label(
+    label: &str,
+) -> Option<ConfigurationFactsFilterField> {
+    match label {
+        ":format" | ":formats" => Some(ConfigurationFactsFilterField::Formats),
+        ":node-kind" | ":node_kind" | ":node-kinds" | ":node_kinds" => {
+            Some(ConfigurationFactsFilterField::NodeKinds)
+        }
+        ":role" | ":roles" => Some(ConfigurationFactsFilterField::Roles),
+        ":scalar-kind" | ":scalar_kind" | ":scalar-kinds" | ":scalar_kinds" => {
+            Some(ConfigurationFactsFilterField::ScalarKinds)
+        }
+        ":key" | ":keys" => Some(ConfigurationFactsFilterField::Keys),
+        ":route" | ":routes" => Some(ConfigurationFactsFilterField::Routes),
+        ":fact-ordinal" | ":fact_ordinal" | ":fact-ordinals" | ":fact_ordinals" => {
+            Some(ConfigurationFactsFilterField::FactOrdinals)
+        }
+        ":provenance" | ":provenances" => Some(ConfigurationFactsFilterField::Provenances),
+        ":completeness" | ":completenesses" => Some(ConfigurationFactsFilterField::Completenesses),
+        _ => None,
+    }
+}
+
+/// Canonical visible labels for the configuration member-role vocabulary.
+pub fn configuration_member_role_label(role: ConfigurationMemberRole) -> &'static str {
+    match role {
+        ConfigurationMemberRole::ObjectMember => "object_member",
+        ConfigurationMemberRole::TableEntry => "table_entry",
+        ConfigurationMemberRole::Property => "property",
+        ConfigurationMemberRole::XmlAttribute => "xml_attribute",
+        ConfigurationMemberRole::XmlElement => "xml_element",
+    }
+}
+
+pub fn configuration_member_role_from_label(label: &str) -> Option<ConfigurationMemberRole> {
+    match label {
+        "object_member" | "object-member" => Some(ConfigurationMemberRole::ObjectMember),
+        "table_entry" | "table-entry" => Some(ConfigurationMemberRole::TableEntry),
+        "property" => Some(ConfigurationMemberRole::Property),
+        "xml_attribute" | "xml-attribute" => Some(ConfigurationMemberRole::XmlAttribute),
+        "xml_element" | "xml-element" => Some(ConfigurationMemberRole::XmlElement),
+        _ => None,
+    }
+}
+
+pub fn configuration_scalar_kind_label(kind: ConfigurationScalarKind) -> &'static str {
+    match kind {
+        ConfigurationScalarKind::String => "string",
+        ConfigurationScalarKind::Boolean => "boolean",
+        ConfigurationScalarKind::Integer => "integer",
+        ConfigurationScalarKind::Decimal => "decimal",
+        ConfigurationScalarKind::Null => "null",
+        ConfigurationScalarKind::Url => "url",
+        ConfigurationScalarKind::Duration => "duration",
+        ConfigurationScalarKind::Opaque => "opaque",
+    }
+}
+
+pub fn configuration_scalar_kind_from_label(label: &str) -> Option<ConfigurationScalarKind> {
+    match label {
+        "string" => Some(ConfigurationScalarKind::String),
+        "boolean" => Some(ConfigurationScalarKind::Boolean),
+        "integer" => Some(ConfigurationScalarKind::Integer),
+        "decimal" => Some(ConfigurationScalarKind::Decimal),
+        "null" => Some(ConfigurationScalarKind::Null),
+        "url" => Some(ConfigurationScalarKind::Url),
+        "duration" => Some(ConfigurationScalarKind::Duration),
+        "opaque" => Some(ConfigurationScalarKind::Opaque),
+        _ => None,
+    }
+}
+
+pub fn configuration_provenance_label(provenance: ConfigurationValueProvenance) -> &'static str {
+    match provenance {
+        ConfigurationValueProvenance::Authored => "authored",
+    }
+}
+
+pub fn configuration_provenance_from_label(label: &str) -> Option<ConfigurationValueProvenance> {
+    (label == "authored").then_some(ConfigurationValueProvenance::Authored)
 }
 
 pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {

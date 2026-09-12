@@ -71,7 +71,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::SourceSet { .. }
                 | CodeQueryResultValue::BuildTarget { .. }
                 | CodeQueryResultValue::TopologyEdge { .. }
-                | CodeQueryResultValue::RewritePath { .. } => None,
+                | CodeQueryResultValue::RewritePath { .. }
+                | CodeQueryResultValue::ConfigurationFact { .. } => None,
             })
             .collect()
     }
@@ -1212,6 +1213,18 @@ impl CodeQueryResult {
                                 }
                             ));
                         }
+                    }
+                    CodeQueryResultValue::ConfigurationFact { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [configuration; {} {}.{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.format,
+                            value.node_kind,
+                            value.key.as_deref().unwrap_or("<document>"),
+                            value.route,
+                        ));
                     }
                 }
                 if let Some(summary) = result.provenance_summary() {

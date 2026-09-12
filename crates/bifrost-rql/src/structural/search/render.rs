@@ -1,3 +1,4 @@
+use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::*;
 
@@ -6,6 +7,9 @@ use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
 
 use super::call_binding::{
     semantic_model_completeness_label, semantic_model_origin_label, semantic_model_proof_label,
+};
+use brokk_bifrost_core::analyzer::configuration::{
+    ConfigurationMemberRole, ConfigurationNodeKind, ConfigurationScalarKind,
 };
 
 pub(super) fn insert_pipeline_row(
@@ -242,6 +246,9 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::PathSegment(value) => CodeQueryResultValue::PathSegment {
             value: Box::new(render_path_segment(analyzer, &value, cache)),
+        },
+        PipelineValue::ConfigurationFact(value) => CodeQueryResultValue::ConfigurationFact {
+            value: Box::new(render_configuration_fact(&value, cache)),
         },
     };
     CodeQueryResultItem {
@@ -610,6 +617,9 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::PathSegment(value) => {
                         render_path_segment_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ConfigurationFact(value) => {
+                        render_configuration_fact_ref(value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -1576,6 +1586,161 @@ pub(super) fn render_qualified_path_ref(
         path: rel_path_string(&row.file),
         range: render_source_range(analyzer, &row.file, &row.range, cache),
         segment_count: row.segment_count,
+    }
+}
+
+pub(super) fn render_configuration_fact_ref(
+    value: &ConfigurationFactValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let fact = value.fact();
+    let evidence = fact.evidence();
+    let range = cache
+        .coordinates_for(&value.file, || Some(value.source.to_string()))
+        .map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                evidence.start_byte(),
+                evidence.end_byte(),
+            )
+        })
+        .unwrap_or(CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        });
+    CodeQueryResultRef::ConfigurationFact {
+        id: value.id(),
+        fact_id: value.fact_id(),
+        path: rel_path_string(&value.file),
+        range,
+    }
+}
+
+pub(super) fn render_configuration_fact(
+    value: &ConfigurationFactValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryConfigurationFact {
+    let fact = value.fact();
+    let evidence = fact.evidence();
+    let range = cache
+        .coordinates_for(&value.file, || Some(value.source.to_string()))
+        .map(|coordinates| {
+            range_for_offsets(
+                &coordinates.source,
+                &coordinates.line_starts,
+                evidence.start_byte(),
+                evidence.end_byte(),
+            )
+        })
+        .unwrap_or(CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        });
+    let format = value.format();
+    let (role, key, occurrence) = match fact.kind() {
+        ConfigurationNodeKind::Member { role, key, .. } => {
+            let occurrence =
+                value.fact().route().segments().last().and_then(|segment| {
+                    match segment.selector() {
+                    brokk_bifrost_core::analyzer::configuration::ConfigurationRouteSelector::Key {
+                        occurrence,
+                        ..
+                    } => u32::try_from(*occurrence).ok(),
+                    _ => None,
+                }
+                });
+            (Some(*role), Some(key.text().to_string()), occurrence)
+        }
+        _ => (None, None, None),
+    };
+    let scalar_kind = match fact.kind() {
+        ConfigurationNodeKind::Scalar { scalar_kind } => Some(*scalar_kind),
+        ConfigurationNodeKind::Member {
+            value: member_value,
+            ..
+        } => member_value
+            .as_ref()
+            .and_then(|fact_id| value.document.fact(*fact_id))
+            .and_then(|value_fact| match value_fact.kind() {
+                ConfigurationNodeKind::Scalar { scalar_kind } => Some(*scalar_kind),
+                _ => None,
+            }),
+        _ => None,
+    };
+    let index =
+        value
+            .fact()
+            .route()
+            .segments()
+            .last()
+            .and_then(|segment| match segment.selector() {
+                brokk_bifrost_core::analyzer::configuration::ConfigurationRouteSelector::Index(
+                    index,
+                ) => u32::try_from(*index).ok(),
+                _ => None,
+            });
+    CodeQueryConfigurationFact {
+        id: value.id(),
+        fact_id: value.fact_id(),
+        parent_id: value.parent_id(),
+        value_id: value.member_value_id(),
+        path: rel_path_string(&value.file),
+        format: format.label(),
+        node_kind: node_kind_label(fact.kind()),
+        role: role.map(role_label),
+        scalar_kind: scalar_kind.map(scalar_kind_label),
+        provenance: "authored",
+        completeness: match value.completeness() {
+            crate::query::ConfigurationCompletenessFilter::Complete => "complete",
+            crate::query::ConfigurationCompletenessFilter::Incomplete => "incomplete",
+        },
+        key,
+        occurrence,
+        index,
+        route: value.route(),
+        ordinal: u32::try_from(value.index).unwrap_or(u32::MAX),
+        range,
+        start_byte: evidence.start_byte(),
+        end_byte: evidence.end_byte(),
+    }
+}
+
+fn node_kind_label(kind: &ConfigurationNodeKind) -> &'static str {
+    match kind {
+        ConfigurationNodeKind::Document { .. } => "document",
+        ConfigurationNodeKind::Object { .. } => "object",
+        ConfigurationNodeKind::Section { .. } => "section",
+        ConfigurationNodeKind::Sequence { .. } => "sequence",
+        ConfigurationNodeKind::Member { .. } => "member",
+        ConfigurationNodeKind::Scalar { .. } => "scalar",
+    }
+}
+
+fn role_label(role: ConfigurationMemberRole) -> &'static str {
+    match role {
+        ConfigurationMemberRole::ObjectMember => "object-member",
+        ConfigurationMemberRole::TableEntry => "table-entry",
+        ConfigurationMemberRole::Property => "property",
+        ConfigurationMemberRole::XmlAttribute => "xml-attribute",
+        ConfigurationMemberRole::XmlElement => "xml-element",
+    }
+}
+
+fn scalar_kind_label(scalar_kind: ConfigurationScalarKind) -> &'static str {
+    match scalar_kind {
+        ConfigurationScalarKind::String => "string",
+        ConfigurationScalarKind::Boolean => "boolean",
+        ConfigurationScalarKind::Integer => "integer",
+        ConfigurationScalarKind::Decimal => "decimal",
+        ConfigurationScalarKind::Null => "null",
+        ConfigurationScalarKind::Url => "url",
+        ConfigurationScalarKind::Duration => "duration",
+        ConfigurationScalarKind::Opaque => "opaque",
     }
 }
 

@@ -1065,6 +1065,7 @@ const fn plan_source_label(source: &CodeQueryPlanSource) -> &'static str {
         CodeQueryPlanSource::Paths(_) => "paths",
         CodeQueryPlanSource::GenerationSites(_) => "generation_sites",
         CodeQueryPlanSource::Exports(_) => "exports",
+        CodeQueryPlanSource::ConfigurationFacts(_) => "configuration_facts",
         CodeQueryPlanSource::Set { op, .. } => match op {
             SetOperator::Union => "union",
             SetOperator::Intersect => "intersect",

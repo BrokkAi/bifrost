@@ -9,6 +9,7 @@ use super::*;
 use crate::analyzer::usages::receiver_query::ReceiverQueryOperation;
 use brokk_bifrost_rql::QueryValueKind;
 
+mod configuration;
 mod diagnostics;
 mod environment;
 mod provenance;
@@ -18,6 +19,7 @@ mod semantic;
 mod sites;
 mod topology;
 
+pub use configuration::*;
 pub use diagnostics::*;
 pub use environment::*;
 pub use provenance::*;
@@ -399,6 +401,10 @@ pub enum CodeQueryResultValue {
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
+    },
+    ConfigurationFact {
+        #[serde(flatten)]
+        value: Box<CodeQueryConfigurationFact>,
     },
     ReferenceSite {
         #[serde(flatten)]

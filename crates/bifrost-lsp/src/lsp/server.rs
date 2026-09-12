@@ -1837,6 +1837,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::FlowRelation { value } => &value.path,
                     CodeQueryResultValue::ControlRelation { value } => &value.path,
                     CodeQueryResultValue::Guard { value } => &value.path,
+                    CodeQueryResultValue::ConfigurationFact { value } => &value.path,
                     CodeQueryResultValue::SourceSet { value } => &value.build_file,
                     CodeQueryResultValue::BuildTarget { value } => &value.build_file,
                     CodeQueryResultValue::TopologyEdge { value } => &value.build_file,

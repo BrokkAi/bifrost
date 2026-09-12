@@ -233,6 +233,41 @@ pub(super) fn execute_plan(
                 execution
             }
         }
+        (
+            PhysicalQueryOperator::ConfigurationFactsScan,
+            LogicalQueryOperator::ConfigurationFactsSeed(seed),
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_configuration_facts_seed(
+                    seed,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
             if state
                 .cancellation
@@ -866,6 +901,7 @@ pub(super) fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: occurrence_cache.fork_empty(),
                     environment_cache: environment_cache.fork_empty(),
+                    configuration_cache: ConfigurationFactsTraversalCache::default(),
                     materialization_cache: materialization::MaterializationTraversalCache::default(
                     ),
                     edge_cache: EdgeTraversalCache::default(),

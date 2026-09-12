@@ -9,6 +9,8 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- Configuration facts are now exposed through canonical CodeQuery and RQL.
+- Scala semantic-model packs now record contextual declaration roles.
 - Reusable procedure summaries now publish typed dimension coverage, making
   the dimensions each reusable artifact proves explicit.
 - RQL relational policies now support set-equal and subset aggregates with
@@ -18,8 +20,36 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Diff-tool requests now report their execution phases to the client while
+  running, and analyzer cache build-lock waits are cancellable and
+  self-naming.
+- Analyzer cache collection stays out of the way of interactive work and
+  paces itself per new store.
 - Kotlin overload selection now resolves through the shared call_binding
   relation.
+
+### Fixed
+
+- Type flow: an instance guard's true arm now replaces the Unknown remainder
+  instead of widening results.
+- `search_symbols` declaration-name fallback is now bounded to the hit's own
+  lines, removing the whole-file walk that timed out on large headers.
+- C/C++: anonymous aggregate members are indexed and range-honest,
+  unterminated macro invocations no longer publish as fields, constructor
+  usages count only by-value members, and tagged qualifier segments resolve
+  as themselves.
+- C++ navigation resolves same-header declarations the index already
+  contains, and include-boundary failures no longer disown names the file
+  declares.
+- C# attribute names resolve through the full type-name ladder, one segment
+  at a time.
+- Python usage seeding now covers classes and functions passed by reference
+  and import-bound declarations, skips namespace imports, and no longer
+  counts a star re-export as making a bare module read a usage.
+- Scala: companion-apply locations resolve instead of refusing,
+  qualified-path extraction rejects call and infix spines, recovery owners
+  grow with the members they adopt, and type headers follow the 1-based line
+  convention.
 
 ## [0.11.3] - 2026-09-11
 

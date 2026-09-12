@@ -2663,6 +2663,10 @@ fn executable_match_query(
             | QueryValueKind::GenerationSite
             | QueryValueKind::Export
             | QueryValueKind::DeclarationState
+            // An authored configuration fact is an exact parser record at one
+            // document position (#3277); whether the ingested documents are
+            // whole is the query's diagnostics' business, the #1476 argument.
+            | QueryValueKind::ConfigurationFact
             // A reference edge is likewise an exact record of what one
             // producer derived at one site; set-level completeness is the
             // query's diagnostics' business (#1479).
@@ -3356,6 +3360,29 @@ fn adapt_terminal_result(
             DetailedCodeQueryKey::File,
             UnitRowIdentities::None,
         ) => Ok((PolicyQueryResultRef::file(expected_path.clone()), false)),
+        // Authored configuration facts are exact parser rows. The policy
+        // terminal keeps the fact's workspace path and byte span through the
+        // structural envelope while carrying no semantic identity: a
+        // configuration fact is evidence about a document, never about a
+        // resolved declaration.
+        (
+            UnitRowItemTerminal::SourcePosition,
+            DetailedCodeQueryDomain::ConfigurationFact,
+            DetailedCodeQueryKey::ConfigurationFact { .. },
+            UnitRowIdentities::None,
+        ) => {
+            let DetailedCodeQueryKey::ConfigurationFact { id, fact_id } = key else {
+                unreachable!();
+            };
+            Ok((
+                PolicyQueryResultRef::ConfigurationFact {
+                    location: location.clone(),
+                    id: id.clone(),
+                    fact_id: fact_id.clone(),
+                },
+                false,
+            ))
+        }
         (
             UnitRowItemTerminal::ReferenceSite {
                 proof,
@@ -4053,6 +4080,11 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::GenerationSite => Some(MatchResultDomain::GenerationSite),
         DetailedCodeQueryDomain::Export => Some(MatchResultDomain::Export),
         DetailedCodeQueryDomain::DeclarationState => Some(MatchResultDomain::DeclarationState),
+        // Authored configuration facts are exact parser rows anchored at their
+        // own workspace path and byte span. They are parser evidence, not
+        // semantic resolution, so they keep a dedicated result domain instead
+        // of borrowing a structural one.
+        DetailedCodeQueryDomain::ConfigurationFact => Some(MatchResultDomain::ConfigurationFact),
         DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
@@ -4167,6 +4199,10 @@ fn weak_finding_key(evidence: &UnitRowEvidence, path: &WorkspaceRelativePath) ->
         }
         DetailedCodeQueryKey::RuntimeKeyedReadValue { id } => {
             update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::ConfigurationFact { id, fact_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, fact_id.as_bytes());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {

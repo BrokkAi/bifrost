@@ -1,15 +1,18 @@
 use super::ir::{
     ArityConstraint, BindingFilter, BindingSeed, CallArgumentSelector, CallIdentity,
     CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQuerySeed, ControlRelationFilter, DeclarationStateFilter, DecoratorBindingFilter,
-    EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern,
-    QueryPathScope, QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
-    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
+    ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteSegmentFilter,
+    ControlRelationFilter, DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter,
+    ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
+    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryPathScope,
+    QueryStep, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed,
+    StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
-    CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
-    usage_surface_label,
+    CallTraversalCompleteness, QueryStepField, configuration_member_role_label,
+    configuration_provenance_label, configuration_scalar_kind_label, reference_kind_label,
+    usage_proof_label, usage_surface_label,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
@@ -54,6 +57,7 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
         CodeQueryPlanSource::Bindings(seed) => binding_seed_to_json(seed),
         CodeQueryPlanSource::GenerationSites(seed) => generation_site_seed_to_json(seed),
         CodeQueryPlanSource::Exports(seed) => export_seed_to_json(seed),
+        CodeQueryPlanSource::ConfigurationFacts(seed) => configuration_facts_seed_to_json(seed),
         CodeQueryPlanSource::Paths(seed) => path_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
             let mut object = Map::new();
@@ -608,6 +612,123 @@ pub(super) fn export_filter_to_json(filter: &ExportFilter) -> Map<String, Value>
         );
     }
     object
+}
+
+fn configuration_facts_seed_to_json(seed: &ConfigurationFactsSeed) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !seed.where_globs.is_empty() {
+        object.insert("where".to_string(), path_scope_to_json(&seed.where_globs));
+    }
+    object.insert(
+        "configuration_facts".to_string(),
+        Value::Object(configuration_facts_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+pub(super) fn configuration_facts_filter_to_json(
+    filter: &ConfigurationFactsFilter,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.formats.is_empty() {
+        object.insert(
+            "formats".to_string(),
+            configuration_labels(&filter.formats, super::domain::ConfigurationFormat::label),
+        );
+    }
+    if !filter.node_kinds.is_empty() {
+        object.insert(
+            "node_kinds".to_string(),
+            configuration_labels(&filter.node_kinds, ConfigurationNodeKindFilter::label),
+        );
+    }
+    if !filter.roles.is_empty() {
+        object.insert(
+            "roles".to_string(),
+            configuration_labels(&filter.roles, configuration_member_role_label),
+        );
+    }
+    if !filter.scalar_kinds.is_empty() {
+        object.insert(
+            "scalar_kinds".to_string(),
+            configuration_labels(&filter.scalar_kinds, configuration_scalar_kind_label),
+        );
+    }
+    if !filter.keys.is_empty() {
+        object.insert(
+            "keys".to_string(),
+            Value::Array(filter.keys.iter().map(|key| json!(key)).collect()),
+        );
+    }
+    if !filter.routes.is_empty() {
+        object.insert(
+            "routes".to_string(),
+            Value::Array(
+                filter
+                    .routes
+                    .iter()
+                    .map(|route| {
+                        Value::Array(
+                            route
+                                .0
+                                .iter()
+                                .map(configuration_route_segment_to_json)
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.fact_ordinals.is_empty() {
+        object.insert(
+            "fact_ordinals".to_string(),
+            Value::Array(
+                filter
+                    .fact_ordinals
+                    .iter()
+                    .map(|ordinal| json!(ordinal))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.provenances.is_empty() {
+        object.insert(
+            "provenances".to_string(),
+            configuration_labels(&filter.provenances, configuration_provenance_label),
+        );
+    }
+    if !filter.completenesses.is_empty() {
+        object.insert(
+            "completenesses".to_string(),
+            configuration_labels(
+                &filter.completenesses,
+                ConfigurationCompletenessFilter::label,
+            ),
+        );
+    }
+    object
+}
+
+fn configuration_labels<T>(values: &[T], label: impl Fn(T) -> &'static str) -> Value
+where
+    T: Copy,
+{
+    Value::Array(values.iter().map(|value| json!(label(*value))).collect())
+}
+
+fn configuration_route_segment_to_json(segment: &ConfigurationRouteSegmentFilter) -> Value {
+    match segment {
+        ConfigurationRouteSegmentFilter::Key(key) => json!({
+            "kind": "key",
+            "key": key,
+        }),
+        ConfigurationRouteSegmentFilter::Index(ordinal) => json!({
+            "kind": "index",
+            "ordinal": ordinal,
+        }),
+        ConfigurationRouteSegmentFilter::Any => json!({ "kind": "any" }),
+    }
 }
 
 pub(super) fn declaration_state_filter_to_json(

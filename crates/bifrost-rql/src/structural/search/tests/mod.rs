@@ -32,6 +32,7 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
     }
 }
 
+mod configuration;
 mod contracts;
 mod details;
 mod execution;

@@ -1829,3 +1829,232 @@ fn budget_exhaustion_is_inconclusive_and_only_a_cycle_is_a_counterexample() {
         "budget exhaustion is absence of evidence: never a finding, never a pass"
     );
 }
+
+fn configuration_json_fixture(body: &str) -> (tempfile::TempDir, TypescriptAnalyzer, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "server.json")
+        .write(body)
+        .expect("write configuration");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    (temp, analyzer, body.to_string())
+}
+
+fn configuration_enabled_query() -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "configuration_facts": {
+            "formats": ["json"],
+            "node_kinds": ["member"],
+            "roles": ["object_member"],
+            "scalar_kinds": ["boolean"],
+            "keys": ["enabled"],
+            "routes": [[
+                {"kind": "key", "key": "server"},
+                {"kind": "key", "key": "enabled"}
+            ]]
+        }
+    }))
+    .expect("configuration query")
+}
+
+const CONFIGURATION_SELECTOR_POLICY: &str = r#"(policy
+      :id "test.configuration-fact"
+      :name "Configuration fact"
+      :message "Authored enabled flag"
+      :severity warning
+      :analysis (analysis
+        :type match
+        :selector (rql (configuration-facts
+          :format json
+          :node-kind member
+          :role object_member
+          :scalar-kind boolean
+          :key "enabled"
+          :route [[(key "server") (key "enabled")]]))))"#;
+
+fn evaluate_configuration_selector_policy(analyzer: &TypescriptAnalyzer) -> PolicyRun {
+    let registry = policy_registry("test:configuration-fact", CONFIGURATION_SELECTOR_POLICY);
+    let policy = registry.policies().next().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+    };
+    let mut budget = PolicyBudget::default();
+    DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut budget)
+        .unwrap()
+}
+
+#[test]
+fn configuration_fact_selector_matches_direct_query_over_the_same_snapshot() {
+    let source = r#"{
+  "server": {
+    "enabled": true,
+    "retries": 2
+  }
+}
+"#;
+    let (_temp, analyzer, source) = configuration_json_fixture(source);
+    let policy_id = PolicyId::new("test.configuration-fact").expect("policy id");
+
+    let direct = evaluate_match_query_candidates(
+        &policy_id,
+        &analyzer,
+        &configuration_enabled_query(),
+        &PolicyBudget::default(),
+        None,
+    );
+    assert_eq!(
+        direct.completion,
+        PolicyRunCompletion::Complete,
+        "{direct:#?}"
+    );
+    assert_eq!(direct.candidates.len(), 1, "{direct:#?}");
+    let candidate = &direct.candidates[0];
+    assert_eq!(
+        candidate.evidence.result_domain(),
+        MatchResultDomain::ConfigurationFact
+    );
+    assert!(
+        candidate.location.path().ends_with("server.json"),
+        "{candidate:#?}"
+    );
+    let member_start = source
+        .rfind("\"enabled\"")
+        .expect("enabled member in fixture");
+    let member_end = member_start + "\"enabled\": true".len();
+    assert_eq!(
+        candidate
+            .location
+            .byte_span()
+            .map(|span| span.start()..span.end()),
+        Some(member_start as u64..member_end as u64),
+        "{candidate:#?}"
+    );
+
+    let selector_run = evaluate_configuration_selector_policy(&analyzer);
+    assert_eq!(
+        selector_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{selector_run:#?}"
+    );
+    assert_eq!(selector_run.findings().len(), direct.candidates.len());
+    assert_eq!(selector_run.diagnostics().len(), direct.diagnostics.len());
+    let finding = &selector_run.findings()[0];
+    assert_eq!(finding.id(), candidate.id, "same anchor, same id");
+    assert_eq!(finding.primary().path(), candidate.location.path());
+    assert_eq!(
+        finding
+            .primary()
+            .byte_span()
+            .map(|span| span.start()..span.end()),
+        candidate
+            .location
+            .byte_span()
+            .map(|span| span.start()..span.end())
+    );
+}
+
+#[test]
+fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
+    let source = r#"{
+  "server": {
+    "enabled": true,
+    "retries": 2
+  }
+}
+"#;
+    let (_temp, analyzer, _source) = configuration_json_fixture(source);
+    let policy_id = PolicyId::new("test.configuration-fact").expect("policy id");
+    let mut wrong_axes = vec![
+        "routes".to_string(),
+        "fact_ordinals".to_string(),
+        "node_kinds".to_string(),
+        "roles".to_string(),
+        "scalar_kinds".to_string(),
+    ];
+    wrong_axes.sort();
+    for axis in wrong_axes {
+        let mut filter = json!({
+            "configuration_facts": {
+                "formats": ["json"],
+                "keys": ["enabled"]
+            }
+        });
+        let filter_object = filter["configuration_facts"].as_object_mut().unwrap();
+        match axis.as_str() {
+            "routes" => {
+                filter_object.insert(
+                    "routes".to_string(),
+                    json!([[{"kind": "key", "key": "client"}]]),
+                );
+            }
+            "fact_ordinals" => {
+                filter_object.insert("fact_ordinals".to_string(), json!([99]));
+            }
+            "node_kinds" => {
+                filter_object.insert("node_kinds".to_string(), json!(["scalar"]));
+            }
+            "roles" => {
+                filter_object.insert("roles".to_string(), json!(["table_entry"]));
+            }
+            "scalar_kinds" => {
+                filter_object.insert("scalar_kinds".to_string(), json!(["integer"]));
+            }
+            other => unreachable!("untracked near-miss axis {other}"),
+        }
+        let query = CodeQuery::from_json(&filter).expect("near-miss query");
+        let evaluated = evaluate_match_query_candidates(
+            &policy_id,
+            &analyzer,
+            &query,
+            &PolicyBudget::default(),
+            None,
+        );
+        assert_eq!(
+            evaluated.completion,
+            PolicyRunCompletion::Complete,
+            "axis {axis}: {evaluated:#?}"
+        );
+        assert!(
+            evaluated.candidates.is_empty(),
+            "axis {axis} must not match: {evaluated:#?}"
+        );
+    }
+}
+
+#[test]
+fn configuration_fact_recovered_document_stays_typed_incomplete() {
+    // The truncated document recovers the enabled member, but no completion
+    // claim may hide that recovery happened.
+    let source = "{\n  \"server\": {\n    \"enabled\": true\n";
+    let (_temp, analyzer, _source) = configuration_json_fixture(source);
+    let policy_id = PolicyId::new("test.configuration-fact").expect("policy id");
+    let direct = evaluate_match_query_candidates(
+        &policy_id,
+        &analyzer,
+        &configuration_enabled_query(),
+        &PolicyBudget::default(),
+        None,
+    );
+    assert!(
+        matches!(direct.completion, PolicyRunCompletion::Inconclusive { .. }),
+        "{direct:#?}"
+    );
+    // Whatever rows recovery retained keep their exact anchors.
+    for candidate in &direct.candidates {
+        let member_start = source
+            .rfind("\"enabled\"")
+            .expect("recovered enabled member");
+        assert_eq!(
+            candidate.location.byte_span().map(|span| span.start()),
+            Some(member_start as u64),
+            "{candidate:#?}"
+        );
+    }
+}

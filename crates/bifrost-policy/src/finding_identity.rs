@@ -46,6 +46,7 @@ pub enum MatchResultDomain {
     ReferenceEdge,
     QualifiedPath,
     PathSegment,
+    ConfigurationFact,
     File,
 }
 
@@ -69,6 +70,7 @@ impl MatchResultDomain {
             Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
+            Self::ConfigurationFact => "configuration_fact",
             Self::File => "file",
         }
     }

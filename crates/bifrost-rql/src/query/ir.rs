@@ -1,7 +1,11 @@
+use super::domain::ConfigurationFormat;
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use crate::structural::{CodeQueryRowField, CodeQueryRowScalarType, DetailedCodeQueryDomain};
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::configuration::{
+    ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
+};
 use brokk_bifrost_core::analyzer::structural::control_relation::{
     ControlExitPartition, ControlRelationKind,
 };
@@ -212,6 +216,12 @@ pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
 /// Upper bound on one exact decorator-binding identity filter value.
 pub const MAX_DECORATOR_BINDING_FILTER_LENGTH: usize = 4096;
+/// Upper bound on entries in one configuration-fact constrained-value filter.
+pub const MAX_CONFIGURATION_FILTER_ENTRIES: usize = 32;
+/// Upper bound on one exact configuration key in a route filter.
+pub const MAX_CONFIGURATION_KEY_LENGTH: usize = 4096;
+/// Upper bound on ordered segments in one configuration route alternative.
+pub const MAX_CONFIGURATION_ROUTE_SEGMENTS: usize = 64;
 /// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
 /// auto-compatible versions was collapsed to 1; a new version is minted only
 /// when an existing query stops parsing or changes meaning.
@@ -300,6 +310,7 @@ pub enum QueryValueKind {
     GenerationSite,
     Export,
     DeclarationState,
+    ConfigurationFact,
     File,
 }
 
@@ -372,9 +383,142 @@ impl QueryValueKind {
             Self::GenerationSite => "generation_site",
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
+            Self::ConfigurationFact => "configuration_fact",
             Self::File => "file",
         }
     }
+}
+
+/// The visible kinds of a configuration fact's structured node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigurationNodeKindFilter {
+    Document,
+    Object,
+    Section,
+    Sequence,
+    Member,
+    Scalar,
+}
+
+impl ConfigurationNodeKindFilter {
+    pub const LABELS: &[&str] = &[
+        "document", "object", "section", "sequence", "member", "scalar",
+    ];
+    pub const ALL: [Self; 6] = [
+        Self::Document,
+        Self::Object,
+        Self::Section,
+        Self::Sequence,
+        Self::Member,
+        Self::Scalar,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Object => "object",
+            Self::Section => "section",
+            Self::Sequence => "sequence",
+            Self::Member => "member",
+            Self::Scalar => "scalar",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.label() == label)
+    }
+}
+
+/// The document-level completeness boundary visible to a configuration fact.
+///
+/// Recovery detail remains on typed diagnostics and the result row; this axis
+/// only selects whether the author asked for facts from complete or recovered
+/// documents. It never turns a recovered document into a complete one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigurationCompletenessFilter {
+    Complete,
+    Incomplete,
+}
+
+impl ConfigurationCompletenessFilter {
+    pub const LABELS: &[&str] = &["complete", "incomplete"];
+    pub const ALL: [Self; 2] = [Self::Complete, Self::Incomplete];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.label() == label)
+    }
+}
+
+/// One exact ordered configuration route segment.
+///
+/// A key segment matches only a key selector with that exact text; an index
+/// segment matches only an index selector with that zero-based ordinal. `Any`
+/// is a typed wildcard for a segment whose identity is not constrained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationRouteSegmentFilter {
+    Key(String),
+    Index(u32),
+    Any,
+}
+
+/// One exact-length ordered route alternative. An empty alternative selects
+/// the document fact itself; an unconstrained query has no route alternatives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigurationRouteFilter(pub Vec<ConfigurationRouteSegmentFilter>);
+
+impl ConfigurationRouteFilter {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Constrained-value filter over authored configuration-document facts.
+///
+/// Every axis is an author's enumeration: an empty axis means every value,
+/// never no value. Route alternatives are exact-length and order-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigurationFactsFilter {
+    pub formats: Vec<ConfigurationFormat>,
+    pub node_kinds: Vec<ConfigurationNodeKindFilter>,
+    pub roles: Vec<ConfigurationMemberRole>,
+    pub scalar_kinds: Vec<ConfigurationScalarKind>,
+    pub keys: Vec<String>,
+    pub routes: Vec<ConfigurationRouteFilter>,
+    pub fact_ordinals: Vec<u32>,
+    pub provenances: Vec<ConfigurationValueProvenance>,
+    pub completenesses: Vec<ConfigurationCompletenessFilter>,
+}
+
+impl ConfigurationFactsFilter {
+    pub fn is_empty(&self) -> bool {
+        self.formats.is_empty()
+            && self.node_kinds.is_empty()
+            && self.roles.is_empty()
+            && self.scalar_kinds.is_empty()
+            && self.keys.is_empty()
+            && self.routes.is_empty()
+            && self.fact_ordinals.is_empty()
+            && self.provenances.is_empty()
+            && self.completenesses.is_empty()
+    }
+}
+
+/// A non-structural seed producing authored configuration facts directly from
+/// workspace documents.
+///
+/// Configuration has no language axis: it is a distinct input domain, and a
+/// shared `language` wrapper is rejected instead of silently ignored.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigurationFactsSeed {
+    pub where_globs: QueryPathScope,
+    pub filter: ConfigurationFactsFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2535,6 +2679,7 @@ pub enum CodeQueryPlanSource {
     Paths(Box<PathSeed>),
     GenerationSites(Box<GenerationSiteSeed>),
     Exports(Box<ExportSeed>),
+    ConfigurationFacts(Box<ConfigurationFactsSeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
@@ -2568,6 +2713,7 @@ impl CodeQuery {
             | CodeQueryPlanSource::Paths(_)
             | CodeQueryPlanSource::GenerationSites(_)
             | CodeQueryPlanSource::Exports(_)
+            | CodeQueryPlanSource::ConfigurationFacts(_)
             | CodeQueryPlanSource::Set { .. } => None,
         }
     }
@@ -2656,6 +2802,11 @@ fn validate_plan(
         },
         CodeQueryPlanSource::Exports(_) => ValidatedDomain {
             kind: QueryValueKind::Export,
+            captures: None,
+            projected_fields: None,
+        },
+        CodeQueryPlanSource::ConfigurationFacts(_) => ValidatedDomain {
+            kind: QueryValueKind::ConfigurationFact,
             captures: None,
             projected_fields: None,
         },

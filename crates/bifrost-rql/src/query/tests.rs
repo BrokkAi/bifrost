@@ -3554,6 +3554,26 @@ fn shared_scope_and_nested_wrappers_distribute_identically_over_sets() {
 }
 
 #[test]
+fn empty_shared_scope_does_not_add_an_axis_to_configuration_facts() {
+    use crate::sexp::parse_sexp;
+    let local = parse_sexp("(configuration-facts :format json)")
+        .unwrap()
+        .expr
+        .unwrap();
+    let query = sexp::code_query_from_expr_with_scope(
+        &local,
+        schema::resolve_rql_schema_version(None).unwrap(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(matches!(
+        query.plan.source,
+        CodeQueryPlanSource::ConfigurationFacts(_)
+    ));
+}
+
+#[test]
 fn language_families_expand_and_deduplicate_in_both_frontends() {
     for (alias, members) in [
         ("jvm", vec!["java", "kotlin", "scala"]),

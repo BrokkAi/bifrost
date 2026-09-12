@@ -417,6 +417,57 @@ void test("highlights bounded rewrite-path forms and filter options", async () =
   }
 });
 
+void test("highlights configuration-fact source and constrained values", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(configuration-facts :format json :node-kind member :role object_member " +
+      ':key "enabled" :fact-ordinal 1 :route [[(key "server") (key "enabled")]] ' +
+      ":scalar-kind boolean :provenance authored :completeness complete)"
+  );
+  assertScoped(tokens, "configuration-facts", "support.function.wrapper.bifrost-rql");
+  for (const option of [
+    ":format",
+    ":node-kind",
+    ":role",
+    ":key",
+    ":fact-ordinal",
+    ":route",
+    ":scalar-kind",
+    ":provenance",
+    ":completeness"
+  ]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+  assertScoped(tokens, "json", "constant.language.configuration-format.bifrost-rql");
+  assertScoped(tokens, "member", "constant.language.configuration-node-kind.bifrost-rql");
+  assertScoped(tokens, "object_member", "constant.language.configuration-member-role.bifrost-rql");
+  assertScoped(tokens, "boolean", "constant.language.configuration-scalar-kind.bifrost-rql");
+  assertScoped(tokens, "authored", "constant.language.configuration-provenance.bifrost-rql");
+  assertScoped(tokens, "complete", "constant.language.configuration-completeness.bifrost-rql");
+  assertScoped(tokens, "key", "support.function.configuration-route.bifrost-rql");
+});
+
+void test("highlights accepted configuration-fact aliases", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(configuration_facts :formats props :node_kinds scalar :scalar-kinds string " +
+      ':keys "host" :fact_ordinals 0 :routes [[(any)]] :completenesses incomplete)'
+  );
+  for (const option of [
+    ":formats",
+    ":node_kinds",
+    ":scalar-kinds",
+    ":keys",
+    ":fact_ordinals",
+    ":routes",
+    ":completenesses"
+  ]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+  assertScoped(tokens, "props", "constant.language.configuration-format.bifrost-rql");
+  assertScoped(tokens, "any", "support.function.configuration-route.bifrost-rql");
+});
+
 void test("highlights schema-v12 materialization forms and filter options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),

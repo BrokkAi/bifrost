@@ -2371,6 +2371,15 @@ fn write_query_result_detail<W: Write>(
     result: &PolicyQueryResultRef,
 ) -> Result<(), PolicyRenderError> {
     match result {
+        PolicyQueryResultRef::ConfigurationFact { id, fact_id, .. } => {
+            write!(
+                output,
+                " fact {} identity {}",
+                escape_terminal_text(id),
+                escape_terminal_text(fact_id),
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyQueryResultRef::StructuralMatch { kind, .. } => {
             write!(output, " {}", escape_terminal_text(kind)).map_err(map_io_error)?;
         }
@@ -3346,6 +3355,7 @@ const fn cvss_evidence_scope(value: CvssEvidenceScope) -> &'static str {
 
 const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
     match value {
+        PolicyQueryResultRef::ConfigurationFact { .. } => "configuration_fact",
         PolicyQueryResultRef::StructuralMatch { .. } => "structural_match",
         PolicyQueryResultRef::Declaration { .. } => "declaration",
         PolicyQueryResultRef::File { .. } => "file",
@@ -3447,6 +3457,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceEdge => "reference edge",
         MatchResultDomain::QualifiedPath => "qualified_path",
         MatchResultDomain::PathSegment => "path_segment",
+        MatchResultDomain::ConfigurationFact => "configuration_fact",
     }
 }
 

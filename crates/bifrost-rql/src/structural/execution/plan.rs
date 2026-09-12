@@ -1,15 +1,20 @@
 use std::fmt;
 
 use serde::Serialize;
+use serde_json::{Map, Value, json};
 
 use crate::hash::HashMap;
 
+use crate::query::schema::{
+    configuration_member_role_label, configuration_provenance_label,
+    configuration_scalar_kind_label,
+};
 use crate::structural::derived_cache::DerivedLayerRequest;
 use brokk_bifrost_rql::schema::QuerySemanticFacet;
 use brokk_bifrost_rql::{
-    BindingSeed, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ExportSeed,
-    GenerationSiteSeed, OccurrenceSeed, PathSeed, QueryError, QueryStep, QueryValueKind, ScopeSeed,
-    SetOperator,
+    BindingSeed, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
+    ConfigurationFactsSeed, ExportSeed, GenerationSiteSeed, OccurrenceSeed, PathSeed, QueryError,
+    QueryStep, QueryValueKind, ScopeSeed, SetOperator,
 };
 
 /// A dense, plan-local identifier for one logical operator.
@@ -41,6 +46,7 @@ pub(crate) enum LogicalQueryOperator {
     GenerationSiteSeed(Box<GenerationSiteSeed>),
     ExportSeed(Box<ExportSeed>),
     PathSeed(Box<PathSeed>),
+    ConfigurationFactsSeed(Box<ConfigurationFactsSeed>),
     Step {
         input: LogicalQueryNodeId,
         step: QueryStep,
@@ -69,6 +75,7 @@ impl LogicalQueryOperator {
             | Self::GenerationSiteSeed(_)
             | Self::ExportSeed(_) => &[],
             Self::PathSeed(_) => &[],
+            Self::ConfigurationFactsSeed(_) => &[],
             Self::Step { input, .. } | Self::Limit { input, .. } => std::slice::from_ref(input),
             Self::Set { inputs, .. } => inputs,
         }
@@ -295,6 +302,13 @@ impl LogicalQueryPlanBuilder {
                     (id, QueryValueKind::QualifiedPath)
                 }
             }
+            CodeQueryPlanSource::ConfigurationFacts(seed) => {
+                let id = self.push_node(
+                    LogicalQueryOperator::ConfigurationFactsSeed(seed.clone()),
+                    QueryValueKind::ConfigurationFact,
+                );
+                (id, QueryValueKind::ConfigurationFact)
+            }
             CodeQueryPlanSource::Set { op, branches } => {
                 let lowered = branches
                     .iter()
@@ -384,6 +398,7 @@ pub(crate) enum PhysicalQueryOperator {
     GenerationSiteScan,
     ExportScan,
     PathScan,
+    ConfigurationFactsScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -464,6 +479,9 @@ impl PhysicalQueryPlan {
                     }
                     LogicalQueryOperator::ExportSeed(_) => PhysicalQueryOperator::ExportScan,
                     LogicalQueryOperator::PathSeed(_) => PhysicalQueryOperator::PathScan,
+                    LogicalQueryOperator::ConfigurationFactsSeed(_) => {
+                        PhysicalQueryOperator::ConfigurationFactsScan
+                    }
                     LogicalQueryOperator::Step { .. } => PhysicalQueryOperator::PipelineStep,
                     LogicalQueryOperator::Set { op, .. } => match op {
                         SetOperator::Union if parallel_union == Some(logical_node) => {
@@ -613,6 +631,9 @@ enum LogicalQueryOperatorExplain {
     PathSeed {
         seed: serde_json::Value,
     },
+    ConfigurationFactsSeed {
+        seed: serde_json::Value,
+    },
     Step {
         step: serde_json::Value,
         final_in_authored_suffix: bool,
@@ -649,6 +670,9 @@ impl LogicalQueryOperatorExplain {
             LogicalQueryOperator::PathSeed(seed) => Self::PathSeed {
                 seed: seed.to_canonical_json(),
             },
+            LogicalQueryOperator::ConfigurationFactsSeed(seed) => Self::ConfigurationFactsSeed {
+                seed: configuration_facts_seed_to_json(seed),
+            },
             LogicalQueryOperator::Step {
                 step,
                 final_in_authored_suffix,
@@ -661,6 +685,157 @@ impl LogicalQueryOperatorExplain {
             LogicalQueryOperator::Limit { count, .. } => Self::Limit { count: *count },
         }
     }
+}
+
+fn configuration_facts_seed_to_json(seed: &ConfigurationFactsSeed) -> Value {
+    let mut object = Map::new();
+    if !seed.where_globs.is_empty() {
+        let scope = if seed.where_globs.groups().len() == 1 {
+            json!(
+                seed.where_globs.groups()[0]
+                    .iter()
+                    .map(|glob| glob.as_str())
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            json!(
+                seed.where_globs
+                    .groups()
+                    .iter()
+                    .map(|group| group.iter().map(|glob| glob.as_str()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
+        };
+        object.insert("where".to_string(), scope);
+    }
+    object.insert(
+        "configuration_facts".to_string(),
+        Value::Object(configuration_facts_filter_to_json(&seed.filter)),
+    );
+    Value::Object(object)
+}
+
+fn configuration_facts_filter_to_json(
+    filter: &crate::query::ConfigurationFactsFilter,
+) -> Map<String, Value> {
+    let labels = |values: &[crate::query::domain::ConfigurationFormat]| {
+        Value::Array(values.iter().map(|value| json!(value.label())).collect())
+    };
+    let mut object = Map::new();
+    if !filter.formats.is_empty() {
+        object.insert("formats".to_string(), labels(&filter.formats));
+    }
+    if !filter.node_kinds.is_empty() {
+        object.insert(
+            "node_kinds".to_string(),
+            Value::Array(
+                filter
+                    .node_kinds
+                    .iter()
+                    .map(|kind| json!(kind.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.roles.is_empty() {
+        object.insert(
+            "roles".to_string(),
+            Value::Array(
+                filter
+                    .roles
+                    .iter()
+                    .map(|role| json!(configuration_member_role_label(*role)))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.scalar_kinds.is_empty() {
+        object.insert(
+            "scalar_kinds".to_string(),
+            Value::Array(
+                filter
+                    .scalar_kinds
+                    .iter()
+                    .map(|kind| json!(configuration_scalar_kind_label(*kind)))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.keys.is_empty() {
+        object.insert(
+            "keys".to_string(),
+            Value::Array(filter.keys.iter().map(|key| json!(key)).collect()),
+        );
+    }
+    if !filter.routes.is_empty() {
+        object.insert(
+            "routes".to_string(),
+            Value::Array(
+                filter
+                    .routes
+                    .iter()
+                    .map(|route| {
+                        Value::Array(
+                            route
+                                .0
+                                .iter()
+                                .map(|segment| match segment {
+                                    crate::query::ConfigurationRouteSegmentFilter::Key(key) => {
+                                        json!({ "kind": "key", "key": key })
+                                    }
+                                    crate::query::ConfigurationRouteSegmentFilter::Index(
+                                        ordinal,
+                                    ) => {
+                                        json!({ "kind": "index", "ordinal": ordinal })
+                                    }
+                                    crate::query::ConfigurationRouteSegmentFilter::Any => {
+                                        json!({ "kind": "any" })
+                                    }
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.fact_ordinals.is_empty() {
+        object.insert(
+            "fact_ordinals".to_string(),
+            Value::Array(
+                filter
+                    .fact_ordinals
+                    .iter()
+                    .map(|ordinal| json!(ordinal))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.provenances.is_empty() {
+        object.insert(
+            "provenances".to_string(),
+            Value::Array(
+                filter
+                    .provenances
+                    .iter()
+                    .map(|provenance| json!(configuration_provenance_label(*provenance)))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.completenesses.is_empty() {
+        object.insert(
+            "completenesses".to_string(),
+            Value::Array(
+                filter
+                    .completenesses
+                    .iter()
+                    .map(|completeness| json!(completeness.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
 }
 
 /// Stable, versioned explanation of a parsed query and its selected plan.
@@ -794,6 +969,7 @@ pub enum CodeQueryLogicalOperation {
     GenerationSiteSeed { seed: serde_json::Value },
     ExportSeed { seed: serde_json::Value },
     PathSeed { seed: serde_json::Value },
+    ConfigurationFactsSeed { seed: serde_json::Value },
     Step { step: serde_json::Value },
     Set { op: &'static str },
     Limit { count: usize },
@@ -811,6 +987,9 @@ impl CodeQueryLogicalOperation {
             }
             LogicalQueryOperatorExplain::ExportSeed { seed } => Self::ExportSeed { seed },
             LogicalQueryOperatorExplain::PathSeed { seed } => Self::PathSeed { seed },
+            LogicalQueryOperatorExplain::ConfigurationFactsSeed { seed } => {
+                Self::ConfigurationFactsSeed { seed }
+            }
             LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
             LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
@@ -885,6 +1064,7 @@ pub enum CodeQueryPhysicalOperator {
     GenerationSiteScan,
     ExportScan,
     PathScan,
+    ConfigurationFactsScan,
     PipelineStep,
     SequentialUnion,
     ParallelUnion,
@@ -903,6 +1083,7 @@ impl CodeQueryPhysicalOperator {
             PhysicalQueryOperator::GenerationSiteScan => Self::GenerationSiteScan,
             PhysicalQueryOperator::ExportScan => Self::ExportScan,
             PhysicalQueryOperator::PathScan => Self::PathScan,
+            PhysicalQueryOperator::ConfigurationFactsScan => Self::ConfigurationFactsScan,
             PhysicalQueryOperator::PipelineStep => Self::PipelineStep,
             PhysicalQueryOperator::SequentialUnion => Self::SequentialUnion,
             PhysicalQueryOperator::ParallelUnion => Self::ParallelUnion,

@@ -409,6 +409,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::Export(_)
                     | PipelineValue::DeclarationState(_)
                     | PipelineValue::ReferenceEdge(_) => None,
+                    PipelineValue::ConfigurationFact(_) => None,
                     PipelineValue::StateEvent(_)
                     | PipelineValue::FlowRelation(_)
                     | PipelineValue::ControlRelation(_)
@@ -503,6 +504,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::Export(_)
                                 | PipelineValue::DeclarationState(_)
                                 | PipelineValue::ReferenceEdge(_)
+                                | PipelineValue::ConfigurationFact(_)
                                 | PipelineValue::StateEvent(_)
                                 | PipelineValue::FlowRelation(_)
                                 | PipelineValue::ControlRelation(_)
@@ -609,6 +611,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::Export(_)
                         | PipelineValue::DeclarationState(_)
                         | PipelineValue::ReferenceEdge(_) => None,
+                        PipelineValue::ConfigurationFact(_) => None,
                         PipelineValue::StateEvent(_)
                         | PipelineValue::FlowRelation(_)
                         | PipelineValue::ControlRelation(_)
@@ -1087,6 +1090,7 @@ pub(super) fn python_absent_member_file(
             CodeQueryPlanSource::Paths(seed) => (&seed.languages, &seed.where_globs),
             CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, &seed.where_globs),
             CodeQueryPlanSource::Exports(seed) => (&seed.languages, &seed.where_globs),
+            CodeQueryPlanSource::ConfigurationFacts(_) => continue,
             CodeQueryPlanSource::Set { branches, .. } => {
                 pending.extend(branches.iter().rev().map(|branch| (branch, needs_absence)));
                 continue;

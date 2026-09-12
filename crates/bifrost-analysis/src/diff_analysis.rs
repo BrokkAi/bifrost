@@ -588,8 +588,20 @@ impl PreparedDiff {
         options: &DiffAnalysisOptions,
         cancellation: &CancellationToken,
     ) -> Result<Self, String> {
-        let resolution_repo = open_repository(root, options, false)?;
-        let (base, target) = resolve_endpoints(&resolution_repo.repo, &params)?;
+        // Opening the repository and resolving the endpoints both read the
+        // repository from disk, and a request whose budget expired here used to
+        // report only the tool it was running: on a loaded Windows runner a
+        // request spent its whole 20s budget before it reached the phase below
+        // (issue #3170). Each phase ends with the statement it describes.
+        let resolution_repo = {
+            let _phase =
+                cancellation.enter_phase(format!("opening the repository at {}", root.display()));
+            open_repository(root, options, false)?
+        };
+        let (base, target) = {
+            let _phase = cancellation.enter_phase("resolving the diff endpoints");
+            resolve_endpoints(&resolution_repo.repo, &params)?
+        };
         // Everything below -- the isolated object database, the Git diff, and
         // opening the shared cache -- runs before any analyzer exists, so a
         // budget that expires here would otherwise only be able to name the

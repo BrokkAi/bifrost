@@ -580,6 +580,10 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::Declaration(value) => key("declaration").declaration_value(value).finish(),
         PipelineKey::Semantic(value) => semantic_unit_row_key(value),
         PipelineKey::File(file) => key("file").path(file).finish(),
+        PipelineKey::ConfigurationFact(value) => key("configuration_fact")
+            .path(&value.file)
+            .number(value.fact_index)
+            .finish(),
         PipelineKey::ReferenceSite(site) => key("reference_site")
             .path(&site.file)
             .range(site.range)
@@ -1398,7 +1402,8 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::PathSegment { .. }
             | CodeQueryResultValue::SourceSet { .. }
             | CodeQueryResultValue::BuildTarget { .. }
-            | CodeQueryResultValue::TopologyEdge { .. } => UnitRowItemTerminal::SourcePosition,
+            | CodeQueryResultValue::TopologyEdge { .. }
+            | CodeQueryResultValue::ConfigurationFact { .. } => UnitRowItemTerminal::SourcePosition,
             CodeQueryResultValue::Procedure { .. }
             | CodeQueryResultValue::ProgramPoint { .. }
             | CodeQueryResultValue::ControlEdge { .. }
@@ -1476,6 +1481,7 @@ fn row_path(value: &CodeQueryResultValue) -> &str {
         CodeQueryResultValue::Export { value } => &value.path,
         CodeQueryResultValue::DeclarationState { value } => &value.path,
         CodeQueryResultValue::PathSegment { value } => &value.path,
+        CodeQueryResultValue::ConfigurationFact { value } => &value.path,
         CodeQueryResultValue::SourceSet { value } => &value.build_file,
         CodeQueryResultValue::BuildTarget { value } => &value.build_file,
         CodeQueryResultValue::TopologyEdge { value } => &value.build_file,
@@ -2081,6 +2087,7 @@ fn seed_languages(plan: &CodeQueryPlan) -> (&[Language], bool) {
         CodeQueryPlanSource::Paths(seed) => (&seed.languages, false),
         CodeQueryPlanSource::GenerationSites(seed) => (&seed.languages, false),
         CodeQueryPlanSource::Exports(seed) => (&seed.languages, false),
+        CodeQueryPlanSource::ConfigurationFacts(_) => (&[], false),
         CodeQueryPlanSource::Set { .. } => {
             unreachable!("a union leaf has no set source")
         }

@@ -21,5 +21,11 @@
     :receiver-type (assignable-to "java.sql.Statement")
     (call-bindings (call-shape (call :callee "execute")))))
 
+; Authored configuration facts preserve route occurrence and value kind.
+(configuration-facts :format json :node-kind member :role object_member
+  :key "enabled" :fact-ordinal 1
+  :route [[(key "server") (key "enabled")]]
+  :scalar-kind boolean :provenance authored :completeness complete)
+
 ; Unsupported values and unknown forms must remain safely tokenizable and plain.
 (custom_identifier :unexpected true false null 7

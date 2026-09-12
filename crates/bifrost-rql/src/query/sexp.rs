@@ -3,10 +3,11 @@ use super::ir::{
     MAX_DECORATOR_BINDING_FILTER_LENGTH, QueryStep, ResolvedCallReceiverType,
 };
 use super::schema::{
-    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, DECORATOR_BINDING_STEP_OPTIONS,
-    QueryStepField, QueryStepOp, ReceiverTypeConstraintForm, RqlForm, RqlFormClass, RqlProperty,
-    SCOPE_SEED_RQL_LABELS, ScopeFilterField, binding_option_for_rql_label,
-    candidate_option_for_rql_label, declaration_state_option_for_rql_label,
+    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, ConfigurationFactsFilterField,
+    DECORATOR_BINDING_STEP_OPTIONS, QueryStepField, QueryStepOp, ReceiverTypeConstraintForm,
+    RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
+    binding_option_for_rql_label, candidate_option_for_rql_label,
+    configuration_facts_field_for_rql_label, declaration_state_option_for_rql_label,
     export_field_for_rql_label, generation_site_field_for_rql_label,
     occurrence_option_for_rql_label, resolve_rql_schema_version,
 };
@@ -266,8 +267,8 @@ pub fn code_query_from_expr_with_scope(
         )?;
     super::decode::conjoin_plan_scope(
         &mut query.plan,
-        Some(&shared_scope),
-        Some(&shared_languages),
+        (!where_globs.is_empty()).then_some(&shared_scope),
+        (!languages.is_empty()).then_some(&shared_languages),
         "",
     )
     .map_err(|error| shared_scope_error(expr, &error.path, lower_error(expr, error.message)))?;
@@ -1279,6 +1280,12 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             query.insert("exports".to_string(), Value::Object(filter));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::ConfigurationFacts => {
+            let filter = configuration_facts_filter_to_json(expr, head, &items[1..])?;
+            let mut query = Map::new();
+            query.insert("configuration_facts".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::DeclarationStateOf => {
             if items.len() < 2 {
                 return Err(lower_error(
@@ -1707,6 +1714,138 @@ fn materialization_filter_to_json(
     Ok(object)
 }
 
+/// Lower the configuration-fact filter options into canonical JSON. Enum-like
+/// axes accept one label or a vector; route syntax is structural and validated
+/// here so bad route nesting cannot look like a missing nested query.
+fn configuration_facts_filter_to_json(
+    expr: &Expr,
+    head: &str,
+    options: &[Expr],
+) -> LowerResult<Map<String, Value>> {
+    if !options.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            format!("({head} ...) filter options must be name/value pairs"),
+        ));
+    }
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let field = configuration_facts_field_for_rql_label(key).ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!(
+                    "({head} ...) accepts only :format, :node-kind, :role, :scalar-kind, :key, :route, :fact-ordinal, :provenance, and :completeness"
+                ),
+            )
+        })?;
+        let value = if field == ConfigurationFactsFilterField::Routes {
+            let alternatives = pair[1].as_sequence().ok_or_else(|| {
+                lower_error(&pair[1], format!("{key} must be a sequence of routes"))
+            })?;
+            let mut routes = Vec::with_capacity(alternatives.len());
+            for alternative in alternatives {
+                let segments = alternative.as_sequence().ok_or_else(|| {
+                    lower_error(
+                        alternative,
+                        format!("{key} routes must each be a sequence of segments"),
+                    )
+                })?;
+                let mut json_route = Vec::with_capacity(segments.len());
+                for segment in segments {
+                    json_route.push(configuration_route_segment_to_json(segment)?);
+                }
+                routes.push(Value::Array(json_route));
+            }
+            Value::Array(routes)
+        } else if field == ConfigurationFactsFilterField::Keys {
+            let labels = match pair[1].as_sequence() {
+                Some(entries) => entries
+                    .iter()
+                    .map(|entry| {
+                        entry.as_string().map(str::to_string).ok_or_else(|| {
+                            lower_error(entry, format!("{key} values must be strings"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => vec![pair[1].as_string().map(str::to_string).ok_or_else(|| {
+                    lower_error(&pair[1], format!("{key} values must be strings"))
+                })?],
+            };
+            Value::Array(labels.into_iter().map(Value::String).collect())
+        } else if field == ConfigurationFactsFilterField::FactOrdinals {
+            let values = match pair[1].as_sequence() {
+                Some(entries) => entries.iter().collect(),
+                None => vec![&pair[1]],
+            };
+            let mut ordinals = Vec::with_capacity(values.len());
+            for value in values {
+                ordinals.push(number_value(value, head)?);
+            }
+            Value::Array(ordinals)
+        } else {
+            let labels = match pair[1].as_sequence() {
+                Some(entries) => entries
+                    .iter()
+                    .map(symbol_or_string)
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => vec![symbol_or_string(&pair[1])?],
+            };
+            array_of_strings(labels)
+        };
+        insert_unique(&mut object, field.label(), value).at(&pair[0])?;
+    }
+    Ok(object)
+}
+
+fn configuration_route_segment_to_json(expr: &Expr) -> LowerResult<Value> {
+    let Some(items) = expr.as_list() else {
+        return Err(lower_error(
+            expr,
+            "configuration route segment must be a list",
+        ));
+    };
+    let Some(kind) = head_symbol(items)? else {
+        return Err(lower_error(expr, "route segment must not be empty"));
+    };
+    let mut object = Map::new();
+    match (kind, items.len()) {
+        ("key", 2) => {
+            let Some(key) = items[1].as_string() else {
+                return Err(lower_error(&items[1], "(key ...) requires an exact string"));
+            };
+            object.insert("kind".to_string(), json!("key"));
+            object.insert("key".to_string(), json!(key));
+        }
+        ("index", 2) => {
+            object.insert("kind".to_string(), json!("index"));
+            object.insert(
+                "ordinal".to_string(),
+                number_value(&items[1], "configuration route")?,
+            );
+        }
+        ("any", 1) => {
+            object.insert("kind".to_string(), json!("any"));
+        }
+        ("key" | "index", _) => {
+            return Err(lower_error(expr, format!("({kind} ...) expects one value")));
+        }
+        ("any", _) => return Err(lower_error(expr, "(any ...) expects no value")),
+        _ => {
+            return Err(lower_error(
+                expr,
+                "unknown route segment kind; expected key, index, or any",
+            ));
+        }
+    }
+    Ok(Value::Object(object))
+}
+
 impl EnvironmentFilterKind {
     fn accepted_options(self) -> &'static str {
         match self {
@@ -2088,6 +2227,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CandidateTarget
         | RqlForm::GenerationSites
         | RqlForm::Exports
+        | RqlForm::ConfigurationFacts
         | RqlForm::Generates
         | RqlForm::GeneratedBy
         | RqlForm::DeclarationStateOf
@@ -3541,5 +3681,53 @@ mod tests {
     fn structural_query_sexp_preserves_pathful_validation_errors() {
         let error = CodeQuery::from_sexp("(assignment :callee (name \"run\"))").unwrap_err();
         assert!(error.contains("match.callee"), "{error}");
+    }
+
+    #[test]
+    fn configuration_facts_json_and_rql_have_one_canonical_meaning() {
+        let json = json!({
+            "configuration_facts": {
+                "formats": ["props"],
+                "node_kinds": ["member"],
+                "roles": ["object_member"],
+                "scalar_kinds": ["string"],
+                "keys": ["host"],
+                "routes": [[
+                    {"kind": "key", "key": "server"},
+                    {"kind": "index", "ordinal": 0}
+                ]],
+                "fact_ordinals": [1],
+                "provenances": ["authored"],
+                "completenesses": ["incomplete"]
+            }
+        });
+        let sexp = r#"(configuration-facts
+          :format props
+          :node-kind member
+          :role object-member
+          :scalar-kind string
+          :key "host"
+          :route [[(key "server") (index 0)]]
+          :fact-ordinal 1
+          :provenance authored
+          :completeness incomplete)"#;
+        let from_json = CodeQuery::from_json(&json).expect("valid JSON query");
+        let from_sexp = CodeQuery::from_sexp(sexp).expect("valid RQL query");
+        assert_eq!(from_json.to_canonical_json(), from_sexp.to_canonical_json());
+        assert_eq!(
+            from_sexp.to_canonical_json()["configuration_facts"]["formats"],
+            json!(["properties"])
+        );
+    }
+
+    #[test]
+    fn configuration_facts_rejects_a_programming_language_scope() {
+        let json = json!({
+            "languages": ["rust"],
+            "configuration_facts": {}
+        });
+        let error = CodeQuery::from_json(&json).unwrap_err();
+        assert_eq!(error.path, "languages");
+        assert!(error.message.contains("configuration facts"));
     }
 }

@@ -699,6 +699,26 @@ mod value_domain {
     pub(super) const CONTROL_EXIT_PARTITION: &[&str] = ControlExitPartition::LABELS;
     pub(super) const CONTROL_RELATION_COMPLETENESS: &[&str] =
         crate::structural::search::control_relations::CONTROL_RELATION_COMPLETENESS_LABELS;
+
+    /// The configuration-fact vocabularies the row surface publishes
+    /// (#3277). Each folds the exact labels its producing enum writes, so a
+    /// row column cannot drift from the value ingestion produces.
+    pub(super) const CONFIGURATION_FORMAT: &[&str] = &["yaml", "toml", "json", "xml", "properties"];
+    pub(super) const CONFIGURATION_NODE_KIND: &[&str] = &[
+        "document", "object", "section", "sequence", "member", "scalar",
+    ];
+    pub(super) const CONFIGURATION_ROLE: &[&str] = &[
+        "object-member",
+        "table-entry",
+        "property",
+        "xml-attribute",
+        "xml-element",
+    ];
+    pub(super) const CONFIGURATION_SCALAR_KIND: &[&str] = &[
+        "string", "boolean", "integer", "decimal", "null", "url", "duration", "opaque",
+    ];
+    pub(super) const CONFIGURATION_PROVENANCE: &[&str] = &["authored"];
+    pub(super) const CONFIGURATION_COMPLETENESS: &[&str] = &["complete", "incomplete"];
     /// The three boundary roles plus the `interior` label an absent boundary
     /// renders as; the producer is the row projector, and the exact literal set
     /// lives beside the enum it extends rather than being restated here.
@@ -1201,6 +1221,28 @@ detailed_row_domains! {
                     CodeQueryRowField::required("origins_truncated", Scalar::Boolean),
                     CodeQueryRowField::required("witnesses_truncated", Scalar::Boolean),
                     CodeQueryRowField::required("ambiguous", Scalar::Boolean),
+        ],
+    },
+    ConfigurationFact => "configuration_fact" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("fact_id", Scalar::StableId),
+                    CodeQueryRowField::optional("parent_id", Scalar::StableId),
+                    CodeQueryRowField::optional("value_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("format", value_domain::CONFIGURATION_FORMAT),
+                    CodeQueryRowField::required_enum("node_kind", value_domain::CONFIGURATION_NODE_KIND),
+                    CodeQueryRowField::optional_enum("role", value_domain::CONFIGURATION_ROLE),
+                    CodeQueryRowField::optional_enum("scalar_kind", value_domain::CONFIGURATION_SCALAR_KIND),
+                    CodeQueryRowField::required_enum("provenance", value_domain::CONFIGURATION_PROVENANCE),
+                    CodeQueryRowField::required_enum("completeness", value_domain::CONFIGURATION_COMPLETENESS),
+                    CodeQueryRowField::optional("key", Scalar::String),
+                    CodeQueryRowField::optional("occurrence", Scalar::Integer),
+                    CodeQueryRowField::optional("index", Scalar::Integer),
+                    CodeQueryRowField::required("route", Scalar::String),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
         ],
     },
     File => "file" {
@@ -4728,6 +4770,54 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::TopologyEdge { value }, "completeness") => {
             Some(Scalar::ConstrainedEnum(value.completeness))
         }
+        (CodeQueryResultValue::ConfigurationFact { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "fact_id") => {
+            Some(Scalar::StableId(&value.fact_id))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "parent_id") => {
+            value.parent_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "value_id") => {
+            value.value_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "path") => {
+            Some(Scalar::String(&value.path))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "format") => {
+            Some(Scalar::ConstrainedEnum(value.format))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "node_kind") => {
+            Some(Scalar::ConstrainedEnum(value.node_kind))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "role") => {
+            value.role.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "scalar_kind") => {
+            value.scalar_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "provenance") => {
+            Some(Scalar::ConstrainedEnum(value.provenance))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "key") => {
+            value.key.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "occurrence") => value
+            .occurrence
+            .map(|occurrence| Scalar::Integer(u64::from(occurrence))),
+        (CodeQueryResultValue::ConfigurationFact { value }, "index") => {
+            value.index.map(|index| Scalar::Integer(u64::from(index)))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "route") => {
+            Some(Scalar::String(&value.route))
+        }
+        (CodeQueryResultValue::ConfigurationFact { value }, "ordinal") => {
+            Some(Scalar::Integer(u64::from(value.ordinal)))
+        }
         _ => None,
     }
 }
@@ -4787,6 +4877,10 @@ pub enum DetailedCodeQueryKey {
         id: String,
     },
     File,
+    ConfigurationFact {
+        id: String,
+        fact_id: String,
+    },
     ReferenceSite {
         target_id: Option<String>,
         target_fq_name: String,
@@ -5327,6 +5421,13 @@ fn detailed_semantic_identity(
                 id: value.id.clone(),
             },
         )),
+        CodeQueryResultValue::ConfigurationFact { value } => Some((
+            DetailedCodeQueryDomain::ConfigurationFact,
+            DetailedCodeQueryKey::ConfigurationFact {
+                id: value.id.clone(),
+                fact_id: value.fact_id.clone(),
+            },
+        )),
         CodeQueryResultValue::StructuralMatch { .. }
         | CodeQueryResultValue::Declaration { .. }
         | CodeQueryResultValue::File { .. }
@@ -5425,6 +5526,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }
         | DetailedCodeQueryKey::File
+        | DetailedCodeQueryKey::ConfigurationFact { .. }
         | DetailedCodeQueryKey::ReferenceSite { .. }
         | DetailedCodeQueryKey::CallSite { .. }
         | DetailedCodeQueryKey::ExpressionSite { .. }

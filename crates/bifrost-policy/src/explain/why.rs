@@ -282,6 +282,9 @@ pub(super) fn ref_location(value: &PolicyQueryResultRef) -> Option<PolicySourceL
 /// A short, deterministic rendering of one retained row reference.
 pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
     match value {
+        PolicyQueryResultRef::ConfigurationFact { id, fact_id, .. } => {
+            format!("configuration_fact {id} {fact_id}")
+        }
         PolicyQueryResultRef::StructuralMatch { kind, .. } => format!("structural_match {kind}"),
         PolicyQueryResultRef::Declaration { kind, fq_name, .. } => {
             format!("declaration {kind} {fq_name}")

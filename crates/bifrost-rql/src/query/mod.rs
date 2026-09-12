@@ -18,19 +18,25 @@ pub mod schema;
 pub mod sexp;
 mod source;
 
+pub use brokk_bifrost_core::analyzer::configuration::{
+    ConfigurationMemberRole, ConfigurationScalarKind, ConfigurationValueProvenance,
+};
 pub use domain::*;
 pub use ir::{
     ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
     CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
     CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
+    CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
+    ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteFilter,
+    ConfigurationRouteSegmentFilter, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
     DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
     FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
     GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, JsxElementIdentity,
     KeyedReadValueTraversal, LanguageScopeConflict, MAX_ARITY, MAX_BINDING_NAME_LENGTH,
-    MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
-    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES, MAX_CONFIGURATION_KEY_LENGTH,
+    MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
     MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
     OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope,
@@ -45,8 +51,8 @@ pub use ir::{
 };
 pub use partition::PlanPartitioning;
 pub use schema::{
-    ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp,
-    QueryStepShape,
+    ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,
+    ConfigurationFactsFilterField, QueryStepOp, QueryStepShape,
 };
 pub use source::{
     QuerySourceDiagnostic, QuerySourceEdit, QuerySourceFix, QuerySourceHelp, query_source_help_at,

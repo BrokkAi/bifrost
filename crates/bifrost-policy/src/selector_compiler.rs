@@ -3086,6 +3086,11 @@ pub(super) fn selected_site_quality(
             | CodeQueryResultValue::GenerationSite { .. }
             | CodeQueryResultValue::Export { .. }
             | CodeQueryResultValue::DeclarationState { .. }
+            // A configuration-fact row is an exact parser record of one
+            // authored document fact (#3277); whether the ingested document
+            // set is whole arrives through the query's diagnostics, never
+            // through this per-row judgement.
+            | CodeQueryResultValue::ConfigurationFact { .. }
             // The identity-route rows are parser facts with the same per-axis
             // completeness story (#1475).
             | CodeQueryResultValue::QualifiedPath { .. }

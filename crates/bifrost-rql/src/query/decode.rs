@@ -2,27 +2,33 @@ use super::ir::{
     ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallArgumentSelector,
     CallIdentity, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter,
     CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
+    CodeQuerySeed, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
+    ConfigurationFactsSeed, ConfigurationNodeKindFilter, ConfigurationRouteFilter,
+    ConfigurationRouteSegmentFilter, ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter,
     DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
     FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
     GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, KeyedReadValueTraversal,
-    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
-    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES,
-    MAX_ROW_PROJECTION_COLUMNS, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter,
-    OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral,
-    QueryRowPredicate, QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn,
-    QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter,
-    ResolvedCallProof, ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter,
-    ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate,
-    TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal,
-    WitnessTraversal, intersect_language_scopes,
+    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
+    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS,
+    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_KIND_LIST_ENTRIES,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_ROW_PREDICATE_SET_MEMBERS, MAX_ROW_PREDICATES, MAX_ROW_PROJECTION_COLUMNS,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryPathScope, QueryRowLiteral, QueryRowPredicate,
+    QueryRowPredicateOp, QueryRowPredicateOperand, QueryRowProjectionColumn, QueryStep,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, ResolvedCallFilter, ResolvedCallProof,
+    ResolvedCallReceiverType, ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter,
+    ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
+    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    intersect_language_scopes,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
-    StringPredicateField, call_traversal_completeness_from_label, jsx_element_identity_from_label,
+    StringPredicateField, call_traversal_completeness_from_label,
+    configuration_member_role_from_label, configuration_provenance_from_label,
+    configuration_scalar_kind_from_label, jsx_element_identity_from_label,
     reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
     usage_proof_from_label, usage_surface_from_label,
 };
@@ -147,6 +153,7 @@ struct QueryFields<'a> {
     bindings: Option<&'a Value>,
     generation_sites: Option<&'a Value>,
     exports: Option<&'a Value>,
+    configuration_facts: Option<&'a Value>,
     paths: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
@@ -182,6 +189,7 @@ fn collect_query_fields<'a>(
             QueryField::Bindings => fields.bindings = Some(value),
             QueryField::GenerationSites => fields.generation_sites = Some(value),
             QueryField::Exports => fields.exports = Some(value),
+            QueryField::ConfigurationFacts => fields.configuration_facts = Some(value),
             QueryField::Paths => fields.paths = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
@@ -236,6 +244,7 @@ fn decode_plan(
         ("bindings", fields.bindings),
         ("generation_sites", fields.generation_sites),
         ("exports", fields.exports),
+        ("configuration_facts", fields.configuration_facts),
         ("paths", fields.paths),
         ("union", fields.union),
         ("intersect", fields.intersect),
@@ -437,6 +446,24 @@ fn decode_plan(
                 .transpose()?
                 .unwrap_or_default(),
             filter: decode_export_filter(object, &exports_path)?,
+        }))
+    } else if let Some(value) = fields.configuration_facts {
+        let configuration_path = child_path(path, "configuration_facts");
+        reject_structural_containment(&fields, path, "configuration_facts")?;
+        if fields.languages.is_some() {
+            return Err(QueryError::new(
+                child_path(path, "languages"),
+                "configuration facts do not have a programming-language axis",
+            ));
+        }
+        let object = as_object(value, &configuration_path)?;
+        CodeQueryPlanSource::ConfigurationFacts(Box::new(ConfigurationFactsSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_path_scope(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_configuration_facts_filter(object, &configuration_path)?,
         }))
     } else {
         for (label, value) in [
@@ -1104,6 +1131,291 @@ pub(super) fn decode_export_filter(
     })
 }
 
+fn decode_configuration_enum_axis<T: PartialEq>(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+    noun: &str,
+    from_label: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, field);
+    let entries = value.as_array().ok_or_else(|| {
+        QueryError::new(&field_path, format!("expected an array of {noun} labels"))
+    })?;
+    if entries.len() > MAX_CONFIGURATION_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            &field_path,
+            format!("at most {MAX_CONFIGURATION_FILTER_ENTRIES} {noun} labels are allowed"),
+        ));
+    }
+    let mut decoded = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let label = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, format!("expected a {noun} label")))?;
+        let decoded_entry = from_label(label)
+            .ok_or_else(|| QueryError::new(&entry_path, format!("unknown {noun} {label:?}")))?;
+        if !decoded.contains(&decoded_entry) {
+            decoded.push(decoded_entry);
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_configuration_keys(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<Vec<String>, QueryError> {
+    let Some(value) = object.get("keys") else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, "keys");
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(&field_path, "expected an array of configuration keys"))?;
+    if entries.len() > MAX_CONFIGURATION_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            &field_path,
+            format!("at most {MAX_CONFIGURATION_FILTER_ENTRIES} configuration keys are allowed"),
+        ));
+    }
+    let mut keys = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let key = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, "expected a configuration key string"))?;
+        if key.is_empty() || key.len() > MAX_CONFIGURATION_KEY_LENGTH {
+            return Err(QueryError::new(
+                &entry_path,
+                format!(
+                    "configuration key length must be between 1 and {MAX_CONFIGURATION_KEY_LENGTH}"
+                ),
+            ));
+        }
+        if !keys.contains(&key.to_string()) {
+            keys.push(key.to_string());
+        }
+    }
+    Ok(keys)
+}
+
+fn decode_configuration_fact_ordinals(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<Vec<u32>, QueryError> {
+    let Some(value) = object.get("fact_ordinals") else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, "fact_ordinals");
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(&field_path, "expected an array of fact ordinals"))?;
+    if entries.len() > MAX_CONFIGURATION_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            &field_path,
+            format!("at most {MAX_CONFIGURATION_FILTER_ENTRIES} fact ordinals are allowed"),
+        ));
+    }
+    let mut ordinals = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let ordinal = entry
+            .as_u64()
+            .and_then(|ordinal| u32::try_from(ordinal).ok())
+            .ok_or_else(|| {
+                QueryError::new(
+                    &entry_path,
+                    "fact ordinal must be a non-negative 32-bit integer",
+                )
+            })?;
+        if !ordinals.contains(&ordinal) {
+            ordinals.push(ordinal);
+        }
+    }
+    Ok(ordinals)
+}
+
+fn decode_configuration_route_segment(
+    value: &Value,
+    path: &str,
+) -> Result<ConfigurationRouteSegmentFilter, QueryError> {
+    let object = as_object(value, path)?;
+    let Some(kind) = object.get("kind").and_then(Value::as_str) else {
+        return Err(QueryError::new(
+            child_path(path, "kind"),
+            "expected a route segment kind",
+        ));
+    };
+    let segment = match kind {
+        "key" => {
+            let Some(key) = object.get("key").and_then(Value::as_str) else {
+                return Err(QueryError::new(
+                    child_path(path, "key"),
+                    "a key route segment requires an exact key",
+                ));
+            };
+            if key.is_empty() || key.len() > MAX_CONFIGURATION_KEY_LENGTH {
+                return Err(QueryError::new(
+                    child_path(path, "key"),
+                    format!(
+                        "route key length must be between 1 and {MAX_CONFIGURATION_KEY_LENGTH}"
+                    ),
+                ));
+            }
+            ConfigurationRouteSegmentFilter::Key(key.to_string())
+        }
+        "index" => {
+            let ordinal = object
+                .get("ordinal")
+                .and_then(Value::as_u64)
+                .and_then(|ordinal| u32::try_from(ordinal).ok())
+                .ok_or_else(|| {
+                    QueryError::new(
+                        child_path(path, "ordinal"),
+                        "an index route segment requires a non-negative 32-bit ordinal",
+                    )
+                })?;
+            ConfigurationRouteSegmentFilter::Index(ordinal)
+        }
+        "any" => ConfigurationRouteSegmentFilter::Any,
+        _ => {
+            return Err(QueryError::new(
+                child_path(path, "kind"),
+                "unknown route segment kind; expected key, index, or any",
+            ));
+        }
+    };
+    let required_fields: &[&str] = match segment {
+        ConfigurationRouteSegmentFilter::Key(_) => &["kind", "key"],
+        ConfigurationRouteSegmentFilter::Index(_) => &["kind", "ordinal"],
+        ConfigurationRouteSegmentFilter::Any => &["kind"],
+    };
+    for key in object.keys() {
+        if !required_fields.contains(&key.as_str()) {
+            return Err(QueryError::new(
+                child_path(path, key),
+                format!("unknown field in a {kind} route segment"),
+            ));
+        }
+    }
+    Ok(segment)
+}
+
+fn decode_configuration_routes(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<Vec<ConfigurationRouteFilter>, QueryError> {
+    let Some(value) = object.get("routes") else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, "routes");
+    let alternatives = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(&field_path, "expected an array of route alternatives"))?;
+    if alternatives.len() > MAX_CONFIGURATION_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            &field_path,
+            format!("at most {MAX_CONFIGURATION_FILTER_ENTRIES} route alternatives are allowed"),
+        ));
+    }
+    let mut routes = Vec::with_capacity(alternatives.len());
+    for (alternative_index, alternative) in alternatives.iter().enumerate() {
+        let alternative_path = index_path(&field_path, alternative_index);
+        let segments = alternative.as_array().ok_or_else(|| {
+            QueryError::new(&alternative_path, "expected an array of route segments")
+        })?;
+        if segments.len() > MAX_CONFIGURATION_ROUTE_SEGMENTS {
+            return Err(QueryError::new(
+                &alternative_path,
+                format!("at most {MAX_CONFIGURATION_ROUTE_SEGMENTS} route segments are allowed"),
+            ));
+        }
+        let mut route = Vec::with_capacity(segments.len());
+        for (segment_index, segment) in segments.iter().enumerate() {
+            route.push(decode_configuration_route_segment(
+                segment,
+                &index_path(&alternative_path, segment_index),
+            )?);
+        }
+        routes.push(ConfigurationRouteFilter(route));
+    }
+    Ok(routes)
+}
+
+pub(super) fn decode_configuration_facts_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ConfigurationFactsFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[
+            "formats",
+            "node_kinds",
+            "roles",
+            "scalar_kinds",
+            "keys",
+            "routes",
+            "fact_ordinals",
+            "provenances",
+            "completenesses",
+        ],
+        "configuration facts",
+    )?;
+    Ok(ConfigurationFactsFilter {
+        formats: decode_configuration_enum_axis(
+            object,
+            path,
+            "formats",
+            "configuration format",
+            super::domain::ConfigurationFormat::from_label,
+        )?,
+        node_kinds: decode_configuration_enum_axis(
+            object,
+            path,
+            "node_kinds",
+            "configuration node kind",
+            ConfigurationNodeKindFilter::from_label,
+        )?,
+        roles: decode_configuration_enum_axis(
+            object,
+            path,
+            "roles",
+            "configuration role",
+            configuration_member_role_from_label,
+        )?,
+        scalar_kinds: decode_configuration_enum_axis(
+            object,
+            path,
+            "scalar_kinds",
+            "configuration scalar kind",
+            configuration_scalar_kind_from_label,
+        )?,
+        keys: decode_configuration_keys(object, path)?,
+        routes: decode_configuration_routes(object, path)?,
+        fact_ordinals: decode_configuration_fact_ordinals(object, path)?,
+        provenances: decode_configuration_enum_axis(
+            object,
+            path,
+            "provenances",
+            "configuration provenance",
+            configuration_provenance_from_label,
+        )?,
+        completenesses: decode_configuration_enum_axis(
+            object,
+            path,
+            "completenesses",
+            "configuration completeness",
+            ConfigurationCompletenessFilter::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_declaration_state_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1209,6 +1521,20 @@ fn conjoin_source_scope(
                 (&mut seed.where_globs, &mut seed.languages)
             }
             CodeQueryPlanSource::Exports(seed) => (&mut seed.where_globs, &mut seed.languages),
+            CodeQueryPlanSource::ConfigurationFacts(seed) => {
+                if let Some(shared) = scope {
+                    seed.where_globs = seed.where_globs.combine(shared).map_err(|error| {
+                        QueryError::new(child_path(&path, "where"), error.to_string())
+                    })?;
+                }
+                if languages.is_some() {
+                    return Err(QueryError::new(
+                        child_path(&path, "languages"),
+                        "configuration facts do not have a programming-language axis",
+                    ));
+                }
+                continue;
+            }
             CodeQueryPlanSource::Set { op, branches } => {
                 let branch_path = child_path(&path, op.label());
                 pending.extend(

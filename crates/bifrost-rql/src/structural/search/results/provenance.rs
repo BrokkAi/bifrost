@@ -596,6 +596,12 @@ pub enum CodeQueryResultRef {
         fq_name: String,
         origin: &'static str,
     },
+    ConfigurationFact {
+        id: String,
+        fact_id: String,
+        path: String,
+        range: CodeQueryRange,
+    },
 }
 
 impl CodeQueryResultRef {
@@ -673,6 +679,7 @@ impl CodeQueryResultRef {
             Self::GenerationSite { .. } => "generation_site",
             Self::Export { .. } => "export",
             Self::DeclarationState { .. } => "declaration_state",
+            Self::ConfigurationFact { .. } => "configuration_fact",
         }
     }
 
@@ -747,7 +754,8 @@ impl CodeQueryResultRef {
             | Self::PathSegment { path, .. }
             | Self::GenerationSite { path, .. }
             | Self::Export { path, .. }
-            | Self::DeclarationState { path, .. } => path,
+            | Self::DeclarationState { path, .. }
+            | Self::ConfigurationFact { path, .. } => path,
         }
     }
 }

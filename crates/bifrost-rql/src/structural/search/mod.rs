@@ -97,6 +97,7 @@ mod call_binding;
 mod call_shape;
 mod callable_signature;
 mod concurrency;
+mod configuration;
 mod control_relations;
 mod decorator_binding;
 mod dispatch;
@@ -125,6 +126,10 @@ use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
 use call_binding::CallBindingValue;
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use concurrency::ConcurrentAccessConflictValue;
+use configuration::{
+    ConfigurationFactKey, ConfigurationFactValue, ConfigurationFactsTraversalCache,
+    execute_configuration_facts_seed,
+};
 use control_relations::{ControlRelationKey, ControlRelationTraversalCache, ControlRelationValue};
 use decorator_binding::DecoratedParameterValue;
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
@@ -994,6 +999,7 @@ enum PipelineValue {
     RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
+    ConfigurationFact(ConfigurationFactValue),
 }
 
 /// One member-selection summary computed from the production resolver's own
@@ -1165,6 +1171,7 @@ enum PipelineKey {
     RewritePath(RewritePathKey),
     QualifiedPath(PathKey),
     PathSegment(SegmentKey),
+    ConfigurationFact(ConfigurationFactKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1283,6 +1290,7 @@ impl PipelineValue {
             Self::RewritePath(value) => PipelineKey::RewritePath(value.key()),
             Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
             Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
+            Self::ConfigurationFact(value) => PipelineKey::ConfigurationFact(value.key()),
         }
     }
 }
@@ -1588,6 +1596,7 @@ enum PipelineTraceValue {
     RewritePath(Box<RewritePathValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
+    ConfigurationFact(ConfigurationFactValue),
 }
 
 #[derive(Debug, Clone)]
@@ -2385,6 +2394,7 @@ struct QueryExecutionState<'a> {
     topology_cache: TopologyTraversalCache,
     rewrite_path_cache: RewritePathTraversalCache,
     path_cache: PathTraversalCache,
+    configuration_cache: ConfigurationFactsTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -3638,6 +3648,7 @@ fn execute_internal_with_analysis_strategy_and_row_family_session(
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache,
         environment_cache,
+        configuration_cache: ConfigurationFactsTraversalCache::default(),
         materialization_cache: materialization::MaterializationTraversalCache::default(),
         edge_cache: EdgeTraversalCache::default(),
         flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
@@ -5276,6 +5287,26 @@ fn detailed_evidence_for_pipeline_value(
                 runtime_keyed_read: None,
             }
         }
+        PipelineValue::ConfigurationFact(value) => {
+            let fact = value.fact();
+            let byte_span = fact.evidence().start_byte()..fact.evidence().end_byte();
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ConfigurationFact,
+                key: DetailedCodeQueryKey::ConfigurationFact {
+                    id: value.id(),
+                    fact_id: value.fact_id(),
+                },
+                file: value.file.clone(),
+                source_slice_sha256: source_slice_sha256(&value.source, &byte_span),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+                decorated_parameter: None,
+                runtime_keyed_read: None,
+            }
+        }
     }
 }
 
@@ -5363,6 +5394,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::LexicalScope(value) => Some(value.file()),
         PipelineValue::QualifiedPath(value) => Some(value.file()),
         PipelineValue::PathSegment(value) => Some(value.file()),
+        PipelineValue::ConfigurationFact(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
         PipelineValue::CandidateHop(value) => Some(value.file()),
@@ -5628,6 +5660,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::PathSegment(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::ConfigurationFact(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -5643,6 +5678,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::File(_) => {}
+        PipelineTraceValue::ConfigurationFact(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineTraceValue::ReferenceSite(site) => collect_reference_source_files(site, files),
         PipelineTraceValue::CallSite(site) => collect_call_source_files(site, files),
         PipelineTraceValue::ExpressionSite(site) => {
@@ -5994,6 +6032,36 @@ fn detailed_trace_provenance_ref(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             source_slice_sha256: None,
         },
+        PipelineTraceValue::ConfigurationFact(value) => {
+            let evidence = value.fact().evidence();
+            let byte_span = evidence.start_byte()..evidence.end_byte();
+            let display_range = cache.sources.get(&value.file).and_then(|coordinates| {
+                coordinates.as_ref().map(|coordinates| {
+                    range_for_offsets(
+                        &coordinates.source,
+                        &coordinates.line_starts,
+                        byte_span.start,
+                        byte_span.end,
+                    )
+                })
+            });
+            DetailedCodeQueryProvenanceRefEvidence {
+                domain: DetailedCodeQueryDomain::ConfigurationFact,
+                key: DetailedCodeQueryKey::ConfigurationFact {
+                    id: value.id(),
+                    fact_id: value.fact_id(),
+                },
+                file: value.file().clone(),
+                byte_span: Some(byte_span),
+                display_range,
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                source_slice_sha256: cached_source_slice_sha256(
+                    cache,
+                    value.file(),
+                    &(evidence.start_byte()..evidence.end_byte()),
+                ),
+            }
+        }
         PipelineTraceValue::ReferenceSite(value) => detailed_reference_provenance_ref(value, cache),
         PipelineTraceValue::CallSite(value) => detailed_call_provenance_ref(value, cache),
         PipelineTraceValue::ExpressionSite(value) => {
@@ -7158,5 +7226,8 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::QualifiedPath(value.clone()))
         }
         PipelineValue::PathSegment(value) => Some(PipelineTraceValue::PathSegment(value.clone())),
+        PipelineValue::ConfigurationFact(value) => {
+            Some(PipelineTraceValue::ConfigurationFact(value.clone()))
+        }
     }
 }
