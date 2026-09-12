@@ -114,6 +114,33 @@ pub struct CollectionFlowFact {
     pub provenance: Vec<String>,
 }
 
+/// Native companion for the standardized CSMI conditional-type-refinement
+/// profile. Payload references use native declaration IDs inside a pack and
+/// are remapped to document-local symbols only at the interchange boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalTypeRefinementsPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<ConditionalTypeRefinementFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalTypeRefinementFact {
+    #[schemars(with = "serde_json::Value")]
+    pub payload: crate::analyzer::semantic_model::csmi::CsmiConditionalTypeRefinement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<crate::analyzer::semantic_model::csmi::CsmiCoverageStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+}
+
+impl ConditionalTypeRefinementsPayload {
+    pub fn record_count(&self) -> usize {
+        self.refinements.len()
+    }
+}
+
 /// Typed native companion for the CSMI deferred-yield vocabulary. These facts
 /// retain their exact linked factory, resume, and handle-type scope in the
 /// payload; coverage and provenance remain independent claims.
@@ -1006,6 +1033,8 @@ pub struct AuthoredShard {
     pub collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_yields: Option<DeferredYieldsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1033,6 +1062,13 @@ pub struct AuthoredProcedureSummary {
     pub id: String,
     pub target: AuthoredProcedureTarget,
     pub completeness: Completeness,
+    /// Reviewed claim that this procedure and its transitive behavior do not
+    /// write, publish, or escape ordinary program storage, or invoke an
+    /// unaccounted callback. Synchronization bookkeeping named by
+    /// `concurrency_effects` is outside this claim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub ordinary_heap_unchanged: bool,
     /// The author's explicit claim that every implementation of this member
     /// outside the workspace conforms to this summary (#2371).
     ///

@@ -1,6 +1,6 @@
 //! Translation from Bifrost semantic-model packs to CSMI v0.1 documents.
 
-use crate::analyzer::semantic_model::DeferredYieldsPayload;
+use crate::analyzer::semantic_model::{ConditionalTypeRefinementsPayload, DeferredYieldsPayload};
 
 use super::canonical::{canonical_json, sha256_hex};
 use super::identity::{
@@ -394,6 +394,8 @@ fn export_semantic_document<'a>(
     let mut runtime_values_completeness = Vec::new();
     let mut collection_flow_affects = Vec::new();
     let mut collection_flow_completeness = Vec::new();
+    let mut conditional_type_affects = Vec::new();
+    let mut conditional_type_completeness = Vec::new();
     let mut deferred_yield_affects = Vec::new();
     let mut deferred_yield_completeness = Vec::new();
     let callable_shape_completeness: HashMap<String, bool> = member_facts
@@ -411,6 +413,19 @@ fn export_semantic_document<'a>(
             &mut runtime_values_affects,
             &mut runtime_values_completeness,
         )?;
+    }
+    for shard in &shards {
+        if let Some(refinements) = shard.conditional_type_refinements() {
+            export_conditional_type_refinements(
+                refinements,
+                options,
+                &symbol_by_bifrost_id,
+                &callable_shape_completeness,
+                &mut extension_facts,
+                &mut conditional_type_affects,
+                &mut conditional_type_completeness,
+            )?;
+        }
     }
     for shard in &shards {
         let Some(deferred_yields) = shard.deferred_yields() else {
@@ -724,6 +739,7 @@ fn export_semantic_document<'a>(
     completeness_statements.extend(runtime_values_completeness);
     completeness_statements.extend(collection_flow_completeness);
     completeness_statements.extend(deferred_yield_completeness);
+    completeness_statements.extend(conditional_type_completeness);
     let declaration_status = match pack_completeness {
         Completeness::Complete => CsmiCoverageStatus::Complete,
         Completeness::Partial => CsmiCoverageStatus::Partial,
@@ -968,6 +984,15 @@ fn export_semantic_document<'a>(
                         affects: collection_flow_affects,
                     });
                 }
+                if !conditional_type_affects.is_empty() {
+                    uses.push(CsmiVocabularyUse {
+                        identifier: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID.to_owned(),
+                        version: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION.to_owned(),
+                        schema: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA.to_owned(),
+                        requirement: CsmiVocabularyRequirement::Required,
+                        affects: conditional_type_affects,
+                    });
+                }
                 if !deferred_yield_affects.is_empty() {
                     uses.push(CsmiVocabularyUse {
                         identifier: CSMI_DEFERRED_YIELD_PROFILE_ID.to_owned(),
@@ -1070,6 +1095,11 @@ fn logical_pack(
         CSMI_COLLECTION_FLOW_PROFILE_SCHEMA,
     );
     support.add(
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+    );
+    support.add(
         CSMI_DEFERRED_YIELD_PROFILE_ID,
         CSMI_DEFERRED_YIELD_PROFILE_VERSION,
         CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,
@@ -1152,6 +1182,97 @@ fn export_collection_flows(
             },
             extensions: Vec::new(),
         });
+    }
+    Ok(())
+}
+
+fn export_conditional_type_refinements(
+    refinements: &ConditionalTypeRefinementsPayload,
+    options: &CsmiExportOptions,
+    symbols: &HashMap<String, String>,
+    callable_shapes: &HashMap<String, bool>,
+    facts: &mut Vec<CsmiExtensionFact>,
+    affects: &mut Vec<CsmiAffectedUnit>,
+    completeness: &mut Vec<CsmiCompletenessStatement>,
+) -> Result<(), CsmiExportError> {
+    for refinement in &refinements.refinements {
+        let mut payload = refinement.payload.clone();
+        payload.remap_symbols(|id| {
+            symbols
+                .get(id)
+                .cloned()
+                .ok_or_else(|| CsmiExportError::MissingDeclaration {
+                    path: "conditional_type_refinements".to_owned(),
+                    target: id.to_owned(),
+                })
+        })?;
+        let scope = json!({"callable": payload.callable, "subject": payload.subject});
+        let provenance = vec![options.provenance_id.clone()];
+        facts.push(CsmiExtensionFact {
+            vocabulary: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID.to_owned(),
+            version: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION.to_owned(),
+            family: CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY.to_owned(),
+            scope: scope.clone(),
+            payload: serde_json::to_value(&payload)
+                .map_err(|error| CsmiExportError::Canonical(error.to_string()))?,
+            provenance: provenance.clone(),
+            extensions: Vec::new(),
+        });
+        affects.push(CsmiAffectedUnit::FactFamily(CsmiAffectedFactFamily {
+            kind: CsmiAffectedFactFamilyKind::FactFamily,
+            family: CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY.to_owned(),
+            scope: scope.clone(),
+        }));
+        for (vocabulary, version, family, scope, status) in [
+            (
+                Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID.to_owned()),
+                Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION.to_owned()),
+                CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY,
+                scope,
+                refinement.coverage,
+            ),
+            (
+                None,
+                None,
+                "declaration-aspects",
+                json!({"symbol": payload.callable, "aspect": "callable-shape"}),
+                Some(
+                    if callable_shapes
+                        .get(&refinement.payload.callable)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        CsmiCoverageStatus::Complete
+                    } else {
+                        CsmiCoverageStatus::Partial
+                    },
+                ),
+            ),
+        ] {
+            let Some(status) = status else {
+                continue;
+            };
+            let statement = CsmiCompletenessStatement {
+                vocabulary,
+                version,
+                family: family.to_owned(),
+                scope,
+                status,
+                limitations: if status == CsmiCoverageStatus::Complete {
+                    Vec::new()
+                } else {
+                    vec![CsmiLimitation {
+                        kind: "coverage-limited".to_owned(),
+                        diagnostic: None,
+                    }]
+                },
+                provenance: provenance.clone(),
+                extensions: Vec::new(),
+            };
+            if !completeness.contains(&statement) {
+                completeness.push(statement);
+            }
+        }
     }
     Ok(())
 }

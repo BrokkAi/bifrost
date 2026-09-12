@@ -9,7 +9,7 @@ use super::super::capabilities::{SemanticCapabilities, SemanticCapability};
 use super::super::ids::{
     AdapterSemanticsVersion, AllocationId, BlockId, CallSiteId, CaptureId,
     ConfigurationFingerprint, ContentIdentity, ControlEdgeId, DeclarationLocator,
-    DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint, EvidenceId,
+    DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint, EvidenceId, GuardId,
     MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
     SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole, SourceAnchor,
     SourceMappingId, SourcePosition, SourceRevision, SourceSpan, StructuralNodeIdentity, ValueId,
@@ -338,6 +338,89 @@ fn minimal_valid_artifact_exposes_scoped_handles() {
     assert!(handle.control_edge_handle(ControlEdgeId::new(1)).is_some());
     assert!(handle.control_edge_handle(ControlEdgeId::new(2)).is_none());
     assert!(handle.value_handle(ValueId::new(0)).is_none());
+}
+
+#[test]
+fn ordered_integer_guards_require_a_subject_and_represented_integer_constant() {
+    let artifact = |subject, constant, constant_kind| {
+        let key = key();
+        let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        procedure.values = vec![
+            parameter_value(0, 0, FormalMultiplicity::One),
+            SemanticValue {
+                id: ValueId::new(1),
+                kind: constant_kind,
+                source: SourceMappingId::new(0),
+                evidence: EvidenceId::new(0),
+            },
+        ];
+        procedure.guard_facts.push(GuardFactParts {
+            id: GuardId::new(0),
+            point: ProgramPointId::new(0),
+            subject,
+            predicate: GuardPredicate::OrderedIntegerComparison {
+                relation: IntegerComparison::GreaterThan,
+                constant,
+            },
+            true_arm: None,
+            false_arm: None,
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        SemanticArtifact::try_new(
+            key,
+            capabilities(&[SemanticCapability::Values, SemanticCapability::GuardFacts]),
+            vec![procedure],
+        )
+    };
+
+    let valid = artifact(
+        Some(ValueId::new(0)),
+        ValueId::new(1),
+        SemanticValueKind::UnsignedInteger(0),
+    )
+    .expect("a subject and represented integer form a valid ordered guard");
+    assert!(matches!(
+        valid.procedures()[0].guard_facts(),
+        [GuardFact {
+            subject: Some(subject),
+            predicate: GuardPredicate::OrderedIntegerComparison {
+                relation: IntegerComparison::GreaterThan,
+                constant,
+            },
+            ..
+        }] if *subject == ValueId::new(0) && *constant == ValueId::new(1)
+    ));
+
+    for (invalid, expected) in [
+        (
+            artifact(None, ValueId::new(1), SemanticValueKind::UnsignedInteger(0)),
+            SemanticIrErrorKind::GuardContract,
+        ),
+        (
+            artifact(
+                Some(ValueId::new(0)),
+                ValueId::new(2),
+                SemanticValueKind::UnsignedInteger(0),
+            ),
+            SemanticIrErrorKind::OutOfBounds,
+        ),
+        (
+            artifact(
+                Some(ValueId::new(0)),
+                ValueId::new(1),
+                SemanticValueKind::Boolean(false),
+            ),
+            SemanticIrErrorKind::GuardContract,
+        ),
+    ] {
+        assert_eq!(
+            invalid
+                .expect_err("the malformed ordered guard is rejected")
+                .kind(),
+            expected
+        );
+    }
 }
 
 fn artifact_with_values(values: Vec<SemanticValue>) -> Result<SemanticArtifact, SemanticIrError> {
@@ -835,6 +918,113 @@ fn rejects_non_dense_and_out_of_bounds_local_ids() {
 }
 
 #[test]
+fn aggregate_initializer_validates_values_selector_scope_and_event_evidence() {
+    let key = key();
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    let selector = SemanticLocator::new(
+        key.mount(),
+        key.path().clone(),
+        key.language(),
+        procedure_locator(&key, "main", 1).declaration().clone(),
+        SemanticRole::MemoryLocation,
+        anchor(3, 0),
+    );
+    let procedure_with = |aggregate: ValueId,
+                          value: ValueId,
+                          selector: SemanticLocator,
+                          event_evidence: EvidenceId| {
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.values.extend([
+            SemanticValue {
+                id: ValueId::new(0),
+                kind: SemanticValueKind::Temporary,
+                source,
+                evidence,
+            },
+            SemanticValue {
+                id: ValueId::new(1),
+                kind: SemanticValueKind::Temporary,
+                source,
+                evidence,
+            },
+        ]);
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::AggregateInitializer {
+                aggregate,
+                selector,
+                value,
+            },
+            source,
+            event_evidence,
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        parts
+    };
+
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure_with(
+            ValueId::new(2),
+            ValueId::new(1),
+            selector.clone(),
+            evidence,
+        )],
+    )
+    .expect_err("aggregate initializer aggregate must be procedure-local");
+    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
+
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure_with(
+            ValueId::new(0),
+            ValueId::new(2),
+            selector.clone(),
+            evidence,
+        )],
+    )
+    .expect_err("aggregate initializer value must be procedure-local");
+    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
+
+    let foreign_selector = SemanticLocator::new(
+        key.mount(),
+        WorkspaceRelativePath::new("src/Other.java").expect("valid foreign path"),
+        key.language(),
+        procedure_locator(&key, "main", 1).declaration().clone(),
+        SemanticRole::MemoryLocation,
+        anchor(3, 0),
+    );
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure_with(
+            ValueId::new(0),
+            ValueId::new(1),
+            foreign_selector,
+            evidence,
+        )],
+    )
+    .expect_err("aggregate initializer selector must belong to its artifact");
+    assert_eq!(error.kind(), SemanticIrErrorKind::SourceScope);
+
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[SemanticCapability::Values]),
+        vec![procedure_with(
+            ValueId::new(0),
+            ValueId::new(1),
+            selector,
+            EvidenceId::new(1),
+        )],
+    )
+    .expect_err("aggregate initializer event evidence must be local");
+    assert_eq!(error.kind(), SemanticIrErrorKind::OutOfBounds);
+}
+
+#[test]
 fn aggregate_copy_requires_one_adjacent_matching_assignment() {
     let key = key();
     let source = SourceMappingId::new(0);
@@ -1178,6 +1368,7 @@ fn rejects_creator_local_capture_destination() {
         kind: MemoryLocationKind::LexicalCell {
             binding: ValueId::new(1),
         },
+        value_copy: MemoryValueCopy::Unknown,
         source: SourceMappingId::new(0),
         evidence: EvidenceId::new(0),
     });
@@ -1221,6 +1412,7 @@ fn capture_slot_requires_a_subject_specific_binding_gap() {
             lexical_parent: ProcedureId::new(0),
             binding: None,
         },
+        value_copy: MemoryValueCopy::Unknown,
         source: SourceMappingId::new(0),
         evidence: EvidenceId::new(0),
     });
@@ -1355,6 +1547,7 @@ fn receiver_capture_requires_a_receiver_value() {
             lexical_parent: ProcedureId::new(0),
             binding: None,
         },
+        value_copy: MemoryValueCopy::Unknown,
         source: SourceMappingId::new(0),
         evidence: EvidenceId::new(0),
     });
@@ -1433,6 +1626,7 @@ fn known_capture_mode_rejects_a_contradictory_unknown_gap() {
             lexical_parent: ProcedureId::new(0),
             binding: None,
         },
+        value_copy: MemoryValueCopy::Unknown,
         source,
         evidence,
     });
@@ -1750,6 +1944,7 @@ fn canonical_index_identity_requires_a_constant_indexed_location() {
             constant_index: None,
             identity: IndexedLocationIdentity::Element,
         },
+        value_copy: MemoryValueCopy::Unknown,
         source,
         evidence,
     });
@@ -1830,6 +2025,7 @@ fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
                     constant_index: Some(0),
                     identity: IndexedLocationIdentity::Element,
                 },
+                value_copy: MemoryValueCopy::Unknown,
                 source,
                 evidence,
             },
@@ -1841,6 +2037,7 @@ fn canonical_index_identity_requires_its_exact_access_at_the_gap_point() {
                     constant_index: Some(0),
                     identity: IndexedLocationIdentity::Element,
                 },
+                value_copy: MemoryValueCopy::Unknown,
                 source,
                 evidence,
             },

@@ -2350,6 +2350,10 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("null_on_true", Scalar::Boolean),
                     CodeQueryRowField::optional("null_target_id", Scalar::StableId),
                     CodeQueryRowField::optional("equality_negated", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum(
+                        "integer_relation",
+                        &["less_than", "less_than_or_equal", "greater_than", "greater_than_or_equal"]
+                    ),
                     CodeQueryRowField::optional("constant_value", Scalar::Integer),
                     CodeQueryRowField::optional("guarded_value", Scalar::Integer),
                     CodeQueryRowField::optional("classes_value", Scalar::Integer),
@@ -4689,6 +4693,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::Guard { value }, "equality_negated") => {
             value.equality_negated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::Guard { value }, "integer_relation") => {
+            value.integer_relation.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::Guard { value }, "constant_value") => {
             value.constant_value.map(Scalar::Integer)

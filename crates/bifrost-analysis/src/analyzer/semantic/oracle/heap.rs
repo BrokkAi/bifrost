@@ -113,6 +113,18 @@ impl FreshObjectPublicationResult {
     pub fn publications(&self) -> &OracleSet<FreshObjectPublication> {
         &self.publications
     }
+
+    /// Whether every candidate on this bounded publication slice is present
+    /// with proof and completeness evidence. The enclosing provider outcome
+    /// must independently be complete before absence can prove non-publication.
+    pub fn has_exhaustive_proven_inventory(&self) -> bool {
+        self.publications.coverage().is_exhaustive()
+            && self
+                .publications
+                .candidates()
+                .iter()
+                .all(OracleCandidate::is_proven_complete)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

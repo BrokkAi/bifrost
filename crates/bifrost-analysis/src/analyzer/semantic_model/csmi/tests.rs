@@ -5,7 +5,8 @@ use crate::analyzer::semantic_model::{
     AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget, AuthoredSemanticModelPack,
     AuthoredShard, AuthoredSummaryEffect, AuthoredSummaryExitKind, AuthoredSummaryInput,
     AuthoredSummaryOutput, AuthoredSummaryTransfer, CatalogCoordinate, CatalogOptions,
-    CompilerOptions, Completeness, DecodeLimits, ImplicitOperation, Locator, MemberKind,
+    CompilerOptions, Completeness, ConditionalTypeRefinementFact,
+    ConditionalTypeRefinementsPayload, DecodeLimits, ImplicitOperation, Locator, MemberKind,
     ProcedureSummaryTargetKey, RuntimeSourceForm, RuntimeStaticKey,
     SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
@@ -1142,6 +1143,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
                     parameter_count: 1,
                 },
                 completeness: Completeness::Complete,
+                ordinary_heap_unchanged: false,
                 covers_overrides: false,
                 normal_continuation_absent: false,
                 normal_result_count: None,
@@ -1167,6 +1169,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
         runtime_values: None,
         collection_flows: None,
         deferred_yields: None,
+        conditional_type_refinements: None,
     });
     pack
 }
@@ -2184,4 +2187,91 @@ fn recognized_indeterminate_profile_value_remains_uninterpretable() {
             .iter()
             .all(|profile| !profile.semantically_supported)
     );
+}
+
+#[test]
+fn conditional_type_refinement_round_trip_retains_target_arguments() {
+    let mut authored = authored_exact_pack();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut authored.shards[0].payload
+    else {
+        panic!("expected declaration facts");
+    };
+    members[0].callable_family_complete = true;
+    let callable = members[0].id.clone();
+    let target = types[0].id.clone();
+    authored.shards[0].conditional_type_refinements = Some(ConditionalTypeRefinementsPayload {
+        refinements: vec![ConditionalTypeRefinementFact {
+            payload: serde_json::from_value(json!({
+                "kind": "conditional-type-refinement", "callable": callable,
+                "subject": {"kind": "parameter", "position": 0},
+                "outcome": {"kind": "supported", "semantics": "positive-only",
+                    "target": {"kind": "reference", "symbol": target, "arguments": [
+                        {"kind": "reference", "symbol": target}
+                    ]}}
+            }))
+            .unwrap(),
+            coverage: Some(CsmiCoverageStatus::Complete),
+            provenance: Vec::new(),
+        }],
+    });
+    let artifact = CsmiArtifactEvidence::new("pkg:maven/com.acme/widget@1.2.0", artifact_digest());
+    let options = CsmiExportOptions::default();
+    let exported = export_authored_csmi_pack(&authored, &artifact, &options).unwrap();
+    let support = CsmiVocabularySupport::support(
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+    );
+    let imported =
+        import_logical_csmi_pack(&exported, &support, &CompilerOptions::default()).unwrap();
+    let compiled = imported.compile(&CompilerOptions::default()).unwrap();
+    assert_eq!(
+        compiled
+            .shards
+            .iter()
+            .map(
+                |shard| decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default())
+                    .unwrap()
+            )
+            .filter_map(|shard| shard
+                .conditional_type_refinements()
+                .map(|payload| payload.refinements.len()))
+            .sum::<usize>(),
+        1
+    );
+    let reexported = export_csmi_pack(&compiled, &artifact, &options).unwrap();
+    let refinement = |pack: &CsmiLogicalPack| {
+        semantic_value(pack)["semanticModels"][0]["extensionFacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fact| fact["vocabulary"] == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID)
+            .unwrap()["payload"]
+            .clone()
+    };
+    assert_eq!(refinement(&exported), refinement(&reexported));
+    for coverage in [
+        None,
+        Some(CsmiCoverageStatus::Unknown),
+        Some(CsmiCoverageStatus::Partial),
+    ] {
+        authored.shards[0]
+            .conditional_type_refinements
+            .as_mut()
+            .unwrap()
+            .refinements[0]
+            .coverage = coverage;
+        let exported = export_authored_csmi_pack(&authored, &artifact, &options).unwrap();
+        let imported =
+            import_logical_csmi_pack(&exported, &support, &CompilerOptions::default()).unwrap();
+        assert_eq!(
+            imported.pack.shards[0]
+                .conditional_type_refinements
+                .as_ref()
+                .unwrap()
+                .refinements[0]
+                .coverage,
+            coverage
+        );
+    }
 }

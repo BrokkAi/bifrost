@@ -32,6 +32,7 @@ pub enum OracleContractError {
     DuplicateDispatchTarget,
     InconsistentCoverage,
     InvalidCallBinding(&'static str),
+    InvalidPublicationEvent,
     InvalidStoreEvent,
     InvalidStoreObservation,
     StoreLocationMismatch,
@@ -89,6 +90,9 @@ impl fmt::Display for OracleContractError {
             }
             Self::InconsistentCoverage => formatter
                 .write_str("dispatch coverage contradicts an unresolved or truncated boundary"),
+            Self::InvalidPublicationEvent => {
+                formatter.write_str("publication handle does not name a compatible semantic event")
+            }
             Self::InvalidStoreEvent => {
                 formatter.write_str("store handle does not name a MemoryStore event")
             }

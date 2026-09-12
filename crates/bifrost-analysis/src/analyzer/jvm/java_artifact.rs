@@ -525,6 +525,7 @@ fn finish_production(
         runtime_values: None,
         collection_flows: None,
         deferred_yields: None,
+        conditional_type_refinements: None,
     }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),

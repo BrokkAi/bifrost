@@ -31,8 +31,8 @@ use crate::analyzer::semantic::{
     CallableReferenceKind, CallableTarget, CallableTargetResolution, CallerReceiverBinding,
     CaptureMode, CaptureSource, ContentIdentity, GuardPredicate, MemoryAccessKind,
     MemoryLocationKind, SemanticCapability, SemanticEffect, SemanticGapDischarge,
-    SemanticGapImpact, SemanticGapSubject, SemanticLocator, SemanticValueKind, ValueFlowKind,
-    ValueUseKind,
+    SemanticGapImpact, SemanticGapSubject, SemanticLocator, SemanticValueKind,
+    SynchronizationPayload, ValueFlowKind, ValueUseKind,
 };
 use crate::analyzer::semantic::{LengthDelimitedDigest, UnmaterializedExternalTarget};
 use crate::analyzer::semantic_model::{
@@ -1125,15 +1125,13 @@ fn build_result_use_index(
                             .entry(*source)
                             .or_default()
                             .push(*target);
-                    } else if *kind == ValueFlowKind::LanguageDefined
-                        && semantics.value(*target).is_some_and(|value| {
-                            matches!(
-                                &value.kind,
-                                SemanticValueKind::LanguageDefined(kind)
-                                    if kind.as_ref() == "go.defer_capture"
-                            )
-                        })
-                    {
+                    } else if semantics.value(*target).is_some_and(|value| {
+                        matches!(
+                            &value.kind,
+                            SemanticValueKind::LanguageDefined(kind)
+                                if kind.as_ref() == "go.defer_capture"
+                        )
+                    }) {
                         index
                             .deferred_capture_sources
                             .entry(*target)
@@ -2921,6 +2919,7 @@ pub(super) fn nilness_operation_expansions(
         .filter(|shape| shape.outcome.coverage == CallShapeCoverage::Exact)
         .map(|shape| CallShapeValue {
             report: Arc::new(shape.clone()),
+            source: None,
         })
         .collect::<Vec<_>>();
     for shape in contract_shapes {
@@ -5826,9 +5825,9 @@ fn captured_callable_invocation_enumeration_is_open(
 
     semantics.points().iter().any(|point| {
         point.events.iter().any(|event| match event.effect {
-            SemanticEffect::MemoryStore { value, .. } | SemanticEffect::ValueUse { value, .. } => {
-                aliases.contains(&value)
-            }
+            SemanticEffect::MemoryStore { value, .. }
+            | SemanticEffect::AggregateInitializer { value, .. }
+            | SemanticEffect::ValueUse { value, .. } => aliases.contains(&value),
             SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
                 value.is_some_and(|value| aliases.contains(&value))
             }
@@ -5910,6 +5909,7 @@ fn normalized_success_guard_edges(
                     | CompiledResultPredicate::False,
                     GuardPredicate::ConstantBoolean { .. }
                     | GuardPredicate::ConstantEquality { .. }
+                    | GuardPredicate::OrderedIntegerComparison { .. }
                     | GuardPredicate::InstanceOf { .. }
                     | GuardPredicate::ExactClass { .. }
                     | GuardPredicate::HasMember { .. }
@@ -6258,6 +6258,7 @@ fn exact_conditional_wrapper_shape(
             | SemanticEffect::Allocation { .. }
             | SemanticEffect::MemoryLoad { .. }
             | SemanticEffect::MemoryStore { .. }
+            | SemanticEffect::AggregateInitializer { .. }
             | SemanticEffect::Synchronization { .. }
             | SemanticEffect::CallableCreation { .. }
             | SemanticEffect::CaptureBind { .. }
@@ -6603,7 +6604,18 @@ fn conditional_result_consumption(
             SemanticEffect::MemoryLoad { location, .. } => semantics
                 .memory_location(*location)
                 .is_some_and(|location| location.kind.uses_value(result)),
-            SemanticEffect::Synchronization { subject, .. } => *subject == result,
+            SemanticEffect::Synchronization {
+                subject, payload, ..
+            } => {
+                *subject == result
+                    || matches!(
+                        payload,
+                        Some(SynchronizationPayload::Send { value, .. }) if *value == result
+                    )
+            }
+            SemanticEffect::AggregateInitializer {
+                aggregate, value, ..
+            } => *aggregate == result || *value == result,
             SemanticEffect::CallableCreation { callable, .. }
             | SemanticEffect::CallableReference { callable, .. } => {
                 callable.bound_receiver == Some(result)

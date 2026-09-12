@@ -1,7 +1,10 @@
 //! Translation from a verified CSMI v0.1 logical pack into Bifrost authoring
 //! types. No CSMI sidecar or producer-specific metadata is consulted.
 
-use crate::analyzer::semantic_model::{DeferredYieldFact, DeferredYieldsPayload};
+use crate::analyzer::semantic_model::{
+    ConditionalTypeRefinementFact, ConditionalTypeRefinementsPayload, DeferredYieldFact,
+    DeferredYieldsPayload,
+};
 
 use super::canonical::{canonical_pack_manifest, sha256_hex};
 use super::identity::{JVM_IDENTITY_SCHEME, JVM_IDENTITY_VERSION, type_symbol_id};
@@ -438,6 +441,12 @@ fn import_semantic_document(
         });
     }
     import_value_transfer_facts(model, &type_ids, &member_ids, &mut types, &mut members)?;
+    let conditional_type_refinements = import_conditional_type_refinements(
+        model,
+        document.default_provenance.as_deref(),
+        &type_ids,
+        &member_ids,
+    )?;
     let deferred_yields = import_deferred_yields(
         model,
         document.default_provenance.as_deref(),
@@ -565,6 +574,7 @@ fn import_semantic_document(
         runtime_values,
         collection_flows,
         deferred_yields,
+        conditional_type_refinements,
     };
     let summary_shard = AuthoredShard {
         id: format!("csmi.{pack_digest}.procedure-summaries"),
@@ -573,6 +583,7 @@ fn import_semantic_document(
         runtime_values: None,
         collection_flows: None,
         deferred_yields: None,
+        conditional_type_refinements: None,
     };
     Ok(AuthoredSemanticModelPack {
         schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
@@ -726,6 +737,67 @@ fn import_collection_flows(
         });
     }
     Ok((!flows.is_empty()).then_some(CollectionFlowsPayload { flows }))
+}
+
+fn import_conditional_type_refinements(
+    model: &CsmiSemanticModel,
+    default_provenance: Option<&str>,
+    type_ids: &HashMap<String, String>,
+    member_ids: &HashMap<String, String>,
+) -> Result<Option<ConditionalTypeRefinementsPayload>, CsmiImportError> {
+    let mut refinements: Vec<ConditionalTypeRefinementFact> = Vec::new();
+    for (index, fact) in model
+        .extension_facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| fact.vocabulary == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID)
+    {
+        let path = format!("extensionFacts[{index}]");
+        if fact.version != CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION
+            || fact.family != CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY
+        {
+            return Err(CsmiImportError::Unsupported {
+                path,
+                semantic: "unsupported conditional refinement version or family".to_owned(),
+            });
+        }
+        let mut payload: CsmiConditionalTypeRefinement =
+            serde_json::from_value(fact.payload.clone()).map_err(|cause| {
+                CsmiImportError::Unsupported {
+                    path: path.clone(),
+                    semantic: cause.to_string(),
+                }
+            })?;
+        payload.remap_symbols(|symbol| member_ids.get(symbol).or_else(|| type_ids.get(symbol)).cloned()
+            .ok_or_else(|| CsmiImportError::Unsupported { path: path.clone(), semantic: format!("conditional refinement identity {symbol:?} has no exact native declaration mapping") }))?;
+        let coverage = model
+            .completeness_statements
+            .iter()
+            .find(|statement| {
+                statement.vocabulary.as_deref() == Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID)
+                    && statement.version.as_deref()
+                        == Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION)
+                    && statement.family == CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY
+                    && statement.scope == fact.scope
+            })
+            .map(|statement| statement.status);
+        let provenance = runtime_provenance(fact, default_provenance);
+        if let Some(existing) = refinements
+            .iter_mut()
+            .find(|candidate| candidate.payload == payload && candidate.coverage == coverage)
+        {
+            existing.provenance.extend(provenance);
+            existing.provenance.sort_unstable();
+            existing.provenance.dedup();
+        } else {
+            refinements.push(ConditionalTypeRefinementFact {
+                payload,
+                coverage,
+                provenance,
+            });
+        }
+    }
+    Ok((!refinements.is_empty()).then_some(ConditionalTypeRefinementsPayload { refinements }))
 }
 
 fn import_deferred_yields(
@@ -1804,6 +1876,7 @@ fn summary_from_csmi(
         id: format!("csmi-summary.{}", sha256_hex(summary.callable.as_bytes())),
         target,
         completeness,
+        ordinary_heap_unchanged: false,
         covers_overrides: false,
         normal_continuation_absent: false,
         normal_result_count: (!shape.results.is_empty()).then_some(shape.results.len() as u32),

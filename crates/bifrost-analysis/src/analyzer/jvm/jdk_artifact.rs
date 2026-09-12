@@ -398,6 +398,7 @@ impl JdkSourceArchivePackProducer {
                 runtime_values: None,
                 collection_flows: None,
                 deferred_yields: None,
+                conditional_type_refinements: None,
             });
         }
         if record_limit_hit {

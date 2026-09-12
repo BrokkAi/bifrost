@@ -119,6 +119,13 @@ pub enum UnknownReason {
     UnmodeledGuard {
         class: Box<str>,
     },
+    /// The guard's condition is a call on this receiver whose callee the
+    /// adapter cannot model. The developer's predicate states something about
+    /// the receiver on both arms of the guard, and the class-set domain cannot
+    /// say what, so neither arm's set is bounded. Unlike
+    /// [`UnmodeledGuard`](Self::UnmodeledGuard), no class is named: the
+    /// condition spelled a callable, not a class.
+    UnmodeledPredicate,
 }
 
 impl UnknownReason {
@@ -150,6 +157,7 @@ impl UnknownReason {
             Self::ClassObject => "class_object",
             Self::ClassCreation => "class_creation",
             Self::UnmodeledGuard { .. } => "unmodeled_guard",
+            Self::UnmodeledPredicate => "unmodeled_predicate",
         }
     }
 
@@ -181,6 +189,7 @@ impl UnknownReason {
             "scalar_receiver" => Self::ScalarReceiver,
             "class_object" => Self::ClassObject,
             "class_creation" => Self::ClassCreation,
+            "unmodeled_predicate" => Self::UnmodeledPredicate,
             label => Self::UnmodeledGuard {
                 class: label
                     .strip_prefix("unmodeled_guard:")
@@ -948,6 +957,40 @@ pub enum MemberAccessQuery<'a> {
     Load(&'a MemoryLocation),
 }
 
+/// What an opaque guard condition says about a call argument.
+///
+/// The three cases are distinct answers, not degrees of confidence. A
+/// condition that is not a predicate call on a candidate value constrains
+/// nothing; a modeled callee classifies every candidate; an unmodeled callee
+/// says that this value is constrained in a way the engine cannot name, which
+/// holds on both arms of the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallGuardOutcome {
+    /// The condition constrains no value the engine tracks.
+    NoConstraint,
+    /// The callee was modeled: one verdict per candidate, in input order,
+    /// with the same true/false-arm contract as `narrowing_verdicts`.
+    Narrowed {
+        value: ValueId,
+        verdicts: Vec<NarrowingVerdict>,
+    },
+    /// Intersect known candidates on true and exclude them on false. An
+    /// unnamed incoming value acquires the target bound only on true.
+    Intersected {
+        value: ValueId,
+        verdicts: Vec<NarrowingVerdict>,
+        target: ClassSeed,
+    },
+    /// Replace the incoming type on true; the false arm retains it unchanged.
+    /// The replacement still requires an incoming value at the guarded point.
+    Replaced { value: ValueId, target: ClassSeed },
+    /// The condition is a call whose callee could not be modeled. Every
+    /// directly passed argument is constrained by it, in call order: the
+    /// condition says something the engine cannot name about each of them, on
+    /// both arms.
+    Unmodeled { values: Vec<ValueId> },
+}
+
 /// Per-language facts the class-set engine cannot derive from the IR.
 /// Implementations are zero-sized and `'static`; every method receives the
 /// workspace it should consult. `class_hierarchy` describes the known
@@ -1151,12 +1194,15 @@ pub trait TypeFlowAdapter: Send + Sync {
             .collect()
     }
 
-    /// Derive a guard from an exactly resolved workspace predicate call.
-    /// Return the constrained actual argument and one verdict per candidate,
-    /// with the same true/false-arm contract as `narrowing_verdicts`.
-    /// Implementations must validate the current body and callable binding;
-    /// an opaque or effectful body supplies no constraint. These query-local
-    /// facts become ordinary edge kills, whose behavior is summary-keyed.
+    /// Derive a guard from an exactly resolved predicate call.
+    /// Implementations must validate the current body and callable binding.
+    /// A resolved, modeled predicate reports `Narrowed` with the constrained
+    /// actual argument and one verdict per candidate. A predicate call whose
+    /// callee cannot be modeled reports `Unmodeled` with that argument: the
+    /// developer's condition says something about the value that the engine
+    /// cannot name, which is true on both arms. Anything else reports
+    /// `NoConstraint`. These query-local facts become ordinary edge kills,
+    /// whose behavior is summary-keyed.
     fn call_guard_narrowing(
         &self,
         _workspace: &WorkspaceAnalyzer,
@@ -1164,8 +1210,8 @@ pub trait TypeFlowAdapter: Send + Sync {
         _guard: &GuardFact,
         _atoms: &[&ClassIdentity],
         _member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
-    ) -> Option<(ValueId, Vec<NarrowingVerdict>)> {
-        None
+    ) -> CallGuardOutcome {
+        CallGuardOutcome::NoConstraint
     }
 
     /// Return only contracts whose target, actual/formal binding, and class

@@ -403,6 +403,7 @@ fn valid_unknown_reason(reason: &str) -> bool {
             | "scalar_receiver"
             | "class_creation"
             | "class_object"
+            | "unmodeled_predicate"
     )
 }
 

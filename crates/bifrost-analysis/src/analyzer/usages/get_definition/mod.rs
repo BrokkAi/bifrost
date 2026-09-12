@@ -1353,6 +1353,56 @@ pub fn result_binds_by_reference_at_ordinal(
     }
 }
 
+/// Exact pointer-versus-copy binding for a parameter at a callable source
+/// span, including anonymous Go literals. Backing descriptors remain copies
+/// in this domain; unavailable type or source identity remains unknown.
+pub fn parameter_binds_by_reference_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => go::parameter_binds_by_reference_at_span(file, source, start, end, ordinal),
+        _ => None,
+    }
+}
+
+/// Whether one exact Go callable parameter copies a slice, map, or channel
+/// descriptor while preserving its backing storage. Unsupported named types
+/// and missing source identity remain unknown.
+pub fn parameter_preserves_backing_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => go::parameter_preserves_backing_at_span(file, source, start, end, ordinal),
+        _ => None,
+    }
+}
+
+/// Whether one exact indexed Go callable parameter is proven to be a
+/// reference-free primitive value. Unsupported or shadowed types remain
+/// unknown.
+pub fn parameter_is_reference_free_at_ordinal(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    declaration: &CodeUnit,
+    ordinal: usize,
+) -> Option<bool> {
+    match language_for_file(file) {
+        Language::Go => {
+            go::parameter_is_reference_free_at_ordinal(analyzer, file, source, declaration, ordinal)
+        }
+        _ => None,
+    }
+}
+
 /// Prove that an exact selector occurrence names a modeled method declaration.
 /// This consumes resolver-owned selection evidence, not the receiver shape of
 /// a callable value that might have been loaded from a mutable field.

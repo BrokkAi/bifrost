@@ -42,6 +42,7 @@ use crate::analyzer::usages::call_binding::{
     CallBindingCoverage, CallBindingMapping, CallBindingReport, CallBindingRow, CallBindingTarget,
     CallReceiverBinding, call_binding_report,
 };
+use crate::analyzer::usages::call_conversion::ConversionUnknown;
 use crate::analyzer::usages::call_relations::{
     formal_owner_for_callee, python_first_formal_is_bound,
 };
@@ -230,18 +231,19 @@ enum ModelCallBinding {
     Unique {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
-        key: ModeledProcedureKey,
+        key: Box<ModeledProcedureKey>,
         model_id: String,
         model_callable_id: String,
         pack_id: String,
         receiver_type_id: Option<String>,
         signature_id: String,
+        signature: Box<crate::analyzer::semantic_model::Signature>,
         semantic_model_provenance: Arc<SemanticModelProvenance>,
     },
     CompatibleLayout {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
-        key: ModeledProcedureKey,
+        key: Box<ModeledProcedureKey>,
         model_callable_id: String,
         formal_layout_id: String,
         pack_id: String,
@@ -255,6 +257,12 @@ enum ModelCallBinding {
         semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
     },
     Empty,
+    ConversionUnavailable {
+        model_id: Option<String>,
+        pack_id: Option<String>,
+        reason: ConversionUnknown,
+        semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
+    },
     Unavailable,
 }
 
@@ -302,11 +310,8 @@ fn model_formal_layout(
     }
 }
 
-fn model_receiver_binding(
-    target: &crate::analyzer::semantic::UnmaterializedExternalTarget,
-    shape: &CallShapeValue,
-) -> CallReceiverBinding {
-    if target.has_receiver() {
+fn model_receiver_binding(has_receiver: bool, shape: &CallShapeValue) -> CallReceiverBinding {
+    if has_receiver {
         shape
             .report
             .outcome
@@ -327,19 +332,53 @@ fn model_call_binding(
     analyzer: &dyn IAnalyzer,
     arm: &super::dispatch::DispatchArm,
     shape: &CallShapeValue,
+    bindings: &mut CallBindingCache,
 ) -> ModelCallBinding {
-    let Some(target) = arm.unmaterialized_target.as_ref() else {
+    let identity = arm.external_callee_identity.as_ref();
+    let unmaterialized = arm.unmaterialized_target.as_ref();
+    let Some((language, owner, member, has_receiver, arity)) = identity
+        .and_then(|identity| {
+            let has_receiver = arm
+                .exact_external_target
+                .as_ref()
+                .map(|target| target.has_receiver())
+                .or_else(|| unmaterialized.map(|target| target.has_receiver()))?;
+            let arity = arm
+                .exact_external_target
+                .as_ref()
+                .map(|target| target.parameter_count())
+                .or_else(|| unmaterialized.map(|target| target.arity()))?;
+            Some((
+                identity.language().config_label(),
+                identity.owner_fqn(),
+                identity.member(),
+                has_receiver,
+                arity,
+            ))
+        })
+        .or_else(|| {
+            unmaterialized.map(|target| {
+                (
+                    target.language().semantic_pack_label(),
+                    target.owner_fqn(),
+                    target.member(),
+                    target.has_receiver(),
+                    target.arity(),
+                )
+            })
+        })
+    else {
         return ModelCallBinding::Unavailable;
     };
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return ModelCallBinding::Unavailable;
     };
     let modeled_key = ModeledProcedureKey {
-        language: target.language().semantic_pack_label().to_owned(),
-        owner: target.owner_fqn().to_owned(),
-        member: target.member().to_owned(),
-        has_receiver: target.has_receiver(),
-        parameter_count: target.arity(),
+        language: language.to_owned(),
+        owner: owner.to_owned(),
+        member: member.to_owned(),
+        has_receiver,
+        parameter_count: arity,
     };
     let key = SemanticModelCallableKey::new(
         &modeled_key.language,
@@ -351,6 +390,12 @@ fn model_call_binding(
     let application = structured_model_application(shape);
     let model_callable_id = overlay.callable_family_id_for_target(key);
     let matched = overlay.callable_for_application(key, &application);
+    let exact_external_target = arm.exact_external_target.as_ref();
+    let exact_target_matches = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
+        exact_external_target.is_none_or(|target| {
+            symbol.has_exact_artifact_locator(target.procedure().path().as_str(), target.symbol())
+        })
+    };
     let provenance = matched
         .records
         .first()
@@ -361,6 +406,9 @@ fn model_call_binding(
             let Some(symbol) = matched.unique() else {
                 return ModelCallBinding::Unavailable;
             };
+            if !exact_target_matches(symbol) {
+                return ModelCallBinding::Conflict;
+            }
             let Some(signature) = symbol.structured_signature() else {
                 return ModelCallBinding::Incomplete {
                     model_id: model_id.clone(),
@@ -370,7 +418,7 @@ fn model_call_binding(
                 };
             };
             let layout = model_formal_layout(signature, shape);
-            let receiver = model_receiver_binding(target, shape);
+            let receiver = model_receiver_binding(has_receiver, shape);
             let Some(model_provenance) = provenance else {
                 return ModelCallBinding::Unavailable;
             };
@@ -380,19 +428,17 @@ fn model_call_binding(
             let Some(model_callable_id) = model_callable_id else {
                 return ModelCallBinding::Conflict;
             };
-            let receiver_type_id = target
-                .has_receiver()
-                .then(|| symbol.owner_id.clone())
-                .flatten();
+            let receiver_type_id = has_receiver.then(|| symbol.owner_id.clone()).flatten();
             ModelCallBinding::Unique {
                 layout,
                 receiver,
-                key: modeled_key,
+                key: Box::new(modeled_key),
                 model_id,
                 model_callable_id,
                 pack_id,
                 receiver_type_id,
                 signature_id,
+                signature: Box::new(signature.clone()),
                 semantic_model_provenance: model_provenance,
             }
         }
@@ -403,11 +449,9 @@ fn model_call_binding(
             let Some(signature) = symbol.structured_signature() else {
                 return ModelCallBinding::Unavailable;
             };
-            let layout = model_formal_layout(signature, shape);
             let Some(model_callable_id) = model_callable_id else {
                 return ModelCallBinding::Conflict;
             };
-            let formal_layout_id = model_signature_id(&model_callable_id, signature);
             let Some(pack_id) = matched
                 .records
                 .iter()
@@ -418,17 +462,80 @@ fn model_call_binding(
             else {
                 return ModelCallBinding::Conflict;
             };
-            ModelCallBinding::CompatibleLayout {
-                layout,
-                receiver: model_receiver_binding(target, shape),
-                key: modeled_key,
-                model_callable_id,
-                formal_layout_id,
-                pack_id,
-                receiver_type_id: target
-                    .has_receiver()
-                    .then(|| symbol.owner_id.clone())
-                    .flatten(),
+            if crate::analyzer::common::language_for_file(&shape.report.outcome.file)
+                != Language::Java
+            {
+                return ModelCallBinding::CompatibleLayout {
+                    layout: model_formal_layout(signature, shape),
+                    receiver: model_receiver_binding(has_receiver, shape),
+                    key: Box::new(modeled_key),
+                    model_callable_id: model_callable_id.clone(),
+                    formal_layout_id: model_signature_id(&model_callable_id, signature),
+                    pack_id,
+                    receiver_type_id: has_receiver.then(|| symbol.owner_id.clone()).flatten(),
+                };
+            }
+            let candidates = matched
+                .records
+                .iter()
+                .filter(|candidate| exact_target_matches(candidate))
+                .filter_map(|candidate| {
+                    let signature = candidate.structured_signature()?;
+                    Some((candidate.id.clone(), signature.clone()))
+                })
+                .collect::<Vec<_>>();
+            if exact_external_target.is_some() && candidates.is_empty() {
+                return ModelCallBinding::Conflict;
+            }
+            match bindings.select_model_signature(
+                analyzer,
+                &shape.report,
+                shape
+                    .source
+                    .as_deref()
+                    .map(|source| (&shape.report.outcome.file, source)),
+                &candidates,
+            ) {
+                Ok(Some((selected_model_id, selected_signature))) => {
+                    let Some(selected_symbol) = matched
+                        .records
+                        .iter()
+                        .find(|candidate| candidate.id == selected_model_id)
+                    else {
+                        return ModelCallBinding::Unavailable;
+                    };
+                    let receiver_type_id = if has_receiver {
+                        selected_symbol.owner_id.clone()
+                    } else {
+                        None
+                    };
+                    let signature_id = model_signature_id(&selected_model_id, &selected_signature);
+                    let layout = model_formal_layout(&selected_signature, shape);
+                    ModelCallBinding::Unique {
+                        layout,
+                        receiver: model_receiver_binding(has_receiver, shape),
+                        key: Box::new(modeled_key),
+                        model_id: selected_model_id,
+                        model_callable_id,
+                        pack_id,
+                        receiver_type_id,
+                        signature_id,
+                        signature: Box::new(selected_signature),
+                        semantic_model_provenance: Arc::new(selected_symbol.provenance.clone()),
+                    }
+                }
+                Ok(None) => ModelCallBinding::ConversionUnavailable {
+                    model_id: model_id.clone(),
+                    pack_id: Some(pack_id),
+                    reason: ConversionUnknown::SignatureApplicability,
+                    semantic_model_provenance: provenance,
+                },
+                Err(reason) => ModelCallBinding::ConversionUnavailable {
+                    model_id: model_id.clone(),
+                    pack_id: Some(pack_id),
+                    reason,
+                    semantic_model_provenance: provenance,
+                },
             }
         }
         SemanticModelCallableDisposition::Conflict => ModelCallBinding::Conflict,
@@ -648,6 +755,7 @@ mod authored_override_residual_tests {
                 target_id: "target".to_owned(),
                 target_path: "target".to_owned(),
                 target_unit: None,
+                external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_target: None,
                 proof: "proven",
@@ -830,6 +938,11 @@ pub(super) fn call_binding_expansions(
     let mut modeled_key = None;
     let mut model_static_selector_proven = false;
     let mut model_layout_compatible = false;
+    let mut model_conversion_context: Option<(
+        String,
+        String,
+        crate::analyzer::semantic_model::Signature,
+    )> = None;
     // A unique model record can describe the source resolver's declaration
     // even when runtime dispatch remains open. Keep those two facts separate:
     // model provenance never upgrades the dispatch proof below.
@@ -872,11 +985,12 @@ pub(super) fn call_binding_expansions(
         && let Some(arm) = dispatch_answer.as_ref().and_then(|answer| {
             (answer.arms.len() == 1
                 && answer.arms[0].target_unit.is_none()
-                && answer.arms[0].unmaterialized_target.is_some())
+                && (answer.arms[0].unmaterialized_target.is_some()
+                    || answer.arms[0].exact_external_target.is_some()))
             .then(|| &answer.arms[0])
         })
     {
-        match model_call_binding(analyzer, arm, shape) {
+        match model_call_binding(analyzer, arm, shape, bindings) {
             ModelCallBinding::Unique {
                 layout,
                 receiver,
@@ -886,22 +1000,50 @@ pub(super) fn call_binding_expansions(
                 pack_id: resolved_pack_id,
                 receiver_type_id: resolved_receiver_type_id,
                 signature_id: resolved_signature_id,
+                signature: resolved_signature,
                 semantic_model_provenance: resolved_provenance,
             } => {
                 model_static_selector_proven = dispatch_answer
                     .as_ref()
                     .is_some_and(resolver_proven_static_model_selector);
                 target = CallBindingTarget::ResolvedExternal { layout, receiver };
-                signature_id = Some(resolved_signature_id);
-                model_id = Some(resolved_model_id);
                 model_callable_id = Some(resolved_model_callable_id);
                 formal_layout_id = signature_id.clone();
+                model_conversion_context = Some((
+                    resolved_model_id.clone(),
+                    resolved_signature_id.clone(),
+                    *resolved_signature,
+                ));
+                model_id = Some(resolved_model_id);
+                signature_id = Some(resolved_signature_id);
                 pack_id = Some(resolved_pack_id);
                 receiver_type_id = resolved_receiver_type_id;
                 semantic_target_id = Some(arm.target_id.clone());
                 target_origin = Some("semantic_model");
                 semantic_model_provenance = Some(resolved_provenance);
-                modeled_key = Some(key);
+                modeled_key = Some(*key);
+            }
+            ModelCallBinding::ConversionUnavailable {
+                model_id: incomplete_model_id,
+                pack_id: incomplete_pack_id,
+                reason,
+                semantic_model_provenance: incomplete_provenance,
+            } => {
+                target = CallBindingTarget::Unresolved;
+                model_id = incomplete_model_id;
+                pack_id = incomplete_pack_id;
+                target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
+                semantic_model_provenance = incomplete_provenance;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: crate::analyzer::common::language_for_file(&file).config_label(),
+                    message: format!(
+                        "call_bindings model signature conversion is unavailable: {reason:?}"
+                    ),
+                    exhausted_roots: Vec::new(),
+                });
             }
             ModelCallBinding::CompatibleLayout {
                 layout,
@@ -916,14 +1058,14 @@ pub(super) fn call_binding_expansions(
                     .as_ref()
                     .is_some_and(resolver_proven_static_model_selector);
                 model_layout_compatible = true;
+                target = CallBindingTarget::ResolvedExternal { layout, receiver };
                 model_callable_id = Some(resolved_model_callable_id);
                 formal_layout_id = Some(resolved_formal_layout_id);
-                target = CallBindingTarget::ResolvedExternal { layout, receiver };
                 pack_id = Some(resolved_pack_id);
                 receiver_type_id = resolved_receiver_type_id;
                 semantic_target_id = Some(arm.target_id.clone());
                 target_origin = Some("semantic_model");
-                modeled_key = Some(key);
+                modeled_key = Some(*key);
             }
             ModelCallBinding::Conflict => {
                 target = CallBindingTarget::Ambiguous;
@@ -977,12 +1119,17 @@ pub(super) fn call_binding_expansions(
     let mut report = call_binding_report(&file, &shape.report, target);
     // The initial producer consumes exact source signatures. Model signature
     // substitution must not lend a different signature's proof to these rows.
-    let conversion_signature = if model_callable_id.is_none() {
-        signature_id.as_deref()
-    } else {
-        None
-    };
-    bindings.populate_conversions(analyzer, &mut report, conversion_signature);
+    let conversion_signature = signature_id.as_deref();
+    bindings.populate_conversions(
+        analyzer,
+        &mut report,
+        conversion_signature,
+        model_conversion_context
+            .as_ref()
+            .map(|(target, signature_id, signature)| {
+                (target.as_str(), signature_id.as_str(), signature)
+            }),
+    );
     // Conversion proof is independent of exact argument mapping. Its typed
     // uncertainty travels on the conversion field and is charged only when a
     // consumer reads that field, not when a policy selects the binding itself.

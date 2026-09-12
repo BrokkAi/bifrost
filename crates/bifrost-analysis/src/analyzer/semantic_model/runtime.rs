@@ -1746,6 +1746,7 @@ fn procedure_claims_agree(
     right: &CompiledProcedureSummary,
 ) -> bool {
     left.completeness == right.completeness
+        && left.ordinary_heap_unchanged == right.ordinary_heap_unchanged
         && left.covers_overrides == right.covers_overrides
         && left.normal_continuation_absent == right.normal_continuation_absent
         && left.normal_result_count == right.normal_result_count
@@ -2612,8 +2613,10 @@ pub fn acquire_active_semantic_models_with_evidence(
         Err(error) => return catalog_lifecycle_error(request.limits, "identify", error),
     };
     let key = format!(
-        "{request_key}:{}:{}",
-        catalog_identity.mutation_generation, catalog_identity.sqlite_data_version
+        "{request_key}:{}:{}:{}",
+        catalog_identity.instance_identity,
+        catalog_identity.mutation_generation,
+        catalog_identity.sqlite_data_version
     );
     // The activation guard asks whether the analyzer snapshot moved underneath
     // this resolution. Comparing the whole optional identity keeps an analyzer
@@ -3859,6 +3862,7 @@ mod procedure_claim_agreement_tests {
                 parameter_count: 1,
             },
             completeness: Completeness::Complete,
+            ordinary_heap_unchanged: false,
             covers_overrides: false,
             normal_continuation_absent: false,
             normal_result_count: None,
@@ -4013,6 +4017,27 @@ mod procedure_claim_agreement_tests {
         assert!(
             !procedure_claims_agree(&left, &right),
             "override coverage is a trust claim, so conflicting records must refuse"
+        );
+    }
+
+    #[test]
+    fn a_different_ordinary_heap_unchanged_claim_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.ordinary_heap_unchanged = true;
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "heap-preservation certification is a trust claim, so conflicting records must refuse"
+        );
+
+        let mut matching = left.clone();
+        matching.ordinary_heap_unchanged = true;
+        assert!(
+            procedure_claims_agree(&matching, &right),
+            "identical heap-preservation certifications still make one claim"
         );
     }
 

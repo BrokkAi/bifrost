@@ -55,6 +55,13 @@ fn transfer_stops_identity_trace(
             target,
         } if *target == value
             || (*source == value && matches!(transfer.kind, TransferKind::Move { .. }))
+    ) || matches!(
+        effect,
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+            source,
+            target,
+        } if *source == value || *target == value
     )
 }
 
@@ -2094,6 +2101,9 @@ fn effect_names_any(
         SemanticEffect::ValueFlow { source, target, .. } => {
             names.contains(source) || names.contains(target)
         }
+        SemanticEffect::AggregateInitializer {
+            aggregate, value, ..
+        } => names.contains(aggregate) || names.contains(value),
         SemanticEffect::ValueUse { value, .. } => names.contains(value),
         SemanticEffect::MemoryLoad {
             location, result, ..
@@ -2345,6 +2355,14 @@ fn callee_formal_is_nonpublishing(
         })?;
         for event in &point.events {
             match event.effect {
+                SemanticEffect::AggregateInitializer {
+                    aggregate, value, ..
+                } => {
+                    // Unrefined aggregate operands cannot certify nonpublication.
+                    if names.contains(&aggregate) || names.contains(&value) {
+                        return Ok(false);
+                    }
+                }
                 SemanticEffect::MemoryStore {
                     location, value, ..
                 } => {
@@ -2825,23 +2843,27 @@ fn resolve_fresh_object_publications(
         let point_handle = procedure
             .point_handle(point.id)
             .expect("validated publication slice retains its program point");
-        for event in &point.events {
+        for (event_index, event) in point.events.iter().enumerate() {
             let publication = match &event.effect {
                 SemanticEffect::MemoryStore { value, .. } if names.contains(value) => Some((
-                    FreshObjectPublication::at(
+                    FreshObjectPublication::at_event(
                         point_handle.clone(),
+                        event_index,
                         FreshObjectPublicationKind::MemoryStore,
-                    ),
+                    )
+                    .expect("matched memory store is a valid publication event"),
                     *value,
                 )),
                 SemanticEffect::ProcedureReturn { value }
                     if value.is_some_and(|value| names.contains(&value)) =>
                 {
                     Some((
-                        FreshObjectPublication::at(
+                        FreshObjectPublication::at_event(
                             point_handle.clone(),
+                            event_index,
                             FreshObjectPublicationKind::Return,
-                        ),
+                        )
+                        .expect("matched return is a valid publication event"),
                         value.expect("matched return value"),
                     ))
                 }
@@ -2849,10 +2871,12 @@ fn resolve_fresh_object_publications(
                     if value.is_some_and(|value| names.contains(&value)) =>
                 {
                     Some((
-                        FreshObjectPublication::at(
+                        FreshObjectPublication::at_event(
                             point_handle.clone(),
+                            event_index,
                             FreshObjectPublicationKind::Throw,
-                        ),
+                        )
+                        .expect("matched throw is a valid publication event"),
                         value.expect("matched throw value"),
                     ))
                 }
@@ -2860,26 +2884,26 @@ fn resolve_fresh_object_publications(
                     if awaited.is_some_and(|value| names.contains(&value)) =>
                 {
                     Some((
-                        FreshObjectPublication::at(
+                        FreshObjectPublication::at_event(
                             point_handle.clone(),
+                            event_index,
                             FreshObjectPublicationKind::AsyncSuspend,
-                        ),
+                        )
+                        .expect("matched suspension is a valid publication event"),
                         awaited.expect("matched awaited value"),
                     ))
                 }
                 SemanticEffect::ValueFlow {
-                    kind:
-                        ValueFlowKind::Parameter
-                        | ValueFlowKind::Receiver
-                        | ValueFlowKind::Return
-                        | ValueFlowKind::IndexedReturn { .. },
+                    kind: ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. },
                     source,
                     ..
                 } if names.contains(source) => Some((
-                    FreshObjectPublication::at(
+                    FreshObjectPublication::at_event(
                         point_handle.clone(),
+                        event_index,
                         FreshObjectPublicationKind::Return,
-                    ),
+                    )
+                    .expect("matched return flow is a valid publication event"),
                     *source,
                 )),
                 SemanticEffect::CallableCreation { callable, .. }
@@ -2889,10 +2913,12 @@ fn resolve_fresh_object_publications(
                         .is_some_and(|receiver| names.contains(&receiver)) =>
                 {
                     Some((
-                        FreshObjectPublication::at(
+                        FreshObjectPublication::at_event(
                             point_handle.clone(),
+                            event_index,
                             FreshObjectPublicationKind::Capture,
-                        ),
+                        )
+                        .expect("matched bound receiver is a valid publication event"),
                         callable.bound_receiver.expect("matched bound receiver"),
                     ))
                 }
@@ -2902,10 +2928,12 @@ fn resolve_fresh_object_publications(
                     .find(|row| row.id == *capture)
                     .and_then(|capture| match capture.captured {
                         CaptureSource::Value(value) if names.contains(&value) => Some((
-                            FreshObjectPublication::at(
+                            FreshObjectPublication::at_event(
                                 point_handle.clone(),
+                                event_index,
                                 FreshObjectPublicationKind::Capture,
-                            ),
+                            )
+                            .expect("matched capture is a valid publication event"),
                             value,
                         )),
                         CaptureSource::Value(_) | CaptureSource::Location(_) => None,
@@ -4022,6 +4050,14 @@ func assign(holder *Holder) {
             publication.value().kind(),
             FreshObjectPublicationKind::MemoryStore
         );
+        assert!(matches!(
+            semantics
+                .point(publication.value().point().id())
+                .expect("publication point belongs to assign")
+                .events[publication.value().event_index() as usize]
+                .effect,
+            SemanticEffect::MemoryStore { .. }
+        ));
         assert!(matches!(publication.proof(), ProofStatus::Unproven(_)));
         assert!(matches!(
             publication.completeness(),

@@ -101,6 +101,8 @@ pub struct CompiledShard {
     pub(crate) collection_flows: Option<CollectionFlowsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deferred_yields: Option<DeferredYieldsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
     /// The pack-level native C/C++ evidence is repeated in each shard wire
     /// envelope so a shard remains self-describing after extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +132,11 @@ impl CompiledShard {
                 self.deferred_yields
                     .as_ref()
                     .map_or(0, DeferredYieldsPayload::record_count),
+            )
+            .saturating_add(
+                self.conditional_type_refinements
+                    .as_ref()
+                    .map_or(0, ConditionalTypeRefinementsPayload::record_count),
             )
     }
 
@@ -173,6 +180,10 @@ impl CompiledShard {
         self.collection_flows.as_ref()
     }
 
+    pub fn conditional_type_refinements(&self) -> Option<&ConditionalTypeRefinementsPayload> {
+        self.conditional_type_refinements.as_ref()
+    }
+
     pub fn deferred_yields(&self) -> Option<&DeferredYieldsPayload> {
         self.deferred_yields.as_ref()
     }
@@ -206,6 +217,12 @@ pub struct CompiledProcedureSummary {
     pub content_sha256: String,
     pub target: CompiledProcedureTarget,
     pub completeness: Completeness,
+    /// Authored claim that this procedure and its transitive behavior do not
+    /// write, publish, or escape ordinary program storage, or invoke an
+    /// unaccounted callback. Synchronization bookkeeping remains represented
+    /// separately.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ordinary_heap_unchanged: bool,
     /// The author's explicit claim that every implementation outside the
     /// workspace conforms to this summary (#2371). Serialized only when
     /// claimed, so a summary that does not claim it keeps its content digest.
@@ -699,6 +716,8 @@ struct WireCompiledShard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     deferred_yields: Option<DeferredYieldsPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    conditional_type_refinements: Option<ConditionalTypeRefinementsPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cpp_portability: Option<CppPortabilityEvidence>,
     payload: CompiledPayload,
 }
@@ -1009,7 +1028,7 @@ pub fn decode_shard(
             "routing keys do not match payload".to_owned(),
         ));
     }
-    let (defined_ids, referenced_ids) = payload_inventory(&shard.payload);
+    let (defined_ids, referenced_ids) = shard_inventory(&shard);
     if defined_ids != descriptor.defined_ids || referenced_ids != descriptor.referenced_ids {
         return Err(ArtifactError::InvalidDescriptor(
             "declaration inventory does not match payload".to_owned(),
@@ -1082,6 +1101,7 @@ fn compiled_from_wire(wire: WireCompiledShard) -> CompiledShard {
         runtime_values: wire.runtime_values,
         collection_flows: wire.collection_flows,
         deferred_yields: wire.deferred_yields,
+        conditional_type_refinements: wire.conditional_type_refinements,
         cpp_portability: wire.cpp_portability,
         payload: wire.payload,
     }
@@ -1247,6 +1267,8 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         #[serde(skip_serializing_if = "Option::is_none")]
         deferred_yields: &'a Option<DeferredYieldsPayload>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        conditional_type_refinements: &'a Option<ConditionalTypeRefinementsPayload>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         payload: &'a CompiledPayload,
     }
@@ -1263,6 +1285,7 @@ pub(crate) fn semantic_digest(shard: &CompiledShard) -> Result<String, ArtifactE
         runtime_values: &shard.runtime_values,
         collection_flows: &shard.collection_flows,
         deferred_yields: &shard.deferred_yields,
+        conditional_type_refinements: &shard.conditional_type_refinements,
         cpp_portability: &shard.cpp_portability,
         payload: &shard.payload,
     })?;
@@ -1392,6 +1415,36 @@ pub(crate) fn routing_keys(
     keys.sort_unstable();
     keys.dedup();
     keys
+}
+
+pub(crate) fn shard_inventory(shard: &CompiledShard) -> (Vec<String>, Vec<String>) {
+    use super::csmi::{CsmiConditionalTypeOutcome, CsmiTypeExpression};
+    let (defined, mut referenced) = payload_inventory(&shard.payload);
+    if let Some(payload) = &shard.conditional_type_refinements {
+        let mut pending = Vec::new();
+        for fact in &payload.refinements {
+            referenced.push(fact.payload.callable.clone());
+            if let CsmiConditionalTypeOutcome::Supported { target, .. } = &fact.payload.outcome {
+                pending.push(target);
+            }
+        }
+        while let Some(target) = pending.pop() {
+            match target {
+                CsmiTypeExpression::Reference(reference) => {
+                    referenced.push(reference.symbol.clone());
+                    pending.extend(&reference.arguments);
+                }
+                CsmiTypeExpression::Parameter(parameter) => {
+                    referenced.push(parameter.symbol.clone())
+                }
+                CsmiTypeExpression::Intrinsic(_) => {}
+                CsmiTypeExpression::Unknown(_) => {}
+            }
+        }
+        referenced.sort_unstable();
+        referenced.dedup();
+    }
+    (defined, referenced)
 }
 
 pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>) {
@@ -1564,6 +1617,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
             runtime_values: shard.runtime_values.clone(),
             collection_flows: shard.collection_flows.clone(),
             deferred_yields: shard.deferred_yields.clone(),
+            conditional_type_refinements: shard.conditional_type_refinements.clone(),
         }],
     }
 }
@@ -1604,6 +1658,7 @@ fn authored_procedure_summary_from_compiled(
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
+        ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,
@@ -3016,6 +3071,195 @@ mod tests {
         ] {
             let diagnostics =
                 compile_pack(&with_effects(effects), &CompilerOptions::default()).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected_code),
+                "missing {expected_code} in {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_heap_unchanged_defaults_omits_and_round_trips() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| !summary.ordinary_heap_unchanged)
+        );
+        let mut summary = summaries[1].clone();
+        summary.ordinary_heap_unchanged = true;
+        summary.effects.clear();
+        let expected = summary.clone();
+        summaries[1] = summary;
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = &decoded.payload().procedure_summaries().unwrap()[1];
+        assert!(summary.ordinary_heap_unchanged);
+        assert_eq!(authored_procedure_summary_from_compiled(summary), expected);
+        assert!(
+            String::from_utf8(canonical_json(summary).unwrap())
+                .unwrap()
+                .contains("\"ordinary_heap_unchanged\":true")
+        );
+
+        let decoded_default = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            !decoded_default.payload().procedure_summaries().unwrap()[0].ordinary_heap_unchanged
+        );
+        assert!(
+            !String::from_utf8(
+                canonical_json(&decoded_default.payload().procedure_summaries().unwrap()[0])
+                    .unwrap(),
+            )
+            .unwrap()
+            .contains("ordinary_heap_unchanged")
+        );
+    }
+
+    #[test]
+    fn ordinary_heap_unchanged_rejects_incomplete_and_conflicting_claims() {
+        fn with_claim(
+            mutate: impl FnOnce(&mut AuthoredProcedureSummary),
+        ) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            summaries[1].ordinary_heap_unchanged = true;
+            summaries[1].effects.clear();
+            mutate(&mut summaries[1]);
+            authored
+        }
+
+        let call = AuthoredSummaryEffect::Call {
+            event: "event.wrapper.call".to_owned(),
+            callee: "summary.helper".to_owned(),
+        };
+        let escape = AuthoredSummaryEffect::Escape {
+            event: "event.wrapper.escape".to_owned(),
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+        };
+        let unknown = AuthoredSummaryEffect::UnknownCallBoundary {
+            event: "event.wrapper.unknown".to_owned(),
+        };
+        let ambiguous = AuthoredSummaryEffect::AmbiguousCall {
+            event: "event.wrapper.ambiguous".to_owned(),
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            candidates: vec!["summary.helper".to_owned(), "summary.wrapper".to_owned()],
+        };
+        let conditional_write = AuthoredConditionalIndirectWrite {
+            result_ordinal: 0,
+            outcome: true,
+            parameter_ordinal: 0,
+            target: AuthoredIndirectWriteTarget::Pointee,
+        };
+        let storage_location = AuthoredSummaryLocation {
+            id: "location.heap".to_owned(),
+            location_kind: AuthoredSummaryLocationKind::Heap,
+        };
+        let storage_transfer = AuthoredSummaryTransfer {
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            exit_kind: AuthoredSummaryExitKind::Normal,
+            output: AuthoredSummaryOutput::Heap {
+                location: storage_location.id.clone(),
+            },
+            value_transfer: None,
+        };
+        let receiver_transfer = AuthoredSummaryTransfer {
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            exit_kind: AuthoredSummaryExitKind::Normal,
+            output: AuthoredSummaryOutput::Receiver {},
+            value_transfer: None,
+        };
+        let atomic_store = AuthoredConcurrencyEffect::Atomic {
+            location: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            operation: AuthoredAtomicOperation::Store,
+        };
+        let spawn = AuthoredConcurrencyEffect::TaskSpawn {
+            callable: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            group: None,
+        };
+
+        let cases = vec![
+            (
+                with_claim(|summary| summary.completeness = Completeness::Partial),
+                "summary.ordinary_heap_unchanged_on_partial_summary",
+            ),
+            (
+                with_claim(|summary| summary.effects = vec![call]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.effects = vec![escape]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.effects = vec![unknown]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.effects = vec![ambiguous]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| {
+                    summary.normal_result_count = Some(1);
+                    summary.conditional_indirect_writes = vec![conditional_write];
+                }),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| {
+                    summary.locations = vec![storage_location];
+                    summary.transfers = vec![storage_transfer];
+                }),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.transfers = vec![receiver_transfer]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.concurrency_effects = vec![atomic_store]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| summary.concurrency_effects = vec![spawn]),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+            (
+                with_claim(|summary| {
+                    summary.concurrency_effects = vec![AuthoredConcurrencyEffect::Unsupported {
+                        protocol: "unknown.protocol".to_owned(),
+                    }]
+                }),
+                "summary.ordinary_heap_unchanged_conflict",
+            ),
+        ];
+        for (pack, expected_code) in cases {
+            let diagnostics = compile_pack(&pack, &CompilerOptions::default()).unwrap_err();
             assert!(
                 diagnostics
                     .iter()

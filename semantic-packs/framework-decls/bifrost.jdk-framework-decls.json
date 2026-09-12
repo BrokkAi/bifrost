@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "pack_id": "bifrost.jdk-framework-decls",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "producer": {
     "name": "bifrost-framework-foundry",
     "version": "0.9.0"
@@ -133,6 +133,36 @@
               "kind": "artifact",
               "path": "java.base/java/lang/Runtime.java",
               "symbol": "java.lang.Runtime"
+            }
+          },
+          {
+            "id": "jdk.java-lang-string",
+            "name": "java.lang.String",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Object",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String"
             }
           },
           {

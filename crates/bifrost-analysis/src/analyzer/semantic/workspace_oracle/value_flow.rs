@@ -39,9 +39,9 @@ use crate::analyzer::semantic::{
     ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator, SemanticCapability,
     SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
     SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
-    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId, ValueTransfer,
-    assignment_transfer, gap_certifies_canonical_index_identity,
+    SemanticWork, SynchronizationPayload, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId,
+    ValueTransfer, assignment_transfer, gap_certifies_canonical_index_identity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,9 +815,21 @@ fn read_values(
             .flat_map(move |event| -> Vec<ValueId> {
                 match &event.effect {
                     SemanticEffect::Assignment { value, .. } => vec![*value],
+                    SemanticEffect::AggregateInitializer {
+                        aggregate, value, ..
+                    } => vec![*aggregate, *value],
                     SemanticEffect::ValueFlow { source, .. } => vec![*source],
                     SemanticEffect::ValueUse { value, .. } => vec![*value],
                     SemanticEffect::MemoryStore { value, .. } => vec![*value],
+                    SemanticEffect::Synchronization {
+                        subject, payload, ..
+                    } => {
+                        let mut values = vec![*subject];
+                        if let Some(SynchronizationPayload::Send { value, .. }) = payload {
+                            values.push(*value);
+                        }
+                        values
+                    }
                     SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
                         value.iter().copied().collect()
                     }
@@ -1640,7 +1652,10 @@ fn procedure_value_facts(
                     }
                 }
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(_),
+                    kind:
+                        ValueFlowKind::Transfer(_)
+                        | ValueFlowKind::ReferenceBoxing
+                        | ValueFlowKind::ReferenceUnboxing,
                     target,
                     ..
                 } => {
@@ -3735,6 +3750,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     SemanticEffect::Entry
                     | SemanticEffect::NormalExit
                     | SemanticEffect::ExceptionalExit
+                    | SemanticEffect::AggregateInitializer { .. }
                     | SemanticEffect::ValueUse { .. }
                     | SemanticEffect::CallableCreation { .. }
                     | SemanticEffect::CallableReference { .. }
@@ -3884,6 +3900,16 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         false,
                     ),
                     SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+                        source,
+                        target,
+                    } => (
+                        ValueFlowRelationKind::LanguageDefined,
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *source)?),
+                        ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
+                        false,
+                    ),
+                    SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Parameter,
                         source,
                         target,
@@ -3931,7 +3957,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         false,
                     ),
                     SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::LanguageDefined,
+                        kind: ValueFlowKind::LanguageDefined | ValueFlowKind::IntegerOffset { .. },
                         source,
                         target,
                     } => (
@@ -5405,6 +5431,78 @@ mod tests {
     }
 
     #[test]
+    fn integer_offset_is_a_non_identity_value_flow_relation() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "countdown.go",
+                r#"package countdown
+
+func next(depth int) int {
+    return depth - 1
+}
+"#,
+            )
+            .build();
+        let file = project.file("countdown.go");
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let artifact = analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Go semantic materialization runs")
+            .available_value()
+            .cloned()
+            .expect("Go semantic artifact is available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("next")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("next procedure");
+        let oracle = analyzer.semantic_oracle_provider();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let outcome = oracle
+            .procedure_relations(
+                &procedure,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("value-flow relation query runs");
+        let relations = outcome
+            .available_value()
+            .expect("value-flow relation query retains its snapshot")
+            .relations();
+
+        assert!(relations.iter().any(|relation| {
+            let point = relation
+                .point()
+                .procedure()
+                .semantics()
+                .point(relation.point().id())
+                .expect("relation point is retained");
+            let SemanticEffect::ValueFlow { kind, .. } =
+                &point.events[relation.event_index() as usize].effect
+            else {
+                return false;
+            };
+            matches!(kind, ValueFlowKind::IntegerOffset { .. })
+                && relation.kind == ValueFlowRelationKind::LanguageDefined
+                && !kind.preserves_runtime_class()
+        }));
+    }
+
+    #[test]
     fn issue_2835_balanced_templates_preserve_their_typed_quality_bound() {
         fn assert_run_outcomes(
             language: Language,
@@ -5766,7 +5864,7 @@ func arrayCopy() int {
 
         for (name, expected_gaps) in [
             ("literal", 2),
-            ("directLiteral", 1),
+            ("directLiteral", 2),
             ("siblingLiteral", 3),
             ("siblingLiteralNegative", 3),
         ] {

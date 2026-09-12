@@ -76,7 +76,7 @@ const PRODUCER_NAME: &str = "bifrost-framework-foundry";
 
 /// The pack content version. It is the framework content's own version, not the
 /// Bifrost version, and advances when the shipped declarations change.
-const PACK_CONTENT_VERSION: &str = "0.2.0";
+const PACK_CONTENT_VERSION: &str = "0.2.1";
 
 /// The authored framework declarations are Bifrost's own recorded surface,
 /// not a slice of the described library. New Bifrost-owned public packs use
@@ -547,6 +547,7 @@ impl PackIdentity {
                 runtime_values: None,
                 collection_flows: None,
                 deferred_yields: None,
+                conditional_type_refinements: None,
             }],
         }
     }

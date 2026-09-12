@@ -739,6 +739,11 @@
             "$ref": "#/$defs/AuthoredNormalReturnTypeRefinement"
           }
         },
+        "ordinary_heap_unchanged": {
+          "description": "Reviewed claim that this procedure and its transitive behavior do not\nwrite, publish, or escape ordinary program storage, or invoke an\nunaccounted callback. Synchronization bookkeeping named by\n`concurrency_effects` is outside this claim.",
+          "type": "boolean",
+          "default": false
+        },
         "preconditions": {
           "description": "Reviewed predicates required of this exact procedure invocation's\ninputs. Omission means operation preconditions were not reviewed; a\npresent empty list means the procedure was reviewed and requires none.\n\nSerialized only when reviewed so adding this field leaves every\nexisting authored summary's canonical bytes and content digest\nunchanged.",
           "type": [
@@ -921,6 +926,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/CollectionFlowsPayload"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conditional_type_refinements": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConditionalTypeRefinementsPayload"
             },
             {
               "type": "null"
@@ -1625,6 +1640,45 @@
         "complete"
       ]
     },
+    "ConditionalTypeRefinementFact": {
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CsmiCoverageStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": true,
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "payload"
+      ]
+    },
+    "ConditionalTypeRefinementsPayload": {
+      "description": "Native companion for the standardized CSMI conditional-type-refinement\nprofile. Payload references use native declaration IDs inside a pack and\nare remapped to document-local symbols only at the interchange boundary.",
+      "type": "object",
+      "properties": {
+        "refinements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConditionalTypeRefinementFact"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "CppArtifactDigest": {
       "type": "object",
       "properties": {
@@ -2124,6 +2178,14 @@
       "enum": [
         "const",
         "volatile"
+      ]
+    },
+    "CsmiCoverageStatus": {
+      "type": "string",
+      "enum": [
+        "unknown",
+        "partial",
+        "complete"
       ]
     },
     "DeclarationGuard": {

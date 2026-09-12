@@ -169,6 +169,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 }],
             }),
             diagnostics,
@@ -348,6 +349,7 @@ impl PythonArtifactPackProducer {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 }],
             }),
             completeness,
@@ -508,6 +510,7 @@ impl PythonArtifactPackProducer {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 }],
             }),
             completeness,
@@ -1318,36 +1321,38 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
     }
 
     fn hierarchy_type_ref(&self, node: Node<'_>, owner: &str, guard: Option<usize>) -> TypeRef {
-        let parsed = type_ref(node, self.source, self.limits.max_signature_depth);
-        let Some(binding) = self.resolved_hierarchy_binding(node, owner, guard) else {
-            return parsed;
-        };
-        let Some(target) = binding.target else {
-            return parsed;
-        };
-        let TypeRef::Named {
-            arguments,
-            nullable,
-            ..
-        } = parsed
-        else {
-            return parsed;
-        };
-        if !binding.local_type {
-            return TypeRef::Named {
-                name: target,
-                arguments,
-                nullable,
-            };
-        }
-        TypeRef::Declared {
-            id: type_declaration_id(TypeIdentity {
-                ecosystem: "python",
-                name: &target,
-            }),
-            arguments,
-            nullable,
-        }
+        type_ref_with_names(
+            node,
+            self.source,
+            self.limits.max_signature_depth,
+            &|node, name| match self.resolved_hierarchy_binding(node, owner, guard) {
+                Some(ResolvedHierarchyBinding {
+                    target: Some(target),
+                    local_type: true,
+                    ..
+                }) => TypeRef::Declared {
+                    id: type_declaration_id(TypeIdentity {
+                        ecosystem: "python",
+                        name: &target,
+                    }),
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                Some(ResolvedHierarchyBinding {
+                    target: Some(target),
+                    ..
+                }) => TypeRef::Named {
+                    name: target,
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+                _ => TypeRef::Named {
+                    name,
+                    arguments: Vec::new(),
+                    nullable: false,
+                },
+            },
+        )
     }
 
     /// Resolve the AST name of a hierarchy expression through the bindings
@@ -1386,7 +1391,13 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             }
             scope = current.rsplit_once('.').map(|(parent, _)| parent);
         }
-        None
+        (suffix.is_empty()
+            && brokk_bifrost_python::diagnostics::is_python_builtin_or_constant(local))
+        .then(|| ResolvedHierarchyBinding {
+            target: Some(format!("builtins.{local}")),
+            bound_name: format!("builtins.{local}"),
+            local_type: false,
+        })
     }
 
     /// This file's module-level surface, in the form the production's
@@ -2364,6 +2375,19 @@ fn type_parameter_names(list: Node<'_>, source: &str) -> Vec<String> {
 /// degrades every annotated parameter and return to `Any`, which erases the
 /// difference between two overloads of one name.
 fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
+    type_ref_with_names(node, source, max_depth, &|_, name| TypeRef::Named {
+        name,
+        arguments: Vec::new(),
+        nullable: false,
+    })
+}
+
+fn type_ref_with_names(
+    node: Node<'_>,
+    source: &str,
+    max_depth: usize,
+    resolve: &impl Fn(Node<'_>, String) -> TypeRef,
+) -> TypeRef {
     if max_depth == 0 {
         return any_type();
     }
@@ -2373,37 +2397,47 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
         // way, and the shape is the first named child in each case.
         "type" | "constrained_type" | "splat_type" => node
             .named_child(0)
-            .map(|inner| type_ref(inner, source, max_depth - 1))
+            .map(|inner| type_ref_with_names(inner, source, max_depth - 1, resolve))
             .unwrap_or_else(any_type),
-        "identifier" => TypeRef::Named {
-            name: node_identifier(Some(node), source).unwrap_or_else(|| "Any".to_owned()),
-            arguments: Vec::new(),
-            nullable: false,
-        },
-        "attribute" | "member_type" => TypeRef::Named {
-            name: type_name(node, source).unwrap_or_else(|| "Any".to_owned()),
-            arguments: Vec::new(),
-            nullable: false,
-        },
+        "identifier" => resolve(
+            node,
+            node_identifier(Some(node), source).unwrap_or_else(|| "Any".to_owned()),
+        ),
+        "attribute" | "member_type" => resolve(
+            node,
+            type_name(node, source).unwrap_or_else(|| "Any".to_owned()),
+        ),
         "subscript" => {
             let name = node
                 .child_by_field_name("value")
-                .map(|value| type_ref(value, source, max_depth - 1));
+                .map(|value| type_ref_with_names(value, source, max_depth - 1, resolve));
             let arguments = node
                 .child_by_field_name("subscript")
                 .map(|argument| {
                     if argument.kind() == "tuple" {
                         named_children(argument)
-                            .map(|argument| type_ref(argument, source, max_depth - 1))
+                            .map(|argument| {
+                                type_ref_with_names(argument, source, max_depth - 1, resolve)
+                            })
                             .collect()
                     } else {
-                        vec![type_ref(argument, source, max_depth - 1)]
+                        vec![type_ref_with_names(
+                            argument,
+                            source,
+                            max_depth - 1,
+                            resolve,
+                        )]
                     }
                 })
                 .unwrap_or_default();
             match name {
                 Some(TypeRef::Named { name, .. }) => TypeRef::Named {
                     name,
+                    arguments,
+                    nullable: false,
+                },
+                Some(TypeRef::Declared { id, .. }) => TypeRef::Declared {
+                    id,
                     arguments,
                     nullable: false,
                 },
@@ -2416,14 +2450,19 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
             let mut children = named_children(node);
             let name = children
                 .next()
-                .map(|name| type_ref(name, source, max_depth - 1));
+                .map(|name| type_ref_with_names(name, source, max_depth - 1, resolve));
             let arguments = children
                 .flat_map(named_children)
-                .map(|argument| type_ref(argument, source, max_depth - 1))
+                .map(|argument| type_ref_with_names(argument, source, max_depth - 1, resolve))
                 .collect();
             match name {
                 Some(TypeRef::Named { name, .. }) => TypeRef::Named {
                     name,
+                    arguments,
+                    nullable: false,
+                },
+                Some(TypeRef::Declared { id, .. }) => TypeRef::Declared {
+                    id,
                     arguments,
                     nullable: false,
                 },
@@ -2433,7 +2472,7 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
         "union_type" => TypeRef::Named {
             name: "Union".to_owned(),
             arguments: named_children(node)
-                .map(|child| type_ref(child, source, max_depth - 1))
+                .map(|child| type_ref_with_names(child, source, max_depth - 1, resolve))
                 .collect(),
             nullable: false,
         },

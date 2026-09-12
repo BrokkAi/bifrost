@@ -237,6 +237,8 @@ pub struct SemanticModelSymbol {
     pub(crate) extension_receiver_constraints: Vec<TypeRef>,
     #[serde(skip)]
     pub(crate) locator_path: Option<String>,
+    #[serde(skip)]
+    pub(crate) locator_symbol: Option<String>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -640,6 +642,8 @@ pub struct SemanticModelOverlay {
     runtime_values: Vec<RuntimeValueContracts>,
     collection_flows: Vec<CollectionFlowContract>,
     collection_flows_by_callable: HashMap<String, Vec<usize>>,
+    conditional_type_refinements: Vec<ConditionalTypeRefinementContract>,
+    conditional_types_by_callable: HashMap<String, Vec<usize>>,
     deferred_yields: Vec<DeferredYieldContract>,
     deferred_yields_by_scope: HashMap<(String, String, String), Vec<usize>>,
 }
@@ -676,6 +680,21 @@ pub struct CollectionFlowContract {
     pub callable: String,
     pub payload: crate::analyzer::semantic_model::csmi::CsmiCollectionFlowPayload,
     pub coverage: Option<Completeness>,
+}
+
+/// A standard refinement scoped to the exact activated publishing pack.
+#[derive(Debug)]
+pub struct ConditionalTypeRefinementContract {
+    pub provenance: SemanticModelProvenance,
+    pub payload: super::csmi::CsmiConditionalTypeRefinement,
+    pub coverage: Option<super::csmi::CsmiCoverageStatus>,
+}
+
+impl ConditionalTypeRefinementContract {
+    pub fn is_complete(&self) -> bool {
+        self.coverage == Some(super::csmi::CsmiCoverageStatus::Complete)
+            && !self.provenance.ambiguous
+    }
 }
 
 /// One deferred-yield fact retained with the activation evidence of its
@@ -743,6 +762,8 @@ impl SemanticModelOverlay {
                 runtime_values: Vec::new(),
                 collection_flows: Vec::new(),
                 collection_flows_by_callable: HashMap::default(),
+                conditional_type_refinements: Vec::new(),
+                conditional_types_by_callable: HashMap::default(),
                 deferred_yields: Vec::new(),
                 deferred_yields_by_scope: HashMap::default(),
             });
@@ -752,6 +773,7 @@ impl SemanticModelOverlay {
         let mut relation_ids = Vec::new();
         let mut runtime_values = Vec::new();
         let mut collection_flows = Vec::new();
+        let mut conditional_type_refinements = Vec::new();
         let mut deferred_yields = Vec::new();
         let mut declaration_surface_languages: Vec<String> = Vec::new();
         for shard in active.shards() {
@@ -785,6 +807,26 @@ impl SemanticModelOverlay {
                         callable: flow.callable.clone(),
                         payload: flow.payload.clone(),
                         coverage: flow.coverage,
+                    });
+                }
+            }
+            if let Some(payload) = shard.shard.conditional_type_refinements() {
+                for fact in &payload.refinements {
+                    conditional_type_refinements.push(ConditionalTypeRefinementContract {
+                        provenance: provenance(
+                            active,
+                            shard,
+                            &fact.payload.callable,
+                            &model_location(
+                                shard,
+                                "conditional-type-refinement",
+                                &fact.payload.callable,
+                            ),
+                            None,
+                            false,
+                        ),
+                        payload: fact.payload.clone(),
+                        coverage: fact.coverage,
                     });
                 }
             }
@@ -942,6 +984,13 @@ impl SemanticModelOverlay {
                 .or_insert_with(Vec::new)
                 .push(index);
         }
+        let mut conditional_types_by_callable = HashMap::default();
+        for (index, fact) in conditional_type_refinements.iter().enumerate() {
+            conditional_types_by_callable
+                .entry(fact.payload.callable.clone())
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
         let mut deferred_yields_by_scope = HashMap::default();
         for (index, contract) in deferred_yields.iter().enumerate() {
             deferred_yields_by_scope
@@ -973,6 +1022,8 @@ impl SemanticModelOverlay {
             runtime_values,
             collection_flows,
             collection_flows_by_callable,
+            conditional_type_refinements,
+            conditional_types_by_callable,
             deferred_yields,
             deferred_yields_by_scope,
         };
@@ -1046,6 +1097,23 @@ impl SemanticModelOverlay {
         callable: &str,
     ) -> SemanticModelOverlayMatch<'_, CollectionFlowContract> {
         self.collection_flow_match(self.collection_flows_by_callable.get(callable))
+    }
+
+    /// Local declaration IDs are meaningful only within the publishing pack.
+    pub fn conditional_type_refinements_for<'a>(
+        &'a self,
+        callable: &'a SemanticModelSymbol,
+    ) -> impl Iterator<Item = &'a ConditionalTypeRefinementContract> + 'a {
+        self.conditional_types_by_callable
+            .get(&callable.id)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.conditional_type_refinements[*index])
+            .filter(|fact| {
+                fact.provenance.pack_digest == callable.provenance.pack_digest
+                    && fact.provenance.pack_id == callable.provenance.pack_id
+                    && fact.provenance.activation == callable.provenance.activation
+            })
     }
 
     pub fn deferred_yield_contracts(&self) -> &[DeferredYieldContract] {
@@ -1576,10 +1644,10 @@ impl SemanticModelOverlay {
                     missing_signatures.push(member);
                     continue;
                 };
-                match application_match(signature, application) {
-                    SemanticModelApplicationMatch::Exact => exact_candidates.push(member),
-                    SemanticModelApplicationMatch::PossibleSpread => spread_candidates.push(member),
-                    SemanticModelApplicationMatch::Mismatch => application_mismatches = true,
+                match bind_semantic_model_arguments(signature, application) {
+                    SemanticModelArgumentBinding::Exact { .. } => exact_candidates.push(member),
+                    SemanticModelArgumentBinding::PossibleSpread => spread_candidates.push(member),
+                    SemanticModelArgumentBinding::Mismatch => application_mismatches = true,
                 }
             }
         }
@@ -2067,6 +2135,7 @@ impl SemanticModelOverlay {
             &self.symbols_by_owner,
             &self.relations_from,
             &self.relations_to,
+            &self.conditional_types_by_callable,
         ] {
             for (key, posting) in map {
                 index_bytes = index_bytes.saturating_add(key.capacity()).saturating_add(
@@ -2076,6 +2145,15 @@ impl SemanticModelOverlay {
                 );
             }
         }
+        let conditional_bytes =
+            self.conditional_type_refinements
+                .iter()
+                .fold(0usize, |bytes, fact| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<ConditionalTypeRefinementContract>())
+                        .saturating_add(fact.payload.callable.capacity())
+                        .saturating_add(fact.provenance.retained_string_bytes())
+                });
         let deferred_bytes = self.deferred_yields.iter().fold(0usize, |bytes, contract| {
             bytes
                 .saturating_add(std::mem::size_of::<DeferredYieldContract>())
@@ -2100,6 +2178,7 @@ impl SemanticModelOverlay {
                 .saturating_add(symbol_bytes)
                 .saturating_add(relation_bytes)
                 .saturating_add(deferred_bytes)
+                .saturating_add(conditional_bytes)
                 .saturating_add(index_bytes),
         )
         .unwrap_or(u64::MAX)
@@ -2198,21 +2277,25 @@ impl SemanticModelOverlay {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticModelApplicationMatch {
-    Exact,
+/// Exact written argument positions map to signature parameter ordinals.
+/// Positions are positional arguments followed by named arguments in their
+/// written order. A spread never establishes an exact binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticModelArgumentBinding {
+    Exact { parameter_ordinals: Vec<usize> },
     PossibleSpread,
     Mismatch,
 }
 
-fn application_match(
+pub fn bind_semantic_model_arguments(
     signature: &Signature,
     application: &SemanticModelCallApplication,
-) -> SemanticModelApplicationMatch {
+) -> SemanticModelArgumentBinding {
     let Some((positional_count, named_labels, has_spread)) = application.written() else {
-        return SemanticModelApplicationMatch::Mismatch;
+        return SemanticModelArgumentBinding::Mismatch;
     };
     let mut bound = vec![false; signature.parameters.len()];
+    let mut parameter_ordinals = Vec::with_capacity(positional_count + named_labels.len());
 
     for position in 0..positional_count {
         let matched = signature
@@ -2234,9 +2317,10 @@ fn application_match(
                     .map(|(ordinal, _)| ordinal)
             });
         let Some(ordinal) = matched else {
-            return SemanticModelApplicationMatch::Mismatch;
+            return SemanticModelArgumentBinding::Mismatch;
         };
         bound[ordinal] = true;
+        parameter_ordinals.push(ordinal);
     }
 
     for label in named_labels {
@@ -2250,7 +2334,7 @@ fn application_match(
             })
             .map(|(ordinal, _)| ordinal);
         let matched = match declared {
-            Some(ordinal) if bound[ordinal] => return SemanticModelApplicationMatch::Mismatch,
+            Some(ordinal) if bound[ordinal] => return SemanticModelArgumentBinding::Mismatch,
             Some(ordinal) => Some(ordinal),
             None => signature
                 .parameters
@@ -2261,16 +2345,17 @@ fn application_match(
                 .map(|(ordinal, _)| ordinal),
         };
         let Some(ordinal) = matched else {
-            return SemanticModelApplicationMatch::Mismatch;
+            return SemanticModelArgumentBinding::Mismatch;
         };
         if bound[ordinal] && !signature.parameters[ordinal].variadic {
-            return SemanticModelApplicationMatch::Mismatch;
+            return SemanticModelArgumentBinding::Mismatch;
         }
         bound[ordinal] = true;
+        parameter_ordinals.push(ordinal);
     }
 
     if has_spread {
-        return SemanticModelApplicationMatch::PossibleSpread;
+        return SemanticModelArgumentBinding::PossibleSpread;
     }
     if signature
         .parameters
@@ -2278,9 +2363,9 @@ fn application_match(
         .zip(bound)
         .all(|(parameter, bound)| parameter.optional || parameter.variadic || bound)
     {
-        SemanticModelApplicationMatch::Exact
+        SemanticModelArgumentBinding::Exact { parameter_ordinals }
     } else {
-        SemanticModelApplicationMatch::Mismatch
+        SemanticModelArgumentBinding::Mismatch
     }
 }
 
@@ -2291,8 +2376,7 @@ fn binding_layouts_match(left: &Signature, right: &Signature) -> bool {
             .iter()
             .zip(&right.parameters)
             .all(|(left, right)| {
-                left.name == right.name
-                    && left.optional == right.optional
+                left.optional == right.optional
                     && left.variadic == right.variadic
                     && left.passing_mode == right.passing_mode
             })
@@ -2309,6 +2393,14 @@ impl SemanticModelSymbol {
     /// The structured callable signature, when the model published one.
     pub fn structured_signature(&self) -> Option<&Signature> {
         self.structured_signature.as_ref()
+    }
+
+    /// Whether the declaration model record names this exact artifact
+    /// declaration. Both values come from structured locators retained by
+    /// their producers; callers must not reconstruct either from display
+    /// names or rendered signatures.
+    pub fn has_exact_artifact_locator(&self, path: &str, symbol: &str) -> bool {
+        self.locator_path.as_deref() == Some(path) && self.locator_symbol.as_deref() == Some(symbol)
     }
 
     /// Whether this model member is static according to the authored fact.
@@ -4314,6 +4406,7 @@ fn emit_rule_match(
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
                         locator_path: None,
+                        locator_symbol: None,
                         rust_generated_scope: None,
                         location,
                         provenance: model_provenance,
@@ -4368,6 +4461,7 @@ fn emit_rule_match(
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
                             locator_path: None,
+                            locator_symbol: None,
                             rust_generated_scope: None,
                             location,
                             provenance: model_provenance,
@@ -4776,6 +4870,7 @@ fn type_symbol(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
+        locator_symbol: locator_symbol(&record.locator).map(str::to_owned),
         rust_generated_scope: None,
         provenance: provenance(
             active,
@@ -4838,6 +4933,7 @@ fn member_symbol(
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
+        locator_symbol: locator_symbol(&record.locator).map(str::to_owned),
         rust_generated_scope: None,
         provenance: provenance(
             active,
@@ -4854,6 +4950,13 @@ fn member_symbol(
 fn locator_path(locator: &Locator) -> &str {
     match locator {
         Locator::Source { path, .. } | Locator::Artifact { path, .. } => path,
+    }
+}
+
+fn locator_symbol(locator: &Locator) -> Option<&str> {
+    match locator {
+        Locator::Source { symbol, .. } => symbol.as_deref(),
+        Locator::Artifact { symbol, .. } => Some(symbol),
     }
 }
 
@@ -5372,6 +5475,8 @@ mod tests {
             runtime_values: Vec::new(),
             collection_flows: Vec::new(),
             collection_flows_by_callable: HashMap::default(),
+            conditional_type_refinements: Vec::new(),
+            conditional_types_by_callable: HashMap::default(),
             deferred_yields: Vec::new(),
             deferred_yields_by_scope: HashMap::default(),
         };
@@ -5508,6 +5613,7 @@ mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
+            locator_symbol: None,
             rust_generated_scope: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{qualified_name}"),
@@ -5625,6 +5731,7 @@ mod tests {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
+            locator_symbol: None,
             rust_generated_scope: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{}", owner.qualified_name),
@@ -5756,7 +5863,7 @@ mod tests {
     }
 
     #[test]
-    fn external_callable_lookup_keeps_same_arity_overloads_ambiguous() {
+    fn external_callable_lookup_keeps_same_arity_overloads_layout_compatible() {
         let mut owner = class("pkg.Owner", "java");
         owner.provenance.completeness = SemanticModelCompleteness::Partial;
         let mut first = method(
@@ -5781,7 +5888,7 @@ mod tests {
 
         assert_eq!(
             result.disposition,
-            SemanticModelCallableDisposition::Conflict
+            SemanticModelCallableDisposition::CompatibleLayout
         );
         assert_eq!(result.records.len(), 2);
         assert!(result.unique().is_none());
@@ -5903,6 +6010,35 @@ mod tests {
         );
         assert_eq!(result.records.len(), 2);
         assert!(result.unique().is_none(), "no overload was selected");
+    }
+
+    #[test]
+    fn external_callable_application_keeps_different_formal_names_in_one_layout() {
+        let owner = class("pkg.Owner", "java");
+        let first = method(
+            &owner,
+            "member.run.first",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        let second = method(
+            &owner,
+            "member.run.second",
+            "run",
+            Some(signature(&[Some("values")], false)),
+        );
+        let overlay = overlay(vec![owner, first, second], Vec::new());
+
+        let result = overlay.callable_for_application(
+            callable_key(1),
+            &SemanticModelCallApplication::positional(1),
+        );
+
+        assert_eq!(
+            result.disposition,
+            SemanticModelCallableDisposition::CompatibleLayout
+        );
+        assert_eq!(result.records.len(), 2);
     }
 
     #[test]

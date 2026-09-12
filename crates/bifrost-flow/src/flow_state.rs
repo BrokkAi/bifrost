@@ -777,7 +777,10 @@ impl FlowStateDerivation {
                         assignment_conversion_sources.insert(source);
                     }
                     SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Transfer(_),
+                        kind:
+                            ValueFlowKind::Transfer(_)
+                            | ValueFlowKind::ReferenceBoxing
+                            | ValueFlowKind::ReferenceUnboxing,
                         source,
                         target,
                     } => {
@@ -1748,6 +1751,7 @@ impl FlowStateDerivation {
                         | SemanticEffect::Allocation { .. }
                         | SemanticEffect::MemoryLoad { .. }
                         | SemanticEffect::MemoryStore { .. }
+                        | SemanticEffect::AggregateInitializer { .. }
                         | SemanticEffect::CallableCreation { .. }
                         | SemanticEffect::CallableReference { .. }
                         | SemanticEffect::CaptureBind { .. }
@@ -8332,20 +8336,20 @@ func mixed(value *item, err error, ch chan int) int {
         });
         let mixed_procedure = fixture.procedure(0, mixed.procedure);
         let mixed_semantics = mixed_procedure.semantics();
-        let select_gaps = mixed_semantics
+        let channel_gaps = mixed_semantics
             .gaps()
             .iter()
             .filter(|gap| {
                 let mapping = mixed_semantics
                     .source_mapping(gap.source)
-                    .expect("a select gap has a source mapping");
+                    .expect("a channel-send gap has a source mapping");
                 let span = mapping.locator.anchor().span();
                 &GO_ACTIVE_CLEANUP_COMPLETION_RELATIVE_TO_TARGET
                     [span.start_byte() as usize..span.end_byte() as usize]
                     == "ch <- 1"
             })
             .collect::<Vec<_>>();
-        let select_completion = select_gaps
+        let channel_completion = channel_gaps
             .iter()
             .copied()
             .find(|gap| {
@@ -8353,18 +8357,20 @@ func mixed(value *item, err error, ch chan int) int {
                     && gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion
             })
             .unwrap_or_else(|| {
-                panic!("select must publish its exit-only panic gap: {select_gaps:#?}")
+                panic!("channel send must publish its exit-only panic gap: {channel_gaps:#?}")
             });
-        let select_raw_control = select_gaps
+        let channel_control = channel_gaps
             .iter()
             .copied()
             .find(|gap| {
                 gap.capability == SemanticCapability::NormalControlFlow
-                    && gap.discharge == SemanticGapDischarge::None
+                    && gap.discharge == SemanticGapDischarge::RetainedControlTopology
             })
-            .unwrap_or_else(|| panic!("select must retain its raw blocking gap: {select_gaps:#?}"));
+            .unwrap_or_else(|| {
+                panic!("channel send must retain its source-local topology: {channel_gaps:#?}")
+            });
         assert_eq!(
-            select_completion.point, select_raw_control.point,
+            channel_completion.point, channel_control.point,
             "the two obligations intentionally share one retained point"
         );
         let mixed_report = call_handle_spelled(
@@ -8412,7 +8418,7 @@ func mixed(value *item, err error, ch chan int) int {
                 mixed_dominance,
                 &mixed_candidates,
                 &[mixed_report_point],
-                &[select_completion],
+                &[channel_completion],
             )
             .as_ref(),
             [GuardDominanceAnswer::Proven].as_slice(),
@@ -8425,11 +8431,11 @@ func mixed(value *item, err error, ch chan int) int {
                 mixed_dominance,
                 &mixed_candidates,
                 &[mixed_report_point],
-                &[select_completion, select_raw_control],
+                &[channel_completion, channel_control],
             )
             .as_ref(),
             [GuardDominanceAnswer::Open].as_slice(),
-            "a completion marker must not discharge a co-located raw control gap"
+            "the raw helper leaves discharge policy to its semantic consumer"
         );
 
         let cleanup = procedure_containing(&state, |event| {

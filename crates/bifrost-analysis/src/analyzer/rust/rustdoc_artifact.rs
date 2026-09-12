@@ -532,6 +532,7 @@ fn merge_source_set_productions(
             runtime_values: None,
             collection_flows: None,
             deferred_yields: None,
+            conditional_type_refinements: None,
         }],
     });
     ArtifactProduction {
@@ -2220,6 +2221,7 @@ fn finish(
                 runtime_values: None,
                 collection_flows,
                 deferred_yields: None,
+                conditional_type_refinements: None,
             }],
         }),
         completeness,

@@ -14,6 +14,8 @@ use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::{
     PackageRelationKind, PackageRelationValue, RelationalName, model::StructuredTypeNodeView,
 };
+use brokk_bifrost_go::declarations::is_predeclared_go_type;
+use brokk_bifrost_go::graph::reference::go_name_shadowed_at_with_scope;
 use tree_sitter::Tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3237,15 +3239,226 @@ pub fn result_binds_by_reference_at_ordinal(
     go_type_binding_mode(root, type_node, source, type_node)
 }
 
+/// Whether an exact Go callable parameter copies a pointer to its caller's
+/// object. Descriptor copies use the separate backing-store binding domain;
+/// this fact must not equate slice views or interface wrappers with payloads.
+/// Unsupported named reference types and missing type evidence remain unknown.
+pub fn parameter_binds_by_reference_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    go_parameter_binding_mode_at_span(file, source, start, end, ordinal)
+        .map(|mode| matches!(mode, GoParameterBindingMode::Reference))
+}
+
+/// Whether an exact Go callable parameter copies a descriptor that preserves
+/// backing storage. Inline aggregate copies and pointers use their separate
+/// identity domains; named or unavailable types remain unknown.
+pub fn parameter_preserves_backing_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<bool> {
+    go_parameter_binding_mode_at_span(file, source, start, end, ordinal)
+        .map(|mode| matches!(mode, GoParameterBindingMode::BackingDescriptor))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoParameterBindingMode {
+    Reference,
+    BackingDescriptor,
+    ValueCopy,
+}
+
+fn go_parameter_binding_mode_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<GoParameterBindingMode> {
+    if language_for_file(file) != Language::Go || start >= end || end > source.len() {
+        return None;
+    }
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = root.named_descendant_for_byte_range(start, end)?;
+    if callable.start_byte() != start
+        || callable.end_byte() != end
+        || !matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        )
+        || callable.is_missing()
+    {
+        return None;
+    }
+    let type_node = go_parameter_type_node_at_ordinal(callable, ordinal)?;
+    if type_node.is_missing() || type_node.has_error() {
+        return None;
+    }
+    match type_node.kind() {
+        "pointer_type" => Some(GoParameterBindingMode::Reference),
+        "slice_type" | "map_type" | "channel_type" => {
+            Some(GoParameterBindingMode::BackingDescriptor)
+        }
+        "struct_type"
+        | "array_type"
+        | "implicit_length_array_type"
+        | "function_type"
+        | "interface_type" => Some(GoParameterBindingMode::ValueCopy),
+        // The shared named-type proof can establish an inline aggregate.
+        // Its positive result also includes backing descriptors, so it is
+        // insufficient to certify an ordinary pointer binding here.
+        "type_identifier" | "identifier" => {
+            (go_type_binding_mode(root, type_node, source, type_node) == Some(false))
+                .then_some(GoParameterBindingMode::ValueCopy)
+        }
+        _ => None,
+    }
+}
+
+/// Whether one exact indexed Go callable parameter is proven to be a
+/// reference-free primitive value. Only universe numeric and boolean types
+/// are admitted; strings and all named, generic, imported, aggregate, and
+/// recovery forms remain unknown.
+pub fn parameter_is_reference_free_at_ordinal(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    declaration: &CodeUnit,
+    ordinal: usize,
+) -> Option<bool> {
+    if !declaration.is_function()
+        || declaration.is_synthetic()
+        || declaration.source() != file
+        || language_for_file(file) != Language::Go
+    {
+        return None;
+    }
+
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = analyzer
+        .ranges_of(declaration)
+        .into_iter()
+        .find_map(|range| {
+            let node = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            (node.start_byte() == range.start_byte
+                && node.end_byte() == range.end_byte
+                && matches!(node.kind(), "function_declaration" | "method_declaration")
+                && !node.has_error()
+                && !node.is_missing())
+            .then_some(node)
+        })?;
+    let type_node = go_parameter_type_node_at_ordinal(callable, ordinal)?;
+    if type_node.has_error() || type_node.is_missing() {
+        return None;
+    }
+
+    let name = match type_node.kind() {
+        "type_identifier" | "identifier" => go_node_text(type_node, source),
+        _ => return None,
+    };
+    if !go_reference_free_predeclared_name(name) {
+        return None;
+    }
+    if go_enclosing_type_parameter_status(type_node, name, source) != Some(false) {
+        return None;
+    }
+
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    if !go.workspace_declaration_identities_authoritative() {
+        return None;
+    }
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let (imports, dot_imports) = go.definition_import_namespaces(scope.token(), file);
+    if !dot_imports.is_empty() || imports.contains_key(name) {
+        return None;
+    }
+    if go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), name, || true)
+        != Some(false)
+    {
+        return None;
+    }
+
+    let declared_package = go.package_clause_of(file)?;
+    let package = go
+        .workspace_path_index()
+        .canonical_package_name(file, &declared_package);
+    let package_name = format!("{package}.{name}");
+    let module_name = format!(
+        "{package}.{}.{name}",
+        crate::analyzer::GO_MODULE_SCOPE_SEGMENT
+    );
+    if go.definitions(&package_name).next().is_some()
+        || go.definitions(&module_name).next().is_some()
+    {
+        return None;
+    }
+    Some(true)
+}
+
+fn go_reference_free_predeclared_name(name: &str) -> bool {
+    is_predeclared_go_type(name)
+        && matches!(
+            name,
+            "bool"
+                | "byte"
+                | "complex64"
+                | "complex128"
+                | "float32"
+                | "float64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "rune"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+        )
+}
+
 fn go_result_type_node_at_ordinal(callable: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
     let result = callable.child_by_field_name("result")?;
     if result.kind() != "parameter_list" {
         return (ordinal == 0).then_some(result);
     }
 
-    let mut cursor = result.walk();
+    go_parameter_list_type_node_at_ordinal(result, ordinal)
+}
+
+fn go_parameter_type_node_at_ordinal(callable: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
+    let parameters = callable.child_by_field_name("parameters")?;
+    go_parameter_list_type_node_at_ordinal(parameters, ordinal)
+}
+
+fn go_parameter_list_type_node_at_ordinal(
+    parameter_list: Node<'_>,
+    ordinal: usize,
+) -> Option<Node<'_>> {
+    if parameter_list.kind() != "parameter_list" {
+        return None;
+    }
+    let mut cursor = parameter_list.walk();
     let mut next_ordinal = 0usize;
-    for declaration in result.named_children(&mut cursor) {
+    for declaration in parameter_list.named_children(&mut cursor) {
         if !matches!(
             declaration.kind(),
             "parameter_declaration" | "variadic_parameter_declaration"
@@ -3260,6 +3473,9 @@ fn go_result_type_node_at_ordinal(callable: Node<'_>, ordinal: usize) -> Option<
             .max(1);
         let end_ordinal = next_ordinal.checked_add(width)?;
         if ordinal < end_ordinal {
+            if declaration.kind() == "variadic_parameter_declaration" {
+                return None;
+            }
             return Some(type_node);
         }
         next_ordinal = end_ordinal;
@@ -5980,6 +6196,8 @@ mod bounded_tests {
                 ("testing.T", "Stat", true, 0) => Some("testing.T.Stat".to_owned()),
                 ("testing.F", "Fatal", true, 1) => Some("testing.F.Fatal".to_owned()),
                 ("sync.RWMutex", "Lock", true, 0) => Some("sync.RWMutex.Lock".to_owned()),
+                ("sync.RWMutex", "RLock", true, 0) => Some("sync.RWMutex.RLock".to_owned()),
+                ("sync.RWMutex", "RUnlock", true, 0) => Some("sync.RWMutex.RUnlock".to_owned()),
                 _ => None,
             }
         }
@@ -7303,6 +7521,162 @@ func use(table *CacheTable) {
     }
 
     #[test]
+    fn interface_key_map_ranges_preserve_pointer_and_value_elements() {
+        let source = r#"package main
+
+import "sync"
+
+type item struct {
+    sync.RWMutex
+}
+
+type valueItem struct{}
+
+func (valueItem) Run() {}
+
+type table struct {
+    items map[interface{} /* an empty interface key */]*item
+}
+
+type valueTable struct {
+    items map[interface{}]valueItem
+}
+
+type other struct{}
+
+type otherTable struct {
+    items map[interface{}]*other
+}
+
+type unknownTable struct {
+    items map[interface{}]*Missing
+}
+
+func run(t *table) {
+    items := t.items
+    for _, entry := range items {
+        entry.RLock()
+        entry.RUnlock()
+    }
+}
+
+func runValue(t *valueTable) {
+    items := t.items
+    for _, entry := range items {
+        entry.Run()
+    }
+}
+
+func runOther(t *otherTable) {
+    items := t.items
+    for _, otherEntry := range items {
+        otherEntry.RLock()
+    }
+}
+
+func runUnknown(t *unknownTable) {
+    items := t.items
+    for _, unknownEntry := range items {
+        unknownEntry.RLock()
+    }
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        for (expression, member) in [("entry.RLock()", "RLock"), ("entry.RUnlock()", "RUnlock")] {
+            let expected_target = format!("sync.RWMutex.{member}");
+            let site = site_for(&file, source, expression, member);
+            let resolution =
+                resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &site);
+            assert_eq!(
+                resolution.outcome.status,
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "{expression}: {:#?}",
+                resolution.outcome
+            );
+            assert_eq!(
+                resolution
+                    .outcome
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.text.as_str()),
+                Some(expected_target.as_str()),
+                "{expression}: {:#?}",
+                resolution.outcome
+            );
+            let proof = resolution.exact_external_call.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "{expression} must retain one exact promoted target: {:#?}",
+                    resolution.outcome
+                )
+            });
+            assert_eq!(proof.canonical_callee(), expected_target.as_str());
+        }
+
+        let value_site = site_for(&file, source, "entry.Run()", "Run");
+        let value_resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &value_site);
+        assert_eq!(
+            value_resolution.outcome.status,
+            DefinitionLookupStatus::Resolved,
+            "value element range must retain its declared element type: {:#?}",
+            value_resolution.outcome
+        );
+        assert!(
+            value_resolution
+                .outcome
+                .definitions
+                .iter()
+                .any(|definition| { definition.fq_name() == "example.com/app.valueItem.Run" }),
+            "value element range target: {:#?}",
+            value_resolution.outcome
+        );
+
+        let other_site = site_for(&file, source, "otherEntry.RLock()", "RLock");
+        let other_resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &other_site);
+        assert_ne!(
+            other_resolution.outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "a different map element type must not inherit item's promoted method: {:#?}",
+            other_resolution.outcome
+        );
+        assert!(
+            other_resolution
+                .outcome
+                .reference
+                .as_ref()
+                .is_none_or(|reference| reference.text != "sync.RWMutex.RLock"),
+            "different element target: {:#?}",
+            other_resolution.outcome
+        );
+
+        let unknown_site = site_for(&file, source, "unknownEntry.RLock()", "RLock");
+        let unknown_resolution =
+            resolve_with_concrete_testing_receiver(&fixture, &file, source, &tree, &unknown_site);
+        assert_ne!(
+            unknown_resolution.outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "an undeclared map element type must stay unknown: {:#?}",
+            unknown_resolution.outcome
+        );
+        assert!(
+            unknown_resolution
+                .outcome
+                .reference
+                .as_ref()
+                .is_none_or(|reference| reference.text != "sync.RWMutex.RLock"),
+            "unknown element target: {:#?}",
+            unknown_resolution.outcome
+        );
+    }
+
+    #[test]
     fn equally_near_modeled_promotions_remain_ambiguous() {
         let source = r#"package main
 
@@ -8039,6 +8413,254 @@ func Recovery() *NamedSlice {
                 "{reason}",
             );
         }
+    }
+
+    #[test]
+    fn go_parameter_binding_uses_exact_callable_spans_and_preserves_descriptor_copies() {
+        let source = r#"package main
+type Cell struct{}
+type Other struct{}
+func Values(first, second *Cell, value Cell, slice []int, mapping map[int]int, channel chan int, callback func(), boxed interface{}, array [1]int, unknown Missing) {}
+func (Cell) Same(value *Cell) {}
+func (Other) Same(value Cell) {}
+func init() {
+    _ = func(value *Cell) {}
+    _ = func(value Cell) {}
+}
+"#;
+        let file = ProjectFile::new(std::env::temp_dir(), "parameter-binding.go");
+        let tree = parse_tree_for_language(&file, Language::Go, source).expect("Go fixture parses");
+        let mut pending = vec![tree.root_node()];
+        let mut callables = Vec::new();
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            ) {
+                callables.push(node);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        callables.sort_by_key(Node::start_byte);
+        let expected = [
+            vec![
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+            ],
+            vec![Some(true)],
+            vec![Some(false)],
+            vec![],
+            vec![Some(true)],
+            vec![Some(false)],
+        ];
+        let backing_expected = [
+            vec![
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+            ],
+            vec![Some(false)],
+            vec![Some(false)],
+            vec![],
+            vec![Some(false)],
+            vec![Some(false)],
+        ];
+        assert_eq!(callables.len(), expected.len());
+        assert_eq!(callables.len(), backing_expected.len());
+        for ((callable, expected), backing_expected) in
+            callables.into_iter().zip(expected).zip(backing_expected)
+        {
+            for (ordinal, (expected, backing_expected)) in expected
+                .into_iter()
+                .chain([None])
+                .zip(backing_expected.into_iter().chain([None]))
+                .enumerate()
+            {
+                assert_eq!(
+                    parameter_binds_by_reference_at_span(
+                        &file,
+                        source,
+                        callable.start_byte(),
+                        callable.end_byte(),
+                        ordinal
+                    ),
+                    expected,
+                    "exact callable {:?}, ordinal {ordinal}",
+                    callable.range()
+                );
+                assert_eq!(
+                    parameter_preserves_backing_at_span(
+                        &file,
+                        source,
+                        callable.start_byte(),
+                        callable.end_byte(),
+                        ordinal
+                    ),
+                    backing_expected,
+                    "exact callable {:?}, backing ordinal {ordinal}",
+                    callable.range()
+                );
+            }
+            assert_eq!(
+                parameter_binds_by_reference_at_span(
+                    &file,
+                    source,
+                    callable.start_byte(),
+                    callable.end_byte() - 1,
+                    0
+                ),
+                None
+            );
+            assert_eq!(
+                parameter_preserves_backing_at_span(
+                    &file,
+                    source,
+                    callable.start_byte(),
+                    callable.end_byte() - 1,
+                    0
+                ),
+                None
+            );
+        }
+        let recovery = "package main\nfunc broken(value *Cell) { @ }";
+        assert_eq!(
+            parameter_binds_by_reference_at_span(&file, recovery, 13, recovery.len(), 0),
+            None
+        );
+        assert_eq!(
+            parameter_preserves_backing_at_span(&file, recovery, 13, recovery.len(), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn go_parameter_reference_free_uses_exact_ordinals_and_unshadowed_primitives() {
+        let source = r#"package main
+
+type Cell struct{}
+type Alias = int
+type Box[T any] struct{}
+type Left struct{}
+type Right struct{}
+
+func Values(first, second int, flag bool, text string, pointer *Cell, slice []int, values map[int]int, channel chan int, callback func(), boxed interface{}, aggregate struct{}, array [1]int) {}
+func AliasParameter(value Alias) {}
+func Variadic(values ...int) {}
+func Generic[T any](value T) {}
+func (box Box[T]) GenericReceiver(value int) {}
+func (Left) Build(value int) {}
+func (Right) Build(value *Cell) {}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+
+        let values = indexed_go_function_at_start(analyzer, &file, source, "func Values(");
+        for (ordinal, expected) in [
+            (0, Some(true)), // first
+            (1, Some(true)), // second, grouped with first
+            (2, Some(true)), // bool
+            (3, None),       // string
+            (4, None),       // pointer
+            (5, None),       // slice
+            (6, None),       // map
+            (7, None),       // channel
+            (8, None),       // function
+            (9, None),       // interface
+            (10, None),      // struct
+            (11, None),      // array
+            (12, None),      // out of range
+        ] {
+            assert_eq!(
+                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &values, ordinal,),
+                expected,
+                "Values parameter ordinal {ordinal}",
+            );
+        }
+
+        for (marker, expected, reason) in [
+            ("func AliasParameter(", None, "named alias"),
+            ("func Variadic(", None, "variadic parameter"),
+            ("func Generic[", None, "type parameter"),
+            (
+                "func (box Box[T]) GenericReceiver(",
+                None,
+                "generic receiver",
+            ),
+        ] {
+            let function = indexed_go_function_at_start(analyzer, &file, source, marker);
+            assert_eq!(
+                parameter_is_reference_free_at_ordinal(analyzer, &file, source, &function, 0),
+                expected,
+                "{reason}",
+            );
+        }
+
+        let left = indexed_go_function_at_start(analyzer, &file, source, "func (Left) Build(");
+        let right = indexed_go_function_at_start(analyzer, &file, source, "func (Right) Build(");
+        assert_eq!(
+            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &left, 0),
+            Some(true),
+            "the exact Left.Build declaration has a primitive parameter",
+        );
+        assert_eq!(
+            parameter_is_reference_free_at_ordinal(analyzer, &file, source, &right, 0),
+            None,
+            "the exact Right.Build declaration has a pointer parameter",
+        );
+
+        let shadowed_source = r#"package main
+
+type Cell struct{}
+type int *Cell
+
+func Shadowed(value int) {}
+"#;
+        let shadowed_fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("main.go", shadowed_source),
+            ],
+        );
+        let shadowed_analyzer = shadowed_fixture.analyzer.analyzer();
+        let shadowed_file = ProjectFile::new(shadowed_fixture.project_root(), "main.go");
+        let shadowed = indexed_go_function_at_start(
+            shadowed_analyzer,
+            &shadowed_file,
+            shadowed_source,
+            "func Shadowed(",
+        );
+        assert_eq!(
+            parameter_is_reference_free_at_ordinal(
+                shadowed_analyzer,
+                &shadowed_file,
+                shadowed_source,
+                &shadowed,
+                0,
+            ),
+            None,
+            "a package declaration shadowing int must stay unknown",
+        );
     }
 
     #[test]

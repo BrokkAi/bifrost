@@ -121,6 +121,7 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         null_on_true,
         null_target_id,
         equality_negated,
+        integer_relation,
         constant_value,
         guarded_value,
         classes_value,
@@ -140,11 +141,24 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             None,
             None,
+            None,
         ),
         GuardPredicate::ConstantEquality { negated, constant } => (
             None,
             None,
             Some(negated),
+            None,
+            Some(u64::from(constant.get())),
+            None,
+            None,
+            None,
+            None,
+        ),
+        GuardPredicate::OrderedIntegerComparison { relation, constant } => (
+            None,
+            None,
+            None,
+            Some(relation.label()),
             Some(u64::from(constant.get())),
             None,
             None,
@@ -153,6 +167,7 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         ),
         GuardPredicate::InstanceOf { value, classes }
         | GuardPredicate::ExactClass { value, classes, .. } => (
+            None,
             None,
             None,
             None,
@@ -167,6 +182,7 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             None,
             None,
+            None,
             Some(u64::from(value.get())),
             None,
             None,
@@ -177,15 +193,26 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
             None,
             None,
             None,
+            None,
             Some(u64::from(value.get())),
             None,
             Some(u64::from(member.get())),
             None,
         ),
-        GuardPredicate::Opaque { digest } => {
-            (None, None, None, None, None, None, None, Some(digest.get()))
+        GuardPredicate::Opaque { digest } => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(digest.get()),
+        ),
+        GuardPredicate::ConstantBoolean { .. } => {
+            (None, None, None, None, None, None, None, None, None)
         }
-        GuardPredicate::ConstantBoolean { .. } => (None, None, None, None, None, None, None, None),
     };
     CodeQueryGuard {
         id: digest.finish().to_string(),
@@ -199,6 +226,7 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         null_on_true,
         null_target_id,
         equality_negated,
+        integer_relation,
         constant_value,
         guarded_value,
         classes_value,
@@ -277,6 +305,10 @@ mod tests {
                 negated: false,
                 constant: crate::analyzer::semantic::ValueId::new(0),
             },
+            GuardPredicate::OrderedIntegerComparison {
+                relation: crate::analyzer::semantic::IntegerComparison::GreaterThan,
+                constant: crate::analyzer::semantic::ValueId::new(0),
+            },
             GuardPredicate::InstanceOf {
                 value: crate::analyzer::semantic::ValueId::new(0),
                 classes: crate::analyzer::semantic::ValueId::new(1),
@@ -304,7 +336,7 @@ mod tests {
                 "{predicate:?}"
             );
         }
-        assert_eq!(GuardPredicate::LABELS.len(), 8);
+        assert_eq!(GuardPredicate::LABELS.len(), 9);
     }
 
     /// A constant condition proves one arm cannot execute, and which arm that

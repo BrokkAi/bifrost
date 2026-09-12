@@ -1273,6 +1273,10 @@ enum StructuredTypeNode {
     // Keep this appended so the bincode discriminants of existing structured
     // identities remain stable when the C++ rvalue-reference shape is added.
     RvalueReference(StructuredTypeNodeId),
+    // Keep new language-specific leaves appended so existing bincode
+    // discriminants remain stable. This is the exact Go `interface{}` shape;
+    // unsupported or unknown interfaces do not use this node.
+    EmptyInterface,
 }
 
 /// A read-only view of one [`StructuredTypeIdentity`] arena node.
@@ -1286,6 +1290,7 @@ pub enum StructuredTypeNodeView<'a> {
     Pointer(StructuredTypeNodeId),
     Reference(StructuredTypeNodeId),
     RvalueReference(StructuredTypeNodeId),
+    EmptyInterface,
     Array(StructuredTypeNodeId),
     Slice(StructuredTypeNodeId),
     Map {
@@ -1314,6 +1319,7 @@ enum StructuredTypeNodeWire {
         arguments: BoundedStructuredTypeNodeIds,
     },
     RvalueReference(StructuredTypeNodeId),
+    EmptyInterface,
 }
 
 struct BoundedStructuredTypeNodeIds(Vec<StructuredTypeNodeId>);
@@ -1379,6 +1385,7 @@ impl<'de> Deserialize<'de> for StructuredTypeNode {
             StructuredTypeNodeWire::Pointer(inner) => Self::Pointer(inner),
             StructuredTypeNodeWire::Reference(inner) => Self::Reference(inner),
             StructuredTypeNodeWire::RvalueReference(inner) => Self::RvalueReference(inner),
+            StructuredTypeNodeWire::EmptyInterface => Self::EmptyInterface,
             StructuredTypeNodeWire::Array(inner) => Self::Array(inner),
             StructuredTypeNodeWire::Slice(inner) => Self::Slice(inner),
             StructuredTypeNodeWire::Map { key, value } => Self::Map { key, value },
@@ -1419,6 +1426,7 @@ enum CanonicalStructuredTypeNode {
     Pointer(u32),
     Reference(u32),
     RvalueReference(u32),
+    EmptyInterface,
     Array(u32),
     Slice(u32),
     Map { key: u32, value: u32 },
@@ -1592,7 +1600,7 @@ impl StructuredTypeIdentity {
                     let node = self.node(id)?;
                     pending.push(StructuredTypeTraversalFrame::Finish(id));
                     match node {
-                        StructuredTypeNode::Named(_) => {}
+                        StructuredTypeNode::Named(_) | StructuredTypeNode::EmptyInterface => {}
                         StructuredTypeNode::Pointer(inner)
                         | StructuredTypeNode::Reference(inner)
                         | StructuredTypeNode::RvalueReference(inner)
@@ -1640,6 +1648,7 @@ impl StructuredTypeIdentity {
                 StructuredTypeNode::RvalueReference(inner) => {
                     CanonicalStructuredTypeNode::RvalueReference(*canonical_ids.get(inner)?)
                 }
+                StructuredTypeNode::EmptyInterface => CanonicalStructuredTypeNode::EmptyInterface,
                 StructuredTypeNode::Array(inner) => {
                     CanonicalStructuredTypeNode::Array(*canonical_ids.get(inner)?)
                 }
@@ -1689,6 +1698,9 @@ impl StructuredTypeIdentity {
                     7_u8.hash(&mut hasher);
                     digests.get(inner)?.hash(&mut hasher);
                 }
+                StructuredTypeNode::EmptyInterface => {
+                    8_u8.hash(&mut hasher);
+                }
                 StructuredTypeNode::Array(inner) => {
                     3_u8.hash(&mut hasher);
                     digests.get(inner)?.hash(&mut hasher);
@@ -1728,7 +1740,7 @@ impl StructuredTypeIdentity {
             }
             let valid_child = |child: StructuredTypeNodeId| (child.0 as usize) < index;
             match node {
-                StructuredTypeNode::Named(_) => true,
+                StructuredTypeNode::Named(_) | StructuredTypeNode::EmptyInterface => true,
                 StructuredTypeNode::Pointer(inner)
                 | StructuredTypeNode::Reference(inner)
                 | StructuredTypeNode::RvalueReference(inner)
@@ -1762,6 +1774,7 @@ impl StructuredTypeIdentity {
             StructuredTypeNode::RvalueReference(inner) => {
                 StructuredTypeNodeView::RvalueReference(*inner)
             }
+            StructuredTypeNode::EmptyInterface => StructuredTypeNodeView::EmptyInterface,
             StructuredTypeNode::Array(inner) => StructuredTypeNodeView::Array(*inner),
             StructuredTypeNode::Slice(inner) => StructuredTypeNodeView::Slice(*inner),
             StructuredTypeNode::Map { key, value } => StructuredTypeNodeView::Map {
@@ -1799,6 +1812,7 @@ impl StructuredTypeIdentity {
                 StructuredTypeNode::Generic { base, .. } => current = *base,
                 StructuredTypeNode::Array(_)
                 | StructuredTypeNode::Slice(_)
+                | StructuredTypeNode::EmptyInterface
                 | StructuredTypeNode::Map { .. } => return None,
             }
         }
@@ -1964,6 +1978,11 @@ impl StructuredTypeIdentityBuilder {
         self.push(StructuredTypeNode::Named(name))
     }
 
+    /// Adds Go's exact empty-interface (`interface{}`) leaf shape.
+    pub fn empty_interface(&mut self) -> Option<StructuredTypeNodeId> {
+        self.push(StructuredTypeNode::EmptyInterface)
+    }
+
     pub fn pointer(&mut self, inner: StructuredTypeNodeId) -> Option<StructuredTypeNodeId> {
         self.push_with_children(StructuredTypeNode::Pointer(inner), &[inner])
     }
@@ -2053,7 +2072,7 @@ impl StructuredTypeIdentityBuilder {
 
 fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usize, usize)> {
     let edge_count = match node {
-        StructuredTypeNode::Named(_) => 0,
+        StructuredTypeNode::Named(_) | StructuredTypeNode::EmptyInterface => 0,
         StructuredTypeNode::Pointer(_)
         | StructuredTypeNode::Reference(_)
         | StructuredTypeNode::RvalueReference(_)
@@ -2073,6 +2092,7 @@ fn structured_type_node_resource_cost(node: &StructuredTypeNode) -> Option<(usiz
         StructuredTypeNode::Pointer(_)
         | StructuredTypeNode::Reference(_)
         | StructuredTypeNode::RvalueReference(_)
+        | StructuredTypeNode::EmptyInterface
         | StructuredTypeNode::Array(_)
         | StructuredTypeNode::Slice(_)
         | StructuredTypeNode::Map { .. }
@@ -4899,6 +4919,46 @@ mod structured_type_identity_tests {
 
         assert_eq!(key_identity, named);
         assert_eq!(hash(&key_identity), hash(&named));
+    }
+
+    #[test]
+    fn empty_interface_map_key_is_distinct_and_projects_value_after_roundtrip() {
+        let service =
+            StructuredTypeName::new(vec!["Service".to_string()], Vec::new(), false).unwrap();
+        let string =
+            StructuredTypeName::new(vec!["string".to_string()], Vec::new(), false).unwrap();
+
+        let mut interface_builder = StructuredTypeIdentityBuilder::default();
+        let interface_key = interface_builder.empty_interface().unwrap();
+        let service_value = interface_builder.named(service.clone()).unwrap();
+        let interface_root = interface_builder.map(interface_key, service_value).unwrap();
+        let interface_map = interface_builder.finish(interface_root).unwrap();
+
+        let decoded: StructuredTypeIdentity =
+            bincode::deserialize(&bincode::serialize(&interface_map).unwrap()).unwrap();
+        assert_eq!(interface_map, decoded);
+        assert_eq!(hash(&interface_map), hash(&decoded));
+        let key_identity = decoded.clone().into_map_key_with(|| true).unwrap();
+        assert!(matches!(
+            key_identity.view(key_identity.root_id()),
+            Some(StructuredTypeNodeView::EmptyInterface)
+        ));
+
+        let projected = decoded
+            .into_container_element_with(|| true)
+            .expect("map value projection");
+        let mut string_builder = StructuredTypeIdentityBuilder::default();
+        let string_key = string_builder.named(string).unwrap();
+        let string_value = string_builder.named(service.clone()).unwrap();
+        let string_root = string_builder.map(string_key, string_value).unwrap();
+        let string_map = string_builder.finish(string_root).unwrap();
+        assert_ne!(interface_map, string_map);
+
+        let mut named_builder = StructuredTypeIdentityBuilder::default();
+        let named_id = named_builder.named(service).unwrap();
+        let named = named_builder.finish(named_id).unwrap();
+        assert_eq!(projected, named);
+        assert_eq!(hash(&projected), hash(&named));
     }
 }
 

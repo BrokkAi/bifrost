@@ -295,6 +295,7 @@ pub(super) fn measure_artifact_work(
                     | SemanticEffect::NormalExit
                     | SemanticEffect::ExceptionalExit
                     | SemanticEffect::Assignment { .. }
+                    | SemanticEffect::AggregateInitializer { .. }
                     | SemanticEffect::ValueFlow { .. }
                     | SemanticEffect::ValueUse { .. }
                     | SemanticEffect::Allocation { .. }
@@ -939,6 +940,7 @@ fn validate_procedure(
     validate_guard_facts(capabilities, procedure, &control_edges)?;
     validate_switch_facts(capabilities, procedure, &control_edges)?;
     validate_events(
+        key,
         capabilities,
         procedures,
         procedure_locators,
@@ -1148,6 +1150,36 @@ fn validate_guard_facts(
                 ));
             }
         }
+        if let GuardPredicate::OrderedIntegerComparison { constant, .. } = guard.predicate {
+            let Some(subject) = guard.subject else {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!("ordered integer guard {} has no subject", guard.id),
+                ));
+            };
+            ensure_value(id, subject, procedure.values.len(), "ordered guard subject")?;
+            ensure_value(
+                id,
+                constant,
+                procedure.values.len(),
+                "ordered guard constant",
+            )?;
+            if !matches!(
+                procedure.values[constant.index()].kind,
+                SemanticValueKind::UnsignedInteger(_)
+            ) {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!(
+                        "ordered integer guard {} compares against value {constant}, which is a {} rather than a represented integer",
+                        guard.id,
+                        procedure.values[constant.index()].kind.label()
+                    ),
+                ));
+            }
+        }
         match guard.predicate {
             GuardPredicate::InstanceOf { value, classes }
             | GuardPredicate::ExactClass { value, classes, .. } => {
@@ -1164,6 +1196,7 @@ fn validate_guard_facts(
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::ConstantEquality { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::Opaque { .. } => {}
         }
     }
@@ -2102,6 +2135,7 @@ fn validate_control_edges(
 }
 
 fn validate_events(
+    key: &SemanticArtifactKey,
     capabilities: &SemanticCapabilities,
     procedures: &[ProcedureSemanticsParts],
     procedure_locators: &ProcedureLocatorIndex,
@@ -2147,6 +2181,26 @@ fn validate_events(
                     ensure_value(id, *target, procedure.values.len(), "assignment target")?;
                     ensure_value(id, *value, procedure.values.len(), "assigned value")?;
                 }
+                SemanticEffect::AggregateInitializer {
+                    aggregate,
+                    selector,
+                    value,
+                } => {
+                    ensure_value(
+                        id,
+                        *aggregate,
+                        procedure.values.len(),
+                        "aggregate initializer aggregate",
+                    )?;
+                    ensure_value(
+                        id,
+                        *value,
+                        procedure.values.len(),
+                        "aggregate initializer value",
+                    )?;
+                    validate_locator_scope(key, id, "aggregate initializer selector", selector)?;
+                    validate_memory_member_locator(id, selector, "aggregate initializer selector")?;
+                }
                 SemanticEffect::ValueFlow {
                     kind,
                     source,
@@ -2177,6 +2231,9 @@ fn validate_events(
                         | ValueFlowKind::Receiver
                         | ValueFlowKind::Return
                         | ValueFlowKind::IndexedReturn { .. }
+                        | ValueFlowKind::IntegerOffset { .. }
+                        | ValueFlowKind::ReferenceBoxing
+                        | ValueFlowKind::ReferenceUnboxing
                         | ValueFlowKind::LanguageDefined => {}
                     }
                     validate_value_flow_kind(procedure, *kind, *source, *target)?;
@@ -2277,13 +2334,57 @@ fn validate_events(
                     ensure_value(id, *value, procedure.values.len(), "stored value")?;
                     validate_memory_access_kind(procedure, *location, *kind)?;
                 }
-                SemanticEffect::Synchronization { subject, .. } => {
+                SemanticEffect::Synchronization {
+                    operation,
+                    subject,
+                    payload,
+                } => {
                     ensure_value(
                         id,
                         *subject,
                         procedure.values.len(),
                         "synchronization subject",
                     )?;
+                    match (operation, payload) {
+                        (
+                            SynchronizationOperation::ChannelSend,
+                            Some(SynchronizationPayload::Send { value, .. }),
+                        ) => ensure_value(
+                            id,
+                            *value,
+                            procedure.values.len(),
+                            "channel send payload",
+                        )?,
+                        (
+                            SynchronizationOperation::ChannelReceive,
+                            Some(SynchronizationPayload::Receive { result }),
+                        ) => ensure_value(
+                            id,
+                            *result,
+                            procedure.values.len(),
+                            "channel receive result",
+                        )?,
+                        (SynchronizationOperation::ChannelClose, Some(_))
+                        | (
+                            SynchronizationOperation::ChannelSend,
+                            Some(SynchronizationPayload::Receive { .. }),
+                        )
+                        | (
+                            SynchronizationOperation::ChannelReceive,
+                            Some(SynchronizationPayload::Send { .. }),
+                        ) => {
+                            return Err(SemanticIrError::procedure(
+                                id,
+                                SemanticIrErrorKind::EventContract,
+                                format!(
+                                    "{} synchronization at point {} has an incompatible payload role",
+                                    operation.label(),
+                                    point.id
+                                ),
+                            ));
+                        }
+                        (_, None) => {}
+                    }
                 }
                 SemanticEffect::CallableCreation { result, callable } => {
                     validate_callable_value(
@@ -2771,7 +2872,10 @@ fn validate_value_flow_kind(
         ValueFlowKind::Local
         | ValueFlowKind::Transfer(_)
         | ValueFlowKind::BackingStore { .. }
-        | ValueFlowKind::BackingStoreAlternative { .. } => true,
+        | ValueFlowKind::IntegerOffset { .. }
+        | ValueFlowKind::ReferenceBoxing
+        | ValueFlowKind::BackingStoreAlternative { .. }
+        | ValueFlowKind::ReferenceUnboxing => true,
         ValueFlowKind::Parameter => {
             matches!(source_kind, SemanticValueKind::Parameter { .. })
                 || matches!(target_kind, SemanticValueKind::Parameter { .. })
@@ -3390,11 +3494,15 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
         SemanticEffect::Assignment { .. } => {
             &[SemanticCapability::Assignments, SemanticCapability::Values]
         }
+        SemanticEffect::AggregateInitializer { .. } => &[SemanticCapability::Values],
         SemanticEffect::ValueFlow { kind, .. } => match kind {
             ValueFlowKind::Local
             | ValueFlowKind::Transfer(_)
             | ValueFlowKind::BackingStore { .. }
-            | ValueFlowKind::BackingStoreAlternative { .. } => {
+            | ValueFlowKind::IntegerOffset { .. }
+            | ValueFlowKind::ReferenceBoxing
+            | ValueFlowKind::BackingStoreAlternative { .. }
+            | ValueFlowKind::ReferenceUnboxing => {
                 &[SemanticCapability::Values, SemanticCapability::LocalFlow]
             }
             ValueFlowKind::Parameter => &[

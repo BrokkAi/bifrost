@@ -344,6 +344,22 @@ pub struct CallBindingCache {
 }
 
 impl CallBindingCache {
+    /// Select the one structured model overload proven applicable to this
+    /// exact written application, using the conversion cache's source index.
+    pub fn select_model_signature(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        shape: &super::call_shape::CallShapeReport,
+        caller_source: Option<(&ProjectFile, &str)>,
+        candidates: &[(String, crate::analyzer::semantic_model::Signature)],
+    ) -> Result<
+        Option<(String, crate::analyzer::semantic_model::Signature)>,
+        crate::analyzer::usages::call_conversion::ConversionUnknown,
+    > {
+        self.conversions
+            .select_model_signature(analyzer, shape, caller_source, candidates)
+    }
+
     /// Populate the adjacent shared conversion relation using this query's
     /// source cache and the already-selected signature.
     pub fn populate_conversions(
@@ -351,8 +367,20 @@ impl CallBindingCache {
         analyzer: &dyn IAnalyzer,
         report: &mut super::call_binding::CallBindingReport,
         signature: Option<&str>,
+        model_signature: Option<(&str, &str, &crate::analyzer::semantic_model::Signature)>,
     ) {
-        self.conversions.populate(analyzer, report, signature);
+        match model_signature {
+            Some((model_target_id, model_signature_id, signature)) => {
+                self.conversions.populate_model_signature(
+                    analyzer,
+                    report,
+                    model_target_id,
+                    model_signature_id,
+                    signature,
+                )
+            }
+            None => self.conversions.populate(analyzer, report, signature),
+        }
     }
 
     /// The callable's syntax-derived formal parameter layout, read once per

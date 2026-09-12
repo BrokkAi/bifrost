@@ -23,11 +23,11 @@ use crate::dataflow::{
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticProcedureSummary, SummaryCompleteness,
     SummaryConcurrencyAccessPath, SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect,
     SummaryConcurrencyEffectKind, SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation,
-    SummaryConcurrencyTargetCoverage, SummaryDependencyKey, SummaryDimension,
-    SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect, SummaryEffectKey,
-    SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
-    SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
-    SummaryTransfer, SummaryValidationError,
+    SummaryConcurrencySubjectIdentity, SummaryConcurrencyTargetCoverage, SummaryDependencyKey,
+    SummaryDimension, SummaryDimensionClaim, SummaryDimensionStatus, SummaryEffect,
+    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryExit, SummaryExitKind,
+    SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryRecursiveEdge,
+    SummaryRecursiveGroupKey, SummaryTransfer, SummaryValidationError,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 
@@ -1149,6 +1149,7 @@ fn lower_effect(
                 key_by_node,
                 records,
             )?),
+            witness: None,
         },
         CompiledSummaryEffect::Escape { input, .. } => SummaryEffectKey::Escape {
             event,
@@ -1214,6 +1215,12 @@ fn lower_concurrency_effect(
         | CompiledConcurrencyEffect::LockRelease { lock, mode } => {
             SummaryConcurrencyEffectKind::Lock {
                 lock: path(lock)?,
+                identity: match lock {
+                    CompiledSummaryInput::Receiver {} => SummaryConcurrencySubjectIdentity::Backing,
+                    CompiledSummaryInput::Parameter { .. } => {
+                        SummaryConcurrencySubjectIdentity::Value
+                    }
+                },
                 operation: match effect {
                     CompiledConcurrencyEffect::LockAcquire { .. } => {
                         SummaryConcurrencyLockOperation::Acquire

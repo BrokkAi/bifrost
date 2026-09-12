@@ -719,6 +719,11 @@
             "$ref": "#/$defs/AuthoredNormalReturnTypeRefinement"
           }
         },
+        "ordinary_heap_unchanged": {
+          "description": "Reviewed claim that this procedure and its transitive behavior do not\nwrite, publish, or escape ordinary program storage, or invoke an\nunaccounted callback. Synchronization bookkeeping named by\n`concurrency_effects` is outside this claim.",
+          "type": "boolean",
+          "default": false
+        },
         "preconditions": {
           "description": "Reviewed predicates required of this exact procedure invocation's\ninputs. Omission means operation preconditions were not reviewed; a\npresent empty list means the procedure was reviewed and requires none.\n\nSerialized only when reviewed so adding this field leaves every\nexisting authored summary's canonical bytes and content digest\nunchanged.",
           "type": [

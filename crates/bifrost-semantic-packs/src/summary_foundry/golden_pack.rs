@@ -637,6 +637,7 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         id: summary_id(&target.symbol),
         target,
         completeness: candidate.completeness,
+        ordinary_heap_unchanged: false,
         covers_overrides,
         normal_continuation_absent: false,
         normal_result_count: None,
@@ -842,6 +843,7 @@ fn build_pack(
             runtime_values: None,
             collection_flows: None,
             deferred_yields: None,
+            conditional_type_refinements: None,
         }],
     }
 }

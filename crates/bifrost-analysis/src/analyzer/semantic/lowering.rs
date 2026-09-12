@@ -18,12 +18,12 @@ use super::{
     CancellationToken, CaptureBinding, CaptureId, CaptureMode, CaptureSource, ControlContinuation,
     ControlEdge, ControlEdgeKind, Evidence, EvidenceCompleteness, EvidenceId, ExecutionTiming,
     FormalMultiplicity, GuardArm, GuardFactParts, GuardId, GuardPredicate, MemoryAccessKind,
-    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
-    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
-    SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
-    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
+    MemoryLocation, MemoryLocationId, MemoryLocationKind, MemoryValueCopy, ProcedureId,
+    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
+    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
+    SemanticGap, SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind,
+    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole,
+    SemanticValue, SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
     SourceMappingKind, SourcePosition, SourceSpan, StructuralNodeIdentity, SwitchCaseFactParts,
     SwitchEdgeParts, SwitchFactId, SwitchFactKind, SwitchFactParts, SwitchSelectorDomain,
     ValueFlowKind, ValueId,
@@ -1113,12 +1113,23 @@ impl<'a> ProcedureLoweringSession<'a> {
         point: ProgramPointId,
         kind: MemoryLocationKind,
     ) -> Result<MemoryLocationId, ProcedureLoweringError> {
+        self.add_memory_location_with_value_copy(builder, point, kind, MemoryValueCopy::Unknown)
+    }
+
+    pub(crate) fn add_memory_location_with_value_copy(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: MemoryLocationKind,
+        value_copy: MemoryValueCopy,
+    ) -> Result<MemoryLocationId, ProcedureLoweringError> {
         let metadata = self.metadata(point)?;
         let id = MemoryLocationId::try_from_index(self.next_memory_location)
             .map_err(|_| ProcedureLoweringError::Invalid("too many memory locations".into()))?;
         builder.add_memory_location(MemoryLocation {
             id,
             kind,
+            value_copy,
             source: metadata.source,
             evidence: metadata.evidence,
         })?;

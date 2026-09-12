@@ -561,6 +561,7 @@ fn pack_source(
                         parameter_count: entry.boundary.parameter_count,
                     },
                     completeness,
+                    ordinary_heap_unchanged: false,
                     covers_overrides: false,
                     normal_continuation_absent: false,
                     normal_result_count: None,
@@ -581,6 +582,7 @@ fn pack_source(
             runtime_values: None,
             collection_flows: None,
             deferred_yields: None,
+            conditional_type_refinements: None,
         }],
     };
     let mut rendered =

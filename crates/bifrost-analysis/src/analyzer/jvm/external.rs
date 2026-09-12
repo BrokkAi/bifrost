@@ -1329,6 +1329,7 @@ fn merge_java_dependency_packs(
             runtime_values,
             collection_flows,
             deferred_yields,
+            conditional_type_refinements,
         } = shard;
         let (secondary_types, secondary_members, secondary_relations) = match payload {
             AuthoredPayload::DeclarationFacts {
@@ -1345,6 +1346,7 @@ fn merge_java_dependency_packs(
                         runtime_values,
                         collection_flows,
                         deferred_yields,
+                        conditional_type_refinements,
                     });
                 }
                 continue;
@@ -1367,9 +1369,21 @@ fn merge_java_dependency_packs(
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 });
                 index
             });
+        if let Some(mut refinements) = conditional_type_refinements {
+            pack.shards[target_shard_index]
+                .conditional_type_refinements
+                .get_or_insert_with(|| {
+                    crate::analyzer::semantic_model::ConditionalTypeRefinementsPayload {
+                        refinements: Vec::new(),
+                    }
+                })
+                .refinements
+                .append(&mut refinements.refinements);
+        }
         for fact in secondary_types {
             if let Some((shard_index, fact_index)) = type_indexes.get(&fact.id).copied() {
                 let AuthoredPayload::DeclarationFacts { types, .. } =
@@ -4727,6 +4741,7 @@ mod tests {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 },
             );
         }

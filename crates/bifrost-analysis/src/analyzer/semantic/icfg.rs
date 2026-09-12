@@ -23,16 +23,18 @@ use super::workspace_oracle::{
     semantic_locator_work,
 };
 use super::{
-    CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId, CandidateCoverage,
-    ControlContinuation, ControlEdgeKind, DeferredInvocationKind, DispatchBoundary,
-    DispatchBoundaryKind, DispatchHints, DispatchOracle, DispatchResult, EvidenceCompleteness,
-    EvidenceHandle, FormalMultiplicity, LengthDelimitedDigest, OracleLimits, OracleRelationArena,
-    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
-    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticLanguage, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticValue, SemanticValueKind, SemanticWork, StableDigest,
+    AccessPathAtPoint, AliasQuery, AliasResult, CallContinuationKind, CallInvocationMode,
+    CallSiteHandle, CallSiteId, CandidateCoverage, ControlContinuation, ControlEdgeKind,
+    DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchHints, DispatchOracle,
+    DispatchResult, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity,
+    FreshObjectPublicationQuery, FreshObjectPublicationResult, HeapOracle, LengthDelimitedDigest,
+    LocationResult, OracleLimits, OracleRelationArena, OracleRelationHandle, OracleRelationId,
+    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
+    PointsToResult, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
+    SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
+    SemanticWork, StableDigest, StoreAtPoint, UpdateEligibility, ValueAtPoint,
 };
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
@@ -1583,6 +1585,54 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
         Ok(outcome)
     }
 }
+
+impl HeapOracle for WorkspaceIcfgProvider<'_> {
+    fn pointees(
+        &self,
+        value: &ValueAtPoint,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<PointsToResult>, SemanticProviderError> {
+        self.record_artifact_read(value.point().procedure());
+        self.oracle.pointees(value, request)
+    }
+
+    fn locations(
+        &self,
+        access: &AccessPathAtPoint,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<LocationResult>, SemanticProviderError> {
+        self.record_artifact_read(access.point().procedure());
+        self.oracle.locations(access, request)
+    }
+
+    fn alias(
+        &self,
+        query: &AliasQuery,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<AliasResult>, SemanticProviderError> {
+        self.record_artifact_read(query.left().point().procedure());
+        self.oracle.alias(query, request)
+    }
+
+    fn fresh_object_publications(
+        &self,
+        query: &FreshObjectPublicationQuery,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<FreshObjectPublicationResult>, SemanticProviderError> {
+        self.record_artifact_read(query.observation().procedure());
+        self.oracle.fresh_object_publications(query, request)
+    }
+
+    fn update_eligibility(
+        &self,
+        store: &StoreAtPoint,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<UpdateEligibility>, SemanticProviderError> {
+        self.record_artifact_read(store.store().point().procedure());
+        self.oracle.update_eligibility(store, request)
+    }
+}
+
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
     fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
         self.behavior_identity

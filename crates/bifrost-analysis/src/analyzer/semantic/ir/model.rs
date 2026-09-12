@@ -717,10 +717,40 @@ impl MemoryLocationKind {
     }
 }
 
+/// How assigning a language value to a memory slot preserves heap identity.
+///
+/// This fact describes the value held by the slot, independently of the
+/// slot's own storage. Consumers must still prove which store reaches a load
+/// before applying it. `Unknown` never implies either reference identity or
+/// an inline value copy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryValueCopy {
+    #[default]
+    Unknown,
+    /// The stored value has its own inline identity after the copy.
+    Value,
+    /// The copied value denotes the same referenced runtime object.
+    Reference,
+    /// The copied descriptor denotes the same indexed backing store.
+    BackingStore { identity: IndexedLocationIdentity },
+}
+
+impl MemoryValueCopy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Value => "value",
+            Self::Reference => "reference",
+            Self::BackingStore { .. } => "backing_store",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemoryLocation {
     pub id: MemoryLocationId,
     pub kind: MemoryLocationKind,
+    pub value_copy: MemoryValueCopy,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
 }
@@ -1601,6 +1631,34 @@ pub enum TransferOperation {
     Unknown,
 }
 
+/// One signed integer magnitude without a host-width signed cast.
+///
+/// The representation covers `-u128::MAX` through `u128::MAX`. Negative zero
+/// is canonicalized to positive zero at construction so equal offsets have one
+/// stable IR representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignedIntegerMagnitude {
+    negative: bool,
+    magnitude: u128,
+}
+
+impl SignedIntegerMagnitude {
+    pub const fn new(negative: bool, magnitude: u128) -> Self {
+        Self {
+            negative: negative && magnitude != 0,
+            magnitude,
+        }
+    }
+
+    pub const fn negative(self) -> bool {
+        self.negative
+    }
+
+    pub const fn magnitude(self) -> u128 {
+        self.magnitude
+    }
+}
+
 impl TransferOperation {
     pub const fn label(self) -> &'static str {
         match self {
@@ -1658,6 +1716,11 @@ pub enum ValueFlowKind {
     BackingStore {
         offset: BackingStoreOffset,
     },
+    /// `target` is `source` plus one exact signed integer magnitude. This is a
+    /// scalar computation, not a heap-identity or runtime-class relation.
+    IntegerOffset {
+        offset: SignedIntegerMagnitude,
+    },
     /// The target uses either the source backing store at `offset` or the
     /// named fresh allocation.  The allocation is a bounded alternative, not
     /// an additional ordinary value-flow edge; consumers must retain both
@@ -1673,6 +1736,15 @@ pub enum ValueFlowKind {
     IndexedReturn {
         ordinal: u32,
     },
+    /// The source reference value is stored in a distinct interface or
+    /// wrapper representation. The wrapper's storage identity is separate
+    /// from the referenced payload; this edge preserves ordinary value
+    /// dependence without claiming that the two values alias.
+    ReferenceBoxing,
+    /// A reference payload is extracted from a wrapper after the producer
+    /// proved the compatible assertion. The extracted reference may retain
+    /// its payload identity, but the wrapper itself remains a separate value.
+    ReferenceUnboxing,
     LanguageDefined,
 }
 
@@ -1683,9 +1755,12 @@ impl ValueFlowKind {
     pub const fn preserves_runtime_class(self) -> bool {
         match self {
             Self::Transfer(transfer) => transfer.preserves_runtime_class(),
-            Self::LanguageDefined
-            | Self::BackingStore { .. }
-            | Self::BackingStoreAlternative { .. } => false,
+            Self::BackingStore { .. }
+            | Self::IntegerOffset { .. }
+            | Self::ReferenceBoxing
+            | Self::ReferenceUnboxing
+            | Self::BackingStoreAlternative { .. }
+            | Self::LanguageDefined => false,
             Self::Local
             | Self::Parameter
             | Self::Receiver
@@ -1699,11 +1774,14 @@ impl ValueFlowKind {
             Self::Local => "local",
             Self::Transfer(_) => "transfer",
             Self::BackingStore { .. } => "backing_store",
+            Self::IntegerOffset { .. } => "integer_offset",
             Self::BackingStoreAlternative { .. } => "backing_store_alternative",
             Self::Parameter => "parameter",
             Self::Receiver => "receiver",
             Self::Return => "return",
             Self::IndexedReturn { .. } => "indexed_return",
+            Self::ReferenceBoxing => "reference_boxing",
+            Self::ReferenceUnboxing => "reference_unboxing",
             Self::LanguageDefined => "language_defined",
         }
     }
@@ -1772,6 +1850,44 @@ impl SynchronizationOperation {
     }
 }
 
+/// The part of a synchronization operation that carries a language value.
+///
+/// A send records a payload only when the language front end can prove how
+/// the channel element copy preserves object identity. A receive records its
+/// result independently; a consumer must still pair it with one exact send
+/// before relating the two values. Missing payload metadata is an unsupported
+/// transport fact, never evidence that no value crossed the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SynchronizationPayload {
+    Send {
+        value: ValueId,
+        copy: SynchronizationPayloadCopy,
+    },
+    Receive {
+        result: ValueId,
+    },
+}
+
+/// The identity-preserving part of a channel element copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SynchronizationPayloadCopy {
+    /// A pointer or channel descriptor preserves the referenced object.
+    Reference,
+    /// A container descriptor preserves its backing store. The indexed
+    /// identity distinguishes sequence elements from associative aggregates
+    /// so a receive can retain the producer-authored location family.
+    BackingStore { identity: IndexedLocationIdentity },
+}
+
+impl SynchronizationPayloadCopy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::BackingStore { .. } => "backing_store",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallContinuationKind {
     Normal,
@@ -1813,6 +1929,19 @@ pub enum SemanticEffect {
         target: ValueId,
         value: ValueId,
     },
+    /// One keyed operand of an aggregate whose layout was unavailable to the
+    /// file-local producer.  The selector is the exact source key locator and
+    /// `value` is the already-lowered RHS value.  This is an operand relation
+    /// only: it does not identify a struct field, map entry, copy, alias, or
+    /// storage location.  The fact is emitted at the aggregate expression's
+    /// post-child terminal point, after the RHS has been evaluated. A
+    /// workspace-aware provider may refine it when the aggregate declaration
+    /// is available.
+    AggregateInitializer {
+        aggregate: ValueId,
+        selector: SemanticLocator,
+        value: ValueId,
+    },
     ValueFlow {
         kind: ValueFlowKind,
         source: ValueId,
@@ -1838,6 +1967,7 @@ pub enum SemanticEffect {
     Synchronization {
         operation: SynchronizationOperation,
         subject: ValueId,
+        payload: Option<SynchronizationPayload>,
     },
     CallableCreation {
         result: ValueId,
@@ -1885,6 +2015,7 @@ impl SemanticEffect {
             Self::NormalExit => "normal_exit",
             Self::ExceptionalExit => "exceptional_exit",
             Self::Assignment { .. } => "assignment",
+            Self::AggregateInitializer { .. } => "aggregate_initializer",
             Self::ValueFlow { .. } => "value_flow",
             Self::ValueUse { .. } => "value_use",
             Self::Allocation { .. } => "allocation",
@@ -1979,6 +2110,8 @@ impl ProgramPoint {
             matches!(next.effect, SemanticEffect::ValueFlow {
                 kind: ValueFlowKind::Transfer(_)
                     | ValueFlowKind::BackingStore { .. }
+                    | ValueFlowKind::ReferenceBoxing
+                    | ValueFlowKind::ReferenceUnboxing
                     | ValueFlowKind::BackingStoreAlternative { .. },
                 source,
                 target: transferred,
@@ -2064,6 +2197,44 @@ impl GuardConditionDigest {
     }
 }
 
+/// The ordered relation between a guard subject and an exact integer constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntegerComparison {
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+impl IntegerComparison {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LessThan => "less_than",
+            Self::LessThanOrEqual => "less_than_or_equal",
+            Self::GreaterThan => "greater_than",
+            Self::GreaterThanOrEqual => "greater_than_or_equal",
+        }
+    }
+
+    pub const fn reverse(self) -> Self {
+        match self {
+            Self::LessThan => Self::GreaterThan,
+            Self::LessThanOrEqual => Self::GreaterThanOrEqual,
+            Self::GreaterThan => Self::LessThan,
+            Self::GreaterThanOrEqual => Self::LessThanOrEqual,
+        }
+    }
+
+    pub const fn negate(self) -> Self {
+        match self {
+            Self::LessThan => Self::GreaterThanOrEqual,
+            Self::LessThanOrEqual => Self::GreaterThan,
+            Self::GreaterThan => Self::LessThanOrEqual,
+            Self::GreaterThanOrEqual => Self::LessThan,
+        }
+    }
+}
+
 /// The normalized meaning of one decision point's condition (issue #2443).
 ///
 /// A lowerer publishes a predicate only when its own structured syntax
@@ -2085,6 +2256,11 @@ pub enum GuardPredicate {
     /// The condition compares the subject against a constant value.
     /// `negated` distinguishes an inequality from an equality.
     ConstantEquality { negated: bool, constant: ValueId },
+    /// The subject is ordered relative to one represented integer constant.
+    OrderedIntegerComparison {
+        relation: IntegerComparison,
+        constant: ValueId,
+    },
     /// The condition tests whether `value` is an instance of one or more
     /// classes denoted by `classes`.
     InstanceOf { value: ValueId, classes: ValueId },
@@ -2125,6 +2301,7 @@ impl GuardPredicate {
         "constant_boolean",
         "null_comparison",
         "constant_equality",
+        "ordered_integer_comparison",
         "instance_of",
         "exact_class",
         "has_member",
@@ -2137,6 +2314,7 @@ impl GuardPredicate {
             Self::ConstantBoolean { .. } => "constant_boolean",
             Self::NullComparison { .. } => "null_comparison",
             Self::ConstantEquality { .. } => "constant_equality",
+            Self::OrderedIntegerComparison { .. } => "ordered_integer_comparison",
             Self::InstanceOf { .. } => "instance_of",
             Self::ExactClass { .. } => "exact_class",
             Self::HasMember { .. } => "has_member",
@@ -2152,6 +2330,7 @@ impl GuardPredicate {
             Self::ConstantBoolean { value } => Some(value),
             Self::NullComparison { .. }
             | Self::ConstantEquality { .. }
+            | Self::OrderedIntegerComparison { .. }
             | Self::InstanceOf { .. }
             | Self::ExactClass { .. }
             | Self::HasMember { .. }

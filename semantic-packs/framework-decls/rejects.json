@@ -1,6 +1,6 @@
 {
   "format": "bifrost_framework_pack_audit/v1",
-  "types_total": 10,
+  "types_total": 11,
   "members_total": 53,
   "packs": [
     {
@@ -19,7 +19,7 @@
       "pinned": true,
       "ecosystem": "jdk",
       "completeness": "partial",
-      "types": 7,
+      "types": 8,
       "members": 36
     }
   ]

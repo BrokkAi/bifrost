@@ -748,7 +748,7 @@ pub struct CodeQueryGuard {
     pub range: CodeQueryRange,
     pub point: CodeQueryProgramPointRef,
     /// `constant_boolean`, `null_comparison`, `constant_equality`,
-    /// `instance_of`, `has_member`, or `opaque`.
+    /// `ordered_integer_comparison`, `instance_of`, `has_member`, or `opaque`.
     pub predicate: &'static str,
     /// For a constant condition, the value it always takes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -765,6 +765,9 @@ pub struct CodeQueryGuard {
     /// inequality rather than an equality.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equality_negated: Option<bool>,
+    /// The ordered relation between the subject and `constant_value`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integer_relation: Option<&'static str>,
     /// The procedure-local value ID of the constant in a constant comparison.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constant_value: Option<u64>,

@@ -47,12 +47,20 @@ pub use planned::{
     TypestateCanonicalObservation, TypestatePlannedEvidence, TypestatePlannedResult,
     TypestatePlannedSolveError, solve_typestate_planned,
 };
+pub(crate) use production::direct_publication_destination;
+pub(crate) use production::{
+    DirectConcurrencyPath, DirectScalarSource, direct_concurrency_path,
+    direct_concurrency_value_path, direct_scalar_source, direct_scalar_summary_port,
+};
 pub use production::{
+    ProductionSemanticSummaryAcquisition, ProductionSemanticSummaryAcquisitionKind,
     ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
     ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
     ProductionTypestateSolveError, ProductionTypestateSolveResult,
     ProductionTypestateSummaryRepository, TypestateProductionCacheStatus,
-    TypestateSummaryRepositoryLimits, project_production_semantic_summaries,
+    TypestateSummaryRepositoryLimits, acquire_production_semantic_summaries,
+    acquire_production_semantic_summaries_with_concurrency, project_production_semantic_summaries,
+    project_production_semantic_summaries_with_concurrency,
     solve_typestate_with_production_summaries,
 };
 pub use protocol::{

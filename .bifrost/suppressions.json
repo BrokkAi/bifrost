@@ -159,7 +159,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "2e56bb534e204007e10f2cd620a9fc2eb14ac93b2cc31e7c20354b185b1fff52",
+      "finding_id": "464030cfb0dd2eb1d5a7b2b1cf69248ea8f9b5e2afda42c401c7d807bc469100",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -171,7 +171,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "0556d2cf0972ea8d2d2a4d4e48e025d16598c823f631771a31e32ace115ef26e",
+      "finding_id": "f161bb34e9a96cd61f35b2f63130be3485a6054666fd93e542c78e9f94a31fbb",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",

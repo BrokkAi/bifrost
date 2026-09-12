@@ -119,10 +119,11 @@ pub use service::semantic_artifact_retained_bytes;
 #[cfg(any(test, feature = "test-support"))]
 pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
 pub use type_flow::{
-    ClassAtom, ClassHierarchy, ClassIdentity, ClassSeed, DispatchHint, DispatchHintCallSiteKey,
-    DispatchHintSet, DispatchHints, DynamicFieldWrite, ExternalMemberDeclaration, MemberAccessKind,
-    MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit, NarrowingVerdict,
-    NormalReturnTypeConstraint, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason,
-    type_flow_adapter, validate_prepared_syntax_for_procedure,
+    CallGuardOutcome, ClassAtom, ClassHierarchy, ClassIdentity, ClassSeed, DispatchHint,
+    DispatchHintCallSiteKey, DispatchHintSet, DispatchHints, DynamicFieldWrite,
+    ExternalMemberDeclaration, MemberAccessKind, MemberAccessQuery, MemberDeclaration,
+    MemberLookup, MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, SourceSite,
+    SourceSiteKind, TypeFlowAdapter, UnknownReason, type_flow_adapter,
+    validate_prepared_syntax_for_procedure,
 };
 pub use workspace_oracle::*;

@@ -100,6 +100,7 @@ pub(super) fn call_shape_expansions_for_input(
     }
     let value = CallShapeValue {
         report: Arc::new(report),
+        source: Some(Arc::from(facts.source())),
     };
     vec![pipeline_expansion(PipelineValue::CallShape(value))]
 }

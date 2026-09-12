@@ -1551,6 +1551,7 @@ pub enum FreshObjectPublicationKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FreshObjectPublication {
     point: ProgramPointHandle,
+    event_index: u32,
     kind: FreshObjectPublicationKind,
     call: Option<CallSiteHandle>,
 }
@@ -1566,27 +1567,90 @@ impl FreshObjectPublication {
             .procedure()
             .point_handle(row.point)
             .ok_or(OracleContractError::InvalidSemanticScope)?;
+        let mut events = point
+            .procedure()
+            .semantics()
+            .point(point.id())
+            .expect("program-point handles are validated at construction")
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id())
+                    .then_some(index)
+            });
+        let event_index = events
+            .next()
+            .filter(|_| events.next().is_none())
+            .ok_or(OracleContractError::InvalidPublicationEvent)?;
         Ok(Self {
             point,
+            event_index: u32::try_from(event_index)
+                .map_err(|_| OracleContractError::InvalidPublicationEvent)?,
             kind: FreshObjectPublicationKind::Call,
             call: Some(call),
         })
     }
 
-    pub fn at(point: ProgramPointHandle, kind: FreshObjectPublicationKind) -> Self {
-        assert!(
-            kind != FreshObjectPublicationKind::Call,
-            "call publications retain their exact call-site handle"
+    pub fn at_event(
+        point: ProgramPointHandle,
+        event_index: usize,
+        kind: FreshObjectPublicationKind,
+    ) -> Result<Self, OracleContractError> {
+        if kind == FreshObjectPublicationKind::Call {
+            return Err(OracleContractError::InvalidPublicationEvent);
+        }
+        let event = point
+            .procedure()
+            .semantics()
+            .point(point.id())
+            .expect("program-point handles are validated at construction")
+            .events
+            .get(event_index)
+            .ok_or(OracleContractError::InvalidPublicationEvent)?;
+        let compatible = matches!(
+            (kind, &event.effect),
+            (
+                FreshObjectPublicationKind::MemoryStore,
+                SemanticEffect::MemoryStore { .. }
+            ) | (
+                FreshObjectPublicationKind::Return,
+                SemanticEffect::ProcedureReturn { .. }
+                    | SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. },
+                        ..
+                    }
+            ) | (
+                FreshObjectPublicationKind::Throw,
+                SemanticEffect::Throw { .. }
+            ) | (
+                FreshObjectPublicationKind::AsyncSuspend,
+                SemanticEffect::AsyncSuspend { .. }
+            ) | (
+                FreshObjectPublicationKind::Capture,
+                SemanticEffect::CallableCreation { .. }
+                    | SemanticEffect::CallableReference { .. }
+                    | SemanticEffect::CaptureBind { .. }
+            )
         );
-        Self {
+        if !compatible {
+            return Err(OracleContractError::InvalidPublicationEvent);
+        }
+        Ok(Self {
             point,
+            event_index: u32::try_from(event_index)
+                .map_err(|_| OracleContractError::InvalidPublicationEvent)?,
             kind,
             call: None,
-        }
+        })
     }
 
     pub fn point(&self) -> &ProgramPointHandle {
         &self.point
+    }
+
+    pub const fn event_index(&self) -> u32 {
+        self.event_index
     }
 
     pub const fn kind(&self) -> FreshObjectPublicationKind {

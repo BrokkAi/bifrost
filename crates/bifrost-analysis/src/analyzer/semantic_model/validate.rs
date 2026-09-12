@@ -235,19 +235,35 @@ impl Validator {
                 );
             }
         }
-        if pack
-            .shards
-            .iter()
-            .any(|shard| shard.deferred_yields.is_some())
-        {
-            if native_deferred_depth_within(pack, self.limits.max_depth) {
-                self.diagnostics
-                    .extend(validate_native_deferred_contracts(pack));
+        if pack.shards.iter().any(|shard| {
+            shard.deferred_yields.is_some() || shard.conditional_type_refinements.is_some()
+        }) {
+            if native_profile_depth_within(pack, self.limits.max_depth) {
+                if self.validate_references {
+                    self.diagnostics
+                        .extend(validate_native_profile_contracts(pack));
+                } else {
+                    let model = native_contract_model(pack);
+                    self.diagnostics.extend(
+                        super::csmi::validate_native_deferred_yield_model(&model)
+                            .into_iter()
+                            .chain(super::csmi::validate_native_conditional_type_payloads(
+                                &model,
+                            ))
+                            .map(|diagnostic| {
+                                Diagnostic::error(
+                                    diagnostic.code,
+                                    diagnostic.path,
+                                    diagnostic.message,
+                                )
+                            }),
+                    );
+                }
             } else {
                 self.error(
                     "limit.deferred_depth",
                     "$.shards",
-                    "deferred-yield shape nesting exceeds the configured depth budget",
+                    "standard-profile type or shape nesting exceeds the configured depth budget",
                 );
             }
         }
@@ -288,12 +304,19 @@ impl Validator {
                         .as_ref()
                         .map_or(0, CollectionFlowsPayload::record_count),
                 );
-            let records = records.saturating_add(
-                shard
-                    .deferred_yields
-                    .as_ref()
-                    .map_or(0, DeferredYieldsPayload::record_count),
-            );
+            let records = records
+                .saturating_add(
+                    shard
+                        .deferred_yields
+                        .as_ref()
+                        .map_or(0, DeferredYieldsPayload::record_count),
+                )
+                .saturating_add(
+                    shard
+                        .conditional_type_refinements
+                        .as_ref()
+                        .map_or(0, ConditionalTypeRefinementsPayload::record_count),
+                );
             if records == 0 {
                 self.error(
                     "shard.empty_payload",
@@ -1739,6 +1762,8 @@ impl Validator {
             }
         }
 
+        self.ordinary_heap_unchanged(path, summary);
+
         if let Some(normal_result_count) = summary.normal_result_count
             && normal_result_count > MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
         {
@@ -2140,6 +2165,94 @@ impl Validator {
                 format!("{path}.concurrency_effects"),
                 format!("task_join and wait_group_wait make duplicate join claims for {group:?}"),
             );
+        }
+    }
+
+    fn ordinary_heap_unchanged(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        if !summary.ordinary_heap_unchanged {
+            return;
+        }
+        if summary.completeness != Completeness::Complete {
+            self.error(
+                "summary.ordinary_heap_unchanged_on_partial_summary",
+                format!("{path}.ordinary_heap_unchanged"),
+                "ordinary_heap_unchanged requires completeness: complete",
+            );
+        }
+        for (index, effect) in summary.effects.iter().enumerate() {
+            let conflict = match effect {
+                AuthoredSummaryEffect::Allocation {
+                    output:
+                        AuthoredSummaryOutput::Capture { .. }
+                        | AuthoredSummaryOutput::Receiver {}
+                        | AuthoredSummaryOutput::Heap { .. },
+                    ..
+                } => Some("an allocation into ordinary storage is not unchanged"),
+                AuthoredSummaryEffect::Allocation { .. } => None,
+                AuthoredSummaryEffect::Call { .. } => {
+                    Some("a transitive call requires its own heap-preservation certification")
+                }
+                AuthoredSummaryEffect::Escape { .. } => {
+                    Some("an escape contradicts ordinary_heap_unchanged")
+                }
+                AuthoredSummaryEffect::UnknownCall { .. }
+                | AuthoredSummaryEffect::UnknownCallBoundary { .. }
+                | AuthoredSummaryEffect::AmbiguousCall { .. } => {
+                    Some("unknown or ambiguous behavior contradicts ordinary_heap_unchanged")
+                }
+                AuthoredSummaryEffect::Sanitize { .. } => None,
+            };
+            if let Some(conflict) = conflict {
+                self.error(
+                    "summary.ordinary_heap_unchanged_conflict",
+                    format!("{path}.effects[{index}]"),
+                    conflict,
+                );
+            }
+        }
+        if !summary.conditional_indirect_writes.is_empty() {
+            self.error(
+                "summary.ordinary_heap_unchanged_conflict",
+                format!("{path}.conditional_indirect_writes"),
+                "conditional indirect writes contradict ordinary_heap_unchanged",
+            );
+        }
+        for (index, transfer) in summary.transfers.iter().enumerate() {
+            if matches!(
+                &transfer.output,
+                AuthoredSummaryOutput::Capture { .. }
+                    | AuthoredSummaryOutput::Receiver {}
+                    | AuthoredSummaryOutput::Heap { .. }
+            ) {
+                self.error(
+                    "summary.ordinary_heap_unchanged_conflict",
+                    format!("{path}.transfers[{index}].output"),
+                    "a transfer into ordinary storage contradicts ordinary_heap_unchanged",
+                );
+            }
+        }
+        for (index, effect) in summary.concurrency_effects.iter().enumerate() {
+            let conflict = match effect {
+                AuthoredConcurrencyEffect::Atomic {
+                    operation:
+                        AuthoredAtomicOperation::Store | AuthoredAtomicOperation::ReadModifyWrite,
+                    ..
+                } => Some("an atomic memory mutation contradicts ordinary_heap_unchanged"),
+                AuthoredConcurrencyEffect::TaskSpawn { .. } => {
+                    Some("a spawned callback contradicts ordinary_heap_unchanged")
+                }
+                AuthoredConcurrencyEffect::Unsupported { .. } => {
+                    Some("an unsupported concurrency protocol cannot certify heap preservation")
+                }
+                _ => None,
+            };
+            if let Some(conflict) = conflict {
+                self.error(
+                    "summary.ordinary_heap_unchanged_conflict",
+                    format!("{path}.concurrency_effects[{index}]"),
+                    conflict,
+                );
+            }
         }
     }
 
@@ -4238,7 +4351,16 @@ pub(crate) fn is_canonical_relative_path(value: &str) -> bool {
 
 // Use the same neutral semantic checks for native producer payloads and imported
 // wire payloads. IDs stay native-local here; no display-name identity is created.
-fn validate_native_deferred_contracts(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+fn validate_native_profile_contracts(pack: &AuthoredSemanticModelPack) -> Vec<Diagnostic> {
+    let model = native_contract_model(pack);
+    super::csmi::validate_native_deferred_yield_model(&model)
+        .into_iter()
+        .chain(super::csmi::validate_native_conditional_type_model(&model))
+        .map(|diagnostic| Diagnostic::error(diagnostic.code, diagnostic.path, diagnostic.message))
+        .collect()
+}
+
+fn native_contract_model(pack: &AuthoredSemanticModelPack) -> super::csmi::CsmiSemanticModel {
     use crate::analyzer::semantic_model::csmi::*;
     use serde_json::json;
 
@@ -4359,15 +4481,41 @@ fn validate_native_deferred_contracts(pack: &AuthoredSemanticModelPack) -> Vec<D
         affects.push(json!({"kind":"fact-family","family":"deferred-yields","scope":scope}));
         completeness.push(json!({"vocabulary":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"family":"deferred-yields","scope":scope,"status":if complete {"complete"} else {"partial"}}));
     }
+    let mut conditional_affects = Vec::new();
+    let mut conditional_scopes = HashMap::new();
+    for shard in &pack.shards {
+        let Some(payload) = &shard.conditional_type_refinements else {
+            continue;
+        };
+        for fact in &payload.refinements {
+            let scope = json!({"callable": fact.payload.callable, "subject": fact.payload.subject});
+            let key = serde_json::to_string(&scope).expect("conditional scope serializes");
+            let complete = fact.coverage == Some(CsmiCoverageStatus::Complete);
+            conditional_scopes
+                .entry(key)
+                .and_modify(|entry: &mut (serde_json::Value, bool)| entry.1 &= complete)
+                .or_insert((scope.clone(), complete));
+            facts.push(json!({"vocabulary": CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+                "version": CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+                "family": CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY, "scope": scope, "payload": fact.payload}));
+        }
+    }
+    for (scope, complete) in conditional_scopes.into_values() {
+        conditional_affects.push(json!({"kind":"fact-family", "family":CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY,"scope":scope}));
+        completeness.push(
+            json!({"vocabulary":CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+            "version":CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+            "family":CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY,"scope":scope,
+            "status":if complete {"complete"} else {"partial"}}),
+        );
+    }
     let model: CsmiSemanticModel = serde_json::from_value(json!({
         "artifactSelectors":[],"declarations":declarations,"extensionFacts":facts,
-        "vocabularyUses":[{"identifier":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"schema":CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,"requirement":"required","affects":affects}],
+        "vocabularyUses":[{"identifier":CSMI_DEFERRED_YIELD_PROFILE_ID,"version":CSMI_DEFERRED_YIELD_PROFILE_VERSION,"schema":CSMI_DEFERRED_YIELD_PROFILE_SCHEMA,"requirement":"required","affects":affects},
+            {"identifier":CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,"version":CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,"schema":CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,"requirement":"required","affects":conditional_affects}],
         "completenessStatements":completeness
     })).expect("native declaration shape construction is valid");
-    validate_native_deferred_yield_model(&model)
-        .into_iter()
-        .map(|diagnostic| Diagnostic::error(diagnostic.code, diagnostic.path, diagnostic.message))
-        .collect()
+    model
 }
 
 fn native_generic_binder_symbols(
@@ -4463,7 +4611,7 @@ fn native_receiver_reference(owner: &str, binders: &[String]) -> serde_json::Val
     })
 }
 
-fn native_deferred_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usize) -> bool {
+fn native_profile_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usize) -> bool {
     use crate::analyzer::semantic_model::csmi::{CsmiDeferredYieldShape, CsmiTypeExpression};
     let mut shapes = Vec::new();
     let mut types = Vec::new();
@@ -4471,6 +4619,15 @@ fn native_deferred_depth_within(pack: &AuthoredSemanticModelPack, max_depth: usi
         if let Some(payload) = &shard.deferred_yields {
             for fact in &payload.yields {
                 shapes.extend(fact.payload.roots.iter().map(|root| (&root.shape, 0usize)));
+            }
+        }
+    }
+    for shard in &pack.shards {
+        if let Some(payload) = &shard.conditional_type_refinements {
+            for fact in &payload.refinements {
+                if let crate::analyzer::semantic_model::csmi::CsmiConditionalTypeOutcome::Supported { target, .. } = &fact.payload.outcome {
+                    types.push((target, 0usize));
+                }
             }
         }
     }
@@ -4674,7 +4831,7 @@ mod native_deferred_bridge_tests {
             ])
         );
         assert!(
-            validate_native_deferred_contracts(&native_pack(serde_json::json!(["K", "V"])))
+            validate_native_profile_contracts(&native_pack(serde_json::json!(["K", "V"])))
                 .is_empty(),
             "ordered binders should satisfy receiver substitution"
         );

@@ -41,6 +41,101 @@ pub const CSMI_DEFERRED_YIELD_PROFILE_VERSION: &str = "0.1.0";
 pub const CSMI_DEFERRED_YIELD_PROFILE_SCHEMA: &str =
     "https://csmi.brokk.ai/schema/profiles/deferred-yield/0.1/schema.json";
 
+// Independently pinned at CSMI PR #38, e06a89ae77a2cba8443f1d0cd3edd2d5419e3af3.
+pub const CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID: &str = "csmi.conditional-type-refinement";
+pub const CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/conditional-type-refinement/0.1/schema.json";
+pub const CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY: &str = "conditional-type-refinements";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiConditionalTypeRefinement {
+    pub kind: CsmiConditionalTypeRefinementKind,
+    pub callable: LocalId,
+    pub subject: CsmiConditionalTypeSubject,
+    pub outcome: CsmiConditionalTypeOutcome,
+}
+
+impl CsmiConditionalTypeRefinement {
+    /// Remap declaration references without flattening ordered type arguments.
+    pub(crate) fn remap_symbols<E>(
+        &mut self,
+        mut resolve: impl FnMut(&str) -> Result<String, E>,
+    ) -> Result<(), E> {
+        self.callable = resolve(&self.callable)?;
+        if let CsmiConditionalTypeOutcome::Supported { target, .. } = &mut self.outcome {
+            let mut stack = vec![target];
+            while let Some(target) = stack.pop() {
+                match target {
+                    CsmiTypeExpression::Reference(reference) => {
+                        reference.symbol = resolve(&reference.symbol)?;
+                        stack.extend(reference.arguments.iter_mut());
+                    }
+                    CsmiTypeExpression::Parameter(parameter) => {
+                        parameter.symbol = resolve(&parameter.symbol)?;
+                    }
+                    CsmiTypeExpression::Intrinsic(_) | CsmiTypeExpression::Unknown(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CsmiConditionalTypeRefinementKind {
+    #[serde(rename = "conditional-type-refinement")]
+    ConditionalTypeRefinement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiConditionalTypeSubject {
+    Parameter { position: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiConditionalTypeSemantics {
+    Biconditional,
+    PositiveOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CsmiConditionalTypeOutcome {
+    Supported {
+        semantics: CsmiConditionalTypeSemantics,
+        target: CsmiTypeExpression,
+    },
+    Unsupported {
+        limitation: CsmiConditionalTypeLimitation,
+    },
+    Indeterminate {
+        limitation: CsmiConditionalTypeLimitation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsmiConditionalTypeLimitation {
+    pub kind: CsmiConditionalTypeLimitationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CsmiConditionalTypeLimitationKind {
+    UnsupportedTarget,
+    ConflictingOverloads,
+    UninterpretableSemantics,
+    UnresolvedIdentity,
+    IncompleteInput,
+    Other,
+}
+
 /// Typed payload for the CSMI deferred-yield vocabulary.
 ///
 /// This is intentionally independent from collection-flow. A collection-flow
@@ -1619,7 +1714,7 @@ pub struct CsmiCompletenessStatement {
     pub extensions: Vec<CsmiExtensionAttachment>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum CsmiCoverageStatus {
     Unknown,

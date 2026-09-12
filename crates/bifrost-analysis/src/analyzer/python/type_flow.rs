@@ -25,9 +25,9 @@ use super::PythonAnalyzer;
 use super::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::type_flow::{
-    ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite, ExternalClassCache,
-    MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup, MemberLookupHit,
-    NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter, UnknownReason,
+    CallGuardOutcome, ClassHierarchy, ClassIdentity, ClassSeed, DynamicFieldWrite,
+    ExternalClassCache, MemberAccessKind, MemberAccessQuery, MemberDeclaration, MemberLookup,
+    MemberLookupHit, NarrowingVerdict, NormalReturnTypeConstraint, TypeFlowAdapter, UnknownReason,
     analyzer_range_for_span, class_seed_from_lookup_types, external_class_identity,
     external_member_lookup, file_for_locator, source_span_for_node,
     validate_prepared_syntax_for_procedure,
@@ -68,7 +68,7 @@ pub(super) fn python_analyzer(workspace: &WorkspaceAnalyzer) -> &PythonAnalyzer 
         .expect("PythonTypeFlowAdapter serves only workspaces that analyze Python")
 }
 
-fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
+pub(super) fn overlay_of(workspace: &WorkspaceAnalyzer) -> Option<Arc<SemanticModelOverlay>> {
     workspace
         .analyzer()
         .active_semantic_model_snapshot()
@@ -1618,7 +1618,7 @@ impl PythonTypeFlowAdapter {
             .collect()
     }
 
-    fn guard_classes_have_supported_instance_checks(
+    pub(super) fn guard_classes_have_supported_instance_checks(
         &self,
         workspace: &WorkspaceAnalyzer,
         classes: &[ClassIdentity],
@@ -1663,7 +1663,7 @@ impl PythonTypeFlowAdapter {
         true
     }
 
-    fn instance_relation(
+    pub(super) fn instance_relation(
         &self,
         workspace: &WorkspaceAnalyzer,
         atom: &ClassIdentity,
@@ -1883,7 +1883,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // remainder.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-guard-proved-classes-v36",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-v38",
         )
         .expect("adapter name is non-empty")
     }
@@ -2752,6 +2752,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 .collect(),
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::ConstantEquality { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
         }
     }
@@ -2782,6 +2783,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::HasMember { .. }
             | GuardPredicate::Truthy { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::Opaque { .. } => return ClassSeed::NotApplicable,
         };
         let Ok(classes) = self.guard_classes(workspace, procedure, classes) else {
@@ -2838,7 +2840,29 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             if !matches!(
                 call.invocation_mode,
                 crate::analyzer::semantic::CallInvocationMode::Ordinary
-            ) || call.arguments.iter().any(|argument| {
+            ) {
+                continue;
+            }
+            // `call_guard_narrowing` constrains a direct argument of a call an
+            // opaque guard tests. `module.predicate(value)` carries a receiver
+            // and is recognized too, so this is not restricted by receiver.
+            if call
+                .result
+                .is_some_and(|result| opaque_guard_subjects.contains(&result))
+            {
+                subjects.extend(
+                    call.arguments
+                        .iter()
+                        .filter(|argument| {
+                            matches!(
+                                argument.expansion,
+                                crate::analyzer::semantic::CallArgumentExpansion::Direct(_)
+                            )
+                        })
+                        .map(|argument| argument.value),
+                );
+            }
+            if call.arguments.iter().any(|argument| {
                 argument.keyword.is_some()
                     || !matches!(
                         argument.expansion,
@@ -2873,12 +2897,6 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 {
                     subjects.extend(call.arguments.iter().map(|argument| argument.value));
                 }
-            } else if let [argument] = call.arguments.as_ref()
-                && call
-                    .result
-                    .is_some_and(|result| opaque_guard_subjects.contains(&result))
-            {
-                subjects.push(argument.value);
             }
         }
         subjects
@@ -2891,8 +2909,9 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         guard: &GuardFact,
         atoms: &[&ClassIdentity],
         member_lookup: &dyn Fn(&ClassIdentity, &str) -> MemberLookup,
-    ) -> Option<(ValueId, Vec<NarrowingVerdict>)> {
+    ) -> CallGuardOutcome {
         super::guard_summary::call_guard_narrowing(
+            self,
             workspace,
             procedure,
             guard,

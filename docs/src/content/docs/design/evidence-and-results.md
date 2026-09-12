@@ -130,6 +130,31 @@ Derived results can have several provenance paths. A bounded response may retain
 only some of them, with omission status distinguishing one witness from an
 exhaustive witness set.
 
+### Effective configuration
+
+Authored configuration facts and effective configuration are separate result
+types. An authored fact says what one exact document snapshot contains. An
+effective result says what wins after a caller supplies explicit layers,
+profiles, includes, deployment overrides, placeholder expansions, or external
+environment evidence together with their precedence relations.
+
+The resolver never reads ambient process state, retrieves secrets, evaluates
+expressions, or guesses framework bindings. Each contribution retains a stable
+source identity and provider/version identity. Each precedence edge names the
+lower and higher layer and the reason for that ordering. Structural keys omit
+source ranges so the same key can correlate across files; the authored facts
+retain the exact ranges as evidence.
+
+Resolution is iterative and bounded by contribution and precedence-work limits.
+A uniquely maximal contribution can provide useful positive evidence while a
+missing include, unavailable environment, unknown profile, unresolved
+interpolation, parser limitation, or other typed reason makes completeness
+partial. Incomparable maximal contributions are a conflict even when their
+opaque values have the same spelling: equality does not prove which source won.
+Cancellation and either exhausted budget produce an unresolved proof rather
+than fabricating a winner. Only a uniquely selected contribution with complete
+evidence is an effective value claim.
+
 A retained report identifies its artifacts, declarations, events, policies,
 and sources before mapping them into the current presentation.
 

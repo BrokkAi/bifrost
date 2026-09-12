@@ -17,8 +17,8 @@ use super::ir::{
     ControlEdge, Evidence, EvidenceCompleteness, FormalMultiplicity, MemoryLocation,
     MemoryLocationKind, ProcedureSemantics, ProgramPoint, ProofStatus, SemanticArtifact,
     SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapSubject,
-    SemanticValue, SemanticValueKind, SourceMapping, TransferKind, TransferOperation,
-    ValueFlowKind,
+    SemanticValue, SemanticValueKind, SourceMapping, SynchronizationPayload, TransferKind,
+    TransferOperation, ValueFlowKind,
 };
 use super::{
     DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
@@ -621,6 +621,18 @@ fn write_memory_location(writer: &mut dyn fmt::Write, location: &MemoryLocation)
     }
     write!(
         writer,
+        " :value-copy {}",
+        quoted(location.value_copy.label())
+    )?;
+    if let super::ir::MemoryValueCopy::BackingStore { identity } = location.value_copy {
+        write!(
+            writer,
+            " :value-copy-indexed-identity {}",
+            quoted(identity.label())
+        )?;
+    }
+    write!(
+        writer,
         " :source {} :evidence {})",
         location.source, location.evidence
     )
@@ -904,6 +916,15 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
         SemanticEffect::Assignment { target, value } => {
             write!(writer, " :target {target} :value {value}")?;
         }
+        SemanticEffect::AggregateInitializer {
+            aggregate,
+            selector,
+            value,
+        } => {
+            write!(writer, " :aggregate {aggregate} :selector (locator ")?;
+            write_locator(writer, selector)?;
+            write!(writer, ") :value {value}")?;
+        }
         SemanticEffect::ValueFlow {
             kind,
             source,
@@ -955,6 +976,18 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                     }
                 }
             }
+            if let ValueFlowKind::IntegerOffset { offset } = kind {
+                write!(
+                    writer,
+                    " :integer-offset-sign {} :integer-offset-magnitude {}",
+                    quoted(if offset.negative() {
+                        "negative"
+                    } else {
+                        "positive"
+                    }),
+                    offset.magnitude()
+                )?;
+            }
             if let ValueFlowKind::BackingStoreAlternative { offset, allocation } = kind {
                 write!(writer, " :alternative-allocation {allocation}")?;
                 match offset {
@@ -996,12 +1029,41 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                 quoted(kind.label())
             )?;
         }
-        SemanticEffect::Synchronization { operation, subject } => {
+        SemanticEffect::Synchronization {
+            operation,
+            subject,
+            payload,
+        } => {
             write!(
                 writer,
                 " :operation {} :subject {subject}",
                 quoted(operation.label())
             )?;
+            match payload {
+                Some(SynchronizationPayload::Send { value, copy }) => {
+                    write!(
+                        writer,
+                        " :payload-kind {} :payload-value {value} :payload-copy {}",
+                        quoted("send"),
+                        quoted(copy.label())
+                    )?;
+                    if let super::ir::SynchronizationPayloadCopy::BackingStore { identity } = copy {
+                        write!(
+                            writer,
+                            " :payload-index-identity {}",
+                            quoted(identity.label())
+                        )?;
+                    }
+                }
+                Some(SynchronizationPayload::Receive { result }) => {
+                    write!(
+                        writer,
+                        " :payload-kind {} :payload-result {result}",
+                        quoted("receive")
+                    )?;
+                }
+                None => {}
+            }
         }
         SemanticEffect::CallableCreation { result, callable }
         | SemanticEffect::CallableReference { result, callable } => {
@@ -1501,6 +1563,28 @@ mod tests {
             quoted(&value).to_string(),
             serde_json::to_string(&value).unwrap()
         );
+    }
+
+    #[test]
+    fn integer_offset_flow_renders_its_exact_signed_magnitude() {
+        let event = SemanticEvent::new(
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset {
+                    offset: crate::analyzer::semantic::SignedIntegerMagnitude::new(true, 3),
+                },
+                source: crate::analyzer::semantic::ValueId::new(0),
+                target: crate::analyzer::semantic::ValueId::new(1),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        );
+        let mut rendered = String::new();
+
+        write_event(&mut rendered, 0, &event).expect("integer offset event renders");
+
+        assert!(rendered.contains(":flow-kind \"integer_offset\""));
+        assert!(rendered.contains(":integer-offset-sign \"negative\""));
+        assert!(rendered.contains(":integer-offset-magnitude 3"));
     }
 
     #[test]
@@ -2099,6 +2183,7 @@ mod tests {
             kind: MemoryLocationKind::LexicalCell {
                 binding: super::super::ids::ValueId::new(2),
             },
+            value_copy: super::super::ir::MemoryValueCopy::Unknown,
             source,
             evidence,
         }];
@@ -2108,6 +2193,7 @@ mod tests {
                 lexical_parent: ProcedureId::new(0),
                 binding: None,
             },
+            value_copy: super::super::ir::MemoryValueCopy::Unknown,
             source,
             evidence,
         }];

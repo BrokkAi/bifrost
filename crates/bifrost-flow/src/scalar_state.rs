@@ -7,9 +7,9 @@
 #[cfg(test)]
 use crate::analyzer::semantic::MoveInvalidation;
 use crate::analyzer::semantic::{
-    CallSiteId, ControlEdgeId, GuardPredicate, ProcedureHandle, ProcedureId, ProgramPointId,
-    SemanticEffect, SemanticGapImpact, SemanticGapSubject, SemanticValueKind, TransferKind,
-    TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
+    CallSiteId, ControlEdgeId, GuardPredicate, IntegerComparison, ProcedureHandle, ProcedureId,
+    ProgramPointId, SemanticEffect, SemanticGapImpact, SemanticGapSubject, SemanticValueKind,
+    TransferKind, TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::cmp::Ordering;
@@ -364,6 +364,14 @@ impl ScalarFact {
 pub struct ScalarStateDerivation {
     procedure: ProcedureId,
     states: Box<[Option<Box<[ScalarFact]>>]>,
+    feasible_edges: HashSet<ControlEdgeId>,
+}
+
+/// One exact caller-supplied scalar fact at procedure entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalarEntryFact {
+    pub target: ValueId,
+    pub fact: ScalarFact,
 }
 
 /// One outcome-sensitive scalar mutation applied while traversing a CFG edge.
@@ -391,12 +399,20 @@ pub struct ScalarCallEffects<'a> {
 
 impl ScalarStateDerivation {
     pub fn derive(procedure: &ProcedureHandle) -> Self {
-        Self::derive_with_call_effects(procedure, ScalarCallEffects::default())
+        Self::derive_with_entry_facts(procedure, ScalarCallEffects::default(), &[])
     }
 
     pub fn derive_with_call_effects(
         procedure: &ProcedureHandle,
         call_effects: ScalarCallEffects<'_>,
+    ) -> Self {
+        Self::derive_with_entry_facts(procedure, call_effects, &[])
+    }
+
+    pub fn derive_with_entry_facts(
+        procedure: &ProcedureHandle,
+        call_effects: ScalarCallEffects<'_>,
+        entry_facts: &[ScalarEntryFact],
     ) -> Self {
         let semantics = procedure.semantics();
         let value_count = semantics.values().len();
@@ -412,11 +428,30 @@ impl ScalarStateDerivation {
                 _ => intrinsic_fact(semantics, value.id),
             };
         }
+        let mut seeded = HashSet::default();
+        for seed in entry_facts {
+            let value = semantics
+                .value(seed.target)
+                .expect("scalar entry fact belongs to its procedure");
+            assert!(
+                matches!(
+                    value.kind,
+                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+                ),
+                "scalar entry facts target only parameters or receivers"
+            );
+            assert!(
+                seeded.insert(seed.target),
+                "one scalar entry fact exists per formal"
+            );
+            entry[seed.target.index()] = seed.fact;
+        }
         incoming[semantics.entry_point().index()] = Some(entry.into_boxed_slice());
 
         let guards_by_edge = guards_by_edge(procedure);
         let mut pending = VecDeque::from([semantics.entry_point()]);
         let mut queued = HashSet::default();
+        let mut feasible_edges = HashSet::default();
         queued.insert(semantics.entry_point());
         let mut updates = 0_usize;
         while let Some(point) = pending.pop_front() {
@@ -445,11 +480,19 @@ impl ScalarStateDerivation {
                     continue;
                 }
                 let mut successor = state.clone();
+                let mut feasible = true;
                 if let Some(refinements) = guards_by_edge.get(&edge_id) {
                     for refinement in refinements {
-                        apply_guard_refinement(procedure, point, refinement, &mut successor);
+                        if !apply_guard_refinement(procedure, point, refinement, &mut successor) {
+                            feasible = false;
+                            break;
+                        }
                     }
                 }
+                if !feasible {
+                    continue;
+                }
+                feasible_edges.insert(edge_id);
                 for write in call_effects
                     .edge_writes
                     .iter()
@@ -475,6 +518,7 @@ impl ScalarStateDerivation {
         Self {
             procedure: procedure.id(),
             states: states.into_boxed_slice(),
+            feasible_edges,
         }
     }
 
@@ -489,6 +533,14 @@ impl ScalarStateDerivation {
             .and_then(|state| state.get(value.index()))
             .copied()
             .unwrap_or(ScalarFact::Unreachable)
+    }
+
+    pub fn is_reachable(&self, point: ProgramPointId) -> bool {
+        self.states.get(point.index()).is_some_and(Option::is_some)
+    }
+
+    pub fn edge_is_feasible(&self, edge: ControlEdgeId) -> bool {
+        self.feasible_edges.contains(&edge)
     }
 }
 
@@ -549,6 +601,33 @@ fn transfer_point(
                 state[target.index()] = fact_of(semantics, state, source);
             }
             SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::IntegerOffset { offset },
+                source,
+                target,
+            } => {
+                state[target.index()] = match fact_of(semantics, state, source) {
+                    ScalarFact::Integer(interval) => {
+                        let offset = ScalarIntegerValue::new(offset.negative(), offset.magnitude());
+                        if !interval.domain().contains(offset) {
+                            ScalarFact::Unknown
+                        } else {
+                            match interval.add_interval(ScalarIntegerInterval::exact(
+                                offset,
+                                interval.domain(),
+                            )) {
+                                ScalarIntegerArithmetic::Interval(result) => {
+                                    ScalarFact::Integer(result)
+                                }
+                                ScalarIntegerArithmetic::Overflow
+                                | ScalarIntegerArithmetic::MagnitudeExceeded
+                                | ScalarIntegerArithmetic::UnknownDomain => ScalarFact::Unknown,
+                            }
+                        }
+                    }
+                    _ => ScalarFact::Unknown,
+                };
+            }
+            SemanticEffect::ValueFlow {
                 kind: ValueFlowKind::Transfer(transfer),
                 source,
                 target,
@@ -561,7 +640,11 @@ fn transfer_point(
                 }
             }
             SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::LanguageDefined | ValueFlowKind::BackingStoreAlternative { .. },
+                kind:
+                    ValueFlowKind::LanguageDefined
+                    | ValueFlowKind::ReferenceBoxing
+                    | ValueFlowKind::ReferenceUnboxing
+                    | ValueFlowKind::BackingStoreAlternative { .. },
                 target,
                 ..
             }
@@ -612,6 +695,7 @@ fn transfer_point(
             | SemanticEffect::ExceptionalExit
             | SemanticEffect::ValueUse { .. }
             | SemanticEffect::MemoryStore { .. }
+            | SemanticEffect::AggregateInitializer { .. }
             | SemanticEffect::CaptureBind { .. }
             | SemanticEffect::Synchronization { .. }
             | SemanticEffect::CallContinuation { .. }
@@ -716,9 +800,9 @@ fn apply_guard_refinement(
     _point: ProgramPointId,
     refinement: &EdgeRefinement,
     state: &mut [ScalarFact],
-) {
+) -> bool {
     let Some(subject) = refinement.subject else {
-        return;
+        return true;
     };
     let semantics = procedure.semantics();
     let refined = match refinement.predicate {
@@ -738,20 +822,79 @@ fn apply_guard_refinement(
                 ScalarFact::False => ScalarFact::True,
                 ScalarFact::Integer(value) if equality_arm => ScalarFact::Integer(value),
                 ScalarFact::Integer(_) => ScalarFact::NonExactInteger,
-                _ => return,
+                _ => return true,
             }
+        }
+        GuardPredicate::OrderedIntegerComparison { relation, constant } => {
+            let relation = if refinement.truth {
+                relation
+            } else {
+                relation.negate()
+            };
+            let ScalarFact::Integer(constant) = intrinsic_fact(semantics, constant) else {
+                return true;
+            };
+            let Some(constant) = constant.exact_value() else {
+                return true;
+            };
+            let ScalarFact::Integer(current) = fact_of(semantics, state, subject) else {
+                return true;
+            };
+            let Some(refined) = refine_integer_interval(current, relation, constant) else {
+                return false;
+            };
+            ScalarFact::Integer(refined)
         }
         GuardPredicate::ConstantBoolean { .. }
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }
         | GuardPredicate::HasMember { .. }
         | GuardPredicate::Truthy { .. }
-        | GuardPredicate::Opaque { .. } => return,
+        | GuardPredicate::Opaque { .. } => return true,
     };
     state[subject.index()] = refined;
     if let Some(binding) = unique_binding_origin(procedure, subject) {
         state[binding.index()] = refined;
     }
+    true
+}
+
+fn refine_integer_interval(
+    interval: ScalarIntegerInterval,
+    relation: IntegerComparison,
+    constant: ScalarIntegerValue,
+) -> Option<ScalarIntegerInterval> {
+    let (lower, upper) = match relation {
+        IntegerComparison::LessThan => {
+            if interval.lower() >= constant {
+                return None;
+            }
+            let upper_bound = constant
+                .checked_sub(ScalarIntegerValue::unsigned(1))
+                .expect("subtracting one from a represented nonnegative constant fits");
+            (interval.lower(), interval.upper().min(upper_bound))
+        }
+        IntegerComparison::LessThanOrEqual => {
+            if interval.lower() > constant {
+                return None;
+            }
+            (interval.lower(), interval.upper().min(constant))
+        }
+        IntegerComparison::GreaterThan => {
+            if interval.upper() <= constant {
+                return None;
+            }
+            let lower_bound = constant.checked_add(ScalarIntegerValue::unsigned(1))?;
+            (interval.lower().max(lower_bound), interval.upper())
+        }
+        IntegerComparison::GreaterThanOrEqual => {
+            if interval.upper() < constant {
+                return None;
+            }
+            (interval.lower().max(constant), interval.upper())
+        }
+    };
+    Some(ScalarIntegerInterval::new(lower, upper, interval.domain()))
 }
 
 pub(crate) struct BindingOriginIndex<'procedure> {
@@ -1194,6 +1337,127 @@ func run(values []int) int {
             })
             .collect::<Vec<_>>();
         assert_eq!(facts, vec![exact_integer(1)], "{semantics:#?}");
+    }
+
+    #[test]
+    fn seeded_countdown_prunes_ordered_arms_and_computes_the_next_argument() {
+        let fixture = Fixture::go(
+            r#"package sample
+type cell struct{}
+func run(ch chan *cell, value *cell, depth int) {
+    if depth > 0 { run(ch, value, depth - 1); return }
+    ch <- value
+}
+"#,
+            "run",
+        );
+        let semantics = fixture.procedure.semantics();
+        let depth = semantics
+            .values()
+            .iter()
+            .find_map(|value| match &value.kind {
+                SemanticValueKind::Parameter {
+                    name: Some(name), ..
+                } if name.as_ref() == "depth" => Some(value.id),
+                _ => None,
+            })
+            .expect("depth formal");
+        let [call] = semantics.call_sites() else {
+            panic!("one recursive call: {semantics:#?}");
+        };
+        let call_point = semantics
+            .points()
+            .iter()
+            .find(|point| {
+                point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::Invoke { call_site } if call_site == call.id
+                    )
+                })
+            })
+            .map(|point| point.id)
+            .expect("recursive call point");
+        let send_point = semantics
+            .points()
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Synchronization { .. }))
+            })
+            .map(|point| point.id)
+            .expect("channel send point");
+        let next_depth = call.arguments[2].value;
+
+        let one = ScalarStateDerivation::derive_with_entry_facts(
+            &fixture.procedure,
+            ScalarCallEffects::default(),
+            &[ScalarEntryFact {
+                target: depth,
+                fact: exact_integer(1),
+            }],
+        );
+        assert!(one.is_reachable(call_point));
+        assert!(!one.is_reachable(send_point));
+        assert_eq!(one.fact_at(call_point, next_depth), exact_integer(0));
+
+        let zero = ScalarStateDerivation::derive_with_entry_facts(
+            &fixture.procedure,
+            ScalarCallEffects::default(),
+            &[ScalarEntryFact {
+                target: depth,
+                fact: exact_integer(0),
+            }],
+        );
+        assert!(!zero.is_reachable(call_point));
+        assert!(zero.is_reachable(send_point));
+
+        let unknown = ScalarStateDerivation::derive(&fixture.procedure);
+        assert!(unknown.is_reachable(call_point));
+        assert!(unknown.is_reachable(send_point));
+    }
+
+    #[test]
+    fn represented_integer_offset_overflow_stays_unknown() {
+        let fixture = Fixture::go(
+            r#"package sample
+func run(value int) int { return value + 1 }
+"#,
+            "run",
+        );
+        let semantics = fixture.procedure.semantics();
+        let parameter = semantics
+            .values()
+            .iter()
+            .find_map(|value| {
+                matches!(value.kind, SemanticValueKind::Parameter { .. }).then_some(value.id)
+            })
+            .expect("integer parameter");
+        let (point, result) = semantics
+            .points()
+            .iter()
+            .find_map(|point| {
+                point.events.iter().find_map(|event| match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IntegerOffset { .. },
+                        target,
+                        ..
+                    } => Some((point.id, target)),
+                    _ => None,
+                })
+            })
+            .expect("integer offset flow");
+        let derivation = ScalarStateDerivation::derive_with_entry_facts(
+            &fixture.procedure,
+            ScalarCallEffects::default(),
+            &[ScalarEntryFact {
+                target: parameter,
+                fact: exact_integer(u128::MAX),
+            }],
+        );
+        assert_eq!(derivation.fact_at(point, result), ScalarFact::Unknown);
     }
 
     #[test]

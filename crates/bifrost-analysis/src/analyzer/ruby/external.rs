@@ -144,6 +144,7 @@ impl RubyGemArchivePackProducer {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 }],
             }),
             completeness,

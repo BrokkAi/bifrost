@@ -15,6 +15,7 @@ use brokk_bifrost_js_ts::syntax::{
     is_jsx_intrinsic_element_name as jsts_jsx_intrinsic_element_name,
     is_named_function_expression_declaration as jsts_named_function_expression_declaration,
     is_object_property_key as jsts_object_property_key,
+    is_static_subscript_property_name as jsts_is_static_subscript_property_name,
 };
 use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
@@ -150,11 +151,16 @@ pub fn census_identifier_ranges(
 /// The identifier membership used to validate inverse hits independently of
 /// probe eligibility. It retains the census contract and additionally includes
 /// grammar nodes that are simultaneous source references and binders, such as
-/// JS/TS shorthand destructuring properties (#2037). Java (#2086), PHP (#1867)
-/// Scala (#2085), and C++ (#2248) membership also descends parser-recovery subtrees, where
-/// each admits only the terminals whose reference role the grammar still states:
-/// valid inverse references stay backed without proposing recovery tokens as
-/// forward census sites.
+/// JS/TS shorthand destructuring properties (#2037), and the structured
+/// property-name nodes a language spells outside its identifier grammar, such
+/// as the string interior of a JS/TS `data["prop"]` subscript (#3215). Java
+/// (#2086), PHP (#1867) Scala (#2085), C++ (#2248) and JS/TS (#3215) membership
+/// also descends parser-recovery subtrees: valid inverse references stay backed
+/// without proposing recovery tokens as forward census sites. C++, PHP and
+/// Scala admit only the terminals whose reference role the grammar still
+/// states there; Java drops the declaration and label roles; JS/TS keeps the
+/// frontier it uses everywhere else, because recovery leaves its references no
+/// structured parent to read a role from.
 ///
 /// Every one of those recovery tests belongs to recovery alone. Outside an ERROR
 /// subtree the grammar states every role, so membership is a superset of the
@@ -297,12 +303,19 @@ fn collect_candidate_ranges(
         // The test is per-subtree, not per-file: a locally recoverable ERROR
         // leaves the rest of the file proposed. The index-filtered and
         // semantic-token frontiers keep their existing reach, because the LSP
-        // still colors and resolves inside a broken edit.
+        // still colors and resolves inside a broken edit. Inverse membership
+        // descends recovery for the languages listed here, because an inverse
+        // hit still lands on the exact terminal the recovered tree kept.
         if (matches!(frontier, CandidateFrontier::Census)
             || (matches!(frontier, CandidateFrontier::CensusMembership)
                 && !matches!(
                     language,
-                    Language::Cpp | Language::Java | Language::Php | Language::Scala
+                    Language::Cpp
+                        | Language::Java
+                        | Language::JavaScript
+                        | Language::Php
+                        | Language::Scala
+                        | Language::TypeScript
                 )))
             && node.is_error()
         {
@@ -332,7 +345,8 @@ fn collect_candidate_ranges(
                         && rust_token_tree_member)
                     || (matches!(frontier, CandidateFrontier::CensusMembership)
                         && matches!(language, Language::JavaScript | Language::TypeScript)
-                        && node.kind() == "shorthand_property_identifier_pattern")
+                        && (node.kind() == "shorthand_property_identifier_pattern"
+                            || jsts_is_static_subscript_property_name(node)))
             }
         };
         // Inside recovery, C++ (#2248), PHP (#1867), and Scala (#2085) admit only the
@@ -342,6 +356,15 @@ fn collect_candidate_ranges(
         // an ERROR subtree the grammar still states every role, and dropping a
         // role there costs membership occurrences the census itself proposes and
         // grades (#2185).
+        //
+        // JS/TS (#3215) needs no such test, and would be wrong to have one:
+        // recovery leaves the reference no structured parent to read a role from
+        // -- a JSX element name derailed by a reserved-word attribute becomes a
+        // direct child of the ERROR node -- and the frontier already admits
+        // declaration names everywhere else, so there is no role for recovery to
+        // remove. What membership asserts is that the inverse hit landed on an
+        // identifier-class terminal the tree really holds, and recovery does not
+        // move those bytes.
         let candidate = candidate
             && (!inside_error
                 || !matches!(frontier, CandidateFrontier::CensusMembership)
@@ -878,13 +901,21 @@ mod tests {
         }
     }
 
+    /// The JS/TS membership additions, and only them: the shorthand
+    /// destructuring property that is a reference and a binder at once (#2037),
+    /// and the string interior a statically keyed subscript spells the accessed
+    /// property with (#3215). An object-literal string key is a declaration
+    /// name, not a keyed access, and stays out.
     #[test]
-    fn js_ts_census_membership_adds_only_shorthand_destructuring_properties() {
+    fn js_ts_census_membership_adds_shorthand_and_static_subscript_properties() {
         let source = concat!(
             "const plain = 1;\n",
             "const { shorthand } = owner;\n",
             "const { renamed: local } = owner;\n",
             "const literal = { \"quoted\": 1 };\n",
+            "owner[\"keyed\"] = plain;\n",
+            "owner[dynamic] = plain;\n",
+            "owner[\"esc\\naped\"] = plain;\n",
         );
         for (language, path) in [
             (Language::JavaScript, "index.js"),
@@ -897,31 +928,81 @@ mod tests {
             let local = source.find("local").expect("renamed local binder");
             let plain = source.find("plain").expect("ordinary declaration");
             let quoted = source.find("quoted").expect("quoted key");
+            let keyed = source.find("keyed").expect("static subscript key");
+            let dynamic = source.find("dynamic").expect("dynamic subscript key");
+            let escaped = source.find("esc\\naped").expect("escaped subscript key");
 
             assert!(!census.contains(&shorthand), "{language:?}: {census:?}");
-            assert!(
-                membership.contains(&shorthand),
-                "{language:?}: {membership:?}"
-            );
-            for offset in [renamed, local, plain] {
+            assert!(!census.contains(&keyed), "{language:?}: {census:?}");
+            for offset in [shorthand, keyed] {
+                assert!(
+                    membership.contains(&offset),
+                    "{language:?} at {offset}: {membership:?}"
+                );
+            }
+            for offset in [renamed, local, plain, dynamic] {
                 assert_eq!(
                     census.contains(&offset),
                     membership.contains(&offset),
-                    "only the exact shorthand grammar node is added for {language:?} at {offset}"
+                    "only the exact added grammar nodes differ for {language:?} at {offset}"
                 );
             }
-            assert!(
-                !membership.contains(&quoted),
-                "{language:?}: {membership:?}"
-            );
+            for offset in [quoted, escaped] {
+                assert!(
+                    !membership.contains(&offset),
+                    "{language:?} at {offset}: {membership:?}"
+                );
+            }
 
-            let added = membership
+            let mut added = membership
                 .iter()
                 .copied()
                 .filter(|offset| !census.contains(offset))
                 .collect::<Vec<_>>();
-            assert_eq!(added, vec![shorthand], "{language:?}");
+            added.sort_unstable();
+            assert_eq!(added, vec![shorthand, keyed], "{language:?}");
         }
+    }
+
+    /// A JSX attribute named by a reserved word (`class=`, as Preact and plain
+    /// DOM JSX spell it) is outside the JavaScript grammar's attribute rule, so
+    /// the parser derails and the element names and expression reads that follow
+    /// survive only as terminals below ERROR. Membership must back an inverse hit
+    /// on them (#3215) while the forward census keeps refusing to propose a site
+    /// it cannot grade. The prettier witness is this shape.
+    #[test]
+    fn js_census_membership_backs_recovered_jsx_references_without_proposing_them() {
+        let source = concat!(
+            "import { Button, Panel } from './parts.js';\n",
+            "export const App = (settings) => (\n",
+            "  <div class=\"bar\">\n",
+            "    {settings.showFirst ? (\n",
+            "      <Panel name=\"first\" />\n",
+            "    ) : null}\n",
+            "    <Button onClick={settings.reset}>Clear</Button>\n",
+            "  </div>\n",
+            ");\n",
+        );
+        let census = census_offsets(Language::JavaScript, "app.jsx", source);
+        let membership = census_membership_offsets(Language::JavaScript, "app.jsx", source);
+        let element = source.find("<Button onClick").expect("JSX element name") + 1;
+        let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
+        let intact = source.find("(settings)").expect("parameter binder") + 1;
+
+        for offset in [element, read] {
+            assert!(
+                !census.contains(&offset),
+                "recovery fallout must stay out of the graded census at {offset}: {census:?}"
+            );
+            assert!(
+                membership.contains(&offset),
+                "the recovered reference at {offset} must back an inverse hit: {membership:?}"
+            );
+        }
+        assert!(
+            census.contains(&intact) && membership.contains(&intact),
+            "the intact part of the file keeps both frontiers: {census:?} {membership:?}"
+        );
     }
 
     #[test]

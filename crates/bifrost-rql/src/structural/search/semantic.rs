@@ -866,6 +866,7 @@ impl<'a> SemanticQueryContext<'a> {
                     target_unit: self
                         .definition_for_locator(locator)
                         .filter(|unit| self.locator_exactly_names_unit(locator, unit)),
+                    external_callee_identity: None,
                     exact_external_target: None,
                     // A dispatch candidate names a materialized procedure, so
                     // it never carries an unmaterialized identity.
@@ -899,6 +900,7 @@ impl<'a> SemanticQueryContext<'a> {
                     target_unit: self
                         .definition_for_locator(locator)
                         .filter(|unit| self.locator_exactly_names_unit(locator, unit)),
+                    external_callee_identity: boundary.external_callee_identity().cloned(),
                     exact_external_target: boundary.exact_external_target().cloned(),
                     // #1978: a fully-qualified callee the workspace never
                     // materializes still has a canonical member identity. It
@@ -1656,15 +1658,29 @@ impl<'a> SemanticQueryContext<'a> {
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
         );
-        let summaries = match brokk_bifrost_flow::typestate::project_production_semantic_summaries(
+        let summary_reads =
+            brokk_bifrost_flow::dataflow::SummaryReadRecorder::new(self.workspace.analyzer());
+        let projection_concurrency = WorkspaceConcurrencyProvider::new(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+            None,
+        );
+        let summaries = match brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
             std::slice::from_ref(&procedure.handle),
             &icfg,
+            &projection_concurrency,
+            self.semantic_summaries.as_ref(),
+            &summary_reads,
             &mut request,
         ) {
-            Ok(summaries) => {
-                if let Err(error) = self
-                    .semantic_summaries
-                    .publish_components(summaries.summaries(), summaries.components())
+            Ok(acquired) => {
+                let kind = acquired.kind();
+                let summaries = acquired.into_summaries();
+                if kind
+                    == brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Projected
+                    && let Err(error) = self
+                        .semantic_summaries
+                        .publish_components(summaries.summaries(), summaries.components())
                 {
                     self.diagnostics.push(CodeQueryDiagnostic {
                         code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,

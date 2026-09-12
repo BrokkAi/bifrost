@@ -6,7 +6,7 @@ produces, not for its position. The numbered files beside it carry a store
 forward through the current version; version numbers remain explicit because
 this chain can deliberately skip an unpublished number.
 
-`0063-current-fresh-schema.sql` is SQLite's rendering of the same final schema
+`0064-current-fresh-schema.sql` is SQLite's rendering of the same final schema
 after the complete migration chain. A database with version zero and no schema
 objects may install it directly, avoiding obsolete table rewrites. Existing
 stores still run every pending numbered migration, and tests require the direct
@@ -306,3 +306,13 @@ of the declaring file's blob, and scoped assertions avoid a language-wide
 dependency. Complete name-lookup answers also record their language scope, with
 composite lookups replayed across the current workspace's languages. Source
 analysis facts remain available for rebuilding the cache.
+
+Migration `0064-class-set-unmodeled-predicate-remainder.sql` admits the
+`unmodeled_predicate` class-set remainder. A guard whose condition is a call on
+the receiver states something about that receiver on both of its arms; when the
+callee cannot be modeled, neither arm's class set is bounded. The reason names
+no class, which is what separates it from `unmodeled_guard`: that one carries
+the class an `isinstance`-style guard spelled and the adapter could not model.
+It follows `0063-class-set-class-object.sql`, so its rebuilt table keeps the
+`class_object` reason that migration added as well. The migration rebuilds only
+the constrained leaf row table and carries every schema-63 row across.

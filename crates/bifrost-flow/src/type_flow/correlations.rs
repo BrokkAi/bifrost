@@ -721,6 +721,7 @@ fn tested_boolean_bindings(
                 }
             }
             GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::OrderedIntegerComparison { .. }
             | GuardPredicate::NullComparison { .. }
             | GuardPredicate::InstanceOf { .. }
             | GuardPredicate::ExactClass { .. }
@@ -829,6 +830,7 @@ fn guard_binding_and_true_fact(
             Some((subject, if negated { fact.opposite() } else { fact }))
         }
         GuardPredicate::ConstantBoolean { .. }
+        | GuardPredicate::OrderedIntegerComparison { .. }
         | GuardPredicate::NullComparison { .. }
         | GuardPredicate::InstanceOf { .. }
         | GuardPredicate::ExactClass { .. }

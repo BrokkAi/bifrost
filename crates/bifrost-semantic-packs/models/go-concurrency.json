@@ -31,6 +31,7 @@
             "id": "sync.mutex.lock",
             "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
           },
@@ -38,6 +39,7 @@
             "id": "sync.mutex.unlock",
             "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
           },
@@ -45,6 +47,7 @@
             "id": "sync.rwmutex.lock",
             "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Lock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
           },
@@ -52,6 +55,7 @@
             "id": "sync.rwmutex.unlock",
             "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
           },
@@ -59,6 +63,7 @@
             "id": "sync.rwmutex.rlock",
             "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RLock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "shared" }]
           },
@@ -66,6 +71,7 @@
             "id": "sync.rwmutex.runlock",
             "target": { "path": "src/sync/rwmutex.go", "symbol": "sync.RWMutex.RUnlock()", "has_receiver": true, "parameter_count": 0 },
             "completeness": "complete",
+            "ordinary_heap_unchanged": true,
             "transfers": [],
             "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "shared" }]
           },

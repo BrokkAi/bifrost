@@ -17,7 +17,8 @@
 use super::*;
 
 use crate::analyzer::semantic::{
-    CandidateCoverage, ExactExternalProcedureTarget, SemanticLocator, UnmaterializedExternalTarget,
+    CandidateCoverage, ExactExternalProcedureTarget, ResolverOwnedExternalCalleeIdentity,
+    SemanticLocator, UnmaterializedExternalTarget,
 };
 
 /// Domain separator for one dispatch site's stable id.
@@ -165,6 +166,9 @@ pub(super) struct DispatchArm {
     pub(super) target_id: String,
     pub(super) target_path: String,
     pub(super) target_unit: Option<CodeUnit>,
+    /// Resolver-owned owner/member identity retained independently of whether
+    /// the external procedure has an artifact-backed exact target.
+    pub(super) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
     /// The resolver's exact semantic-pack declaration, including the
     /// structured overload contract. Retained so other call relations consume
     /// the same target answer and identity instead of repeating pack lookup or

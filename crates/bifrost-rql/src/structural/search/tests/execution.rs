@@ -5785,6 +5785,7 @@ type st struct {
 func (s *st) bump() { s.n = 1 }
 
 func eachOf(s *st, fn func(*st)) { fn(s) }
+func eachValue(s st, fn func(st)) { fn(s) }
 
 func reachesTheWriteThroughACallback() int {
     s := &st{}
@@ -5795,6 +5796,12 @@ func reachesTheWriteThroughACallback() int {
 func reachesTheWriteDirectly() int {
     s := &st{}
     go s.bump()
+    return s.n
+}
+
+func copiesTheValueThroughACallback() int {
+    s := st{}
+    go func() { eachValue(s, func(x st) { x.n = 1 }) }()
     return s.n
 }
 "#,
@@ -5849,6 +5856,46 @@ func reachesTheWriteDirectly() int {
         ("unordered", "proven", "exhaustive"),
         "{direct:#?}"
     );
+    let copied = conflicts_for("copiesTheValueThroughACallback");
+    assert_no_proven_conflicts_with_explanation(&copied);
+}
+
+#[test]
+fn go_concurrent_access_conflicts_keep_cross_file_parameter_copies_separate() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("types.go", "package main\ntype Cell struct { n int }\n")
+        .file(
+            "helpers.go",
+            "package main\ntype CopyAlias = Cell\nfunc writeValue(c Cell) { c.n = 1 }\nfunc writeAlias(c CopyAlias) { c.n = 1 }\nfunc writePointer(c *Cell) { c.n = 1 }\n",
+        )
+        .file(
+            "main.go",
+            r#"package main
+func crossFileCopy() int {
+    c := Cell{}
+    go writeValue(c)
+    return c.n
+}
+func crossFilePointer() int {
+    c := &Cell{}
+    go writePointer(c)
+    return c.n
+}
+func crossFileAliasCopy() int {
+    c := Cell{}
+    go writeAlias(c)
+    return c.n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let shared = go_invocation_conflicts(&workspace, "crossFilePointer");
+    assert_proven_unordered_unprotected_conflict(&shared, "crossFilePointer");
+    for root in ["crossFileCopy", "crossFileAliasCopy"] {
+        let copied = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&copied);
+    }
 }
 
 #[test]
@@ -6274,6 +6321,15 @@ func unsafeBoundary() int {
     go func() { value = 1 }()
     return value
 }
+
+func unsafeBoundaryAfter() int {
+    value := 0
+    go func() { value = 1 }()
+    observed := value
+    pointer := unsafe.Pointer(&value)
+    _ = pointer
+    return observed
+}
 "#,
         )
         .file(
@@ -6292,12 +6348,28 @@ func cgoBoundary() int {
     C.noop()
     return value
 }
+
+func cgoBoundaryAfter() int {
+    value := 0
+    go func() {
+        value = 1
+        C.noop()
+    }()
+    observed := value
+    C.noop()
+    return observed
+}
 "#,
         )
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
 
-    for name in ["unsafeBoundary", "cgoBoundary"] {
+    for (name, expected_proof, expected_coverage, expected_reasons) in [
+        ("unsafeBoundary", "open", "open", vec!["unresolved_target"]),
+        ("cgoBoundary", "open", "open", vec!["unresolved_target"]),
+        ("unsafeBoundaryAfter", "proven", "exhaustive", vec![]),
+        ("cgoBoundaryAfter", "proven", "exhaustive", vec![]),
+    ] {
         let query = CodeQuery::from_json(&json!({
             "languages": ["go"],
             "match": { "kind": "function", "name": name },
@@ -6340,10 +6412,10 @@ func cgoBoundary() int {
         }));
         assert_eq!(
             (value.proof, value.coverage),
-            ("proven", "exhaustive"),
-            "an unrelated {name} boundary must not poison the exact ordinary race: {result:#?}"
+            (expected_proof, expected_coverage),
+            "only a boundary after both observations is independent of their ordering: {name}: {result:#?}"
         );
-        assert!(value.reasons.is_empty(), "{result:#?}");
+        assert_eq!(value.reasons, expected_reasons, "{name}: {result:#?}");
     }
 }
 
@@ -6448,6 +6520,13 @@ type functionFieldHolder struct {
 func functionValuedFieldLoadRace() {
     holder := &functionFieldHolder{callback: func() {}}
     go func() { holder.callback = func() {} }()
+    holder.callback()
+}
+
+func functionFieldAfterUnknownCall(before func()) {
+    holder := &functionFieldHolder{callback: func() {}}
+    go func() { holder.callback = func() {} }()
+    before()
     holder.callback()
 }
 
@@ -6725,6 +6804,28 @@ func unknownGroupCount(delta int) int {
         value = 1
     }()
     group.Wait()
+    return value
+}
+
+func summarizedAtomicOnly() {
+    var value int64
+    go func() { atomic.StoreInt64(&value, 1) }()
+    go func() { _ = atomic.LoadInt64(&value) }()
+}
+func summarizedMixedAtomic() {
+    var value int64
+    go func() { atomic.StoreInt64(&value, 1) }()
+    go func() { _ = value }()
+}
+func summarizedDistinctAtomic() {
+    var first int64
+    var second int64
+    go func() { atomic.StoreInt64(&first, 1) }()
+    go func() { _ = atomic.LoadInt64(&second) }()
+}
+func summarizedAtomicCopy() int64 {
+    var value int64
+    go func(copied int64) { atomic.StoreInt64(&copied, 1) }(value)
     return value
 }
 
@@ -7021,6 +7122,7 @@ func unsupportedOnce() int {
                   "id": "mutex.lock",
                   "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Lock()", "has_receiver": true, "parameter_count": 0 },
                   "completeness": "complete",
+                  "ordinary_heap_unchanged": true,
                   "transfers": [],
                   "concurrency_effects": [{ "kind": "lock_acquire", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
                 },
@@ -7028,6 +7130,7 @@ func unsupportedOnce() int {
                   "id": "mutex.unlock",
                   "target": { "path": "src/sync/mutex.go", "symbol": "sync.Mutex.Unlock()", "has_receiver": true, "parameter_count": 0 },
                   "completeness": "complete",
+                  "ordinary_heap_unchanged": true,
                   "transfers": [],
                   "concurrency_effects": [{ "kind": "lock_release", "lock": { "kind": "receiver" }, "mode": "exclusive" }]
                 },
@@ -7119,10 +7222,181 @@ func unsupportedOnce() int {
         },
         &CancellationToken::default(),
     );
-    assert!(
-        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
-        "sync models activate: {activation:#?}"
+    let snapshot = match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("sync models activate: {other:#?}"),
+    };
+
+    let cancellation = CancellationToken::default();
+    let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("atomic wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("atomic wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    let roots = [
+        procedure("summarizedAtomicOnly"),
+        procedure("summarizedMixedAtomic"),
+        procedure("summarizedDistinctAtomic"),
+        procedure("summarizedAtomicCopy"),
+    ];
+    let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        None,
     );
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &direct_provider,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("atomic wrappers project");
+    let atomic_count = summaries.summaries().iter().flat_map(|summary| summary.effects())
+        .filter(|effect| matches!(effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(effect.kind(), brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::Atomic { .. })
+        )).count();
+    assert_eq!(
+        atomic_count, 6,
+        "all six atomic calls must retain witnessed effects"
+    );
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(summaries.clone()),
+    );
+    let repository = brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new();
+    repository
+        .publish_components(summaries.summaries(), summaries.components())
+        .expect("atomic summaries publish");
+    let acquisition =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &direct_provider,
+            &repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("atomic summaries reacquire");
+    assert_eq!(
+        acquisition.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained
+    );
+    let summaries = acquisition.into_summaries();
+    let retained_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        Some(summaries.clone()),
+    );
+    let without_models = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        None,
+        Some(summaries),
+    );
+    for (index, root) in roots.iter().enumerate() {
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &direct_provider,
+            root,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("direct atomic report");
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let projected = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &projected_provider,
+            root,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("projected atomic report");
+        assert_eq!(
+            projected, direct,
+            "atomic route {index} must agree under fresh projection"
+        );
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let retained = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &retained_provider,
+            root,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("retained atomic report");
+        assert_eq!(
+            retained, direct,
+            "atomic route {index} must agree under summary replay"
+        );
+        if index < 2 {
+            let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+            let replay_only = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+                &without_models,
+                root,
+                &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("stored atomic effects survive unavailable live models");
+            assert_eq!(
+                replay_only.conflicts, retained.conflicts,
+                "stored effects must preserve access classification; missing dispatch evidence remains in report reasons"
+            );
+        }
+        let unordered = retained
+            .conflicts
+            .iter()
+            .filter(|conflict| {
+                conflict.ordering == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+            })
+            .collect::<Vec<_>>();
+        match index {
+            0 => assert!(
+                unordered.iter().any(|conflict| conflict.proven
+                    && conflict.exhaustive
+                    && conflict.protection
+                        == brokk_bifrost_flow::concurrency::ConcurrentProtection::AtomicOnly),
+                "{retained:#?}"
+            ),
+            1 => assert!(
+                unordered.iter().any(|conflict| conflict.proven
+                    && conflict.exhaustive
+                    && conflict.protection
+                        == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected),
+                "{retained:#?}"
+            ),
+            2 => assert!(
+                unordered.is_empty(),
+                "distinct storage cannot conflict: {retained:#?}"
+            ),
+            3 => assert!(
+                unordered.iter().all(|conflict| !conflict.proven),
+                "copied values cannot prove a shared atomic access: {retained:#?}"
+            ),
+            _ => unreachable!(),
+        }
+    }
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
@@ -7405,9 +7679,20 @@ func unsupportedOnce() int {
     // the caller-side field load.
     // The bound-method fixture also has unresolved callable/identity evidence;
     // preserve that limitation while requiring the actual read/write pair.
-    for (field_call, proof, coverage) in [
-        ("functionValuedFieldLoadRace", "proven", "exhaustive"),
-        ("boundMethodFieldLoadRace", "open", "open"),
+    for (field_call, proof, coverage, open_reason) in [
+        ("functionValuedFieldLoadRace", "proven", "exhaustive", None),
+        (
+            "boundMethodFieldLoadRace",
+            "open",
+            "open",
+            Some("unknown_location"),
+        ),
+        (
+            "functionFieldAfterUnknownCall",
+            "open",
+            "open",
+            Some("unresolved_target"),
+        ),
     ] {
         let query = CodeQuery::from_json(&json!({
             "languages": ["go"],
@@ -7442,12 +7727,9 @@ func unsupportedOnce() int {
             ("unordered", "unprotected", proof, coverage),
             "{field_call}: a function-valued field load must remain a race: {result:#?}"
         );
-        if proof == "open" {
+        if let Some(open_reason) = open_reason {
             assert!(
-                value
-                    .reasons
-                    .iter()
-                    .any(|reason| reason == "unknown_location"),
+                value.reasons.iter().any(|reason| reason == open_reason),
                 "{result:#?}"
             );
         }
@@ -8167,10 +8449,9 @@ fn go_heap_identity_survives_parameter_receiver_field_and_closure_routes() {
 }
 
 /// #2902's container-copy semantics: a slice or map copy keeps its backing
-/// store, and a struct copied by value does not.
-///
-/// The array-copy half of this criterion does not hold today and is pinned in
-/// `go_array_copy_is_distinct_storage`.
+/// store, while a struct or array copied by value gets distinct inline
+/// storage. References nested inside either value copy still name their
+/// original pointees.
 #[test]
 fn go_container_copies_keep_backing_and_value_copies_do_not() {
     let (_project, workspace) = heap_identity_workspace();
@@ -8185,6 +8466,95 @@ fn go_container_copies_keep_backing_and_value_copies_do_not() {
         0,
         "a struct copied by value has its own field storage"
     );
+    for route in [
+        "arrayPointerElementCopy",
+        "arrayPointerElementCopyChain",
+        "arrayPointerElementCompositeLiteral",
+        "arrayPointerElementKeyedCompositeLiteral",
+        "structPointerFieldCopy",
+    ] {
+        let result = heap_identity_conflicts(&workspace, route);
+        assert_proven_unordered_unprotected_conflict(
+            &result,
+            "copying an aggregate preserves its nested pointer payload",
+        );
+    }
+    let distinct = heap_identity_conflicts(&workspace, "arrayPointerElementsStayDistinct");
+    assert_no_proven_conflicts_with_explicit_evidence(&distinct);
+    for route in [
+        "arrayPointerElementConstLengthLiteral",
+        "arrayValueCompositeLiteralCopy",
+        "arrayPointerElementReplacedAfterCopy",
+        "arrayPointerElementSourceReplacedAfterCopy",
+    ] {
+        let result = heap_identity_conflicts(&workspace, route);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+}
+
+#[test]
+fn go_append_reallocation_distinguishes_backing_storage() {
+    let (_project, workspace) = heap_identity_workspace();
+    let replaced = heap_identity_conflicts(&workspace, "appendPastCapacity");
+    assert_no_proven_conflicts_with_explanation(&replaced);
+    assert_eq!(
+        replaced.completion(),
+        CodeQueryCompletion::Complete,
+        "capacity proves that append allocated distinct backing storage: {replaced:#?}"
+    );
+
+    let unknown = heap_identity_conflicts(&workspace, "appendUnknownCapacity");
+    assert_no_proven_conflicts_with_explicit_evidence(&unknown);
+}
+
+#[test]
+fn go_slice_copy_retains_exact_element_reads_and_writes() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in ["copyDestinationRace", "copySourceRace"] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(
+            &result,
+            "an exact copy retains its source read and destination write",
+        );
+    }
+
+    let distinct = heap_identity_conflicts(&workspace, "copyDistinctBacking");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+    assert_eq!(
+        distinct.completion(),
+        CodeQueryCompletion::Complete,
+        "copy accesses do not merge distinct backing stores: {distinct:#?}"
+    );
+
+    let unknown = heap_identity_conflicts(&workspace, "copyUnknownLength");
+    assert_no_proven_conflicts_with_explicit_evidence(&unknown);
+}
+
+#[test]
+fn go_slice_copy_preserves_reference_elements_and_replaces_destination_values() {
+    let (_project, workspace) = heap_identity_workspace();
+    let shared = heap_identity_conflicts(&workspace, "copySharedPointerElement");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "copying a pointer element preserves the pointed-to object",
+    );
+
+    let replaced = heap_identity_conflicts(&workspace, "copyReplacedPointerElement");
+    assert_no_proven_conflicts_with_explanation(&replaced);
+
+    let distinct = heap_identity_conflicts(&workspace, "copyDistinctPointerElements");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+    assert_eq!(
+        distinct.completion(),
+        CodeQueryCompletion::Complete,
+        "independent pointer-copy chains must resolve without aliasing: {distinct:#?}"
+    );
+
+    let value = heap_identity_conflicts(&workspace, "copyStructValueElement");
+    assert_no_proven_conflicts_with_explicit_evidence(&value);
+
+    let dynamic = heap_identity_conflicts(&workspace, "copyDynamicPointerElement");
+    assert_no_proven_conflicts_with_explicit_evidence(&dynamic);
 }
 
 /// A Go array copy duplicates the elements, so the two arrays share nothing.
@@ -8350,16 +8720,209 @@ func choose(c *cell) cell { return *c }
     );
 }
 
-/// Interface dispatch remains isolated from the now-active call-result test.
-/// It still has the known #2902 identity gap and is intentionally ignored.
 #[test]
-#[ignore = "finds real bug: identity is lost through an interface (#2902)"]
+fn go_heap_identity_asserted_pointer_fields_never_disappear() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in ["sharedPointerAssertion", "sharedExplicitInterfaceAssertion"] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_conflict_or_explicit_open(&result);
+    }
+}
+
+#[test]
+fn go_heap_identity_preserves_asserted_pointer_payloads() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "sharedPointerAssertion",
+        "sharedExplicitInterfaceAssertion",
+        "sharedVarPointerAssertion",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
+}
+
+#[test]
+fn go_heap_identity_preserves_pointer_assertions_inside_a_child() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "sharedDirectPointerAssertion");
+    assert_proven_unordered_unprotected_conflict(&result, "assertion inside a child");
+}
+
+#[test]
+fn go_heap_identity_incompatible_assertions_never_prove_races() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "incompatibleSliceAssertion",
+        "incompatibleMapAssertion",
+        "incompatibleSliceElementAssertion",
+        "incompatibleMapKeyAssertion",
+        "incompatibleMapValueAssertion",
+        "incompatibleNestedMapAssertion",
+        "incompatibleSliceSelfAssertion",
+        "incompatibleArraySelfAssertion",
+        "incompatibleStructSelfAssertion",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
+fn go_heap_identity_does_not_prove_replaced_interface_payloads() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "replacedInterfacePayload",
+        "replacedInterfacePayloadInClosure",
+        "replacedInterfacePayloadInSelect",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
+fn go_heap_identity_keeps_unknown_interface_payload_open() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "unknownInterfacePayload");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_heap_identity_assertion_aliases_use_declaration_scope() {
+    let (_project, workspace) = heap_identity_workspace();
+    let shared = heap_identity_conflicts(&workspace, "shadowedSliceAssertion");
+    assert_proven_unordered_unprotected_conflict(&shared, "slice alias keeps its declared type");
+    let copied = heap_identity_conflicts(&workspace, "shadowedArrayAssertion");
+    assert_no_proven_conflicts_with_explanation(&copied);
+}
+
+#[test]
+fn go_heap_identity_preserves_asserted_backing_storage() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in ["sharedSliceAssertion", "sharedMapAssertion"] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
+}
+
+#[test]
+fn go_heap_identity_assertion_copies_and_distinct_payloads_never_prove_races() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "copiedValueAssertion",
+        "copiedArrayAssertion",
+        "distinctPointerAssertions",
+        "distinctSliceAssertions",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
 fn go_heap_identity_survives_interface_route() {
     let (_project, workspace) = heap_identity_workspace();
-    assert!(
-        proven_conflicts(&workspace, "sharedInterface") >= 1,
-        "an interface carrying one pointer must preserve its shared location"
+    let result = heap_identity_conflicts(&workspace, "sharedInterface");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "an interface carrying one stable pointer must preserve its shared location",
     );
+}
+
+#[test]
+fn go_heap_identity_preserves_stable_interface_forwarding() {
+    let (_project, workspace) = heap_identity_workspace();
+    let shared = heap_identity_conflicts(&workspace, "sharedForwardedInterface");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "a stable interface-to-interface conversion retains its pointer payload",
+    );
+
+    let distinct = heap_identity_conflicts(&workspace, "distinctForwardedInterface");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+    assert_eq!(
+        distinct.completion(),
+        CodeQueryCompletion::Complete,
+        "{distinct:#?}"
+    );
+
+    let replaced = heap_identity_conflicts(&workspace, "replacedForwardedInterface");
+    assert_no_proven_conflicts_with_explicit_evidence(&replaced);
+}
+
+#[test]
+#[ignore = "finds real gap: #2771 must supply complete cross-file receiver type-flow feedback"]
+fn go_heap_identity_preserves_cross_file_interface_dispatch() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "types.go",
+            r#"package main
+
+type crossFileCell struct { n int }
+type crossFileBumper interface { bump() }
+
+func (c *crossFileCell) bump() { c.n++ }
+"#,
+        )
+        .file(
+            "main.go",
+            r#"package main
+
+func sharedCrossFileInterface() {
+    c := &crossFileCell{}
+    var boxed crossFileBumper = c
+    go boxed.bump()
+    go c.bump()
+}
+
+func distinctCrossFileInterface() {
+    first := &crossFileCell{}
+    second := &crossFileCell{}
+    var boxed crossFileBumper = first
+    go boxed.bump()
+    go second.bump()
+}
+
+func replacedCrossFileInterface() {
+    original := &crossFileCell{}
+    var boxed crossFileBumper = original
+    boxed = &crossFileCell{}
+    go boxed.bump()
+    go original.bump()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let shared = heap_identity_conflicts(&workspace, "sharedCrossFileInterface");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "an exact cross-file interface dispatch retains its pointer payload",
+    );
+
+    let distinct = heap_identity_conflicts(&workspace, "distinctCrossFileInterface");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+
+    let replaced = heap_identity_conflicts(&workspace, "replacedCrossFileInterface");
+    assert_no_proven_conflicts_with_explicit_evidence(&replaced);
+}
+
+#[test]
+fn go_heap_identity_interface_dispatch_does_not_fabricate_payload_identity() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "interfaceDistinctPayloads",
+        "interfaceReplacedPayload",
+        "interfaceValuePayload",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+    let value_receiver =
+        heap_identity_conflicts(&workspace, "interfacePointerPayloadValueReceiver");
+    assert_no_proven_conflicts_with_explicit_evidence(&value_receiver);
 }
 
 /// Returning a `cell` by value copies its inline field storage. A missing
@@ -8613,17 +9176,78 @@ fn go_heap_identity_preserves_stable_formal_entry_results() {
 /// #2902 asks that "exact channel/container transport can publish an object to
 /// another task without treating every payload as globally aliased". Sending a
 /// pointer and receiving it in a spawned task currently relates nothing, so the
-/// receiver's write and the sender's write are declared disjoint.
+/// receiver's write and the sender's write name the same allocation.
 ///
 /// Owned by #2902.
 #[test]
-#[ignore = "finds real bug: a channel does not publish its payload's identity (#2902)"]
 fn go_channel_transport_publishes_its_payload() {
     let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "channelPublish");
     assert!(
-        proven_conflicts(&workspace, "channelPublish") >= 1,
-        "a pointer sent through a channel is the same object on both sides"
+        result.results.iter().any(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::ConcurrentAccessConflict { value }
+                    if value.verdict == "conflict" && value.proof == "proven"
+            )
+        }),
+        "a pointer sent through a channel is the same object on both sides: {result:#?}"
     );
+}
+
+#[test]
+fn go_channel_descriptor_copy_preserves_exact_payload_transport() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "channelDescriptorCopy");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a copied channel descriptor retains one exact channel object",
+    );
+}
+
+#[test]
+fn go_channel_formal_preserves_exact_payload_transport() {
+    let (_project, workspace) = heap_identity_workspace();
+    let result = heap_identity_conflicts(&workspace, "channelHelperPayload");
+    assert_proven_unordered_unprotected_conflict(
+        &result,
+        "a fresh caller channel passed through exact helpers retains its transported object",
+    );
+}
+
+#[test]
+fn go_channel_backing_transport_publishes_slice_and_map_storage() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in ["channelSlicePublish", "channelMapPublish"] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(
+            &result,
+            "a slice or map sent through one exact channel retains its backing storage",
+        );
+    }
+}
+
+#[test]
+fn go_channel_transport_does_not_fabricate_payload_identity() {
+    let (_project, workspace) = heap_identity_workspace();
+    for root in [
+        "channelStructValueCopy",
+        "channelMultipleSends",
+        "channelInterfacePayload",
+        "channelParameterPayload",
+        "channelHelperValueCopy",
+        "channelReassignedHelper",
+        "channelLoopSend",
+        "channelCloseAlternative",
+        "channelTupleAlias",
+        "channelSliceOffset",
+        "channelFieldSliceOffset",
+    ] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+    let distinct = heap_identity_conflicts(&workspace, "channelDistinctBackingStore");
+    assert_no_proven_conflicts_with_explanation(&distinct);
 }
 
 /// Count the proven conflicts a root reports, which is what every heap-identity
@@ -8687,6 +9311,12 @@ type bumper interface {
 }
 
 func (c *cell) bump() { c.n++ }
+
+type valueBumper interface {
+    bumpValue()
+}
+
+func (c cell) bumpValue() { c.n++ }
 
 func viaParam(c *cell) { c.n = 1 }
 
@@ -9047,11 +9677,295 @@ func unavailableResultTypeMetadataUse() {
     go func() { source.n = 2 }()
 }
 
+func sharedPointerAssertion() {
+    original := &cell{}
+    var boxed any = original
+    recovered := boxed.(*cell)
+    go func() { recovered.n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func sharedExplicitInterfaceAssertion() {
+    original := &cell{}
+    var boxed interface{} = original
+    recovered := boxed.(*cell)
+    go func() { recovered.n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func sharedVarPointerAssertion() {
+    original := &cell{}
+    var boxed interface{} = original
+    var recovered = boxed.(*cell)
+    go func() { recovered.n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func sharedDirectPointerAssertion() {
+    original := &cell{}
+    var boxed any = original
+    go func() { boxed.(*cell).n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func copiedValueAssertion() {
+    original := cell{}
+    var boxed any = original
+    recovered := boxed.(cell)
+    go func() { recovered.n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func copiedArrayAssertion() {
+    original := [1]int{}
+    var boxed any = original
+    recovered := boxed.([1]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func sharedSliceAssertion() {
+    original := make([]int, 1)
+    var boxed any = original
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func sharedMapAssertion() {
+    original := make(map[int]int)
+    var boxed any = original
+    recovered := boxed.(map[int]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func incompatibleSliceAssertion() {
+    original := make(map[int]int)
+    var boxed any = original
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func incompatibleMapAssertion() {
+    original := make([]int, 1)
+    var boxed any = original
+    recovered := boxed.(map[int]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func incompatibleSliceElementAssertion() {
+    original := make([]int, 1)
+    var boxed any = original
+    recovered := boxed.([]string)
+    go func() { recovered[0] = "value" }()
+    go func() { original[0] = 2 }()
+}
+
+func incompatibleSliceSelfAssertion() {
+    original := make([]int, 1)
+    var boxed any = original
+    recovered := boxed.([]string)
+    go func() { recovered[0] = "one" }()
+    go func() { recovered[0] = "two" }()
+}
+
+func incompatibleArraySelfAssertion() {
+    original := [1]int{}
+    var boxed any = original
+    recovered := boxed.([1]string)
+    go func() { recovered[0] = "one" }()
+    go func() { recovered[0] = "two" }()
+}
+
+type assertionOtherCell struct { n int }
+
+func incompatibleStructSelfAssertion() {
+    original := cell{}
+    var boxed any = original
+    recovered := boxed.(assertionOtherCell)
+    go func() { recovered.n = 1 }()
+    go func() { recovered.n = 2 }()
+}
+
+func incompatibleMapKeyAssertion() {
+    original := make(map[int]int)
+    var boxed any = original
+    recovered := boxed.(map[uint]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func incompatibleMapValueAssertion() {
+    original := make(map[int]int)
+    var boxed any = original
+    recovered := boxed.(map[int]string)
+    go func() { recovered[0] = "value" }()
+    go func() { original[0] = 2 }()
+}
+
+type assertionMapKey int
+type assertionMapValue int
+type assertionOtherMapValue int
+
+func incompatibleNestedMapAssertion() {
+    original := map[assertionMapKey]map[string]assertionMapValue{0: {"key": 0}}
+    var boxed any = original
+    recovered := boxed.(map[assertionMapKey]map[string]assertionOtherMapValue)
+    go func() { recovered[0]["key"] = 1 }()
+    go func() { original[0]["key"] = 2 }()
+}
+
+func replacedInterfacePayload() {
+    original := make([]int, 1)
+    var boxed any = original
+    boxed = make([]int, 1)
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func replacedInterfacePayloadInClosure() {
+    original := make([]int, 1)
+    var boxed any = original
+    replace := func() { boxed = make([]int, 1) }
+    replace()
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func unknownInterfacePayload(boxed any, original []int) {
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+func replacedInterfacePayloadInSelect() {
+    ch := make(chan any, 1)
+    original := make([]int, 1)
+    var boxed any = original
+    ch <- make([]int, 1)
+    select {
+    case boxed = <-ch:
+    }
+    recovered := boxed.([]int)
+    go func() { recovered[0] = 1 }()
+    go func() { original[0] = 2 }()
+}
+
+type assertionSliceBase []int
+type assertionSliceAlias = assertionSliceBase
+type assertionArrayBase [1]int
+type assertionArrayAlias = assertionArrayBase
+
+func shadowedSliceAssertion() {
+    original := assertionSliceAlias{0}
+    var boxed any = original
+    {
+        type assertionSliceBase [1]int
+        recovered := boxed.(assertionSliceAlias)
+        go func() { recovered[0] = 1 }()
+        go func() { original[0] = 2 }()
+    }
+}
+
+func shadowedArrayAssertion() {
+    original := assertionArrayAlias{0}
+    var boxed any = original
+    {
+        type assertionArrayBase []int
+        recovered := boxed.(assertionArrayAlias)
+        go func() { recovered[0] = 1 }()
+        go func() { original[0] = 2 }()
+    }
+}
+
+func distinctSliceAssertions() {
+    first := make([]int, 1)
+    second := make([]int, 1)
+    var firstBox any = first
+    var secondBox any = second
+    firstRecovered := firstBox.([]int)
+    secondRecovered := secondBox.([]int)
+    go func() { firstRecovered[0] = 1 }()
+    go func() { secondRecovered[0] = 2 }()
+}
+
+func distinctPointerAssertions() {
+    first := &cell{}
+    second := &cell{}
+    var firstBox any = first
+    var secondBox any = second
+    firstRecovered := firstBox.(*cell)
+    secondRecovered := secondBox.(*cell)
+    go func() { firstRecovered.n = 1 }()
+    go func() { secondRecovered.n = 2 }()
+}
+
 func sharedInterface() {
     c := &cell{}
     var b bumper = c
     go b.bump()
     go c.bump()
+}
+
+func sharedForwardedInterface() {
+    c := &cell{}
+    var first bumper = c
+    var forwarded bumper = first
+    go forwarded.bump()
+    go c.bump()
+}
+
+func distinctForwardedInterface() {
+    first := &cell{}
+    second := &cell{}
+    var boxed bumper = first
+    var forwarded bumper = boxed
+    go forwarded.bump()
+    go second.bump()
+}
+
+func replacedForwardedInterface() {
+    original := &cell{}
+    var boxed bumper = original
+    boxed = &cell{}
+    var forwarded bumper = boxed
+    go forwarded.bump()
+    go original.bump()
+}
+
+func interfaceDistinctPayloads() {
+    first := &cell{}
+    second := &cell{}
+    var b bumper = first
+    go b.bump()
+    go second.bump()
+}
+
+func interfacePointerPayloadValueReceiver() {
+    original := &cell{}
+    var b valueBumper = original
+    go b.bumpValue()
+    go func() { original.n = 2 }()
+}
+
+func interfaceReplacedPayload() {
+    original := &cell{}
+    var b bumper = original
+    b = &cell{}
+    go b.bump()
+    go original.bump()
+}
+
+func interfaceValuePayload() {
+    original := cell{}
+    var b valueBumper = original
+    go b.bumpValue()
+    go func() { original.n = 2 }()
 }
 
 func sliceCopy() {
@@ -9075,6 +9989,101 @@ func appendWithinCapacity() {
     go func() { s[0] = 2 }()
 }
 
+func appendPastCapacity() {
+    s := make([]int, 1, 1)
+    t := append(s, 1)
+    go func() { t[0] = 1 }()
+    go func() { s[0] = 2 }()
+}
+
+func appendUnknownCapacity(s []int) {
+    t := append(s, 1)
+    go func() { t[0] = 1 }()
+    go func() { s[0] = 2 }()
+}
+
+func copySharedPointerElement() {
+    source := make([]*cell, 1)
+    source[0] = &cell{}
+    target := make([]*cell, 1)
+    copy(target, source)
+    go writePointerElement(target)
+    go writePointerElement(source)
+}
+
+func copyReplacedPointerElement() {
+    original := &cell{}
+    replacement := &cell{}
+    source := make([]*cell, 1)
+    source[0] = replacement
+    target := make([]*cell, 1)
+    target[0] = original
+    copy(target, source)
+    go writePointerElement(target)
+    go func() { original.n = 2 }()
+}
+
+func copyDistinctPointerElements() {
+    leftSource := make([]*cell, 1)
+    leftSource[0] = &cell{}
+    leftTarget := make([]*cell, 1)
+    copy(leftTarget, leftSource)
+
+    rightSource := make([]*cell, 1)
+    rightSource[0] = &cell{}
+    rightTarget := make([]*cell, 1)
+    copy(rightTarget, rightSource)
+
+    go writePointerElement(leftTarget)
+    go writePointerElement(rightTarget)
+}
+
+func copyStructValueElement() {
+    source := make([]cell, 1)
+    target := make([]cell, 1)
+    copy(target, source)
+    go func() { target[0].n = 1 }()
+    go func() { source[0].n = 2 }()
+}
+
+func copyDynamicPointerElement(index int) {
+    source := make([]*cell, 1)
+    source[index] = &cell{}
+    target := make([]*cell, 1)
+    copy(target, source)
+    go writePointerElement(target)
+    go writePointerElement(source)
+}
+
+func writePointerElement(values []*cell) { values[0].n = 1 }
+
+func copyDestinationRace() {
+    destination := []int{0}
+    source := []int{1}
+    go func() { destination[0] = 2 }()
+    copy(destination, source)
+}
+
+func copySourceRace() {
+    destination := []int{0}
+    source := []int{1}
+    go func() { source[0] = 2 }()
+    copy(destination, source)
+}
+
+func copyDistinctBacking() {
+    destination := []int{0}
+    source := []int{1}
+    other := []int{2}
+    go func() { other[0] = 3 }()
+    copy(destination, source)
+}
+
+func copyUnknownLength(destination, source []int) {
+    go func() { destination[0] = 2 }()
+    copy(destination, source)
+}
+
 func arrayCopy() {
     var a [4]int
     b := a
@@ -9089,6 +10098,100 @@ func structValueCopy() {
     go func() { v.c.n = 2 }()
 }
 
+func structPointerFieldCopy() {
+    c := &cell{}
+    v := wrap{c: c}
+    w := v
+    go func() { w.c.n = 1 }()
+    go func() { v.c.n = 2 }()
+}
+
+func arrayPointerElementCopy() {
+    c := &cell{}
+    var v [1]*cell
+    v[0] = c
+    w := v
+    go func() { w[0].n = 1 }()
+    go func() { v[0].n = 2 }()
+}
+
+func arrayPointerElementCopyChain() {
+    c := &cell{}
+    var v [1]*cell
+    v[0] = c
+    x := v
+    w := x
+    go func() { w[0].n = 1 }()
+    go func() { v[0].n = 2 }()
+}
+
+func arrayPointerElementCompositeLiteral() {
+    c := &cell{}
+    v := [1]*cell{c}
+    w := v
+    go func() { w[0].n = 1 }()
+    go func() { v[0].n = 2 }()
+}
+
+func arrayPointerElementKeyedCompositeLiteral() {
+    c := &cell{}
+    v := [3]*cell{2: c}
+    w := v
+    go func() { w[2].n = 1 }()
+    go func() { v[2].n = 2 }()
+}
+
+func arrayValueCompositeLiteralCopy() {
+    v := [1]cell{{}}
+    w := v
+    go func() { w[0].n = 1 }()
+    go func() { v[0].n = 2 }()
+}
+
+func arrayPointerElementConstLengthLiteral() {
+    const length = 1
+    c := &cell{}
+    v := [length]*cell{c}
+    w := v
+    go func() { w[0].n = 1 }()
+    go func() { v[0].n = 2 }()
+}
+
+func arrayPointerElementsStayDistinct() {
+    a := &cell{}
+    b := &cell{}
+    var left [1]*cell
+    left[0] = a
+    leftCopy := left
+    var right [1]*cell
+    right[0] = b
+    rightCopy := right
+    go func() { leftCopy[0].n = 1 }()
+    go func() { rightCopy[0].n = 2 }()
+}
+
+func arrayPointerElementReplacedAfterCopy() {
+    original := &cell{}
+    replacement := &cell{}
+    var v [1]*cell
+    v[0] = original
+    w := v
+    w[0] = replacement
+    go func() { w[0].n = 1 }()
+    go func() { original.n = 2 }()
+}
+
+func arrayPointerElementSourceReplacedAfterCopy() {
+    original := &cell{}
+    replacement := &cell{}
+    var v [1]*cell
+    v[0] = original
+    w := v
+    v[0] = replacement
+    go func() { w[0].n = 1 }()
+    go func() { replacement.n = 2 }()
+}
+
 func channelPublish() {
     ch := make(chan *cell, 1)
     c := &cell{}
@@ -9098,6 +10201,208 @@ func channelPublish() {
         got.n = 1
     }()
     go func() { c.n = 2 }()
+}
+
+func channelDescriptorCopy() {
+    ch := make(chan *cell, 1)
+    copy := ch
+    c := &cell{}
+    ch <- c
+    go func() {
+        got := <-copy
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func sendCell(ch chan *cell, c *cell) { ch <- c }
+func receiveCell(ch chan *cell) {
+    got := <-ch
+    got.n = 1
+}
+func channelHelperPayload() {
+    ch := make(chan *cell, 1)
+    c := &cell{}
+    sendCell(ch, c)
+    go receiveCell(ch)
+    go func() { c.n = 2 }()
+}
+
+func sendCellValue(ch chan cell, c cell) { ch <- c }
+func receiveCellValue(ch chan cell) {
+    got := <-ch
+    got.n = 1
+}
+func channelHelperValueCopy() {
+    ch := make(chan cell, 1)
+    c := cell{}
+    sendCellValue(ch, c)
+    go receiveCellValue(ch)
+    go func() { c.n = 2 }()
+}
+
+func receiveCellReplacement(ch, replacement chan *cell) {
+    ch = replacement
+    got := <-ch
+    got.n = 1
+}
+func channelReassignedHelper() {
+    original := make(chan *cell, 1)
+    replacement := make(chan *cell, 1)
+    first := &cell{}
+    second := &cell{}
+    original <- first
+    replacement <- second
+    go receiveCellReplacement(original, replacement)
+    go func() { first.n = 2 }()
+}
+
+func channelSlicePublish() {
+    ch := make(chan []int, 1)
+    values := make([]int, 1)
+    ch <- values
+    go func() {
+        got := <-ch
+        got[0] = 1
+    }()
+    go func() { values[0] = 2 }()
+}
+
+func channelMapPublish() {
+    ch := make(chan map[int]int, 1)
+    values := make(map[int]int)
+    ch <- values
+    go func() {
+        got := <-ch
+        got[0] = 1
+    }()
+    go func() { values[0] = 2 }()
+}
+
+func channelStructValueCopy() {
+    ch := make(chan cell, 1)
+    c := cell{}
+    ch <- c
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func channelMultipleSends() {
+    ch := make(chan *cell, 2)
+    first := &cell{}
+    second := &cell{}
+    ch <- first
+    ch <- second
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { second.n = 2 }()
+}
+
+func channelInterfacePayload() {
+    ch := make(chan any, 1)
+    c := &cell{}
+    ch <- c
+    go func() {
+        got := (<-ch).(*cell)
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func channelParameterPayload(ch chan *cell) {
+    c := &cell{}
+    ch <- c
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func channelLoopSend() {
+    ch := make(chan *cell, 1)
+    c := &cell{}
+    for i := 0; i < 1; i++ {
+        ch <- c
+    }
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func channelCloseAlternative() {
+    ch := make(chan *cell, 1)
+    c := &cell{}
+    ch <- c
+    close(ch)
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { c.n = 2 }()
+}
+
+func channelTupleAlias() {
+    ch := make(chan *cell, 2)
+    var alias chan *cell
+    ignored := 0
+    alias, ignored = ch, ignored
+    first := &cell{}
+    second := &cell{}
+    alias <- first
+    ch <- second
+    go func() {
+        got := <-ch
+        got.n = 1
+    }()
+    go func() { second.n = 2 }()
+}
+
+func channelSliceOffset() {
+    ch := make(chan []int, 1)
+    values := make([]int, 2)
+    tail := values[1:]
+    ch <- tail
+    go func() {
+        got := <-ch
+        got[0] = 1
+    }()
+    go func() { values[0] = 2 }()
+}
+
+type channelSliceHolder struct {
+    values []int
+}
+
+func channelFieldSliceOffset() {
+    ch := make(chan []int, 1)
+    values := make([]int, 2)
+    holder := channelSliceHolder{values: values[1:]}
+    ch <- holder.values
+    go func() {
+        got := <-ch
+        got[0] = 1
+    }()
+    go func() { values[0] = 2 }()
+}
+
+func channelDistinctBackingStore() {
+    ch := make(chan []int, 1)
+    first := make([]int, 1)
+    second := make([]int, 1)
+    ch <- first
+    go func() {
+        got := <-ch
+        got[0] = 1
+    }()
+    go func() { second[0] = 2 }()
 }
 
 "#,
@@ -9231,20 +10536,141 @@ fn go_concurrent_access_conflicts_keep_distinct_pointer_formals_disjoint() {
     assert_no_concurrent_conflicts(&result);
 }
 
-/// Holder payload identity is not modeled yet. Keep both the unbound formal
-/// route and same/different pointer initializers explicit and unproven rather
-/// than accepting a clean zero or manufacturing a race.
+/// Exact initializer payloads distinguish shared from independent pointees.
+/// Unbound holder inputs still need explicit identity uncertainty.
 #[test]
-fn go_concurrent_access_conflicts_keep_holder_payload_routes_open() {
+fn go_concurrent_access_conflicts_distinguish_holder_payloads() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let unknown = go_invocation_conflicts(&workspace, "holderInputs");
+    assert_no_proven_conflicts_with_explicit_evidence(&unknown);
+
+    let shared = go_invocation_conflicts(&workspace, "samePointeeInDifferentHolders");
+    assert_proven_unordered_unprotected_conflict(&shared, "samePointeeInDifferentHolders");
+    let distinct = go_invocation_conflicts(&workspace, "distinctPointeesInDifferentHolders");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+    assert_eq!(distinct.completion(), CodeQueryCompletion::Complete);
+
+    for result in [&shared, &distinct] {
+        let mut initializers = 0;
+        for item in &result.results {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("expected a concurrent-access relation: {item:#?}");
+            };
+            if value.first_procedure_id == value.root_procedure_id {
+                initializers += 1;
+                assert_eq!(
+                    (value.ordering, value.verdict, value.proof),
+                    ("happens_before", "ordered", "proven"),
+                    "holder initialization precedes its child's field load: {result:#?}"
+                );
+            } else if value.verdict == "conflict" {
+                assert_eq!(value.first_access, "write");
+                assert_eq!(value.second_access, "write");
+                assert_eq!(value.task_relation, "siblings");
+            }
+        }
+        assert_eq!(
+            initializers, 2,
+            "both holder initializers remain visible: {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_do_not_prove_nil_holder_field_payloads() {
     let (_project, workspace) = go_invocation_identity_workspace();
     for root in [
-        "holderInputs",
-        "samePointeeInDifferentHolders",
-        "distinctPointeesInDifferentHolders",
+        "nilHolderFieldPayload",
+        "explicitNilHolderFieldPayload",
+        "overwrittenHolderFieldPayload",
+        "nestedNilHolderFieldPayload",
+        "storedNilHolderFieldPayload",
+        "zeroHolderFieldPayload",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_preserve_initialized_holder_field_payloads() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in ["sharedHolderFieldPayload", "assignedHolderFieldPayload"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_do_not_prove_cleared_holder_field_payloads() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "capturedNilHolderFieldPayload",
+        "copiedNilHolderFieldPayload",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_keep_uncertain_holder_field_payloads_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "conditionalHolderFieldPayload",
+        "opaqueHolderFieldPayload",
+        "escapedHolderFieldPayload",
+        "escapedCallbackHolderFieldPayload",
     ] {
         let result = go_invocation_conflicts(&workspace, root);
         assert_no_proven_conflicts_with_explicit_evidence(&result);
     }
+}
+
+/// A closure initializes a fresh holder once and is then published through a
+/// package-level function value. Its captured field may be mutated by a later
+/// invocation that the local query cannot account for, so the child accesses
+/// must remain explicitly incomplete rather than inheriting one singleton
+/// payload identity.
+#[test]
+fn go_concurrent_access_conflicts_keep_published_holder_initializer_open() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "publishedHolderInitializer",
+        "publishedHolderInitializerThroughCaptureCell",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+}
+
+/// Each repeated child invokes a helper that allocates both its holder and
+/// pointer payload. The helper's allocation snapshot is per activation and
+/// must not become a shared cross-activation field identity.
+#[test]
+fn go_concurrent_access_conflicts_keep_repeated_fresh_holder_helpers_disjoint() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    for root in [
+        "repeatedFreshHolderHelpers",
+        "repeatedFreshPublishedFieldArguments",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+}
+
+#[test]
+fn go_concurrent_access_conflicts_order_conditional_write_before_spawn() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "conditionalWriteBeforeSpawn");
+    assert_exact_safe_concurrent_relations(&result, "ordered");
+}
+
+#[test]
+fn go_concurrent_access_conflicts_prove_conditional_write_after_spawn() {
+    let (_project, workspace) = go_invocation_identity_workspace();
+    let result = go_invocation_conflicts(&workspace, "conditionalWriteAfterSpawn");
+    assert_proven_unordered_unprotected_conflict(&result, "conditional write after spawn");
 }
 
 /// Separate inline struct values have disjoint direct field storage, even
@@ -9840,8 +11266,1101 @@ fn assert_conflict_or_explicit_open(result: &CodeQueryResult) {
     });
     assert!(
         retained || !result.diagnostics.is_empty(),
-        "a missed WaitGroup ordering must retain a conflict or explicit open evidence: {result:#?}"
+        "a potentially shared access must retain a conflict or explicit open evidence: {result:#?}"
     );
+}
+
+#[test]
+fn go_recursive_detached_slices_preserve_identity_and_open_effects() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct { n int }
+func shared(p *cell) { p.n++; go shared(p) }
+func fresh(p *cell) { p.n++; go fresh(&cell{}) }
+func copied(c cell) { c.n++; go copied(c) }
+func write(p *cell) { p.n++ }
+func sharedRoot() { p := &cell{}; go shared(p); go shared(p) }
+func freshRoot() { go fresh(&cell{}); go fresh(&cell{}) }
+func copiedRoot() { c := cell{}; go copied(c); go copied(c) }
+func directRoot() { p := &cell{}; go write(p); go write(p) }
+
+func relay(start, finish chan struct{}, depth int) {
+    if depth > 0 { go relay(start, finish, depth - 1); return }
+    <-start
+    close(finish)
+}
+func recursiveJoin() {
+    n := 0
+    start := make(chan struct{})
+    finish := make(chan struct{})
+    go func() { n = 1; close(start) }()
+    go relay(start, finish, 5)
+    go func() { <-finish; n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let shared = go_invocation_conflicts(&workspace, "sharedRoot");
+    assert_conflict_or_explicit_open(&shared);
+    assert!(
+        !shared.results.is_empty(),
+        "shared object must retain candidate pairs: {shared:#?}"
+    );
+    for root in ["sharedRoot", "freshRoot", "copiedRoot", "recursiveJoin"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_ne!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{root}: {result:#?}"
+        );
+        assert!(!result.diagnostics.is_empty(), "{root}: {result:#?}");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    != CodeQueryDiagnosticCode::SemanticBudgetExhausted),
+            "{root}: {result:#?}"
+        );
+        for item in &result.results {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("typed concurrency row: {item:#?}");
+            };
+            assert_eq!(value.proof, "open", "{root}: {result:#?}");
+            assert!(
+                value
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "recursive_expansion"),
+                "{root}: {result:#?}"
+            );
+        }
+        if root == "freshRoot" {
+            assert!(
+                result.results.is_empty(),
+                "distinct allocations must not acquire shared identity: {result:#?}"
+            );
+        }
+    }
+    let direct = go_invocation_conflicts(&workspace, "directRoot");
+    assert_proven_unordered_unprotected_conflict(
+        &direct,
+        "independent sibling calls remain analyzed",
+    );
+}
+
+#[test]
+fn go_concurrent_access_conflicts_keep_competing_channel_senders_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+// The first receive is guaranteed to consume senderTwo. senderOne's n=1
+// write happens before its release receive, but its send happens only after
+// the receiver has written n=2. The two writes are therefore unordered.
+func competingRoot() {
+	ch := make(chan struct{})
+	gate := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	n := 0
+
+	go func() {
+		n = 1
+		<-release
+		ch <- struct{}{}
+	}()
+
+	go func() {
+		<-gate
+		ch <- struct{}{}
+	}()
+
+	go func() {
+		close(gate)
+		<-ch
+		n = 2
+		close(release)
+		<-ch
+		close(done)
+	}()
+
+	<-done
+	_ = n
+}
+
+// With one sender, the channel rendezvous orders n=1 before n=2. The sender
+// completion signal also makes the final root read a direct join of the
+// sender, rather than depending on a transitive channel proof.
+func singleRoot() {
+	ch := make(chan struct{})
+	doneSender := make(chan struct{})
+	doneReceiver := make(chan struct{})
+	n := 0
+
+	go func() {
+		n = 1
+		ch <- struct{}{}
+		close(doneSender)
+	}()
+
+	go func() {
+		<-ch
+		n = 2
+		close(doneReceiver)
+	}()
+
+	<-doneSender
+	<-doneReceiver
+	_ = n
+}
+
+// The capacity-two buffer permits the receiver to consume either sender's
+// value. Both sends complete before the closer closes the channel.
+func bufferedCompetingRoot() {
+	ch := make(chan struct{}, 2)
+	sentOne := make(chan struct{})
+	sentTwo := make(chan struct{})
+	closed := make(chan struct{})
+	done := make(chan struct{})
+	n := 0
+
+	go func() {
+		n = 1
+		ch <- struct{}{}
+		close(sentOne)
+	}()
+
+	go func() {
+		ch <- struct{}{}
+		close(sentTwo)
+	}()
+
+	go func() {
+		<-sentOne
+		<-sentTwo
+		close(ch)
+		close(closed)
+	}()
+
+	go func() {
+		<-ch
+		n = 2
+		<-ch
+		close(done)
+	}()
+
+	<-done
+	<-closed
+	_ = n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for root in ["competingRoot", "bufferedCompetingRoot"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        let pair = find_concurrent_relation(&result, |value| {
+            value.task_relation == "siblings"
+                && value.first_access == "write"
+                && value.second_access == "write"
+        });
+        assert_eq!(
+            (pair.first_access, pair.second_access),
+            ("write", "write"),
+            "the retained {root} relation is the write pair: {result:#?}"
+        );
+        assert_eq!(
+            (pair.ordering, pair.proof, pair.coverage),
+            ("open", "open", "open"),
+            "a competing sender cannot prove the sibling write ordering: {result:#?}"
+        );
+        assert!(
+            pair.reasons
+                .iter()
+                .any(|reason| reason == "ambiguous_synchronization"),
+            "the competing channel route retains its ambiguity reason: {result:#?}"
+        );
+    }
+
+    let control = go_invocation_conflicts(&workspace, "singleRoot");
+    assert_eq!(
+        control.completion(),
+        CodeQueryCompletion::Complete,
+        "single sender control resolves completely: {control:#?}"
+    );
+    assert!(
+        control.diagnostics.is_empty(),
+        "single sender control has no diagnostics: {control:#?}"
+    );
+    let mut has_final_root_read = false;
+    assert!(
+        !control.results.is_empty(),
+        "single sender control retains its access relations: {control:#?}"
+    );
+    for item in &control.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("singleRoot returned a non-concurrency row: {item:#?}");
+        };
+        has_final_root_read |= value.first_access == "read" || value.second_access == "read";
+        assert_eq!(
+            (value.ordering, value.proof, value.coverage),
+            ("happens_before", "proven", "exhaustive"),
+            "single sender control must prove every relation: {control:#?}"
+        );
+    }
+    assert!(
+        has_final_root_read,
+        "single sender control includes the final root read: {control:#?}"
+    );
+}
+
+#[test]
+fn go_synchronous_recursive_relay_keeps_conflict_proof_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func relay(start, finish chan struct{}, depth int) {
+    if depth > 0 { relay(start, finish, depth - 1); return }
+    <-start
+    close(finish)
+}
+func directRelay(start, finish chan struct{}) { <-start; close(finish) }
+func recursiveRoot() {
+    n := 0
+    start := make(chan struct{})
+    finish := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(start) }()
+    go relay(start, finish, 5)
+    go func() { <-finish; n = 2; close(done) }()
+    <-done
+    _ = n
+}
+func directRoot() {
+    n := 0
+    start := make(chan struct{})
+    finish := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(start) }()
+    go directRelay(start, finish)
+    go func() { <-finish; n = 2; close(done) }()
+    <-done
+    _ = n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let recursive = go_invocation_conflicts(&workspace, "recursiveRoot");
+    assert_ne!(recursive.completion(), CodeQueryCompletion::Complete);
+    assert!(!recursive.diagnostics.is_empty(), "{recursive:#?}");
+    assert!(
+        recursive.results.iter().any(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("typed concurrency row: {item:#?}");
+            };
+            value.first_access == "write"
+                && value.second_access == "write"
+                && value.first_procedure_id != value.root_procedure_id
+                && value.second_procedure_id != value.root_procedure_id
+        }),
+        "the omitted relay must retain the uncertain write pair: {recursive:#?}"
+    );
+    for item in &recursive.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("typed concurrency row: {item:#?}");
+        };
+        assert_eq!(value.proof, "open", "{recursive:#?}");
+        assert_eq!(value.coverage, "open", "{recursive:#?}");
+        assert!(
+            value
+                .reasons
+                .iter()
+                .any(|reason| reason == "recursive_expansion"),
+            "a report-level warning cannot qualify an omitted synchronization path: {recursive:#?}"
+        );
+    }
+    let direct = go_invocation_conflicts(&workspace, "directRoot");
+    assert_eq!(
+        direct.completion(),
+        CodeQueryCompletion::Complete,
+        "{direct:#?}"
+    );
+    assert!(!direct.results.is_empty(), "{direct:#?}");
+    for item in &direct.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+            panic!("typed concurrency row: {item:#?}");
+        };
+        assert_eq!(value.proof, "proven", "{direct:#?}");
+        assert_eq!(value.coverage, "exhaustive", "{direct:#?}");
+        assert_eq!(value.ordering, "happens_before", "{direct:#?}");
+    }
+}
+
+#[test]
+fn go_recursive_channel_payload_proves_exact_countdown() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func recursiveSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { recursiveSend(ch, c, depth - 1); return }
+    ch <- c
+}
+func recursiveSendValue(ch chan cell, c cell, depth int) {
+    if depth > 0 { recursiveSendValue(ch, c, depth - 1); return }
+    ch <- c
+}
+func pointerRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go recursiveSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func valueRoot() {
+    ch := make(chan cell)
+    c := cell{}
+    go recursiveSendValue(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let pointer = go_invocation_conflicts(&workspace, "pointerRoot");
+    let value = go_invocation_conflicts(&workspace, "valueRoot");
+    assert_proven_exhaustive_sibling_conflicts(&pointer, 1);
+    assert_no_proven_conflicts_with_explicit_evidence(&value);
+    assert!(
+        value.results.iter().any(|item| {
+            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                panic!("concurrent_access_conflicts returns a typed row: {item:#?}");
+            };
+            value.task_relation == "siblings"
+                && value.ordering == "unordered"
+                && value.proof == "open"
+                && value
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "recursive_expansion")
+        }),
+        "a value-copy payload must not acquire pointer identity: {value:#?}"
+    );
+}
+
+#[test]
+fn go_recursive_channel_cardinality_controls_remain_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+
+func unknownSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { unknownSend(ch, c, depth - 1); return }
+    ch <- c
+}
+func nondecreasingSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { nondecreasingSend(ch, c, depth); return }
+    ch <- c
+}
+func mutableSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { depth = depth - 1; mutableSend(ch, c, depth); return }
+    ch <- c
+}
+func unrepresentedSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { unrepresentedSend(ch, c, depth / 2); return }
+    ch <- c
+}
+func doubleSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { doubleSend(ch, c, depth - 1); return }
+    ch <- c
+    ch <- c
+}
+func cyclicSend(ch chan *cell, c *cell, depth int) {
+    if depth > 0 { cyclicSend(ch, c, depth - 1); return }
+    for i := 0; i < 1; i++ { ch <- c }
+}
+
+func unknownRoot(depth int) {
+    ch := make(chan *cell)
+    c := &cell{}
+    go unknownSend(ch, c, depth)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func nondecreasingRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go nondecreasingSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func mutableRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go mutableSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func unrepresentedRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go unrepresentedSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func doubleRoot() {
+    ch := make(chan *cell, 2)
+    c := &cell{}
+    go doubleSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+func cyclicRoot() {
+    ch := make(chan *cell)
+    c := &cell{}
+    go cyclicSend(ch, c, 1)
+    go func() { got := <-ch; got.n = 1 }()
+    go func() { c.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in [
+        "unknownRoot",
+        "nondecreasingRoot",
+        "mutableRoot",
+        "unrepresentedRoot",
+        "doubleRoot",
+        "cyclicRoot",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+        assert!(
+            result.results.iter().any(|item| {
+                let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
+                    panic!("concurrent_access_conflicts returns a typed row: {item:#?}");
+                };
+                value.task_relation == "siblings"
+                    && value.ordering == "unordered"
+                    && value.proof == "open"
+                    && value
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "recursive_expansion")
+            }),
+            "an unproved recursive synchronization count must remain Open for {root}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn go_channel_receive_does_not_join_future_sender_iterations() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package sample
+
+func cyclicRoot() {
+	ch := make(chan struct{})
+	senderDone := make(chan struct{})
+	receiverDone := make(chan struct{})
+	n := 0
+	go func() {
+		for i := 0; i < 2; i++ {
+			n = 1
+			ch <- struct{}{}
+		}
+		close(senderDone)
+	}()
+	go func() {
+		<-ch
+		n = 2
+		<-ch
+		close(receiverDone)
+	}()
+	<-senderDone
+	<-receiverDone
+	_ = n
+}
+
+
+type Cell struct { n int }
+func writeThenSend(c *Cell, ch chan struct{}) { c.n = 1; ch <- struct{}{} }
+func helperRoot() {
+    c := &Cell{}
+    ch := make(chan struct{})
+    senderDone := make(chan struct{})
+    receiverDone := make(chan struct{})
+    go func() {
+        for i := 0; i < 2; i++ { writeThenSend(c, ch) }
+        close(senderDone)
+    }()
+    go func() {
+        <-ch
+        c.n = 2
+        <-ch
+        close(receiverDone)
+    }()
+    <-senderDone
+    <-receiverDone
+    _ = c.n
+}
+
+func closedRoot() {
+    ch := make(chan struct{})
+    done := make(chan struct{})
+    n := 0
+    go func() {
+        for i := 0; i < 2; i++ { n = 1 }
+        close(ch)
+    }()
+    go func() {
+        <-ch
+        n = 2
+        close(done)
+    }()
+    <-done
+    _ = n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in ["cyclicRoot", "helperRoot"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        let pair = find_concurrent_relation(&result, |value| {
+            value.task_relation == "siblings"
+                && value.first_access == "write"
+                && value.second_access == "write"
+        });
+        assert_eq!(
+            (pair.ordering, pair.proof, pair.coverage),
+            ("open", "open", "open"),
+            "a receive cannot join future iterations of its sender: {result:#?}"
+        );
+        assert!(
+            pair.reasons
+                .iter()
+                .any(|reason| reason == "ambiguous_synchronization"),
+            "iteration correspondence remains unresolved: {result:#?}"
+        );
+    }
+
+    let control = go_invocation_conflicts(&workspace, "closedRoot");
+    assert_eq!(
+        control.completion(),
+        CodeQueryCompletion::Complete,
+        "{control:#?}"
+    );
+    assert!(!control.results.is_empty(), "{control:#?}");
+    for row in &control.results {
+        let CodeQueryResultValue::ConcurrentAccessConflict { value } = &row.value else {
+            panic!("unexpected row: {row:#?}")
+        };
+        assert_eq!(
+            (value.ordering, value.proof, value.coverage),
+            ("happens_before", "proven", "exhaustive"),
+            "close after the loop orders every earlier iteration: {control:#?}"
+        );
+    }
+}
+
+#[test]
+fn go_fresh_channels_do_not_serialize_unjoined_helper_activations() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package sample
+
+type Cell struct { n int }
+func localFanout(c *Cell, finished chan struct{}) {
+    ch := make(chan struct{})
+    go func() { c.n = 1; ch <- struct{}{} }()
+    go func() { <-ch; c.n = 2; finished <- struct{}{} }()
+}
+func unjoinedRoot() {
+    c := &Cell{}
+    finished := make(chan struct{}, 2)
+    go func() {
+        for i := 0; i < 2; i++ { localFanout(c, finished) }
+    }()
+    <-finished
+    <-finished
+    _ = c.n
+}
+
+func joinedFanout(c *Cell) {
+    ch := make(chan struct{})
+    done := make(chan struct{})
+    go func() { c.n = 1; ch <- struct{}{} }()
+    go func() { <-ch; c.n = 2; close(done) }()
+    <-done
+}
+func joinedRoot() {
+    c := &Cell{}
+    for i := 0; i < 2; i++ { joinedFanout(c) }
+    _ = c.n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let unjoined = go_invocation_conflicts(&workspace, "unjoinedRoot");
+    let pair = find_concurrent_relation(&unjoined, |value| {
+        value.task_relation == "repeated"
+            && value.first_procedure_id != value.second_procedure_id
+            && value.first_access == "write"
+            && value.second_access == "write"
+    });
+    assert_eq!(
+        (pair.ordering, pair.proof, pair.coverage),
+        ("open", "open", "open"),
+        "distinct per-helper channels cannot order shared storage across unjoined activations: {unjoined:#?}"
+    );
+    assert!(
+        pair.reasons
+            .iter()
+            .any(|reason| reason == "ambiguous_synchronization"),
+        "{unjoined:#?}"
+    );
+
+    let joined = go_invocation_conflicts(&workspace, "joinedRoot");
+    let pair = find_concurrent_relation(&joined, |value| {
+        value.task_relation == "repeated"
+            && value.first_procedure_id != value.second_procedure_id
+            && value.first_access == "write"
+            && value.second_access == "write"
+    });
+    assert_eq!(
+        (pair.ordering, pair.proof, pair.coverage),
+        ("happens_before", "proven", "exhaustive"),
+        "joining both children before returning serializes helper activations: {joined:#?}"
+    );
+    assert_no_proven_unordered_unprotected_conflicts(&joined);
+}
+
+#[test]
+fn go_channel_formals_preserve_distinct_and_reassigned_descriptors() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func wait(ch chan struct{}) { <-ch }
+func waitReplacement(ch, replacement chan struct{}) { ch = replacement; <-ch }
+func distinct() {
+    n := 0
+    first := make(chan struct{})
+    second := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(first) }()
+    go func() { wait(second); n = 2; close(done) }()
+    close(second)
+    <-first
+    <-done
+    _ = n
+}
+func reassigned() {
+    n := 0
+    first := make(chan struct{})
+    second := make(chan struct{})
+    done := make(chan struct{})
+    go func() { n = 1; close(first) }()
+    go func() { waitReplacement(first, second); n = 2; close(done) }()
+    close(second)
+    <-first
+    <-done
+    _ = n
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in ["distinct", "reassigned"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        let pair = find_concurrent_relation(&result, |value| {
+            value.task_relation == "siblings"
+                && value.first_access == "write"
+                && value.second_access == "write"
+        });
+        assert!(
+            pair.proof == "open" || pair.ordering == "unordered",
+            "independent or replaced channels cannot order the writes: {root}: {result:#?}"
+        );
+        if root == "distinct" {
+            assert_eq!(
+                (pair.proof, pair.coverage, pair.ordering),
+                ("proven", "exhaustive", "unordered"),
+                "{result:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn go_unknown_effects_require_private_storage_and_private_synchronization() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+import "context"
+func privateContext(ctx context.Context, stop bool) (err error) {
+    done := make(chan struct{})
+    go func() { defer close(done); err = nil; if stop { return }; err = nil }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+type privateCell struct { n int }
+func mutatePrivate(cell *privateCell, stop bool) {
+    cell.n = 1
+    if stop { return }
+    cell.n = 2
+}
+func privateArguments(ctx context.Context, stop bool) {
+    cell := &privateCell{}
+    go mutatePrivate(cell, stop)
+    select { case <-ctx.Done(): cell.n = 3; default: cell.n = 4 }
+}
+func (cell *privateCell) mutate(stop bool) {
+    cell.n = 1
+    if stop { return }
+    cell.n = 2
+}
+func privateReceiver(ctx context.Context, stop bool) {
+    cell := &privateCell{}
+    go cell.mutate(stop)
+    select { case <-ctx.Done(): cell.n = 3; default: cell.n = 4 }
+}
+func makePrivate() *privateCell { return &privateCell{} }
+func privateResult(ctx context.Context, stop bool) {
+    cell := makePrivate()
+    go mutatePrivate(cell, stop)
+    select { case <-ctx.Done(): cell.n = 3; default: cell.n = 4 }
+}
+func publishPrivate(cell *privateCell, publish func(*privateCell)) {
+    publish(cell)
+    cell.n = 1
+}
+func publishedArguments(ctx context.Context, publish func(*privateCell)) {
+    cell := &privateCell{}
+    go publishPrivate(cell, publish)
+    select { case <-ctx.Done(): cell.n = 2; default: cell.n = 3 }
+}
+func (cell *privateCell) publish(publish func(*privateCell)) {
+    publish(cell)
+    cell.n = 1
+}
+func publishedReceiver(ctx context.Context, publish func(*privateCell)) {
+    cell := &privateCell{}
+    go cell.publish(publish)
+    select { case <-ctx.Done(): cell.n = 2; default: cell.n = 3 }
+}
+func makePublished(publish func(*privateCell)) *privateCell {
+    cell := &privateCell{}
+    publish(cell)
+    return cell
+}
+func publishedResult(ctx context.Context, publish func(*privateCell)) {
+    cell := makePublished(publish)
+    go mutatePrivate(cell, false)
+    select { case <-ctx.Done(): cell.n = 2; default: cell.n = 3 }
+}
+func makePair(publish func(*privateCell)) (*privateCell, *privateCell) {
+    first := &privateCell{}
+    second := &privateCell{}
+    publish(first)
+    return first, second
+}
+func privateSecondResult(ctx context.Context, publish func(*privateCell)) {
+    _, cell := makePair(publish)
+    go mutatePrivate(cell, false)
+    select { case <-ctx.Done(): cell.n = 2; default: cell.n = 3 }
+}
+func publishedFirstResult(ctx context.Context, publish func(*privateCell)) {
+    cell, _ := makePair(publish)
+    go mutatePrivate(cell, false)
+    select { case <-ctx.Done(): cell.n = 2; default: cell.n = 3 }
+}
+func publishedContext(ctx context.Context, publish func(*error, chan struct{})) (err error) {
+    done := make(chan struct{})
+    publish(&err, done)
+    go func() { defer close(done); err = nil }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+func unknownWorker(ctx context.Context, cb func()) (err error) {
+    done := make(chan struct{})
+    go func() { defer close(done); err = nil; cb() }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+var gate chan struct{}
+func globalWorker(ctx context.Context) (err error) {
+    done := make(chan struct{})
+    go func() { <-gate; err = nil; close(done) }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+func publishedClosure(ctx context.Context, publish func(func())) (err error) {
+    done := make(chan struct{})
+    publish(func() { err = nil; close(done) })
+    go func() { defer close(done); err = nil }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+type localContext interface { Done() <-chan struct{} }
+func lookalikeContext(ctx localContext) (err error) {
+    done := make(chan struct{})
+    go func() { defer close(done); err = nil }()
+    select { case <-ctx.Done(): return context.Canceled; case <-done: }
+    return err
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let private = go_invocation_conflicts(&workspace, "privateContext");
+    assert!(
+        private.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.proof == "proven" && value.ordering == "unordered"
+                && value.protection == "unprotected" && value.verdict == "conflict")
+        }),
+        "a foreign receiver cannot synchronize a closed child through its unpublished channel or access the private captured cell: {private:#?}"
+    );
+    let private_arguments = go_invocation_conflicts(&workspace, "privateArguments");
+    assert!(
+        private_arguments.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.proof == "proven" && value.ordering == "unordered"
+                && value.protection == "unprotected" && value.verdict == "conflict")
+        }),
+        "passing fresh storage only into a retained child must not publish it to an unrelated foreign call: {private_arguments:#?}"
+    );
+    let private_receiver = go_invocation_conflicts(&workspace, "privateReceiver");
+    assert!(
+        private_receiver.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.proof == "proven" && value.ordering == "unordered"
+                && value.protection == "unprotected" && value.verdict == "conflict")
+        }),
+        "passing fresh storage only as a retained receiver must not publish it to an unrelated foreign call: {private_receiver:#?}"
+    );
+    let private_result = go_invocation_conflicts(&workspace, "privateResult");
+    assert!(
+        private_result.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.proof == "proven" && value.ordering == "unordered"
+                && value.protection == "unprotected" && value.verdict == "conflict")
+        }),
+        "returning fresh storage only into a retained caller must not publish it to an unrelated foreign call: {private_result:#?}"
+    );
+    let private_second_result = go_invocation_conflicts(&workspace, "privateSecondResult");
+    assert!(
+        private_second_result.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.proof == "proven" && value.ordering == "unordered"
+                && value.protection == "unprotected" && value.verdict == "conflict")
+        }),
+        "publishing one result ordinal must not publish a distinct returned allocation: {private_second_result:#?}"
+    );
+    for root in [
+        "publishedContext",
+        "publishedArguments",
+        "publishedReceiver",
+        "publishedResult",
+        "publishedFirstResult",
+        "unknownWorker",
+        "globalWorker",
+        "publishedClosure",
+        "lookalikeContext",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_conflict_or_explicit_open(&result);
+        assert_no_proven_unordered_unprotected_conflicts(&result);
+    }
+}
+
+#[test]
+fn go_unresolved_effects_cross_synchronous_calls() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func invoke(cb func()) { cb() }
+func helperBefore(cb func()) {
+    n := 0
+    go func() { invoke(cb); n = 1 }()
+    go func() { invoke(cb); n = 2 }()
+}
+func helperAfter(cb func()) {
+    n := 0
+    go func() { n = 1; invoke(cb) }()
+    go func() { n = 2; invoke(cb) }()
+}
+func callerBefore(cb func()) {
+    n := 0
+    go func() { cb(); func() { n = 1 }() }()
+    go func() { cb(); func() { n = 2 }() }()
+}
+func callerAfter(cb func()) {
+    n := 0
+    go func() { func() { n = 1 }(); cb() }()
+    go func() { func() { n = 2 }(); cb() }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for name in ["helperAfter", "callerAfter"] {
+        let result = go_invocation_conflicts(&workspace, name);
+        assert!(
+            result.results.iter().any(|item| matches!(
+                &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+            )),
+            "later unknown effects cannot alter earlier observations: {name}: {result:#?}"
+        );
+    }
+    for name in ["helperBefore", "callerBefore"] {
+        let result = go_invocation_conflicts(&workspace, name);
+        assert!(
+            !result.results.iter().any(|item| matches!(
+                &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "proven"
+            )),
+            "earlier unknown effects cross synchronous call boundaries: {name}: {result:#?}"
+        );
+        assert!(
+            result.results.iter().any(|item| matches!(
+                &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.verdict == "conflict" && value.proof == "open"
+                    && value.reasons.iter().any(|reason| reason == "unresolved_target")
+            )),
+            "retain the open conflict and its source uncertainty: {name}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn go_model_reason_order_respects_expression_regions() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+func sample() int { return 1 }
+func consume(a, b int) {}
+func afterExpression(cb func()) {
+    n := 0
+    go func() {
+        consume(n, sample())
+        n = 1
+        if cb != nil { cb() }
+    }()
+    go func() { n = 2 }()
+}
+func insideExpression(cb func() int) {
+    n := 0
+    go func() { consume(n, cb()) }()
+    go func() { n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let after = go_invocation_conflicts(&workspace, "afterExpression");
+    assert!(
+        after.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.first_access == "write" && value.second_access == "write"
+                && value.verdict == "conflict" && value.proof == "proven")
+        }),
+        "an earlier expression cannot reorder a later write and callback: {after:#?}"
+    );
+    let inside = go_invocation_conflicts(&workspace, "insideExpression");
+    assert!(
+        !inside.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.verdict == "conflict" && value.proof == "proven")
+        }),
+        "an unknown callback can precede a read in the same expression: {inside:#?}"
+    );
+    assert!(
+        inside.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.verdict == "conflict" && value.proof == "open"
+                && value.reasons.iter().any(|reason| reason == "unresolved_target"))
+        }),
+        "a read and unknown callback in one expression retain ordering uncertainty: {inside:#?}"
+    );
+}
+
+/// Inline reads must not repeatedly pay for a whole invocation inventory.
+/// The unknown call still prevents proving the holder's reference payload.
+#[test]
+fn go_field_payload_budget_skips_unprovable_and_inline_loads() {
+    let reads = "    sum += h.n\n".repeat(256);
+    let source = format!(
+        "package main\ntype cell struct {{ n int }}\ntype holder struct {{ n int; p *cell }}\nfunc unknown(h *holder)\nfunc manyInlineReads() int {{\n    h := &holder{{p: &cell{{}}}}\n    unknown(h)\n    sum := 0\n{reads}    go func() {{ h.p.n = 1 }}()\n    go func() {{ h.p.n = 2 }}()\n    return sum\n}}\n"
+    );
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("main.go", &source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
+        "match": { "kind": "function", "name": "manyInlineReads" },
+        "steps": [{ "op": "procedure_of" }, { "op": "concurrent_access_conflicts" }],
+        "result_detail": "full"
+    }))
+    .unwrap();
+    let defaults = CodeQueryExecutionLimits::default();
+    let default_rows = semantic::semantic_budget_limits(defaults.semantic);
+    // A bounded request exposes quadratic inventory prepayment without making
+    // the per-push fixture itself large and expensive to analyze.
+    let limits = CodeQueryExecutionLimits {
+        semantic: CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                if dimension == SemanticBudgetDimension::NestedEntries {
+                    500_000
+                } else {
+                    default_rows.get(dimension)
+                }
+            })),
+            ..defaults.semantic
+        },
+        ..defaults
+    };
+    let result = super::super::execute_internal(
+        workspace.analyzer(),
+        Some(&workspace),
+        &query,
+        limits,
+        None,
+        None,
+        false,
+    )
+    .result;
+    assert!(
+        result.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        }),
+        "ordinary inline reads fit the query budget: {result:#?}"
+    );
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
 }
 
 fn assert_no_proven_conflicts_with_explanation(result: &CodeQueryResult) {
@@ -9965,9 +12484,19 @@ type holder struct {
     p *cell
 }
 
+type nestedHolder struct {
+    inner *holder
+}
+
 type nestedCell struct {
     inner cell
 }
+
+func opaqueRetargetHolder(*holder)
+func opaqueRetargetField(**cell)
+func opaqueRun(func())
+
+var publishedHolderCallback func()
 
 func launch(c *cell) {
     go func() { c.n++ }()
@@ -9990,6 +12519,139 @@ func differentInput() {
 func holderInputs(a, b *holder) {
     go func() { a.p.n = 1 }()
     go func() { b.p.n = 2 }()
+}
+
+func capturedNilHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    alias := h
+    clear := func() { alias.p = nil }
+    clear()
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func conditionalHolderFieldPayload(choose bool) {
+    h := &holder{}
+    if choose {
+        h.p = &cell{}
+    }
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func opaqueHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    opaqueRetargetHolder(h)
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func escapedHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    opaqueRetargetField(&h.p)
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func escapedCallbackHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    opaqueRun(func() { h.p = nil })
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func copiedNilHolderFieldPayload() {
+    original := holder{}
+    copied := original
+    go func() { copied.p.n = 1 }()
+    go func() { original.p.n = 2 }()
+}
+
+func nilHolderFieldPayload() {
+    h := &holder{}
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func explicitNilHolderFieldPayload() {
+    h := &holder{p: nil}
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func overwrittenHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    h.p = nil
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func nestedNilHolderFieldPayload() {
+    h := &nestedHolder{inner: &holder{}}
+    go func() { h.inner.p.n = 1 }()
+    go func() { h.inner.p.n = 2 }()
+}
+
+func storedNilHolderFieldPayload() {
+    h := &holder{}
+    p := h.p
+    go func() { p.n = 1 }()
+    go func() { p.n = 2 }()
+}
+
+func conditionalWriteBeforeSpawn(choose bool) {
+    p := &cell{}
+    if choose {
+        p.n = 1
+    }
+    go func() { p.n = 2 }()
+}
+
+func conditionalWriteAfterSpawn(choose bool) {
+    p := &cell{}
+    go func() { p.n = 1 }()
+    if choose {
+        p.n = 2
+    }
+}
+
+func zeroHolderFieldPayload() {
+    var h *holder
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func sharedHolderFieldPayload() {
+    h := &holder{p: &cell{}}
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func assignedHolderFieldPayload() {
+    h := &holder{}
+    h.p = &cell{}
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func publishedHolderInitializer() {
+    h := &holder{}
+    init := func() { h.p = &cell{} }
+    init()
+    publishedHolderCallback = init
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
+}
+
+func publishedHolderInitializerThroughCaptureCell() {
+    h := &holder{}
+    f := func() { h.p = &cell{} }
+    f = func() { h.p = &cell{} }
+    _ = func() { _ = f }
+    h.p = &cell{}
+    publishedHolderCallback = f
+    go func() { h.p.n = 1 }()
+    go func() { h.p.n = 2 }()
 }
 
 func samePointeeInDifferentHolders() {
@@ -10045,6 +12707,34 @@ func freshHolderHelper() {
 
 func freshHelperHolderPointer() {
     for index := 0; index < 2; index++ { freshHolderHelper() }
+}
+
+func freshHolderPayloadHelper() *holder {
+    h := &holder{}
+    h.p = &cell{}
+    return h
+}
+
+func initializeHolderPayload(h *holder) {
+    h.p = &cell{}
+}
+
+func repeatedFreshHolderHelpers() {
+    for {
+        go func() {
+            h := freshHolderPayloadHelper()
+            h.p.n = 1
+        }()
+    }
+}
+
+func repeatedFreshPublishedFieldArguments() {
+    h := &holder{}
+    for {
+        initializeHolderPayload(h)
+        p := h.p
+        go func(value *cell) { value.n = 1 }(p)
+    }
 }
 
 func sharedHolderHelper(shared *cell) {
@@ -10443,6 +13133,34 @@ func errgroupJoined() int {
     _ = group.Wait()
     return value
 }
+
+type modeledCell struct { value int }
+
+func setWrapped(mutex *sync.RWMutex, cell *modeledCell) {
+    mutex.Lock()
+    cell.value = 1
+    mutex.Unlock()
+}
+
+func wrappedExclusive() {
+    mutex := &sync.RWMutex{}
+    cell := &modeledCell{}
+    go setWrapped(mutex, cell)
+    setWrapped(mutex, cell)
+}
+
+func setCopied(mutex sync.RWMutex, cell *modeledCell) {
+    mutex.Lock()
+    cell.value = 1
+    mutex.Unlock()
+}
+
+func wrappedValueCopy() {
+    mutex := sync.RWMutex{}
+    cell := &modeledCell{}
+    go setCopied(mutex, cell)
+    setCopied(mutex, cell)
+}
 "#,
         )
         .build();
@@ -10646,11 +13364,145 @@ func errgroupJoined() int {
         },
         &CancellationToken::default(),
     );
+    let snapshot = match activation {
+        SemanticModelRuntimeOutcome::Ready { snapshot, .. } => snapshot,
+        other => panic!("RWMutex/errgroup models activate: {other:#?}"),
+    };
+
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("main.go"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("modeled wrapper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("modeled wrapper semantics are available");
+    let procedure = |name: &str| {
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap_or_else(|| panic!("missing {name} procedure"))
+    };
+    let wrapped = procedure("wrappedExclusive");
+    let copied = procedure("wrappedValueCopy");
+    let set_wrapped = procedure("setWrapped");
+    let set_copied = procedure("setCopied");
+    let icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace,
+            Some(snapshot.clone()),
+        );
+    let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        None,
+    );
+    let mut budget = SemanticBudget::default();
+    let summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            &[wrapped.clone(), copied.clone()],
+            &icfg,
+            &projection_provider,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("modeled wrapper summaries project");
+    for helper in [&set_wrapped, &set_copied] {
+        let summary = summaries
+            .summary_for(helper)
+            .expect("modeled helper has a production summary");
+        assert_eq!(
+            summary
+                .effects()
+                .iter()
+                .filter(|effect| matches!(
+                    effect.key(),
+                    brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                        if matches!(
+                            effect.kind(),
+                            brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::ModeledCall {
+                                effect_count: 1
+                            }
+                        )
+                ))
+                .count(),
+            2,
+            "Lock and Unlock each retain one complete modeled inventory: {summary:#?}"
+        );
+        assert_eq!(
+            summary
+                .effects()
+                .iter()
+                .filter(|effect| matches!(
+                    effect.key(),
+                    brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                        if matches!(
+                            effect.kind(),
+                            brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::Lock {
+                                identity: brokk_bifrost_flow::dataflow::SummaryConcurrencySubjectIdentity::Backing,
+                                ..
+                            }
+                        )
+                ))
+                .count(),
+            2,
+            "modeled receiver identity survives projection: {summary:#?}"
+        );
+    }
+
+    // The consumer deliberately has no active semantic models. Its only lock
+    // inventory is the stable, source-witnessed summary projected above.
+    let retained_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        None,
+        Some(summaries),
+    );
+    let mut budget = SemanticBudget::default();
+    let retained = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &retained_provider,
+        &wrapped,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("retained modeled locks apply");
     assert!(
-        matches!(activation, SemanticModelRuntimeOutcome::Ready { .. }),
-        "RWMutex/errgroup models activate: {activation:#?}"
+        retained.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "retained wrapper summary establishes exact lock protection: {retained:#?}"
+    );
+    let mut budget = SemanticBudget::default();
+    let retained_copy = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &retained_provider,
+        &copied,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("retained copied-lock report computes");
+    assert!(
+        retained_copy.conflicts.iter().any(|conflict| {
+            conflict.protection
+                != brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+                && conflict.proven
+                && conflict.exhaustive
+        }),
+        "retained summaries must prove distinct by-value mutex copies do not protect the shared access: {retained_copy:#?}"
     );
 
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
     let conflicts_for = |name: &str| {
         let query = CodeQuery::from_json(&json!({
             "languages": ["go"],
@@ -10662,13 +13514,13 @@ func errgroupJoined() int {
             "result_detail": "full"
         }))
         .expect("RWMutex/errgroup concurrent access query");
-        execute_workspace(
-            &workspace,
-            &brokk_bifrost_flow::FlowWorkspaceState::new(),
-            &query,
-        )
+        execute_workspace(&workspace, &flow_state, &query)
     };
-    for (name, verdict) in [("rwExclusive", "protected"), ("errgroupJoined", "ordered")] {
+    for (name, verdict) in [
+        ("rwExclusive", "protected"),
+        ("errgroupJoined", "ordered"),
+        ("wrappedExclusive", "protected"),
+    ] {
         let result = conflicts_for(name);
         assert_eq!(
             result.completion(),
@@ -10677,6 +13529,35 @@ func errgroupJoined() int {
         );
         assert_exact_safe_concurrent_relations(&result, verdict);
     }
+    let retained_wrapper = conflicts_for("wrappedExclusive");
+    assert_eq!(
+        retained_wrapper.completion(),
+        CodeQueryCompletion::Complete,
+        "{retained_wrapper:#?}"
+    );
+    assert_exact_safe_concurrent_relations(&retained_wrapper, "protected");
+
+    let copied = conflicts_for("wrappedValueCopy");
+    let copied_conflicts = copied
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::ConcurrentAccessConflict { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        copied_conflicts
+            .iter()
+            .any(|value| value.verdict == "conflict"),
+        "value-copy lock wrappers must retain the shared access conflict: {copied:#?}"
+    );
+    assert!(
+        copied_conflicts
+            .iter()
+            .all(|value| value.protection != "protected"),
+        "distinct copied mutexes must not become one protective lock: {copied:#?}"
+    );
     let shared = conflicts_for("rwSharedWrite");
     assert_eq!(
         shared.completion(),
@@ -14302,6 +17183,277 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
         origins.contains(&"unknown:semantic_budget"),
         "the unreached sink names the semantic budget: {origins:?}"
     );
+}
+
+/// A selected receive can replace a local pointer with a nil channel value.
+/// The following field writes are unreachable at runtime, so stale identity
+/// from the pre-select pointer must not become a proven sibling conflict.
+#[test]
+fn go_concurrent_access_conflicts_keep_selected_receive_rebinding_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    n int
+}
+
+func selectedReceiveRebinding() {
+    ch := make(chan *cell, 1)
+    ch <- nil
+    pointer := &cell{}
+    select {
+    case pointer = <-ch:
+    default:
+    }
+    go func() { pointer.n = 1 }()
+    go func() { pointer.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let result = go_invocation_conflicts(&workspace, "selectedReceiveRebinding");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// A local nonzero-offset slice is returned through a helper and compared
+/// with a zero-offset view of the same allocation. The two child writes reach
+/// different elements; unresolved offset propagation must remain explicitly
+/// open instead of proving a race.
+#[test]
+fn go_concurrent_access_conflicts_keep_local_tail_and_head_views_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+func localTail(values []int) []int {
+    tail := values[1:]
+    return tail
+}
+
+func localTailAndHeadViews() {
+    values := make([]int, 2)
+    tail := localTail(values)
+    head := values[:1]
+    go func() { tail[0] = 1 }()
+    go func() { head[0] = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let result = go_invocation_conflicts(&workspace, "localTailAndHeadViews");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+/// A successful comma-ok assertion can still produce a nil pointer. Both
+/// post-assertion field writes panic, so a stale pre-assertion parameter
+/// identity must remain open instead of becoming a proven sibling conflict.
+#[test]
+fn go_heap_identity_keeps_comma_ok_assertion_rebindings_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+
+type cell struct {
+    n int
+}
+
+
+func commaOkAssertion(boxed any, pointer *cell) {
+    var ok bool
+    pointer, ok = boxed.(*cell)
+    _ = ok
+    go func() { pointer.n = 1 }()
+    go func() { pointer.n = 2 }()
+}
+
+func commaOkAssertionWithShortDeclaration(boxed any, pointer *cell) {
+    pointer, ok := boxed.(*cell)
+    _ = ok
+    go func() { pointer.n = 1 }()
+    go func() { pointer.n = 2 }()
+}
+
+func commaOkLocalAssertionRoot() {
+    var boxed any = (*cell)(nil)
+    pointer := &cell{}
+    var ok bool
+    pointer, ok = boxed.(*cell)
+    _ = ok
+    go func() { pointer.n = 1 }()
+    go func() { pointer.n = 2 }()
+}
+
+func commaOkAssertionRoot() {
+    var boxed any = (*cell)(nil)
+    commaOkAssertion(boxed, &cell{})
+}
+
+func commaOkAssertionWithShortDeclarationRoot() {
+    var boxed any = (*cell)(nil)
+    commaOkAssertionWithShortDeclaration(boxed, &cell{})
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in [
+        "commaOkLocalAssertionRoot",
+        "commaOkAssertionRoot",
+        "commaOkAssertionWithShortDeclarationRoot",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explicit_evidence(&result);
+    }
+}
+
+#[test]
+fn go_heap_identity_keeps_recursive_receiver_rebinding_open() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+type box struct { p *cell }
+func (b *box) replace(depth int) {
+    if depth == 0 { return }
+    b = &box{p: &cell{}}
+    b.p.n++
+    b.replace(depth - 1)
+}
+func recursiveReceiverRebinding() {
+    original := &box{p: &cell{}}
+    go original.replace(2)
+    go func(v *box) { v.p.n++ }(original)
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let result = go_invocation_conflicts(&workspace, "recursiveReceiverRebinding");
+    assert_no_proven_conflicts_with_explicit_evidence(&result);
+}
+
+#[test]
+fn go_heap_identity_preserves_forwarded_callback_environments() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type callbackCell struct { n int }
+type callbackHolder struct { p *callbackCell }
+func invokeCallback(f func()) { f() }
+func writeCallback(h *callbackHolder) { invokeCallback(func() { h.p.n++ }) }
+func sharedCallbackEnvironment() {
+    h := &callbackHolder{p: &callbackCell{}}
+    go writeCallback(h)
+    go writeCallback(h)
+}
+func distinctCallbackEnvironments() {
+    go writeCallback(&callbackHolder{p: &callbackCell{}})
+    go writeCallback(&callbackHolder{p: &callbackCell{}})
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let shared = go_invocation_conflicts(&workspace, "sharedCallbackEnvironment");
+    assert_proven_unordered_unprotected_conflict(&shared, "sharedCallbackEnvironment");
+    let distinct = go_invocation_conflicts(&workspace, "distinctCallbackEnvironments");
+    assert_no_proven_conflicts_with_explanation(&distinct);
+}
+
+#[test]
+fn go_heap_identity_does_not_retain_replaced_callable_targets() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+var replacementCallback func()
+func unknownCallback() func() { return replacementCallback }
+func replaceCallback(f func()) { f = unknownCallback(); f() }
+func keepCallback(f func()) { f() }
+func replacedCallableTarget() {
+    counter := 0
+    go replaceCallback(func() { counter++ })
+    go func() { counter++ }()
+}
+
+func stableCallableTarget() {
+    counter := 0
+    go keepCallback(func() { counter++ })
+    go func() { counter++ }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let stable = go_invocation_conflicts(&workspace, "stableCallableTarget");
+    assert_proven_unordered_unprotected_conflict(&stable, "stableCallableTarget");
+    let replaced = go_invocation_conflicts(&workspace, "replacedCallableTarget");
+    assert_no_proven_conflicts_with_explanation(&replaced);
+    assert!(matches!(
+        replaced.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+    assert!(
+        replaced
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("UnresolvedTarget") }),
+        "the replacement callable must retain its unresolved dispatch: {replaced:#?}"
+    );
+}
+
+#[test]
+fn go_heap_identity_keeps_repeated_mutable_capture_cells_distinct() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func repeatedMutableCapture() {
+    p := &cell{}
+    f := func() { p.n = 1 }
+    p = &cell{}
+    go f()
+}
+func distinctRepeatedMutableCapture() {
+    for i := 0; i < 2; i++ { go repeatedMutableCapture() }
+}
+func localCounterCapture() {
+    counter := 0
+    go func() { counter++ }()
+}
+func distinctRepeatedCounterCapture() {
+    for i := 0; i < 2; i++ { go localCounterCapture() }
+}
+func sharedCounterCapture() {
+    counter := 0
+    go func() { counter++ }()
+    go func() { counter++ }()
+}
+func sharedRepeatedCounterCapture() {
+    for i := 0; i < 2; i++ { go sharedCounterCapture() }
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in [
+        "distinctRepeatedMutableCapture",
+        "distinctRepeatedCounterCapture",
+    ] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+    }
+    let shared = go_invocation_conflicts(&workspace, "sharedRepeatedCounterCapture");
+    assert_proven_unordered_unprotected_conflict(&shared, "siblings share their creator's counter");
 }
 
 /// #3194: a root that exhausts a budget must be attributable from the

@@ -1117,6 +1117,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     runtime_values: None,
                     collection_flows: None,
                     deferred_yields: None,
+                    conditional_type_refinements: None,
                 }],
             }),
             diagnostics,
@@ -1489,6 +1490,9 @@ fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
                     work.push(Work::RvalueReference);
                     work.push(Work::Visit(inner));
                 }
+                // Go's empty-interface leaf has no C++ semantic-pack
+                // counterpart. Keep this translator exact and fail closed.
+                StructuredTypeNodeView::EmptyInterface => return None,
                 StructuredTypeNodeView::Array(inner) => {
                     work.push(Work::Array);
                     work.push(Work::Visit(inner));

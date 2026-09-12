@@ -16,16 +16,17 @@ use brokk_bifrost_core::profiling;
 
 use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::cfg_algorithms::{
-    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, postdominators,
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, Postdominators, postdominators,
 };
 use crate::analyzer::semantic::{
-    CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed, DispatchReadAttribution,
-    DispatchReadUnattributedReason, EvidenceCompleteness, GuardPredicate, LengthDelimitedDigest,
-    MemberAccessKind, MemberAccessQuery, MemberLookup, MemoryLocationKind, NarrowingVerdict,
-    ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect, SemanticLocator,
-    SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
-    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
+    CallGuardOutcome, CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed,
+    DispatchReadAttribution, DispatchReadUnattributedReason, EvidenceCompleteness, GuardFact,
+    GuardPredicate, LengthDelimitedDigest, MemberAccessKind, MemberAccessQuery, MemberLookup,
+    MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind, SemanticWork,
+    SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
+    ValueFlowEndpoint, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -545,6 +546,8 @@ fn guard_transfers(
                 .iter()
                 .map(|(class, _)| *class)
                 .collect::<Vec<_>>();
+            let mut predicate_target = None;
+            let mut replacement_inputs = None;
             let (binding, call_verdicts) = match guard.predicate {
                 GuardPredicate::InstanceOf { .. }
                 | GuardPredicate::ExactClass { .. }
@@ -554,22 +557,97 @@ fn guard_transfers(
                     (bindings.binding_for_guard(guard_index), None)
                 }
                 GuardPredicate::Opaque { .. } => {
-                    let Some((value, verdicts)) = adapter.call_guard_narrowing(
+                    match adapter.call_guard_narrowing(
                         workspace,
                         procedure,
                         guard,
                         &classes,
                         &member_lookup,
-                    ) else {
-                        continue;
-                    };
-                    (
-                        bindings.binding_at_point(guard.point, value),
-                        Some(verdicts),
-                    )
+                    ) {
+                        CallGuardOutcome::NoConstraint => continue,
+                        CallGuardOutcome::Narrowed { value, verdicts } => (
+                            bindings.binding_at_point(guard.point, value),
+                            Some(verdicts),
+                        ),
+                        CallGuardOutcome::Intersected {
+                            value,
+                            verdicts,
+                            target,
+                        } => {
+                            predicate_target = Some(target);
+                            (
+                                bindings.binding_at_point(guard.point, value),
+                                Some(verdicts),
+                            )
+                        }
+                        CallGuardOutcome::Replaced { value, target } => {
+                            predicate_target = Some(target);
+                            replacement_inputs = Some(
+                                class_sources
+                                    .iter()
+                                    .flat_map(|(_, sources)| sources.iter().cloned())
+                                    .chain(unknown_sources.iter().cloned())
+                                    .collect::<Vec<_>>(),
+                            );
+                            (
+                                bindings.binding_at_point(guard.point, value),
+                                Some(vec![NarrowingVerdict::Drop; classes.len()]),
+                            )
+                        }
+                        // The developer's condition constrains this value in a
+                        // way the engine cannot name. That holds on both arms:
+                        // `if p(x)` and `if not p(x)` each say something the
+                        // candidate set does not express. The remainder rides
+                        // the guarded binding until the arms reconverge.
+                        CallGuardOutcome::Unmodeled { values } => {
+                            // With no named candidate there is no completeness
+                            // claim to weaken. Keep the existing unknown atoms;
+                            // a conditional remainder needs a concrete trigger.
+                            if class_sources.is_empty() {
+                                continue;
+                            }
+                            for value in values {
+                                let Some(binding) = bindings.binding_at_point(guard.point, value)
+                                else {
+                                    continue;
+                                };
+                                let carrier = binding_carrier(procedure, binding);
+                                let point = procedure
+                                    .point_handle(guard.point)
+                                    .expect("a retained guard point is live");
+                                let key = push_guard_remainder(
+                                    workspace,
+                                    procedure,
+                                    tables,
+                                    guard,
+                                    &point,
+                                    &carrier,
+                                    UnknownReason::UnmodeledPredicate,
+                                    class_sources
+                                        .iter()
+                                        .flat_map(|(_, sources)| sources.iter().cloned())
+                                        .collect(),
+                                );
+                                unknown_sources.push(key.clone());
+                                if let Some(join) = guard_join(
+                                    procedure,
+                                    &mut joins,
+                                    &mut cfg_budget,
+                                    cancellation,
+                                    guard.point,
+                                )? {
+                                    kill_at_predecessors(
+                                        procedure, &mut kills, join, &carrier, &key,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    }
                 }
                 GuardPredicate::ConstantBoolean { .. }
-                | GuardPredicate::ConstantEquality { .. } => continue,
+                | GuardPredicate::ConstantEquality { .. }
+                | GuardPredicate::OrderedIntegerComparison { .. } => continue,
             };
             let Some(binding) = binding else {
                 continue;
@@ -602,20 +680,24 @@ fn guard_transfers(
             // name. A guard that establishes the subject's class states the
             // atoms the remainder becomes there; every other guard answers
             // with no atoms and the remainder is carried through unchanged.
-            let proved = if unknown_sources.is_empty() {
+            let proved = if unknown_sources.is_empty() && replacement_inputs.is_none() {
                 Vec::new()
             } else {
-                adapter
-                    .guard_proves_classes(workspace, procedure, guard)
+                predicate_target
+                    .unwrap_or_else(|| adapter.guard_proves_classes(workspace, procedure, guard))
                     .into_atoms()
                     .collect::<Vec<_>>()
             };
             let proved_replaces_remainder = !proved.is_empty();
-            true_arm_sources.extend(
-                proved
-                    .into_iter()
-                    .map(|atom| (atom, unknown_sources.clone())),
-            );
+            true_arm_sources.extend(proved.into_iter().map(|atom| {
+                (
+                    atom,
+                    replacement_inputs
+                        .as_ref()
+                        .unwrap_or(&unknown_sources)
+                        .clone(),
+                )
+            }));
             // Every kill this guard emits reads the candidate tables as they
             // reached it, so they are all emitted before the arm's own
             // sources are installed: a guard never drops what it just proved.
@@ -666,22 +748,13 @@ fn guard_transfers(
             }
             if guard.true_edge.is_some() && !true_arm_sources.is_empty() {
                 let semantics = procedure.semantics();
-                if joins.is_none() {
-                    joins = Some(
-                        postdominators(
-                            semantics,
-                            semantics.entry_point(),
-                            semantics.normal_exit_point(),
-                            semantics.exceptional_exit_point(),
-                            &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
-                        )
-                        .map_err(TypeFlowPlanError::GuardControl)?,
-                    );
-                }
-                let join = joins
-                    .as_ref()
-                    .expect("guard postdominators were computed")
-                    .immediate_postdominator(semantics, guard.point);
+                let join = guard_join(
+                    procedure,
+                    &mut joins,
+                    &mut cfg_budget,
+                    cancellation,
+                    guard.point,
+                )?;
                 let point = procedure
                     .point_handle(guard.point)
                     .expect("a retained guard point is live");
@@ -738,19 +811,14 @@ fn guard_transfers(
                         .false_edge
                         .and_then(|edge| semantics.control_edge(edge))
                         .map(|edge| edge.target_point);
-                    for target in [false_target, join].into_iter().flatten() {
-                        for (_, edge) in semantics.predecessor_edges(target) {
-                            kills.push(ValueFlowEdgeKillSpec {
-                                point: procedure
-                                    .point_handle(edge.source_point)
-                                    .expect("a retained predecessor point is live"),
-                                target,
-                                kind: edge.kind,
-                                carrier: carrier.clone(),
-                                sources: vec![key.clone()],
-                            });
+                    if replacement_inputs.is_none() {
+                        for target in [false_target, join].into_iter().flatten() {
+                            kill_at_predecessors(procedure, &mut kills, target, &carrier, &key);
                         }
                     }
+                    // A replacement contributes its type to later joins just
+                    // like any other reaching value. Dropping it at the join
+                    // would leave only the false arm's original candidates.
                 }
             }
         }
@@ -814,6 +882,94 @@ fn guard_transfers(
         }
     }
     Ok(kills)
+}
+
+/// The guard's immediate postdominator: the point where its arms reconverge
+/// and a conditional remainder stops applying. Postdominators are derived once
+/// per procedure and reused by every guard in it.
+fn guard_join(
+    procedure: &ProcedureHandle,
+    joins: &mut Option<Postdominators<ProgramPointId>>,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+    point: ProgramPointId,
+) -> Result<Option<ProgramPointId>, TypeFlowPlanError> {
+    let semantics = procedure.semantics();
+    if joins.is_none() {
+        *joins = Some(
+            postdominators(
+                semantics,
+                semantics.entry_point(),
+                semantics.normal_exit_point(),
+                semantics.exceptional_exit_point(),
+                &mut CfgAlgorithmRequest::new(cfg_budget, cancellation),
+            )
+            .map_err(TypeFlowPlanError::GuardControl)?,
+        );
+    }
+    Ok(joins
+        .as_ref()
+        .expect("guard postdominators were computed")
+        .immediate_postdominator(semantics, point))
+}
+
+/// Seed an undecidable candidate on the guarded binding at the guard point.
+/// The remainder is conditional on the candidate classes reaching the guard:
+/// zero classes can reach an infeasible arm, and must not manufacture one.
+#[allow(clippy::too_many_arguments)]
+fn push_guard_remainder(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    tables: &mut SeedTables,
+    guard: &GuardFact,
+    point: &ProgramPointHandle,
+    carrier: &ValueFlowCarrier,
+    reason: UnknownReason,
+    inputs: Vec<ValueFlowEventKey>,
+) -> ValueFlowEventKey {
+    let site = source_site(
+        workspace,
+        procedure,
+        mapping_span(procedure, guard.source),
+        SourceSiteKind::Unknown,
+    )
+    .expect("a workspace guard retains its source file");
+    let key = tables.event_key(point, ValueFlowEventKind::Source);
+    tables.sources.push((
+        ValueFlowSourceSpec::new(
+            key.clone(),
+            point.clone(),
+            ValueFlowObservationPhase::AfterEffects,
+            carrier.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        )
+        .when_sources_reach(inputs),
+        ClassAtom::Unknown(reason),
+        site,
+    ));
+    key
+}
+
+/// Stop a guard remainder on every edge that enters `target`.
+fn kill_at_predecessors(
+    procedure: &ProcedureHandle,
+    kills: &mut Vec<ValueFlowEdgeKillSpec>,
+    target: ProgramPointId,
+    carrier: &ValueFlowCarrier,
+    key: &ValueFlowEventKey,
+) {
+    for (_, edge) in procedure.semantics().predecessor_edges(target) {
+        kills.push(ValueFlowEdgeKillSpec {
+            point: procedure
+                .point_handle(edge.source_point)
+                .expect("a retained predecessor point is live"),
+            target,
+            kind: edge.kind,
+            carrier: carrier.clone(),
+            sources: vec![key.clone()],
+        });
+    }
 }
 
 fn binding_carrier(

@@ -67,3 +67,15 @@ pub fn authoring_json_schema() -> String {
     rendered.push('\n');
     rendered
 }
+
+#[cfg(test)]
+mod tests {
+    use super::authoring_json_schema;
+
+    #[test]
+    fn authoring_schema_exports_ordinary_heap_unchanged_default() {
+        let schema = authoring_json_schema();
+        assert!(schema.contains("\"ordinary_heap_unchanged\""));
+        assert!(schema.contains("\"default\": false"));
+    }
+}

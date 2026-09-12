@@ -15,9 +15,11 @@ use crate::analyzer::semantic::{
     LengthDelimitedDigest, StableDigest, TransferKind, TransferOperation, ValuePreservation,
     ValueTransfer,
 };
+use crate::analyzer::semantic_model::{Signature, TypeRef};
 use crate::analyzer::usages::call_binding::{
     CallBindingKind, CallBindingMapping, CallBindingReport, CallBindingRow,
 };
+use crate::analyzer::usages::call_shape::CallShapeReport;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
@@ -165,6 +167,21 @@ pub(crate) trait CallArgumentConversionProver: Send + Sync {
         formal: tree_sitter::Node<'_>,
         formal_source: &str,
     ) -> Result<ArgumentTypeConversion, ConversionUnknown>;
+
+    /// Prove one actual against a structured model signature formal. The
+    /// language adapter owns interpretation of the model's `TypeRef`; the
+    /// shared relation never compares rendered type spellings.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_model_argument(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _actual: tree_sitter::Node<'_>,
+        _source: &str,
+        _formal_type: &TypeRef,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        Err(ConversionUnknown::UnsupportedConversion)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +408,10 @@ pub struct CallArgumentConversion {
     pub site_id: String,
     pub selected_signature: Option<String>,
     pub target: Option<CodeUnit>,
+    /// The exact unmaterialized model target selected by dispatch. This is
+    /// disjoint from `target`: a model fact can never join to a source
+    /// declaration merely because the source has no range identity.
+    pub model_target_id: Option<String>,
     pub argument_id: Option<String>,
     pub formal_index: Option<usize>,
     pub result: Result<ArgumentTypeConversion, ConversionUnknown>,
@@ -410,6 +431,7 @@ impl CallArgumentConversion {
             site_id: row.site_id.clone(),
             selected_signature: signature.map(str::to_owned),
             target: target.cloned(),
+            model_target_id: None,
             argument_id: row.argument_id.clone(),
             formal_index: row.formal_index,
             result: Err(reason),
@@ -417,6 +439,17 @@ impl CallArgumentConversion {
             completeness: ConversionCompleteness::Unknown(reason),
             operation_id: None,
         }
+    }
+
+    pub(crate) fn unknown_model(
+        row: &CallBindingRow,
+        model_target_id: &str,
+        signature: Option<&str>,
+        reason: ConversionUnknown,
+    ) -> Self {
+        let mut fact = Self::unknown(row, None, signature, reason);
+        fact.model_target_id = Some(model_target_id.to_owned());
+        fact
     }
 
     /// A proven result has exhaustive typing evidence for this pair; unknown
@@ -483,14 +516,15 @@ impl CallArgumentConversion {
                 .expect("selected signature")
                 .as_bytes(),
         );
-        digest.push(
-            self.target
-                .as_ref()
-                .expect("selected target")
-                .declaration_id()
-                .as_str()
-                .as_bytes(),
-        );
+        let target_id = self
+            .target
+            .as_ref()
+            .map(|target| target.declaration_id().to_owned());
+        digest.push(match (&target_id, &self.model_target_id) {
+            (Some(target_id), None) => target_id.as_str().as_bytes(),
+            (None, Some(model_target_id)) => model_target_id.as_bytes(),
+            _ => unreachable!("a conversion fact joins exactly one target kind"),
+        });
         digest.push(self.argument_id.as_ref().expect("source actual").as_bytes());
         digest.push(&(self.formal_index.expect("bound formal") as u64).to_be_bytes());
         for identity in [&conversion.source, &conversion.target] {
@@ -597,7 +631,7 @@ impl CallConversionCache {
                 }
             }
         }
-        project_conversion_facts(report, signature);
+        project_conversion_facts(report, signature, None);
     }
 
     fn prove(
@@ -719,6 +753,212 @@ impl CallConversionCache {
         }
         Ok(proofs)
     }
+
+    /// Select the one model overload whose structured formals accept every
+    /// written positional actual. No applicable overload and more than one
+    /// applicable overload are distinct typed failures.
+    pub fn select_model_signature(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        shape: &CallShapeReport,
+        caller_source: Option<(&ProjectFile, &str)>,
+        candidates: &[(String, Signature)],
+    ) -> Result<Option<(String, Signature)>, ConversionUnknown> {
+        let language = language_for_file(&shape.outcome.file);
+        let Some(prover) =
+            language_support(language).and_then(LanguageSupport::call_argument_conversion_prover)
+        else {
+            return Err(ConversionUnknown::UnsupportedLanguage);
+        };
+        let source = match self.source(analyzer, &shape.outcome.file) {
+            Some(source) => source,
+            None => {
+                let (file, source) = caller_source
+                    .filter(|(file, _)| *file == &shape.outcome.file)
+                    .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+                let tree = parse_tree_for_language(file, language_for_file(file), source)
+                    .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+                Arc::new(ConversionSource {
+                    source: source.to_owned(),
+                    tree,
+                })
+            }
+        };
+        let mut written = Vec::new();
+        for (formal_index, argument) in shape.arguments.iter().enumerate() {
+            if argument.spread || argument.name.is_some() {
+                return Err(ConversionUnknown::AmbiguousBinding);
+            }
+            let actual = source
+                .tree
+                .root_node()
+                .named_descendant_for_byte_range(argument.range.start_byte, argument.range.end_byte)
+                .filter(|node| {
+                    node.byte_range() == (argument.range.start_byte..argument.range.end_byte)
+                })
+                .ok_or(ConversionUnknown::UnsupportedExpression)?;
+            if actual.has_error() || actual.is_missing() {
+                return Err(ConversionUnknown::UnsupportedExpression);
+            }
+            written.push((formal_index, actual));
+        }
+
+        let mut applicable = Vec::new();
+        let mut failures = Vec::new();
+        for (model_id, signature) in candidates {
+            let mut candidate_ok = true;
+            for (formal_index, actual) in &written {
+                let Some(formal) = signature.parameters.get(*formal_index) else {
+                    failures.push(ConversionUnknown::UnresolvedTargetType);
+                    candidate_ok = false;
+                    break;
+                };
+                if !formal.passing_mode.accepts_positional() || formal.variadic {
+                    failures.push(ConversionUnknown::UnsupportedConversion);
+                    candidate_ok = false;
+                    break;
+                }
+                if let Err(reason) = prover.prove_model_argument(
+                    analyzer,
+                    &shape.outcome.file,
+                    *actual,
+                    &source.source,
+                    &formal.r#type,
+                ) {
+                    failures.push(reason);
+                    candidate_ok = false;
+                    break;
+                }
+            }
+            if candidate_ok {
+                applicable.push((model_id.clone(), signature.clone()));
+            }
+        }
+        match applicable.as_slice() {
+            [(model_id, signature)] => Ok(Some((model_id.clone(), signature.clone()))),
+            [] if failures.windows(2).all(|pair| pair[0] == pair[1]) && !failures.is_empty() => {
+                Err(failures[0])
+            }
+            [] => Err(ConversionUnknown::SignatureApplicability),
+            _ => Err(ConversionUnknown::AmbiguousBinding),
+        }
+    }
+
+    /// Populate conversions for the exact model target/signature/actual/formal
+    /// join selected by the model call binder.
+    pub fn populate_model_signature(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        report: &mut CallBindingReport,
+        model_target_id: &str,
+        signature_id: &str,
+        signature: &Signature,
+    ) {
+        let language = language_for_file(&report.file);
+        let prerequisite = language_support(language)
+            .and_then(LanguageSupport::call_argument_conversion_prover)
+            .ok_or(ConversionUnknown::UnsupportedLanguage)
+            .and_then(|prover| self.prove_model(analyzer, report, prover, signature));
+        report.conversion_facts = report
+            .rows
+            .iter()
+            .map(|row| {
+                CallArgumentConversion::unknown_model(
+                    row,
+                    model_target_id,
+                    Some(signature_id),
+                    prerequisite
+                        .as_ref()
+                        .err()
+                        .copied()
+                        .unwrap_or(ConversionUnknown::AmbiguousBinding),
+                )
+            })
+            .collect();
+        if let Ok(proofs) = prerequisite {
+            for (index, proof) in proofs {
+                match proof {
+                    Ok(proof) => report.conversion_facts[index].establish(proof),
+                    Err(reason) => {
+                        report.conversion_facts[index].result = Err(reason);
+                        report.conversion_facts[index].completeness =
+                            ConversionCompleteness::Unknown(reason);
+                    }
+                }
+            }
+        }
+        project_conversion_facts(report, Some(signature_id), Some(model_target_id));
+    }
+
+    fn prove_model(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        report: &CallBindingReport,
+        prover: &dyn CallArgumentConversionProver,
+        signature: &Signature,
+    ) -> Result<Vec<IndexedConversionProof>, ConversionUnknown> {
+        let source = self
+            .source(analyzer, &report.file)
+            .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+        let mut proofs = Vec::new();
+        for (index, row) in report.rows.iter().enumerate() {
+            if row.argument_id.is_none()
+                || matches!(
+                    row.binding_kind,
+                    Some(CallBindingKind::Receiver | CallBindingKind::Implicit)
+                )
+            {
+                continue;
+            }
+            let proof = (|| {
+                if row.mapping != CallBindingMapping::Exact
+                    || row.binding_kind != Some(CallBindingKind::Positional)
+                {
+                    return Err(ConversionUnknown::AmbiguousBinding);
+                }
+                let formal_index = row
+                    .formal_index
+                    .ok_or(ConversionUnknown::AmbiguousBinding)?;
+                let formal = signature
+                    .parameters
+                    .get(formal_index)
+                    .ok_or(ConversionUnknown::UnresolvedTargetType)?;
+                if formal.variadic {
+                    return Err(ConversionUnknown::UnsupportedConversion);
+                }
+                let actual = source
+                    .tree
+                    .root_node()
+                    .named_descendant_for_byte_range(row.range.start_byte, row.range.end_byte)
+                    .filter(|node| node.byte_range() == (row.range.start_byte..row.range.end_byte))
+                    .ok_or(ConversionUnknown::UnsupportedExpression)?;
+                if actual.has_error() || actual.is_missing() {
+                    return Err(ConversionUnknown::UnsupportedExpression);
+                }
+                prover.prove_model_argument(
+                    analyzer,
+                    &report.file,
+                    actual,
+                    &source.source,
+                    &formal.r#type,
+                )
+            })();
+            proofs.push((index, proof));
+        }
+        if proofs.iter().any(|(_, proof)| proof.is_err())
+            || report
+                .rows
+                .iter()
+                .any(|row| row.terminal || row.mapping != CallBindingMapping::Exact)
+        {
+            for (_, proof) in &mut proofs {
+                if proof.is_ok() {
+                    *proof = Err(ConversionUnknown::SignatureApplicability);
+                }
+            }
+        }
+        Ok(proofs)
+    }
 }
 
 /// Presentation is an exact identity join, independent of fact ordering. A
@@ -726,11 +966,30 @@ impl CallConversionCache {
 /// this row; an ordinary actual with no matching fact gets typed ambiguous
 /// conversion evidence instead. Receiver, implicit and absent-actual rows do
 /// not have a conversion field to explain.
-pub fn project_conversion_facts(report: &mut CallBindingReport, signature: Option<&str>) {
+pub fn project_conversion_facts(
+    report: &mut CallBindingReport,
+    signature: Option<&str>,
+    expected_model_target: Option<&str>,
+) {
     let mut by_binding = HashMap::default();
     for fact in &report.conversion_facts {
-        if fact.target != report.target || fact.selected_signature.as_deref() != signature {
+        // A source fact joins only its own report target; a model fact joins
+        // only the exact unmaterialized model target the binder selected.
+        let target_kind_matches = match (expected_model_target, fact.model_target_id.as_deref()) {
+            (Some(expected), Some(actual)) => {
+                actual == expected && fact.target.is_none() && report.target.is_none()
+            }
+            (None, None) => fact.target.is_some() && fact.target == report.target,
+            _ => false,
+        };
+        if !target_kind_matches || fact.selected_signature.as_deref() != signature {
             continue;
+        }
+        if signature.is_none() {
+            assert!(
+                fact.selected_signature.is_none(),
+                "a signatureless model conversion cannot join a signatureless query",
+            );
         }
         let previous = by_binding.insert(
             (
@@ -851,7 +1110,7 @@ mod tests {
             Some("signature"),
             ConversionUnknown::UnsupportedExpression,
         );
-        project_conversion_facts(&mut expected, Some("signature"));
+        project_conversion_facts(&mut expected, Some("signature"), None);
         let mut reordered = report();
         reordered.conversion_facts[1] = CallArgumentConversion::unknown(
             &reordered.rows[1],
@@ -860,7 +1119,7 @@ mod tests {
             ConversionUnknown::UnsupportedExpression,
         );
         reordered.conversion_facts.reverse();
-        project_conversion_facts(&mut reordered, Some("signature"));
+        project_conversion_facts(&mut reordered, Some("signature"), None);
         assert_eq!(expected.rows, reordered.rows);
         assert_eq!(
             expected.rows[1].conversion_reason,
@@ -901,7 +1160,7 @@ mod tests {
                 4 => fact.site_id = "another-call".to_owned(),
                 _ => unreachable!(),
             }
-            project_conversion_facts(&mut changed, Some("signature"));
+            project_conversion_facts(&mut changed, Some("signature"), None);
             assert!(
                 changed.rows[0].conversion.is_none(),
                 "dimension {dimension}"
@@ -917,17 +1176,51 @@ mod tests {
     }
 
     #[test]
+    fn model_target_identity_is_disjoint_and_cannot_borrow_a_conversion() {
+        let mut report = report();
+        report.target = None;
+        report.conversion_facts = report
+            .rows
+            .iter()
+            .map(|row| {
+                let mut fact = CallArgumentConversion::unknown_model(
+                    row,
+                    "member.run.string",
+                    Some("signature"),
+                    ConversionUnknown::UnresolvedSourceType,
+                );
+                fact.establish(ArgumentTypeConversion {
+                    source: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
+                    target: ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int),
+                    kind: ConversionKind::JavaIdentity,
+                });
+                fact
+            })
+            .collect();
+
+        project_conversion_facts(&mut report, Some("signature"), Some("member.run.array"));
+
+        assert!(report.rows.iter().all(|row| row.conversion.is_none()));
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|row| { row.conversion_reason == Some(ConversionUnknown::AmbiguousBinding) })
+        );
+    }
+
+    #[test]
     fn conversion_reason_is_not_applicable_to_receiver_implicit_or_absent_actual_rows() {
         let mut receiver_report = report();
         receiver_report.rows[0].binding_kind = Some(CallBindingKind::Receiver);
         receiver_report.rows[1].argument_id = None;
-        project_conversion_facts(&mut receiver_report, Some("signature"));
+        project_conversion_facts(&mut receiver_report, Some("signature"), None);
         assert_eq!(receiver_report.rows[0].conversion_reason, None);
         assert_eq!(receiver_report.rows[1].conversion_reason, None);
 
         let mut report = report();
         report.rows[0].binding_kind = Some(CallBindingKind::Implicit);
-        project_conversion_facts(&mut report, Some("signature"));
+        project_conversion_facts(&mut report, Some("signature"), None);
         assert_eq!(report.rows[0].conversion_reason, None);
     }
 

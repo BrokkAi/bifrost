@@ -30,6 +30,8 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Windows filesystem watchers no longer rearm a closed handle during
+  shutdown, preventing intermittent workspace cleanup hangs.
 - Type flow: an instance guard's true arm now replaces the Unknown remainder
   instead of widening results.
 - `search_symbols` declaration-name fallback is now bounded to the hit's own

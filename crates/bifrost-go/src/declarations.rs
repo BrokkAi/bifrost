@@ -552,6 +552,25 @@ pub fn go_structured_type_identity_with(
                     "parenthesized_type" | "negated_type" => {
                         frames.push(GoStructuredTypeFrame::Visit(go_type_wrapper_child(node)?));
                     }
+                    "interface_type" => {
+                        if node.has_error() || node.is_missing() {
+                            return None;
+                        }
+                        let mut cursor = node.walk();
+                        for child in node.named_children(&mut cursor) {
+                            if !visit() {
+                                return None;
+                            }
+                            // Comments are parser extras and carry no type
+                            // shape. Every other named child of an empty
+                            // interface would be a method/type element or an
+                            // unexpected parser node, so fail closed.
+                            if child.kind() != "comment" {
+                                return None;
+                            }
+                        }
+                        values.push(builder.empty_interface()?);
+                    }
                     "type_elem" => {
                         let mut cursor = node.walk();
                         let mut children = node.named_children(&mut cursor);

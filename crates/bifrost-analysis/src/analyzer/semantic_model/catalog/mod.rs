@@ -61,7 +61,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// declaration it emits with an `ambient_use` role. Warm generated packs carry
 /// no such role, and absence there means "unreviewed", so a stale pack would
 /// silently withhold every Scala unused-import proof.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 20;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 21;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -697,6 +697,9 @@ pub struct SemanticPackCatalog {
     root: PathBuf,
     mode: CatalogOpenMode,
     options: CatalogOptions,
+    // Session packs and SQLite data-version counters belong to one opened
+    // catalog. Equal counters in another catalog do not identify its content.
+    instance_identity: u64,
     connection: Mutex<Connection>,
     session_packs: Mutex<Vec<SessionPack>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
@@ -711,6 +714,7 @@ pub struct SemanticPackCatalog {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SemanticPackCatalogCacheIdentity {
+    pub(crate) instance_identity: u64,
     pub(crate) mutation_generation: u64,
     pub(crate) sqlite_data_version: u64,
 }
@@ -842,10 +846,17 @@ impl SemanticPackCatalog {
             reconcile_storage(&root, &mut connection)?;
         }
         drop(initialization_lock);
+        static NEXT_CATALOG_INSTANCE: AtomicU64 = AtomicU64::new(1);
+        let instance_identity = NEXT_CATALOG_INSTANCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("semantic-pack catalog instance identity space exhausted");
         Ok(Self {
             root,
             mode,
             options,
+            instance_identity,
             connection: Mutex::new(connection),
             session_packs: Mutex::new(Vec::new()),
             session_activations: Mutex::new(HashMap::new()),
@@ -3027,6 +3038,7 @@ impl SemanticPackCatalog {
             .query_row("PRAGMA data_version", [], |row| row.get(0))
             .map_err(|error| CatalogError::sqlite("read catalog data version", error))?;
         Ok(SemanticPackCatalogCacheIdentity {
+            instance_identity: self.instance_identity,
             mutation_generation: self.mutation_generation.load(Ordering::Relaxed),
             sqlite_data_version,
         })

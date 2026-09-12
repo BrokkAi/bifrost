@@ -35,6 +35,8 @@ const JAVA_JVM_MAPPING_SCHEMA_JSON: &str = include_str!("profiles/java-jvm-mappi
 const JVM_COMPATIBILITY_SCHEMA_JSON: &str = include_str!("profiles/jvm-compatibility.schema.json");
 const RUNTIME_VALUES_SCHEMA_JSON: &str = include_str!("profiles/runtime-values.schema.json");
 const COLLECTION_FLOW_SCHEMA_JSON: &str = include_str!("profiles/collection-flow.schema.json");
+const CONDITIONAL_TYPE_REFINEMENT_SCHEMA_JSON: &str =
+    include_str!("profiles/conditional-type-refinement.schema.json");
 const DEFERRED_YIELD_SCHEMA_JSON: &str = include_str!("profiles/deferred-yield.schema.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +378,13 @@ struct KnownProfile {
 }
 
 const KNOWN_PROFILES: &[KnownProfile] = &[
+    KnownProfile {
+        identifier: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        version: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+        schema: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+        schema_json: CONDITIONAL_TYPE_REFINEMENT_SCHEMA_JSON,
+        payload_definitions: &["$root"],
+    },
     KnownProfile {
         identifier: CSMI_COLLECTION_FLOW_PROFILE_ID,
         version: CSMI_COLLECTION_FLOW_PROFILE_VERSION,
@@ -2442,6 +2451,15 @@ fn validate_model(
         model,
         &prefix,
         &symbols,
+        &declaration_categories,
+        &callable_declarations,
+        diagnostics,
+    ) {
+        valid = false;
+    }
+    if !validate_conditional_type_refinements(
+        model,
+        &prefix,
         &declaration_categories,
         &callable_declarations,
         diagnostics,
@@ -6004,6 +6022,311 @@ fn sort_diagnostics(diagnostics: &mut Vec<CsmiDiagnostic>) {
         (&left.path, &left.code, &left.message).cmp(&(&right.path, &right.code, &right.message))
     });
     diagnostics.dedup();
+}
+
+/// Apply the same profile schema and semantic joins to native companion facts.
+pub(crate) fn validate_native_conditional_type_payloads(
+    model: &CsmiSemanticModel,
+) -> Vec<CsmiDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let (index, _) = known_profile(
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+    )
+    .expect("conditional refinement profile is registered");
+    let schema = profile_schema_validators()[index]
+        .as_ref()
+        .expect("profile schema");
+    for fact in model
+        .extension_facts
+        .iter()
+        .filter(|fact| fact.vocabulary == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID)
+    {
+        for violation in schema.iter_errors(&fact.payload) {
+            error(
+                &mut diagnostics,
+                "conditional_type.schema",
+                "$",
+                violation.to_string(),
+            );
+        }
+    }
+    diagnostics
+}
+
+pub(crate) fn validate_native_conditional_type_model(
+    model: &CsmiSemanticModel,
+) -> Vec<CsmiDiagnostic> {
+    let declarations = model
+        .declarations
+        .iter()
+        .map(|declaration| (declaration.symbol.clone(), declaration.category))
+        .collect();
+    let callables = model
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .callable
+                .as_ref()
+                .map(|shape| (declaration.symbol.clone(), shape))
+        })
+        .collect();
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(validate_native_conditional_type_payloads(model));
+    validate_conditional_type_refinements(model, "$", &declarations, &callables, &mut diagnostics);
+    diagnostics
+}
+
+fn validate_conditional_type_refinements(
+    model: &CsmiSemanticModel,
+    prefix: &str,
+    declarations: &HashMap<String, CsmiDeclarationCategory>,
+    callables: &HashMap<String, &CsmiCallableShape>,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) -> bool {
+    let before = diagnostics.len();
+    let mut affects = HashSet::new();
+    for (index, use_) in model
+        .vocabulary_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| {
+            use_.identifier == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID
+                && use_.version == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION
+        })
+    {
+        let path = format!("{prefix}.vocabularyUses[{index}]");
+        if use_.schema != CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA
+            || use_.requirement != CsmiVocabularyRequirement::Required
+        {
+            error(
+                diagnostics,
+                "semantic.conditional_type_required_use",
+                &path,
+                "conditional refinements require the exact required profile schema",
+            );
+            continue;
+        }
+        for affect in &use_.affects {
+            let CsmiAffectedUnit::FactFamily(family) = affect else {
+                error(
+                    diagnostics,
+                    "semantic.conditional_type_scope",
+                    &path,
+                    "conditional refinements affect an exact callable/parameter fact family",
+                );
+                continue;
+            };
+            if family.family != CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY
+                || conditional_type_scope(&family.scope, callables).is_none()
+            {
+                error(
+                    diagnostics,
+                    "semantic.conditional_type_scope",
+                    &path,
+                    "conditional refinement scope must resolve a callable and parameter ordinal",
+                );
+                continue;
+            }
+            affects.insert(canonical_scope(&family.scope));
+        }
+    }
+    let mut outcomes: HashMap<String, CsmiConditionalTypeOutcome> = HashMap::new();
+    let mut conflicts = HashSet::new();
+    for (index, fact) in model
+        .extension_facts
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| {
+            fact.vocabulary == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID
+                && fact.version == CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION
+        })
+    {
+        let path = format!("{prefix}.extensionFacts[{index}]");
+        let key = canonical_scope(&fact.scope);
+        let Some((callable, subject)) = conditional_type_scope(&fact.scope, callables) else {
+            error(
+                diagnostics,
+                "semantic.conditional_type_scope",
+                &path,
+                "conditional refinement scope must resolve a callable and parameter ordinal",
+            );
+            continue;
+        };
+        if fact.family != CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY || !affects.contains(&key) {
+            error(
+                diagnostics,
+                "semantic.conditional_type_scope",
+                &path,
+                "conditional refinement requires its exact family and required affected scope",
+            );
+        }
+        let payload: CsmiConditionalTypeRefinement =
+            match serde_json::from_value(fact.payload.clone()) {
+                Ok(payload) => payload,
+                Err(cause) => {
+                    error(
+                        diagnostics,
+                        "semantic.conditional_type_payload",
+                        &path,
+                        cause.to_string(),
+                    );
+                    continue;
+                }
+            };
+        if payload.callable != callable || payload.subject != subject {
+            error(
+                diagnostics,
+                "semantic.conditional_type_scope",
+                &path,
+                "conditional refinement payload and fact scope must agree exactly",
+            );
+        }
+        let shape_complete = model.completeness_statements.iter().any(|statement| {
+            statement.vocabulary.is_none()
+                && statement.family == "declaration-aspects"
+                && statement.scope
+                    == serde_json::json!({"symbol": callable, "aspect": "callable-shape"})
+                && statement.status == CsmiCoverageStatus::Complete
+        });
+        if matches!(
+            &payload.outcome,
+            CsmiConditionalTypeOutcome::Supported { .. }
+        ) && !shape_complete
+        {
+            error(
+                diagnostics,
+                "semantic.conditional_type_callable_shape",
+                &path,
+                "supported refinement requires complete callable-shape evidence",
+            );
+        }
+        if let CsmiConditionalTypeOutcome::Supported { target, .. } = &payload.outcome {
+            validate_conditional_type_target(target, model, declarations, &path, diagnostics);
+        }
+        match outcomes.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(payload.outcome);
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get() != &payload.outcome =>
+            {
+                conflicts.insert(key);
+                error(
+                    diagnostics,
+                    "semantic.conditional_type_conflict",
+                    &path,
+                    "conflicting conditional refinements for one exact callable/parameter scope",
+                );
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+    for (index, statement) in
+        model
+            .completeness_statements
+            .iter()
+            .enumerate()
+            .filter(|(_, statement)| {
+                statement.vocabulary.as_deref() == Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID)
+                    && statement.version.as_deref()
+                        == Some(CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION)
+            })
+    {
+        let path = format!("{prefix}.completenessStatements[{index}]");
+        let key = canonical_scope(&statement.scope);
+        if statement.family != CSMI_CONDITIONAL_TYPE_REFINEMENT_FAMILY
+            || !affects.contains(&key)
+            || conditional_type_scope(&statement.scope, callables).is_none()
+        {
+            error(
+                diagnostics,
+                "semantic.conditional_type_completeness",
+                &path,
+                "conditional refinement coverage must name an exact required affected scope",
+            );
+        }
+        if statement.status == CsmiCoverageStatus::Complete
+            && (conflicts.contains(&key)
+                || !matches!(
+                    outcomes.get(&key),
+                    Some(CsmiConditionalTypeOutcome::Supported { .. })
+                ))
+        {
+            error(
+                diagnostics,
+                "semantic.conditional_type_completeness",
+                &path,
+                "complete conditional refinement cannot contain missing, unsupported, indeterminate, or conflicting facts",
+            );
+        }
+    }
+    before == diagnostics.len()
+}
+
+fn conditional_type_scope<'a>(
+    scope: &'a Value,
+    callables: &HashMap<String, &CsmiCallableShape>,
+) -> Option<(&'a str, CsmiConditionalTypeSubject)> {
+    let callable = scope.get("callable")?.as_str()?;
+    let subject: CsmiConditionalTypeSubject =
+        serde_json::from_value(scope.get("subject")?.clone()).ok()?;
+    if *scope != serde_json::json!({"callable": callable, "subject": subject}) {
+        return None;
+    }
+    let shape = callables.get(callable)?;
+    let CsmiConditionalTypeSubject::Parameter { position } = subject;
+    if !shape
+        .parameters
+        .iter()
+        .any(|parameter| parameter.position == position)
+        || shape.results.len() != 1
+        || shape.results[0].position != 0
+    {
+        return None;
+    }
+    Some((callable, subject))
+}
+
+fn validate_conditional_type_target(
+    target: &CsmiTypeExpression,
+    model: &CsmiSemanticModel,
+    declarations: &HashMap<String, CsmiDeclarationCategory>,
+    path: &str,
+    diagnostics: &mut Vec<CsmiDiagnostic>,
+) {
+    let mut stack = vec![target];
+    while let Some(target) = stack.pop() {
+        let supported_identity = match target {
+            CsmiTypeExpression::Reference(reference) => {
+                stack.extend(reference.arguments.iter());
+                matches!(
+                    declarations.get(&reference.symbol),
+                    Some(CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias)
+                )
+            }
+            CsmiTypeExpression::Parameter(parameter) => {
+                declarations.get(&parameter.symbol) == Some(&CsmiDeclarationCategory::TypeParameter)
+            }
+            CsmiTypeExpression::Intrinsic(intrinsic) => model.vocabulary_uses.iter().any(|use_| {
+                use_.identifier == intrinsic.vocabulary
+                    && use_.version == intrinsic.version
+                    && use_.requirement == CsmiVocabularyRequirement::Required
+            }),
+            CsmiTypeExpression::Unknown(_) => false,
+        };
+        if !supported_identity {
+            error(
+                diagnostics,
+                "semantic.conditional_type_target",
+                path,
+                format!(
+                    "conditional refinement target has unresolved or unsupported identity: {target:?}"
+                ),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

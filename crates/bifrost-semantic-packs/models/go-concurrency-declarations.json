@@ -7,7 +7,7 @@
   "ecosystem": "go",
   "compatibility": { "bifrost": ">=0.10.7, <1.0.0", "toolchains": [] },
   "provenance": {
-    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/, and https://pkg.go.dev/golang.org/x/sync/errgroup",
+    "source": "https://go.dev/src/context/, https://go.dev/src/sync/, https://go.dev/src/time/time.go (time.Time, time.Duration, time.Time.Sub, time.Now), https://go.dev/src/time/sleep.go (time.Timer, time.Timer.Stop, time.AfterFunc), and https://pkg.go.dev/golang.org/x/sync/errgroup",
     "revision": "go1.26.0;x-sync-v0.15.0"
   },
   "license": "BSD-3-Clause",
@@ -574,6 +574,54 @@
         "kind": "declaration_facts",
         "types": [
           {
+            "id": "type.f5792b534655089a8504502abdf42fa2ef9ed01136f10cde59a3d9c689b237a9",
+            "name": "time.Time",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/time/time.go", "symbol": "time.Time" }
+          },
+          {
+            "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f",
+            "name": "time.Duration",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/time/time.go", "symbol": "time.Duration" }
+          },
+          {
+            "id": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+            "name": "time.Timer",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer" }
+          },
+          {
             "id": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
             "name": "time",
             "type_kind": "module",
@@ -592,7 +640,62 @@
         ],
         "members": [
           {
-            "id": "member.ff779d96f039a87327fdb64619965187cecb969d543640e37fbb90d40b8ff06b",
+            "id": "member.8d1b721c83026248db0fa6b75a877980e8db9ff82651a7f885afc15ed8ae935c",
+            "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
+            "name": "Now",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": { "kind": "declared", "id": "type.f5792b534655089a8504502abdf42fa2ef9ed01136f10cde59a3d9c689b237a9", "arguments": [], "nullable": false }
+            },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/time.go", "symbol": "time.Now" }
+          },
+          {
+            "id": "member.ea8cdadede5c1870c32ce4173208f066985dd172e106adb45356f7230078369c",
+            "owner": "type.f5792b534655089a8504502abdf42fa2ef9ed01136f10cde59a3d9c689b237a9",
+            "name": "Sub",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                { "name": "u", "type": { "kind": "declared", "id": "type.f5792b534655089a8504502abdf42fa2ef9ed01136f10cde59a3d9c689b237a9", "arguments": [], "nullable": false }, "optional": false, "variadic": false }
+              ],
+              "returns": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false }
+            },
+            "receiver": { "pointer": false },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/time.go", "symbol": "time.Time.Sub" }
+          },
+          {
+            "id": "member.6ca7ee4ba1a9781805d964449cad26ea95aaa5ae7b613fb84ce056112268a09f",
+            "owner": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f",
+            "name": "Stop",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": { "kind": "named", "name": "bool", "arguments": [], "nullable": false }
+            },
+            "receiver": { "pointer": true },
+            "aliases": [],
+            "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.Timer.Stop" }
+          },
+          {
+            "id": "member.348968f2fd5d260bd64344016c8075efec0787aeea2760759e5168da502c9f92",
             "owner": "type.0e5eb8274d8a136652db26087e21a5a350ee36c3b7d9c47f2ffca11ec56d98e0",
             "name": "AfterFunc",
             "member_kind": "function",
@@ -605,7 +708,7 @@
               "parameters": [
                 {
                   "name": "d",
-                  "type": { "kind": "named", "name": "time.Duration", "arguments": [], "nullable": false },
+                  "type": { "kind": "declared", "id": "type.093f2445cc8f7389a5299fa7e7d70ae8fadd6fa2291af0d0b16069cc3433b19f", "arguments": [], "nullable": false },
                   "optional": false,
                   "variadic": false
                 },
@@ -615,7 +718,8 @@
                   "optional": false,
                   "variadic": false
                 }
-              ]
+              ],
+              "returns": { "kind": "pointer", "element": { "kind": "declared", "id": "type.2fd0aa06a7ead591780725343ef0ad1392e76f63c7759ee4578483f9badf438f", "arguments": [], "nullable": false } }
             },
             "aliases": [],
             "locator": { "kind": "artifact", "path": "src/time/sleep.go", "symbol": "time.AfterFunc" }

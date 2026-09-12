@@ -1997,14 +1997,45 @@ fn static_string_property<'tree>(
     string: Node<'tree>,
     source: &str,
 ) -> Option<(Node<'tree>, String)> {
+    let fragment = static_string_property_node(string)?;
+    Some((fragment, slice(fragment, source).to_string()))
+}
+
+/// The single `string_fragment` a string literal contributes as a static
+/// property name. A literal that carries an escape sequence or a template
+/// substitution has more than one child and is rejected here, so no caller has
+/// to interpret source text to decide what the key spells.
+fn static_string_property_node(string: Node<'_>) -> Option<Node<'_>> {
+    if string.kind() != "string" {
+        return None;
+    }
     let mut cursor = string.walk();
     let mut children = string.named_children(&mut cursor);
     let fragment = children.next()?;
-    if fragment.kind() != "string_fragment" || children.next().is_some() {
-        return None;
+    (fragment.kind() == "string_fragment" && children.next().is_none()).then_some(fragment)
+}
+
+/// Whether this terminal is the property name of a statically keyed member
+/// access: the `string_fragment` of `data["connectionTimeout"]`.
+///
+/// [`static_member_property`] resolves exactly this node as the accessed
+/// property, so the usage scan publishes its reference hits at this range even
+/// though a string interior is not an identifier-class leaf. Inverse membership
+/// needs the same structural answer to back those hits. The forward census
+/// probe frontier stays identifier-only and never proposes the range.
+pub fn is_static_subscript_property_name(node: Node<'_>) -> bool {
+    if node.kind() != "string_fragment" {
+        return false;
     }
-    let name = slice(fragment, source);
-    Some((fragment, name.to_string()))
+    let Some(string) = node.parent() else {
+        return false;
+    };
+    let Some(subscript) = string.parent() else {
+        return false;
+    };
+    subscript.kind() == "subscript_expression"
+        && subscript.child_by_field_name("index") == Some(string)
+        && static_string_property_node(string) == Some(node)
 }
 
 /// The identifier at the root of a static member chain (`module` in

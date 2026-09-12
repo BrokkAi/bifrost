@@ -477,6 +477,15 @@ fn relation_matches_event(
                 && runtime_value_endpoint(procedure, &relation.target, *target)
         }
         SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+            source,
+            target,
+        } => {
+            relation.kind == ValueFlowRelationKind::LanguageDefined
+                && value_endpoint(&relation.source, *source)
+                && value_endpoint(&relation.target, *target)
+        }
+        SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Parameter,
             source,
             target,
@@ -516,7 +525,7 @@ fn relation_matches_event(
                 )
         }
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::LanguageDefined,
+            kind: ValueFlowKind::LanguageDefined | ValueFlowKind::IntegerOffset { .. },
             source,
             target,
         } => {

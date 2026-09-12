@@ -704,6 +704,23 @@ mod tests {
                 "sync.RWMutex.TryRLock",
             ]
         );
+        let mut ordinary_heap_unchanged = summaries
+            .iter()
+            .filter(|summary| summary.ordinary_heap_unchanged)
+            .map(|summary| summary.id.as_str())
+            .collect::<Vec<_>>();
+        ordinary_heap_unchanged.sort_unstable();
+        assert_eq!(
+            ordinary_heap_unchanged,
+            [
+                "sync.mutex.lock",
+                "sync.mutex.unlock",
+                "sync.rwmutex.lock",
+                "sync.rwmutex.rlock",
+                "sync.rwmutex.runlock",
+                "sync.rwmutex.unlock",
+            ]
+        );
 
         let errgroup = concurrency
             .shards
@@ -809,8 +826,132 @@ mod tests {
             declaration_type_count += types.len();
             declaration_member_count += members.len();
         }
-        assert_eq!(declaration_type_count, 12);
-        assert_eq!(declaration_member_count, 33);
+        assert_eq!(declaration_type_count, 15);
+        assert_eq!(declaration_member_count, 36);
+
+        let time_declarations = concurrency_declarations
+            .shards
+            .iter()
+            .find(|shard| shard.descriptor.shard_id == "go.concurrency.time.declarations")
+            .expect("the Go concurrency declaration pack carries its time shard");
+        let time_declarations = decode_shard_for_manifest(
+            &concurrency_declarations.manifest,
+            &time_declarations.descriptor,
+            &time_declarations.bytes,
+            &DecodeLimits::default(),
+        )
+        .expect("the Go time declaration shard decodes");
+        let (time_types, time_members, relations) = time_declarations
+            .payload()
+            .declaration_facts()
+            .expect("the Go time declaration shard carries declaration facts");
+        assert!(relations.is_empty());
+        assert_eq!(time_types.len(), 4);
+        assert_eq!(time_members.len(), 4);
+        let time_module = time_types
+            .iter()
+            .find(|fact| fact.name == "time")
+            .expect("the time module is declared");
+        let time_type = time_types
+            .iter()
+            .find(|fact| fact.name == "time.Time")
+            .expect("time.Time is declared");
+        let duration_type = time_types
+            .iter()
+            .find(|fact| fact.name == "time.Duration")
+            .expect("time.Duration is declared");
+        let timer_type = time_types
+            .iter()
+            .find(|fact| fact.name == "time.Timer")
+            .expect("time.Timer is declared");
+        assert_eq!(time_type.type_kind, TypeKind::Struct);
+        assert_eq!(duration_type.type_kind, TypeKind::Class);
+        assert_eq!(timer_type.type_kind, TypeKind::Struct);
+
+        let now = time_members
+            .iter()
+            .find(|member| member.name == "Now")
+            .expect("time.Now is declared");
+        assert_eq!(now.owner, time_module.id);
+        assert!(matches!(
+            now.signature.as_ref().and_then(|signature| signature.returns.as_ref()),
+            Some(TypeRef::Declared { id, arguments, nullable })
+                if id == &time_type.id && arguments.is_empty() && !nullable
+        ));
+
+        let sub = time_members
+            .iter()
+            .find(|member| member.name == "Sub")
+            .expect("time.Time.Sub is declared");
+        assert_eq!(sub.owner, time_type.id);
+        assert_eq!(
+            sub.receiver.as_ref().map(|receiver| receiver.pointer),
+            Some(false)
+        );
+        let sub_signature = sub
+            .signature
+            .as_ref()
+            .expect("time.Time.Sub has a signature");
+        assert!(matches!(
+            sub_signature.parameters.as_slice(),
+            [parameter]
+                if matches!(
+                    &parameter.r#type,
+                    TypeRef::Declared { id, arguments, nullable }
+                        if id == &time_type.id && arguments.is_empty() && !nullable
+                )
+        ));
+        assert!(matches!(
+            sub_signature.returns.as_ref(),
+            Some(TypeRef::Declared { id, arguments, nullable })
+                if id == &duration_type.id && arguments.is_empty() && !nullable
+        ));
+
+        let stop = time_members
+            .iter()
+            .find(|member| member.name == "Stop")
+            .expect("time.Timer.Stop is declared");
+        assert_eq!(stop.owner, timer_type.id);
+        assert_eq!(
+            stop.receiver.as_ref().map(|receiver| receiver.pointer),
+            Some(true)
+        );
+        assert!(matches!(
+            stop.signature.as_ref().and_then(|signature| signature.returns.as_ref()),
+            Some(TypeRef::Named { name, arguments, nullable })
+                if name == "bool" && arguments.is_empty() && !nullable
+        ));
+
+        let after_func = time_members
+            .iter()
+            .find(|member| member.name == "AfterFunc")
+            .expect("time.AfterFunc is declared");
+        let after_func_signature = after_func
+            .signature
+            .as_ref()
+            .expect("time.AfterFunc has a signature");
+        assert!(matches!(
+            after_func_signature.parameters.as_slice(),
+            [duration, callback]
+                if matches!(
+                    &duration.r#type,
+                    TypeRef::Declared { id, arguments, nullable }
+                        if id == &duration_type.id && arguments.is_empty() && !nullable
+                ) && matches!(
+                    &callback.r#type,
+                    TypeRef::Named { name, arguments, nullable }
+                        if name == "func()" && arguments.is_empty() && !nullable
+                )
+        ));
+        assert!(matches!(
+            after_func_signature.returns.as_ref(),
+            Some(TypeRef::Pointer { element })
+                if matches!(
+                    element.as_ref(),
+                    TypeRef::Declared { id, arguments, nullable }
+                        if id == &timer_type.id && arguments.is_empty() && !nullable
+                )
+        ));
 
         let atomic = decoded
             .iter()

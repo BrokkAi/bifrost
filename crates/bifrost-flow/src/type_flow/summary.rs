@@ -2587,6 +2587,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
                             SummaryEffectKey::Call {
                                 event: SummaryEventKey::from_digest(event.finish()),
                                 callee: Box::new(dependency.clone()),
+                                witness: None,
                             },
                             Default::default(),
                         )

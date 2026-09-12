@@ -14,7 +14,7 @@ use super::artifact::{
     CompiledSummaryValueTransferKind, CompiledSummaryValueTransferLimitation,
     CompiledSummaryValueTransferLimitationKind, CompiledSummaryValueTransferOperation,
     DecodeLimits, canonical_json, content_digest, manifest_content_digest,
-    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
+    manifest_semantic_digest, routing_keys, semantic_digest, shard_inventory, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -117,6 +117,7 @@ pub fn compile_pack(
             runtime_values: shard.runtime_values.clone(),
             collection_flows: shard.collection_flows.clone(),
             deferred_yields: shard.deferred_yields.clone(),
+            conditional_type_refinements: shard.conditional_type_refinements.clone(),
             cpp_portability: normalized.cpp_portability.clone(),
             payload: compile_payload(&normalized.pack_id, &shard.payload)
                 .map_err(artifact_diagnostic)?,
@@ -164,7 +165,7 @@ pub fn compile_pack(
                 ),
             )]);
         }
-        let (defined_ids, referenced_ids) = payload_inventory(&compiled.payload);
+        let (defined_ids, referenced_ids) = shard_inventory(&compiled);
         let descriptor = CompiledShardDescriptor {
             shard_id: compiled.shard_id.clone(),
             payload_kind: compiled.payload_kind(),
@@ -272,6 +273,16 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
             collection_flows
                 .flows
                 .sort_by(|left, right| left.callable.cmp(&right.callable));
+        }
+        if let Some(refinements) = &mut shard.conditional_type_refinements {
+            for fact in &mut refinements.refinements {
+                fact.provenance.sort_unstable();
+                fact.provenance.dedup();
+            }
+            refinements
+                .refinements
+                .sort_by_cached_key(canonical_sort_key);
+            refinements.refinements.dedup();
         }
         if let Some(deferred_yields) = &mut shard.deferred_yields {
             for fact in &mut deferred_yields.yields {
@@ -479,6 +490,7 @@ fn compile_procedure_summary(
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
+        ordinary_heap_unchanged: summary.ordinary_heap_unchanged,
         covers_overrides: summary.covers_overrides,
         normal_continuation_absent: summary.normal_continuation_absent,
         normal_result_count: summary.normal_result_count,

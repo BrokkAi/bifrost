@@ -599,6 +599,7 @@ fn build_summary(
             SanitizerCompleteness::Partial => Completeness::Partial,
             SanitizerCompleteness::Complete => Completeness::Complete,
         },
+        ordinary_heap_unchanged: false,
         covers_overrides: false,
         normal_continuation_absent: false,
         normal_result_count: None,
@@ -773,6 +774,7 @@ impl PackIdentity {
                 runtime_values: None,
                 collection_flows: None,
                 deferred_yields: None,
+                conditional_type_refinements: None,
             }],
         }
     }

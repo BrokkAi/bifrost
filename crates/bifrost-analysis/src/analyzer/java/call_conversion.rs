@@ -6,6 +6,7 @@ use crate::analyzer::jvm::external::{
 use crate::analyzer::lexical_definitions::{LexicalBindingResolution, resolve_lexical_binding};
 use crate::analyzer::multi_analyzer::resolve_analyzer;
 use crate::analyzer::semantic::StableDigest;
+use crate::analyzer::semantic_model::TypeRef;
 use crate::analyzer::usages::call_conversion::{
     ArgumentTypeConversion, CallArgumentConversionProver, ConversionKind, ConversionUnknown,
     ExternalConversionIdentity, ExternalConversionProvenance, JavaPrimitive,
@@ -53,6 +54,17 @@ impl TypeResolutionFailure {
     }
 }
 
+/// The Java view of one conversion side. Arrays are modeled structurally from
+/// tree-sitter declaration shapes and model `TypeRef` terms. The shared
+/// conversion fact records the element pair with its proven kind; this layer
+/// owns array identity so a lexical `String[]` actual applies only to an
+/// `Array(String)` model formal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JavaConversionType {
+    Value(ResolvedConversionType),
+    Array(Box<JavaConversionType>),
+}
+
 /// Prove the conversion for one Java actual/formal pair.
 ///
 /// The caller supplies the exact expression and formal declaration nodes from
@@ -77,9 +89,7 @@ pub(super) fn prove_argument(
         resolve_analyzer::<JavaAnalyzer>(analyzer).ok_or(ConversionUnknown::UnsupportedLanguage)?;
     let scope = AnalyzerQueryScope::new(java);
     let token = scope.token();
-    let packs = analyzer
-        .active_query_semantic_model_overlay()
-        .and_then(|overlay| overlay);
+    let packs = analyzer.semantic_model_overlay();
 
     let target = resolve_formal_type(
         java,
@@ -91,7 +101,7 @@ pub(super) fn prove_argument(
     )?;
     let source_type = resolve_actual_type(java, token, packs, file, actual, source)?;
 
-    classify_conversion(source_type, target)
+    classify_java_conversion(source_type, JavaConversionType::Value(target))
 }
 
 pub(crate) static CALL_ARGUMENT_CONVERSION_PROVER: JavaCallArgumentConversionProver =
@@ -119,6 +129,27 @@ impl CallArgumentConversionProver for JavaCallArgumentConversionProver {
             formal,
             formal_source,
         )
+    }
+
+    fn prove_model_argument(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        actual: Node<'_>,
+        source: &str,
+        formal_type: &TypeRef,
+    ) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+        if file.language() != Language::Java {
+            return Err(ConversionUnknown::UnsupportedLanguage);
+        }
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer)
+            .ok_or(ConversionUnknown::UnsupportedLanguage)?;
+        let scope = AnalyzerQueryScope::new(java);
+        let token = scope.token();
+        let packs = analyzer.semantic_model_overlay();
+        let source_type = resolve_actual_type(java, token, packs.clone(), file, actual, source)?;
+        let target = resolve_model_type_ref(java, token, packs, file, formal_type)?;
+        classify_java_conversion(source_type, target)
     }
 }
 
@@ -151,7 +182,7 @@ fn resolve_actual_type(
     file: &ProjectFile,
     actual: Node<'_>,
     source: &str,
-) -> Result<ResolvedConversionType, ConversionUnknown> {
+) -> Result<JavaConversionType, ConversionUnknown> {
     let mut expression = actual;
     while expression.kind() == "parenthesized_expression" {
         expression = expression
@@ -160,7 +191,9 @@ fn resolve_actual_type(
     }
 
     if let Some(primitive) = primitive_literal(expression) {
-        return Ok(ResolvedConversionType::JavaPrimitive(primitive));
+        return Ok(JavaConversionType::Value(
+            ResolvedConversionType::JavaPrimitive(primitive),
+        ));
     }
 
     match expression.kind() {
@@ -175,7 +208,8 @@ fn resolve_actual_type(
             file,
             "java.lang.String",
             ConversionUnknown::UnresolvedSourceType,
-        ),
+        )
+        .map(JavaConversionType::Value),
         _ => Err(ConversionUnknown::UnsupportedExpression),
     }
 }
@@ -187,7 +221,7 @@ fn resolve_lexical_actual_type(
     file: &ProjectFile,
     actual: Node<'_>,
     source: &str,
-) -> Result<ResolvedConversionType, ConversionUnknown> {
+) -> Result<JavaConversionType, ConversionUnknown> {
     let identifier = node_text(actual, source);
     if identifier.is_empty() {
         return Err(ConversionUnknown::UnresolvedSourceType);
@@ -217,11 +251,46 @@ fn resolve_lexical_actual_type(
         .ok_or(ConversionUnknown::UnresolvedSourceType)?;
     let type_node =
         declared_type_node(declaration).ok_or(ConversionUnknown::UnresolvedSourceType)?;
-    if declaration_declares_array(declaration, type_node) {
+    let (element_type_node, array_dimensions) = declared_java_type_shape(declaration, type_node)?;
+    let element = resolve_type_node(java, token, packs, file, element_type_node, source)
+        .map_err(TypeResolutionFailure::source)?;
+    Ok(array_java_type(element, array_dimensions))
+}
+
+/// The declared element type and array dimension count, read structurally
+/// from tree-sitter `array_type` element/dimensions fields and declarator
+/// dimension fields. No rendered-spelling parsing.
+fn declared_java_type_shape<'a>(
+    declaration: Node<'a>,
+    type_node: Node<'a>,
+) -> Result<(Node<'a>, usize), ConversionUnknown> {
+    if declaration.kind() == "spread_parameter" {
         return Err(ConversionUnknown::UnsupportedConversion);
     }
-    resolve_type_node(java, token, packs, file, type_node, source)
-        .map_err(TypeResolutionFailure::source)
+    let mut element = type_node;
+    let mut dimensions = 0usize;
+    while element.kind() == "array_type" {
+        dimensions += dimension_count(element.child_by_field_name("dimensions"));
+        element = element
+            .child_by_field_name("element")
+            .ok_or(ConversionUnknown::UnresolvedSourceType)?;
+    }
+    dimensions += dimension_count(declaration.child_by_field_name("dimensions"));
+    Ok((element, dimensions))
+}
+
+fn dimension_count(dimensions: Option<Node<'_>>) -> usize {
+    // Each `[]` axis contributes two anonymous child tokens to a
+    // `dimensions` node, so the axis count is half the child count.
+    dimensions.map_or(0, |dimensions| dimensions.child_count() / 2)
+}
+
+fn array_java_type(element: ResolvedConversionType, dimensions: usize) -> JavaConversionType {
+    let mut java_type = JavaConversionType::Value(element);
+    for _ in 0..dimensions {
+        java_type = JavaConversionType::Array(Box::new(java_type));
+    }
+    java_type
 }
 
 fn resolve_type_node(
@@ -304,6 +373,105 @@ fn resolve_external_spelling(
     external
         .map(|identity| ResolvedConversionType::External { identity })
         .ok_or(unknown)
+}
+
+fn model_primitive_type(name: &str) -> Option<JavaPrimitive> {
+    match name {
+        "boolean" => Some(JavaPrimitive::Boolean),
+        "byte" => Some(JavaPrimitive::Byte),
+        "short" => Some(JavaPrimitive::Short),
+        "char" => Some(JavaPrimitive::Char),
+        "int" => Some(JavaPrimitive::Int),
+        "long" => Some(JavaPrimitive::Long),
+        "float" => Some(JavaPrimitive::Float),
+        "double" => Some(JavaPrimitive::Double),
+        _ => None,
+    }
+}
+
+/// Resolve the model's structured type term through the same declaration
+/// surface used for source formals. The field is a structured `TypeRef`, not
+/// a rendered signature; generic terms remain explicitly unresolved and
+/// arrays recurse structurally to their element terms.
+fn resolve_model_type_ref(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    type_ref: &TypeRef,
+) -> Result<JavaConversionType, ConversionUnknown> {
+    match type_ref {
+        TypeRef::Array { element } => Ok(JavaConversionType::Array(Box::new(
+            resolve_model_type_ref(java, token, packs, file, element)?,
+        ))),
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable: _,
+        } => resolve_model_named_type(java, token, packs, file, name, arguments),
+        // Declared, type-parameter, reference, slice, fixed-length, map,
+        // channel and wildcard terms stay typed unsupported for this Java
+        // adapter rather than falling back to any element interpretation.
+        _ => Err(ConversionUnknown::UnsupportedConversion),
+    }
+}
+
+fn resolve_model_named_type(
+    java: &JavaAnalyzer,
+    token: crate::analyzer::QueryToken<'_>,
+    packs: Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    file: &ProjectFile,
+    name: &str,
+    arguments: &[TypeRef],
+) -> Result<JavaConversionType, ConversionUnknown> {
+    if !arguments.is_empty() {
+        return Err(ConversionUnknown::GenericSubstitution);
+    }
+    if let Some(primitive) = model_primitive_type(name) {
+        return Ok(JavaConversionType::Value(
+            ResolvedConversionType::JavaPrimitive(primitive),
+        ));
+    }
+
+    if java
+        .resolve_type_name_candidates_in_file(token, file, name)
+        .len()
+        > 1
+    {
+        return Err(ConversionUnknown::AmbiguousBinding);
+    }
+    match java.resolve_type_name_with_external(token, packs.clone(), file, name) {
+        Some(JavaTypeResolution::Source(unit)) => Ok(JavaConversionType::Value(
+            workspace_type_identity(java, unit).map_err(TypeResolutionFailure::target)?,
+        )),
+        Some(JavaTypeResolution::External(external)) => {
+            let identity = external_identity(java, packs.as_deref(), &external)
+                .ok_or(ConversionUnknown::UnresolvedTargetType)?;
+            Ok(JavaConversionType::Value(
+                ResolvedConversionType::External { identity },
+            ))
+        }
+        None => Err(ConversionUnknown::UnresolvedTargetType),
+    }
+}
+
+/// Classify one conversion between structured Java types. Identical array
+/// shapes recurse to their element pair, so the recorded fact carries the
+/// element identities with the proven kind; a shape mismatch stays a typed
+/// rejection and never falls back to element compatibility.
+fn classify_java_conversion(
+    source: JavaConversionType,
+    target: JavaConversionType,
+) -> Result<ArgumentTypeConversion, ConversionUnknown> {
+    match (source, target) {
+        (JavaConversionType::Array(source_element), JavaConversionType::Array(target_element)) => {
+            classify_java_conversion(*source_element, *target_element)
+        }
+        (JavaConversionType::Value(source), JavaConversionType::Value(target)) => {
+            classify_conversion(source, target)
+        }
+        _ => Err(ConversionUnknown::UnsupportedConversion),
+    }
 }
 
 fn classify_conversion(
@@ -597,6 +765,26 @@ fn root_of(node: Node<'_>) -> Node<'_> {
 mod tests {
     use super::*;
 
+    fn parse_java(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("java grammar loads");
+        parser.parse(source, None).expect("java source parses")
+    }
+
+    fn first_kind<'tree>(root: tree_sitter::Node<'tree>, kind: &str) -> tree_sitter::Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("no {kind} node in test source");
+    }
+
     fn external(fqn: &str, declaration_is_class: bool) -> ExternalConversionIdentity {
         ExternalConversionIdentity::from_provenance(
             fqn,
@@ -644,5 +832,132 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn lexical_array_shapes_are_read_structurally() {
+        let tree = parse_java("class A { void f(String[] args) {} }");
+        let root = tree.root_node();
+        let formal = first_kind(root, "formal_parameter");
+        let type_node = declared_type_node(formal).expect("formal declares a type");
+        let (element, dimensions) =
+            declared_java_type_shape(formal, type_node).expect("array shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 1);
+    }
+
+    #[test]
+    fn c_style_declarator_dimensions_are_structural() {
+        let tree = parse_java("class A { void f(String args[]) {} }");
+        let root = tree.root_node();
+        let formal = first_kind(root, "formal_parameter");
+        let type_node = declared_type_node(formal).expect("formal declares a type");
+        let (element, dimensions) =
+            declared_java_type_shape(formal, type_node).expect("array shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 1);
+    }
+
+    #[test]
+    fn nested_array_dimensions_count_each_axis() {
+        let tree = parse_java("class A { void m() { String[][] grid = null; } }");
+        let root = tree.root_node();
+        let declarator = first_kind(root, "variable_declarator");
+        let type_node = declared_type_node(declarator).expect("declarator declares a type");
+        let (element, dimensions) =
+            declared_java_type_shape(declarator, type_node).expect("array shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 2);
+    }
+
+    #[test]
+    fn non_array_declarations_have_zero_dimensions() {
+        let tree = parse_java("class A { void f(String command) {} }");
+        let root = tree.root_node();
+        let formal = first_kind(root, "formal_parameter");
+        let type_node = declared_type_node(formal).expect("formal declares a type");
+        let (element, dimensions) =
+            declared_java_type_shape(formal, type_node).expect("shape resolves");
+        assert_eq!(element.kind(), "type_identifier");
+        assert_eq!(dimensions, 0);
+    }
+
+    #[test]
+    fn spread_parameters_stay_typed_unsupported() {
+        let tree = parse_java("class A { void f(String... args) {} }");
+        let root = tree.root_node();
+        let spread = first_kind(root, "spread_parameter");
+        // A spread_parameter carries no `type` field; its first named child
+        // is the element type.
+        let type_node = spread.named_child(0).expect("spread declares a type");
+        let error = declared_java_type_shape(spread, type_node)
+            .expect_err("spread parameters stay unsupported");
+        assert_eq!(error, ConversionUnknown::UnsupportedConversion);
+    }
+
+    #[test]
+    fn array_java_type_wraps_one_layer_per_dimension() {
+        let element = ResolvedConversionType::External {
+            identity: external("java.lang.String", true),
+        };
+        let shape = array_java_type(element.clone(), 2);
+        assert_eq!(
+            shape,
+            JavaConversionType::Array(Box::new(JavaConversionType::Array(Box::new(
+                JavaConversionType::Value(element.clone())
+            ))))
+        );
+        assert_eq!(
+            array_java_type(element.clone(), 0),
+            JavaConversionType::Value(element)
+        );
+    }
+
+    #[test]
+    fn identical_array_shapes_prove_element_identity() {
+        let string = ResolvedConversionType::External {
+            identity: external("java.lang.String", true),
+        };
+        let array = JavaConversionType::Array(Box::new(JavaConversionType::Value(string.clone())));
+        let conversion =
+            classify_java_conversion(array.clone(), array).expect("identical arrays convert");
+        assert_eq!(conversion.kind, ConversionKind::JavaIdentity);
+        assert_eq!(conversion.source, string);
+        assert_eq!(conversion.target, string);
+    }
+
+    #[test]
+    fn array_actual_rejects_non_array_model_formal() {
+        let string = ResolvedConversionType::External {
+            identity: external("java.lang.String", true),
+        };
+        let array = JavaConversionType::Array(Box::new(JavaConversionType::Value(string.clone())));
+        let value = JavaConversionType::Value(string);
+        let error = classify_java_conversion(array, value)
+            .expect_err("an array actual never applies to a non-array formal");
+        assert_eq!(error, ConversionUnknown::UnsupportedConversion);
+    }
+
+    #[test]
+    fn array_shape_mismatch_is_typed_unsupported() {
+        let string = ResolvedConversionType::External {
+            identity: external("java.lang.String", true),
+        };
+        let one_dimension =
+            JavaConversionType::Array(Box::new(JavaConversionType::Value(string.clone())));
+        let two_dimensions = JavaConversionType::Array(Box::new(one_dimension.clone()));
+        let error = classify_java_conversion(two_dimensions, one_dimension)
+            .expect_err("shape mismatches never fall back to element compatibility");
+        assert_eq!(error, ConversionUnknown::UnsupportedConversion);
+    }
+
+    #[test]
+    fn value_widening_survives_the_java_type_layer() {
+        let conversion = classify_java_conversion(
+            JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Int)),
+            JavaConversionType::Value(ResolvedConversionType::JavaPrimitive(JavaPrimitive::Long)),
+        )
+        .expect("int to long widens");
+        assert_eq!(conversion.kind, ConversionKind::JavaPrimitiveWidening);
     }
 }

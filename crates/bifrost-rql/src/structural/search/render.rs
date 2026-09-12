@@ -3140,6 +3140,7 @@ pub(super) fn render_concurrent_access_conflict(
         ConcurrencyOpenReason::UnknownLocation => "unknown_location".to_owned(),
         ConcurrencyOpenReason::AliasSetTruncated => "alias_set_truncated".to_owned(),
         ConcurrencyOpenReason::UnknownOwnership => "unknown_ownership".to_owned(),
+        ConcurrencyOpenReason::UnknownPublication => "unknown_publication".to_owned(),
         ConcurrencyOpenReason::AmbiguousSynchronization => "ambiguous_synchronization".to_owned(),
         ConcurrencyOpenReason::UnsupportedSynchronization(protocol) => {
             format!("unsupported_synchronization:{protocol}")

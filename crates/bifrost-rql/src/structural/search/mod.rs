@@ -822,6 +822,9 @@ impl FieldWriteValue {
 #[derive(Debug, Clone)]
 struct CallShapeValue {
     report: Arc<crate::analyzer::usages::call_shape::CallShapeReport>,
+    /// The exact structural-fact source snapshot that produced `report`.
+    /// Some semantic-only internal shapes have no retained source.
+    source: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]

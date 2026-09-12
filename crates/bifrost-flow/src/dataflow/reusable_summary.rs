@@ -10,6 +10,7 @@ use std::fmt;
 use std::mem::{size_of, size_of_val};
 use std::ops::Range;
 use std::sync::Mutex;
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::analyzer::invalidation::{
     ArtifactVerdict, DerivedArtifactId, InvalidationReason, RetentionReason,
@@ -17,8 +18,8 @@ use crate::analyzer::invalidation::{
 use crate::analyzer::semantic::{
     DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint,
     EvidenceCompleteness, ExecutionTiming, LengthDelimitedDigest, ProofStatus, SemanticArtifactKey,
-    SemanticLocator, SemanticRole, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
-    is_unmaterialized_external_artifact_locator,
+    SemanticLocator, SemanticRole, StableDigest, SynchronizationOperation, WorkspaceMountId,
+    WorkspaceRelativePath, is_unmaterialized_external_artifact_locator,
 };
 use crate::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
@@ -179,11 +180,40 @@ define_summary_digest!(
     SummaryEventKey
 );
 
+define_summary_digest!(
+    /// Checkout-independent source identity of the procedure that owns a
+    /// witnessed concurrency event.
+    SummaryProcedureSourceKey
+);
+
+impl SummaryProcedureSourceKey {
+    pub fn from_locator(locator: &SemanticLocator) -> Self {
+        assert_eq!(
+            locator.role(),
+            SemanticRole::Procedure,
+            "summary concurrency source owner is a procedure"
+        );
+        let mut digest =
+            LengthDelimitedDigest::new(b"bifrost-production-concurrency-source-procedure-v1");
+        locator.push_stable_identity(&mut digest);
+        Self::from_digest(digest.finish())
+    }
+}
+
 impl SummaryEventKey {
     /// Derive the stable key shared by production projection and live replay
     /// for one source-backed concurrency event.
     pub fn from_concurrency_source(locator: &SemanticLocator, ordinal: usize) -> Self {
         let mut digest = LengthDelimitedDigest::new(b"bifrost-production-concurrency-effect-v2");
+        locator.push_stable_identity(&mut digest);
+        digest.push(&ordinal.to_le_bytes());
+        Self::from_digest(digest.finish())
+    }
+
+    /// Derive the stable key for one source call occurrence. The ordinal
+    /// distinguishes nested or synthetic calls that share a source mapping.
+    pub fn from_call_source(locator: &SemanticLocator, ordinal: usize) -> Self {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-production-call-effect-v2");
         locator.push_stable_identity(&mut digest);
         digest.push(&ordinal.to_le_bytes());
         Self::from_digest(digest.finish())
@@ -205,6 +235,16 @@ impl SummaryLocationKey {
         digest.push(locator.language().stable_label().as_bytes());
         digest.push(locator.role().stable_label().as_bytes());
         digest.push_anchor(locator.anchor());
+        Self::from_digest(digest.finish())
+    }
+
+    /// Name one allocation occurrence without conflating multiple semantic
+    /// allocations that share a source expression and locator.
+    pub fn from_allocation_source(locator: &SemanticLocator, ordinal: usize) -> Self {
+        let mut digest =
+            LengthDelimitedDigest::new(b"bifrost-production-concurrency-allocation-v1");
+        locator.push_stable_identity(&mut digest);
+        digest.push(&ordinal.to_le_bytes());
         Self::from_digest(digest.finish())
     }
 }
@@ -1227,11 +1267,32 @@ pub enum SummaryConcurrencyLockMode {
     Exclusive,
 }
 
+/// The equivalence relation a reviewed concurrency model applies to one
+/// stable subject. This survives composition separately from the subject's
+/// current boundary path: a modeled receiver can preserve backing identity
+/// even after that receiver is substituted with a caller parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencySubjectIdentity {
+    Value,
+    Backing,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SummaryConcurrencySynchronizationOperation {
     Acquire,
     Release,
     AcquireRelease,
+}
+
+impl From<SynchronizationOperation> for SummaryConcurrencySynchronizationOperation {
+    fn from(operation: SynchronizationOperation) -> Self {
+        match operation {
+            SynchronizationOperation::ChannelSend | SynchronizationOperation::ChannelClose => {
+                Self::Release
+            }
+            SynchronizationOperation::ChannelReceive => Self::Acquire,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1353,21 +1414,61 @@ pub enum SummaryConcurrencyTargetCoverage {
     Unknown,
 }
 
-/// A bounded source witness within the procedure artifact named by the
-/// surrounding summary identity.
+/// A bounded source witness within one exact source procedure.
+///
+/// The owner remains attached when an effect is composed into a caller
+/// summary. A consumer must reconnect that stable key to the matching live
+/// procedure before interpreting the byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SummaryConcurrencySourceWitness {
+    procedure: SummaryProcedureSourceKey,
     start_byte: u32,
     end_byte: u32,
 }
 
 impl SummaryConcurrencySourceWitness {
-    pub fn new(start_byte: u32, end_byte: u32) -> Self {
+    pub fn new(procedure: &SemanticLocator, start_byte: u32, end_byte: u32) -> Self {
         assert!(start_byte <= end_byte, "summary witness range is ordered");
         Self {
+            procedure: SummaryProcedureSourceKey::from_locator(procedure),
             start_byte,
             end_byte,
         }
+    }
+
+    pub const fn procedure(self) -> SummaryProcedureSourceKey {
+        self.procedure
+    }
+
+    pub const fn start_byte(self) -> u32 {
+        self.start_byte
+    }
+
+    pub const fn end_byte(self) -> u32 {
+        self.end_byte
+    }
+}
+
+/// A bounded source witness for one call occurrence in its owning procedure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryCallSourceWitness {
+    procedure: SummaryProcedureSourceKey,
+    start_byte: u32,
+    end_byte: u32,
+}
+
+impl SummaryCallSourceWitness {
+    pub fn new(procedure: &SemanticLocator, start_byte: u32, end_byte: u32) -> Self {
+        assert!(start_byte <= end_byte, "summary witness range is ordered");
+        Self {
+            procedure: SummaryProcedureSourceKey::from_locator(procedure),
+            start_byte,
+            end_byte,
+        }
+    }
+
+    pub const fn procedure(self) -> SummaryProcedureSourceKey {
+        self.procedure
     }
 
     pub const fn start_byte(self) -> u32 {
@@ -1404,8 +1505,15 @@ pub enum SummaryConcurrencyEffectKind {
     TaskJoin {
         group: SummaryConcurrencyAccessPath,
     },
+    /// Complete reviewed-model effect inventory for one source call. Effects
+    /// sharing this event may replace live model lookup only when their count
+    /// agrees with this certificate and every source witness rehydrates.
+    ModeledCall {
+        effect_count: u32,
+    },
     Lock {
         lock: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
         operation: SummaryConcurrencyLockOperation,
         mode: SummaryConcurrencyLockMode,
     },
@@ -1428,6 +1536,12 @@ pub enum SummaryConcurrencyEffectKind {
         operation: SummaryConcurrencyAtomicOperation,
     },
     Publish {
+        value: SummaryConcurrencyAccessPath,
+        destination: SummaryConcurrencyAccessPath,
+    },
+    /// The fresh allocation named by `value` has a proven complete, empty
+    /// publication inventory through every procedure exit.
+    Unpublished {
         value: SummaryConcurrencyAccessPath,
     },
     Escape {
@@ -1503,6 +1617,7 @@ pub enum SummaryEffectKey {
     Call {
         event: SummaryEventKey,
         callee: Box<SummaryDependencyKey>,
+        witness: Option<SummaryCallSourceWitness>,
     },
     Escape {
         event: SummaryEventKey,
@@ -2357,12 +2472,13 @@ impl SemanticProcedureSummary {
                 SummaryEffectKey::Call {
                     event: call_event,
                     callee: Box::new(next_dependency),
+                    witness: None,
                 },
                 invocation_evidence.clone(),
             ));
             for effect in &next.effects {
                 effects.push(SummaryEffect::new(
-                    effect.key.clone(),
+                    substitute_composed_concurrency_effect(&effect.key, boundaries),
                     invocation_evidence
                         .conjoin(&effect.evidence)
                         .map_err(SummaryCompositionError::InvalidResult)?,
@@ -2992,6 +3108,212 @@ impl SummaryBoundaryMap {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryPortSubstitutionError {
+    Unbound,
+    Ambiguous,
+}
+
+impl SummaryPortSubstitutionError {
+    const fn protocol(self) -> &'static str {
+        match self {
+            Self::Unbound => "unbound-summary-concurrency-port",
+            Self::Ambiguous => "ambiguous-summary-concurrency-port",
+        }
+    }
+}
+
+fn substitute_composed_concurrency_effect(
+    key: &SummaryEffectKey,
+    boundaries: &SummaryBoundaryMap,
+) -> SummaryEffectKey {
+    let SummaryEffectKey::Concurrency(effect) = key else {
+        return key.clone();
+    };
+    let kind = match substitute_concurrency_effect_kind(effect.kind(), boundaries) {
+        Ok(kind) => kind,
+        Err(error) => SummaryConcurrencyEffectKind::Unsupported {
+            protocol: error.protocol().into(),
+        },
+    };
+    SummaryEffectKey::Concurrency(SummaryConcurrencyEffect::new(
+        effect.event(),
+        kind,
+        effect.execution(),
+        effect.witness(),
+    ))
+}
+
+fn substitute_concurrency_effect_kind(
+    kind: &SummaryConcurrencyEffectKind,
+    boundaries: &SummaryBoundaryMap,
+) -> Result<SummaryConcurrencyEffectKind, SummaryPortSubstitutionError> {
+    let path = |path| substitute_concurrency_access_path(path, boundaries);
+    let port = |port| substitute_concurrency_port(port, boundaries);
+    Ok(match kind {
+        SummaryConcurrencyEffectKind::Unsupported { protocol } => {
+            SummaryConcurrencyEffectKind::Unsupported {
+                protocol: protocol.clone(),
+            }
+        }
+        SummaryConcurrencyEffectKind::Access {
+            location,
+            mode,
+            must_hold,
+        } => SummaryConcurrencyEffectKind::Access {
+            location: path(location)?,
+            mode: *mode,
+            must_hold: must_hold
+                .iter()
+                .map(|requirement| {
+                    Ok(SummaryConcurrencyLockRequirement::new(
+                        path(requirement.lock())?,
+                        requirement.mode(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, SummaryPortSubstitutionError>>()?
+                .into_boxed_slice(),
+        },
+        SummaryConcurrencyEffectKind::Allocation { location } => {
+            SummaryConcurrencyEffectKind::Allocation {
+                location: path(location)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::Alias { source, target } => {
+            SummaryConcurrencyEffectKind::Alias {
+                source: path(source)?,
+                target: path(target)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::TaskSpawn {
+            callable,
+            target_coverage,
+            group,
+        } => SummaryConcurrencyEffectKind::TaskSpawn {
+            callable: port(callable)?,
+            target_coverage: *target_coverage,
+            group: group.as_ref().map(path).transpose()?,
+        },
+        SummaryConcurrencyEffectKind::TaskJoin { group } => {
+            SummaryConcurrencyEffectKind::TaskJoin {
+                group: path(group)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::ModeledCall { effect_count } => {
+            SummaryConcurrencyEffectKind::ModeledCall {
+                effect_count: *effect_count,
+            }
+        }
+        SummaryConcurrencyEffectKind::Lock {
+            lock,
+            identity,
+            operation,
+            mode,
+        } => SummaryConcurrencyEffectKind::Lock {
+            lock: path(lock)?,
+            identity: *identity,
+            operation: *operation,
+            mode: *mode,
+        },
+        SummaryConcurrencyEffectKind::Synchronize { subject, operation } => {
+            SummaryConcurrencyEffectKind::Synchronize {
+                subject: path(subject)?,
+                operation: *operation,
+            }
+        }
+        SummaryConcurrencyEffectKind::WaitGroupAdd { group, delta } => {
+            SummaryConcurrencyEffectKind::WaitGroupAdd {
+                group: path(group)?,
+                delta: port(delta)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::WaitGroupDone { group } => {
+            SummaryConcurrencyEffectKind::WaitGroupDone {
+                group: path(group)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::WaitGroupWait { group } => {
+            SummaryConcurrencyEffectKind::WaitGroupWait {
+                group: path(group)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::Atomic {
+            location,
+            operation,
+        } => SummaryConcurrencyEffectKind::Atomic {
+            location: path(location)?,
+            operation: *operation,
+        },
+        SummaryConcurrencyEffectKind::Publish { value, destination } => {
+            SummaryConcurrencyEffectKind::Publish {
+                value: path(value)?,
+                destination: path(destination)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::Unpublished { value } => {
+            SummaryConcurrencyEffectKind::Unpublished {
+                value: path(value)?,
+            }
+        }
+        SummaryConcurrencyEffectKind::Escape { value } => SummaryConcurrencyEffectKind::Escape {
+            value: path(value)?,
+        },
+        SummaryConcurrencyEffectKind::OwnershipTransfer { value, destination } => {
+            SummaryConcurrencyEffectKind::OwnershipTransfer {
+                value: path(value)?,
+                destination: path(destination)?,
+            }
+        }
+    })
+}
+
+fn substitute_concurrency_access_path(
+    path: &SummaryConcurrencyAccessPath,
+    boundaries: &SummaryBoundaryMap,
+) -> Result<SummaryConcurrencyAccessPath, SummaryPortSubstitutionError> {
+    let root = substitute_concurrency_port(path.root(), boundaries)?;
+    let selectors = path
+        .selectors()
+        .iter()
+        .map(|selector| match selector {
+            SummaryConcurrencyAccessSelector::Index(port) => {
+                Ok(SummaryConcurrencyAccessSelector::Index(
+                    substitute_concurrency_port(port, boundaries)?,
+                ))
+            }
+            _ => Ok(selector.clone()),
+        })
+        .collect::<Result<Vec<_>, SummaryPortSubstitutionError>>()?;
+    Ok(SummaryConcurrencyAccessPath::new(root, selectors))
+}
+
+fn substitute_concurrency_port(
+    port: &SummaryPort,
+    boundaries: &SummaryBoundaryMap,
+) -> Result<SummaryPort, SummaryPortSubstitutionError> {
+    if matches!(
+        port,
+        SummaryPort::NormalReturn
+            | SummaryPort::IndexedNormalReturn(_)
+            | SummaryPort::ExceptionalReturn
+            | SummaryPort::Heap(_)
+    ) {
+        return Ok(port.clone());
+    }
+    let mut outputs = boundaries
+        .bindings()
+        .iter()
+        .filter(|binding| binding.input() == port)
+        .map(SummaryBoundaryBinding::output);
+    let output = outputs
+        .next()
+        .ok_or(SummaryPortSubstitutionError::Unbound)?;
+    if outputs.next().is_some() {
+        return Err(SummaryPortSubstitutionError::Ambiguous);
+    }
+    Ok(output.clone())
+}
+
 /// Compose two canonical relations using only explicitly supplied bindings.
 ///
 /// Exceptional exits from `first` remain exits of the composition. Normal
@@ -3229,6 +3551,51 @@ pub struct ProductionSemanticSummaryRepository {
     state: Mutex<CompleteSummaryRepository>,
 }
 
+/// One exact dependency closure recovered from retained complete summaries.
+///
+/// Rows and component ranges use the same dependency-first order required by
+/// [`ProductionSemanticSummaryRepository::publish_components`]. Stable summary
+/// rows are owned clones; no repository lock or generation-local handle escapes
+/// the lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedSemanticSummaryClosure {
+    summaries: Vec<SemanticProcedureSummary>,
+    components: Vec<Range<usize>>,
+}
+
+impl RetainedSemanticSummaryClosure {
+    pub fn summaries(&self) -> &[SemanticProcedureSummary] {
+        &self.summaries
+    }
+
+    pub fn components(&self) -> &[Range<usize>] {
+        &self.components
+    }
+
+    /// Announce only a closure a caller will consume. A failed acquisition is
+    /// a preflight miss followed by recomputation, so its temporary absence is
+    /// not a semantic input to the final result.
+    pub fn observe(&self, observer: &dyn SummaryReadObserver) {
+        for summary in &self.summaries {
+            observer.summary_read(
+                summary.key().identity(),
+                summary.public_content_digest(),
+                summary.dependencies(),
+            );
+        }
+    }
+
+    pub fn into_parts(self) -> (Vec<SemanticProcedureSummary>, Vec<Range<usize>>) {
+        (self.summaries, self.components)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum RetainedSummaryComponent {
+    Procedure(Box<ProcedureSummaryKey>),
+    Recursive(SummaryRecursiveGroupKey),
+}
+
 impl Default for ProductionSemanticSummaryRepository {
     fn default() -> Self {
         Self::with_limits(SummaryRepositoryLimits::default())
@@ -3257,6 +3624,21 @@ impl ProductionSemanticSummaryRepository {
         observer: &dyn SummaryReadObserver,
     ) -> Option<SemanticProcedureSummary> {
         self.state().get_observed(key, observer).cloned()
+    }
+
+    /// Recover the complete retained dependency closure for exact root
+    /// identities.
+    ///
+    /// A root identity deliberately omits its dependency fingerprint. The
+    /// repository can supply that missing part only when exactly one base
+    /// summary is retained for the identity. Historical ambiguity, a missing
+    /// exact dependency, or an incomplete recursive component rejects the
+    /// whole lookup; no arbitrary retained revision is selected.
+    pub fn complete_closure(
+        &self,
+        roots: &[ProcedureSummaryIdentity],
+    ) -> Option<RetainedSemanticSummaryClosure> {
+        self.state().complete_closure(roots)
     }
 
     /// The public content retained for one recorded summary identity.
@@ -3388,6 +3770,138 @@ impl CompleteSummaryRepository {
             retained.map_or(&[], |summary| summary.dependencies()),
         );
         retained
+    }
+
+    fn complete_closure(
+        &self,
+        roots: &[ProcedureSummaryIdentity],
+    ) -> Option<RetainedSemanticSummaryClosure> {
+        let mut root_identities = roots.to_vec();
+        root_identities.sort_unstable();
+        root_identities.dedup();
+        if root_identities.is_empty() {
+            return Some(RetainedSemanticSummaryClosure {
+                summaries: Vec::new(),
+                components: Vec::new(),
+            });
+        }
+
+        let base_key_for_identity =
+            |identity: &ProcedureSummaryIdentity,
+             recursive_group: Option<SummaryRecursiveGroupKey>| {
+                let mut matching = self.entries.keys().filter(|key| {
+                    key.identity() == identity
+                        && key.composition_root().is_none()
+                        && recursive_group.is_none_or(|group| key.recursive_group() == Some(group))
+                });
+                let key = matching.next()?.clone();
+                matching.next().is_none().then_some(key)
+            };
+
+        let mut pending = Vec::with_capacity(root_identities.len());
+        for identity in &root_identities {
+            pending.push(base_key_for_identity(identity, None)?);
+        }
+        let mut selected = HashMap::<ProcedureSummaryKey, SemanticProcedureSummary>::default();
+        while let Some(key) = pending.pop() {
+            if selected.contains_key(&key) {
+                continue;
+            }
+            let summary = self.entries.get(&key)?.clone();
+            for dependency in summary.dependencies() {
+                let dependency = match dependency {
+                    SummaryDependencyKey::Complete(key) => key.as_ref().clone(),
+                    SummaryDependencyKey::Recursive(identity) => {
+                        base_key_for_identity(identity, Some(summary.recursive_group()?))?
+                    }
+                };
+                pending.push(dependency);
+            }
+            selected.insert(key, summary);
+        }
+
+        let component_for = |key: &ProcedureSummaryKey| match key.recursive_group() {
+            Some(group) => RetainedSummaryComponent::Recursive(group),
+            None => RetainedSummaryComponent::Procedure(Box::new(key.clone())),
+        };
+        let mut members = HashMap::<RetainedSummaryComponent, Vec<ProcedureSummaryKey>>::default();
+        for key in selected.keys() {
+            members
+                .entry(component_for(key))
+                .or_default()
+                .push(key.clone());
+        }
+        for (component, keys) in &mut members {
+            keys.sort_unstable();
+            if let RetainedSummaryComponent::Recursive(group) = component
+                && keys.len() != group.member_count() as usize
+            {
+                return None;
+            }
+        }
+
+        let mut dependencies =
+            HashMap::<RetainedSummaryComponent, HashSet<RetainedSummaryComponent>>::default();
+        let mut dependents =
+            HashMap::<RetainedSummaryComponent, HashSet<RetainedSummaryComponent>>::default();
+        for (key, summary) in &selected {
+            let component = component_for(key);
+            dependencies.entry(component.clone()).or_default();
+            dependents.entry(component.clone()).or_default();
+            for dependency in summary.dependencies() {
+                let dependency_key = match dependency {
+                    SummaryDependencyKey::Complete(key) => key.as_ref(),
+                    SummaryDependencyKey::Recursive(identity) => {
+                        let group = summary.recursive_group()?;
+                        selected.keys().find(|key| {
+                            key.identity() == identity.as_ref()
+                                && key.recursive_group() == Some(group)
+                        })?
+                    }
+                };
+                let dependency_component = component_for(dependency_key);
+                if dependency_component == component {
+                    continue;
+                }
+                dependencies
+                    .entry(component.clone())
+                    .or_default()
+                    .insert(dependency_component.clone());
+                dependents
+                    .entry(dependency_component)
+                    .or_default()
+                    .insert(component.clone());
+            }
+        }
+
+        let mut remaining = dependencies
+            .iter()
+            .map(|(component, dependencies)| (component.clone(), dependencies.len()))
+            .collect::<HashMap<_, _>>();
+        let mut ready = remaining
+            .iter()
+            .filter_map(|(component, &count)| (count == 0).then_some(Reverse(component.clone())))
+            .collect::<BinaryHeap<_>>();
+        let mut summaries = Vec::with_capacity(selected.len());
+        let mut components = Vec::with_capacity(members.len());
+        while let Some(Reverse(component)) = ready.pop() {
+            let started = summaries.len();
+            for key in members.get(&component)? {
+                summaries.push(selected.get(key)?.clone());
+            }
+            components.push(started..summaries.len());
+            for dependent in dependents.get(&component).into_iter().flatten() {
+                let count = remaining.get_mut(dependent)?;
+                *count = count.checked_sub(1)?;
+                if *count == 0 {
+                    ready.push(Reverse(dependent.clone()));
+                }
+            }
+        }
+        (summaries.len() == selected.len()).then_some(RetainedSemanticSummaryClosure {
+            summaries,
+            components,
+        })
     }
 
     /// The content digest retained under `identity`'s public fingerprint, for
@@ -4367,9 +4881,13 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         | SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupDone { group }
         | SummaryConcurrencyEffectKind::WaitGroupWait { group } => path_bytes(group),
+        SummaryConcurrencyEffectKind::ModeledCall { .. } => 0,
         SummaryConcurrencyEffectKind::Lock { lock, .. } => path_bytes(lock),
         SummaryConcurrencyEffectKind::Synchronize { subject, .. } => path_bytes(subject),
-        SummaryConcurrencyEffectKind::Publish { value }
+        SummaryConcurrencyEffectKind::Publish { value, destination } => {
+            path_bytes(value).saturating_add(path_bytes(destination))
+        }
+        SummaryConcurrencyEffectKind::Unpublished { value }
         | SummaryConcurrencyEffectKind::Escape { value } => path_bytes(value),
         SummaryConcurrencyEffectKind::OwnershipTransfer { value, destination } => {
             path_bytes(value).saturating_add(path_bytes(destination))
