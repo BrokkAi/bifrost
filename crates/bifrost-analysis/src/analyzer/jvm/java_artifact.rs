@@ -584,6 +584,7 @@ pub(super) fn java_api_facts(
             .expect("parsed Java type receives an id")
             .clone();
         types.push(TypeFact {
+            ambient_use: None,
             id: type_id.clone(),
             name: declaration.name,
             type_kind: declaration.type_kind,
@@ -641,6 +642,7 @@ pub(super) fn java_api_facts(
                     .and_then(|signature| signature.returns.as_ref()),
             });
             members.push(MemberFact {
+                ambient_use: None,
                 id,
                 owner: type_id.clone(),
                 name: member.name,

@@ -67,6 +67,7 @@ pub(crate) use crate::analyzer::usages::reference_site::{
 use crate::analyzer::{QueryScope, QueryToken};
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+use serde::{Deserialize, Serialize};
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
 // `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
 // fleet's largest reach-in into a language's graph module -- inverts through the
@@ -656,6 +657,101 @@ impl DefinitionLookupStatus {
 pub struct DefinitionLookupDiagnostic {
     pub kind: String,
     pub message: String,
+    /// The indexing claim this diagnostic makes, in structured form: which
+    /// unit the resolver asserts is outside the workspace, and in which role.
+    /// `None` for diagnostics that make no indexing claim. Lets contract
+    /// consumers (the MCP property fuzzer's I4) test the claim without
+    /// parsing `message`.
+    pub claim: Option<UnindexedClaim>,
+}
+
+/// The indexing claim a failure diagnostic makes, in structured form.
+/// `subject` is the resolver's fully-qualified intent where one exists (the
+/// Java static-import site passes `butterknife.lint`, not the backticked
+/// `lint` the message shows); `role` names the kind of unit the subject was
+/// resolved as, which is the search bucket a contradicting in-workspace hit
+/// must come from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UnindexedClaim {
+    pub kind: UnindexedClaimKind,
+    /// The units the claim is about, exactly as the resolver means them (a
+    /// fully-qualified import path where one exists, e.g. `butterknife.lint`,
+    /// not the backticked terminal the message shows). Several entries when
+    /// one message claims a list (Go dot-imported packages).
+    pub subjects: Vec<String>,
+    pub role: ClaimSubjectRole,
+}
+
+/// What a failure claim asserts about indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnindexedClaimKind {
+    /// The subject itself is asserted to be outside the indexed workspace
+    /// (an import/include/using/crate boundary).
+    ExternalBoundary,
+    /// The name resolved to an external declaration (a builtin, an external
+    /// package's member); the workspace is not claimed to lack a declaration
+    /// of the name, so only an identity-exact in-workspace hit contradicts.
+    ResolvedExternal,
+    /// The resolver admits ignorance: the name may be declared by an owner
+    /// the workspace does not index (a supertype/base type). Any in-workspace
+    /// declaration of the name contradicts the claim.
+    UnindexedOwner,
+}
+
+/// The kind of unit a claim's subject was resolved as, named after the search
+/// bucket a contradicting in-workspace hit must come from. `Any` keeps the
+/// caller's prior behavior (a site whose subject could be more than one kind
+/// passes this, so an unsure site changes nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSubjectRole {
+    Module,
+    Type,
+    Member,
+    Any,
+}
+
+impl UnindexedClaim {
+    /// The subject itself is asserted to be outside the indexed workspace.
+    pub fn external_boundary(subject: impl Into<String>, role: ClaimSubjectRole) -> Self {
+        Self::external_boundary_many(vec![subject.into()], role)
+    }
+
+    /// The multi-subject form (one message claiming a list of externals).
+    pub fn external_boundary_many<S: AsRef<str>>(
+        subjects: impl IntoIterator<Item = S>,
+        role: ClaimSubjectRole,
+    ) -> Self {
+        Self {
+            kind: UnindexedClaimKind::ExternalBoundary,
+            subjects: subjects
+                .into_iter()
+                .map(|subject| subject.as_ref().to_string())
+                .collect(),
+            role,
+        }
+    }
+
+    /// The name resolved to an external declaration (a builtin, an external
+    /// package's member); the workspace is not claimed to lack the name.
+    pub fn resolved_external(subject: impl Into<String>, role: ClaimSubjectRole) -> Self {
+        Self {
+            kind: UnindexedClaimKind::ResolvedExternal,
+            subjects: vec![subject.into()],
+            role,
+        }
+    }
+
+    /// The resolver admits ignorance: the name may be declared by an owner
+    /// the workspace does not index (a supertype/base type).
+    pub fn unindexed_owner(subject: impl Into<String>, role: ClaimSubjectRole) -> Self {
+        Self {
+            kind: UnindexedClaimKind::UnindexedOwner,
+            subjects: vec![subject.into()],
+            role,
+        }
+    }
 }
 
 /// Historical forward evidence that stopped at an indexed selector prefix.
@@ -2609,6 +2705,7 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
         0 => (
             DefinitionLookupStatus::NoDefinition,
             vec![DefinitionLookupDiagnostic {
+                claim: None,
                 kind: "no_indexed_definition".to_string(),
                 message: "the reference resolved to no workspace definition".to_string(),
             }],
@@ -2617,6 +2714,7 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
         _ => (
             DefinitionLookupStatus::Ambiguous,
             vec![DefinitionLookupDiagnostic {
+                claim: None,
                 kind: "ambiguous_definition".to_string(),
                 message: "reference resolved to multiple workspace definitions".to_string(),
             }],
@@ -2656,6 +2754,7 @@ fn finalize_navigation_outcome(
         .retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
     if outcome.status == DefinitionLookupStatus::Ambiguous {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: "ambiguous_definition".to_string(),
             message: format!(
                 "{} navigation resolved to multiple workspace targets",
@@ -2736,6 +2835,7 @@ fn navigation_lookup_outcome(
             diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
             status = DefinitionLookupStatus::NoDefinition;
             diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
                 kind: match operation {
                     NavigationOperation::Declaration => "no_declaration",
                     NavigationOperation::Definition => "no_definition",
@@ -2761,6 +2861,7 @@ fn navigation_lookup_outcome(
         };
         if status == DefinitionLookupStatus::Ambiguous {
             diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
                 kind: "ambiguous_definition".to_string(),
                 message: format!(
                     "{} navigation resolved to multiple workspace targets",
@@ -2779,6 +2880,7 @@ fn navigation_lookup_outcome(
             .any(|diagnostic| diagnostic.kind == CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC)
     {
         diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC.to_string(),
             message: "one or more C/C++ candidates could not be classified from indexed syntax"
                 .to_string(),
@@ -2786,6 +2888,7 @@ fn navigation_lookup_outcome(
     }
     if unproven_link_unit {
         diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
             message:
                 "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
@@ -2794,6 +2897,7 @@ fn navigation_lookup_outcome(
     }
     if truncated {
         diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC.to_string(),
             message: format!(
                 "{} navigation targets were truncated to the request budget of {}",
@@ -2856,6 +2960,7 @@ fn ambiguous_candidates_outcome_of_kind(
         definitions: candidates,
         lexical_definition: None,
         diagnostics: vec![DefinitionLookupDiagnostic {
+            claim: None,
             kind: kind.into(),
             message: message.into(),
         }],
@@ -2890,11 +2995,12 @@ fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
 /// preceding enclosing-scope/workspace-namespace probe that returned early, or a
 /// predicate that already fused the workspace check. Each such call MUST carry a
 /// `// gated upstream:` comment naming where its guard lives.
-fn boundary_unchecked(message: String) -> DefinitionLookupOutcome {
-    diagnostic_outcome(
+fn boundary_unchecked(message: String, claim: UnindexedClaim) -> DefinitionLookupOutcome {
+    diagnostic_outcome_with_claim(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
         import_boundary_workspace_message(message),
+        Some(claim),
     )
 }
 
@@ -2917,9 +3023,13 @@ fn boundary_unchecked(message: String) -> DefinitionLookupOutcome {
 /// convention: a new emission site cannot skip it, because it cannot reach
 /// [`boundary_unchecked`] without supplying the closure. Where both guard
 /// families apply, callers `OR` them inside the closure.
+/// `claim` is the structured form of the indexing claim the boundary message
+/// makes (which unit is asserted external, and in which role), so contract
+/// consumers can test the claim without parsing the message.
 fn gated_boundary(
     workspace_internal: impl FnOnce() -> bool,
     boundary_message: String,
+    claim: UnindexedClaim,
     no_definition_kind: impl Into<String>,
     no_definition_message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
@@ -2927,7 +3037,7 @@ fn gated_boundary(
         no_definition(no_definition_kind, no_definition_message)
     } else {
         trace::record_boundary_gate();
-        boundary_unchecked(boundary_message)
+        boundary_unchecked(boundary_message, claim)
     }
 }
 
@@ -2999,6 +3109,7 @@ fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLookupO
         definitions: Vec::new(),
         lexical_definition: None,
         diagnostics: vec![DefinitionLookupDiagnostic {
+            claim: None,
             kind: "ambiguous_definition".to_string(),
             message: message.into(),
         }],
@@ -3016,6 +3127,17 @@ fn diagnostic_outcome(
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
+    diagnostic_outcome_with_claim(status, kind, message, None)
+}
+
+/// [`diagnostic_outcome`] plus the structured indexing claim (see
+/// [`DefinitionLookupDiagnostic::claim`]).
+fn diagnostic_outcome_with_claim(
+    status: DefinitionLookupStatus,
+    kind: impl Into<String>,
+    message: impl Into<String>,
+    claim: Option<UnindexedClaim>,
+) -> DefinitionLookupOutcome {
     debug_assert!(
         status != DefinitionLookupStatus::Ambiguous,
         "ambiguity is emitted by `ambiguous_candidates_outcome` or `ambiguous_without_candidates`"
@@ -3028,6 +3150,7 @@ fn diagnostic_outcome(
         diagnostics: vec![DefinitionLookupDiagnostic {
             kind: kind.into(),
             message: message.into(),
+            claim,
         }],
     }
 }

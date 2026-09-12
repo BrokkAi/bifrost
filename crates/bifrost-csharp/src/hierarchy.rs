@@ -7,14 +7,13 @@
 //! which declarations a type derives from, is language knowledge and lives
 //! here.
 
+use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{
     CSharpSource, logical_type_count, partial_type_parts, sort_dedup_type_candidates,
     sort_type_candidates, supertype_candidates, unique_logical_type, usage_partial_type_parts,
-    usage_visible_type_candidates, visible_type_candidates,
 };
 use crate::syntax::csharp_normalize_full_name;
 
@@ -31,35 +30,40 @@ enum AttributeTypeResolution {
     Ambiguous(Vec<CodeUnit>),
 }
 
+/// Whether `candidate` may be the class an attribute name denotes: proven to
+/// derive from `System.Attribute`, or with ancestry this workspace does not
+/// index. Only a declaration proven not to be an attribute class is rejected,
+/// so it cannot steal an attribute shorthand reference.
+pub fn attribute_class_is_applicable(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    candidate: &CodeUnit,
+) -> bool {
+    attribute_class_evidence(source, token, candidate, false)
+        != AttributeClassEvidence::DefinitelyNot
+}
+
 /// Resolve the two C# attribute-name forms, retaining only declarations
 /// that are proven to derive from `System.Attribute` or whose external
 /// ancestry is unavailable. Indexed declarations proven not to be
 /// attributes must not steal an attribute shorthand reference.
-pub fn attribute_type_candidates_with_ambiguity(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
+///
+/// `type_candidates` is the caller's whole C# type lookup for one spelling,
+/// not merely the file-keyed visible search: an attribute name is written
+/// inside a type declaration and names a type through the enclosing type and
+/// namespace scopes first (#3300).
+pub fn attribute_type_candidates_with_lookups<Candidates, Evidence>(
     names: &[String],
-) -> (Vec<CodeUnit>, bool) {
-    match attribute_type_resolution(source, token, file, names) {
-        AttributeTypeResolution::Unresolved => (Vec::new(), false),
-        AttributeTypeResolution::Resolved(candidates) => (candidates, false),
-        AttributeTypeResolution::Ambiguous(candidates) => (candidates, true),
-    }
-}
-
-pub fn attribute_type_candidates_with_lookups<Visible, Evidence>(
-    names: &[String],
-    visible_type_candidates: &mut Visible,
+    type_candidates: &mut Candidates,
     attribute_class_is_applicable: &mut Evidence,
 ) -> Option<(Vec<CodeUnit>, bool)>
 where
-    Visible: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
     Evidence: FnMut(&CodeUnit) -> Option<bool>,
 {
     match attribute_type_resolution_with_lookups(
         names,
-        visible_type_candidates,
+        type_candidates,
         attribute_class_is_applicable,
     )? {
         AttributeTypeResolution::Unresolved => Some((Vec::new(), false)),
@@ -68,66 +72,60 @@ where
     }
 }
 
-/// Inverse usage proof requires one logical attribute type. An ambiguous
-/// annotation is not a proven reference to every declaration it might name.
-pub fn usage_unambiguous_attribute_type_candidates(
+/// The usage side's [`attribute_class_is_applicable`], reading ancestry
+/// through the inverse pass's bounded definition lookups.
+pub fn usage_attribute_class_is_applicable(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
-    file: &ProjectFile,
+    candidate: &CodeUnit,
+) -> bool {
+    attribute_class_evidence(source, token, candidate, true)
+        != AttributeClassEvidence::DefinitelyNot
+}
+
+/// Inverse usage proof requires one logical attribute type. An ambiguous
+/// annotation is not a proven reference to every declaration it might name.
+///
+/// `type_candidates` is the caller's whole C# type lookup for one spelling,
+/// for the reason [`attribute_type_candidates_with_lookups`] states.
+pub fn usage_unambiguous_attribute_type_candidates<Candidates>(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     names: &[String],
-) -> Vec<CodeUnit> {
-    match attribute_type_resolution_inner(source, token, file, names, true) {
-        AttributeTypeResolution::Resolved(candidates) => candidates,
-        AttributeTypeResolution::Unresolved | AttributeTypeResolution::Ambiguous(_) => Vec::new(),
+    type_candidates: &mut Candidates,
+) -> Vec<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let mut attribute_class_is_applicable = |candidate: &CodeUnit| {
+        Some(usage_attribute_class_is_applicable(
+            source, token, candidate,
+        ))
+    };
+    match attribute_type_resolution_with_lookups(
+        names,
+        type_candidates,
+        &mut attribute_class_is_applicable,
+    ) {
+        Some(AttributeTypeResolution::Resolved(candidates)) => candidates,
+        Some(AttributeTypeResolution::Unresolved | AttributeTypeResolution::Ambiguous(_))
+        | None => Vec::new(),
     }
 }
 
-fn attribute_type_resolution(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
+fn attribute_type_resolution_with_lookups<Candidates, Evidence>(
     names: &[String],
-) -> AttributeTypeResolution {
-    attribute_type_resolution_inner(source, token, file, names, false)
-}
-
-fn attribute_type_resolution_inner(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    names: &[String],
-    usage: bool,
-) -> AttributeTypeResolution {
-    let mut visible = |name: &str| {
-        Some(if usage {
-            usage_visible_type_candidates(source, token, file, name)
-        } else {
-            visible_type_candidates(source, token, file, name)
-        })
-    };
-    let mut attribute_class_is_applicable = |candidate: &CodeUnit| {
-        Some(
-            attribute_class_evidence(source, token, candidate, usage)
-                != AttributeClassEvidence::DefinitelyNot,
-        )
-    };
-    attribute_type_resolution_with_lookups(names, &mut visible, &mut attribute_class_is_applicable)
-        .unwrap_or(AttributeTypeResolution::Unresolved)
-}
-
-fn attribute_type_resolution_with_lookups<Visible, Evidence>(
-    names: &[String],
-    visible_type_candidates: &mut Visible,
+    type_candidates: &mut Candidates,
     attribute_class_is_applicable: &mut Evidence,
 ) -> Option<AttributeTypeResolution>
 where
-    Visible: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
     Evidence: FnMut(&CodeUnit) -> Option<bool>,
 {
     let mut candidates = Vec::new();
     let mut successful_spellings = 0usize;
     for name in names {
-        let visible = visible_type_candidates(name)?;
+        let visible = type_candidates(name)?;
         // C# suppresses errors from each of the two attribute spellings
         // independently. An ambiguous spelling contributes no candidate;
         // the other spelling can still resolve uniquely.

@@ -1820,10 +1820,15 @@ pub(super) fn resolve_scan_usages_target(
     // fix for #1231: without it, a short-name coincidence elsewhere in the
     // matching_units pool could out-narrow (or otherwise interfere with) a
     // genuine exact-selector match at the same location.
+    // The display spelling is accepted here, not printed: it is a spelling a
+    // reader plausibly types, and this check asks what the caller may have
+    // meant, not which selector a result offers. `display_symbol_for_target`
+    // answers the printing question instead and keeps index decoration when
+    // the stripped spelling belongs to a sibling (#3302).
     let selector_matches_exact_form = |unit: &CodeUnit, symbol: &str| {
         unit.fq_name() == symbol
             || definition_selector(unit) == symbol
-            || display_symbol_for_target(unit) == symbol
+            || display_symbol_name(language_for_target(unit), unit.fq_name_str()) == symbol
     };
     // Members' short_name is owner-qualified (`Widget.helper`), so bare-name
     // acceptance also matches the terminal segment: the location already pins
@@ -2813,7 +2818,7 @@ fn scan_usages_backend_on_pool(
         let resolved_definition = resolved_usage_definition(analyzer, &overloads);
         let target_is_method = overloads
             .iter()
-            .any(|unit| unit.is_function() && display_parent_symbol_for_target(unit).is_some());
+            .any(|unit| unit.is_function() && parent_fq_name_for_target(unit).is_some());
         let interruption_reason = context.interruption_reason();
         let mut incomplete_reason = if interrupted {
             Some(interruption_reason)

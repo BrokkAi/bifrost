@@ -1105,6 +1105,7 @@ fn authored_exact_pack() -> AuthoredSemanticModelPack {
     };
     relations.clear();
     types.push(TypeFact {
+        ambient_use: None,
         id: "type.java.lang.string".to_owned(),
         name: "java.lang.String".to_owned(),
         type_kind: TypeKind::Class,

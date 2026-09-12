@@ -206,6 +206,10 @@ impl fmt::Display for UnknownReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassSeed {
     Class(ClassIdentity),
+    /// Several named classes are possible and no other runtime class is.
+    /// Construction canonicalizes the class list; expansion emits every class
+    /// in that order.
+    Classes(Box<[ClassIdentity]>),
     /// The named class is possible, but other runtime classes may also flow.
     /// Expansion always emits the class first and the open remainder second.
     ClassWithOpenBound(ClassIdentity),
@@ -219,15 +223,12 @@ pub enum ClassSeed {
 }
 
 impl ClassSeed {
+    pub fn classes(classes: impl IntoIterator<Item = ClassIdentity>) -> Self {
+        Self::Classes(canonical_class_list(classes))
+    }
+
     pub fn classes_with_open_bound(classes: impl IntoIterator<Item = ClassIdentity>) -> Self {
-        let mut classes = classes.into_iter().collect::<Vec<_>>();
-        classes.sort_by(class_identity_order);
-        classes.dedup();
-        assert!(
-            !classes.is_empty(),
-            "an open multi-class seed names at least one class"
-        );
-        Self::ClassesWithOpenBound(classes.into_boxed_slice())
+        Self::ClassesWithOpenBound(canonical_class_list(classes))
     }
 
     /// Expand an adapter answer into the language-neutral facts propagated by
@@ -236,31 +237,42 @@ impl ClassSeed {
     pub fn into_atoms(self) -> impl Iterator<Item = ClassAtom> {
         let atoms = match self {
             Self::Class(class) => vec![ClassAtom::Class(class)],
+            Self::Classes(classes) => canonical_class_list(classes.into_vec())
+                .into_vec()
+                .into_iter()
+                .map(ClassAtom::Class)
+                .collect(),
             Self::ClassWithOpenBound(class) => vec![
                 ClassAtom::Class(class),
                 ClassAtom::Unknown(UnknownReason::OpenTypeBound),
             ],
-            Self::ClassesWithOpenBound(classes) => {
-                let mut classes = classes.into_vec();
-                classes.sort_by(class_identity_order);
-                classes.dedup();
-                assert!(
-                    !classes.is_empty(),
-                    "an open multi-class seed names at least one class"
-                );
-                classes
-                    .into_iter()
-                    .map(ClassAtom::Class)
-                    .chain(std::iter::once(ClassAtom::Unknown(
-                        UnknownReason::OpenTypeBound,
-                    )))
-                    .collect()
-            }
+            Self::ClassesWithOpenBound(classes) => canonical_class_list(classes.into_vec())
+                .into_vec()
+                .into_iter()
+                .map(ClassAtom::Class)
+                .chain(std::iter::once(ClassAtom::Unknown(
+                    UnknownReason::OpenTypeBound,
+                )))
+                .collect(),
             Self::Unknown(reason) => vec![ClassAtom::Unknown(reason)],
             Self::NotApplicable => Vec::new(),
         };
         atoms.into_iter()
     }
+}
+
+/// The one spelling of a multi-class seed's class list: sorted, deduplicated,
+/// and non-empty. Seed identity feeds reusable-summary event identity, so two
+/// adapters that name the same classes must produce the same list.
+fn canonical_class_list(classes: impl IntoIterator<Item = ClassIdentity>) -> Box<[ClassIdentity]> {
+    let mut classes = classes.into_iter().collect::<Vec<_>>();
+    classes.sort_by(class_identity_order);
+    classes.dedup();
+    assert!(
+        !classes.is_empty(),
+        "a multi-class seed names at least one class"
+    );
+    classes.into_boxed_slice()
 }
 
 pub(crate) type ExternalClassCache =
@@ -476,6 +488,10 @@ pub enum SourceSiteKind {
     ContainerLiteral,
     DeclaredParameter,
     RootReceiver,
+    /// A guard arm proved this class; no syntax here produced the value. A
+    /// finding witness prefers a site that did, so this kind ranks last when
+    /// one class has more than one origin.
+    NarrowingGuard,
     /// Unclassified origin syntax; independent of whether its class is known.
     Unknown,
 }
@@ -781,6 +797,8 @@ fn source_site_kind_tag(kind: SourceSiteKind) -> u8 {
         SourceSiteKind::DeclaredParameter => 3,
         SourceSiteKind::RootReceiver => 4,
         SourceSiteKind::Unknown => 5,
+        // Appended: the tags of the kinds above are persisted.
+        SourceSiteKind::NarrowingGuard => 6,
     }
 }
 
@@ -1087,6 +1105,29 @@ pub trait TypeFlowAdapter: Send + Sync {
         vec![NarrowingVerdict::Unknown; atoms.len()]
     }
 
+    /// What the guard's true arm proves about a value the class-set domain
+    /// could not name.
+    ///
+    /// [`narrowing_verdicts`](Self::narrowing_verdicts) classifies candidates
+    /// the engine already named, and an `Unknown` atom is not a class: it has
+    /// no hierarchy to test, so narrowing alone carries a remainder into an
+    /// arm that has already established what the value is. A predicate that
+    /// does establish it answers here, in the same seed vocabulary the other
+    /// adapter answers use, and the engine replaces the remainder on the true
+    /// arm with this seed. Answer the exact class set only when the check is
+    /// closed; a check a subclass also satisfies names its classes with an
+    /// open bound, because the subclass's member surface is not the named
+    /// class's. The default, `NotApplicable`, says the true arm proves no
+    /// class and the remainder is carried through unchanged.
+    fn guard_proves_classes(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _guard: &GuardFact,
+    ) -> ClassSeed {
+        ClassSeed::NotApplicable
+    }
+
     /// Every value [`call_guard_narrowing`](Self::call_guard_narrowing) and
     /// [`normal_return_type_constraints`](Self::normal_return_type_constraints)
     /// can name as a subject in `procedure`.
@@ -1244,9 +1285,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "an open multi-class seed names at least one class")]
+    #[should_panic(expected = "a multi-class seed names at least one class")]
     fn multi_class_open_seed_rejects_an_empty_class_set() {
         ClassSeed::classes_with_open_bound(std::iter::empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "a multi-class seed names at least one class")]
+    fn multi_class_closed_seed_rejects_an_empty_class_set() {
+        ClassSeed::classes(std::iter::empty());
     }
 
     #[test]

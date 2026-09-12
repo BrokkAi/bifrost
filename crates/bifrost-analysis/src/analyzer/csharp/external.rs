@@ -1132,6 +1132,7 @@ impl CSharpAssemblyPackProducer {
                 }
             }
             types.push(TypeFact {
+                ambient_use: None,
                 id: type_id.clone(),
                 name: ty.fqn.clone(),
                 type_kind: semantic_type_kind(ty.kind),
@@ -1229,6 +1230,7 @@ impl CSharpAssemblyPackProducer {
                     return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
+                    ambient_use: None,
                     id,
                     owner: type_id.clone(),
                     name: member.name.clone(),

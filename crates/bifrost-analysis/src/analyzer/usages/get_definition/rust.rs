@@ -45,9 +45,10 @@ use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use std::cell::RefCell;
 
 use super::{
-    DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
-    MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND, MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND,
-    MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND, MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+    ClaimSubjectRole, DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND, MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
+    MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND, MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND,
+    MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND, UnindexedClaim,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1275,14 +1276,18 @@ fn resolve_rust_unscoped(
                     // gated upstream: the enclosing-scope member fallback and the
                     // current-module candidates just above are the workspace
                     // check; only a genuinely-unindexed import reaches here.
-                    return boundary_unchecked(format!(
-                        "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
-                    ));
+                    return boundary_unchecked(
+                        format!(
+                            "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
+                        ),
+                        UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Any),
+                    );
                 }
                 RustVisibleImportResolution::GlobBoundButUnindexed => {
-                    return boundary_unchecked(format!(
-                        "`{reference}` is inherited from an unindexed Rust import"
-                    ));
+                    return boundary_unchecked(
+                        format!("`{reference}` is inherited from an unindexed Rust import"),
+                        UnindexedClaim::unindexed_owner(reference, ClaimSubjectRole::Any),
+                    );
                 }
                 RustVisibleImportResolution::Unbound => {
                     // A bare name is first resolved in its physical module. The
@@ -1368,9 +1373,12 @@ fn resolve_rust_unscoped(
         {
             return candidates_outcome(vec![unit]);
         }
-        return boundary_unchecked(format!(
-            "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
-        ));
+        return boundary_unchecked(
+            format!(
+                "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Any),
+        );
     }
     if scoped_lookup_failed {
         return no_definition(
@@ -1936,15 +1944,17 @@ fn rust_collect_macro_units(
                             format!(
                                 "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
                             ),
+                            UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
                         )));
                     }
                     same_package
                 }
             }
             RustVisibleImportResolution::GlobBoundButUnindexed => {
-                return MacroUnitResolution::Boundary(Box::new(boundary_unchecked(format!(
-                    "Rust macro `{name}` is inherited from an unindexed import"
-                ))));
+                return MacroUnitResolution::Boundary(Box::new(boundary_unchecked(
+                    format!("Rust macro `{name}` is inherited from an unindexed import"),
+                    UnindexedClaim::unindexed_owner(name, ClaimSubjectRole::Any),
+                )));
             }
             RustVisibleImportResolution::Unbound => rust_current_module_candidates(
                 analyzer,
@@ -2217,6 +2227,7 @@ fn rust_macro_argument_outcome(
             format!(
                 "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
             ),
+            UnindexedClaim::external_boundary(macro_name.clone(), ClaimSubjectRole::Any),
             MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
             format!(
                 "a Rust macro named `{macro_name}` is indexed in this workspace, but matcher evidence is unavailable"
@@ -2293,6 +2304,7 @@ fn rust_macro_argument_outcome(
             format!(
                 "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
             ),
+            UnindexedClaim::external_boundary(macro_name.clone(), ClaimSubjectRole::Any),
             MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
             format!(
                 "Rust macro `{macro_name}` is indexed in this workspace, but has no replayable `macro_rules!` matcher"
@@ -2442,6 +2454,10 @@ fn argument_boundary_outcome(
         outcome.diagnostics.insert(
             0,
             DefinitionLookupDiagnostic {
+                claim: Some(UnindexedClaim::external_boundary(
+                    macro_name,
+                    ClaimSubjectRole::Any,
+                )),
                 kind: "unresolvable_import_boundary".to_string(),
                 message: format!(
                     "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
@@ -2527,6 +2543,7 @@ fn rust_matcher_namespace_outcome(
         ),
     };
     outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        claim: None,
         kind: MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND.to_string(),
         message: format!(
             "macro_fqn={} arm={} metavar=${} fragment={}",
@@ -2656,14 +2673,18 @@ fn rust_resolve_matcher_bare_name(
             }
             // gated upstream: matcher-proven namespace already consulted the
             // current module and the value-namespace class view of the import.
-            return boundary_unchecked(format!(
-                "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
-            ));
+            return boundary_unchecked(
+                format!(
+                    "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
+                ),
+                UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Any),
+            );
         }
         RustVisibleImportResolution::GlobBoundButUnindexed => {
-            return boundary_unchecked(format!(
-                "`{reference}` is inherited from an unindexed Rust import"
-            ));
+            return boundary_unchecked(
+                format!("`{reference}` is inherited from an unindexed Rust import"),
+                UnindexedClaim::unindexed_owner(reference, ClaimSubjectRole::Any),
+            );
         }
         RustVisibleImportResolution::Unbound => {}
     }
@@ -4785,7 +4806,10 @@ fn rust_focused_terminal_scoped_declaration_outcome(
                     "Rust owner `{owner}` is explicitly imported across a crate/module boundary that is not indexed"
                 )
             };
-            return Some(boundary_unchecked(message));
+            return Some(boundary_unchecked(
+                message,
+                UnindexedClaim::external_boundary(owner, ClaimSubjectRole::Any),
+            ));
         }
     }
     sort_units(&mut candidates);
@@ -5456,6 +5480,7 @@ fn rust_focused_prefix_resolution_outcome(
                     format!(
                         "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
                     ),
+                    UnindexedClaim::external_boundary(focused_text, ClaimSubjectRole::Module),
                     "workspace_module_namespace",
                     format!(
                         "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
@@ -5468,6 +5493,7 @@ fn rust_focused_prefix_resolution_outcome(
                     format!(
                         "focused Rust owner `{focused_text}` is inherited from an unindexed import"
                     ),
+                    UnindexedClaim::unindexed_owner(focused_text, ClaimSubjectRole::Any),
                     "workspace_module_namespace",
                     format!(
                         "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
@@ -5528,9 +5554,12 @@ fn rust_focused_prefix_resolution_outcome(
             // gated upstream: reached only inside a resolved Cargo library route
             // whose crate root the workspace does not index — the route
             // resolution itself is the workspace check.
-            return boundary_unchecked(format!(
-                "focused Rust owner `{focused_text}` resolves through Cargo but its crate root is not indexed"
-            ));
+            return boundary_unchecked(
+                format!(
+                    "focused Rust owner `{focused_text}` resolves through Cargo but its crate root is not indexed"
+                ),
+                UnindexedClaim::external_boundary(focused_text, ClaimSubjectRole::Module),
+            );
         }
     }
 
@@ -5601,9 +5630,12 @@ fn rust_focused_prefix_resolution_outcome(
         || rust_extern_prelude_root(rust, token, support, file, refs, root, root_name)
     {
         if root_availability == Some(RustOwnerRootAvailability::CargoBoundary) {
-            return boundary_unchecked(format!(
-                "focused Rust path segment `{focused_text}` resolves through a declared Cargo dependency whose crate root is not indexed"
-            ));
+            return boundary_unchecked(
+                format!(
+                    "focused Rust path segment `{focused_text}` resolves through a declared Cargo dependency whose crate root is not indexed"
+                ),
+                UnindexedClaim::external_boundary(focused_text, ClaimSubjectRole::Module),
+            );
         }
         // Before a confident boundary claim, resolve the focused segment against
         // the enclosing type/trait scope: `Self::TransactionManager::run` names
@@ -5640,6 +5672,7 @@ fn rust_focused_prefix_resolution_outcome(
             format!(
                 "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
             ),
+            UnindexedClaim::external_boundary(focused_text, ClaimSubjectRole::Module),
             "workspace_module_namespace",
             format!(
                 "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"

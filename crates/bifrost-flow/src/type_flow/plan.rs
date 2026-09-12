@@ -505,21 +505,23 @@ fn guard_transfers(
     cancellation: &CancellationToken,
 ) -> Result<Vec<ValueFlowEdgeKillSpec>, TypeFlowPlanError> {
     let mut sources_by_class = HashMap::<ClassIdentity, Vec<ValueFlowEventKey>>::default();
+    // Every source the domain could not name. A verdict classifies a class
+    // against the guard's predicate, and an Unknown has no hierarchy to test,
+    // so narrowing alone carries a remainder straight into an arm that has
+    // already established what the value is. The guards that do establish it
+    // answer for these sources instead (issue #3296). The list grows with the
+    // remainders the loop installs, so a later guard sees an earlier guard's.
+    let mut unknown_sources = Vec::<ValueFlowEventKey>::new();
     for (source, atom, _) in &tables.sources {
-        let ClassAtom::Class(atom) = atom else {
-            continue;
-        };
-        sources_by_class
-            .entry(atom.clone())
-            .or_default()
-            .push(source.key().clone());
+        match atom {
+            ClassAtom::Class(class) => sources_by_class
+                .entry(class.clone())
+                .or_default()
+                .push(source.key().clone()),
+            ClassAtom::Unknown(_) => unknown_sources.push(source.key().clone()),
+        }
     }
     let mut kills = Vec::new();
-    let class_sources = sources_by_class.iter().collect::<Vec<_>>();
-    let classes = class_sources
-        .iter()
-        .map(|(class, _)| *class)
-        .collect::<Vec<_>>();
     let member_lookup = |class: &ClassIdentity, member: &str| {
         narrowing_member_lookup(workspace, adapter, field_slots, class, member)
     };
@@ -530,9 +532,19 @@ fn guard_transfers(
         };
         let mut joins = None;
         for (guard_index, guard) in procedure.semantics().guard_facts().iter().enumerate() {
-            if classes.is_empty() || (guard.true_edge.is_none() && guard.false_edge.is_none()) {
+            if (sources_by_class.is_empty() && unknown_sources.is_empty())
+                || (guard.true_edge.is_none() && guard.false_edge.is_none())
+            {
                 continue;
             }
+            // The candidates this guard classifies, including the classes an
+            // earlier guard's arm proved: those are ordinary plan sources and
+            // a later guard must be able to drop them.
+            let class_sources = sources_by_class.iter().collect::<Vec<_>>();
+            let classes = class_sources
+                .iter()
+                .map(|(class, _)| *class)
+                .collect::<Vec<_>>();
             let (binding, call_verdicts) = match guard.predicate {
                 GuardPredicate::InstanceOf { .. }
                 | GuardPredicate::ExactClass { .. }
@@ -580,7 +592,79 @@ fn guard_transfers(
                         .extend(atom_sources.iter().cloned());
                 }
             }
-            if guard.true_edge.is_some() && !remainders.is_empty() {
+            let mut remainders = remainders.into_iter().collect::<Vec<_>>();
+            remainders.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let mut true_arm_sources = remainders
+                .into_iter()
+                .map(|(reason, inputs)| (ClassAtom::Unknown(reason), inputs))
+                .collect::<Vec<_>>();
+            // What this arm proves about the values the domain could not
+            // name. A guard that establishes the subject's class states the
+            // atoms the remainder becomes there; every other guard answers
+            // with no atoms and the remainder is carried through unchanged.
+            let proved = if unknown_sources.is_empty() {
+                Vec::new()
+            } else {
+                adapter
+                    .guard_proves_classes(workspace, procedure, guard)
+                    .into_atoms()
+                    .collect::<Vec<_>>()
+            };
+            let proved_replaces_remainder = !proved.is_empty();
+            true_arm_sources.extend(
+                proved
+                    .into_iter()
+                    .map(|atom| (atom, unknown_sources.clone())),
+            );
+            // Every kill this guard emits reads the candidate tables as they
+            // reached it, so they are all emitted before the arm's own
+            // sources are installed: a guard never drops what it just proved.
+            for (dropped_verdict, edge_id) in [
+                (NarrowingVerdict::Drop, guard.true_edge),
+                (NarrowingVerdict::Keep, guard.false_edge),
+            ] {
+                let Some(edge) = edge_id.and_then(|id| procedure.semantics().control_edge(id))
+                else {
+                    continue;
+                };
+                let mut dropped = Vec::new();
+                for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
+                    if *verdict == dropped_verdict {
+                        dropped.extend(atom_sources.iter().cloned());
+                    }
+                }
+                if !dropped.is_empty() {
+                    kills.push(ValueFlowEdgeKillSpec {
+                        point: procedure
+                            .point_handle(guard.point)
+                            .expect("a validated guard point remains live"),
+                        target: edge.target_point,
+                        kind: edge.kind,
+                        carrier: carrier.clone(),
+                        sources: dropped,
+                    });
+                }
+            }
+            if proved_replaces_remainder
+                && let Some(edge) = guard
+                    .true_edge
+                    .and_then(|id| procedure.semantics().control_edge(id))
+            {
+                // The arm establishes what the value is, so the remainder
+                // that reached the guard states nothing further about it
+                // there. Only this binding loses it: a copy taken before the
+                // guard keeps its own.
+                kills.push(ValueFlowEdgeKillSpec {
+                    point: procedure
+                        .point_handle(guard.point)
+                        .expect("a validated guard point remains live"),
+                    target: edge.target_point,
+                    kind: edge.kind,
+                    carrier: carrier.clone(),
+                    sources: unknown_sources.clone(),
+                });
+            }
+            if guard.true_edge.is_some() && !true_arm_sources.is_empty() {
                 let semantics = procedure.semantics();
                 if joins.is_none() {
                     joins = Some(
@@ -601,17 +685,24 @@ fn guard_transfers(
                 let point = procedure
                     .point_handle(guard.point)
                     .expect("a retained guard point is live");
-                let mut remainders = remainders.into_iter().collect::<Vec<_>>();
-                remainders.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-                for (reason, inputs) in remainders {
+                for (atom, inputs) in true_arm_sources {
                     let site = source_site(
                         workspace,
                         procedure,
                         mapping_span(procedure, guard.source),
-                        SourceSiteKind::Unknown,
+                        source_kind_for_atom(&atom, SourceSiteKind::NarrowingGuard),
                     )
                     .expect("a workspace guard retains its source file");
                     let key = tables.event_key(&point, ValueFlowEventKind::Source);
+                    // The arm's own source is an ordinary plan source: a
+                    // later guard classifies it like any other.
+                    match &atom {
+                        ClassAtom::Class(class) => sources_by_class
+                            .entry(class.clone())
+                            .or_default()
+                            .push(key.clone()),
+                        ClassAtom::Unknown(_) => unknown_sources.push(key.clone()),
+                    }
                     tables.sources.push((
                         ValueFlowSourceSpec::new(
                             key.clone(),
@@ -622,7 +713,7 @@ fn guard_transfers(
                             EvidenceCompleteness::Complete,
                         )
                         .when_sources_reach(inputs),
-                        ClassAtom::Unknown(reason),
+                        atom,
                         site,
                     ));
                     // The source requires an undecidable candidate on the
@@ -660,32 +751,6 @@ fn guard_transfers(
                             });
                         }
                     }
-                }
-            }
-            for (dropped_verdict, edge_id) in [
-                (NarrowingVerdict::Drop, guard.true_edge),
-                (NarrowingVerdict::Keep, guard.false_edge),
-            ] {
-                let Some(edge) = edge_id.and_then(|id| procedure.semantics().control_edge(id))
-                else {
-                    continue;
-                };
-                let mut dropped = Vec::new();
-                for ((_, atom_sources), verdict) in class_sources.iter().zip(&verdicts) {
-                    if *verdict == dropped_verdict {
-                        dropped.extend(atom_sources.iter().cloned());
-                    }
-                }
-                if !dropped.is_empty() {
-                    kills.push(ValueFlowEdgeKillSpec {
-                        point: procedure
-                            .point_handle(guard.point)
-                            .expect("a validated guard point remains live"),
-                        target: edge.target_point,
-                        kind: edge.kind,
-                        carrier: carrier.clone(),
-                        sources: dropped,
-                    });
                 }
             }
         }

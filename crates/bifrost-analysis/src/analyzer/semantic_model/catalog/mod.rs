@@ -57,7 +57,11 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 18: the Rust rustdoc producer emits keyed `std::collections::HashMap`
 /// collection-flow facts. Warm generated packs predate those contracts.
 /// 19: native compilation preserves and validates deferred-yield contracts.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 19;
+/// 20: schema version three, and the Scala source-JAR producer classifies every
+/// declaration it emits with an `ambient_use` role. Warm generated packs carry
+/// no such role, and absence there means "unreviewed", so a stale pack would
+/// silently withhold every Scala unused-import proof.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 20;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

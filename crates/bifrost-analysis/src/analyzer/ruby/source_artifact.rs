@@ -272,6 +272,7 @@ fn project_constant_assignment(
         returns: Some(return_type.clone()),
     };
     members.push(MemberFact {
+        ambient_use: None,
         id: member_declaration_id(MemberIdentity {
             owner_id,
             kind: MemberKind::Constant,
@@ -377,6 +378,7 @@ fn project_type<'tree>(
         }
     }
     types.push(TypeFact {
+        ambient_use: None,
         id: owner_id.clone(),
         name,
         type_kind: if work.node.kind() == "module" {
@@ -467,6 +469,7 @@ fn project_method(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        ambient_use: None,
         id,
         owner: owner_id.to_owned(),
         name: name.to_owned(),
@@ -574,6 +577,7 @@ fn project_call(
                 return_type: signature.returns.as_ref(),
             });
             members.push(MemberFact {
+                ambient_use: None,
                 id,
                 owner: owner_id.to_owned(),
                 name: name.clone(),

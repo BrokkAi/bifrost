@@ -315,6 +315,7 @@ fn import_semantic_document(
             .cloned()
             .unwrap_or_else(|| symbol.id.clone());
         types.push(TypeFact {
+            ambient_use: None,
             id: id.clone(),
             name: name.clone(),
             type_kind: if declaration.category == CsmiDeclarationCategory::TypeAlias {
@@ -397,6 +398,7 @@ fn import_semantic_document(
         });
         member_ids.insert(declaration.symbol.clone(), member_id.clone());
         members.push(MemberFact {
+            ambient_use: None,
             id: member_id,
             owner: owner_id,
             name: member_name,

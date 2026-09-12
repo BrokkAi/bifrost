@@ -17,7 +17,7 @@ pub use brokk_bifrost_core::analyzer::common::{
 // it lives.
 pub(crate) use brokk_bifrost_rust::declarations::RUST_IDENTIFIER_SIGIL;
 
-use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use std::path::Path;
 
 pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
@@ -45,12 +45,75 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
     )
 }
 
-pub fn display_symbol_for_target(target: &CodeUnit) -> String {
-    display_symbol_name(language_for_target(target), &target.fq_name())
+/// The qualified spelling a result prints for `target`: its display name when
+/// that name still addresses `target`, otherwise its indexed name.
+///
+/// Display normalization exists to hide index decoration nobody writes in
+/// source (Scala's companion `$`, C#'s generic arity and nested-owner `$`,
+/// TypeScript's `$static` marker). Wherever it changes anything, the stripped
+/// spelling is also the spelling an undecorated sibling owns outright:
+/// Monocle's `object GenLens` declares `apply`, stored `GenLens$.apply` and
+/// rendered `GenLens.apply`, which is `class GenLens`'s own `apply`. Exact-fq
+/// resolution answers such a spelling with the sibling ("a printed selector is
+/// a promise", #1056/#1057), so both halves of the pair printed one selector
+/// and only the undecorated half could be reached (#3302).
+///
+/// Asking whether another declaration owns the stripped spelling is what keeps
+/// both properties: a decorated declaration whose stripped spelling is free
+/// still prints the idiomatic name, and one whose stripped spelling is taken
+/// prints the indexed name that resolves to it.
+pub fn display_symbol_for_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
+    addressable_symbol_name(analyzer, language_for_target(target), target.fq_name())
 }
 
-/// The display symbol of the code unit's enclosing scope (the receiver/declaring type for
-/// a method, the outer type for a nested type), or `None` for a top-level declaration.
+/// The one question [`display_symbol_for_target`] asks, over an already
+/// rendered indexed name: is the display spelling of `fq_name` free, or does
+/// it name a different declaration?
+fn addressable_symbol_name(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    fq_name: String,
+) -> String {
+    let display = display_symbol_name(language, &fq_name);
+    if display == fq_name {
+        return fq_name;
+    }
+    // The same lookup `resolve_codeunit_exact` runs, asked of the stripped
+    // spelling: an exact fq hit there is the declaration that spelling
+    // resolves to, and it is never this one (this one's fq is `fq_name`,
+    // which differs).
+    let taken = analyzer
+        .definitions(&display)
+        .any(|other| other.fq_name() == display);
+    if taken { fq_name } else { display }
+}
+
+/// One batched store read for the questions [`display_symbol_for_target`] is
+/// about to ask of each of `targets`.
+///
+/// The question is per declaration and the analyzer answers one name per
+/// call, so rendering a whole file's summary asked for a store round trip
+/// apiece: 110 ms on a 64-file http4s `get_summaries`.
+/// `IAnalyzer::prefetch_definitions` is the batch form of exactly that read,
+/// and the per-name calls then land in the query-scoped memo it fills.
+pub(crate) fn prefetch_display_symbols<'a>(
+    analyzer: &dyn IAnalyzer,
+    targets: impl IntoIterator<Item = &'a CodeUnit>,
+) {
+    let names: Vec<String> = targets
+        .into_iter()
+        .filter_map(|target| {
+            let fq_name = target.fq_name();
+            let display = display_symbol_name(language_for_target(target), &fq_name);
+            (display != fq_name).then_some(display)
+        })
+        .collect();
+    IAnalyzer::prefetch_definitions(analyzer, &names);
+}
+
+/// The indexed qualified name of the code unit's enclosing scope (the
+/// receiver/declaring type for a method, the outer type for a nested type), or
+/// `None` for a top-level declaration.
 ///
 /// Methods are not always lexically nested in their type (Go receivers, Rust `impl`,
 /// C++ out-of-line definitions), so consumers can't reliably reconstruct the parent from
@@ -76,7 +139,7 @@ pub fn display_symbol_for_target(target: &CodeUnit) -> String {
 /// Dropping a whole segment answers all of these the same way, with no per-language
 /// pre-stripping: a `$` or `.` that belongs to a segment's text travels with that
 /// segment. Rendering the remaining prefix natively also makes `parent_symbol` a genuine
-/// prefix of the unit's own [`display_symbol_for_target`] spelling by construction,
+/// prefix of the unit's own indexed spelling by construction,
 /// because [`FqName::render_native`] joins each pair of segments from their kinds alone.
 ///
 /// A declaration whose parent prefix is exactly its package prefix is top level and has
@@ -85,7 +148,7 @@ pub fn display_symbol_for_target(target: &CodeUnit) -> String {
 /// [`FqName`]: brokk_bifrost_core::analyzer::fq_name::FqName
 /// [`FqName::render_native`]: brokk_bifrost_core::analyzer::fq_name::FqName::render_native
 /// [`SegmentKind::Companion`]: brokk_bifrost_core::analyzer::fq_name::SegmentKind::Companion
-pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<String> {
+pub(crate) fn parent_fq_name_for_target(target: &CodeUnit) -> Option<String> {
     let fq = target.fq();
     // `CodeUnit::from_fq` asserts a non-empty name whose package prefix leaves a
     // non-empty declaration tail, so the parent prefix always exists and is never
@@ -94,11 +157,21 @@ pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<Stri
     if parent_len == target.package_segment_count() {
         return None;
     }
-    let language = language_for_target(target);
-    let parent_fq = fq
-        .prefix(parent_len)
-        .display_native(language, crate::analyzer::fq_name::segment_interner());
-    Some(display_symbol_name(language, &parent_fq))
+    Some(fq.prefix(parent_len).display_native(
+        language_for_target(target),
+        crate::analyzer::fq_name::segment_interner(),
+    ))
+}
+
+/// The enclosing scope of [`parent_fq_name_for_target`], spelled the way
+/// [`display_symbol_for_target`] spells the unit itself, so that a printed
+/// `parent_symbol` addresses the owner it names.
+pub(crate) fn display_parent_symbol_for_target(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> Option<String> {
+    parent_fq_name_for_target(target)
+        .map(|parent_fq| addressable_symbol_name(analyzer, language_for_target(target), parent_fq))
 }
 
 /// The user-facing terminal name of `target`: its recorded terminal segment,
@@ -355,8 +428,8 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_LINE_LENGTH, display_parent_symbol_for_target, display_symbol_name,
-        is_unparseable_source, is_valid_rename_identifier,
+        DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source,
+        is_valid_rename_identifier, parent_fq_name_for_target,
     };
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
@@ -406,11 +479,12 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(None, display_parent_symbol_for_target(&top_level));
+        assert_eq!(None, parent_fq_name_for_target(&top_level));
 
         // `object CharsetRange { object Atom }` -> short_name
         // "CharsetRange$.Atom$": the parent is the enclosing object
-        // "org.http4s.CharsetRange", not the target's own display symbol.
+        // "org.http4s.CharsetRange$", not the target's own name. The companion
+        // `$` travels with the segment that owns it, in both directions.
         let mut nested_fq = FqName::new();
         nested_fq.push(interner.intern("org.http4s", SegmentKind::Package));
         nested_fq.push(interner.intern("CharsetRange", SegmentKind::Companion));
@@ -424,8 +498,8 @@ mod tests {
             false,
         );
         assert_eq!(
-            Some("org.http4s.CharsetRange".to_string()),
-            display_parent_symbol_for_target(&nested)
+            Some("org.http4s.CharsetRange$".to_string()),
+            parent_fq_name_for_target(&nested)
         );
     }
 
@@ -450,7 +524,7 @@ mod tests {
         );
         assert_eq!(
             Some("angular.mock".to_string()),
-            display_parent_symbol_for_target(&member)
+            parent_fq_name_for_target(&member)
         );
 
         // A bare `$`-prefixed top-level function has no parent at all.
@@ -464,7 +538,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(None, display_parent_symbol_for_target(&top_level));
+        assert_eq!(None, parent_fq_name_for_target(&top_level));
     }
 
     /// `$` is a legal Java identifier character, so it appears at the end of
@@ -493,7 +567,7 @@ mod tests {
             );
             assert_eq!(
                 expected,
-                display_parent_symbol_for_target(&unit),
+                parent_fq_name_for_target(&unit),
                 "method `{method}` must report its declaring class"
             );
         }
@@ -516,7 +590,7 @@ mod tests {
             );
             assert_eq!(
                 expected,
-                display_parent_symbol_for_target(&nested),
+                parent_fq_name_for_target(&nested),
                 "nested class `{nested_name}` must report its outer class"
             );
         }
@@ -534,7 +608,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(None, display_parent_symbol_for_target(&top_level));
+        assert_eq!(None, parent_fq_name_for_target(&top_level));
     }
 
     /// A TypeScript static member's `$static` marker is part of its own
@@ -558,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             Some("Widget".to_string()),
-            display_parent_symbol_for_target(&member)
+            parent_fq_name_for_target(&member)
         );
     }
 

@@ -354,29 +354,55 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
+    /// The indexed attribute classes an attribute name can denote, and whether
+    /// more than one of its spellings resolved.
+    ///
+    /// An attribute name is a type reference the grammar spells outside the
+    /// type roles, so each spelling takes the same lookup ladder an ordinary
+    /// C# type reference at `byte` takes: the enclosing type chain, then the
+    /// enclosing namespace scopes, then the file's namespace and `using`
+    /// scopes. Only the last of the three ran here, which is why `[Mark]`
+    /// could not name a `MarkAttribute` nested in the very class that writes
+    /// it, and why any attribute name failed in a file whose recorded
+    /// namespace is not the one enclosing the reference (#3300).
     fn attribute_type_candidates(
         &self,
+        analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         file: &ProjectFile,
         names: &[String],
+        byte: usize,
     ) -> (Vec<CodeUnit>, bool) {
-        if self.session.is_none() {
-            return hierarchy::attribute_type_candidates_with_ambiguity(
-                self.csharp,
-                token,
-                file,
-                names,
-            );
-        }
-        let mut visible_type_candidates = |name: &str| {
+        let mut type_candidates = |name: &str| {
+            if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
+                analyzer, token, self, file, name, byte,
+            )
+            .or_else(|| {
+                resolve_csharp_in_enclosing_scopes(
+                    analyzer,
+                    self,
+                    file,
+                    name,
+                    byte,
+                    CodeUnit::is_class,
+                )
+            }) {
+                return Some(vec![unit]);
+            }
             let candidates = self.visible_type_candidates(token, file, name);
             self.observe_cancellation().then_some(candidates)
         };
-        let mut attribute_class_is_applicable =
-            |candidate: &CodeUnit| self.attribute_class_is_applicable(token, candidate);
+        let mut attribute_class_is_applicable = |candidate: &CodeUnit| match self.session {
+            Some(_) => self.attribute_class_is_applicable(token, candidate),
+            None => Some(hierarchy::attribute_class_is_applicable(
+                self.csharp,
+                token,
+                candidate,
+            )),
+        };
         hierarchy::attribute_type_candidates_with_lookups(
             names,
-            &mut visible_type_candidates,
+            &mut type_candidates,
             &mut attribute_class_is_applicable,
         )
         .unwrap_or((Vec::new(), false))
@@ -825,9 +851,12 @@ fn resolve_csharp_in_session(
                 // gated upstream: the alias target names neither an indexed
                 // type nor an indexed namespace, so the qualifier itself is
                 // structured evidence that this reference leaves the workspace.
-                return boundary_unchecked(format!(
-                    "`{reference}` appears to cross a C# using-alias boundary not indexed in this workspace"
-                ));
+                return boundary_unchecked(
+                    format!(
+                        "`{reference}` appears to cross a C# using-alias boundary not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Type),
+                );
             }
             if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
                 analyzer,
@@ -1004,6 +1033,10 @@ fn resolve_csharp_in_session(
                     message: format!(
                         "receiver types {receiver_type_names:?} for C# member `{member}` are not indexed; applicable workspace extensions do not complete ordinary member lookup"
                     ),
+                    claim: Some(UnindexedClaim::external_boundary(
+                        receiver_type_names.join(", "),
+                        ClaimSubjectRole::Type,
+                    )),
                 });
             }
             outcome
@@ -1060,6 +1093,7 @@ fn resolve_csharp_in_session(
                     format!(
                         "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
                     ),
+                    UnindexedClaim::external_boundary(member, ClaimSubjectRole::Member),
                     "no_indexed_definition",
                     format!("`{member}` did not resolve to an indexed C# member"),
                 );
@@ -1365,14 +1399,35 @@ fn csharp_type_lookup_node_resolution(
     if !definitions.scope_step() {
         return None;
     }
+    // #3118's per-segment contract reaches the type-of question too: only the
+    // segment the focus lands on is being asked about. The whole attribute
+    // name takes the attribute-specific resolution; a shorter prefix is an
+    // ordinary focused type segment and must answer for itself, never for the
+    // attribute class spelled after the dot (#3289 on the definition surface,
+    // #3300 here).
     if let Some(name) = csharp_attribute_name_node(node) {
-        let names = csharp_attribute_type_names(name, source);
-        let (candidates, ambiguous) = definitions.attribute_type_candidates(token, file, &names);
+        if csharp_node_spells_whole_attribute_name(node, name) {
+            let names = csharp_attribute_type_names(name, source);
+            let (candidates, ambiguous) = definitions.attribute_type_candidates(
+                analyzer,
+                token,
+                file,
+                &names,
+                name.start_byte(),
+            );
+            return csharp_type_candidates_resolution_with_kind(
+                names.first().map(String::as_str).unwrap_or_default(),
+                candidates,
+                TypeLookupTargetKind::TypeReference,
+                ambiguous,
+            );
+        }
+        let reference = csharp_type_node_identity(node, source);
         return csharp_type_candidates_resolution_with_kind(
-            names.first().map(String::as_str).unwrap_or_default(),
-            candidates,
+            &reference,
+            csharp_visible_type_output_candidates(csharp, token, definitions, file, &reference),
             TypeLookupTargetKind::TypeReference,
-            ambiguous,
+            false,
         );
     }
 
@@ -2265,6 +2320,35 @@ fn csharp_reference_node<'tree>(
     }
 }
 
+/// Whether `node` spells the whole of the attribute name node `name`.
+///
+/// [`csharp_reference_node`] answers this question by climbing before it asks;
+/// the type-of resolver is handed the smallest node covering the focus range
+/// and has to climb here instead. A node occupying the `name` field of its
+/// enclosing qualified or generic name spells that enclosing name too, so
+/// `Cache` in `[Cache<Payload>]` reaches the attribute's whole `generic_name`
+/// while `SqlSugar` in `[SqlSugar.SugarColumn]` stops at the qualifier.
+fn csharp_node_spells_whole_attribute_name(node: Node<'_>, name: Node<'_>) -> bool {
+    let mut current = node;
+    while !same_node(current, name) {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        let terminal = match parent.kind() {
+            "qualified_name" | "alias_qualified_name" => parent.child_by_field_name("name"),
+            "generic_name" => parent
+                .child_by_field_name("name")
+                .or_else(|| parent.named_child(0)),
+            _ => return false,
+        };
+        if !terminal.is_some_and(|terminal| same_node(terminal, current)) {
+            return false;
+        }
+        current = parent;
+    }
+    true
+}
+
 fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "invocation_expression"
@@ -2536,6 +2620,7 @@ fn csharp_type_outcome(
     gated_boundary(
         || !csharp_import_boundary_for_type(csharp, token, definitions, file, reference),
         format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
+        UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# type"),
     )
@@ -2587,12 +2672,13 @@ fn csharp_attribute_outcome(
 ) -> DefinitionLookupOutcome {
     let names = csharp_attribute_type_names(name, source);
     let (candidates, ambiguous_spelling) =
-        definitions.attribute_type_candidates(token, file, &names);
+        definitions.attribute_type_candidates(analyzer, token, file, &names, name.start_byte());
     if !candidates.is_empty() {
         let mut outcome = candidates_outcome(candidates);
         if ambiguous_spelling {
             outcome.status = DefinitionLookupStatus::Ambiguous;
             outcome.diagnostics = vec![DefinitionLookupDiagnostic {
+                claim: None,
                 kind: "ambiguous_definition".to_string(),
                 message: "C# attribute name has multiple successful type-name spellings"
                     .to_string(),
@@ -2636,6 +2722,7 @@ fn csharp_attribute_outcome(
     gated_boundary(
         || !boundary,
         format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
+        UnindexedClaim::external_boundary(reference, ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# attribute type"),
     )
@@ -2861,6 +2948,7 @@ fn csharp_member_outcome(
                     && !csharp_object_declares_overload(member, arity)
             },
             format!("`{member}` is inherited from a C# base type not indexed in this workspace"),
+            UnindexedClaim::unindexed_owner(member, ClaimSubjectRole::Member),
             "no_applicable_overload",
             format!("no C# member `{member}` overload accepts this call"),
         );
@@ -3814,8 +3902,13 @@ fn csharp_named_argument_label_outcome(
         );
     };
     let attribute_names = csharp_attribute_type_names(attribute_name, source);
-    let (owners, _ambiguous_spelling) =
-        definitions.attribute_type_candidates(token, file, &attribute_names);
+    let (owners, _ambiguous_spelling) = definitions.attribute_type_candidates(
+        analyzer,
+        token,
+        file,
+        &attribute_names,
+        attribute_name.start_byte(),
+    );
     if owners.is_empty() {
         let attribute = attribute_names
             .first()
@@ -5153,14 +5246,20 @@ where
     })
     .map_while(|owner| definitions.scope_step().then_some(owner));
     for owner in owners {
-        let Some(prefix_unit) = csharp_nested_type_declared_or_inherited(
+        // An enclosing type declaration is in scope under its own name, so
+        // `Outer.Mark` written inside `Outer` names `Outer`'s nested `Mark`
+        // (#3300). A type `owner` declares or inherits wins, because a member
+        // of the enclosing type hides the enclosing type's own spelling.
+        let prefix_unit = csharp_nested_type_declared_or_inherited(
             analyzer,
             token,
             definitions,
             &owner,
             prefix,
             type_candidates_by_fqn,
-        ) else {
+        )
+        .or_else(|| (owner.identifier() == prefix).then(|| owner.clone()));
+        let Some(prefix_unit) = prefix_unit else {
             continue;
         };
         // The first enclosing class that binds the prefix decides: C# simple-name

@@ -1518,9 +1518,13 @@ fn resolve_cpp_bounded_member(
             // gated upstream: the structured receiver type and exact activated
             // owner/member fact prove that this route leaves the workspace.
             super::trace::record_named_boundary(member.to_owned());
-            return boundary_unchecked(format!(
-                "C++ member `{owner_name}::{member}` routes through an external header"
-            ));
+            return boundary_unchecked(
+                format!("C++ member `{owner_name}::{member}` routes through an external header"),
+                UnindexedClaim::external_boundary(
+                    format!("{owner_name}::{member}"),
+                    ClaimSubjectRole::Member,
+                ),
+            );
         }
         return no_definition(
             "unsupported_cpp_receiver",
@@ -1655,6 +1659,7 @@ fn resolve_cpp_bounded_member(
     if ambiguous_base_subobject && outcome.status == DefinitionLookupStatus::Resolved {
         outcome.status = DefinitionLookupStatus::Ambiguous;
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: "cpp_ambiguous_base_subobject".to_string(),
             message: "C++ member is inherited through multiple non-virtual base subobjects"
                 .to_string(),
@@ -1663,6 +1668,7 @@ fn resolve_cpp_bounded_member(
     if resolution.ambiguous && outcome.status == DefinitionLookupStatus::Resolved {
         outcome.status = DefinitionLookupStatus::Ambiguous;
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: "cpp_open_receiver_type".to_string(),
             message:
                 "C++ receiver type crosses a template or otherwise incomplete structured boundary"
@@ -3321,6 +3327,7 @@ fn resolve_cpp_type(
                 format!(
                     "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
                 ),
+                UnindexedClaim::external_boundary(reference.clone(), ClaimSubjectRole::Type),
                 "no_indexed_definition",
                 format!("`{reference}` did not resolve to an indexed C++ type"),
             );
@@ -3562,10 +3569,16 @@ fn resolve_cpp_type(
             // honesty probe above rules out an indexed name of its own
             // spelling; only an external one (with an unresolved include)
             // reaches here.
-            return boundary_unchecked(format!(
-                "`{}` appears to cross a C++ include boundary not indexed in this workspace",
-                qualifier.reference
-            ));
+            return boundary_unchecked(
+                format!(
+                    "`{}` appears to cross a C++ include boundary not indexed in this workspace",
+                    qualifier.reference
+                ),
+                UnindexedClaim::external_boundary(
+                    qualifier.reference.clone(),
+                    ClaimSubjectRole::Type,
+                ),
+            );
         }
         return no_definition(
             "no_indexed_definition",
@@ -3621,9 +3634,12 @@ fn cpp_type_candidates_outcome(
                 if let Some(outcome) = cpp_indexed_same_file_outcome(support, file, text, "type") {
                     return outcome;
                 }
-                boundary_unchecked(format!(
-                    "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
-                ))
+                boundary_unchecked(
+                    format!(
+                        "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(text, ClaimSubjectRole::Type),
+                )
             } else {
                 no_definition(
                     "no_indexed_definition",
@@ -4153,6 +4169,7 @@ fn cpp_type_candidates_without_focused_qualifier(
             format!(
                 "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
             ),
+            UnindexedClaim::external_boundary(text, ClaimSubjectRole::Type),
             "no_indexed_definition",
             format!("`{text}` did not resolve to an indexed C++ type"),
         ));
@@ -5631,9 +5648,12 @@ fn resolve_cpp_call(
                 {
                     return outcome;
                 }
-                return boundary_unchecked(format!(
-                    "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
-                ));
+                return boundary_unchecked(
+                    format!(
+                        "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(text.clone(), ClaimSubjectRole::Member),
+                );
             }
             no_definition(
                 "no_indexed_definition",
@@ -5688,10 +5708,16 @@ fn resolve_cpp_call(
                         }
                     }
                     CppBlockUsingCallTargetResolution::Unindexed(target) => {
-                        return boundary_unchecked(format!(
-                            "block using-declaration `{}` names a C++ callable not indexed in this workspace",
-                            target.join("::")
-                        ));
+                        return boundary_unchecked(
+                            format!(
+                                "block using-declaration `{}` names a C++ callable not indexed in this workspace",
+                                target.join("::")
+                            ),
+                            UnindexedClaim::external_boundary(
+                                target.join("::"),
+                                ClaimSubjectRole::Member,
+                            ),
+                        );
                     }
                     CppBlockUsingCallTargetResolution::Ambiguous => {
                         return ambiguous_without_candidates(format!(
@@ -6521,9 +6547,13 @@ fn resolve_cpp_field(
             // gated upstream: the structured receiver type and exact activated
             // owner/member fact prove that this route leaves the workspace.
             super::trace::record_named_boundary(member.to_owned());
-            return boundary_unchecked(format!(
-                "C++ member `{owner_name}::{member}` routes through an external header"
-            ));
+            return boundary_unchecked(
+                format!("C++ member `{owner_name}::{member}` routes through an external header"),
+                UnindexedClaim::external_boundary(
+                    format!("{owner_name}::{member}"),
+                    ClaimSubjectRole::Member,
+                ),
+            );
         }
         if receiver_resolved {
             return no_definition(
@@ -6696,6 +6726,7 @@ fn cpp_callable_candidates_outcome(candidates: Vec<CodeUnit>) -> DefinitionLooku
     let mut outcome = candidates_outcome(candidates);
     if link_unit_unproven {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
             kind: CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
             message: "the include graph relates this C/C++ declaration and body, but no build graph proves one link unit"
                 .to_string(),

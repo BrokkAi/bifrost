@@ -3,11 +3,11 @@ use crate::graph::CSharpGraphSource;
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
-    CSharpMemberName, CSharpRelationalGenericCall, csharp_callable_arity,
-    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
-    csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
-    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    CSharpMemberName, CSharpRelationalGenericCall, csharp_attribute_type_names,
+    csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
+    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
+    csharp_source_identifier, csharp_type_leftmost_identifier, csharp_type_node_identity,
+    csharp_type_reference_root, csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target,
 };
 use brokk_bifrost_core::analyzer::model::{
@@ -2520,6 +2520,46 @@ fn resolve_usage_visible_type_fq_name(
     (graph_support::logical_type_count(&candidates) == 1)
         .then(|| graph_support::first_logical_type_fqn(&candidates))
         .flatten()
+}
+
+/// The attribute classes an attribute's `name` node names, on the usage side.
+///
+/// An attribute name is a type reference the grammar spells outside the type
+/// roles, so each of its two spellings takes the same ladder
+/// [`resolve_type_fq_name_at`] gives an ordinary type reference: the site's
+/// enclosing type scopes and the namespace around them first, then the file's
+/// namespace and `using` scopes. Only the last of the three ran here, so a
+/// `[Mark]` naming a `MarkAttribute` nested in the class that writes it proved
+/// no usage at all (#3300).
+pub(super) fn usage_attribute_type_candidates(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    name: Node<'_>,
+    source: &str,
+) -> Vec<CodeUnit> {
+    let names = csharp_attribute_type_names(name, source);
+    let mut type_candidates = |spelling: &str| {
+        Some(
+            match resolve_in_enclosing_type_scopes(
+                csharp,
+                token,
+                class_ranges,
+                spelling,
+                name.start_byte(),
+            ) {
+                Some(unit) => vec![unit],
+                None => graph_support::usage_visible_type_candidates(csharp, token, file, spelling),
+            },
+        )
+    };
+    hierarchy::usage_unambiguous_attribute_type_candidates(
+        csharp,
+        token,
+        &names,
+        &mut type_candidates,
+    )
 }
 
 fn resolve_in_enclosing_type_scopes(

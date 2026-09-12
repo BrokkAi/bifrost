@@ -1289,6 +1289,7 @@ fn ruby_constant_outcome(
     gated_boundary(
         || !ruby_constant_path_leaves_the_workspace(semantic, context, node, source),
         format!("`{raw}` appears to cross a Ruby gem boundary not indexed in this workspace"),
+        UnindexedClaim::external_boundary(raw, ClaimSubjectRole::Any),
         "no_indexed_definition",
         format!("`{raw}` did not resolve to an indexed Ruby definition"),
     )

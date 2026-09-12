@@ -1148,9 +1148,10 @@ fn php_overlay_type_boundary(
     // proof of where it went, and `gated_boundary`'s workspace check would
     // only re-ask the question the empty candidate list already answered.
     trace::record_named_boundary_with_target(fqn.to_owned(), target);
-    Some(boundary_unchecked(format!(
-        "`{fqn}` is declared by an activated PHP semantic pack"
-    )))
+    Some(boundary_unchecked(
+        format!("`{fqn}` is declared by an activated PHP semantic pack"),
+        UnindexedClaim::resolved_external(fqn, ClaimSubjectRole::Type),
+    ))
 }
 
 /// The boundary outcome an activated pack supports for one member of one
@@ -1164,9 +1165,13 @@ fn php_overlay_member_boundary(
         PhpOverlayMember::Indexed(target) => {
             // gated upstream, as in `php_overlay_type_boundary`.
             trace::record_named_boundary_with_target(format!("{owner}.{member}"), target);
-            Some(boundary_unchecked(format!(
-                "`{owner}.{member}` is declared by an activated PHP semantic pack"
-            )))
+            Some(boundary_unchecked(
+                format!("`{owner}.{member}` is declared by an activated PHP semantic pack"),
+                UnindexedClaim::resolved_external(
+                    format!("{owner}.{member}"),
+                    ClaimSubjectRole::Member,
+                ),
+            ))
         }
         PhpOverlayMember::DeclaredAbsent => {
             // The packs publish the owner and its whole inherited surface with
@@ -1174,9 +1179,15 @@ fn php_overlay_member_boundary(
             // target: the reference left the workspace and the published
             // surface does not answer it.
             trace::record_named_boundary_declared_unindexed(format!("{owner}.{member}"));
-            Some(boundary_unchecked(format!(
-                "`{member}` is not on the surface an activated PHP semantic pack publishes for `{owner}`"
-            )))
+            Some(boundary_unchecked(
+                format!(
+                    "`{member}` is not on the surface an activated PHP semantic pack publishes for `{owner}`"
+                ),
+                UnindexedClaim::external_boundary(
+                    format!("{owner}.{member}"),
+                    ClaimSubjectRole::Member,
+                ),
+            ))
         }
         PhpOverlayMember::Unknown => None,
     }
@@ -1240,6 +1251,7 @@ fn php_unindexed_fqn_outcome(
         format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial PHP workspace analysis"
         ),
+        UnindexedClaim::resolved_external(fqn, ClaimSubjectRole::Any),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed PHP definition was found"),
     )
@@ -1363,6 +1375,7 @@ fn php_member_outcome(
                 format!(
                     "`{member}` appears to cross a PHP boundary through `{owner}.{boundary_member}`, whose receiver type is not indexed in this workspace"
                 ),
+                UnindexedClaim::external_boundary(owner.clone(), ClaimSubjectRole::Type),
                 "unsupported_php_receiver",
                 format!(
                     "receiver for PHP member `{member}` is not resolved after `{owner}.{boundary_member}`"
@@ -1454,6 +1467,7 @@ fn php_union_owner_member_outcome(
             format!(
                 "`{member}` appears to cross a PHP boundary at every declared receiver type (`{arms}`) not indexed in this workspace"
             ),
+            UnindexedClaim::external_boundary(owners.join(", "), ClaimSubjectRole::Type),
             "no_indexed_definition",
             format!("`{member}` is not indexed as a PHP definition on any of `{arms}`"),
         ),
@@ -1536,6 +1550,7 @@ fn php_single_owner_member_outcome(
         format!(
             "`{member}` appears to cross a PHP boundary at `{owner}` not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(owner.clone(), ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{fqn}` is not indexed as a PHP definition"),
     )

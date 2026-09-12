@@ -4566,6 +4566,7 @@ object Calls {
                 definitions: vec![second, first],
                 lexical_definition: None,
                 diagnostics: vec![DefinitionLookupDiagnostic {
+                    claim: None,
                     kind: "ambiguous_definition".to_string(),
                     message: "two candidates".to_string(),
                 }],
@@ -4605,10 +4606,12 @@ object Calls {
                 lexical_definition: None,
                 diagnostics: vec![
                     DefinitionLookupDiagnostic {
+                        claim: None,
                         kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),
                         message: "one candidate is external".to_string(),
                     },
                     DefinitionLookupDiagnostic {
+                        claim: None,
                         kind: PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC.to_string(),
                         message: "one candidate is unresolved".to_string(),
                     },
@@ -4639,6 +4642,7 @@ object Calls {
                 definitions: Vec::new(),
                 lexical_definition: None,
                 diagnostics: vec![DefinitionLookupDiagnostic {
+                    claim: None,
                     kind: "ambiguous_definition".to_string(),
                     message: "ambiguous without retainable candidates".to_string(),
                 }],

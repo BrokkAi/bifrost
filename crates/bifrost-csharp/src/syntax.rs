@@ -361,12 +361,35 @@ fn csharp_type_argument_arity(arguments: Node<'_>) -> usize {
         + 1
 }
 
+/// One dotted part of a C# type name: the identifier the source spells, and
+/// the generic arity that spelling states.
+///
+/// The two are kept apart until the join because a terminal suffix belongs to
+/// the identifier, not to the rendered segment. `[Cache<Payload>]` is the
+/// `Attribute` shorthand for `CacheAttribute`1`; appending the suffix to the
+/// rendered `Cache`1` produced `Cache`1Attribute`, which names nothing and
+/// left every generic attribute's own name unresolved (#3300).
+struct CSharpNameSegment {
+    identifier: String,
+    arity: usize,
+}
+
+impl CSharpNameSegment {
+    fn render(self) -> String {
+        if self.arity == 0 {
+            self.identifier
+        } else {
+            format!("{}`{}", self.identifier, self.arity)
+        }
+    }
+}
+
 fn csharp_type_node_segments_with_terminal_suffix(
     node: Node<'_>,
     source: &str,
     terminal_suffix: &str,
 ) -> Vec<String> {
-    let mut segments = Vec::new();
+    let mut segments: Vec<CSharpNameSegment> = Vec::new();
     let mut stack = vec![node];
     let mut alias_qualified = false;
     while let Some(current) = stack.pop() {
@@ -399,10 +422,9 @@ fn csharp_type_node_segments_with_terminal_suffix(
                     let source_name = csharp_type_segment_text(name, source);
                     let arity = type_arguments.map_or(0, csharp_type_argument_arity);
                     if !source_name.is_empty() {
-                        segments.push(if arity == 0 {
-                            source_name.to_string()
-                        } else {
-                            format!("{source_name}`{arity}")
+                        segments.push(CSharpNameSegment {
+                            identifier: source_name.to_string(),
+                            arity,
                         });
                     }
                 }
@@ -435,7 +457,10 @@ fn csharp_type_node_segments_with_terminal_suffix(
             "identifier" | "predefined_type" | "implicit_type" => {
                 let segment = csharp_type_segment_text(current, source);
                 if !segment.is_empty() {
-                    segments.push(segment.to_string());
+                    segments.push(CSharpNameSegment {
+                        identifier: segment.to_string(),
+                        arity: 0,
+                    });
                 }
             }
             // Anything else is not a name. A tuple, a function pointer, and a
@@ -452,8 +477,12 @@ fn csharp_type_node_segments_with_terminal_suffix(
         }
     }
     if let Some(terminal) = segments.last_mut() {
-        terminal.push_str(terminal_suffix);
+        terminal.identifier.push_str(terminal_suffix);
     }
+    let mut segments: Vec<String> = segments
+        .into_iter()
+        .map(CSharpNameSegment::render)
+        .collect();
     // An extern-alias qualifier binds tighter than the dots that follow it, so
     // `A::B.C` is three names but only two dot-joined parts. Fold the qualifier
     // into the first segment and every caller can join with '.' unconditionally.

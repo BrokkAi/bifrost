@@ -797,6 +797,7 @@ fn produce_document(
             type_shape(item, document, &type_ids, limits, &mut diagnostics);
         type_position.insert(item.id, types.len());
         types.push(TypeFact {
+            ambient_use: None,
             id: id.clone(),
             name: name.clone(),
             type_kind,
@@ -996,6 +997,7 @@ fn produce_document(
         }
         member_position.insert(item.id, members.len());
         members.push(MemberFact {
+            ambient_use: None,
             id: member_id.clone(),
             owner: owner_item_id,
             name: name.to_owned(),

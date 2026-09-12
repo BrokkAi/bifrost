@@ -184,6 +184,7 @@ done
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v2.schema.json
+require_archive_file brokk-bifrost schemas/semantic-model-pack-v3.schema.json
 require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)

@@ -490,6 +490,7 @@ fn project_type<'tree>(
     };
     record_namespace(&work.namespace, namespaces);
     types.push(TypeFact {
+        ambient_use: None,
         id: id.clone(),
         name: qualified.clone(),
         type_kind,
@@ -639,6 +640,7 @@ fn project_callable(
         return_type: signature.returns.as_ref(),
     });
     Some(MemberFact {
+        ambient_use: None,
         id,
         owner: owner.id,
         name: name.clone(),
@@ -759,6 +761,7 @@ fn project_properties(
             return_type: signature.returns.as_ref(),
         });
         members.push(MemberFact {
+            ambient_use: None,
             id,
             owner: owner.id.clone(),
             name: name.to_owned(),
@@ -841,6 +844,7 @@ fn constant_member(
         return_type: None,
     });
     MemberFact {
+        ambient_use: None,
         id,
         owner: owner.id,
         name: name.clone(),
@@ -876,6 +880,7 @@ fn namespace_fact(
     entry_path: &str,
 ) -> TypeFact {
     TypeFact {
+        ambient_use: None,
         id: type_declaration_id(TypeIdentity {
             ecosystem: origin.ecosystem,
             name: namespace,

@@ -31,12 +31,12 @@ use crate::graph::resolver::{
     object_initializer_owner_type_node, reference_type_text, resolve_arity_free_type_fq_name_at,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_class_field_receiver_type, usage_direct_base, usage_member_declared_type_fq_name,
-    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
-    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
+    usage_attribute_type_candidates, usage_class_field_receiver_type, usage_direct_base,
+    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
+    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
+    usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
-use crate::hierarchy;
 use crate::syntax::{
     CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
@@ -159,6 +159,18 @@ impl CsScan<'_> {
             || candidates
                 .iter()
                 .any(|candidate| self.may_match_terminal(candidate))
+    }
+
+    /// The attribute classes an attribute's `name` node proves a usage of.
+    fn attribute_type_candidates(&self, token: QueryToken<'_>, name: Node<'_>) -> Vec<CodeUnit> {
+        usage_attribute_type_candidates(
+            self.csharp,
+            token,
+            self.file,
+            &self.class_ranges,
+            name,
+            self.source,
+        )
     }
 
     /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
@@ -430,10 +442,7 @@ fn record_reference(
             if !ctx.may_match_attribute_name(name) {
                 return;
             }
-            let names = csharp_attribute_type_names(name, ctx.source);
-            for candidate in hierarchy::usage_unambiguous_attribute_type_candidates(
-                ctx.csharp, token, ctx.file, &names,
-            ) {
+            for candidate in ctx.attribute_type_candidates(token, name) {
                 ctx.record(candidate.fq_name(), name);
             }
         }
@@ -452,10 +461,7 @@ fn record_reference(
                     if !ctx.may_match_terminal(name) {
                         return;
                     }
-                    let names = csharp_attribute_type_names(attribute_name, ctx.source);
-                    let owners = hierarchy::usage_unambiguous_attribute_type_candidates(
-                        ctx.csharp, token, ctx.file, &names,
-                    );
+                    let owners = ctx.attribute_type_candidates(token, attribute_name);
                     if owners.is_empty() {
                         ctx.record_unproven(name, node);
                     } else {

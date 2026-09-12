@@ -30,7 +30,7 @@ test("build, packaging, dependency, and workflow changes conservatively select t
     ["crates/bifrost-analysis/Cargo.toml"],
     ["crates/bifrost-flow/Cargo.toml"],
     ["crates/bifrost-analysis/resources/treesitter/java/definitions.scm"],
-    ["schemas/semantic-model-pack-v2.schema.json"],
+    ["schemas/semantic-model-pack-v3.schema.json"],
     ["crates/bifrost-jvm/Cargo.toml"],
     ["crates/bifrost-js-ts/Cargo.toml"],
     ["crates/bifrost-python/Cargo.toml"],

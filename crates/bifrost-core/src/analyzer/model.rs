@@ -443,6 +443,40 @@ pub struct ParameterMetadata {
     end_byte: usize,
 }
 
+/// How an import of one declaration can be consumed without the importing file
+/// spelling the imported name.
+///
+/// Scala is the language this answers for today. `import scala.language.postfixOps`
+/// puts an implicit value in scope and is then used by writing `100 millis`;
+/// `import concurrent.duration.DurationInt` brings an implicit class into scope
+/// and is used by writing `42.seconds`. Neither use spells the imported name, so
+/// the absence of that spelling in the importing file proves nothing about the
+/// import. The same question has an answer in every language with contextual
+/// selection, which is why the name states the consumer's question rather than
+/// one language's keyword.
+///
+/// It lives here because two layers must answer it identically: a language's
+/// structural spec reads it from workspace syntax, and the semantic-model pack
+/// format carries it for a declaration that is not in the workspace at all.
+///
+/// Wherever this is optional, absence means the producer did not review the
+/// declaration. It is never negative evidence, and neither is a declaration
+/// kind, because Scala records an implicit `val`, `def`, `class` and `object`
+/// under its ordinary kinds. [`Self::NotAmbient`] is the only variant that
+/// proves anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AmbientUseRole {
+    /// The declaration carries no contextual role: every use of it spells the
+    /// imported name.
+    NotAmbient,
+    /// A Scala 2 `implicit` definition: an implicit value, conversion, class or
+    /// object the compiler selects by type from the imported scope.
+    Implicit,
+    /// A Scala 3 `given` definition, selected by type from the imported scope.
+    Given,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallableArity {
     required: usize,

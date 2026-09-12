@@ -2229,6 +2229,7 @@ pub(super) fn resolve_python(
                     format!(
                         "`{object_text}.{attribute_text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
                     ),
+                    UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
                     "no_indexed_definition",
                     format!(
                         "`{}` did not resolve to an indexed Python definition",
@@ -2318,6 +2319,7 @@ pub(super) fn resolve_python(
                         format!(
                             "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
                         ),
+                        UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
                         "no_indexed_definition",
                         format!("`{text}` did not resolve to an indexed Python definition"),
                     );
@@ -2369,6 +2371,7 @@ pub(super) fn resolve_python(
                     format!(
                         "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
                     ),
+                    UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
                     "no_indexed_definition",
                     format!("`{text}` did not resolve to an indexed Python definition"),
                 );
@@ -3443,6 +3446,7 @@ fn python_fqn_outcome(
         format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
         ),
+        UnindexedClaim::resolved_external(fqn, ClaimSubjectRole::Any),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed Python definition was found"),
     )
@@ -3477,6 +3481,7 @@ fn python_module_outcome(
         format!(
             "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
         ),
+        UnindexedClaim::resolved_external(module_fq, ClaimSubjectRole::Module),
         "no_indexed_definition",
         format!("`{raw}` resolved to module `{module_fq}`, but no indexed Python module was found"),
     )

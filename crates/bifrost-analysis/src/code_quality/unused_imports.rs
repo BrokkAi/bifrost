@@ -35,7 +35,10 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelSymbolKind};
+use crate::analyzer::semantic_model::{
+    AmbientUseRole, SemanticModelCompleteness, SemanticModelOverlay, SemanticModelSymbolKind,
+};
+use crate::analyzer::structural::StructuralSpec;
 use crate::analyzer::structural::facts::FileFacts;
 use crate::analyzer::structural::kinds::NormalizedKind;
 use crate::analyzer::structural::lexical_environment::{BindingRow, environment_for_file};
@@ -56,7 +59,6 @@ use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range, RustOverlayCrates
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::cancellation::CancellationToken;
-use brokk_bifrost_rust::syntax::outer_attributes;
 use tree_sitter::Node;
 
 /// Whether this derivation reports findings for a language, and why not when
@@ -178,10 +180,12 @@ pub enum AmbientImportUse {
     /// and which is used without ever being spelled:
     /// `import scala.concurrent.ExecutionContext.Implicits.global` followed by
     /// a `Future { .. }` spells nothing. Scala 2 imports such a definition by
-    /// its plain name, so the import site does not mark it either. Resolved
-    /// source declarations can rule this out for ordinary values and methods.
-    /// External declarations retain the doubt until packs preserve contextual
-    /// declaration roles, including an explicit non-contextual fact.
+    /// its plain name, so the import site does not mark it either. Whether the
+    /// target is one of these is a property of the declaration, which for an
+    /// import that leaves the workspace is not in this workspace at all.
+    /// Resolved workspace syntax rules it out for an ordinary declaration, and
+    /// an activated dependency pack's `ambient_use` fact rules it out for one
+    /// outside; a target with neither retains this doubt.
     ScalaImplicitScope,
     /// The file carries a documentation comment, and this language resolves
     /// the type names written inside one against the file's imports: Java's
@@ -443,6 +447,7 @@ pub fn unused_imports_for_file(
             file,
             facts.source(),
             language,
+            spec,
             &environment.bindings,
             &mut findings,
         );
@@ -462,6 +467,7 @@ fn refine_import_certainties(
     file: &ProjectFile,
     source: &str,
     language: Language,
+    spec: &dyn StructuralSpec,
     bindings: &[BindingRow],
     findings: &mut [UnusedImport],
 ) {
@@ -513,6 +519,19 @@ fn refine_import_certainties(
             finding.certainty = UnusedImportCertainty::Unreferenced;
             continue;
         }
+        if language == Language::Scala
+            && outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+            && outcome.definitions.is_empty()
+            && scala_pack_rules_out_ambient_use(
+                overlay.as_deref(),
+                &finding.target_segments,
+                bindings,
+                finding.range,
+            )
+        {
+            finding.certainty = UnusedImportCertainty::Unreferenced;
+            continue;
+        }
         if outcome.status != DefinitionLookupStatus::Resolved
             || outcome.definitions.is_empty()
             || !outcome.diagnostics.is_empty()
@@ -541,7 +560,8 @@ fn refine_import_certainties(
                     let Some(node) = node_for_exact_range(tree.root_node(), range) else {
                         return false;
                     };
-                    !node.has_error() && declaration_rules_out_ambient_use(language, node)
+                    !node.has_error()
+                        && spec.declaration_ambient_use(node) == Some(AmbientUseRole::NotAmbient)
                 })
         });
         if nonambient {
@@ -550,50 +570,47 @@ fn refine_import_certainties(
     }
 }
 
-/// These are positive syntax facts, not a default for unrecognized nodes.
-/// In particular a Rust alias may name a trait and a Scala given may carry
-/// either a value or a callable shape.
-fn declaration_rules_out_ambient_use(language: Language, node: Node<'_>) -> bool {
-    match language {
-        Language::Rust => {
-            // `outer_attributes` reads the grammar's grouped layout only. A
-            // procedural macro declaration looks like a function, and an
-            // attribute macro can transform the declaration that follows it.
-            // Neither is a source-backed nonambient proof without expansion.
-            if outer_attributes(node).next().is_some() {
-                return false;
-            }
-            matches!(
-                node.kind(),
-                "struct_item"
-                    | "enum_item"
-                    | "union_item"
-                    | "function_item"
-                    | "const_item"
-                    | "static_item"
-            )
-        }
-        Language::Scala => {
-            if !matches!(
-                node.kind(),
-                "function_definition" | "val_definition" | "var_definition"
-            ) {
-                return false;
-            }
-            let mut cursor = node.walk();
-            !node.named_children(&mut cursor).any(|child| {
-                child.kind() == "modifiers" && {
-                    // Keyword modifiers are anonymous grammar tokens, so a
-                    // named-only subtree walk would lose the implicit fact.
-                    let mut modifiers = child.walk();
-                    child
-                        .children(&mut modifiers)
-                        .any(|modifier| modifier.kind() == "implicit")
-                }
-            })
-        }
-        _ => unreachable!("only Rust and Scala have declaration-specific ambient use"),
+/// Whether the activated dependency packs prove that this Scala import names an
+/// ordinary declaration.
+///
+/// The import path is the lookup key. A Scala pack publishes each declaration
+/// under its dotted qualified name, and the parser's structured path segments
+/// join to exactly that spelling, so nothing here re-reads source text. Only an
+/// explicit [`AmbientUseRole::NotAmbient`] proves anything: a missing fact is a
+/// producer that did not review the declaration, and a `Method`, `Property` or
+/// `Class` kind is not negative evidence, because Scala records an implicit
+/// `val`, `def`, `class` and `object` under exactly those kinds.
+///
+/// Every record the name publishes has to answer `NotAmbient`. One Scala import
+/// binds a whole overload set, and a class together with its companion object,
+/// so a single ordinary record among them is not a claim about the name.
+fn scala_pack_rules_out_ambient_use(
+    overlay: Option<&SemanticModelOverlay>,
+    target_segments: &[String],
+    bindings: &[BindingRow],
+    range: Range,
+) -> bool {
+    // A one-segment path names something already in scope rather than a path a
+    // pack publishes, and the pack index would answer for a bare terminal name.
+    let [root, _, ..] = target_segments else {
+        return false;
+    };
+    // A local binder can rename a different target to this leading spelling,
+    // which would make a same-spelled published path the wrong declaration.
+    if bindings
+        .iter()
+        .any(|binding| binding.name == *root && contains(binding.activation, range))
+    {
+        return false;
     }
+    let Some(overlay) = overlay else {
+        return false;
+    };
+    let matched = overlay.symbols_named(&target_segments.join("."));
+    !matched.records.is_empty()
+        && matched.records.iter().all(|symbol| {
+            symbol.language == "scala" && symbol.ambient_use == Some(AmbientUseRole::NotAmbient)
+        })
 }
 
 /// The spelling under which a name is compared with the tokens of its file.

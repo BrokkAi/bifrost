@@ -1,5 +1,7 @@
 //! Scala structural spec for `query_code`.
 
+use crate::scala::ambient_use::scala_declaration_ambient_use;
+use brokk_bifrost_core::analyzer::model::AmbientUseRole;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     chain_name_child, field_name_in_parent, first_named_child, nearest_ancestor,
@@ -954,6 +956,13 @@ impl StructuralSpec for ScalaStructuralSpec {
     /// Scala spells the two hops with two keywords: `import` brings a name
     /// into this file, and Scala 3's `export` re-publishes it as a member of
     /// the enclosing template, which makes it reachable from other files.
+    /// Scala's two contextual forms, read by the shared classifier every Scala
+    /// consumer of this question uses. See
+    /// [`crate::scala::ambient_use::scala_declaration_ambient_use`].
+    fn declaration_ambient_use(&self, node: Node<'_>) -> Option<AmbientUseRole> {
+        scala_declaration_ambient_use(node)
+    }
+
     fn indirection_relation(
         &self,
         token: Node<'_>,

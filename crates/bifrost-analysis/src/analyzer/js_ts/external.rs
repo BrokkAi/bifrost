@@ -1796,6 +1796,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            ambient_use: None,
             id: id.clone(),
             name: name.to_owned(),
             type_kind,
@@ -1850,6 +1851,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 .and_then(|signature| signature.returns.as_ref()),
         });
         self.members.push(MemberFact {
+            ambient_use: None,
             id,
             owner: owner_id.to_owned(),
             name: draft.name.clone(),

@@ -777,9 +777,10 @@ pub(super) fn resolve_js_ts(
     {
         let reference = format!("{}.{}", modeled.owner.qualified_name, modeled.callable.name);
         trace::record_named_boundary_with_target(reference.clone(), modeled.callable.id.clone());
-        return boundary_unchecked(format!(
-            "`{reference}` resolves through an active JS/TS declaration-model return type"
-        ));
+        return boundary_unchecked(
+            format!("`{reference}` resolves through an active JS/TS declaration-model return type"),
+            UnindexedClaim::resolved_external(reference, ClaimSubjectRole::Member),
+        );
     }
 
     if let Some(member_expression) =
@@ -1274,9 +1275,12 @@ pub(super) fn resolve_js_ts(
                 // gated upstream: the structured file-identifier check above
                 // proved that the receiver is not declared in this workspace.
                 trace::record_named_boundary_with_target(reference.to_owned(), target);
-                return boundary_unchecked(format!(
-                    "`{reference}` resolves to an active TypeScript declaration-model member"
-                ));
+                return boundary_unchecked(
+                    format!(
+                        "`{reference}` resolves to an active TypeScript declaration-model member"
+                    ),
+                    UnindexedClaim::resolved_external(reference, ClaimSubjectRole::Member),
+                );
             }
         } else {
             let exact_project = jsts_exact_dotted_candidates(
@@ -1652,6 +1656,7 @@ fn resolve_js_ts_module_as_namespace(
         return gated_boundary(
             || !is_bare_js_ts_specifier(module),
             format!("`{module}` is a package import outside this partial workspace analysis"),
+            UnindexedClaim::external_boundary(module, ClaimSubjectRole::Module),
             "no_indexed_definition",
             format!("`{module}` could not be resolved to a workspace JS/TS file"),
         );
@@ -1707,6 +1712,7 @@ fn merge_js_ts_binding_outcomes(
         outcome.status = DefinitionLookupStatus::Ambiguous;
         outcome.diagnostics.extend(diagnostics);
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: "ambiguous_definition".to_string(),
             message: competing_imports,
         });
@@ -1714,6 +1720,7 @@ fn merge_js_ts_binding_outcomes(
     };
     if crossed_external_boundary {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
             kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),
             message: format!(
                 "at least one competing import for `{reference}` crosses the indexed workspace boundary"
@@ -1722,6 +1729,7 @@ fn merge_js_ts_binding_outcomes(
     }
     if unresolved_import {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
             kind: PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC.to_string(),
             message: format!(
                 "at least one competing import for `{reference}` could not be resolved"
@@ -1730,6 +1738,7 @@ fn merge_js_ts_binding_outcomes(
     }
     if bindings_truncated {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
             kind: IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC.to_string(),
             message: format!(
                 "competing imports for `{reference}` exceeded the per-name limit of {MAX_STATIC_IMPORT_BINDINGS_PER_NAME}"
@@ -2067,6 +2076,7 @@ fn resolve_js_ts_module_binding(
         return gated_boundary(
             || !is_bare_js_ts_specifier(module),
             format!("`{module}` is a package import outside this partial workspace analysis"),
+            UnindexedClaim::external_boundary(module, ClaimSubjectRole::Module),
             "no_indexed_definition",
             format!("`{module}` could not be resolved to a workspace JS/TS file"),
         );
@@ -2088,10 +2098,13 @@ fn resolve_js_ts_module_binding(
         {
             // gated upstream: `unresolved_reexport_boundary` only returns Some for
             // a re-export chain that terminates outside the indexed workspace.
-            return boundary_unchecked(format!(
-                "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
-                rel_path_string(&reexport_file)
-            ));
+            return boundary_unchecked(
+                format!(
+                    "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
+                    rel_path_string(&reexport_file)
+                ),
+                UnindexedClaim::external_boundary(external_module, ClaimSubjectRole::Module),
+            );
         }
         return no_definition(
             "no_indexed_definition",
@@ -2172,6 +2185,7 @@ fn jsts_local_dotted_outcome(
             format!("property reaching for `{reference}`").into_boxed_str(),
         ));
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                claim: None,
             kind: "analysis_incomplete".to_string(),
             message: format!(
                 "structured property reaching evidence for `{reference}` was incomplete; candidates require retained control-flow evidence"

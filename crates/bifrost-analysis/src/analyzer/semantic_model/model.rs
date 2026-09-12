@@ -1,8 +1,28 @@
 use schemars::JsonSchema;
+// The contextual-role fact is shared with the structural layer: a language's
+// structural spec reads it from workspace syntax and this format carries it for
+// a declaration that is not in the workspace. One enum, declared where both
+// layers can name it.
+pub use brokk_bifrost_core::analyzer::model::AmbientUseRole;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 2;
+/// The schema version every producer writes and every compiled artifact this
+/// build mints. Version three adds [`AmbientUseRole`] to `TypeFact` and
+/// `MemberFact`.
+pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 3;
+/// The schema versions a reader accepts.
+///
+/// Packs reject unknown fields and every object is explicitly tagged, so a
+/// field added under a version number that already shipped would make an older
+/// reader fail on bytes whose version says it can read them. Version three is
+/// therefore a new number rather than a widened two, and an installed version-two
+/// pack or release asset keeps loading here until its producer regenerates it
+/// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
+/// it answers "unreviewed" for every declaration, which is what absence means.
+pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[2, 3];
+/// The lowest schema version whose packs may carry an `ambient_use` fact.
+pub const AMBIENT_USE_MIN_SCHEMA_VERSION: u32 = 3;
 pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = 1;
 pub const MAX_PROCEDURE_SUMMARY_ORDINAL: u32 = 65_535;
 pub const MAX_PROCEDURE_SUMMARY_LOCATIONS: usize = 65_536;
@@ -553,7 +573,7 @@ pub enum RuntimeExceptionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredSemanticModelPack {
-    #[schemars(range(min = 2, max = 2))]
+    #[schemars(range(min = 2, max = 3))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -1621,6 +1641,11 @@ pub struct TypeFact {
     /// operations, rather than that the type has no such operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_semantics: Option<TypeValueSemantics>,
+    /// Whether importing this type can consume it without spelling its name.
+    /// See [`AmbientUseRole`]; absence means the producer did not review the
+    /// declaration, never that the declaration is ordinary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient_use: Option<AmbientUseRole>,
     #[serde(default)]
     pub embedded_types: Vec<EmbeddedTypeFact>,
     #[serde(default)]
@@ -1714,6 +1739,11 @@ pub struct MemberFact {
     /// The member's own stable `id` is the operation identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_operation: Option<ImplicitOperation>,
+    /// Whether importing this member can consume it without spelling its name.
+    /// See [`AmbientUseRole`]; absence means the producer did not review the
+    /// declaration, never that the declaration is ordinary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient_use: Option<AmbientUseRole>,
     /// The authored declarations contain every callable with this member's
     /// exact owner, name, receiver form, and fixed arity.
     ///

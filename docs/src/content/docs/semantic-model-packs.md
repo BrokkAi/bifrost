@@ -323,16 +323,39 @@ rules failed closed, so production emitted neither rule.
 
 ## Version and extension rules
 
-Every source pack must contain `schema_version: 2`. The field is mandatory and
-exact: omitted, zero, and future versions fail instead of falling back. Every
-object rejects unknown fields, and every variant is explicitly tagged. A future
-schema adds a new versioned Rust model and checked-in schema rather than
-silently widening version two.
+Every source pack must contain a `schema_version` this build supports, which is
+`2` or `3`. The field is mandatory: omitted, zero, and unsupported versions fail
+instead of falling back. Every object rejects unknown fields, and every variant
+is explicitly tagged. A schema addition takes a new version number and a new
+checked-in schema rather than silently widening a number that already shipped.
+
+Producers write `3`. Reading a set of versions rather than one exact number is
+what lets an installed version-two pack or release asset keep loading across the
+bump and be regenerated on its producer's normal cadence. A field a version
+introduces is rejected in a pack that declares an earlier version, so a pack that
+an older reader accepts by its number is one that older reader can also parse:
+`ambient_use` on a `schema_version: 2` pack is a validation error, not an
+additive field.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json).
+[`schemas/semantic-model-pack-v3.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v3.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
+[`schemas/semantic-model-pack-v2.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v2.schema.json)
+stays checked in as the frozen description of a version-two pack.
+
+### Version three: contextual declaration roles
+
+Version three adds one optional field, `ambient_use`, to `TypeFact` and
+`MemberFact`. It answers whether importing that declaration can consume it
+without the importing file spelling the imported name: `not_ambient` proves that
+every use spells the name, while `implicit` and `given` name a contextual role
+the compiler selects by type. Absence means the producer did not review the
+declaration, so a consumer must treat it as unknown; a `Method`, `Property` or
+`Class` kind is not negative evidence either, because Scala records an implicit
+`val`, `def`, `class` and `object` under exactly those kinds. Only `not_ambient`
+proves anything, which is what lets the unused-import derivation publish a Scala
+finding whose target is outside the workspace.
 
 YAML is a presentation syntax, not a second data model. Loading permits one
 document and rejects duplicate keys, aliases, anchors, merge keys, includes,

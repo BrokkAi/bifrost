@@ -1491,6 +1491,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         }
         let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
+            ambient_use: None,
             id: type_declaration_id(TypeIdentity {
                 ecosystem: "python",
                 name: &name,
@@ -1591,6 +1592,7 @@ fn member_fact(
             .and_then(|signature| signature.returns.as_ref()),
     });
     MemberFact {
+        ambient_use: None,
         id,
         owner: owner_id,
         name: name.to_owned(),

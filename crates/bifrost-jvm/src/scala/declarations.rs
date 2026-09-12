@@ -395,7 +395,7 @@ impl<'a> ScalaVisitor<'a> {
     ) {
         for child in children {
             match child.kind() {
-                "function_definition" | "function_declaration" => {
+                "function_definition" | "function_declaration" | "given_definition" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
@@ -570,7 +570,7 @@ impl<'a> ScalaVisitor<'a> {
                         });
                     }
                 }
-                "function_definition" | "function_declaration" => {
+                "function_definition" | "function_declaration" | "given_definition" => {
                     self.visit_function(child, &current_package, recovery_parent.clone())
                 }
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
@@ -655,13 +655,23 @@ impl<'a> ScalaVisitor<'a> {
         if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
         }
+        // The recovered header runs from the node the recovery claimed to the
+        // colon that closes it, so each end comes from `node_range`: it is
+        // the one reader of a tree-sitter position in this walk, and it is
+        // what makes a recorded line 1-based (#2428). Reading
+        // `start_position().row` here instead recorded a 0-based span, which
+        // reported the header one line early and, once #3291 grew that span
+        // with the members the recovery adopts, mixed the two bases in one
+        // range (#3303).
+        let opening = node_range(node);
+        let closing = node_range(colon);
         self.parsed.add_code_unit_with_range(
             code_unit.clone(),
             Range {
-                start_byte: node.start_byte(),
-                end_byte: colon.end_byte(),
-                start_line: node.start_position().row,
-                end_line: colon.end_position().row,
+                start_byte: opening.start_byte,
+                end_byte: closing.end_byte,
+                start_line: opening.start_line,
+                end_line: closing.end_line,
             },
             parent,
             None,
@@ -884,7 +894,7 @@ impl<'a> ScalaVisitor<'a> {
     ) {
         for child in children {
             match child.kind() {
-                "function_definition" | "function_declaration" => {
+                "function_definition" | "function_declaration" | "given_definition" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {

@@ -855,6 +855,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                ambient_use: None,
                 id: type_ids[&record.name].clone(),
                 name: record.name.clone(),
                 type_kind: if record.is_type_alias {
@@ -1003,6 +1004,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 returns: return_type,
             });
             members.push(MemberFact {
+                ambient_use: None,
                 id: id.clone(),
                 owner: owner_id.clone(),
                 name: record.name,

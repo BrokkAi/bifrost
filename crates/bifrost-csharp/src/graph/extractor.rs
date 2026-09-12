@@ -14,14 +14,13 @@ use crate::graph::resolver::{
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
     resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    unqualified_member_resolves_to_owner, usage_member_declared_type_fq_name,
-    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
-    usage_visible_extension_method_candidates,
+    unqualified_member_resolves_to_owner, usage_attribute_type_candidates,
+    usage_member_declared_type_fq_name, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::graph_support::{self, CSharpSource};
-use crate::hierarchy;
 use crate::syntax::{
-    CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
+    CSharpNamedArgumentLabel, csharp_attribute_terminal_name,
     csharp_cast_relational_generic_call_for_name, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_implicit_accessor_value,
     csharp_local_binder_name, csharp_member_access_type_receiver, csharp_member_name,
@@ -532,10 +531,16 @@ fn scan_attribute_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut Sca
     if !exact_or_shorthand && !alias {
         return;
     }
-    let names = csharp_attribute_type_names(name, ctx.source);
-    if hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, token, ctx.file, &names)
-        .into_iter()
-        .any(|candidate| type_identity_matches(&candidate.fq_name(), &ctx.spec.target.fq_name()))
+    if usage_attribute_type_candidates(
+        ctx.csharp,
+        token,
+        ctx.file,
+        &ctx.class_ranges,
+        name,
+        ctx.source,
+    )
+    .into_iter()
+    .any(|candidate| type_identity_matches(&candidate.fq_name(), &ctx.spec.target.fq_name()))
     {
         push_hit(name, ctx);
     }
@@ -1285,9 +1290,14 @@ fn member_label_owner_resolution(
     let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
         return LabelOwnerResolution::KnownOther;
     };
-    let names = csharp_attribute_type_names(attribute_name, ctx.source);
-    let owners =
-        hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, token, ctx.file, &names);
+    let owners = usage_attribute_type_candidates(
+        ctx.csharp,
+        token,
+        ctx.file,
+        &ctx.class_ranges,
+        attribute_name,
+        ctx.source,
+    );
     let mut resolution = LabelOwnerResolution::Unknown;
     for owner in owners {
         match receiver_fqn_target_member_resolution(&owner.fq_name(), token, None, None, ctx) {

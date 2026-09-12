@@ -585,6 +585,10 @@ pub fn compile_exact_dependency_production(
     if production_has_errors {
         pack.completeness = Completeness::Partial;
     }
+    // Exactly the version this build mints, not the reader's supported set: the
+    // generated-production cache key is minted from that constant before the
+    // adapter runs, so a pack at any other version would be stored under a key
+    // that does not describe it.
     if pack.producer != producer || pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
         return Err(DependencyProductionFailure::InvalidOutput {
             code: "production.identity_mismatch".to_owned(),

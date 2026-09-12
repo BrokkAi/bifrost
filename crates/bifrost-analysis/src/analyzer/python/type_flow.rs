@@ -812,7 +812,8 @@ fn workspace_class_uses_ordinary_metaclass(
             &prepared,
         ) {
             ClassSeed::Class(identity) => identity,
-            ClassSeed::ClassWithOpenBound(_)
+            ClassSeed::Classes(_)
+            | ClassSeed::ClassWithOpenBound(_)
             | ClassSeed::ClassesWithOpenBound(_)
             | ClassSeed::Unknown(_)
             | ClassSeed::NotApplicable => return false,
@@ -1265,6 +1266,7 @@ fn declaration_reference_seed(
     }
     match resolve_class_at_span(workspace, file.clone(), span_for_node(reference), prepared) {
         ClassSeed::Class(_)
+        | ClassSeed::Classes(_)
         | ClassSeed::ClassWithOpenBound(_)
         | ClassSeed::ClassesWithOpenBound(_) => ClassSeed::Unknown(UnknownReason::ClassObject),
         ClassSeed::Unknown(reason) => ClassSeed::Unknown(reason),
@@ -1607,7 +1609,8 @@ impl PythonTypeFlowAdapter {
                         exact_builtin_class(class, &prepared, overlay.as_deref(), &mut cache)
                             .ok_or_else(|| unmodeled(class))
                     }
-                    ClassSeed::ClassWithOpenBound(_)
+                    ClassSeed::Classes(_)
+                    | ClassSeed::ClassWithOpenBound(_)
                     | ClassSeed::ClassesWithOpenBound(_)
                     | ClassSeed::Unknown(_) => Err(unmodeled(class)),
                 }
@@ -1874,12 +1877,13 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
 
     fn semantics_version(&self) -> AdapterSemanticsVersion {
         // Keep cached class sets in step with program-point refinement,
-        // guard remainders, scoped writes, open builtin call results, and the
-        // class-object remainder a declared or imported class reference now
-        // seeds.
+        // guard remainders, scoped writes, open builtin call results, the
+        // class-object remainder a declared or imported class reference
+        // seeds, and the classes a guard's true arm now proves about a
+        // remainder.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-v35",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-guard-proved-classes-v36",
         )
         .expect("adapter name is non-empty")
     }
@@ -2749,6 +2753,66 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             GuardPredicate::ConstantBoolean { .. }
             | GuardPredicate::ConstantEquality { .. }
             | GuardPredicate::Opaque { .. } => unknown(),
+        }
+    }
+
+    fn guard_proves_classes(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        guard: &GuardFact,
+    ) -> ClassSeed {
+        // Only a class predicate says what an unnamed value is. `hasattr`
+        // proves one attribute, a truth test proves the value is not `None`,
+        // and a null comparison proves only `NoneType`, which has no members
+        // this domain would gain by naming.
+        let (classes, names_the_runtime_class) = match guard.predicate {
+            GuardPredicate::InstanceOf { classes, .. } => (classes, false),
+            // `type(value) is C` names the runtime class on the true arm;
+            // `type(value) is not C` states it on the false arm, so its true
+            // arm proves nothing at all.
+            GuardPredicate::ExactClass {
+                classes,
+                exact_on_true: true,
+                ..
+            } => (classes, true),
+            GuardPredicate::ExactClass { .. }
+            | GuardPredicate::ConstantBoolean { .. }
+            | GuardPredicate::ConstantEquality { .. }
+            | GuardPredicate::NullComparison { .. }
+            | GuardPredicate::HasMember { .. }
+            | GuardPredicate::Truthy { .. }
+            | GuardPredicate::Opaque { .. } => return ClassSeed::NotApplicable,
+        };
+        let Ok(classes) = self.guard_classes(workspace, procedure, classes) else {
+            return ClassSeed::NotApplicable;
+        };
+        if classes.is_empty() {
+            return ClassSeed::NotApplicable;
+        }
+        // The same proof `narrowing_verdicts` needs of a guard's operands:
+        // the names must denote the classes the source spells before either
+        // arm may act on them.
+        let overlay = overlay_of(workspace);
+        if !self.guard_classes_have_supported_instance_checks(
+            workspace,
+            &classes,
+            overlay.as_deref(),
+        ) {
+            return ClassSeed::NotApplicable;
+        }
+        // An exact-class test needs no hierarchy: the value is one of the
+        // named classes or it is not. An `isinstance` a subclass also
+        // satisfies leaves the member surface open, which is exactly what an
+        // open bound records.
+        if names_the_runtime_class
+            || classes
+                .iter()
+                .all(|class| self.declared_class_is_closed(workspace, class))
+        {
+            ClassSeed::classes(classes)
+        } else {
+            ClassSeed::classes_with_open_bound(classes)
         }
     }
 

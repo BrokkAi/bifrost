@@ -81,6 +81,7 @@ fn validate_pack_internal(
         type_parameters_by_id: HashMap::new(),
         pack_completeness: pack.completeness,
         pack_id_bytes: pack.pack_id.len(),
+        schema_version: pack.schema_version,
         validate_references,
     };
     validator.validate(pack);
@@ -105,17 +106,18 @@ struct Validator {
     type_parameters_by_id: HashMap<String, Vec<String>>,
     pack_completeness: Completeness,
     pack_id_bytes: usize,
+    schema_version: u32,
     validate_references: bool,
 }
 
 impl Validator {
     fn validate(&mut self, pack: &AuthoredSemanticModelPack) {
-        if pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
+        if !SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&pack.schema_version) {
             self.error(
                 "schema.unsupported_version",
                 "$.schema_version",
                 format!(
-                    "expected schema version {SEMANTIC_MODEL_SCHEMA_VERSION}, found {}",
+                    "expected one of schema versions {SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS:?}, found {}",
                     pack.schema_version
                 ),
             );
@@ -816,6 +818,9 @@ impl Validator {
                             }
                         }
                     }
+                    if fact.ambient_use.is_some() {
+                        self.ambient_use_version(&fact_path);
+                    }
                     for (embedded_index, embedded) in fact.embedded_types.iter().enumerate() {
                         self.type_ref(
                             &format!("{fact_path}.embedded_types[{embedded_index}].target"),
@@ -847,6 +852,9 @@ impl Validator {
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
+                    if fact.ambient_use.is_some() {
+                        self.ambient_use_version(&fact_path);
+                    }
                     if let Some(operation) = &fact.implicit_operation {
                         match operation {
                             ImplicitOperation::CopyConstructor
@@ -3990,6 +3998,24 @@ impl Validator {
     ) {
         self.diagnostics
             .push(Diagnostic::error(code, path, message));
+    }
+
+    /// A reader that accepts more than one schema version must still hold each
+    /// pack to the shape its own version number promises. A version-two reader
+    /// rejects unknown fields, so a version-two pack carrying `ambient_use`
+    /// would load here and fail there, which is the failure the new version
+    /// number exists to prevent.
+    fn ambient_use_version(&mut self, fact_path: &str) {
+        if self.schema_version < AMBIENT_USE_MIN_SCHEMA_VERSION {
+            self.error(
+                "schema.ambient_use_requires_version",
+                format!("{fact_path}.ambient_use"),
+                format!(
+                    "ambient_use requires schema version {AMBIENT_USE_MIN_SCHEMA_VERSION}, found {}",
+                    self.schema_version
+                ),
+            );
+        }
     }
 }
 

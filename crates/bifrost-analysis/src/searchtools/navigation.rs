@@ -791,7 +791,7 @@ pub fn get_symbol_locations_with_cancellation(
                     .map(|content| line_count(&content))
                     .unwrap_or(0);
                 Some(SymbolLocation {
-                    symbol: display_symbol_for_target(&code_unit),
+                    symbol: display_symbol_for_target(analyzer, &code_unit),
                     path: rel_path_string(code_unit.source()),
                     loc,
                     start_line: primary_range.start_line,
@@ -948,6 +948,7 @@ fn get_navigation_by_location_with_cancellation(
             reference: None,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
+                claim: None,
                 kind: "too_many_references".to_string(),
                 message: format!(
                     "{tool_name} accepts at most {DEFINITION_LOOKUP_MAX_REFERENCES} references per call"
@@ -1014,6 +1015,7 @@ fn get_navigation_by_location_with_cancellation(
                     definitions,
                     diagnostics: if conflict {
                         vec![DefinitionDiagnostic {
+                            claim: None,
                             kind: "semantic_model_conflict".to_string(),
                             message: "the model URI resolves to conflicting active declarations"
                                 .to_string(),
@@ -1049,6 +1051,7 @@ fn get_navigation_by_location_with_cancellation(
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "ambiguous_path".to_string(),
                         message: format!(
                             "`{}` is ambiguous; matches: {}",
@@ -1068,6 +1071,7 @@ fn get_navigation_by_location_with_cancellation(
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "path_not_found".to_string(),
                         message: format!("`{path}` does not resolve to a workspace file"),
                     }],
@@ -1126,6 +1130,7 @@ fn semantic_model_navigation_candidates(
     }
     if relations.len() != 1 || relations[0].provenance.ambiguous {
         return Err(DefinitionDiagnostic {
+            claim: None,
             kind: "semantic_model_conflict".to_string(),
             message: format!(
                 "`{}` has conflicting active semantic-model navigation targets; no definition was selected",
@@ -1147,6 +1152,7 @@ fn semantic_model_navigation_candidates(
         }
         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
             return Err(DefinitionDiagnostic {
+                claim: None,
                 kind: "semantic_model_conflict".to_string(),
                 message: format!(
                     "the navigation target `{}` resolves to conflicting active semantic-model declarations",
@@ -1170,6 +1176,7 @@ fn semantic_model_navigation_candidates(
             }
         }
         CodeUnitResolution::Ambiguous(_) => Err(DefinitionDiagnostic {
+            claim: None,
             kind: "semantic_model_conflict".to_string(),
             message: format!(
                 "the navigation target `{}` is ambiguous in authored source; no definition was selected",
@@ -1187,6 +1194,7 @@ fn unresolved_semantic_model_navigation(
     target: &str,
 ) -> DefinitionDiagnostic {
     DefinitionDiagnostic {
+        claim: None,
         kind: "semantic_model_target_not_found".to_string(),
         message: format!(
             "`{}` navigates to `{target}`, but that target is absent from authored source and the active semantic model",
@@ -1212,6 +1220,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                 reference: None,
                 types: Vec::new(),
                 diagnostics: vec![DefinitionDiagnostic {
+                    claim: None,
                     kind: "too_many_references".to_string(),
                     message: format!(
                         "get_type_by_location accepts at most {TYPE_LOOKUP_MAX_REFERENCES} references per call"
@@ -1248,6 +1257,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                     reference: None,
                     types: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "ambiguous_path".to_string(),
                         message: format!(
                             "`{}` is ambiguous; matches: {}",
@@ -1264,6 +1274,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                     reference: None,
                     types: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "path_not_found".to_string(),
                         message: format!("`{path}` does not resolve to a workspace file"),
                     }],
@@ -1448,6 +1459,7 @@ pub(super) fn rename_symbol_failure(
         old_name: None,
         edits: Vec::new(),
         diagnostics: vec![DefinitionDiagnostic {
+            claim: None,
             kind: kind.to_string(),
             message,
         }],
@@ -1558,12 +1570,14 @@ pub(super) fn render_definition_lookup(
         .diagnostics
         .into_iter()
         .map(|diagnostic| DefinitionDiagnostic {
+            claim: None,
             message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
             kind: diagnostic.kind,
         })
         .collect();
     if source_unavailable {
         diagnostics.push(DefinitionDiagnostic {
+            claim: None,
             kind: "source_unavailable".to_string(),
             message: format!(
                 "not all definition targets could be rendered: {:?}, lexical definition: {:?}",
@@ -1759,6 +1773,7 @@ pub(super) fn render_definition_lookup(
                         } else {
                             status = "ambiguous".to_string();
                             diagnostics.push(DefinitionDiagnostic {
+            claim: None,
                                 kind: "semantic_model_conflict".to_string(),
                                 message: format!(
                                     "`{target}` matches conflicting active semantic-model declarations; no definition was selected"
@@ -2066,6 +2081,7 @@ pub(super) fn render_type_lookup(
         .diagnostics
         .into_iter()
         .map(|diagnostic| DefinitionDiagnostic {
+            claim: None,
             message: external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
             kind: diagnostic.kind,
         })
@@ -2125,6 +2141,7 @@ pub(super) fn enrich_location_diagnostics(
         diagnostic.message = message;
     } else {
         diagnostics.push(DefinitionDiagnostic {
+            claim: None,
             kind: "location_context".to_string(),
             message,
         });
@@ -2219,11 +2236,11 @@ pub fn get_symbol_ancestors(
                     let mut ancestor_names = provider
                         .get_ancestors(&code_unit)
                         .into_iter()
-                        .map(|ancestor| display_symbol_for_target(&ancestor))
+                        .map(|ancestor| display_symbol_for_target(analyzer, &ancestor))
                         .collect::<Vec<_>>();
                     append_active_universal_root(analyzer, &code_unit, &mut ancestor_names);
                     resolved.push(SymbolAncestors {
-                        symbol: display_symbol_for_target(&code_unit),
+                        symbol: display_symbol_for_target(analyzer, &code_unit),
                         ancestors: ancestor_names,
                     });
                 }
@@ -2823,6 +2840,10 @@ pub(super) fn collect_ranked_names_by(
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
         .collect();
+    prefetch_display_symbols(
+        analyzer,
+        candidates.iter().map(|candidate| &candidate.code_unit),
+    );
     // One pass over the file for every candidate's name range rather than a
     // root walk per candidate (see `name_ranges_for_declarations`).
     let display_lines: Vec<usize> = {
@@ -2858,6 +2879,9 @@ pub(super) fn collect_ranked_names_by(
                     .then(|| matched.records[0].provenance.clone())
             });
             let is_type_alias = candidate.is_type_alias;
+            // One declaration, one selector: the hits below differ only by
+            // rendered signature.
+            let symbol = display_symbol_for_target(analyzer, &candidate.code_unit);
             let signatures = {
                 let _scope = profiling::scope(
                     "searchtools::search_symbols.render.collect_hits.display_signatures",
@@ -2867,7 +2891,7 @@ pub(super) fn collect_ranked_names_by(
             signatures
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
-                    symbol: display_symbol_for_target(&candidate.code_unit),
+                    symbol: symbol.clone(),
                     signature,
                     line,
                     is_type_alias,

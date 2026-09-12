@@ -20,18 +20,19 @@ use crate::analyzer::semantic_model::csmi::{
     CsmiTypeExpression,
 };
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    CollectionFlowFact, CollectionFlowsPayload, Completeness, ExactArtifact, ExternalArtifactKind,
-    ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator, MemberFact,
-    MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, ReceiverFact, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, carried_source_paths, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    ActivationSelector, AmbientUseRole, ArtifactProducerLimits, ArtifactProduction,
+    ArtifactProductionRequest, AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard,
+    BoundedProducerDiagnostics, CollectionFlowFact, CollectionFlowsPayload, Completeness,
+    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, ReceiverFact, Signature, TypeFact,
+    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use crate::hash::HashMap;
+use brokk_bifrost_jvm::scala::ambient_use::{scala_declaration_ambient_use, scala_has_modifier};
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaSourceFacts, ScalaTypeExpressionPath,
     scala_source_facts_from_tree,
@@ -387,12 +388,13 @@ fn scala_entry_facts(
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
         let fact = TypeFact {
+            ambient_use: scala_declaration_ambient_use(node),
             id: type_id,
             name,
             type_kind,
             visibility,
-            is_abstract: type_kind == TypeKind::Trait || has_modifier(node, "abstract"),
-            is_sealed: has_modifier(node, "sealed"),
+            is_abstract: type_kind == TypeKind::Trait || scala_has_modifier(node, "abstract"),
+            is_sealed: scala_has_modifier(node, "sealed"),
             has_explicit_type_terms: false,
             type_parameters,
             type_parameter_constraints: Vec::new(),
@@ -410,9 +412,11 @@ fn scala_entry_facts(
         };
         if let Some(&existing_index) = type_index_by_name.get(&fact.name) {
             let existing: &mut TypeFact = &mut types[existing_index];
+            let ambient_use = weaker_ambient_use(existing.ambient_use, fact.ambient_use);
             if existing.type_kind == TypeKind::Module && fact.type_kind != TypeKind::Module {
                 *existing = fact;
             }
+            existing.ambient_use = ambient_use;
             continue;
         }
         if !take_record(remaining_records, record_limit_hit) {
@@ -520,6 +524,7 @@ fn scala_entry_facts(
             && !is_static
             && matches!(member_kind, MemberKind::Method);
         members.push(MemberFact {
+            ambient_use: scala_declaration_ambient_use(node),
             id,
             owner: owner_id.clone(),
             name,
@@ -529,7 +534,7 @@ fn scala_entry_facts(
             is_abstract: source_facts.abstract_callable_ranges.contains(&range_key),
             is_virtual: member_kind == MemberKind::Method
                 && !is_static
-                && !has_modifier(node, "final"),
+                && !scala_has_modifier(node, "final"),
             implicit_operation: None,
             callable_family_complete: false,
             signature,
@@ -558,8 +563,12 @@ fn scala_entry_facts(
     }
 }
 
+/// A constructor a Scala class declares implicitly. Reaching it means writing
+/// `new Widget` or `Widget(..)`, which spells the imported name, so it carries
+/// no contextual role of its own.
 fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
     MemberFact {
+        ambient_use: Some(AmbientUseRole::NotAmbient),
         id: member_declaration_id(MemberIdentity {
             owner_id: &owner.id,
             kind: MemberKind::Constructor,
@@ -1095,20 +1104,26 @@ fn scala_type_ref(path: &ScalaTypeExpressionPath, type_parameters: &[String]) ->
     }
 }
 
-fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if candidate.kind() == modifier {
-            return true;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(
-            candidate
-                .children(&mut cursor)
-                .filter(|child| child.kind() == "modifiers"),
-        );
+/// The weaker of two contextual claims that share one published name.
+///
+/// A companion `class` and `object` are two declarations one import binds
+/// together, and this producer publishes them as a single named type record.
+/// `NotAmbient` is therefore a claim about the name, not about one of the two
+/// declarations, and it survives only when both make it: `class Widget` beside
+/// `implicit object Widget` must keep the doubt the object introduces.
+fn weaker_ambient_use(
+    left: Option<AmbientUseRole>,
+    right: Option<AmbientUseRole>,
+) -> Option<AmbientUseRole> {
+    let contextual = |role| matches!(role, Some(AmbientUseRole::Implicit | AmbientUseRole::Given));
+    if contextual(left) {
+        return left;
     }
-    false
+    if contextual(right) {
+        return right;
+    }
+    (left == Some(AmbientUseRole::NotAmbient) && right == Some(AmbientUseRole::NotAmbient))
+        .then_some(AmbientUseRole::NotAmbient)
 }
 
 fn apply_extension_surfaces(types: &mut [TypeFact], surfaces: Vec<(Vec<String>, String)>) {

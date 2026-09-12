@@ -60,6 +60,10 @@ pub struct DefinitionCandidate {
 pub struct DefinitionDiagnostic {
     pub kind: String,
     pub message: String,
+    /// The structured indexing claim, when this diagnostic makes one (see
+    /// `UnindexedClaim`). Absent from the payload when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<crate::analyzer::usages::get_definition::UnindexedClaim>,
 }
 
 #[derive(
@@ -1766,7 +1770,7 @@ pub(super) fn distinct_definitions(
         let language = language_for_target(unit);
         if language == Language::Scala {
             scala_fqns_by_display
-                .entry(display_symbol_for_target(unit))
+                .entry(display_symbol_for_target(analyzer, unit))
                 .or_default()
                 .insert(unit.fq_name());
         }
@@ -1788,7 +1792,7 @@ pub(super) fn distinct_definitions(
             .get(&fqn)
             .is_some_and(|sources| sources.len() > 1);
         let scala_companion_display = (language_for_target(&unit) == Language::Scala)
-            .then(|| display_symbol_for_target(&unit))
+            .then(|| display_symbol_for_target(analyzer, &unit))
             .filter(|display| {
                 scala_fqns_by_display
                     .get(display)
@@ -2173,6 +2177,7 @@ mod tests {
         cancelled.diagnostics.push(DefinitionLookupDiagnostic {
             kind: "cancelled".to_string(),
             message: "cancelled fixture lookup".to_string(),
+            claim: None,
         });
         let result = crate::searchtools::definitions::collapse_context_outcomes(
             &analyzer,

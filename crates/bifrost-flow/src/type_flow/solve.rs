@@ -22,8 +22,8 @@ use brokk_bifrost_core::profiling;
 use crate::analyzer::semantic::{
     CandidateCoverage, ClassAtom, ClassIdentity, DispatchHint, DispatchHintCallSiteKey,
     DispatchHintSet, DispatchHints, IcfgProvider, MemberAccessKind, MemberLookup, MemberLookupHit,
-    ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SourceSite, TypeFlowAdapter,
-    UnknownReason, WorkspaceIcfgProvider,
+    ProcedureHandle, SemanticBudget, SemanticBudgetExceeded, SourceSite, SourceSiteKind,
+    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{AnalyzerQueryScope, WorkspaceAnalyzer};
@@ -1357,10 +1357,12 @@ fn reached_class_set(
                     // Fact interning order differs between fresh propagation
                     // and bulk summary replay. Choose one stable representative
                     // origin per class independently of that order so class-set
-                    // rows and finding witnesses remain exact.
-                    if source_site
-                        .file
-                        .cmp(&existing_site.file)
+                    // rows and finding witnesses remain exact. A guard arm
+                    // proves a class without producing the value, so it yields
+                    // to any site that did produce one.
+                    if narrowing_guard_rank(source_site)
+                        .cmp(&narrowing_guard_rank(existing_site))
+                        .then_with(|| source_site.file.cmp(&existing_site.file))
                         .then_with(|| source_site.span.cmp(&existing_site.span))
                         .then_with(|| candidate_key.cmp(existing_key))
                         .is_lt()
@@ -1460,6 +1462,11 @@ fn reached_class_set(
         dynamic_writes,
         status,
     }
+}
+
+/// Orders a guard-proved origin after every origin that produced a value.
+fn narrowing_guard_rank(site: &SourceSite) -> u8 {
+    u8::from(site.kind == SourceSiteKind::NarrowingGuard)
 }
 
 fn push_reason(reasons: &mut Vec<UnknownReason>, reason: UnknownReason) {

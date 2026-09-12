@@ -3256,6 +3256,7 @@ fn bounded_scala_ambiguous_candidates(
     let mut outcome = candidates_outcome(candidates);
     outcome.status = DefinitionLookupStatus::Ambiguous;
     outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        claim: None,
         kind: "ambiguous_definition".to_string(),
         message,
     });
@@ -4219,9 +4220,12 @@ fn resolve_scala_with_context(
                     // gated upstream: resolver verdict — the explicit-import
                     // target is bound but not indexed (the workspace check is the
                     // resolver's).
-                    return boundary_unchecked(format!(
-                        "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                    ));
+                    return boundary_unchecked(
+                        format!(
+                            "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                        ),
+                        UnindexedClaim::external_boundary(text, ClaimSubjectRole::Any),
+                    );
                 }
                 ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
@@ -4248,6 +4252,7 @@ fn resolve_scala_with_context(
                 format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
                 ),
+                UnindexedClaim::external_boundary(text, ClaimSubjectRole::Any),
                 "no_indexed_definition",
                 format!("`{text}` did not resolve to an indexed Scala definition"),
             )
@@ -4455,9 +4460,15 @@ fn scala_import_reference_outcome(
                         // gated upstream: `scala_fqn_probe` just above returns
                         // early for any workspace-indexed declaration; this arm is
                         // the package-segment-without-target residual.
-                        return Some(boundary_unchecked(format!(
-                            "`{prefix}` is a Scala import package segment without a declaration target"
-                        )));
+                        return Some(boundary_unchecked(
+                            format!(
+                                "`{prefix}` is a Scala import package segment without a declaration target"
+                            ),
+                            UnindexedClaim::external_boundary(
+                                prefix.clone(),
+                                ClaimSubjectRole::Module,
+                            ),
+                        ));
                     }
                 }
             }
@@ -4506,9 +4517,12 @@ fn scala_import_reference_outcome(
     // for any workspace-indexed import target, so this is reached only when a
     // relevant import's declaration is genuinely absent from the index.
     saw_relevant.then(|| {
-        boundary_unchecked(format!(
-            "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
-        ))
+        boundary_unchecked(
+            format!(
+                "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
+        )
     })
 }
 
@@ -4990,14 +5004,18 @@ fn resolve_scala_focused_qualified_path(
             // verdict that the name is bound by an explicit import whose target
             // the workspace does not index — the workspace check lives in the
             // resolver, so this arm cannot fabricate a claim the resolver did not.
-            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-            )),
-            ScalaNameResolution::Unresolved if missing_singleton_import => {
-                boundary_unchecked(format!(
+            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
+                format!(
                     "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                ))
-            }
+                ),
+                UnindexedClaim::external_boundary(root_name, ClaimSubjectRole::Any),
+            ),
+            ScalaNameResolution::Unresolved if missing_singleton_import => boundary_unchecked(
+                format!(
+                    "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                ),
+                UnindexedClaim::external_boundary(root_name, ClaimSubjectRole::Any),
+            ),
             // The receiver-position caret of a written `Owner.member` path:
             // `Collections` in `Collections.sort`. The owner is what did not
             // resolve, and the member it qualifies is what decides whether the
@@ -5042,6 +5060,7 @@ fn scala_focused_owner_boundary(
         format!(
             "`{spelling}` appears to cross a Scala import boundary not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(spelling, ClaimSubjectRole::Member),
         "no_indexed_definition",
         format!("`{display}` did not resolve to an indexed Scala owner"),
     )
@@ -5685,9 +5704,12 @@ fn resolve_scala_parser_proven_term_role(
             },
             // gated upstream: resolver-verdict arm (workspace check is the
             // resolver's -- see the sibling arm's note above).
-            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-            )),
+            ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
+                format!(
+                    "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                ),
+                UnindexedClaim::external_boundary(root_name, ClaimSubjectRole::Any),
+            ),
             ScalaNameResolution::Ambiguous(_) => no_definition(
                 "ambiguous_scala_term_namespace",
                 format!("`{display_name}` resolves to multiple physical Scala objects"),
@@ -5709,9 +5731,12 @@ fn resolve_scala_parser_proven_term_role(
                     ),
                     // gated upstream: resolver-verdict arm (workspace check is
                     // the resolver's).
-                    ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                        "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                    )),
+                    ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
+                        format!(
+                            "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                        ),
+                        UnindexedClaim::external_boundary(root_name, ClaimSubjectRole::Any),
+                    ),
                     ScalaNameResolution::Ambiguous(_) => no_definition(
                         "ambiguous_scala_term_namespace",
                         format!(
@@ -5775,9 +5800,12 @@ fn resolve_scala_parser_proven_term_role(
             call_site_shape_for_reference(node).as_ref(),
         ),
         // gated upstream: resolver-verdict arm (workspace check is the resolver's).
-        ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-            "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-        )),
+        ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
+            format!(
+                "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
+        ),
         ScalaNameResolution::Ambiguous(_) => no_definition(
             "ambiguous_scala_term_namespace",
             format!("`{name}` resolves to multiple physical Scala objects"),
@@ -5794,9 +5822,12 @@ fn resolve_scala_parser_proven_term_role(
                     call_site_shape_for_reference(node).as_ref(),
                 ),
                 // gated upstream: resolver-verdict arm (workspace check is the resolver's).
-                ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
-                    "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                )),
+                ScalaNameResolution::MissingExplicitImport => boundary_unchecked(
+                    format!(
+                        "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
+                ),
                 ScalaNameResolution::Ambiguous(_) => no_definition(
                     "ambiguous_scala_term_namespace",
                     format!("`{name}` resolves to multiple physical Scala extractor classes"),
@@ -7071,9 +7102,12 @@ fn resolve_scala_type(
         // gated upstream: the enclosing lexical-namespace probe (Stage B) above
         // already ran and found nothing, exactly as the non-local sibling does
         // (#1158); only then does the deferred local-import boundary fire.
-        return boundary_unchecked(format!(
-            "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
-        ));
+        return boundary_unchecked(
+            format!(
+                "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(text, ClaimSubjectRole::Type),
+        );
     }
     if !type_segments.is_empty() {
         match resolver
@@ -7084,9 +7118,12 @@ fn resolve_scala_type(
             }
             // gated upstream: resolver-verdict arm (workspace check is the resolver's).
             ScalaNameResolution::MissingExplicitImport => {
-                return boundary_unchecked(format!(
-                    "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                ));
+                return boundary_unchecked(
+                    format!(
+                        "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                    ),
+                    UnindexedClaim::external_boundary(text, ClaimSubjectRole::Type),
+                );
             }
             ScalaNameResolution::Ambiguous(_) => {
                 return no_definition(
@@ -7126,9 +7163,12 @@ fn resolve_scala_type(
                 }
                 // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => {
-                    return boundary_unchecked(format!(
-                        "`{intrinsic}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                    ));
+                    return boundary_unchecked(
+                        format!(
+                            "`{intrinsic}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                        ),
+                        UnindexedClaim::external_boundary(intrinsic, ClaimSubjectRole::Type),
+                    );
                 }
                 ScalaNameResolution::Ambiguous(owners) => {
                     return scala_ambiguous_outcome(
@@ -7163,6 +7203,7 @@ fn resolve_scala_type(
             )
         },
         format!("`{text}` appears to cross a Scala import boundary not indexed in this workspace"),
+        UnindexedClaim::external_boundary(text, ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala type"),
     )
@@ -7803,9 +7844,12 @@ fn resolve_scala_call(
                 }
                 // gated upstream: resolver-verdict arm (workspace check is the resolver's).
                 ScalaNameResolution::MissingExplicitImport => {
-                    return boundary_unchecked(format!(
-                        "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
-                    ));
+                    return boundary_unchecked(
+                        format!(
+                            "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                        ),
+                        UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
+                    );
                 }
                 ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
@@ -7880,16 +7924,20 @@ fn resolve_scala_call(
                 // gated upstream: every workspace tier above has already failed
                 // to bind `name`, and the owner's supertype closure is provably
                 // not fully indexed, so the declaration can only be outside it.
-                return boundary_unchecked(format!(
-                    "`{name}` may be declared by a supertype of `{}` that is not indexed in this workspace",
-                    owner.fq_name()
-                ));
+                return boundary_unchecked(
+                    format!(
+                        "`{name}` may be declared by a supertype of `{}` that is not indexed in this workspace",
+                        owner.fq_name()
+                    ),
+                    UnindexedClaim::unindexed_owner(name, ClaimSubjectRole::Member),
+                );
             }
             gated_boundary(
                 || !scala_import_boundary_for_name(ctx.scala, token, ctx.support, ctx.file, name),
                 format!(
                     "`{name}` appears to cross a Scala import boundary not indexed in this workspace"
                 ),
+                UnindexedClaim::external_boundary(name, ClaimSubjectRole::Member),
                 "no_indexed_definition",
                 format!("`{name}` did not resolve to an indexed Scala callable"),
             )
@@ -8460,17 +8508,24 @@ fn scala_unresolved_receiver_outcome(
     unresolved_message: String,
 ) -> DefinitionLookupOutcome {
     let declared = scala_external_member_spelling(ctx, token, root, receiver, member);
-    let boundary_message = match &declared {
-        Some(spelling) => format!(
-            "`{spelling}` appears to cross a Scala import boundary not indexed in this workspace"
+    let (boundary_message, claim) = match &declared {
+        Some(spelling) => (
+            format!(
+                "`{spelling}` appears to cross a Scala import boundary not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(spelling.clone(), ClaimSubjectRole::Member),
         ),
-        None => format!(
-            "`{member}` appears to cross a Scala import boundary not indexed in this workspace"
+        None => (
+            format!(
+                "`{member}` appears to cross a Scala import boundary not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(member, ClaimSubjectRole::Member),
         ),
     };
     gated_boundary(
         || declared.is_none(),
         boundary_message,
+        claim,
         SCALA_UNSUPPORTED_RECEIVER,
         unresolved_message,
     )
@@ -8706,6 +8761,7 @@ fn resolve_scala_stable_identifier(
         format!(
             "`{root_name}` appears to cross a Scala import boundary not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(root_name, ClaimSubjectRole::Any),
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala definition"),
     )
@@ -9019,9 +9075,12 @@ fn scala_explicit_local_member_import_outcome(
     } else if matched_local_import {
         // gated upstream: reached only after exact-member resolution against the
         // matched local import found no indexed candidate.
-        Some(boundary_unchecked(format!(
-            "`{visible_name}` is imported from a local Scala value whose exact member is unavailable"
-        )))
+        Some(boundary_unchecked(
+            format!(
+                "`{visible_name}` is imported from a local Scala value whose exact member is unavailable"
+            ),
+            UnindexedClaim::external_boundary(visible_name, ClaimSubjectRole::Member),
+        ))
     } else {
         None
     }

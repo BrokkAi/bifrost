@@ -399,6 +399,7 @@ fn project_constant(
     };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
+            ambient_use: None,
             id: owner_id.clone(),
             name: owner_name.clone(),
             type_kind: TypeKind::Class,
@@ -427,6 +428,7 @@ fn project_constant(
         returns: Some(return_type.clone()),
     };
     members.push(MemberFact {
+        ambient_use: None,
         id: member_declaration_id(MemberIdentity {
             owner_id: &owner_id,
             kind: MemberKind::Constant,
@@ -723,6 +725,7 @@ fn project_type(
         }
     }
     types.push(TypeFact {
+        ambient_use: None,
         id: owner_id,
         name,
         type_kind,
@@ -796,6 +799,7 @@ fn project_attribute(
         returns: Some(property_type),
     };
     Ok(MemberFact {
+        ambient_use: None,
         id: member_declaration_id(MemberIdentity {
             owner_id,
             kind: MemberKind::Property,
@@ -921,6 +925,7 @@ fn project_method(
             return_type: signature.returns.as_ref(),
         });
         projected.push(MemberFact {
+            ambient_use: None,
             id,
             owner: owner_id.to_owned(),
             name: name.clone(),

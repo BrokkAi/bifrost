@@ -926,6 +926,7 @@ fn resolve_java_type_reference(
         format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(normalized, ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     )
@@ -963,9 +964,12 @@ fn java_explicit_scoped_type_reference(
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
         // above return early for any workspace-internal type; reaching here means
         // the name only resolves once external imports are considered.
-        return Some(boundary_unchecked(format!(
-            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
-        )));
+        return Some(boundary_unchecked(
+            format!(
+                "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+            ),
+            UnindexedClaim::external_boundary(normalized, ClaimSubjectRole::Type),
+        ));
     }
     if java_scoped_type_qualifier_resolves_in_source(session, token, java, file, source, scoped) {
         return Some(no_definition(
@@ -985,6 +989,7 @@ fn java_explicit_scoped_type_reference(
         format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(normalized, ClaimSubjectRole::Type),
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     ))
@@ -1791,6 +1796,7 @@ fn java_unresolved_receiver_outcome(
                 })
         },
         boundary_message,
+        UnindexedClaim::external_boundary(spelling.clone(), ClaimSubjectRole::Member),
         "unsupported_java_receiver",
         unresolved_message,
     )
@@ -2196,6 +2202,9 @@ fn java_bare_name_static_import_or_boundary(
     gated_boundary(
         || !java_import_boundary_for_type(java, token, session, file, name),
         format!("`{name}` appears to cross a Java import boundary not indexed in this workspace"),
+        // A bare name falls through the variable, member and type tiers before
+        // reaching this gate, so its unit kind is not pinned down.
+        UnindexedClaim::external_boundary(name, ClaimSubjectRole::Any),
         "no_indexed_definition",
         format!("`{name}` did not resolve to an indexed Java definition"),
     )
@@ -4546,6 +4555,8 @@ fn java_member_candidates(
         format!(
             "`{owner_fqn}.{member}` is inherited from a Java supertype not indexed in this workspace"
         ),
+        // Reached only with a known arity, so the claimed member is a method.
+        UnindexedClaim::unindexed_owner(format!("{owner_fqn}.{member}"), ClaimSubjectRole::Member),
         "no_accepting_overload",
         format!("no indexed `{owner_fqn}.{member}` overload accepts {expected} arguments"),
     )
@@ -4805,6 +4816,12 @@ fn java_static_import_candidates(
             format!(
                 "`{member}` appears to cross a Java static import boundary at `{}` not indexed in this workspace",
                 external_owners.join(", ")
+            ),
+            // The single unambiguous external route carries the qualified owner
+            // path; competing routes leave only the bare member spelling.
+            UnindexedClaim::external_boundary(
+                external_owner.clone().unwrap_or_else(|| member.to_string()),
+                ClaimSubjectRole::Any,
             ),
             "no_static_import_match",
             format!("`{member}` did not match an indexed Java static import"),

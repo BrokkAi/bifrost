@@ -21,6 +21,7 @@ use super::resolution::{
     default_scope_formation,
 };
 use super::routes::{CuratedExportSurface, IdentityRouteSupport, RouteHopKind};
+use crate::analyzer::model::AmbientUseRole;
 use crate::analyzer::tree_walk::ParentIndex;
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
@@ -318,6 +319,20 @@ pub trait StructuralSpec: Send + Sync + 'static {
         _source: &str,
         _surface: &CuratedExportSurface,
     ) -> Option<RouteHopKind> {
+        None
+    }
+
+    /// The contextual role the declaration at `node` carries: whether importing
+    /// it can consume it without the importing file spelling the imported name.
+    ///
+    /// `node` is a declaration node, located from an analyzer declaration range
+    /// rather than from source text. The answer is a positive syntax fact, so
+    /// `None` means this adapter does not establish a role for this node kind
+    /// and a consumer must treat the declaration as unreviewed. The default is
+    /// `None`, which is the honest answer for a language whose imports cannot be
+    /// consumed without spelling the imported name at all -- absence of the
+    /// spelling already decides those.
+    fn declaration_ambient_use(&self, _node: Node<'_>) -> Option<AmbientUseRole> {
         None
     }
 

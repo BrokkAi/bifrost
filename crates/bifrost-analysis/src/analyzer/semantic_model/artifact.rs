@@ -2066,8 +2066,11 @@ fn validate_text(
     Ok(())
 }
 
+/// Decoding accepts every supported schema version, not only the one this
+/// build mints: an installed artifact keeps loading across a version bump and
+/// is regenerated on its producer's normal cadence.
 fn require_version(version: u32) -> Result<(), ArtifactError> {
-    if version == SEMANTIC_MODEL_SCHEMA_VERSION {
+    if SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&version) {
         Ok(())
     } else {
         Err(ArtifactError::UnsupportedVersion(version))

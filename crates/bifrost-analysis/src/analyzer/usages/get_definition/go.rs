@@ -763,10 +763,16 @@ fn resolve_go_outcome(
             );
         }
         if selector.is_some() && !resolution.resolved_import_packages.is_empty() {
-            return boundary_unchecked(format!(
-                "Go import qualifier is ambiguous across packages {:?}",
-                resolution.resolved_import_packages
-            ));
+            return boundary_unchecked(
+                format!(
+                    "Go import qualifier is ambiguous across packages {:?}",
+                    resolution.resolved_import_packages
+                ),
+                UnindexedClaim::external_boundary_many(
+                    resolution.resolved_import_packages.clone(),
+                    ClaimSubjectRole::Module,
+                ),
+            );
         }
         let mut dot_candidates = Vec::new();
         for package in &resolution.resolved_import_packages {
@@ -810,9 +816,15 @@ fn resolve_go_outcome(
             // target. In particular, a positive external model would make the
             // source declaration itself ambiguous rather than authorizing the
             // indexed candidate alone.
-            return boundary_unchecked(format!(
-                "dot-imported `{reference}` is ambiguous between indexed candidates and external packages {external_packages:?}"
-            ));
+            return boundary_unchecked(
+                format!(
+                    "dot-imported `{reference}` is ambiguous between indexed candidates and external packages {external_packages:?}"
+                ),
+                UnindexedClaim::external_boundary_many(
+                    external_packages.clone(),
+                    ClaimSubjectRole::Module,
+                ),
+            );
         }
         if let [package] = external_packages.as_slice() {
             if go_internal_import_allowed(&importer_package, package)
@@ -860,9 +872,15 @@ fn resolve_go_outcome(
             // predicate above. More than one dot import is structurally
             // ambiguous, so no canonical external member identity can be
             // carried.
-            return boundary_unchecked(format!(
-                "dot-imported packages {external_packages:?} are outside this partial Go workspace analysis"
-            ));
+            return boundary_unchecked(
+                format!(
+                    "dot-imported packages {external_packages:?} are outside this partial Go workspace analysis"
+                ),
+                UnindexedClaim::external_boundary_many(
+                    external_packages.clone(),
+                    ClaimSubjectRole::Module,
+                ),
+            );
         }
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
@@ -1053,9 +1071,15 @@ fn resolve_go_outcome(
         // gated upstream: every retained dot import failed the workspace-path
         // predicate above. More than one package remains structurally
         // ambiguous, so no canonical external member identity can be carried.
-        return boundary_unchecked(format!(
-            "dot-imported packages {external_dot_imports:?} are outside this partial Go workspace analysis"
-        ));
+        return boundary_unchecked(
+            format!(
+                "dot-imported packages {external_dot_imports:?} are outside this partial Go workspace analysis"
+            ),
+            UnindexedClaim::external_boundary_many(
+                external_dot_imports.clone(),
+                ClaimSubjectRole::Module,
+            ),
+        );
     }
     if brokk_bifrost_go::diagnostics::is_predeclared_go_name(reference) {
         return no_definition(
@@ -1114,7 +1138,10 @@ fn go_workspace_package_boundary(
         GoWorkspacePackageStatus::Present => {
             no_definition(no_definition_kind, no_definition_message)
         }
-        GoWorkspacePackageStatus::Absent => boundary_unchecked(boundary_message),
+        GoWorkspacePackageStatus::Absent => boundary_unchecked(
+            boundary_message,
+            UnindexedClaim::external_boundary(import_path, ClaimSubjectRole::Module),
+        ),
         GoWorkspacePackageStatus::Unknown => go_workspace_package_status_unknown(import_path),
     }
 }
@@ -2069,9 +2096,10 @@ fn go_package_selector_chain_outcome(
             binding_node,
         )
         .map(|import_path| {
-            boundary_unchecked(format!(
-                "`{import_path}` is outside this partial Go workspace analysis"
-            ))
+            boundary_unchecked(
+                format!("`{import_path}` is outside this partial Go workspace analysis"),
+                UnindexedClaim::external_boundary(import_path, ClaimSubjectRole::Module),
+            )
         });
     };
     let Some(mut owner_fqn) = go_resolve_inferred_type_fqn(support, token, go, &owner) else {
@@ -2084,9 +2112,10 @@ fn go_package_selector_chain_outcome(
             binding_node,
         )
         .map(|import_path| {
-            boundary_unchecked(format!(
-                "`{import_path}` is outside this partial Go workspace analysis"
-            ))
+            boundary_unchecked(
+                format!("`{import_path}` is outside this partial Go workspace analysis"),
+                UnindexedClaim::external_boundary(import_path, ClaimSubjectRole::Module),
+            )
         });
     };
 
@@ -2294,9 +2323,13 @@ fn go_model_package_call_outcome(
                 canonical_reference.clone(),
                 parameter_count,
             ));
-            boundary_unchecked(format!(
-                "`{canonical_reference}` is declared by an activated external Go model"
-            ))
+            boundary_unchecked(
+                format!("`{canonical_reference}` is declared by an activated external Go model"),
+                UnindexedClaim::resolved_external(
+                    canonical_reference.clone(),
+                    ClaimSubjectRole::Member,
+                ),
+            )
         }
         GoModeledPackageCallResolution::DefinitelyNotApplicable => no_definition(
             GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND,
@@ -2336,9 +2369,10 @@ fn go_model_receiver_target_outcome(
     ));
     // gated upstream: structured workspace type resolution failed before the
     // import-binder identity was offered to the reviewed declaration overlay.
-    let mut outcome = boundary_unchecked(format!(
-        "`{target}` is declared by an activated external Go model"
-    ));
+    let mut outcome = boundary_unchecked(
+        format!("`{target}` is declared by an activated external Go model"),
+        UnindexedClaim::resolved_external(target.clone(), ClaimSubjectRole::Member),
+    );
     let mut reference = site.clone();
     reference.text = target;
     outcome.reference = Some(reference);

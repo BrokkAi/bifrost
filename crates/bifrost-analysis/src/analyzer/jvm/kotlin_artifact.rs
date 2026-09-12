@@ -493,6 +493,7 @@ fn entry_facts(
             signature_limit_hit,
         );
         types.push(TypeFact {
+            ambient_use: None,
             id,
             name: name.clone(),
             type_kind: kind,
@@ -692,6 +693,7 @@ fn entry_facts(
                 return_type: signature.as_ref().and_then(|value| value.returns.as_ref()),
             });
             members.push(MemberFact {
+                ambient_use: None,
                 id,
                 owner: owner_id.clone(),
                 name: name.clone(),
@@ -721,6 +723,7 @@ fn entry_facts(
 
 fn package_fact(entry: &str, name: &str) -> TypeFact {
     TypeFact {
+        ambient_use: None,
         id: type_declaration_id(TypeIdentity {
             ecosystem: "jvm",
             name,

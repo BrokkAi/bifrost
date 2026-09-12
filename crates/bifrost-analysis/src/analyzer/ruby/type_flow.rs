@@ -337,7 +337,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
                 ClassSeed::Class(identity) => ClassSeed::ClassWithOpenBound(identity),
                 ClassSeed::ClassWithOpenBound(identity) => ClassSeed::ClassWithOpenBound(identity),
                 ClassSeed::Unknown(reason) => ClassSeed::Unknown(reason),
-                ClassSeed::ClassesWithOpenBound(classes) => {
+                ClassSeed::Classes(classes) | ClassSeed::ClassesWithOpenBound(classes) => {
                     ClassSeed::ClassesWithOpenBound(classes)
                 }
                 ClassSeed::NotApplicable => ClassSeed::Unknown(UnknownReason::UnresolvedCall),

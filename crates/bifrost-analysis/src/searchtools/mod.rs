@@ -1,6 +1,7 @@
 use crate::analyzer::common::{
     display_identifier_for_target, display_parent_symbol_for_target, display_symbol_for_target,
     display_symbol_name, is_scala_object_like, language_for_file, language_for_target,
+    parent_fq_name_for_target, prefetch_display_symbols,
 };
 use crate::analyzer::declaration_range::{
     DeclarationNameRangeContext, code_unit_declaration_name_range,

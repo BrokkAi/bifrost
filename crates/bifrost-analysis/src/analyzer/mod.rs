@@ -45,7 +45,7 @@ pub(crate) use rust::generated_model::{
     is_generated_function as is_rust_generated_function,
     resolve_generated_functions as resolve_rust_generated_functions,
 };
-mod scala;
+pub(crate) mod scala;
 pub mod semantic;
 pub mod semantic_model;
 mod source_ingestion;

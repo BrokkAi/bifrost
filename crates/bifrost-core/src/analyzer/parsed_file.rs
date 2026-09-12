@@ -246,6 +246,19 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
+        // Every declaration range is 1-based and ordered: that is what
+        // `node_range` produces, what the store persists, and what each
+        // consumer of a stored range reads (#2428). An adapter that assembles
+        // a range from raw tree-sitter rows can silently record a 0-based one
+        // -- Scala's recovered `class Foo:` header did (#3303) -- so the
+        // convention is checked where the range is recorded rather than where
+        // some later reader is one line off.
+        debug_assert!(
+            range.start_line >= 1
+                && range.start_line <= range.end_line
+                && range.start_byte <= range.end_byte,
+            "declaration range must be 1-based and ordered: {range:?} for {code_unit:?}"
+        );
         self.record_navigation_range(code_unit.clone(), range);
         let inserted = self.insert_declaration(code_unit.clone());
 
@@ -747,8 +760,8 @@ mod tests {
         Range {
             start_byte,
             end_byte: start_byte + 1,
-            start_line: 0,
-            end_line: 0,
+            start_line: 1,
+            end_line: 1,
         }
     }
 

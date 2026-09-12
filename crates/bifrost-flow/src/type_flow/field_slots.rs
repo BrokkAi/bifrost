@@ -2033,6 +2033,10 @@ fn push_class(digest: &mut LengthDelimitedDigest, class: &ClassIdentity) {
     }
 }
 
+/// A field slot's sources are the class-producing sites this index collects
+/// from declarations and stores. A guard arm proves a class inside one root's
+/// plan and never seeds a slot, which is why the persisted vocabulary does not
+/// name it.
 const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
     match kind {
         SourceSiteKind::ConstructorCall => "constructor_call",
@@ -2041,6 +2045,9 @@ const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
         SourceSiteKind::DeclaredParameter => "declared_parameter",
         SourceSiteKind::RootReceiver => "root_receiver",
         SourceSiteKind::Unknown => "unknown",
+        SourceSiteKind::NarrowingGuard => {
+            panic!("a field-slot source is never a guard-proved class")
+        }
     }
 }
 

@@ -219,6 +219,18 @@ from dynamic-attribute uncertainty. Policy candidate explanations can replay
 the corresponding class-set projection within their query budget to show
 these reasons without changing the policy verdict.
 
+A class check that does resolve states what its true arm proves about a value
+the class domain could not name. Narrowing classifies named candidates, and a
+remainder is not a class, so an arm that establishes the runtime class replaces
+the remainder there instead of carrying it through. The replacement is the
+exact class set when the check names the runtime class outright or every named
+class is closed under the known workspace hierarchy, and the named classes with
+an open bound otherwise, because a subclass satisfies the same check with a
+member surface the named class does not describe. A receiver whose only
+evidence was the remainder is then named rather than emptied. The false arm
+keeps the remainder, a predicate that proves no class keeps it on both arms,
+and the replacement ends with the arm exactly as the unmodeled remainder does.
+
 Python also derives member-guard summaries from ordinary workspace module
 functions called by an unqualified name, including explicit from-imports,
 with one parameter, local assignments, and one final return. The body must use

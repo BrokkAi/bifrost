@@ -5167,22 +5167,36 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    /// Index only anonymous aggregate declarations from an ordinary C
+    /// Index only anonymous aggregate declarations from an ordinary
     /// function body. Function bodies are otherwise outside the declaration
     /// walk, but their anonymous aggregate owners must exist so structured
     /// local binding inference can name their fields (#2994).
-    fn visit_c_anonymous_local_aggregates_in_function<'tree>(
+    fn visit_anonymous_local_aggregates_in_function<'tree>(
         &mut self,
         function: Node<'tree>,
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
         ancestry: &ParentIndex<'tree>,
     ) {
-        if !self.c_tag_semantics || scope.class_unit.is_some() {
-            return;
-        }
         let Some(body) = cpp_body_node(function) else {
             return;
+        };
+        // A body opens a block scope, so nothing declared in it is a member of
+        // the class the definition may be written inside. Dropping the
+        // aggregate carrier gives an inline member function's body the same
+        // block scope an out-of-line `void C::f()` body already has; without
+        // it a C++ header, where member bodies are usually inline, would keep
+        // none of these owners (#3301).
+        let block_scope;
+        let scope = if scope.class_unit.is_some() {
+            block_scope = ScopeInfo {
+                class_unit: None,
+                declarations_are_fields: false,
+                ..scope.clone()
+            };
+            &block_scope
+        } else {
+            scope
         };
         let mut pending = vec![body];
         while let Some(node) = pending.pop() {
@@ -5190,7 +5204,7 @@ impl<'a> CppVisitor<'a> {
                 continue;
             }
             if node.kind() == "declaration"
-                && self.visit_c_anonymous_local_aggregate_declaration(node, scope, stack, ancestry)
+                && self.visit_anonymous_local_aggregate_declaration(node, scope, stack, ancestry)
             {
                 continue;
             }
@@ -6253,7 +6267,7 @@ impl<'a> CppVisitor<'a> {
         } else if let Some(module) = &scope.module {
             self.parsed.add_child(module.clone(), code_unit);
         }
-        self.visit_c_anonymous_local_aggregates_in_function(node, scope, stack, ancestry);
+        self.visit_anonymous_local_aggregates_in_function(node, scope, stack, ancestry);
     }
 
     /// Recover the namespace lost when tree-sitter promotes an export-macro
@@ -6790,11 +6804,10 @@ impl<'a> CppVisitor<'a> {
             self.add_type_aliases(node, scope, recovered_alias_names, ancestry);
             return;
         }
-        if self.visit_c_anonymous_aggregate_declaration(node, scope, in_class_body, stack, ancestry)
-        {
+        if self.visit_anonymous_aggregate_declaration(node, scope, in_class_body, stack, ancestry) {
             return;
         }
-        if self.visit_c_anonymous_local_aggregate_declaration(node, scope, stack, ancestry) {
+        if self.visit_anonymous_local_aggregate_declaration(node, scope, stack, ancestry) {
             return;
         }
 
@@ -6862,6 +6875,20 @@ impl<'a> CppVisitor<'a> {
             if uses_initializer_body {
                 return;
             }
+        }
+
+        // A function-like macro invocation that expands to declarations keeps
+        // no terminator of its own: the semicolons live in the replacement
+        // body, which is not part of this tree. Tree-sitter recovers one and
+        // reads the macro name as the member type and its argument list as a
+        // parenthesized declarator, so `DISABLE_COPY_ASSIGN_MOVE(ClosedDetect)`
+        // published a field named `ClosedDetect` beside the real constructor
+        // and split every reference to the constructor's name between the two
+        // (#3298). The invented terminator is the whole difference from a real
+        // member: a member terminates itself, and with a terminator the
+        // grammar reads `T (name);` as a declaration rather than a field.
+        if in_class_body && cpp_unterminated_macro_invocation_field(node) {
+            return;
         }
 
         let mut handled_function = false;
@@ -6965,7 +6992,7 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    /// Preserve the member structure of an anonymous C aggregate.
+    /// Preserve the member structure of an anonymous aggregate.
     ///
     /// An anonymous union with no declarator promotes its fields into the
     /// containing aggregate. An anonymous struct/union followed by a named
@@ -6973,7 +7000,12 @@ impl<'a> CppVisitor<'a> {
     /// `sock` and an otherwise unnamed receiver type. Give that receiver type
     /// the declarator's structured nested identity so a later `value.sock.ops`
     /// chain can traverse it without parsing a type spelling (#2407).
-    fn visit_c_anonymous_aggregate_declaration<'tree>(
+    ///
+    /// An anonymous aggregate declares no tag, so there is nothing for the C
+    /// dialect to re-scope and nothing for the C++ dialect to nest: both
+    /// readings of this shape are the same, and both need these members
+    /// (#3301).
+    fn visit_anonymous_aggregate_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
         scope: &ScopeInfo,
@@ -6981,7 +7013,7 @@ impl<'a> CppVisitor<'a> {
         stack: &mut Vec<CppWork<'tree>>,
         ancestry: &ParentIndex<'tree>,
     ) -> bool {
-        if !self.c_tag_semantics || !in_class_body || scope.class_unit.is_none() {
+        if !in_class_body || scope.class_unit.is_none() {
             return false;
         }
         let Some(aggregate) = node.child_by_field_name("type") else {
@@ -7036,7 +7068,7 @@ impl<'a> CppVisitor<'a> {
         true
     }
 
-    /// Give a function-local anonymous C aggregate a structured owner so its
+    /// Give a function-local anonymous aggregate a structured owner so its
     /// direct pointer bindings can be typed by the usage graph.  Unlike an
     /// anonymous aggregate in a class body, there is no source-level tag or
     /// typedef to supply an identity.  The aggregate's CST range is therefore
@@ -7044,15 +7076,14 @@ impl<'a> CppVisitor<'a> {
     /// is consulted.  The declaration's own variable remains a file-level
     /// field projection, while the aggregate body is visited as the generated
     /// class's field list.
-    fn visit_c_anonymous_local_aggregate_declaration<'tree>(
+    fn visit_anonymous_local_aggregate_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
         ancestry: &ParentIndex<'tree>,
     ) -> bool {
-        if !self.c_tag_semantics || scope.class_unit.is_some() || !has_function_scope_ancestor(node)
-        {
+        if scope.class_unit.is_some() || !has_function_scope_ancestor(node) {
             return false;
         }
         let Some(aggregate) = node.child_by_field_name("type") else {
@@ -9851,6 +9882,45 @@ impl RecoveredFunctionLikeFieldDeclarator<'_> {
         }
         depth
     }
+}
+
+/// Whether a class-scope field declaration is really a function-like macro
+/// invocation whose replacement the parser never saw.
+///
+/// The invocation carries no terminator of its own, so tree-sitter invents a
+/// zero-width `;` and reads the macro name as the member's type and the
+/// argument list as a `parenthesized_declarator`. That shape is not a member:
+/// a member terminates itself, and with a real terminator the grammar reads
+/// `T (name);` as a declaration rather than a field. Only an identifier-shaped
+/// type can name the macro being invoked; a builtin type keeps whatever
+/// recovery the ordinary declarator walk makes of it.
+fn cpp_unterminated_macro_invocation_field(node: Node<'_>) -> bool {
+    if node.kind() != "field_declaration" {
+        return false;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return false;
+    };
+    if !matches!(type_node.kind(), "identifier" | "type_identifier") {
+        return false;
+    }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    if declarator.kind() != "parenthesized_declarator" {
+        return false;
+    }
+    let mut invented_terminator = false;
+    for child in children_iter(node) {
+        if child.kind() != ";" {
+            continue;
+        }
+        if !child.is_missing() {
+            return false;
+        }
+        invented_terminator = true;
+    }
+    invented_terminator
 }
 
 pub(crate) fn recovered_function_like_field_declarator<'tree>(
@@ -21374,6 +21444,43 @@ struct Widget {
                     .iter()
                     .any(|unit| unit.is_class() && unit.fq_name() == "T"),
                 "{name}: {declarations:?}"
+            );
+        }
+    }
+
+    /// The same principle for every anonymous aggregate the walk indexes, not
+    /// just the typedef one: a promoted anonymous union in a member list, an
+    /// anonymous struct given a receiver type by its declarator, a
+    /// function-local aggregate, and one inside an inline member function
+    /// body. The C++ reading used to mint none of these, so a pure C++
+    /// workspace indexed no members at all (#3301).
+    #[test]
+    fn anonymous_aggregate_members_are_identical_in_both_dialects() {
+        let sources = [
+            "struct outer { union { int a; float b; }; };\n",
+            "struct outer { struct { int *ops; } sock; };\n",
+            "void run(void) { struct { int v; } item; }\n",
+            "struct outer { int probe() { union { int raw; float scaled; } cell; return cell.raw; } };\n",
+        ];
+        for source in sources {
+            let names = |name: &str| {
+                parse_cpp_declarations(source, name)
+                    .declarations()
+                    .iter()
+                    .map(|unit| unit.fq_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let c_names = names("a.c");
+            let cpp_names = names("a.cpp");
+            assert_eq!(
+                c_names, cpp_names,
+                "an anonymous aggregate declares no tag, so both dialects read {source:?} the same"
+            );
+            assert!(
+                c_names
+                    .iter()
+                    .any(|name| name.contains('.') && name != "outer"),
+                "{source:?} must index the anonymous aggregate's members, got {c_names:?}"
             );
         }
     }

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{
-    ActivePackExtractionGap, ActiveSemanticModelShard, AsciiTransform, CaptureBinding,
-    CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness, EmbeddedTypeFact,
-    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, ImplicitOperation,
-    KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind, ReceiverFact,
-    RelationFact, RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
-    RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValuesPayload,
+    ActivePackExtractionGap, ActiveSemanticModelShard, AmbientUseRole, AsciiTransform,
+    CaptureBinding, CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness,
+    EmbeddedTypeFact, EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind,
+    ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
+    ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels, RuleEmission,
+    RuleTrigger, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValuesPayload,
     SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
     StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
     TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
@@ -227,6 +227,10 @@ pub struct SemanticModelSymbol {
     pub receiver: Option<ReceiverFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub implicit_operation: Option<ImplicitOperation>,
+    /// The declaration's reviewed contextual role, carried through from the
+    /// pack record. `None` means the producer did not review it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient_use: Option<AmbientUseRole>,
     #[serde(skip)]
     pub(crate) extension_receiver: Option<TypeRef>,
     #[serde(skip)]
@@ -4286,6 +4290,7 @@ fn emit_rule_match(
                         type_kind: emitted_kind,
                         ..
                     } => SemanticModelSymbol {
+                        ambient_use: None,
                         id,
                         owner_id: None,
                         name: terminal_name(&name).to_string(),
@@ -4330,6 +4335,7 @@ fn emit_rule_match(
                             None => None,
                         };
                         SemanticModelSymbol {
+                            ambient_use: None,
                             id,
                             owner_id: owner.clone(),
                             name: name.clone(),
@@ -4766,6 +4772,7 @@ fn type_symbol(
         embedded_types: record.embedded_types.clone(),
         receiver: None,
         implicit_operation: None,
+        ambient_use: record.ambient_use,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -4827,6 +4834,7 @@ fn member_symbol(
         embedded_types: Vec::new(),
         receiver: record.receiver,
         implicit_operation: record.implicit_operation.clone(),
+        ambient_use: record.ambient_use,
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
         locator_path: Some(locator_path(&record.locator).to_owned()),
@@ -5472,6 +5480,7 @@ mod tests {
     /// name one.
     fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         SemanticModelSymbol {
+            ambient_use: None,
             id: format!("type.{qualified_name}"),
             owner_id: None,
             name: qualified_name
@@ -5590,6 +5599,7 @@ mod tests {
         signature: Option<Signature>,
     ) -> SemanticModelSymbol {
         let mut symbol = SemanticModelSymbol {
+            ambient_use: None,
             id: id.to_string(),
             owner_id: Some(owner.id.clone()),
             name: name.to_string(),

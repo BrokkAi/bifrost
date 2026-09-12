@@ -137,6 +137,7 @@ fn record_query_read_incomplete(
         .any(|diagnostic| diagnostic.kind == kind)
     {
         result.diagnostics.push(DefinitionDiagnostic {
+            claim: None,
             kind: kind.to_string(),
             message,
         });
@@ -192,6 +193,7 @@ pub(super) fn resolve_definition_context_query(
                     incomplete_reason: Some(DefinitionLookupIncompleteReason::AnalysisFailure),
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "read_failed".to_string(),
                         message: "failed to read source file: not indexed by analyzer".to_string(),
                     }],
@@ -268,10 +270,12 @@ pub(super) fn group_definition_context_symbols(
     match groups.as_slice() {
         [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
         [] => Err(vec![DefinitionDiagnostic {
+            claim: None,
             kind: "symbol_not_found".to_string(),
             message: format!("`{symbol}` does not resolve to a workspace symbol"),
         }]),
         _ => Err(vec![DefinitionDiagnostic {
+            claim: None,
             kind: "ambiguous_symbol".to_string(),
             message: format!(
                 "`{symbol}` is ambiguous; matches: {}",
@@ -292,6 +296,7 @@ pub(super) fn resolve_definition_context_symbol(
 ) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
     if symbol.trim().is_empty() {
         return Err(vec![DefinitionDiagnostic {
+            claim: None,
             kind: "empty_symbol".to_string(),
             message: "symbol must not be empty".to_string(),
         }]);
@@ -330,6 +335,7 @@ pub(super) fn resolve_definition_context_symbol(
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return Err(vec![DefinitionDiagnostic {
+                        claim: None,
                         kind: "ambiguous_path".to_string(),
                         message: format!(
                             "`{}` is ambiguous; matches: {}",
@@ -361,6 +367,7 @@ pub(super) fn resolve_definition_context_symbol(
             group_definition_context_symbols(analyzer, token, symbol, units)
         }
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
+            claim: None,
             kind: "symbol_not_found".to_string(),
             message: path_like_symbol_guidance(
                 symbol,
@@ -377,6 +384,7 @@ pub(super) fn invalid_context_lookup(
     message: &str,
 ) -> DefinitionByReferenceLookupResult {
     let (complete, incomplete_reason) = definition_result_completion(&[DefinitionDiagnostic {
+        claim: None,
         kind: kind.to_string(),
         message: message.to_string(),
     }]);
@@ -387,6 +395,7 @@ pub(super) fn invalid_context_lookup(
         incomplete_reason,
         definitions: Vec::new(),
         diagnostics: vec![DefinitionDiagnostic {
+            claim: None,
             kind: kind.to_string(),
             message: message.to_string(),
         }],
@@ -440,6 +449,7 @@ pub(super) fn collapse_context_outcomes(
     }
 
     let mut diagnostics = vec![DefinitionDiagnostic {
+        claim: None,
         kind: "ambiguous_reference_target".to_string(),
         message:
             "target appears multiple times in context and resolves to different semantic outcomes"
@@ -484,6 +494,7 @@ pub(super) fn render_definition_reference_lookup(
             incomplete_reason,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
+            claim: None,
                 kind: "local_binding_requires_location".to_string(),
                 message: "the target resolves to a lexical binding; use get_definitions_by_location with its source position"
                     .to_string(),
@@ -500,6 +511,7 @@ pub(super) fn render_definition_reference_lookup(
         definition_candidates_with_cache(analyzer, token, &outcome.definitions, render_cache);
     if definitions.len() < candidate_count {
         diagnostics.push(DefinitionDiagnostic {
+            claim: None,
             kind: "source_unavailable".to_string(),
             message: format!(
                 "not all indexed definition candidates could be rendered: {:?}",
@@ -549,6 +561,7 @@ pub(super) fn definition_by_reference_diagnostic(
         _ => external_location_diagnostic_message(&diagnostic.kind, diagnostic.message),
     };
     DefinitionDiagnostic {
+        claim: diagnostic.claim,
         kind: diagnostic.kind,
         message,
     }

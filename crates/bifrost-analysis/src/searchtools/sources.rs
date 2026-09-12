@@ -1098,7 +1098,7 @@ fn source_blocks_for_code_unit_with_cache(
 
         let start_line = find_line_index_for_offset(&line_starts, start_byte) + 1;
         blocks.push(SourceBlock {
-            label: display_symbol_for_target(code_unit),
+            label: display_symbol_for_target(analyzer, code_unit),
             path: rel_path_string(code_unit.source()),
             start_line,
             // Same CR-aware line table as start_line: the line-start index
@@ -1283,7 +1283,7 @@ pub(super) fn module_file_listing_blocks(
         for definition in definitions {
             let file = definition.source().clone();
             if seen.insert(file.clone()) {
-                files.push((file, display_symbol_for_target(code_unit)));
+                files.push((file, display_symbol_for_target(analyzer, code_unit)));
             }
         }
     }

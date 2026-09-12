@@ -1,5 +1,6 @@
 //! Rust structural spec for `query_code`.
 
+use brokk_bifrost_core::analyzer::model::AmbientUseRole;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_terminal_callee, field_name_in_parent, first_named_child, is_field_of, nearest_ancestor,
     node_range,
@@ -554,6 +555,35 @@ impl StructuralSpec for RustStructuralSpec {
             RUST_PATH_CHAIN,
             &["generic_type", "generic_function"],
         )
+    }
+
+    /// Rust consumes an import without spelling its name in one way: a `use`
+    /// can name a trait, and a trait is brought into scope for its *methods*,
+    /// so `use std::io::Write;` followed by `file.write_all(..)` spells the
+    /// method and never the trait. Every kind listed here is one whose uses
+    /// spell the imported name.
+    ///
+    /// An attributed declaration is unknown rather than ordinary:
+    /// [`outer_attributes`] reads the grammar's grouped layout only, a
+    /// procedural macro declaration looks like a function, and an attribute
+    /// macro can transform the declaration that follows it. Neither is a
+    /// source-backed proof without expansion. A trait, a module, a `use` alias
+    /// and every other form are unknown here for the same reason: absence of a
+    /// positive fact, not a negative one.
+    fn declaration_ambient_use(&self, node: Node<'_>) -> Option<AmbientUseRole> {
+        if outer_attributes(node).next().is_some() {
+            return None;
+        }
+        matches!(
+            node.kind(),
+            "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "function_item"
+                | "const_item"
+                | "static_item"
+        )
+        .then_some(AmbientUseRole::NotAmbient)
     }
 
     fn indirection_relation(

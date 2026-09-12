@@ -842,7 +842,7 @@ fn summary_block_for_file_with_cancellation(
     }
     let mut elements = analyzer
         .summary_file_projection(file)
-        .map(|projection| summary_elements_from_file_projection(&projection, file))
+        .map(|projection| summary_elements_from_file_projection(analyzer, &projection, file))
         .unwrap_or_else(|| {
             let mut elements = Vec::new();
             for code_unit in analyzer.top_level_declarations(file) {
@@ -1383,7 +1383,7 @@ fn summary_block_for_code_unit(
     }
 
     Some(SummaryBlock {
-        label: display_symbol_for_target(code_unit),
+        label: display_symbol_for_target(analyzer, code_unit),
         path: rel_path_string(code_unit.source()),
         preamble: file_preamble(analyzer, code_unit.source(), &elements),
         fallback_reason: None,
@@ -1432,10 +1432,12 @@ pub(super) fn summary_elements_for_code_unit_in_file(
 }
 
 pub(super) fn summary_elements_from_file_projection(
+    analyzer: &dyn IAnalyzer,
     projection: &SummaryFileProjection,
     file: &ProjectFile,
 ) -> Vec<SummaryElement> {
     let _scope = profiling::scope("searchtools::summary_elements_from_file_projection");
+    prefetch_display_symbols(analyzer, &projection.declarations);
     let mut elements = Vec::new();
     let mut stack: Vec<_> = projection
         .top_level_declarations
@@ -1460,7 +1462,7 @@ pub(super) fn summary_elements_from_file_projection(
             .map(Vec::as_slice)
             .unwrap_or_default();
         elements.extend(summary_elements_from_signature_data(
-            &code_unit, signatures, ranges,
+            analyzer, &code_unit, signatures, ranges,
         ));
 
         if !code_unit.is_class() && !code_unit.is_module() {
@@ -1535,10 +1537,11 @@ pub(super) fn signature_elements(
 ) -> Vec<SummaryElement> {
     let signatures = analyzer.signatures(code_unit);
     let ranges = analyzer.ranges(code_unit);
-    summary_elements_from_signature_data(code_unit, &signatures, &ranges)
+    summary_elements_from_signature_data(analyzer, code_unit, &signatures, &ranges)
 }
 
 pub(super) fn summary_elements_from_signature_data(
+    analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     signatures: &[String],
     ranges: &[Range],
@@ -1550,6 +1553,11 @@ pub(super) fn summary_elements_from_signature_data(
     let mut ranges = ranges.to_vec();
     ranges.sort_by_key(|range| (range.start_line, range.start_byte));
     let path = rel_path_string(code_unit.source());
+    // One declaration, one selector: every element below describes the same
+    // declaration at a different range, so its printed spellings are resolved
+    // once rather than once per overload.
+    let symbol = display_symbol_for_target(analyzer, code_unit);
+    let parent_symbol = display_parent_symbol_for_target(analyzer, code_unit);
     let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
 
     let element_count = if signatures.len() == 1 {
@@ -1587,12 +1595,12 @@ pub(super) fn summary_elements_from_signature_data(
             let end_line = start_line + line_count.saturating_sub(1);
             Some(SummaryElement {
                 path: path.clone(),
-                symbol: display_symbol_for_target(code_unit),
+                symbol: symbol.clone(),
                 kind: code_unit_kind_name(code_unit.kind()).to_string(),
                 start_line,
                 end_line,
                 text,
-                parent_symbol: display_parent_symbol_for_target(code_unit),
+                parent_symbol: parent_symbol.clone(),
                 presentation: None,
             })
         })

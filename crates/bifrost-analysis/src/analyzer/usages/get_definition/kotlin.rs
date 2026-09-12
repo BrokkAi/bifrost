@@ -1487,6 +1487,7 @@ fn kotlin_type_reference_outcome(
                 format!(
                     "`{spelled}` appears to cross a Kotlin import boundary not indexed in this workspace"
                 ),
+                UnindexedClaim::external_boundary(spelled.clone(), ClaimSubjectRole::Type),
                 "no_indexed_definition",
                 format!("`{spelled}` is not indexed as a Kotlin type"),
             )
@@ -2008,6 +2009,7 @@ fn kotlin_unresolved_receiver_outcome(
         format!(
             "`{spelling}` appears to cross a Kotlin import boundary not indexed in this workspace"
         ),
+        UnindexedClaim::external_boundary(spelling.clone(), ClaimSubjectRole::Member),
         unresolved_kind,
         unresolved_message,
     )

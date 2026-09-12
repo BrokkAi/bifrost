@@ -943,6 +943,7 @@ fn module_type_drafts(
                     .collect();
                 TypeDraft {
                     fact: TypeFact {
+                        ambient_use: None,
                         id: type_declaration_id(TypeIdentity {
                             ecosystem: "go",
                             name: &name,
@@ -1199,6 +1200,7 @@ fn collect_type_draft(
     }
     types.push(TypeDraft {
         fact: TypeFact {
+            ambient_use: None,
             id: type_id.clone(),
             name: canonical_name.clone(),
             type_kind,
@@ -1605,6 +1607,7 @@ fn push_member(
         .unwrap_or_default();
     members.push(MemberDraft {
         fact: MemberFact {
+            ambient_use: None,
             id,
             owner: owner_id.to_owned(),
             name,
