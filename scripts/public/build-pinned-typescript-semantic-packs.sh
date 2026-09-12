@@ -11,6 +11,8 @@ work_dir=$2
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/semantic-pack-tool.sh
 source "$script_directory/../lib/semantic-pack-tool.sh"
+# shellcheck source=scripts/lib/semantic-pack-source.sh
+source "$script_directory/../lib/semantic-pack-source.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 compiler_archive="${input_dir}/typescript-7.0.2.tgz"
 library_archive="${input_dir}/typescript-linux-x64-7.0.2.tgz"
@@ -19,14 +21,16 @@ library_root="${input_dir}/typescript-linux-x64-7.0.2-package"
 source_dir="${input_dir}/typescript-7.0.2"
 
 mkdir -p "${input_dir}"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${compiler_archive}" \
-  "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${library_archive}" \
-  "https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz"
+fetch_pinned_archive \
+  "${compiler_archive}" \
+  "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz" \
+  "da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08" \
+  "typescript-7.0.2.tgz"
+fetch_pinned_archive \
+  "${library_archive}" \
+  "https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz" \
+  "7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3" \
+  "typescript-linux-x64-7.0.2.tgz"
 
 cd "${input_dir}"
 shasum -a 256 --check <<'CHECKSUMS'

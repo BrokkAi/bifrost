@@ -12,14 +12,17 @@ cache_root=${3:-}
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/semantic-pack-tool.sh
 source "$script_directory/../lib/semantic-pack-tool.sh"
+# shellcheck source=scripts/lib/semantic-pack-source.sh
+source "$script_directory/../lib/semantic-pack-source.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 typeshed_dir="${work_dir}/typeshed"
 
 mkdir -p "${input_dir}" "${typeshed_dir}"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${input_dir}/typeshed-1620e225476597f34177351ef913dc8390dade30.tar.gz" \
-  "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz"
+fetch_pinned_archive \
+  "${input_dir}/typeshed-1620e225476597f34177351ef913dc8390dade30.tar.gz" \
+  "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz" \
+  "e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626" \
+  "typeshed-1620e225476597f34177351ef913dc8390dade30.tar.gz"
 
 cd "${input_dir}"
 shasum -a 256 --check <<'CHECKSUMS'

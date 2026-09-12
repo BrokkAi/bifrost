@@ -90,6 +90,11 @@ function writeFile(root, relativePath, contents) {
   fs.writeFileSync(target, contents, "utf8");
 }
 
+function writeExecutable(file, contents) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, contents, { mode: 0o755 });
+}
+
 function commit(root, message, files) {
   for (const [relativePath, contents] of Object.entries(files)) {
     writeFile(root, relativePath, contents);
@@ -861,5 +866,87 @@ test("an identity missing a required field is refused", () => {
     const { status, identity } = writeIdentity(dir, { RELEASE_TAG: "" });
     assert.notEqual(status, 0);
     assert.equal(identity, null);
+  });
+});
+
+test("pinned cargo-about reuses only an exact cache and repairs a version mismatch", () => {
+  withTempDir((dir) => {
+    const installer = script("install-pinned-release-tool.sh");
+    const fakeBin = path.join(dir, "fake-bin");
+    const cargoLog = path.join(dir, "cargo.log");
+    const toolRoot = path.join(dir, "cargo-about");
+    writeExecutable(
+      path.join(fakeBin, "cargo"),
+      `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '${cargoLog}'
+tool="\${@: -1}"
+mkdir -p '${toolRoot}/bin'
+rm -f '${toolRoot}.mismatch'
+binary='${toolRoot}/bin/'"$tool"
+cat > "$binary" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -f '${toolRoot}.mismatch' ]]; then
+  echo cargo-about 0.0.0
+else
+  echo cargo-about 0.9.1
+fi
+FAKE
+chmod +x "$binary"
+`,
+    );
+    const environment = { PATH: `${fakeBin}:${process.env.PATH}` };
+    const install = () =>
+      run(BASH, [installer, "cargo-about", toolRoot, "0.9.1"], { env: environment });
+
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(fs.readFileSync(cargoLog, "utf8").split("\n").filter(Boolean).length, 1);
+    assert.match(fs.readFileSync(cargoLog, "utf8"), /--locked --version 0\.9\.1 --root .* --features cli cargo-about$/mu);
+
+    fs.writeFileSync(`${toolRoot}.mismatch`, "yes");
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(fs.readFileSync(cargoLog, "utf8").split("\n").filter(Boolean).length, 2);
+  });
+});
+
+test("pinned Zig reuses its venv only when python-zig reports the exact version", () => {
+  withTempDir((dir) => {
+    const installer = script("install-pinned-release-tool.sh");
+    const fakeBin = path.join(dir, "fake-bin");
+    const pythonLog = path.join(dir, "python.log");
+    const zigRoot = path.join(dir, "ziglang");
+    writeExecutable(
+      path.join(fakeBin, "python3"),
+      `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '${pythonLog}'
+[[ "$1" == -m && "$2" == venv ]] || exit 64
+mkdir -p "$3/bin"
+cat > "$3/bin/pip" <<'FAKE'
+#!/usr/bin/env bash
+rm -f '${zigRoot}.mismatch'
+cat > '${zigRoot}/bin/python-zig' <<'ZIG'
+#!/usr/bin/env bash
+if [[ -f '${zigRoot}.mismatch' ]]; then
+  echo 0.0.0
+else
+  echo 0.15.2
+fi
+ZIG
+chmod +x '${zigRoot}/bin/python-zig'
+FAKE
+chmod +x "$3/bin/pip"
+`,
+    );
+    const environment = { PATH: `${fakeBin}:${process.env.PATH}` };
+    const install = () =>
+      run(BASH, [installer, "ziglang", zigRoot, "0.15.2"], { env: environment });
+
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(fs.readFileSync(pythonLog, "utf8").split("\n").filter(Boolean).length, 1);
+
+    fs.writeFileSync(`${zigRoot}.mismatch`, "yes");
+    assert.equal(install().status, 0, install().stderr);
+    assert.equal(fs.readFileSync(pythonLog, "utf8").split("\n").filter(Boolean).length, 2);
   });
 });

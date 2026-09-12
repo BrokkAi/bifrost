@@ -134,15 +134,28 @@ jobs:
         with:
           toolchain: 1.97.1
 
-      # The key is bound to the exact public commit. Readiness never restores
-      # a cache produced by a different candidate or private source tree.
+      # Reuse dependency compilation across public candidates. rust-cache's
+      # generated key remains bound to the toolchain and Cargo.lock, while
+      # Cargo fingerprints force workspace crates to rebuild and relink from
+      # the exact checked-out public commit.
       - name: Cache Cargo dependencies for notices
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-notices
+          shared-key: release-readiness-notices
+          cache-workspace-crates: false
+
+      - name: Cache pinned cargo-about
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/cargo-about/0.9.1
+          key: ${{ runner.os }}-pinned-cargo-about-0.9.1-v1
 
       - name: Install pinned cargo-about
-        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+        shell: bash
+        run: |
+          tool_root="$PWD/.cache/release-pinned-tools/cargo-about/0.9.1"
+          bash scripts/public/install-pinned-release-tool.sh cargo-about "$tool_root" 0.9.1
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
@@ -184,7 +197,8 @@ jobs:
       - name: Cache Cargo dependencies for crate packages
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-crate-package
+          shared-key: release-readiness-crate-package
+          cache-workspace-crates: false
 
       - name: Verify package contents and build exact archives
         shell: bash
@@ -222,7 +236,8 @@ jobs:
       - name: Cache Cargo dependencies for semantic-pack tool
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-pack-tool
+          shared-key: release-readiness-semantic-pack-tool
+          cache-workspace-crates: false
       - name: Build exact semantic-pack tool
         run: cargo build --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack
       - name: Stage exact semantic-pack tool
@@ -248,6 +263,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/jvm
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -266,6 +283,11 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
+      - name: Restore JVM semantic-pack source inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/semantic-pack-source-cache/jvm
+          key: semantic-pack-source-jvm-${{ runner.os }}-kotlin-27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26-scala-c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5-jdk-59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261
       - name: Generate JVM partial bundle
         run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-jvm" "${RUNNER_TEMP}"
       - name: Verify JVM partial bundle
@@ -287,6 +309,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/python
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -305,6 +329,11 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
+      - name: Restore Python semantic-pack source inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/semantic-pack-source-cache/python
+          key: semantic-pack-source-python-${{ runner.os }}-typeshed-e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626
       - name: Generate Python partial bundle
         run: bash scripts/public/build-pinned-python-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-python" "${RUNNER_TEMP}"
       - name: Verify Python partial bundle
@@ -326,6 +355,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/typescript
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -344,6 +375,11 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
+      - name: Restore TypeScript semantic-pack source inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/semantic-pack-source-cache/typescript
+          key: semantic-pack-source-typescript-${{ runner.os }}-compiler-da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08-library-7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
       - name: Generate TypeScript partial bundle
         run: bash scripts/public/build-pinned-typescript-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-typescript" "${RUNNER_TEMP}"
       - name: Verify TypeScript partial bundle
@@ -365,6 +401,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      SEMANTIC_PACK_SOURCE_CACHE: ${{ runner.temp }}/semantic-pack-source-cache/rust
     steps:
       - name: Checkout qualified source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -383,6 +421,11 @@ jobs:
           (cd "${RUNNER_TEMP}/semantic-pack-tool" && sha256sum --check bifrost-semantic-pack.sha256)
           chmod +x "${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack"
           echo "BIFROST_SEMANTIC_PACK_BIN=${RUNNER_TEMP}/semantic-pack-tool/bifrost-semantic-pack" >> "$GITHUB_ENV"
+      - name: Restore Rust semantic-pack source inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/semantic-pack-source-cache/rust
+          key: semantic-pack-source-rust-${{ runner.os }}-rust-docs-json-nightly-x86_64-unknown-linux-gnu-0b18d55b97cee6756745744c0c169402ab6d3d506bb30267067b2438b3b5e000
       - name: Generate Rust partial bundle
         run: bash scripts/public/build-pinned-rust-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-rust" "${RUNNER_TEMP}"
       - name: Verify Rust partial bundle
@@ -485,14 +528,35 @@ jobs:
       - name: Cache Cargo dependencies for binary build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-build-x86_64-unknown-linux-gnu
+          shared-key: release-readiness-build-x86_64-unknown-linux-gnu
+          cache-workspace-crates: false
+
+      - name: Resolve Python version for pinned Zig cache
+        id: pinned-python
+        shell: bash
+        run: python3 -c 'import sys; print(f"version={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")' >> "$GITHUB_OUTPUT"
+
+      - name: Cache pinned cargo-zigbuild
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/cargo-zigbuild/0.23.3
+          key: ${{ runner.os }}-pinned-cargo-zigbuild-0.23.3-v1
+
+      - name: Cache pinned Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/ziglang/0.15.2
+          key: ${{ runner.os }}-pinned-ziglang-0.15.2-${{ steps.pinned-python.outputs.version }}-v1
+
       - name: Install pinned GNU/Linux linker toolchain
         shell: bash
         run: |
-          cargo install --locked cargo-zigbuild --version '=0.23.3'
-          python3 -m venv "$RUNNER_TEMP/ziglang"
-          "$RUNNER_TEMP/ziglang/bin/pip" install --disable-pip-version-check 'ziglang==0.15.2'
-          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/ziglang/bin/python-zig" >> "$GITHUB_ENV"
+          cargo_zigbuild_root="$PWD/.cache/release-pinned-tools/cargo-zigbuild/0.23.3"
+          zig_root="$PWD/.cache/release-pinned-tools/ziglang/0.15.2"
+          bash scripts/public/install-pinned-release-tool.sh cargo-zigbuild "$cargo_zigbuild_root" 0.23.3
+          bash scripts/public/install-pinned-release-tool.sh ziglang "$zig_root" 0.15.2
+          echo "$cargo_zigbuild_root/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$zig_root/bin/python-zig" >> "$GITHUB_ENV"
       - name: Build GNU/Linux binary with glibc 2.28 floor
         shell: bash
         env:
@@ -571,23 +635,48 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.97.1
-      # The exact public commit is part of the cache namespace. This avoids
-      # restoring build state across candidate refs or private/public edges.
+      # This cache is shared only inside the public repository. Cargo validates
+      # fingerprints and rebuilds workspace members from the exact candidate;
+      # no cache crosses the private/public repository boundary.
       - name: Cache Cargo dependencies for binary build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-build-${{ matrix.target }}
+          shared-key: release-readiness-build-${{ matrix.target }}
+          cache-workspace-crates: false
       - name: Install Rust targets
         shell: bash
         run: rustup target add ${{ matrix.rust_targets }}
+
+      - name: Resolve Python version for pinned Zig cache
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        id: pinned-python
+        shell: bash
+        run: python3 -c 'import sys; print(f"version={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")' >> "$GITHUB_OUTPUT"
+
+      - name: Cache pinned cargo-zigbuild
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/cargo-zigbuild/0.23.3
+          key: ${{ runner.os }}-pinned-cargo-zigbuild-0.23.3-v1
+
+      - name: Cache pinned Zig
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/release-pinned-tools/ziglang/0.15.2
+          key: ${{ runner.os }}-pinned-ziglang-0.15.2-${{ steps.pinned-python.outputs.version }}-v1
+
       - name: Install pinned GNU/Linux linker toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
-          cargo install --locked cargo-zigbuild --version '=0.23.3'
-          python3 -m venv "$RUNNER_TEMP/ziglang"
-          "$RUNNER_TEMP/ziglang/bin/pip" install --disable-pip-version-check 'ziglang==0.15.2'
-          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/ziglang/bin/python-zig" >> "$GITHUB_ENV"
+          cargo_zigbuild_root="$PWD/.cache/release-pinned-tools/cargo-zigbuild/0.23.3"
+          zig_root="$PWD/.cache/release-pinned-tools/ziglang/0.15.2"
+          bash scripts/public/install-pinned-release-tool.sh cargo-zigbuild "$cargo_zigbuild_root" 0.23.3
+          bash scripts/public/install-pinned-release-tool.sh ziglang "$zig_root" 0.15.2
+          echo "$cargo_zigbuild_root/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$zig_root/bin/python-zig" >> "$GITHUB_ENV"
       - name: Set up Android NDK
         if: matrix.target == 'aarch64-linux-android'
         id: setup-ndk
@@ -715,7 +804,8 @@ jobs:
       - name: Cache Cargo dependencies for Python wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-python-${{ matrix.target }}
+          shared-key: release-readiness-python-${{ matrix.target }}
+          cache-workspace-crates: false
       - name: Build Python wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
@@ -777,7 +867,8 @@ jobs:
       - name: Cache Cargo dependencies for uv wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-uv-${{ matrix.target }}
+          shared-key: release-readiness-uv-${{ matrix.target }}
+          cache-workspace-crates: false
       - name: Prepare uv CLI license files
         run: node scripts/public/prepare-uv-cli-package.mjs
       - name: Build uv CLI wheel

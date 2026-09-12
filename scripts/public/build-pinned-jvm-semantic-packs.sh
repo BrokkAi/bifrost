@@ -11,22 +11,27 @@ work_dir=$2
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/semantic-pack-tool.sh
 source "$script_directory/../lib/semantic-pack-tool.sh"
+# shellcheck source=scripts/lib/semantic-pack-source.sh
+source "$script_directory/../lib/semantic-pack-source.sh"
 input_dir="${work_dir}/semantic-pack-inputs"
 temurin_dir="${work_dir}/temurin"
 
 mkdir -p "${input_dir}" "${temurin_dir}"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${input_dir}/kotlin-stdlib-2.2.20-sources.jar" \
-  "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${input_dir}/scala-library-2.13.16-sources.jar" \
-  "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
-curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-  --retry-delay 5 --connect-timeout 30 \
-  --output "${input_dir}/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
-  "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz"
+fetch_pinned_archive \
+  "${input_dir}/kotlin-stdlib-2.2.20-sources.jar" \
+  "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar" \
+  "27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26" \
+  "kotlin-stdlib-2.2.20-sources.jar"
+fetch_pinned_archive \
+  "${input_dir}/scala-library-2.13.16-sources.jar" \
+  "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar" \
+  "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5" \
+  "scala-library-2.13.16-sources.jar"
+fetch_pinned_archive \
+  "${input_dir}/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
+  "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
+  "59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261" \
+  "OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz"
 
 cd "${input_dir}"
 shasum -a 256 --check <<'CHECKSUMS'

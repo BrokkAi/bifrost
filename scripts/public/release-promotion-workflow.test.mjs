@@ -258,6 +258,81 @@ test("release readiness qualifies and assembles attributable semantic-pack parti
   );
 });
 
+readinessTest("semantic-pack source caches are keyed to exact published checksums", () => {
+  const sourceCaches = [
+    {
+      jobName: "semantic-pack-jvm",
+      scriptName: "build-pinned-jvm-semantic-packs.sh",
+      path: "jvm",
+      checksums: [
+        "27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26",
+        "c02edc324e7db59c52115214a6ef36e2d78d0a50dff635eda4dcee5502b1dea5",
+        "59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261",
+      ],
+    },
+    {
+      jobName: "semantic-pack-python",
+      scriptName: "build-pinned-python-semantic-packs.sh",
+      path: "python",
+      checksums: [
+        "e4faf1d0ebbbc22a4932f56af7c3067f21334cd88146bd23deec41d529220626",
+      ],
+    },
+    {
+      jobName: "semantic-pack-typescript",
+      scriptName: "build-pinned-typescript-semantic-packs.sh",
+      path: "typescript",
+      checksums: [
+        "da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08",
+        "7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3",
+      ],
+    },
+    {
+      jobName: "semantic-pack-rust",
+      scriptName: "build-pinned-rust-semantic-packs.sh",
+      path: "rust",
+      checksums: [
+        "0b18d55b97cee6756745744c0c169402ab6d3d506bb30267067b2438b3b5e000",
+      ],
+    },
+  ];
+
+  for (const { jobName, scriptName, path, checksums } of sourceCaches) {
+    const job = jobBlock(readiness, jobName);
+    const script = readFileSync(
+      new URL(`../../scripts/public/${scriptName}`, import.meta.url),
+      "utf8",
+    );
+    const cacheSteps = stepBlocks(job).filter((step) =>
+      step.includes("semantic-pack-source-cache"),
+    );
+    assert.equal(cacheSteps.length, 1, `${jobName} must have one source-input cache step`);
+    assert.match(cacheSteps[0], /actions\/cache@[0-9a-f]{40}/u);
+    assert.match(
+      cacheSteps[0],
+      new RegExp(`path: \\$\\{\\{ runner\\.temp \\}\\}/semantic-pack-source-cache/${path}`, "u"),
+    );
+    assert.doesNotMatch(cacheSteps[0], /restore-keys:/u);
+    for (const checksum of checksums) {
+      assert.match(
+        script,
+        new RegExp(checksum, "u"),
+        `${scriptName} no longer pins a checksum used by its cache key`,
+      );
+      assert.match(
+        cacheSteps[0],
+        new RegExp(checksum, "u"),
+        `${jobName} cache key omits pinned source checksum`,
+      );
+    }
+    assert.match(
+      job,
+      /SEMANTIC_PACK_SOURCE_CACHE: \$\{\{ runner\.temp \}\}\/semantic-pack-source-cache\//u,
+    );
+    assert.match(script, /fetch_pinned_archive/u);
+  }
+});
+
 readinessTest("semantic-pack measurements stay in the tarball and are published separately", () => {
   const assembler = jobBlock(readiness, "semantic-pack-bundle");
   const packaging = stepBlocks(assembler).find((step) => /Package semantic-pack bundle/u.test(step));
@@ -576,6 +651,43 @@ readinessTest("release readiness starts every binary and wheel target without an
   assert.deepEqual(caps, [5, 5, 5]);
 });
 
+readinessTest("release readiness reuses compatibility-keyed Cargo state across candidates", () => {
+  assert.doesNotMatch(readiness, /shared-key:.*needs\.preflight\.outputs\.commit/u);
+  for (const key of [
+    "release-readiness-notices",
+    "release-readiness-crate-package",
+    "release-readiness-semantic-pack-tool",
+    "release-readiness-build-x86_64-unknown-linux-gnu",
+    "release-readiness-build-${{ matrix.target }}",
+    "release-readiness-python-${{ matrix.target }}",
+    "release-readiness-uv-${{ matrix.target }}",
+  ]) {
+    assert.ok(readiness.includes(`shared-key: ${key}`), `missing compatibility cache ${key}`);
+  }
+
+  for (const jobName of [
+    "notices",
+    "crate-package",
+    "semantic-pack-tool",
+    "build-linux-x86-64",
+    "build",
+    "python-wheels",
+    "uv-wheels",
+  ]) {
+    const job = jobBlock(readiness, jobName);
+    assert.match(
+      job,
+      /ref: \$\{\{ needs\.preflight\.outputs\.commit \}\}/u,
+      `${jobName} must retain the exact public checkout`,
+    );
+    assert.match(
+      job,
+      /cache-workspace-crates: false/u,
+      `${jobName} must not restore prior-candidate workspace crates`,
+    );
+  }
+});
+
 readinessTest("release binaries use the restricted larger-runner pools", () => {
   const build = jobBlock(readiness, "build");
   assert.match(
@@ -621,8 +733,10 @@ readinessTest("release readiness separates pinned GNU builds from portable binar
   assert.match(binaryBuild, /run: cargo build --release --locked --bin "\$BIN_NAME"/u);
 
   for (const gnuJob of [linuxBuild, build]) {
-    assert.match(gnuJob, /cargo-zigbuild --version '=0\.23\.3'/u);
-    assert.match(gnuJob, /ziglang==0\.15\.2/u);
+    assert.match(gnuJob, /install-pinned-release-tool\.sh cargo-zigbuild[^\n]* 0\.23\.3/u);
+    assert.match(gnuJob, /install-pinned-release-tool\.sh ziglang[^\n]* 0\.15\.2/u);
+    assert.match(gnuJob, /Cache pinned cargo-zigbuild/u);
+    assert.match(gnuJob, /Cache pinned Zig/u);
     assert.match(gnuJob, /LIBZ_SYS_STATIC: '1'/u);
     assert.match(gnuJob, /cargo zigbuild --release --locked/u);
     const verifier = gnuJob.indexOf("bash scripts/public/verify-linux-release-elf.sh");
