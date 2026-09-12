@@ -5638,10 +5638,20 @@ impl<'a> CppVisitor<'a> {
             return code_unit;
         }
         if has_body {
+            // A forward declaration above this definition is one of the
+            // class's declaration sites: C++ injects the class name at the
+            // forward declaration, so a reference between the two spells this
+            // class (#3297). Moving the unit to its body must not drop the
+            // earlier site, exactly as a function prototype and its body stay
+            // two ranges of one declaration (#1650).
+            let earlier_ranges = self.parsed.declaration_ranges(&code_unit).to_vec();
             if let Some(range) = explicit_range {
                 self.replace_declaration_with_range_deferred(code_unit.clone(), range, None, None);
             } else {
                 self.replace_declaration_deferred(code_unit.clone(), declaration_node, None, None);
+            }
+            for range in earlier_ranges {
+                self.parsed.add_declaration_range(&code_unit, range);
             }
         } else {
             self.add_declaration(code_unit.clone(), declaration_node, None, None);

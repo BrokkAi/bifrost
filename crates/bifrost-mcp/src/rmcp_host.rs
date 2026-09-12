@@ -1354,6 +1354,12 @@ impl BifrostMcpHandler {
             }),
             bifrost_cancellation.clone(),
         );
+        // The phase this request reports if its budget expires. The token is
+        // registered above and travels into the synchronous analyzer, so a
+        // wait deep inside the call -- the analyzer cache build lock, say --
+        // replaces this with its own description for as long as it lasts and
+        // the timeout below names it instead of the tool (issue #3170).
+        let _execution_phase = bifrost_cancellation.enter_phase(format!("executing {name}"));
 
         let bridge_token = bifrost_cancellation.clone();
         let request_finished = McpCancellationToken::new();
@@ -1433,8 +1439,14 @@ impl BifrostMcpHandler {
                 }
                 let budget = mcp_analyzer_request_budget()
                     .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
+                let phase = bifrost_cancellation
+                    .phase()
+                    .expect("the request entered its execution phase before the budget could fire");
                 return Err(ErrorData::internal_error(
-                    format!("{name} exhausted its {budget:?} request budget; cancellation continues in the background"),
+                    format!(
+                        "{name} exhausted its {budget:?} request budget while {phase}; \
+                         cancellation continues in the background"
+                    ),
                     None,
                 ));
             }

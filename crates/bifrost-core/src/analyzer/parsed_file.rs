@@ -495,6 +495,26 @@ impl ParsedFile {
             .unwrap_or_default()
     }
 
+    /// Adds one more declaration range to a declaration that already holds at
+    /// least one.
+    ///
+    /// One declaration can have several declaration sites: a C++ forward
+    /// declaration and the definition that completes it, or a prototype and
+    /// its body in one translation unit (#1650). A language walk that replaces
+    /// the earlier site with the later one restores it here, so resolution
+    /// still sees the name from the earlier site.
+    pub fn add_declaration_range(&mut self, code_unit: &CodeUnit, range: Range) {
+        let ranges = self
+            .ranges
+            .get_mut(code_unit)
+            .expect("a declaration range was added to a unit with no declaration range");
+        if ranges.contains(&range) {
+            return;
+        }
+        ranges.push(range);
+        ranges.sort_by_key(|range| range.start_byte);
+    }
+
     pub fn contains_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.declarations.contains(code_unit)
     }

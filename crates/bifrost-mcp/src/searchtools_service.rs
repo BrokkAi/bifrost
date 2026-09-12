@@ -2868,6 +2868,7 @@ impl SearchToolsService {
                 SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
             })?;
             let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
             return Self::structured_only(
                 analyze_diff_at_root(
                     &root,
@@ -2875,6 +2876,7 @@ impl SearchToolsService {
                     &DiffAnalysisOptions {
                         snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
                     },
+                    cancellation.unwrap_or(&uncancelled),
                 )
                 .map_err(SearchToolsServiceError::internal)?,
             );
@@ -2887,12 +2889,14 @@ impl SearchToolsService {
                     ))
                 })?;
             let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
             let result = cyclomatic_complexity_at_root(
                 &root,
                 params,
                 &DiffAnalysisOptions {
                     snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
                 },
+                cancellation.unwrap_or(&uncancelled),
             )
             .map_err(SearchToolsServiceError::internal)?;
             return Self::rendered_structured(result, render_options);

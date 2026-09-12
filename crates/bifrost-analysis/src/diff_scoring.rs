@@ -270,6 +270,7 @@ impl DiffScoringSession {
                 target: params.target,
             },
             options,
+            cancellation,
         )?;
         if !prepared.target.is_immutable() {
             let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
@@ -378,6 +379,7 @@ impl DiffScoringSession {
                 target: params.target,
             },
             options,
+            cancellation,
         )?;
         assert!(!prepared.target.is_immutable());
         let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;

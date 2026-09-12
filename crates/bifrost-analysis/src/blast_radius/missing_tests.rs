@@ -126,6 +126,7 @@ pub fn missing_tests_at_root(
             target: params.target,
         },
         options,
+        cancellation,
     )?;
     let endpoints = BlastRadiusEndpoints {
         base: prepared.base.label(),

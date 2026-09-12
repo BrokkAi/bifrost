@@ -399,6 +399,16 @@ pub(crate) struct AnalyzerStoreContext {
     /// Shared by every language delegate the same build fans out to. See
     /// [`BuildAbort`].
     pub(crate) build_abort: Arc<BuildAbort>,
+    /// The cancellation of the request this build serves, if it has one.
+    ///
+    /// Carried here because the build's own waits have to answer to it: the
+    /// cross-process analyzer-cache build lock is taken under this token, so a
+    /// request whose budget expires while another builder holds the lock ends
+    /// with an error naming the lock instead of parking a thread past its own
+    /// deadline (issue #3170). A build with no request behind it -- a CLI
+    /// build, a watcher update -- carries the default token, which is never
+    /// cancelled.
+    pub(crate) cancellation: crate::CancellationToken,
     /// Counts the construction-only tier crossings for the current build.
     /// Finished observers remain attached to the analyzer context but ignore
     /// later incremental work.
@@ -791,6 +801,7 @@ fn store_context_from_shared_store(
         build_abort: Arc::new(BuildAbort::default()),
         build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
         structural_facts: Arc::new(OnceLock::new()),
+        cancellation: crate::CancellationToken::default(),
     }
 }
 
@@ -9718,16 +9729,57 @@ where
     /// `normalize_full_name` rewrites `::` into its own vocabulary keeps every
     /// spelling that can match.
     pub(crate) fn definition_candidate_short_names(&self, fq_name: &str) -> Vec<String> {
-        let mut names = self.adapter.lookup_candidate_short_names(fq_name);
-        let normalized = self.adapter.normalize_full_name(fq_name);
+        self.definition_candidate_spellings(fq_name, |adapter, name| {
+            adapter.lookup_candidate_short_names(name)
+        })
+    }
+
+    /// The spellings one fq name is looked up under in the `(lang, identifier)`
+    /// index.
+    ///
+    /// That index is keyed by a declaration's terminal identifier -- the
+    /// rendering of its last name segment alone, which is what
+    /// `identifier_addresses_target` verifies a row against. The owner-chain
+    /// spellings the `short_name` vocabulary mints for a nested declaration
+    /// (`Facade$.Nested$.Member`) can therefore never match a row here, and
+    /// enumerating every per-segment decoration of every separator suffix cost
+    /// ~500 spellings per missed scala name, each permanently interned as one
+    /// `Unknown` segment in the process-global grow-only interner (#3299).
+    ///
+    /// The separator suffixes of the rendered name are the sound vocabulary: a
+    /// declaration's terminal identifier is the rendering of its last segment,
+    /// so it is a suffix at a separator boundary of any spelling that ends in
+    /// it, and a segment whose own text contains a separator (a scala
+    /// backtick-quoted `zio.ZIO`) is covered because the whole rendering is
+    /// itself a candidate. Language decoration of that terminal (scala's
+    /// trailing `$`, C# arity, the TypeScript `$static` marker) is added at the
+    /// seek by `decorated_identifier_seeks`, which is the seek-side inverse of
+    /// `source_identifier_for_target`.
+    pub(crate) fn definition_candidate_identifiers(&self, fq_name: &str) -> Vec<String> {
+        let separators = self.adapter.lookup_candidate_separators();
+        self.definition_candidate_spellings(fq_name, move |_adapter, name| {
+            lookup_suffix_candidates(name, separators)
+        })
+    }
+
+    /// Mint and normalize one lookup vocabulary, then drop the spellings the
+    /// persisted rows for this language can never carry.
+    fn definition_candidate_spellings(
+        &self,
+        fq_name: &str,
+        vocabulary: impl Fn(&dyn LanguageAdapter, &str) -> Vec<String>,
+    ) -> Vec<String> {
+        let adapter: &dyn LanguageAdapter = self.adapter.as_ref();
+        let mut names = vocabulary(adapter, fq_name);
+        let normalized = adapter.normalize_full_name(fq_name);
         if normalized != fq_name {
-            names.extend(self.adapter.lookup_candidate_short_names(&normalized));
+            names.extend(vocabulary(adapter, &normalized));
         }
         // A separator is droppable only when both declarations agree: the
         // renderer never emits it for this language, and the adapter's own
         // lookup vocabulary treats it as a join rather than as name text.
-        let joins = self.adapter.lookup_candidate_separators();
-        let droppable = absent_segment_separators(self.adapter.language())
+        let joins = adapter.lookup_candidate_separators();
+        let droppable = absent_segment_separators(adapter.language())
             .iter()
             .filter(|separator| joins.contains(*separator))
             .collect::<Vec<_>>();
@@ -16102,6 +16154,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -16608,6 +16661,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
@@ -16729,6 +16783,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -16824,6 +16879,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let prepared = AnalyzerStore::prepare_parsed_blob(
             oid,
@@ -17577,6 +17633,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -17670,6 +17727,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -19029,6 +19087,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -19439,6 +19498,7 @@ mod tests {
             build_abort: Arc::new(BuildAbort::default()),
             build_tier_access: Arc::new(AnalyzerBuildTierAccess::default()),
             structural_facts: Arc::new(OnceLock::new()),
+            cancellation: crate::CancellationToken::default(),
         };
         let config = AnalyzerConfig::default();
 

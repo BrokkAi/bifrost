@@ -447,11 +447,12 @@ pub(super) fn search_symbols_with_cap(
             }
             // The persisted primary range is ordinal zero, which is the
             // prototype when one C++ callable has a same-file prototype and a
-            // later body. Use the same structured occurrence classification as
+            // later body, and the forward declaration when a C++ class has one
+            // (#3297). Use the same structured occurrence classification as
             // forward navigation so symbol search offers the physical
             // definition without changing the declarations the pattern named.
             let selected_range = if language_for_target(&candidate.code_unit) == Language::Cpp
-                && candidate.code_unit.is_callable()
+                && (candidate.code_unit.is_callable() || candidate.code_unit.is_class())
             {
                 cpp_identity
                     .primary_range(analyzer, &candidate.code_unit)

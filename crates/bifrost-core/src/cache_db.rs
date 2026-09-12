@@ -385,6 +385,16 @@ pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // as the cross-process arbiter, but give queued writers enough time to take their
 // turn instead of requiring per-worktree database copies.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
+/// What a collection's own connections wait for the store's write lock.
+///
+/// The timeout above is deliberately twice the 60-second MCP request budget,
+/// which is right for a writer whose caller is waiting for its result and
+/// wrong for opportunistic collection: a sweep that queues behind a live
+/// writer for two minutes while holding the analyzer-cache build lock turns
+/// ordinary SQLite serialization into an unexplained request timeout (#3170).
+/// A collection has nothing to deliver and no caller to disappoint, so it
+/// waits briefly and collects on the next cadence instead.
+const COLLECTION_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Per-connection prepared-statement cache capacity. rusqlite defaults to 16,
 /// which is far too small for our query surface: `format!`-spliced predicates
 /// and (now fixed-arity) `IN` lists produce dozens of distinct SQL shapes, and
@@ -563,6 +573,19 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
             None => error,
         }
     })
+}
+
+/// Open the workspace's shared cache database for a collection.
+///
+/// Identical to [`open_unified_connection`] except for how long the connection
+/// waits when another process holds the write lock: see
+/// [`COLLECTION_BUSY_TIMEOUT`]. Collection is the one writer that must yield
+/// to the live session rather than queue in front of it.
+pub fn open_collection_connection(db_path: &Path) -> Result<Connection> {
+    let conn = open_unified_connection(db_path)?;
+    conn.busy_timeout(COLLECTION_BUSY_TIMEOUT)
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    Ok(conn)
 }
 
 /// Turn SQLite's process-global memory statistics off, once, before this
@@ -2171,6 +2194,7 @@ fn migrate_with_sql_locked(
     {
         tx.execute_batch(fresh_schema)
             .map_err(|err| format!("cache DB current-schema creation error: {err}"))?;
+        start_collection_cadence(&tx)?;
         tx.pragma_update(None, "user_version", newest_version)
             .map_err(|err| {
                 format!("cache DB migration error setting version {newest_version}: {err}")
@@ -2188,6 +2212,11 @@ fn migrate_with_sql_locked(
             return Ok(LockedMigrationOutcome::RebuildRequired);
         }
     };
+    // Version zero here means this transaction creates the store's content
+    // from nothing -- an empty file, or a schema this pass rebuilt -- so the
+    // baseline migration below writes the `cache_state` row rather than
+    // carrying an existing one forward.
+    let store_starts_from_nothing = user_version == 0;
     let mut migration_applied = false;
     for migration in migrations
         .iter()
@@ -2204,6 +2233,9 @@ fn migrate_with_sql_locked(
             .map_err(|err| format!("cache DB migration error setting version {version}: {err}"))?;
         migration_applied = true;
     }
+    if store_starts_from_nothing {
+        start_collection_cadence(&tx)?;
+    }
     if migration_applied {
         let _scope = crate::profiling::scope("cache_db.validate_foreign_keys");
         validate_foreign_keys(&tx)?;
@@ -2211,6 +2243,36 @@ fn migrate_with_sql_locked(
     tx.commit()
         .map_err(|err| format!("cache DB migration error: {err}"))?;
     Ok(LockedMigrationOutcome::Complete)
+}
+
+/// Start a new store's collection cadence at its creation time.
+///
+/// Collection becomes due when the store has grown and `GC_MIN_INTERVAL_SECS`
+/// has passed since `last_gc_at` (`cache_gc::gc_due_tx`). The schema's own
+/// `cache_state` row is written with `last_gc_at = 0`, which reads as the
+/// epoch: permanently overdue. Every brand-new store therefore ran a full
+/// sweep the moment its first build persisted a blob, over a store whose whole
+/// content that build had just written and whose `blobs_at_last_gc` was zero
+/// (issue #3170). That sweep held the analyzer-cache build lock, and the first
+/// diff-derived MCP request behind it was reported as budget exhaustion.
+///
+/// A store created now is in the same position as one just collected -- there
+/// is nothing in it to collect -- so its cadence starts here. This is not a
+/// special case for `last_gc_at == 0`: a store that has genuinely never been
+/// collected still becomes due on the ordinary time cadence, and an older
+/// store migrated up to this schema keeps the value it recorded.
+fn start_collection_cadence(tx: &Transaction<'_>) -> Result<()> {
+    let updated = tx
+        .execute(
+            "UPDATE cache_state SET last_gc_at = ?1 WHERE id = 1",
+            [now_unix_seconds()],
+        )
+        .map_err(|err| format!("cache DB collection cadence error: {err}"))?;
+    assert_eq!(
+        updated, 1,
+        "a created store has exactly one cache_state row to start the collection cadence on"
+    );
+    Ok(())
 }
 
 pub fn now_unix_seconds() -> i64 {

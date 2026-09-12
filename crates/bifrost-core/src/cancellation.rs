@@ -1,7 +1,7 @@
-use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,10 +15,29 @@ pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
     timed_out: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    /// What the work under this token is doing right now. See
+    /// [`CancellationToken::enter_phase`].
+    phase: Arc<Mutex<Option<String>>>,
     #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
     #[cfg(any(test, feature = "test-support"))]
     timeout_after_checks: Option<Arc<AtomicUsize>>,
+}
+
+/// Restores the phase that was current when it was entered.
+///
+/// Returned by [`CancellationToken::enter_phase`]; see it for what the phase
+/// is for.
+#[must_use = "the phase ends when this guard is dropped"]
+pub struct PhaseGuard {
+    phase: Arc<Mutex<Option<String>>>,
+    previous: Option<String>,
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        *self.phase.lock().expect("cancellation phase lock poisoned") = self.previous.take();
+    }
 }
 
 impl CancellationToken {
@@ -28,6 +47,38 @@ impl CancellationToken {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Record what this token's work is doing, until the guard is dropped.
+    ///
+    /// A budgeted host cancels the work it is waiting for and then has to say
+    /// why the budget went. Without this it can only name the tool: every wait
+    /// inside the request, however specific, was reported as "exhausted its
+    /// 60s request budget" with nothing to distinguish a slow analysis from a
+    /// thread parked on a file lock (issue #3170). The token is what already
+    /// spans both ends -- the host holds it while the synchronous analyzer
+    /// polls it -- so a long wait publishes its phase here and the host reads
+    /// it back when the deadline fires.
+    ///
+    /// Phases nest: the guard restores the phase that was current when it was
+    /// entered, so a request goes back to describing its tool when a wait
+    /// inside it ends. Enter one only for work whose duration a person would
+    /// want named; this is a diagnostic channel, not a trace.
+    pub fn enter_phase(&self, phase: impl Into<String>) -> PhaseGuard {
+        let mut current = self.phase.lock().expect("cancellation phase lock poisoned");
+        let previous = current.replace(phase.into());
+        PhaseGuard {
+            phase: Arc::clone(&self.phase),
+            previous,
+        }
+    }
+
+    /// The phase this token's work last entered, if any.
+    pub fn phase(&self) -> Option<String> {
+        self.phase
+            .lock()
+            .expect("cancellation phase lock poisoned")
+            .clone()
     }
 
     /// Return a child token that cancels itself after `duration` while still
@@ -104,11 +155,8 @@ impl CancellationToken {
     #[doc(hidden)]
     pub fn cancel_after_checks_for_test(checks: usize) -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            timed_out: Arc::new(AtomicBool::new(false)),
-            deadline: None,
             cancel_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
-            timeout_after_checks: None,
+            ..Self::default()
         }
     }
 
@@ -116,11 +164,8 @@ impl CancellationToken {
     #[doc(hidden)]
     pub fn timeout_after_checks_for_test(checks: usize) -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            timed_out: Arc::new(AtomicBool::new(false)),
-            deadline: None,
-            cancel_after_checks: None,
             timeout_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
+            ..Self::default()
         }
     }
 }

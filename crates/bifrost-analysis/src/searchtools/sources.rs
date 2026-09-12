@@ -976,7 +976,11 @@ fn source_ranges_for_code_unit(
     // `angular.mock.$LogProvider` inside an IIFE -- has no row there at all.
     // Deriving its ranges only from `definitions()` rendered nothing, so a
     // selector the resolver had just printed answered not_found (#1057).
-    let mut ranges = analyzer.ranges(code_unit);
+    let mut ranges = render_cache.cpp_identity.definition_ranges(
+        analyzer,
+        code_unit,
+        analyzer.ranges(code_unit),
+    );
     if !code_unit.is_function() {
         return ranges;
     }

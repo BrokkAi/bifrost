@@ -565,7 +565,12 @@ pub fn correspond_revisions(
     // rather than worked around: the silent alternative re-parses every blob of
     // both revisions on every request, which is a performance failure worth
     // naming.
-    let cache = crate::analyzer::SharedAnalyzerCache::open(workspace_root)
+    // No budgeted host reaches this entry point today, so the cache's build
+    // lock is waited on the way a CLI build waits: until the current builder
+    // is done. A host that calls this inside a request budget must pass its
+    // own token instead of this one.
+    let cancellation = crate::CancellationToken::default();
+    let cache = crate::analyzer::SharedAnalyzerCache::open(workspace_root, &cancellation)
         .map_err(|error| error.to_string())?;
     let base_analyzer =
         crate::diff_analysis::build_revision_analyzer(base_export.image(), Some(&cache))?;

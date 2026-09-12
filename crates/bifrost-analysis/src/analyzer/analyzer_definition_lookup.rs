@@ -28,7 +28,7 @@ pub(crate) trait ForwardQueryProvider {
     fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
     fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit>;
     fn forward_relational_name(&self, unit: &CodeUnit) -> RelationalName;
-    fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String>;
+    fn forward_definition_candidate_identifiers(&self, rendered: &str) -> Vec<String>;
     fn forward_definition_sources_may_exist(&self) -> bool;
     fn forward_package_exists(&self, package: &str) -> bool;
     fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool;
@@ -67,8 +67,8 @@ macro_rules! impl_forward_query_provider {
                 self.inner.relational_name_for_unit(unit)
             }
 
-            fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String> {
-                self.inner.definition_candidate_short_names(rendered)
+            fn forward_definition_candidate_identifiers(&self, rendered: &str) -> Vec<String> {
+                self.inner.definition_candidate_identifiers(rendered)
             }
 
             fn forward_definition_sources_may_exist(&self) -> bool {
@@ -215,10 +215,18 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             .unwrap_or_else(|| RelationalName::stable(unit.fq().clone()))
     }
 
+    /// The spellings the terminal-keyed `(lang, identifier)` index is seeked
+    /// with for `rendered`.
+    ///
+    /// This is not the `(lang, short_name)` vocabulary: a row this lookup can
+    /// keep must have `identifier_addresses_target` hold for one of these
+    /// spellings, and that compares a declaration's *terminal* identifier, so
+    /// the owner-chain aliases the symbol index needs are provably dead here
+    /// (#3299). See `TreeSitterAnalyzer::definition_candidate_identifiers`.
     fn rendered_identifier_candidates(&self, language: Language, rendered: &str) -> Vec<String> {
         let mut candidates = self
             .language_analyzer(language)
-            .map(|provider| provider.forward_definition_candidate_short_names(rendered))
+            .map(|provider| provider.forward_definition_candidate_identifiers(rendered))
             .unwrap_or_default();
         if candidates.is_empty()
             && let Some(identifier) = Self::rendered_terminal(language, rendered)
@@ -475,7 +483,9 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
         // hydrated-name match makes the exact result complete. Otherwise
         // consult the identifier view for mounted-name and source-spelling
         // compatibility (for example a C++ name rendered with both `::` and
-        // `.`).
+        // `.`). No normalized seek joins this round: this entry point promises
+        // the exact rendered identity, and the encoding-agnostic question is
+        // `by_normalized_fqn`, whose own seek already runs first there (#3299).
         units.retain(|unit| unit.fq_name() == rendered);
         if units.is_empty() {
             let identifiers = self.rendered_identifier_candidates(language, rendered);
@@ -502,12 +512,22 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
             Some(_) => panic!("a normalized-name query returned the wrong result shape"),
             None => Vec::new(),
         };
-        let identifiers = self.rendered_identifier_candidates(language, normalized);
-        units.extend(self.identifier_candidates_for_spellings(language, &identifiers, None));
         let Some(provider) = self.language_analyzer(language) else {
             return Vec::new();
         };
         units.retain(|unit| provider.normalize_rendered_name(&unit.fq_name()) == normalized);
+        // The normalized view is the structural answer for every declaration
+        // whose persisted spelling carries an encoding its source spelling does
+        // not (scala's object `$`, C# generic arity, ...). The identifier view
+        // is the compatibility net for the rows that view cannot reach, such as
+        // an anchored row whose package the request does not carry; consulting
+        // it for a name the normalized seek already answered would spend a
+        // whole candidate vocabulary on a miss that is not one (#3299).
+        if units.is_empty() {
+            let identifiers = self.rendered_identifier_candidates(language, normalized);
+            units.extend(self.identifier_candidates_for_spellings(language, &identifiers, None));
+            units.retain(|unit| provider.normalize_rendered_name(&unit.fq_name()) == normalized);
+        }
         sort_units(&mut units);
         units.dedup();
         units
@@ -1244,6 +1264,115 @@ mod definition_lookup_tests {
     use super::*;
     use crate::analyzer::{RubyAnalyzer, TestProject};
     use std::path::PathBuf;
+
+    /// One lookup's interner calls on this thread, with the answer it produced.
+    ///
+    /// The process-global segment interner is grow-only, so every distinct
+    /// spelling a lookup mints is permanent vocabulary. The Cartesian suffix x
+    /// object-encoding expansion minted ~500 of them per missed scala name
+    /// (2^K - 1 per suffix, K <= 8), which accumulated ~2.5 GB of transient
+    /// spellings per large scala repository and OOM-killed the #3268 corpus
+    /// lane.
+    fn measured_lookup(lookup: &AnalyzerDefinitionLookup<'_>, name: &str) -> (Vec<String>, u64) {
+        brokk_bifrost_core::analyzer::fq_name::counters::reset();
+        let units = lookup.by_normalized_fqn(name);
+        let (_resolves, interns) = brokk_bifrost_core::analyzer::fq_name::counters::counts();
+        (
+            units.into_iter().map(|unit| unit.fq_name()).collect(),
+            interns,
+        )
+    }
+
+    /// A deep qualified name that addresses no declaration must cost the
+    /// interner one spelling per separator suffix plus the query's own
+    /// identity work, not the suffix x encoding product.
+    #[test]
+    fn missed_scala_lookup_mints_only_terminal_spellings() {
+        use crate::analyzer::ScalaAnalyzer;
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file(
+                "app/Facade.scala",
+                "package app\n\nobject Facade {\n  object Nested {\n    class Member\n  }\n}\n\nclass Consumer\n",
+            )
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Scala);
+        let name = "com.example.very.deeply.nested.missing.Absent";
+        let (found, minted) = measured_lookup(&lookup, name);
+        assert!(found.is_empty(), "{found:?}");
+        let segments = name.split('.').count() as u64;
+        assert!(
+            minted <= 4 * segments,
+            "a missed lookup must mint at most one spelling per separator suffix plus its own \
+             query identity, got {minted} spellings for {segments} segments"
+        );
+    }
+
+    /// A name the normalized view answers does not consult the terminal-keyed
+    /// identifier view at all: that view is the compatibility net for the rows
+    /// the structural seek cannot reach, not a second round for every answer.
+    #[test]
+    fn resolved_scala_lookup_does_not_expand_identifier_candidates() {
+        use crate::analyzer::ScalaAnalyzer;
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file(
+                "app/Facade.scala",
+                "package app\n\nobject Facade {\n  object Nested {\n    class Member\n  }\n}\n\nclass Consumer\n",
+            )
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Scala);
+        let name = "app.Facade.Nested.Member";
+        let (found, minted) = measured_lookup(&lookup, name);
+        assert!(
+            found
+                .iter()
+                .any(|fq_name| fq_name == "app.Facade$.Nested$.Member"),
+            "{found:?}"
+        );
+        let segments = name.split('.').count() as u64;
+        assert!(
+            minted <= 4 * segments,
+            "a resolved lookup must not mint the identifier fallback vocabulary, got {minted} \
+             spellings for {segments} segments"
+        );
+    }
+
+    /// The bounded vocabulary still answers the declaration the encoded
+    /// spelling persists: a dot-joined scala query resolves a nested object
+    /// chain that is stored with `$` markers, and the object terminal is
+    /// reached through its own `$` decoration.
+    #[test]
+    fn terminal_spelling_vocabulary_still_resolves_encoded_scala_names() {
+        use crate::analyzer::ScalaAnalyzer;
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Scala)
+            .file(
+                "app/Facade.scala",
+                "package app\n\nobject Facade {\n  object Nested {\n    class Member\n  }\n}\n\nclass Consumer\n",
+            )
+            .build();
+        let analyzer = ScalaAnalyzer::from_project(fixture.project().clone());
+        let lookup = AnalyzerDefinitionLookup::new(&analyzer, Language::Scala);
+        for (query, expected) in [
+            ("app.Facade", "app.Facade$"),
+            ("app.Facade.Nested", "app.Facade$.Nested$"),
+            ("app.Facade.Nested.Member", "app.Facade$.Nested$.Member"),
+        ] {
+            let found = lookup.by_normalized_fqn(query);
+            assert!(
+                found.iter().any(|unit| unit.fq_name() == expected),
+                "{query} must resolve {expected}: {found:?}"
+            );
+        }
+        // The nested member is also reachable from its bare terminal, which is
+        // the spelling the identifier index is keyed by.
+        assert!(
+            lookup
+                .identifier("Member")
+                .iter()
+                .any(|unit| unit.fq_name() == "app.Facade$.Nested$.Member")
+        );
+    }
 
     #[test]
     fn workspace_lookup_skips_empty_delegates_and_observes_their_first_source() {

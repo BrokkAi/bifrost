@@ -3386,9 +3386,10 @@ fn build_diff_base_workspace(
     export: &RevisionExport,
     head_root: &Path,
     head_workspace: &WorkspaceAnalyzer,
+    cancellation: &CancellationToken,
 ) -> Result<(RevisionWorkspace, AnalyzerConfig), String> {
     let config = head_workspace.config().cloned().unwrap_or_default();
-    let base = export.build_workspace(head_root, config.clone())?;
+    let base = export.build_workspace(head_root, config.clone(), cancellation)?;
     debug_assert_eq!(
         base.workspace().config(),
         Some(&config),
@@ -3440,12 +3441,18 @@ fn evaluate_policy_diff_baseline(
     // to evaluate always has a head workspace whose configuration it copies.
     let head_workspace = head_workspace
         .expect("a runnable policy input implies the head analyzer workspace that closed it");
-    let (base, base_analyzer_config) =
-        build_diff_base_workspace(&export, head_root, head_workspace).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to build the diff base analyzer for `{revision}`: {error}"
-            ))
-        })?;
+    let uncancelled = CancellationToken::default();
+    let (base, base_analyzer_config) = build_diff_base_workspace(
+        &export,
+        head_root,
+        head_workspace,
+        cancellation.unwrap_or(&uncancelled),
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to build the diff base analyzer for `{revision}`: {error}"
+        ))
+    })?;
     // The base activates the packs its own committed document names and the
     // reviewed semantic models its own tree checks in, the same way it loads
     // its own committed suppressions (#1868, #2493). Both sides of the
@@ -6821,8 +6828,13 @@ mod tests {
         // That run's base came from this function, which takes its
         // configuration from the head workspace rather than choosing one.
         let export = export_revision(workspace.path(), "HEAD").expect("export the base revision");
-        let (base, base_config) = build_diff_base_workspace(&export, workspace.path(), &head)
-            .expect("base analyzer workspace");
+        let (base, base_config) = build_diff_base_workspace(
+            &export,
+            workspace.path(),
+            &head,
+            &CancellationToken::default(),
+        )
+        .expect("base analyzer workspace");
         assert_eq!(base_config, head_config);
         assert_eq!(base.workspace().config(), head.config());
     }

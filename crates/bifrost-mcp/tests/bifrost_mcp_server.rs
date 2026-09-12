@@ -3801,6 +3801,146 @@ fn output_schema_describes_real_workspace_and_policy_results() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+/// Issue #3170: a request that runs out of budget says what it was doing.
+///
+/// The reproduction from the issue: hold the analyzer cache build lock from
+/// another process and call a diff-derived tool. Before this, the tool's
+/// thread parked in `File::lock` and the client was told only that the tool
+/// "exhausted its request budget", which is why five occurrences on the
+/// Windows runner produced no diagnosis at all.
+///
+/// Two answers are correct now, because the request's deadline reaches the
+/// analyzer and the host at the same instant: the host's budget error, which
+/// carries the phase the request was in, or the analyzer's own error, which
+/// names the lock it gave up on. Both name the lock, which is the property
+/// under test; whichever of the two is returned, it is no longer opaque.
+///
+/// Everything the request does before the lock -- resolving the endpoints,
+/// materializing the diff, opening the shared cache, starting the base
+/// revision analyzer -- now publishes a phase of its own, so a failure here
+/// reports where a request that never reached the lock spent its budget
+/// instead of falling back to "executing <tool>".
+#[test]
+fn a_held_build_lock_is_named_when_the_request_budget_expires() {
+    let workspace = InlineTestProject::new()
+        .file("Described.java", "class Described {}\n")
+        .build();
+    let repo = Repository::init(workspace.root()).expect("initialize lock fixture repository");
+    let mut index = repo.index().expect("lock fixture index");
+    index
+        .add_all(["*"], IndexAddOption::DEFAULT, None)
+        .expect("stage lock fixture");
+    index.write().expect("write lock fixture index");
+    let tree = repo
+        .find_tree(index.write_tree().expect("lock fixture tree id"))
+        .expect("lock fixture tree");
+    let signature = Signature::now("Tester", "tester@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+        .expect("commit lock fixture");
+    fs::write(
+        workspace.root().join("Described.java"),
+        "class Described { void changed() {} }\n",
+    )
+    .expect("edit lock fixture");
+
+    let mut child = Command::new(mcp_server_binary())
+        .arg("--root")
+        .arg(workspace.root())
+        .arg("--mcp")
+        .arg("searchtools")
+        // The budget has to outlast everything the request does before the
+        // lock: resolving the endpoints, materializing the diff, and opening
+        // the shared cache. On a loaded 16-vCPU Windows runner 5 s was spent
+        // before the wait even started, so the request expired in the
+        // fallback "executing <tool>" phase and never tested the lock at all.
+        // The test then costs about this long when it works, because the lock
+        // is held until the response arrives.
+        .env(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, "20")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    // The workspace build takes the same lock, so let it finish and release
+    // before the test takes it.
+    call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        1,
+        "get_active_workspace",
+        json!({}),
+    );
+
+    let held = hold_analyzer_cache_build_lock(workspace.root());
+    let started = std::time::Instant::now();
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "cyclomatic_complexity", "arguments": {} }
+        }),
+    );
+    let waited = started.elapsed();
+    drop(held);
+    drop(stdin);
+    let _ = child.wait();
+
+    let message = response["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // The full response, not just the phrase that is missing: a future miss
+    // reports which phase the request was in when the budget went, which is
+    // the whole point of the phases this test covers.
+    assert!(
+        message.contains("analyzer cache build lock"),
+        "a request that ran out of budget on the build lock must name it, and \
+         the phase it did reach says where the budget went instead: {response}"
+    );
+    if message.contains("request budget") {
+        assert!(
+            message.contains("request budget while waiting for the analyzer cache build lock"),
+            "the budget error must carry the phase the request was in: {message}"
+        );
+    }
+    assert!(
+        waited < Duration::from_secs(45),
+        "the request took {waited:?}, which is the parked wait this issue is about"
+    );
+}
+
+/// Take the analyzer cache build lock of the workspace rooted at `root`, the
+/// way another builder in another process holds it.
+fn hold_analyzer_cache_build_lock(root: &std::path::Path) -> fs::File {
+    let cache_dir = root.join(".bifrost").join("cache");
+    let lock_path = fs::read_dir(&cache_dir)
+        .expect("the built workspace has a cache directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".initial-build.lock"))
+        })
+        .unwrap_or_else(|| panic!("no build lock in {}", cache_dir.display()));
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open the build lock");
+    file.lock().expect("hold the build lock");
+    file
+}
+
 /// `search_symbols` answers in four shapes and every one of them has to satisfy
 /// the single advertised schema: a ranked hit, a bounded answer, an empty
 /// answer, and the overload reply that reports counts instead of results.

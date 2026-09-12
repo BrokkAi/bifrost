@@ -11,7 +11,9 @@ use crate::profiling;
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
-use crate::{FileSetProject, FilesystemProject, ImportInfo, Project, WorkspaceAnalyzer};
+use crate::{
+    CancellationToken, FileSetProject, FilesystemProject, ImportInfo, Project, WorkspaceAnalyzer,
+};
 use brokk_bifrost_core::analyzer::project::BifrostIgnoreMatcher;
 use git2::{
     Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
@@ -535,16 +537,23 @@ pub fn analyze_diff(
     analyzer: &dyn IAnalyzer,
     params: AnalyzeDiffParams,
     options: &DiffAnalysisOptions,
+    cancellation: &CancellationToken,
 ) -> Result<DiffAnalysisResult, String> {
-    analyze_diff_at_root(analyzer.project().root(), params, options)
+    analyze_diff_at_root(analyzer.project().root(), params, options, cancellation)
 }
 
 pub fn analyze_diff_at_root(
     root: &Path,
     params: AnalyzeDiffParams,
     options: &DiffAnalysisOptions,
+    cancellation: &CancellationToken,
 ) -> Result<DiffAnalysisResult, String> {
-    let prepared = PreparedDiff::at_root(root, DiffEndpointParams::from(&params), options)?;
+    let prepared = PreparedDiff::at_root(
+        root,
+        DiffEndpointParams::from(&params),
+        options,
+        cancellation,
+    )?;
     analyze_prepared_diff(&prepared, params.include_tests)
 }
 
@@ -577,9 +586,20 @@ impl PreparedDiff {
         root: &Path,
         params: DiffEndpointParams,
         options: &DiffAnalysisOptions,
+        cancellation: &CancellationToken,
     ) -> Result<Self, String> {
         let resolution_repo = open_repository(root, options, false)?;
         let (base, target) = resolve_endpoints(&resolution_repo.repo, &params)?;
+        // Everything below -- the isolated object database, the Git diff, and
+        // opening the shared cache -- runs before any analyzer exists, so a
+        // budget that expires here would otherwise only be able to name the
+        // tool (issue #3170). The endpoints are resolved, so the phase can say
+        // which diff is being prepared.
+        let _phase = cancellation.enter_phase(format!(
+            "preparing the diff between {} and {}",
+            base.label(),
+            target.label()
+        ));
         let repository = if base.is_immutable() && target.is_immutable() {
             open_repository(root, options, true)?
         } else {
@@ -595,7 +615,7 @@ impl PreparedDiff {
         // directory: `cache_dir_path` walks up to the primary repository, and a
         // temp export has no repository to walk up to.
         let shared_cache = if base.is_immutable() || target.is_immutable() {
-            Some(SharedAnalyzerCache::open(root).map_err(|error| error.to_string())?)
+            Some(SharedAnalyzerCache::open(root, cancellation).map_err(|error| error.to_string())?)
         } else {
             None
         };
@@ -644,6 +664,9 @@ impl PreparedDiff {
             &repository.alternate_object_dirs,
             self.shared_cache(),
         )?;
+        let _phase = self
+            .shared_cache()
+            .map(|cache| cache.enter_phase("building the target revision analyzer"));
         let analyzer = build_revision_analyzer(&image, self.shared_cache())?;
         Ok(EndpointAnalysis {
             analyzer,
@@ -780,12 +803,21 @@ fn analyze_prepared_symbol_changes_from_images(
 ) -> Result<PreparedSymbolChanges, String> {
     let file_changes = &prepared.file_changes;
     let changed_lines = &prepared.changed_lines;
+    // Each build publishes its side as the request's phase: the cross-process
+    // build-lock wait happens beneath it, and a budget that expires there
+    // should say which endpoint it was on (issue #3170).
     let base_analyzer = {
         let _scope = profiling::scope("diff_symbols.build_base_analyzer");
+        let _phase = prepared
+            .shared_cache()
+            .map(|cache| cache.enter_phase("building the base revision analyzer"));
         build_revision_analyzer(&base_image, prepared.shared_cache())?
     };
     let target_analyzer = {
         let _scope = profiling::scope("diff_symbols.build_target_analyzer");
+        let _phase = prepared
+            .shared_cache()
+            .map(|cache| cache.enter_phase("building the target revision analyzer"));
         build_revision_analyzer(&target_image, prepared.shared_cache())?
     };
 
@@ -1805,9 +1837,10 @@ impl RevisionExport {
         &self,
         repository_root: &Path,
         config: AnalyzerConfig,
+        cancellation: &CancellationToken,
     ) -> Result<RevisionWorkspace, String> {
-        let cache =
-            SharedAnalyzerCache::open(repository_root).map_err(|error| error.to_string())?;
+        let cache = SharedAnalyzerCache::open(repository_root, cancellation)
+            .map_err(|error| error.to_string())?;
         // Claimed before the build, so a build that fails partway still leaves
         // no rows naming this export's directory behind.
         let projection = cache.claim_revision_workspace(self.image.root());
@@ -4749,10 +4782,10 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol,
-        DiffAnalysisOptions, DiffEndpointParams, FileChange, ImportTarget, Language, PreparedDiff,
-        RevisionImage, RevisionTempDir, SharedAnalyzerCache, Snapshot, SymbolKey, SymbolSnapshot,
-        WORKTREE_ENDPOINT, analyze_diff_at_root, analyze_prepared_diff,
+        AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, CancellationToken, ChangedLines,
+        CommitSymbol, DiffAnalysisOptions, DiffEndpointParams, FileChange, ImportTarget, Language,
+        PreparedDiff, RevisionImage, RevisionTempDir, SharedAnalyzerCache, Snapshot, SymbolKey,
+        SymbolSnapshot, WORKTREE_ENDPOINT, analyze_diff_at_root, analyze_prepared_diff,
         analyze_prepared_symbol_changes, body_similarity, body_token_signature_for_bytes,
         create_private_dirs, diff_local_idf, is_pure_line_shift, pair_endpoints,
         resolve_import_target, within_fuzzy_weight_ratio, worktree_files, write_private_file,
@@ -5090,6 +5123,7 @@ mod tests {
                 target: None,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .unwrap();
         let paired_only = analyze_prepared_symbol_changes(&prepared, true).unwrap();
@@ -5181,6 +5215,7 @@ mod tests {
             root,
             AnalyzeDiffParams::default(),
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .unwrap();
 
@@ -5234,6 +5269,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("sentinel analyze_diff failed");
         let explicit = analyze_diff_at_root(
@@ -5244,6 +5280,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("explicit-target analyze_diff failed");
 
@@ -5305,6 +5342,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("sentinel analyze_diff failed");
         let explicit = analyze_diff_at_root(
@@ -5315,6 +5353,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("explicit-target analyze_diff failed");
 
@@ -5400,7 +5439,8 @@ mod tests {
         let root = dir.path();
         let head = go_import_expansion_repo(root);
         let repo = Repository::open(root).unwrap();
-        let cache = SharedAnalyzerCache::open(root).expect("the fixture is a git repository");
+        let cache = SharedAnalyzerCache::open(root, &CancellationToken::default())
+            .expect("the fixture is a git repository");
 
         let cold = expanded_image_files(&repo, head, Some(&cache));
         let after_cold = cache_row_count(root, "blobs");
@@ -5439,7 +5479,8 @@ mod tests {
         let repo = Repository::open(root).unwrap();
 
         let fallback = expanded_image_files(&repo, head, None);
-        let cache = SharedAnalyzerCache::open(root).expect("the fixture is a git repository");
+        let cache = SharedAnalyzerCache::open(root, &CancellationToken::default())
+            .expect("the fixture is a git repository");
         let shared = expanded_image_files(&repo, head, Some(&cache));
         drop(cache);
 
@@ -5491,6 +5532,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("analyze_diff failed");
 
@@ -5556,6 +5598,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("sentinel analyze_diff failed");
 
@@ -5724,6 +5767,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("analyze_diff failed");
 
@@ -5783,6 +5827,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("analyze_diff failed");
 
@@ -5837,6 +5882,7 @@ mod tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("analyze_diff failed");
 
@@ -6330,6 +6376,7 @@ mod tests {
                 include_tests: true,
             },
             &super::DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("analyze_diff failed");
 
@@ -6451,6 +6498,7 @@ mod entry_point_tests {
                 target: None,
             },
             &options,
+            &CancellationToken::default(),
         )
         .unwrap();
         assert_eq!(prepared.base, Snapshot::Tree(base_tree));
@@ -6558,6 +6606,7 @@ mod entry_point_tests {
                 target: Some("HEAD".to_string()),
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .unwrap();
         let whole_target = prepared.whole_target_analysis().unwrap();
@@ -6643,6 +6692,7 @@ mod entry_point_tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .unwrap();
 
@@ -6738,6 +6788,7 @@ mod entry_point_tests {
                 include_tests: true,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .unwrap();
 
@@ -6796,7 +6847,11 @@ mod entry_point_tests {
         // canonicalizes its root, exactly as the claim did.
         let export_identity = brokk_bifrost_core::gitblob::workspace_cache_identity(export.root());
         let workspace = export
-            .build_workspace(root, AnalyzerConfig::default())
+            .build_workspace(
+                root,
+                AnalyzerConfig::default(),
+                &CancellationToken::default(),
+            )
             .expect("revision workspace");
 
         let names = {

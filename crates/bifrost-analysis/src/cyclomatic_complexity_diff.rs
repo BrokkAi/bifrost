@@ -1,5 +1,6 @@
 //! Cyclomatic-complexity changes for functions introduced or edited by a diff.
 
+use crate::CancellationToken;
 use crate::analyzer::{CodeUnit, IAnalyzer};
 use crate::code_quality::cyclomatic_complexities_for_file;
 use crate::diff_analysis::{
@@ -108,6 +109,7 @@ pub fn cyclomatic_complexity_at_root(
     root: &Path,
     params: CyclomaticComplexityParams,
     options: &DiffAnalysisOptions,
+    cancellation: &CancellationToken,
 ) -> Result<CyclomaticComplexityDiffResult, String> {
     let prepared = PreparedDiff::at_root(
         root,
@@ -116,6 +118,7 @@ pub fn cyclomatic_complexity_at_root(
             target: params.target,
         },
         options,
+        cancellation,
     )?;
     let endpoints = CyclomaticComplexityEndpoints {
         base: prepared.base.label(),
@@ -392,6 +395,7 @@ mod tests {
                 include_tests: false,
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("complexity diff");
 
@@ -468,6 +472,7 @@ mod tests {
                 ..CyclomaticComplexityParams::default()
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("complexity diff without tests");
         assert!(excluded.functions.is_empty());
@@ -480,6 +485,7 @@ mod tests {
                 ..CyclomaticComplexityParams::default()
             },
             &DiffAnalysisOptions::default(),
+            &CancellationToken::default(),
         )
         .expect("complexity diff with tests");
         assert_eq!(1, included.functions.len());

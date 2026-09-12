@@ -414,12 +414,48 @@ impl CppIdentityRenderCache {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Option<Range> {
-        let classifier = if language_for_target(unit) == Language::Cpp && unit.is_callable() {
+        // A class with a forward declaration and a definition has one physical
+        // occurrence per site; the definition is the primary one, the same way
+        // it is for a callable with a prototype (#1650, #3297).
+        let classifier = if language_for_target(unit) == Language::Cpp
+            && (unit.is_callable() || unit.is_class())
+        {
             self.classifier(analyzer, unit.source())
         } else {
             None
         };
         primary_range_with_cpp_classifier(analyzer, unit, classifier)
+    }
+
+    /// The physical declaration ranges to render for `unit`. A C++ class with
+    /// a forward declaration above its definition carries both as declaration
+    /// ranges (#3297); the definition is the one `get_symbol_sources` renders,
+    /// exactly as it renders a callable's body rather than its prototype
+    /// (#1650). Every other unit keeps all of its ranges.
+    pub(super) fn definition_ranges(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        ranges: Vec<Range>,
+    ) -> Vec<Range> {
+        if language_for_target(unit) != Language::Cpp || !unit.is_class() || ranges.len() < 2 {
+            return ranges;
+        }
+        let Some(classifier) = self.classifier(analyzer, unit.source()) else {
+            return ranges;
+        };
+        let definitions = ranges
+            .iter()
+            .copied()
+            .filter(|range| {
+                classifier.classify(unit, range) == crate::analyzer::CppOccurrenceRole::Definition
+            })
+            .collect::<Vec<_>>();
+        if definitions.is_empty() {
+            ranges
+        } else {
+            definitions
+        }
     }
 
     pub(super) fn occurrence_role(
@@ -496,7 +532,11 @@ impl DefinitionCandidateRenderCache {
             .entry(unit.source().clone())
             .or_insert_with(|| load_declaration_name_context(analyzer, unit.source()));
         let name_range = context.as_ref().and_then(|context| {
-            if language_for_target(unit) == Language::Cpp && unit.is_callable() {
+            // A class with a forward declaration and a definition carries both
+            // as declaration ranges; its name is displayed at the definition
+            // occurrence, the same way a callable's is (#1650, #3297).
+            if language_for_target(unit) == Language::Cpp && (unit.is_callable() || unit.is_class())
+            {
                 self.cpp_identity
                     .primary_range(analyzer, unit)
                     .and_then(|range| context.name_range_for_declaration(unit, range))

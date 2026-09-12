@@ -273,6 +273,9 @@ fn build_target_file_dependency_analyzer<'a>(
 
     let target_languages = graph_languages_for_paths(&revision_graph_paths(prepared));
     let image = prepared.materialize_file_dependencies(prepared.target, &target_languages)?;
+    let _phase = prepared
+        .shared_cache()
+        .map(|cache| cache.enter_phase("building the target revision analyzer"));
     let analyzer =
         build_file_dependency_analyzer(&image, prepared.shared_cache(), &target_languages)?;
     Ok(TargetFileDependencyAnalyzer::Revision {
@@ -309,6 +312,7 @@ pub fn blast_radius_at_root(
             target: params.target.clone(),
         },
         options,
+        cancellation,
     )?;
 
     let target_paths = target_diff_paths(&prepared);
@@ -368,6 +372,9 @@ pub fn blast_radius_at_root(
         base_recovery = BaseRecoveryState::Complete;
         let base_languages = graph_languages_for_paths(&base_paths);
         let base_image = prepared.materialize_file_dependencies(prepared.base, &base_languages)?;
+        let _phase = prepared
+            .shared_cache()
+            .map(|cache| cache.enter_phase("building the base revision analyzer"));
         let base_workspace =
             build_file_dependency_analyzer(&base_image, prepared.shared_cache(), &base_languages)?;
         let base_analyzer = base_workspace.analyzer();
@@ -1161,6 +1168,64 @@ mod tests {
         assert_eq!(
             BTreeSet::from([Language::JavaScript, Language::TypeScript]),
             graph_languages_for_paths(&BTreeSet::from(["src/value.ts".to_string()]))
+        );
+    }
+
+    /// Issue #3170: a diff-derived request that meets the analyzer cache build
+    /// lock ends by naming the lock, within its own deadline.
+    ///
+    /// Before this, the wait was `File::lock`: uninterruptible, so the request
+    /// budget expired while the analyzer thread stayed parked in the kernel
+    /// and the client was told only that the tool had used its budget. The
+    /// wait now polls under the request's token, so the answer names the lock
+    /// and its path.
+    #[test]
+    fn a_held_build_lock_ends_a_budgeted_request_by_naming_the_lock() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("source directory");
+        fs::write(root.join("src/__init__.py"), "").expect("source package");
+        fs::write(root.join("src/service.py"), "def run():\n    return 1\n")
+            .expect("service source");
+        let repo = Repository::init(root).expect("initialize repository");
+        commit_all(&repo, "base");
+        fs::write(root.join("src/service.py"), "def run():\n    return 2\n").expect("edit service");
+        let project = Arc::new(FilesystemProject::new(root).expect("filesystem project"));
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("workspace analyzer");
+
+        // The base endpoint is an immutable revision, so its image is built
+        // against the repository's shared cache and takes that cache's build
+        // lock. Another builder holds it for the whole request.
+        let db_path = crate::analyzer::store::analyzer_db_path(root);
+        fs::create_dir_all(db_path.parent().expect("the store path has a directory"))
+            .expect("cache directory");
+        let held =
+            brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(&db_path).expect("lock");
+
+        let cancellation =
+            CancellationToken::default().with_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let error = blast_radius_at_root(
+            root,
+            Some(workspace.analyzer()),
+            BlastRadiusParams::default(),
+            &DiffAnalysisOptions::default(),
+            &cancellation,
+        )
+        .expect_err("a request that cannot take the build lock must report the lock");
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(
+            error.contains("analyzer cache build lock")
+                && error.contains(&db_path.display().to_string()),
+            "the error must name the lock and its path: {error}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the request waited {waited:?} past a 300 ms deadline"
         );
     }
 

@@ -274,8 +274,8 @@ impl ForwardQueryProvider for CppAnalyzer {
         self.inner.relational_name_for_unit(unit)
     }
 
-    fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String> {
-        self.inner.definition_candidate_short_names(rendered)
+    fn forward_definition_candidate_identifiers(&self, rendered: &str) -> Vec<String> {
+        self.inner.definition_candidate_identifiers(rendered)
     }
 
     fn forward_definition_sources_may_exist(&self) -> bool {

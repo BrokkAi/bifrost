@@ -5529,28 +5529,34 @@ impl<'a> VisibilityIndex<'a> {
             return true;
         }
         let directly_visible = peers.iter().any(|peer| {
-            declaration_guard_requirements(analyzer, self.cpp, peer)
+            declaration_guard_sites(analyzer, self.cpp, peer, Some(reference.start_byte()))
                 .into_iter()
-                .any(|(declaration_byte, declaration_guards)| {
+                .any(|site| {
+                    let declaration_byte = site.byte;
+                    let declaration_guards = site.guards;
                     if peer.source() == file {
                         if declaration_byte >= reference.start_byte() {
                             return false;
                         }
-                        if !guard_requirements_hold_at_reference(
-                            &declaration_guards,
-                            raw_reference_guards.as_ref(),
-                        ) {
+                        // The reference's own conditional context must either
+                        // prove the declaration's requirements, or follow a
+                        // completed family that encloses the declaration
+                        // (#3297); either way it must not contradict them.
+                        let active = |guards: Option<&HashSet<PreprocessorGuard>>| {
+                            guard_requirements_hold_at_reference(&declaration_guards, guards)
+                                || (site.completed_family_before_reference
+                                    && guards_compatible_at_reference(&declaration_guards, guards))
+                        };
+                        if !active(raw_reference_guards.as_ref()) {
                             return false;
                         }
-                        return guard_requirements_hold_at_reference(
-                            &declaration_guards,
-                            reference_guards_at_site().as_ref(),
-                        ) && self.preprocessor_guards_stable_between(
-                            file,
-                            declaration_byte,
-                            reference.start_byte(),
-                            &declaration_guards,
-                        );
+                        return active(reference_guards_at_site().as_ref())
+                            && self.preprocessor_guards_stable_between(
+                                file,
+                                declaration_byte,
+                                reference.start_byte(),
+                                &declaration_guards,
+                            );
                     }
                     let raw_feasible = self.foreign_declaration_may_be_reachable_from_raw_guards(
                         file,
@@ -11146,6 +11152,33 @@ fn declaration_guard_requirements(
     cpp: &dyn CppSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
+    declaration_guard_sites(analyzer, cpp, candidate, None)
+        .into_iter()
+        .map(|site| (site.byte, site.guards))
+        .collect()
+}
+
+/// One declaration range's preprocessor facts, as a visible-at-a-reference
+/// question reads them.
+struct DeclarationGuardSite {
+    /// The byte at which the range introduces the name.
+    byte: usize,
+    /// The preprocessor requirements the range's declaration stands under.
+    guards: HashSet<PreprocessorGuard>,
+    /// Whether the range is one branch of completed `#if`/`#else` families
+    /// that all close before the reference. Always false without a reference
+    /// position.
+    completed_family_before_reference: bool,
+}
+
+/// The per-range facts behind [`declaration_guard_requirements`], plus the
+/// reference-relative fact the completed-family rule asks for.
+fn declaration_guard_sites(
+    analyzer: &CppGraphSource<'_>,
+    cpp: &dyn CppSource,
+    candidate: &CodeUnit,
+    reference_byte: Option<usize>,
+) -> Vec<DeclarationGuardSite> {
     let Some(prepared) = cpp.prepared_syntax(analyzer.token, candidate.source()) else {
         return Vec::new();
     };
@@ -11154,14 +11187,70 @@ fn declaration_guard_requirements(
         .ranges(candidate)
         .into_iter()
         .filter_map(|range| {
-            root.descendant_for_byte_range(range.start_byte, range.end_byte)
-                .and_then(|node| preprocessor_guard_environment(node, prepared.source()))
-                // A class name is injected into its own body at the declaration's
-                // introduction point, not after the complete class range. Using
-                // the start also preserves normal before/after ordering for aliases.
-                .map(|required| (range.start_byte, required))
+            let node = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            let guards = preprocessor_guard_environment(node, prepared.source())?;
+            // A class name is injected into its own body at the declaration's
+            // introduction point, not after the complete class range. Using
+            // the start also preserves normal before/after ordering for aliases.
+            Some(DeclarationGuardSite {
+                byte: range.start_byte,
+                guards,
+                completed_family_before_reference: reference_byte.is_some_and(|reference_byte| {
+                    declaration_follows_completed_family_before_reference(
+                        node,
+                        prepared.source(),
+                        reference_byte,
+                    )
+                }),
+            })
         })
         .collect()
+}
+
+/// Whether every conditional enclosing `node` is a completed
+/// `#if`/`#elif`/`#else` family that closes before `reference_byte`.
+///
+/// A completed family is an exhaustive case analysis: every configuration
+/// takes exactly one of its branches. A reference sited below the whole family
+/// is compiled in a configuration that either takes the declaration's branch,
+/// in which case the declaration is what the name resolves to there, or takes
+/// another branch, in which case the declaration is simply not part of that
+/// configuration. Nothing in the reference's own position settles the family,
+/// so the declaration is one resolution the source presents at the reference
+/// rather than a contradiction of it (#3297).
+///
+/// A lone `#if` is not a case analysis: nothing in the source says any
+/// configuration defines its macro, so a declaration under one stays
+/// unprovable and the implication rule keeps it out. Neither does a family
+/// whose end is not behind the reference: a reference inside the other branch
+/// contradicts the declaration, and a reference inside the declaration's own
+/// branch is already covered by implication.
+fn declaration_follows_completed_family_before_reference(
+    node: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> bool {
+    let mut inside_family = false;
+    let mut ancestor = node.parent();
+    while let Some(conditional) = ancestor {
+        if matches!(
+            conditional.kind(),
+            "preproc_if" | "preproc_ifdef" | "preproc_elif"
+        ) && !is_file_covering_include_guard(conditional, source)
+            && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
+        {
+            let family = preprocessor_conditional_family_root(conditional);
+            if !preprocessor_conditional_family_has_terminal_else(family)
+                || family.end_byte() > reference_byte
+            {
+                return false;
+            }
+            inside_family = true;
+        }
+        ancestor = conditional.parent();
+    }
+    inside_family
 }
 
 fn first_declaration_byte(analyzer: &CppGraphSource<'_>, candidate: &CodeUnit) -> Option<usize> {
@@ -11928,6 +12017,13 @@ fn callable_declaration_guard_requirements(
 /// Whether a declaration in the reference's own file is co-active with the
 /// reference: one translation unit resolves every conditional the same way, so
 /// the reference's active guards must imply the declaration's requirements.
+///
+/// The exception is a declaration in one branch of a completed `#if`/`#else`
+/// family the reference follows: the reference's own position settles nothing
+/// about that family, so a compatible branch is one resolution the source
+/// presents at the reference (#3297), exactly as
+/// [`VisibilityIndex::external_type_candidate_visible_in_context`] reads a type
+/// declaration there.
 fn callable_preprocessor_context_is_visible_for_reference(
     node: Node<'_>,
     source: &str,
@@ -11936,7 +12032,13 @@ fn callable_preprocessor_context_is_visible_for_reference(
     let Some(required) = callable_declaration_guard_requirements(node, source, reference) else {
         return false;
     };
-    required.is_empty() || guard_requirements_hold_at_reference(&required, reference.guards())
+    if required.is_empty() || guard_requirements_hold_at_reference(&required, reference.guards()) {
+        return true;
+    }
+    reference.position.as_ref().is_some_and(|position| {
+        guards_compatible_at_reference(&required, reference.guards())
+            && declaration_follows_completed_family_before_reference(node, source, position.byte)
+    })
 }
 
 fn flattened_macro_namespace_declaration_matches(

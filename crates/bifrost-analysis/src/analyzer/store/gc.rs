@@ -160,6 +160,69 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject};
     use crate::gitblob::test_repo::{commit_all, init_repo};
 
+    /// Issue #3170: a store created moments ago is not overdue for collection.
+    ///
+    /// Collection is due when the store has grown and the time cadence has
+    /// elapsed since the last one. A store whose `cache_state` row was written
+    /// with `last_gc_at = 0` reads as overdue by the whole epoch, so the first
+    /// build that persisted a blob scheduled a full sweep of a store it had
+    /// just written -- and that sweep held the analyzer-cache build lock in
+    /// front of the session's first diff-derived request.
+    ///
+    /// The tuning guard pins the production cadence rather than changing it:
+    /// the default interval is the subject here.
+    #[test]
+    fn a_fresh_store_is_not_born_due_for_collection() {
+        let _tuning = crate::cache_gc::set_tuning_for_test(
+            crate::cache_gc::GC_AUTO_BLOB_THRESHOLD,
+            crate::cache_gc::GC_MIN_INTERVAL_SECS,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
+        std::fs::write(root.join("app.rs"), "pub fn widget() -> u32 { 1 }\n").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "first content");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            project,
+            AnalyzerConfig::default(),
+        )
+        .expect("persisted analyzer should build");
+        let db_path = workspace
+            .persisted_store_path()
+            .expect("a persisted build reports its store path");
+        drop(workspace);
+
+        let store = AnalyzerStore::open_persistent(&db_path).expect("open the built store");
+        let outcome = run_gc(&store, &repository, &root).expect("scheduled collection");
+
+        assert!(
+            !outcome.ran,
+            "a store created by this build must not already be due: {outcome:?}"
+        );
+        assert!(
+            outcome.total_blobs_after > 0,
+            "the build must persist blobs, or the scheduling condition is vacuous"
+        );
+        let conn = rusqlite::Connection::open(&db_path).expect("read the store's accounting");
+        let (last_gc_at, blobs_at_last_gc): (i64, i64) = conn
+            .query_row(
+                "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cache_state accounting");
+        assert_eq!(
+            blobs_at_last_gc, 0,
+            "no collection ran, so the recorded blob count must still be the store's initial one"
+        );
+        assert!(
+            last_gc_at > 0,
+            "a created store starts its collection cadence at its creation time"
+        );
+    }
+
     /// A collection that dropped rows leaves this store's pooled readers
     /// planning against statistics the collection invalidated, so the
     /// collection recycles them (issue #3029).

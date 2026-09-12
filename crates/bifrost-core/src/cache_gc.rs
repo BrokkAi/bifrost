@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use git2::Repository;
 use growable_bloom_filter::GrowableBloom;
@@ -36,31 +37,142 @@ pub struct AnalyzerCacheBuildLock {
     _file: File,
 }
 
+/// How long the wait below sleeps between attempts on a held lock.
+const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// A wait at least this long is reported to `BIFROST_TIMING`, whether or not
+/// it ends in the lock being taken. Below it the wait is ordinary
+/// serialization between a build and a collection and says nothing.
+const BUILD_LOCK_REPORT_THRESHOLD: Duration = Duration::from_millis(100);
+
 impl AnalyzerCacheBuildLock {
+    /// Take the lock, waiting for as long as the current holder needs.
+    ///
+    /// For a caller with no deadline of its own: a CLI or batch build, or a
+    /// forced collection. A caller inside a budgeted request must use
+    /// [`Self::acquire_cancellable`] instead, or its wait outlives the budget
+    /// and is reported as the budget rather than as the lock (issue #3170).
     pub fn acquire(db_path: &Path) -> Result<Self, String> {
-        // Keep the established sidecar name so processes running older Bifrost
-        // builds coordinate on the same OS lock during an upgrade.
-        let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                format!(
-                    "failed to open workspace analyzer build lock {}: {error}",
-                    lock_path.display()
-                )
-            })?;
-        file.lock().map_err(|error| {
-            format!(
+        Self::wait_for_lock(db_path, None)
+    }
+
+    /// Take the lock, giving up when the caller's request is cancelled.
+    ///
+    /// The error names the lock, its path, and how long this caller waited, so
+    /// a recurrence is reported as contention on a named lock instead of as an
+    /// unattributed timeout. The wait also publishes itself as the request's
+    /// phase for as long as it lasts (see
+    /// [`CancellationToken::enter_phase`](crate::CancellationToken::enter_phase)).
+    pub fn acquire_cancellable(
+        db_path: &Path,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Self, String> {
+        Self::wait_for_lock(db_path, Some(cancellation))
+    }
+
+    /// Poll for the lock instead of parking in the kernel on it.
+    ///
+    /// `std::fs::File::lock` takes no deadline and cannot be interrupted, so a
+    /// thread that enters it is unreachable until the holder is done: an MCP
+    /// request whose budget expired mid-wait returned a budget error while its
+    /// analyzer thread stayed parked. Polling is what makes the wait
+    /// answerable to the caller's own cancellation.
+    fn wait_for_lock(
+        db_path: &Path,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<Self, String> {
+        let (file, lock_path) = open_build_lock_file(db_path)?;
+        let started = std::time::Instant::now();
+        // Entered on the first attempt that has to wait, and dropped with this
+        // function, so the phase describes exactly the wait.
+        let mut phase = None;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    report_build_lock_wait(&lock_path, started.elapsed());
+                    return Ok(Self { _file: file });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!(
+                        "failed to acquire workspace analyzer build lock {}: {error}",
+                        lock_path.display()
+                    ));
+                }
+            }
+            if let Some(cancellation) = cancellation {
+                if cancellation.is_cancelled() {
+                    let waited = started.elapsed();
+                    report_build_lock_wait(&lock_path, waited);
+                    return Err(format!(
+                        "the analyzer cache build lock at {} was held by another builder or \
+                         collector for {waited:?}, and this request was cancelled before it \
+                         became free",
+                        lock_path.display()
+                    ));
+                }
+                if phase.is_none() {
+                    phase = Some(cancellation.enter_phase(format!(
+                        "waiting for the analyzer cache build lock at {}",
+                        lock_path.display()
+                    )));
+                }
+            }
+            std::thread::sleep(BUILD_LOCK_POLL_INTERVAL);
+        }
+    }
+
+    /// Take the lock only if it is free right now.
+    ///
+    /// `None` means a builder or another collector holds it. Opportunistic
+    /// collection uses this: it runs behind interactive work, so waiting for
+    /// the lock would put the collection in front of the next request that
+    /// needs it, which is the convoy the claim above exists to avoid.
+    pub fn try_acquire(db_path: &Path) -> Result<Option<Self>, String> {
+        let (file, lock_path) = open_build_lock_file(db_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(format!(
                 "failed to acquire workspace analyzer build lock {}: {error}",
+                lock_path.display()
+            )),
+        }
+    }
+}
+
+/// Leave a wait for the build lock in the timing log, so a wait that ends is
+/// as visible as one that does not.
+fn report_build_lock_wait(lock_path: &Path, waited: Duration) {
+    if waited < BUILD_LOCK_REPORT_THRESHOLD {
+        return;
+    }
+    crate::profiling::note_with(|| {
+        format!(
+            "cache_gc.build_lock_wait waited {waited:?} for {}",
+            lock_path.display()
+        )
+    });
+}
+
+/// Open the sidecar file the build lock is taken on, reporting its path.
+///
+/// Keep the established sidecar name so processes running older Bifrost builds
+/// coordinate on the same OS lock during an upgrade.
+fn open_build_lock_file(db_path: &Path) -> Result<(File, PathBuf), String> {
+    let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            format!(
+                "failed to open workspace analyzer build lock {}: {error}",
                 lock_path.display()
             )
         })?;
-        Ok(Self { _file: file })
-    }
+    Ok((file, lock_path))
 }
 
 fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -91,6 +203,7 @@ impl GcOutcome {
 #[derive(Debug)]
 struct GcClaim {
     db_path: std::path::PathBuf,
+    collection: Collection,
 }
 
 /// Collect against a unified cache DB. `db_path` is all collection needs from
@@ -114,7 +227,7 @@ pub fn maybe_gc(
     if !automatic_gc_enabled(std::env::var_os("BIFROST_CACHE_GC").as_deref()) {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     }
-    run_gc(db_path, repo, workspace_root, false)
+    run_gc(db_path, repo, workspace_root, Collection::Opportunistic)
 }
 
 pub fn force_gc(
@@ -122,47 +235,101 @@ pub fn force_gc(
     repo: &Repository,
     workspace_root: &Path,
 ) -> Result<GcOutcome, String> {
-    run_gc(db_path, repo, workspace_root, true)
+    run_gc(db_path, repo, workspace_root, Collection::Forced)
+}
+
+/// Whether this collection may wait for the other users of the store.
+///
+/// Opportunistic collection is scheduled behind a build and nobody is waiting
+/// for its result, so it must never make a request wait: it takes the build
+/// lock only if it is free, its connections carry a short busy timeout, and a
+/// store another process is writing is left for the next cadence. A forced
+/// collection has an explicit caller waiting for the outcome, so it waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    Opportunistic,
+    Forced,
+}
+
+impl Collection {
+    fn open(self, db_path: &Path) -> Result<Connection, String> {
+        match self {
+            Self::Opportunistic => cache_db::open_collection_connection(db_path),
+            Self::Forced => cache_db::open_unified_connection(db_path),
+        }
+    }
+
+    fn acquire_build_lock(self, db_path: &Path) -> Result<Option<AnalyzerCacheBuildLock>, String> {
+        match self {
+            Self::Opportunistic => AnalyzerCacheBuildLock::try_acquire(db_path),
+            Self::Forced => AnalyzerCacheBuildLock::acquire(db_path).map(Some),
+        }
+    }
+}
+
+/// Why a collection stopped before it collected anything.
+///
+/// `StoreBusy` is not a failure: another process is building into the store or
+/// writing to it, so this collection yields, releases its claim, and leaves
+/// the work to the next scheduled one. It is a separate variant rather than a
+/// message so the caller can tell the two apart without reading a string.
+#[derive(Debug)]
+enum GcStopped {
+    StoreBusy,
+    Failed(String),
+}
+
+impl From<rusqlite::Error> for GcStopped {
+    fn from(error: rusqlite::Error) -> Self {
+        match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                Self::StoreBusy
+            }
+            _ => Self::Failed(format!("cache GC SQLite error: {error}")),
+        }
+    }
+}
+
+impl From<String> for GcStopped {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
 }
 
 fn run_gc(
     db_path: &Path,
     repo: &Repository,
     workspace_root: &Path,
-    force: bool,
+    collection: Collection,
 ) -> Result<GcOutcome, String> {
-    let Some(claim) = try_claim_gc(db_path, force)? else {
-        return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
+    let claim = match claim_gc(db_path, collection) {
+        Ok(Some(claim)) => claim,
+        Ok(None) | Err(GcStopped::StoreBusy) => {
+            return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
+        }
+        Err(GcStopped::Failed(message)) => return Err(message),
     };
     match gitblob::has_network_promisor_remote(repo) {
         Ok(true) => {
-            clear_gc_claim(db_path)?;
+            clear_gc_claim(&claim)?;
             eprintln!("Bifrost cache GC skipped: repository uses a network-backed promisor remote");
             return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
         }
         Ok(false) => {}
         Err(error) => {
-            clear_gc_claim(db_path)?;
+            clear_gc_claim(&claim)?;
             return Err(format!("cache GC could not inspect Git remotes: {error}"));
         }
     }
-    // A builder commits content facts before the workspace projection that
-    // retains them. Wait for the complete reconciliation before snapshotting
-    // candidates, or collection can reclaim a revision image in that window.
-    // Claim first so concurrent scheduled tasks skip instead of forming a
-    // lock convoy behind the builder.
-    let _build_lock = match AnalyzerCacheBuildLock::acquire(db_path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            clear_gc_claim(db_path)?;
-            return Err(error);
-        }
-    };
     match sweep_with_claim(&claim, repo, workspace_root) {
         Ok(outcome) => Ok(outcome),
-        Err(err) => {
-            clear_gc_claim(db_path)?;
-            Err(err)
+        Err(GcStopped::StoreBusy) => {
+            clear_gc_claim(&claim)?;
+            Ok(GcOutcome::skipped(total_blob_count(db_path)?))
+        }
+        Err(GcStopped::Failed(message)) => {
+            clear_gc_claim(&claim)?;
+            Err(message)
         }
     }
 }
@@ -460,92 +627,107 @@ fn sweep_with_claim(
     claim: &GcClaim,
     repo: &Repository,
     workspace_root: &Path,
-) -> Result<GcOutcome, String> {
-    // Snapshot the rows eligible for this collection before walking Git. A
-    // workspace build may persist another blob while the reachability walk is
-    // in flight; that new row must belong to the next collection, even when
-    // the walk started before its working-tree or ref update became visible.
-    let mut conn = cache_db::open_unified_connection(&claim.db_path)?;
-    conn.pragma_update(None, "temp_store", "FILE")
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+) -> Result<GcOutcome, GcStopped> {
+    let mut conn = claim.collection.open(&claim.db_path)?;
+    conn.pragma_update(None, "temp_store", "FILE")?;
     conn.execute_batch(
         "CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
            generation INTEGER NOT NULL,
            PRIMARY KEY(blob_oid, lang, generation)
-         ) WITHOUT ROWID;
-         INSERT INTO gc_analyzer_candidates(blob_oid, lang, generation)
+         ) WITHOUT ROWID;",
+    )?;
+
+    // The Git reachability walk reads the repository, not the store, and it is
+    // the longest part of a collection. It runs before the build lock is
+    // taken, so a request that needs the lock never queues behind it.
+    let mut live = live_bloom(repo, workspace_root)?;
+
+    // From here to the deletion commit, and no further.
+    //
+    // A builder commits a blob's facts before it publishes the workspace
+    // projection that retains them, and holds this lock across both. The lock
+    // is therefore what makes "this blob has no root" a question with an
+    // answer: under it, no build is mid-reconciliation, so every committed
+    // blob either belongs to a published projection or belongs to none.
+    //
+    // That is also why the Git walk above may run outside it. A builder that
+    // published after the walk but before this point is covered by the
+    // `workspace_file_versions` roots read below, inside the deletion
+    // transaction; a blob committed after the candidate snapshot is not a
+    // candidate at all. What the lock must cover is the pair -- the snapshot
+    // and the roots read -- not the walk that seeds them.
+    //
+    // The vacuum, the planner-statistics refresh, the accounting update and
+    // the version-store sweep all run after it is released: none of them can
+    // reclaim a row, so none of them needs to exclude a builder.
+    let Some(build_lock) = claim.collection.acquire_build_lock(&claim.db_path)? else {
+        return Err(GcStopped::StoreBusy);
+    };
+
+    // Snapshot the rows eligible for this collection. A workspace build may
+    // persist another blob once the lock is released; that new row belongs to
+    // the next collection.
+    conn.execute_batch(
+        "INSERT INTO gc_analyzer_candidates(blob_oid, lang, generation)
            SELECT blobs.blob_oid, blobs.lang, blobs.generation
            FROM blobs
            LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
            WHERE blobs.generation = COALESCE(epochs.generation, 0);",
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    )?;
 
-    let mut live = live_bloom(repo, workspace_root)?;
-
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Retained workspace revisions also own their blobs, including immutable
     // diff images whose objects need not be reachable from any Git ref. Read
     // these roots under the deletion transaction so a projection published
     // during the Git walk is protected too. Stream them once rather than
     // scanning workspace history separately for every candidate blob.
     {
-        let mut stmt = tx
-            .prepare("SELECT blob_oid FROM workspace_file_versions")
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        let roots = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        let mut stmt = tx.prepare("SELECT blob_oid FROM workspace_file_versions")?;
+        let roots = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for root in roots {
-            live.insert(root.map_err(|err| format!("cache GC SQLite error: {err}"))?);
+            live.insert(root?);
         }
     }
     let dead_analyzer = {
-        let mut stmt = tx
-            .prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?
+        let mut stmt =
+            tx.prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .filter(|(oid, _, _)| !live.contains(oid))
             .collect::<Vec<_>>()
     };
     let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?;
-    tx.commit()
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    conn.pragma_update(None, "incremental_vacuum", 0)
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    tx.commit()?;
+    drop(build_lock);
 
-    // A collection that removed rows changed the cardinalities the planner
-    // reasons from, so the statistics it left behind now describe a database
-    // that no longer exists. Refreshing here is what keeps a collected store
-    // planning as well as a freshly built one (issue #3016).
-    if analyzer_dropped > 0 && planner_statistics_enabled() {
-        let evidence = refresh_planner_statistics(&conn)?;
-        crate::profiling::note_with(|| {
-            format!(
-                "cache_gc.planner_statistics refreshed after dropping {analyzer_dropped} rows: \
-                 {:.1} ms, {} sqlite_stat1 rows",
-                evidence.elapsed.as_secs_f64() * 1000.0,
-                evidence.stat1_rows
-            )
-        });
-    }
-
-    let total_blobs_after = finish_gc(&claim.db_path)?;
+    // This collection is done; what follows is maintenance on the store it has
+    // already changed, and every part of it has a next chance -- the pages
+    // this one freed are returned by the next collection's vacuum, and a store
+    // whose statistics no longer describe it is repaired the next time it is
+    // opened (#3031). A store the live session is writing therefore postpones
+    // the maintenance instead of turning a collection that happened into one
+    // reported as skipped: that report is what tells the caller to recycle the
+    // readers whose query plans the deletions invalidated (#3029).
+    let total_blobs_after = match maintain_collected_store(&mut conn, analyzer_dropped) {
+        Ok(total) => total,
+        Err(GcStopped::StoreBusy) => {
+            eprintln!(
+                "Bifrost cache GC collected {analyzer_dropped} rows and left its bookkeeping to \
+                 the next collection: another writer holds the store"
+            );
+            total_blob_count_conn(&conn)?
+        }
+        Err(failed) => return Err(failed),
+    };
     // Row collection and file collection answer the same question about
     // different granularities, and both belong under the claim: one sweeper at
     // a time, at the cadence the claim already paces.
@@ -562,21 +744,58 @@ fn sweep_with_claim(
     })
 }
 
+/// Return the freed pages, refresh the statistics the deletions invalidated,
+/// and record the collection in `cache_state`. Reports the store's blob count
+/// afterwards.
+///
+/// Runs on the sweep's own connection, with the build lock already released:
+/// none of this can reclaim a row, so none of it needs to exclude a builder.
+fn maintain_collected_store(
+    conn: &mut Connection,
+    analyzer_dropped: usize,
+) -> Result<i64, GcStopped> {
+    conn.pragma_update(None, "incremental_vacuum", 0)?;
+
+    // A collection that removed rows changed the cardinalities the planner
+    // reasons from, so the statistics it left behind now describe a database
+    // that no longer exists. Refreshing here is what keeps a collected store
+    // planning as well as a freshly built one (issue #3016).
+    if analyzer_dropped > 0 && planner_statistics_enabled() {
+        let evidence = refresh_planner_statistics(conn)?;
+        crate::profiling::note_with(|| {
+            format!(
+                "cache_gc.planner_statistics refreshed after dropping {analyzer_dropped} rows: \
+                 {:.1} ms, {} sqlite_stat1 rows",
+                evidence.elapsed.as_secs_f64() * 1000.0,
+                evidence.stat1_rows
+            )
+        });
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let total = total_blob_count_conn(&tx)?;
+    tx.execute(
+        "UPDATE cache_state
+         SET last_gc_at = ?1, blobs_at_last_gc = ?2, gc_claim_until = 0
+         WHERE id = 1",
+        (cache_db::now_unix_seconds(), total),
+    )?;
+    tx.commit()?;
+    conn.pragma_update(None, "incremental_vacuum", 0)?;
+    Ok(total)
+}
+
 fn delete_analyzer_candidates(
     tx: &rusqlite::Transaction<'_>,
     candidates: &[(String, String, i64)],
-) -> Result<usize, String> {
-    let mut delete = tx
-        .prepare(
-            "DELETE FROM blobs
+) -> Result<usize, GcStopped> {
+    let mut delete = tx.prepare(
+        "DELETE FROM blobs
              WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3",
-        )
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    )?;
     let mut dropped = 0usize;
     for (oid, lang, generation) in candidates {
-        dropped += delete
-            .execute((oid, lang, generation))
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        dropped += delete.execute((oid, lang, generation))?;
     }
     Ok(dropped)
 }
@@ -634,50 +853,45 @@ fn ignored_workspace_file_oids(
     Ok(out)
 }
 
-fn try_claim_gc(db_path: &Path, force: bool) -> Result<Option<GcClaim>, String> {
-    let mut conn = cache_db::open_unified_connection(db_path)?;
+fn claim_gc(db_path: &Path, collection: Collection) -> Result<Option<GcClaim>, GcStopped> {
+    let mut conn = collection.open(db_path)?;
     let now = cache_db::now_unix_seconds();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current_total = total_blob_count_conn(&tx)?;
-    let claim_until: i64 = tx
-        .query_row(
-            "SELECT gc_claim_until FROM cache_state WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    let claim_until: i64 = tx.query_row(
+        "SELECT gc_claim_until FROM cache_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
     if claim_until > now {
-        tx.commit()
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+        tx.commit()?;
         return Ok(None);
     }
-    if !force && !gc_due_tx(&tx, current_total, now)? {
-        tx.commit()
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    if collection == Collection::Opportunistic && !gc_due_tx(&tx, current_total, now)? {
+        tx.commit()?;
         return Ok(None);
     }
     tx.execute(
         "UPDATE cache_state SET gc_claim_until = ?1 WHERE id = 1",
         [now + GC_CLAIM_TTL_SECS],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.commit()
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    )?;
+    tx.commit()?;
     Ok(Some(GcClaim {
         db_path: db_path.to_path_buf(),
+        collection,
     }))
 }
 
-fn gc_due_tx(tx: &rusqlite::Transaction<'_>, current_total: i64, now: i64) -> Result<bool, String> {
-    let (last_gc_at, blobs_at_last_gc): (i64, i64) = tx
-        .query_row(
-            "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+fn gc_due_tx(
+    tx: &rusqlite::Transaction<'_>,
+    current_total: i64,
+    now: i64,
+) -> Result<bool, GcStopped> {
+    let (last_gc_at, blobs_at_last_gc): (i64, i64) = tx.query_row(
+        "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     let growth = current_total - blobs_at_last_gc;
     if growth <= 0 {
         return Ok(false);
@@ -688,29 +902,8 @@ fn gc_due_tx(tx: &rusqlite::Transaction<'_>, current_total: i64, now: i64) -> Re
     Ok(now.saturating_sub(last_gc_at) >= MIN_INTERVAL_SECS.load(Ordering::Relaxed))
 }
 
-fn finish_gc(db_path: &Path) -> Result<i64, String> {
-    let mut conn = cache_db::open_unified_connection(db_path)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    let total = total_blob_count_conn(&tx)?;
-    let now = cache_db::now_unix_seconds();
-    tx.execute(
-        "UPDATE cache_state
-         SET last_gc_at = ?1, blobs_at_last_gc = ?2, gc_claim_until = 0
-         WHERE id = 1",
-        (now, total),
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.commit()
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    conn.pragma_update(None, "incremental_vacuum", 0)
-        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    Ok(total)
-}
-
-fn clear_gc_claim(db_path: &Path) -> Result<(), String> {
-    let mut conn = cache_db::open_unified_connection(db_path)?;
+fn clear_gc_claim(claim: &GcClaim) -> Result<(), String> {
+    let mut conn = claim.collection.open(&claim.db_path)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
@@ -858,6 +1051,104 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![live_oid]);
+    }
+
+    /// One blob row and an analysis epoch: the smallest store a collection has
+    /// a reason to sweep.
+    fn store_with_one_collectable_blob(repo_root: &Path) -> PathBuf {
+        let db_path = gitblob::cache_db_path(repo_root);
+        let conn = cache_db::open_unified_connection(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation)
+             VALUES('2222222222222222222222222222222222222222', 'go', 1)",
+            [],
+        )
+        .unwrap();
+        db_path
+    }
+
+    fn gc_claim_until(db_path: &Path) -> i64 {
+        Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT gc_claim_until FROM cache_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Issue #3170: opportunistic collection yields to a builder rather than
+    /// queueing in front of the requests waiting on the same lock.
+    #[test]
+    fn opportunistic_gc_skips_while_a_builder_holds_the_lock() {
+        let _tuning = set_tuning_for_test(GC_AUTO_BLOB_THRESHOLD, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let db_path = store_with_one_collectable_blob(&repo_root);
+
+        let build_lock = AnalyzerCacheBuildLock::acquire(&db_path).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = maybe_gc(&db_path, &repo, &repo_root).unwrap();
+        let elapsed = started.elapsed();
+        drop(build_lock);
+
+        assert!(
+            !outcome.ran,
+            "a collection must not sweep a store a builder is still publishing into: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.total_blobs_after, 1,
+            "a skipped collection retains every candidate"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the collection waited {elapsed:?} for a lock it must not wait for"
+        );
+        assert_eq!(
+            gc_claim_until(&db_path),
+            0,
+            "the next eligible collection must not wait out a stale claim"
+        );
+    }
+
+    /// Issue #3170: the live session's writer is what a collection meets in
+    /// practice -- an index warm queued after the previous tool call. The
+    /// store's 120-second busy timeout is twice the MCP request budget, so an
+    /// opportunistic collection that inherited it would outlast the request it
+    /// is blocking. It uses its own short timeout and skips instead.
+    #[test]
+    fn opportunistic_gc_skips_a_store_another_writer_holds() {
+        let _tuning = set_tuning_for_test(GC_AUTO_BLOB_THRESHOLD, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let db_path = store_with_one_collectable_blob(&repo_root);
+
+        let mut writer = cache_db::open_unified_connection(&db_path).unwrap();
+        let held = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let outcome = maybe_gc(&db_path, &repo, &repo_root).unwrap();
+        let elapsed = started.elapsed();
+        held.rollback().unwrap();
+
+        assert!(
+            !outcome.ran,
+            "a collection must yield the write lock to the live session: {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "the collection waited {elapsed:?}, which is the store's writer timeout rather than \
+             the collection's own"
+        );
     }
 
     /// A persisted build commits blob facts before its workspace projection.

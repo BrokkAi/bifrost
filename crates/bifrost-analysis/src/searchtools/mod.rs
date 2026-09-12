@@ -580,10 +580,14 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range
     if ranges.len() < 2 {
         return ranges.into_iter().next();
     }
-    let classifier = (language_for_target(code_unit) == Language::Cpp && code_unit.is_callable())
-        .then(|| analyzer.indexed_source(code_unit.source()))
-        .flatten()
-        .and_then(|source| cpp_occurrence_classifier_for(&source));
+    // A class with a forward declaration and a definition has one physical
+    // occurrence per site; the definition is the primary one, the same way it
+    // is for a callable with a prototype (#1650, #3297).
+    let classifier = (language_for_target(code_unit) == Language::Cpp
+        && (code_unit.is_callable() || code_unit.is_class()))
+    .then(|| analyzer.indexed_source(code_unit.source()))
+    .flatten()
+    .and_then(|source| cpp_occurrence_classifier_for(&source));
     primary_range_from_ranges(code_unit, ranges, classifier.as_deref())
 }
 
@@ -602,7 +606,7 @@ fn primary_range_from_ranges(
     classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
 ) -> Option<Range> {
     if language_for_target(code_unit) == Language::Cpp
-        && code_unit.is_callable()
+        && (code_unit.is_callable() || code_unit.is_class())
         && let Some(classifier) = classifier
         && let Some(definition) = ranges
             .iter()

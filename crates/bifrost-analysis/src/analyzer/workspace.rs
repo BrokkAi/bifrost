@@ -42,6 +42,10 @@ use std::sync::Arc;
 /// directory and must never be used to derive it.
 pub(crate) struct SharedAnalyzerCache {
     store: Arc<crate::analyzer::store::AnalyzerStore>,
+    /// The cancellation of the request that opened this cache. Every revision
+    /// image built against it waits for the cache's cross-process build lock
+    /// under this token, so the wait ends when the request does.
+    cancellation: crate::CancellationToken,
 }
 
 impl SharedAnalyzerCache {
@@ -60,7 +64,15 @@ impl SharedAnalyzerCache {
     /// filesystem SQLite rejects. The escape for a checkout that must stay
     /// read-only is `BIFROST_CACHE_ROOT`, which relocates the cache off the
     /// repository.
-    pub(crate) fn open(repository_root: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open(
+        repository_root: &Path,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<Self, StoreError> {
+        // Opening the cache is the first place a budgeted immutable request
+        // touches the filesystem, and on a loaded box it can be where the
+        // budget goes; name it so the host does not fall back to "executing
+        // <tool>" (issue #3170).
+        let _phase = cancellation.enter_phase("opening the shared analyzer cache");
         if !brokk_bifrost_core::gitblob::has_object_database(repository_root) {
             return Err(StoreError::new(format!(
                 "{} is not inside a git repository, so it has no shared analyzer cache to serve immutable revision analysis",
@@ -79,11 +91,22 @@ impl SharedAnalyzerCache {
         )?;
         Ok(Self {
             store: Arc::new(store),
+            cancellation: cancellation.clone(),
         })
     }
 
     fn store(&self) -> Arc<crate::analyzer::store::AnalyzerStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Publish what the request that opened this cache is doing with it,
+    /// until the guard is dropped. The token is the request's own, so the
+    /// host reads this back if the budget expires (issue #3170).
+    pub(crate) fn enter_phase(
+        &self,
+        phase: impl Into<String>,
+    ) -> brokk_bifrost_core::cancellation::PhaseGuard {
+        self.cancellation.enter_phase(phase)
     }
 
     /// Claim the workspace projection rows an immutable image at `image_root`
@@ -1228,7 +1251,12 @@ impl WorkspaceAnalyzer {
     ) -> Result<Self, StoreError> {
         let mut store_context = match cache {
             Some(cache) => {
-                crate::analyzer::revision_image_store_context(project.as_ref(), cache.store())
+                let mut context =
+                    crate::analyzer::revision_image_store_context(project.as_ref(), cache.store());
+                // Only a shared cache has a build lock to wait on, and the
+                // cache is what carries the request's cancellation here.
+                context.cancellation = cache.cancellation.clone();
+                context
             }
             None => crate::analyzer::ephemeral_store_context(project.as_ref())?,
         };
@@ -1374,9 +1402,18 @@ impl WorkspaceAnalyzer {
         let build_lock = if let Some(db_path) = store_context.store.db_path() {
             profiling::note("workspace.store=persistent");
             let _scope = profiling::scope("WorkspaceAnalyzer::build_lock_wait");
+            // Under the build's own cancellation: a request that runs out of
+            // budget while another builder or a collection holds this lock
+            // gets an error naming the lock, instead of a thread parked past
+            // the deadline and a bare budget message (issue #3170). A build
+            // with no request behind it carries a token that is never
+            // cancelled and so waits as long as it takes.
             Some(
-                brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire(db_path)
-                    .map_err(StoreError::new)?,
+                brokk_bifrost_core::cache_gc::AnalyzerCacheBuildLock::acquire_cancellable(
+                    db_path,
+                    &store_context.cancellation,
+                )
+                .map_err(StoreError::new)?,
             )
         } else {
             profiling::note("workspace.store=ephemeral");
