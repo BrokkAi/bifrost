@@ -62,7 +62,10 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// Bump this whenever a change makes either something this engine would no
 /// longer mint.
 ///
-/// The current value adds #3151's row-level evidence object to persisted query
+/// The current value adds #3207's retained effect derivations to assertion
+/// findings, including required truncation fields. Older assertion products
+/// must be recomputed before the new reader decodes them.
+/// The preceding value added #3151's row-level evidence object to persisted query
 /// unit products. Cached rows from the preceding engine cannot satisfy exact
 /// agreement with live query transports and must be recomputed. The previous
 /// value added #2724's Rust call conversion producer. Cached rows
@@ -84,7 +87,7 @@ const NO_ACTIVE_MODELS: &str = "bifrost-policy-unit:no-active-models:v1";
 /// this change exists to fix. The previous value was #3022, which took the byte
 /// anchors out of the locator's declaration segments; the one before that was
 /// #2968, which took the binding-plan hash out of the finding identity itself.
-const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3151-row-evidence";
+const POLICY_SUBSTRATE_EPOCH: &str = "bifrost-policy-unit:substrate:3207-effect-derivations";
 
 /// The epoch every unit key and the evaluation row key carry.
 fn policy_substrate_epoch() -> StableDigest {

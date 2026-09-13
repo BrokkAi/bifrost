@@ -22,6 +22,7 @@ use crate::analyzer::{
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use brokk_bifrost_core::analyzer::model::LanguageDialect;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
 use brokk_bifrost_js_ts::javascript::*;
@@ -34,6 +35,16 @@ use std::sync::Arc;
 use tree_sitter::Tree;
 
 mod semantic;
+
+/// The cache `lang` key that rows extracted from a `.jsx` file live under.
+///
+/// Shaped like the TypeScript pair (`typescript:ts` / `typescript:tsx`) and the
+/// C++ pair (`cpp` / `cpp:c`): `.jsx` is read by the TSX grammar rather than
+/// tree-sitter-javascript (#3322), so one blob has two possible projections and
+/// `blobs`/`code_units`, keyed `(blob_oid, lang)`, must not let them collide.
+/// The plain `javascript` key keeps its spelling so `.js` rows already in a
+/// warm cache stay addressable.
+pub(crate) const JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY: &str = "javascript:jsx";
 
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
@@ -49,6 +60,36 @@ impl LanguageAdapter for JavascriptAdapter {
 
     fn file_extension(&self) -> &'static str {
         "js"
+    }
+
+    /// The `.js`/`.jsx` split applies only to files whose OWN language is
+    /// JavaScript, for the reason `TypescriptAdapter` states for `.ts`/`.tsx`:
+    /// the cross-adapter row guards discriminate on this answer, so a foreign
+    /// file must answer its own language's key.
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
+        let own_language = file_language(file);
+        if own_language != Language::JavaScript {
+            return own_language.config_label();
+        }
+        if LanguageDialect::for_path(Language::JavaScript, file.rel_path())
+            == LanguageDialect::JavaScriptJsx
+        {
+            return JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY;
+        }
+        Language::JavaScript.config_label()
+    }
+
+    fn storage_language_keys(&self) -> Vec<(String, tree_sitter::Language)> {
+        vec![
+            (
+                Language::JavaScript.config_label().to_string(),
+                tree_sitter_javascript::LANGUAGE.into(),
+            ),
+            (
+                JAVASCRIPT_JSX_STORAGE_LANGUAGE_KEY.to_string(),
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ),
+        ]
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {
@@ -740,12 +781,12 @@ impl IAnalyzer for JavascriptAnalyzer {
         let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
-        detect_js_ts_test_assertion_smells(
-            file,
-            &source,
-            tree_sitter_javascript::LANGUAGE.into(),
-            &weights,
-        )
+        let Some(grammar) =
+            crate::analyzer::parser_language_for_path(Language::JavaScript, file.rel_path())
+        else {
+            return Vec::new();
+        };
+        detect_js_ts_test_assertion_smells(file, &source, grammar, &weights)
     }
 
     fn find_structural_clone_smells(
@@ -775,15 +816,18 @@ impl IAnalyzer for JavascriptAnalyzer {
             Language::JavaScript,
         );
         let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        // The grammar is the one this unit's own file is parsed with, not the
+        // language's default: `.jsx` is read by the TSX grammar (#3322), and
+        // parsing it with tree-sitter-javascript would compare a clone
+        // candidate built from ERROR-recovery soup against real trees.
         let all_candidates: Vec<CloneCandidateProfile> = corpus_units
             .iter()
             .filter_map(|code_unit| {
-                build_js_ts_clone_candidate_data(
-                    self,
-                    code_unit,
-                    weights,
-                    tree_sitter_javascript::LANGUAGE.into(),
-                )
+                let grammar = crate::analyzer::parser_language_for_path(
+                    Language::JavaScript,
+                    code_unit.source().rel_path(),
+                )?;
+                build_js_ts_clone_candidate_data(self, code_unit, weights, grammar)
             })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();

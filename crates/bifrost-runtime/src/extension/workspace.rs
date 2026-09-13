@@ -1945,6 +1945,11 @@ fn value_transfer_detail(
                 id: StableDigest::parse(conversion.to_string()).expect("SHA-256 is canonical"),
             }
         }
+        TransferOperation::ValueCarrierAdaptation(adaptation) => {
+            ValueTransferOperation::ValueCarrierAdaptation {
+                id: StableDigest::parse(adaptation.to_string()).expect("SHA-256 is canonical"),
+            }
+        }
         TransferOperation::Unknown => ValueTransferOperation::Unknown,
     };
     Ok(ValueTransfer { kind, operation })

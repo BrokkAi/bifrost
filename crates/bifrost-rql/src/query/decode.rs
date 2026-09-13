@@ -1189,12 +1189,12 @@ fn decode_configuration_keys(
         let key = entry
             .as_str()
             .ok_or_else(|| QueryError::new(&entry_path, "expected a configuration key string"))?;
-        if key.is_empty() || key.len() > MAX_CONFIGURATION_KEY_LENGTH {
+        // An empty authored key is a document state that JSON, TOML, and Java
+        // `.properties` all admit, so it must stay selectable.
+        if key.len() > MAX_CONFIGURATION_KEY_LENGTH {
             return Err(QueryError::new(
                 &entry_path,
-                format!(
-                    "configuration key length must be between 1 and {MAX_CONFIGURATION_KEY_LENGTH}"
-                ),
+                format!("configuration key length must be at most {MAX_CONFIGURATION_KEY_LENGTH}"),
             ));
         }
         if !keys.contains(&key.to_string()) {
@@ -1259,12 +1259,10 @@ fn decode_configuration_route_segment(
                     "a key route segment requires an exact key",
                 ));
             };
-            if key.is_empty() || key.len() > MAX_CONFIGURATION_KEY_LENGTH {
+            if key.len() > MAX_CONFIGURATION_KEY_LENGTH {
                 return Err(QueryError::new(
                     child_path(path, "key"),
-                    format!(
-                        "route key length must be between 1 and {MAX_CONFIGURATION_KEY_LENGTH}"
-                    ),
+                    format!("route key length must be at most {MAX_CONFIGURATION_KEY_LENGTH}"),
                 ));
             }
             ConfigurationRouteSegmentFilter::Key(key.to_string())

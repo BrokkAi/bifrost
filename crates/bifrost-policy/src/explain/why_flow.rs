@@ -241,7 +241,11 @@ fn push_shared_children(
 /// The path node itself carries no location: a path is a sequence of sites, and
 /// naming one of them at the top would privilege it over the rest. Each step
 /// carries the exact site the analyzer recorded for it, where it recorded one.
-fn witness_node(witness: &BoundedWitness) -> RawNode {
+///
+/// Shared with the typestate adapter: a typestate finding retains the same
+/// [`BoundedWitness`] this projects, produced by the same solver, so projecting
+/// it twice would let two renderings of one retained path drift apart.
+pub(super) fn witness_node(witness: &BoundedWitness) -> RawNode {
     let mut node = RawNode::new(
         ExplanationNodeKind::Derivation,
         ExplanationOutcome::Satisfied,
@@ -282,7 +286,7 @@ fn witness_node(witness: &BoundedWitness) -> RawNode {
 /// A `possible` finding is may-evidence: the solver reported a path it could
 /// not prove exactly. That is `unknown` and never `failed`, and the reasons it
 /// carries are named rather than flattened into "possible".
-fn certainty_node(finding: &PolicyFinding) -> RawNode {
+pub(super) fn certainty_node(finding: &PolicyFinding) -> RawNode {
     let reasons = finding.certainty().reasons();
     let outcome = if reasons.is_empty() {
         ExplanationOutcome::Satisfied
@@ -308,7 +312,7 @@ fn certainty_node(finding: &PolicyFinding) -> RawNode {
 }
 
 /// The finding's proof state as one obligation.
-fn proof_node(proof: &ProofMetadata) -> RawNode {
+pub(super) fn proof_node(proof: &ProofMetadata) -> RawNode {
     let outcome = match proof.state() {
         ProofState::Proven => ExplanationOutcome::Satisfied,
         ProofState::Unproven | ProofState::Ambiguous => ExplanationOutcome::Unknown,
@@ -337,7 +341,7 @@ fn proof_node(proof: &ProofMetadata) -> RawNode {
 /// authority requires it to equal the finding's `witnesses_truncated`
 /// (`validate_witness_references`), so reading both would report one fact
 /// twice.
-fn retained_witness_node(finding: &PolicyFinding) -> RawNode {
+pub(super) fn retained_witness_node(finding: &PolicyFinding) -> RawNode {
     let truncated_paths = finding
         .witnesses()
         .iter()
@@ -374,7 +378,7 @@ fn retained_witness_node(finding: &PolicyFinding) -> RawNode {
 }
 
 /// The finding's own completeness as one obligation.
-fn completeness_node(finding: &PolicyFinding) -> RawNode {
+pub(super) fn completeness_node(finding: &PolicyFinding) -> RawNode {
     let reasons = finding.completeness().reasons();
     let actual = if reasons.is_empty() {
         finding.completeness().label().to_owned()
@@ -445,7 +449,7 @@ fn join_labels<'a>(labels: impl Iterator<Item = &'a str>) -> String {
 ///
 /// Every identity spelling ends in one authored id -- a local or catalog entry,
 /// or a match endpoint -- and that id is what an author recognizes.
-fn endpoint_entry(identity: &ResolvedEndpointIdentity) -> &str {
+pub(super) fn endpoint_entry(identity: &ResolvedEndpointIdentity) -> &str {
     match identity {
         ResolvedEndpointIdentity::Local { entry_id, .. }
         | ResolvedEndpointIdentity::Catalog { entry_id, .. } => entry_id.as_str(),

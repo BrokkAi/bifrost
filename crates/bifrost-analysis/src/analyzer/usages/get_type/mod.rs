@@ -427,11 +427,7 @@ fn parse_tree_for_type_lookup(
     source: &str,
 ) -> Option<Tree> {
     match language {
-        Language::Go => {
-            let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-            parser.parse(source, None)
-        }
+        Language::Go => brokk_bifrost_go::parse::parse_go(source),
         _ => parse_tree_for_language(file, language, source),
     }
 }

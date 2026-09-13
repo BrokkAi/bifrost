@@ -282,10 +282,16 @@ pub use workspace::{
 };
 pub(crate) use workspace::{SharedAnalyzerCache, WorkspaceProjectionLease};
 
+/// Which of a language's grammars parses one file.
+///
+/// Named for the grammar, not for the dialect that asked for it: two dialects
+/// select [`ParserFlavor::Tsx`], TypeScript's `.tsx` and JavaScript's `.jsx`
+/// (#3322), and a language that ships one grammar answers [`Self::Default`]
+/// for every dialect it has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParserFlavor {
     Default,
-    TypeScriptTsx,
+    Tsx,
 }
 
 impl ParserFlavor {
@@ -294,7 +300,7 @@ impl ParserFlavor {
             // C and C++ share one grammar; the dialect only changes how the
             // parsed tree is interpreted, never which parser produces it.
             LanguageDialect::Standard(_) | LanguageDialect::CppC => Self::Default,
-            LanguageDialect::TypeScriptTsx => Self::TypeScriptTsx,
+            LanguageDialect::TypeScriptTsx | LanguageDialect::JavaScriptJsx => Self::Tsx,
         }
     }
 }
@@ -337,4 +343,27 @@ pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path)
 /// without constructing a workspace analyzer.
 pub fn structural_spec_for(language: Language) -> Option<&'static dyn structural::StructuralSpec> {
     languages::language_support(language).map(languages::LanguageSupport::structural_spec)
+}
+
+/// Swap `tree` for the repair `language`'s bundled grammar needs, when it needs
+/// one.
+///
+/// This is the language-blind form of the repair the indexed path applies
+/// through `LanguageAdapter::reparse_grammar_gap`. A consumer that resolves a
+/// grammar from this registry and parses for itself -- comment density, clone
+/// detection, exception-handling smells -- must read the same tree the
+/// declaration walk read, or it reports roles from a recovery region the
+/// analyzer itself does not have (issue #3325). Only Go answers this today.
+///
+/// Post-parse only: C#'s pre-parse included ranges are not applied here, which
+/// is exactly what these consumers did before. They have always parsed C#
+/// whole, and narrowing that is a C# decision rather than a Go one.
+pub(crate) fn repaired_grammar_gap_tree(
+    language: Language,
+    source: &str,
+    tree: tree_sitter::Tree,
+) -> tree_sitter::Tree {
+    structural_spec_for(language)
+        .and_then(|spec| spec.reparse_grammar_gap(source, &tree, None))
+        .unwrap_or(tree)
 }

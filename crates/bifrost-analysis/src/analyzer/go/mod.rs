@@ -209,11 +209,7 @@ impl GoAnalyzer {
     }
 
     pub fn determine_package_name(&self, source: &str) -> String {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .expect("failed to load go parser");
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = brokk_bifrost_go::parse::parse_go(source) else {
             return String::new();
         };
         determine_go_package_name(tree.root_node(), source)

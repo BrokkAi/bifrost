@@ -14281,11 +14281,12 @@ pub struct RecoveredNamespaceRegion {
     pub components: Vec<String>,
     /// The `namespace Name { ... }` construct that opens each of `components`,
     /// parallel to it, from the `namespace` keyword through the matching close
-    /// the brace stack paired with its `{`. A level the file never closes
-    /// carries its head alone. This is the range the declaration walk records
-    /// for the Module, so a namespace whose head collapsed into an `ERROR`
-    /// reports where it is written rather than where its first member is
-    /// (#3309).
+    /// the brace stack paired with its `{`. A level whose close the stack could
+    /// not prove -- the file never closes it, or the file's brace token stream
+    /// lost an opening token (#3328) -- carries its head alone. This is the
+    /// range the declaration walk records for the Module, so a namespace whose
+    /// head collapsed into an `ERROR` reports where it is written rather than
+    /// where its first member is (#3309).
     pub component_ranges: Vec<Range>,
 }
 
@@ -14309,9 +14310,26 @@ pub struct RecoveredNamespaceRegion {
 /// children sharing that path form one [`RecoveredNamespaceRegion`]. The same
 /// pass retains matching brace positions for declaration partitioning (#3087).
 /// A file without parse errors needs neither correction nor a brace index.
+///
+/// The stack restores the source's nesting only while the tree's brace tokens
+/// are the source's braces. Severe recovery breaks that: in simdjson's
+/// `compile_time_json-inl.h` the C++26 reflection syntax leaves the whole
+/// translation unit an `ERROR`, and inside it `case '{':` re-lexes as a
+/// `compound_literal_expression` whose `initializer_list` opens on the char
+/// literal's own `{`, while the statement's real `{` is consumed as `character`
+/// tokens of a char literal that never terminates. That file's tree holds 219
+/// real `}` against 211 real `{`; eight closes therefore find the stack empty,
+/// and the two namespace levels are paired with interior closes 245 lines
+/// before their own (#3328). An unpaired close proves the stream lost an open at
+/// a position the stack cannot recover, so the pairing of that file is not
+/// evidence of any extent: [`Self::matching_close_brace`] then answers nothing
+/// and each restored level keeps the head that writes it. The namespace paths
+/// remain, as the best-effort structure recovery they are.
 #[derive(Clone, Debug, Default)]
 pub struct OrphanedNamespaceScopeIndex {
     regions: Vec<RecoveredNamespaceRegion>,
+    /// Open-brace start byte to the close the file-global stack paired with it.
+    /// Empty when the walk proved the brace token stream incomplete.
     brace_closes: HashMap<usize, Range>,
 }
 
@@ -14369,6 +14387,12 @@ impl OrphanedNamespaceScopeIndex {
         }
         let mut regions = Vec::new();
         let mut brace_closes = HashMap::default();
+        // Real closes that arrived with nothing open. Each one proves the tree
+        // is missing a scope-opening token the source writes, which is what
+        // makes every pairing in the file unusable as an extent (#3328). The
+        // complete set is kept, not a count, so a walk that has to be diagnosed
+        // shows every position the stream went out of sync.
+        let mut unpaired_closes: Vec<Range> = Vec::new();
         // The brace stack belongs to the file, not to a parser frame. A real
         // close inside a damaged child can close its parent's namespace. The
         // following children must see that removal immediately (#3087).
@@ -14429,18 +14453,23 @@ impl OrphanedNamespaceScopeIndex {
                 }
                 "}" if !child.is_missing() => {
                     regions.extend(current.run.take());
-                    if let Some((start, namespace_len)) = open.pop() {
-                        lexical_scope.truncate(namespace_len);
-                        lexical_heads.truncate(namespace_len);
-                        brace_closes.insert(
-                            start,
-                            Range {
-                                start_byte: child.start_byte(),
-                                end_byte: child.end_byte(),
-                                start_line: child.start_position().row + 1,
-                                end_line: child.end_position().row + 1,
-                            },
-                        );
+                    let close = Range {
+                        start_byte: child.start_byte(),
+                        end_byte: child.end_byte(),
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                    };
+                    match open.pop() {
+                        Some((start, namespace_len)) => {
+                            debug_assert!(
+                                start < close.start_byte,
+                                "a close pairs with an open before it: {start} then {close:?}"
+                            );
+                            lexical_scope.truncate(namespace_len);
+                            lexical_heads.truncate(namespace_len);
+                            brace_closes.insert(start, close);
+                        }
+                        None => unpaired_closes.push(close),
                     }
                     continue;
                 }
@@ -14475,10 +14504,21 @@ impl OrphanedNamespaceScopeIndex {
                 frames.push(frame(child, parsed_scope, source));
             }
         }
-        // Every brace is paired now, so each level's head can grow to the
-        // construct it writes. A level whose `{` never closes keeps its head:
-        // the file ends inside the namespace and there is no real close to
-        // reach for.
+        // A close with nothing open is only possible when a `{` the source
+        // writes is not a `{` token of the tree. The stack then paired some
+        // earlier open with a close that belongs to an inner scope, and
+        // nothing in the token stream says which pairs absorbed the loss: the
+        // lost token sits at an unknown position before the close that
+        // exposed it. Keep no pairing rather than an unprovable extent. An
+        // open the file never closes is the opposite case and stays: it makes
+        // no claim, so the levels it writes keep their heads either way.
+        if !unpaired_closes.is_empty() {
+            brace_closes.clear();
+        }
+        // Every surviving brace is paired now, so each level's head can grow to
+        // the construct it writes. A level whose `{` never closes keeps its
+        // head: the file ends inside the namespace and there is no real close
+        // to reach for.
         let regions = regions
             .into_iter()
             .map(|region| {
@@ -14516,6 +14556,10 @@ impl OrphanedNamespaceScopeIndex {
 
     /// The real AST brace matching an opening brace in a damaged subtree.
     /// Missing tokens and braces inside comments or literals do not participate.
+    ///
+    /// `None` when this open has no close in the file, and for every open in a
+    /// file whose brace token stream lost an opening token: a caller cannot
+    /// treat a pairing the walk could not prove as an enclosing extent (#3328).
     pub fn matching_close_brace(&self, open: usize) -> Option<Range> {
         self.brace_closes.get(&open).copied()
     }
@@ -18437,6 +18481,172 @@ struct AfterAll {};
             )],
             "the recovered namespace owns its full construct, not its first member or just its header"
         );
+    }
+
+    /// A macro that opens a block: `APP_IF_ACTIVE` expands to `if (active) {`,
+    /// so the `{` of a scope the source really opens is part of the macro's
+    /// `preproc_arg` and never becomes a `{` token. The tree therefore holds
+    /// one more real `}` than real `{`, and a file-global stack has to assign
+    /// those closes to the wrong opens: the `}` on line 9 takes `check`'s body,
+    /// `check`'s own `}` on line 11 takes `detail`, line 15 takes `app`, and
+    /// line 16 arrives with nothing open. This is the state simdjson's
+    /// `compile_time_json-inl.h` reaches eight times over (#3328).
+    const MACRO_OPENED_SCOPE: &str = r#"#define APP_IF_ACTIVE if (active) {
+
+namespace app {
+namespace detail {
+
+bool check(bool active) {
+  APP_IF_ACTIVE
+    return true;
+  }
+  return false;
+}
+
+class Tail {};
+
+} // namespace detail
+} // namespace app
+"#;
+
+    /// simdjson's `include/simdjson/compile_time_json-inl.h` at `9b33047a`,
+    /// reduced. The file's C++26 static reflection leaves the whole translation
+    /// unit an `ERROR`, and inside it tree-sitter re-lexes `case '<punct>': {`:
+    /// `case` becomes a type, the char literal's own punctuation opens a
+    /// `compound_literal_expression`, and the literal's closing quote starts a
+    /// character run that never terminates and consumes the statement's real
+    /// `{`. The reduction keeps that mis-lex, so the tree loses a
+    /// scope-opening token here as well and the three namespace opens end up
+    /// paired with the closes one level in (#3328).
+    const REFLECTION_CASE_LABEL_RECOVERY: &str = r#"namespace simdjson {
+namespace compile_time {
+namespace number_parsing {
+consteval int leading_zeroes(uint64_t input_num, int last_bit = 0) {
+    auto hex_to_u32 = [&] [[nodiscard]] () -> uint32_t {
+      auto digit = [](uint8_t c) -> uint32_t {
+      }
+    }
+    if (a) {
+      while (a) {
+      }
+    }
+    switch (c) {
+    case '{': {
+    }
+    }
+  }
+  while (a) {
+    cursor += field.second;
+    if (a) {
+    case '{': {
+      if (a) {
+      }
+    }
+    case 'n': {
+      if (a) {
+      }
+    }
+    }
+  }
+  if (a) {
+    simdjson_consteval_error("Expected '}'");
+  }
+}
+}
+}
+"#;
+
+    /// Real `{` and `}` tokens of a tree, the stream the index pairs.
+    fn real_brace_token_counts(root: Node<'_>) -> (usize, usize) {
+        let mut stack = vec![root];
+        let mut counts = (0, 0);
+        while let Some(node) = stack.pop() {
+            match (node.kind(), node.is_missing()) {
+                ("{", false) => counts.0 += 1,
+                ("}", false) => counts.1 += 1,
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        counts
+    }
+
+    /// The open brace of `head`, which is the key its close lands under.
+    fn namespace_open_byte(source: &str, head: &str) -> usize {
+        let at = source.find(head).expect("fixture namespace head");
+        at + head.len() - 1
+    }
+
+    #[test]
+    fn orphaned_namespace_scope_index_pairs_nothing_when_a_scope_open_is_lost() {
+        let source = MACRO_OPENED_SCOPE;
+        let tree = parse_cpp(source);
+        let root = tree.root_node();
+        assert_eq!(
+            real_brace_token_counts(root),
+            (4, 5),
+            "the fixture must reproduce the loss: one scope the source opens \
+             has no `{{` token, so the stream holds an extra real close"
+        );
+
+        let index = OrphanedNamespaceScopeIndex::build(root, source);
+        for head in ["namespace app {", "namespace detail {"] {
+            assert_eq!(
+                index.matching_close_brace(namespace_open_byte(source, head)),
+                None,
+                "`{head}` must not claim a close: the stack had to give it one that \
+                 belongs to an inner scope (line 15 for `app`, line 11 for \
+                 `detail`) once the macro's `{{` went missing"
+            );
+        }
+    }
+
+    #[test]
+    fn orphaned_namespace_scope_index_pairs_nothing_on_the_reflection_recovery() {
+        let source = REFLECTION_CASE_LABEL_RECOVERY;
+        let tree = parse_cpp(source);
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut mis_lexed_opens = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "character"
+                && &source[node.start_byte()..node.end_byte()] == "{"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() != "char_literal")
+            {
+                mis_lexed_opens.push(node.start_position().row + 1);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        assert!(
+            !mis_lexed_opens.is_empty(),
+            "the fixture must reproduce the mis-lex: a scope-opening `{{` \
+             consumed as a `character` of a char literal recovery never closed"
+        );
+        assert_eq!(
+            real_brace_token_counts(root),
+            (17, 18),
+            "which is what leaves the brace token stream short one open: \
+             mis-lexed at {mis_lexed_opens:?}"
+        );
+
+        let index = OrphanedNamespaceScopeIndex::build(root, source);
+        for head in [
+            "namespace simdjson {",
+            "namespace compile_time {",
+            "namespace number_parsing {",
+        ] {
+            assert_eq!(
+                index.matching_close_brace(namespace_open_byte(source, head)),
+                None,
+                "`{head}` must not claim a close: every close after the lost open \
+                 belongs one level in, so the stack paired the three heads on \
+                 lines 1..3 with the closes on lines 33..35 instead of 34..36"
+            );
+        }
     }
 
     #[test]

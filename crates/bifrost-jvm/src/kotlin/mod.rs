@@ -13,3 +13,4 @@ pub mod supertypes;
 pub mod syntax;
 pub mod test_detection;
 pub mod types;
+pub mod value_classes;

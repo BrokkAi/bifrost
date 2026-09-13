@@ -33,14 +33,21 @@ const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 ///   through [`super::why_assertion::explain_assertion_finding`];
 /// - `flow` and `taint` evidence project through the two entry points of
 ///   [`super::why_flow`], which read the witness paths, origins, certainty,
-///   proof and completeness the run retained.
+///   proof and completeness the run retained;
+/// - `typestate` evidence projects through
+///   [`super::why_typestate::explain_typestate_finding`], which reads the
+///   retained protocol witness: the subject and its entry endpoint, the
+///   violating transition or unmet terminal expectation, and the same bounded
+///   witness paths the flow adapter publishes.
+///
+/// Every family a run can produce now has an adapter, so
+/// [`ExplainError::ExplanationAdapterUnavailable`] is unreachable from here;
+/// it stays the answer [`explain_match_finding`] gives for a non-match run.
 ///
 /// # Errors
 ///
 /// - [`ExplainError::FindingNotFound`] when the run retains no finding with
 ///   this identity.
-/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `typestate`
-///   finding. The error names the families that *are* supported.
 /// - [`ExplainError::BudgetExhausted`] when `limits` cannot hold even a root.
 pub fn explain_finding(
     run: &PolicyRun,
@@ -59,10 +66,9 @@ pub fn explain_finding(
         PolicyFindingEvidence::Taint { evidence } => {
             super::why_flow::explain_taint_finding(run, finding, evidence, limits)
         }
-        other => Err(ExplainError::adapter_unavailable(
-            other.analysis_type(),
-            ExplanationQuestion::Why,
-        )),
+        PolicyFindingEvidence::Typestate { evidence } => {
+            super::why_typestate::explain_typestate_finding(run, finding, evidence, limits)
+        }
     }
 }
 

@@ -533,7 +533,7 @@ fn scala_pattern_slot(parent: Node<'_>, anchor: Node<'_>) -> Option<PatternSlot>
 /// classified: an occurrence is a token, so the chain contributes its segments
 /// (`PathSegment`) and its tail (the role the whole chain plays in context),
 /// never a third row spanning both.
-fn scala_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+pub fn scala_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     if !matches!(
         node.kind(),
         "identifier" | "operator_identifier" | "type_identifier"

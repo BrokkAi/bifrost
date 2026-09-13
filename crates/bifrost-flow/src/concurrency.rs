@@ -1486,6 +1486,8 @@ struct SynchronizationSubjectClasses {
     backing_ambiguous: Vec<(LocalSynchronizationSubject, LocalSynchronizationSubject)>,
     backing_field_origins: Vec<BackingFieldOrigin>,
     canonical_values: HashMap<LocalSynchronizationSubject, ConcurrencyIdentityFact>,
+    /// An address names cell storage, independently of the payload stored there.
+    addressed_cells: HashMap<LocalSynchronizationSubject, LocalLocation>,
     identity_reasons: Vec<ConcurrencyOpenReason>,
     ambiguous: Vec<LocalSynchronizationSubject>,
     /// Values whose producer cannot establish an object identity. Stable
@@ -2102,7 +2104,25 @@ impl SynchronizationSubjectClasses {
                 .into_iter()
                 .filter_map(|(candidate, value)| {
                     (self.backing_root(candidate) == cursor).then_some(value)
-                });
+                })
+                .collect::<Vec<_>>();
+            // A pointer receiver operates on its addressed storage. Bring
+            // explicit address facts into this domain without equating that
+            // storage with the value stored inside the cell.
+            for address in self.addressed_cells.keys().cloned().collect::<Vec<_>>() {
+                if self.backing_root(address.clone()) != cursor {
+                    continue;
+                }
+                match self.bound_canonical_identity(address) {
+                    ConcurrencyAnswer::Proven(Some(fact)) => canonicals.push(fact),
+                    ConcurrencyAnswer::Proven(None) => {}
+                    ConcurrencyAnswer::Open { reasons, .. } => {
+                        self.identity_reasons.extend(reasons);
+                        return None;
+                    }
+                }
+            }
+            let mut canonicals = canonicals.into_iter();
             let base = if let Some(canonical) = canonicals.next() {
                 if canonicals.any(|candidate| candidate != canonical) {
                     return None;
@@ -2345,7 +2365,33 @@ impl SynchronizationSubjectClasses {
             .into_iter()
             .filter_map(|(candidate, canonical)| {
                 (self.root(candidate) == root).then_some(canonical)
+            })
+            .collect::<Vec<_>>();
+        // Typed addresses are explicit storage facts, including when a
+        // recursive input needs identity before modeled accesses are emitted.
+        // Never consult the payload identity bound to the addressed cell.
+        for (address, cell) in self.addressed_cells.clone() {
+            if self.root(address) != root {
+                continue;
+            }
+            let cell_root = self.root(LocalSynchronizationSubject::Location(cell));
+            let LocalSynchronizationSubject::Location(cell) = &cell_root else {
+                return ConcurrencyAnswer::Open {
+                    partial: None,
+                    reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+                };
+            };
+            let mut fact = Self::storage_identity(
+                canonical_local_location(cell),
+                self.capture_cardinality(&cell_root),
+            );
+            fact.resolved.independent_storage = Some(ConcurrencyStorageFamily::LexicalCell {
+                invocation: cell.invocation,
+                location: cell.location,
             });
+            canonicals.push(fact);
+        }
+        let mut canonicals = canonicals.into_iter();
         if let Some(canonical) = canonicals.next() {
             if canonicals.any(|candidate| candidate != canonical) {
                 return ConcurrencyAnswer::Open {
@@ -3501,7 +3547,16 @@ pub fn concurrent_access_conflicts(
                     }
                     SemanticEffect::Assignment { target, value } => {
                         let blocks_identity = identity_transfers.contains(&(value, target));
-                        if !blocks_identity {
+                        let target_row = semantics
+                            .value(target)
+                            .expect("validated assignment target exists");
+                        // Address formation names storage, not the operand's
+                        // payload. In particular, &pointer must not inherit
+                        // the backing identity of pointer's pointee.
+                        if !blocks_identity
+                            && target_row.kind
+                                != crate::analyzer::semantic::SemanticValueKind::Address
+                        {
                             synchronization_subjects.union_backing(
                                 LocalSynchronizationSubject::Value {
                                     task: context.task,
@@ -3545,26 +3600,23 @@ pub fn concurrent_access_conflicts(
                             );
                             continue;
                         }
-                        let Some(target_row) = semantics.value(target) else {
-                            unreachable!("validated assignment target exists");
-                        };
                         let (crate::analyzer::semantic::SemanticValueKind::Address, Some(location)) =
                             (&target_row.kind, binding_location(semantics, value))
                         else {
                             continue;
                         };
-                        synchronization_subjects.union(
-                            LocalSynchronizationSubject::Location(LocalLocation {
-                                task: context.task,
-                                invocation: context.invocation,
-                                procedure: context.procedure.clone(),
-                                location,
-                            }),
+                        synchronization_subjects.addressed_cells.insert(
                             LocalSynchronizationSubject::Value {
                                 task: context.task,
                                 invocation: context.invocation,
                                 procedure: context.procedure.clone(),
                                 value: target,
+                            },
+                            LocalLocation {
+                                task: context.task,
+                                invocation: context.invocation,
+                                procedure: context.procedure.clone(),
+                                location,
                             },
                         );
                         continue;
@@ -9125,6 +9177,9 @@ fn summary_dependency_matches_target(
 /// Published allocations, captures, and generic transfers remain open. One
 /// source-backed channel send is accepted only when a scalar path certificate
 /// proves that it executes exactly once across the omitted recursive closure.
+/// Additional modeled calls require complete witnessed atomic inventories on
+/// invariant locations. Only their exact external dispatch boundaries are
+/// accounted for; unresolved calls and other effects still prevent closure.
 /// A dynamic index is accepted only when every
 /// member forwards the same scalar port unchanged at its SCC edge; a computed
 /// or reassigned argument therefore cannot enter the fixed point.
@@ -9230,9 +9285,54 @@ fn recursive_access_summaries_cover_call(
         {
             return false;
         }
-        let [member_call] = context.procedure.semantics().call_sites() else {
+        let mut source_calls = context
+            .procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter(|call| effect_free_call_targets.contains_key(&(context.invocation, call.id)));
+        let Some(member_call) = source_calls.next() else {
             return false;
         };
+        if source_calls.next().is_some() {
+            return false;
+        }
+        let certificates = summary
+            .effects()
+            .iter()
+            .filter(|effect| {
+                matches!(effect.key(), SummaryEffectKey::Concurrency(effect)
+                if matches!(effect.kind(), SummaryConcurrencyEffectKind::ModeledCall { .. }))
+            })
+            .count();
+        // Account for the certificate scan and each complete effect inventory.
+        // Saturation makes an oversized request exhaust its budget, not wrap.
+        let inventory_work = summary
+            .effects()
+            .len()
+            .saturating_mul(certificates.saturating_add(2));
+        if request.cancellation.is_cancelled()
+            || request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: inventory_work,
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                })
+                .is_err()
+        {
+            classes
+                .identity_reasons
+                .push(ConcurrencyOpenReason::BudgetExhausted);
+            return false;
+        }
+        let Some(atomic_calls) =
+            recursive_atomic_call_inventory(provider, context, summary, member_call, request)
+        else {
+            return false;
+        };
+        if context.procedure.semantics().call_sites().len() != 1 + atomic_calls.len() {
+            return false;
+        }
         let Some(live_target) = effect_free_call_targets.get(&(context.invocation, member_call.id))
         else {
             return false;
@@ -9246,8 +9346,11 @@ fn recursive_access_summaries_cover_call(
         let dynamic_index_mismatch = dynamic_index_ports.iter().any(|port| {
             !recursive_scalar_port_is_invariant(context.procedure.semantics(), member_call, port)
         });
-        let source_gaps_open =
-            !recursive_access_source_gaps_are_closed(&context.procedure, member_call);
+        let source_gaps_open = !recursive_access_source_gaps_are_closed(
+            &context.procedure,
+            member_call,
+            &atomic_calls,
+        );
         if target_group_mismatch
             || target_member_missing
             || dynamic_index_mismatch
@@ -9336,6 +9439,18 @@ fn recursive_access_summaries_cover_call(
         }
         let mut summarized_allocations = HashSet::default();
         for effect in summary.effects() {
+            if let SummaryEffectKey::UnknownCallBoundary {
+                external_call: Some((event, witness)),
+                ..
+            } = effect.key()
+                && effect.evidence().is_proven()
+                && live_summary_call(&context.procedure, *event, Some(*witness))
+                    .is_some_and(|call| atomic_calls.contains_key(&call))
+            {
+                // The external body stays unknown to generic clients. This
+                // client has already validated its complete atomic inventory.
+                continue;
+            }
             if !effect.evidence().is_proven() || !effect.evidence().is_complete() {
                 return false;
             }
@@ -9356,6 +9471,22 @@ fn recursive_access_summaries_cover_call(
                     saw_call = true;
                 }
                 SummaryEffectKey::Concurrency(concurrency) => match concurrency.kind() {
+                    SummaryConcurrencyEffectKind::ModeledCall { .. }
+                    | SummaryConcurrencyEffectKind::Atomic { .. } => {
+                        if concurrency.execution().timing() != ExecutionTiming::SameEvaluation
+                            || !atomic_calls
+                                .values()
+                                .any(|event| *event == concurrency.event())
+                        {
+                            return false;
+                        }
+                        if matches!(
+                            concurrency.kind(),
+                            SummaryConcurrencyEffectKind::Atomic { .. }
+                        ) {
+                            access_count = access_count.saturating_add(1);
+                        }
+                    }
                     SummaryConcurrencyEffectKind::Access {
                         location,
                         must_hold,
@@ -9456,6 +9587,7 @@ fn recursive_access_summaries_cover_call(
                 &summarized_allocations,
                 &summarized_synchronization_events,
                 &result_transition,
+                &atomic_calls,
             )
         {
             return false;
@@ -9472,6 +9604,82 @@ fn recursive_access_summaries_cover_call(
                 .iter()
                 .all(|ordinal| recursive_result_bases.contains_key(ordinal))
         })
+}
+
+fn recursive_atomic_call_inventory(
+    provider: &impl ConcurrencyProvider,
+    context: &ContextKey,
+    summary: &SemanticProcedureSummary,
+    recursive_call: &crate::analyzer::semantic::SemanticCallSite,
+    request: &mut SemanticRequest<'_>,
+) -> Option<HashMap<CallSiteId, SummaryEventKey>> {
+    let mut calls = HashMap::default();
+    for effect in summary.effects() {
+        let SummaryEffectKey::Concurrency(certificate) = effect.key() else {
+            continue;
+        };
+        let SummaryConcurrencyEffectKind::ModeledCall { effect_count } = certificate.kind() else {
+            continue;
+        };
+        if !effect.evidence().is_proven()
+            || !effect.evidence().is_complete()
+            || certificate.execution().timing() != ExecutionTiming::SameEvaluation
+        {
+            return None;
+        }
+        let pending = PendingSummaryEffect {
+            context: context.clone(),
+            effect: certificate.clone(),
+        };
+        let (call_id, _) = source_summary_modeled_call(&pending).ok()?;
+        let call = context.procedure.semantics().call_site(call_id)?;
+        if call_id == recursive_call.id
+            || call.invocation_mode != CallInvocationMode::Ordinary
+            || call.execution_timing != ExecutionTiming::SameEvaluation
+            || calls.insert(call_id, certificate.event()).is_some()
+        {
+            return None;
+        }
+        let mut count = 0_u32;
+        for candidate in summary.effects() {
+            let SummaryEffectKey::Concurrency(atomic) = candidate.key() else {
+                continue;
+            };
+            if atomic.event() != certificate.event()
+                || matches!(
+                    atomic.kind(),
+                    SummaryConcurrencyEffectKind::ModeledCall { .. }
+                )
+            {
+                continue;
+            }
+            let SummaryConcurrencyEffectKind::Atomic { location, .. } = atomic.kind() else {
+                return None;
+            };
+            if !candidate.evidence().is_proven()
+                || !candidate.evidence().is_complete()
+                || atomic.execution().timing() != ExecutionTiming::SameEvaluation
+                || !recursive_access_path_is_invariant(&context.procedure, recursive_call, location)
+            {
+                return None;
+            }
+            let pending = PendingSummaryEffect {
+                context: context.clone(),
+                effect: atomic.clone(),
+            };
+            if !matches!(
+                source_summary_modeled_effect(&pending, call_id, provider, request).ok()?,
+                ResolvedConcurrencyEffect::Atomic { .. }
+            ) {
+                return None;
+            }
+            count = count.checked_add(1)?;
+        }
+        if count == 0 || count != *effect_count {
+            return None;
+        }
+    }
+    Some(calls)
 }
 
 fn recursive_synchronization_executes_exactly_once(
@@ -9767,18 +9975,20 @@ fn recursive_result_transition(
 fn recursive_access_source_gaps_are_closed(
     target: &ProcedureHandle,
     call: &crate::analyzer::semantic::SemanticCallSite,
+    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
 ) -> bool {
     target
         .semantics()
         .gaps()
         .iter()
-        .all(|gap| recursive_access_source_gap_is_closed(target, gap, call))
+        .all(|gap| recursive_access_source_gap_is_closed(target, gap, call, atomic_calls))
 }
 
 fn recursive_access_source_gap_is_closed(
     target: &ProcedureHandle,
     gap: &crate::analyzer::semantic::SemanticGap,
     call: &crate::analyzer::semantic::SemanticCallSite,
+    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
 ) -> bool {
     use crate::analyzer::semantic::{SemanticCapability, SemanticGapDischarge, SemanticGapSubject};
 
@@ -9805,13 +10015,19 @@ fn recursive_access_source_gap_is_closed(
                 })
         }
         (SemanticCapability::Calls, SemanticGapSubject::CallSite(candidate)) => {
-            candidate == call.id
+            candidate == call.id || atomic_calls.contains_key(&candidate)
         }
         (SemanticCapability::DynamicDispatch, SemanticGapSubject::CallSite(candidate)) => {
-            candidate == call.id
+            candidate == call.id || atomic_calls.contains_key(&candidate)
         }
         (SemanticCapability::CallableReferences, SemanticGapSubject::Value(candidate)) => {
             candidate == call.callee
+                || atomic_calls.keys().any(|id| {
+                    target
+                        .semantics()
+                        .call_site(*id)
+                        .is_some_and(|call| call.callee == candidate)
+                })
         }
         (SemanticCapability::IndexMemory, SemanticGapSubject::MemoryLocation(location)) => {
             matches!(
@@ -9826,6 +10042,7 @@ fn recursive_access_source_gap_is_closed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recursive_access_source_inventory_is_closed(
     target: &ProcedureHandle,
     call: &crate::analyzer::semantic::SemanticCallSite,
@@ -9833,6 +10050,7 @@ fn recursive_access_source_inventory_is_closed(
     summarized_allocations: &HashSet<AllocationId>,
     summarized_synchronizations: &HashSet<SummaryEventKey>,
     result_transition: &RecursiveResultTransition,
+    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
 ) -> bool {
     use crate::analyzer::semantic::{SemanticEffect, ValueFlowKind};
 
@@ -9869,12 +10087,21 @@ fn recursive_access_source_inventory_is_closed(
                 )
             }
             SemanticEffect::ValueFlow { .. } => true,
-            SemanticEffect::CallableReference { result, .. } => result == call.callee,
+            SemanticEffect::CallableReference { result, .. } => {
+                result == call.callee
+                    || atomic_calls.keys().any(|id| {
+                        semantics
+                            .call_site(*id)
+                            .is_some_and(|call| call.callee == result)
+                    })
+            }
             SemanticEffect::Invoke { call_site }
-            | SemanticEffect::CallContinuation { call_site, .. } => call_site == call.id,
-            SemanticEffect::Gap { gap } => semantics
-                .gap(gap)
-                .is_some_and(|gap| recursive_access_source_gap_is_closed(target, gap, call)),
+            | SemanticEffect::CallContinuation { call_site, .. } => {
+                call_site == call.id || atomic_calls.contains_key(&call_site)
+            }
+            SemanticEffect::Gap { gap } => semantics.gap(gap).is_some_and(|gap| {
+                recursive_access_source_gap_is_closed(target, gap, call, atomic_calls)
+            }),
             SemanticEffect::Allocation { allocation } => {
                 summarized_allocations.contains(&allocation)
             }

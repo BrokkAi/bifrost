@@ -72,6 +72,7 @@ fn analyze_file(
         .set_language(&grammar)
         .expect("registered parser grammar must load");
     let tree = parser.parse(source, None)?;
+    let tree = crate::analyzer::repaired_grammar_gap_tree(language, source, tree);
     let mut comments = Vec::new();
     walk_tree_preorder(tree.root_node(), true, |node| {
         if node.kind().ends_with("comment") {

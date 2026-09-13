@@ -15,7 +15,8 @@
 use super::*;
 
 pub(super) use brokk_bifrost_jvm::kotlin::syntax::{
-    kotlin_call_arity, kotlin_callee, kotlin_named_argument_label, kotlin_navigation_receiver,
+    kotlin_binding_type_node, kotlin_call_arity, kotlin_callee, kotlin_declared_return_type_node,
+    kotlin_named_argument_label, kotlin_navigation_receiver, kotlin_unwrap_receiver,
     kotlin_value_arguments,
 };
 

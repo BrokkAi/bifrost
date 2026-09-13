@@ -1216,12 +1216,7 @@ const fn directory_scope_label(scope: DirectoryScope) -> &'static str {
 }
 
 const fn observation_phase_label(phase: EndpointObservationPhase) -> &'static str {
-    match phase {
-        EndpointObservationPhase::AtMatch => "at_match",
-        EndpointObservationPhase::BeforeCall => "before_call",
-        EndpointObservationPhase::AfterNormalReturn => "after_normal_return",
-        EndpointObservationPhase::AfterExceptionalReturn => "after_exceptional_return",
-    }
+    phase.label()
 }
 
 fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
@@ -1242,9 +1237,7 @@ fn policy_semantic_event_to_json(event: PolicySemanticEvent) -> Value {
 }
 
 const fn typestate_exit_scope_label(scope: TypestateExitScope) -> &'static str {
-    match scope {
-        TypestateExitScope::AnalysisRoot => "analysis_root",
-    }
+    scope.label()
 }
 
 const fn trust_boundary_label(boundary: TaintTrustBoundary) -> &'static str {

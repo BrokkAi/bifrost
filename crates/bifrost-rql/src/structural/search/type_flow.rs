@@ -1119,7 +1119,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v10";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v11";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1741,7 +1741,7 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v10",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v11",
             "unsupported callee returns must not reuse falsely complete root results"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");

@@ -32,7 +32,10 @@ tree-sitter-javascript = "0.25.0"
 # tree-sitter-ruby 0.23.1. It is versioned independently of
 # tree-sitter-javascript even though one module drives both dialects, and it is
 # the only fleet grammar exporting a second parser constant (`LANGUAGE_TSX`),
-# which is why `ParserFlavor` exists on the analysis side.
+# which is why `ParserFlavor` exists on the analysis side. `LANGUAGE_TSX` also
+# reads `.jsx`: tree-sitter-javascript cannot parse a reserved word as a JSX
+# attribute name, so this crate is a hard dependency of JavaScript support and
+# not only of TypeScript's (#3322).
 tree-sitter-typescript = "0.23.2"
 
 [features]

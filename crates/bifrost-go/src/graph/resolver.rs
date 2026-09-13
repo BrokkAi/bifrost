@@ -33,7 +33,7 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 /// Everything Go graph resolution needs from the analyzer, as the core
 /// capability traits that answer it plus this crate's workspace path index.
@@ -1281,9 +1281,7 @@ pub fn resolve_go_import_bindings(
 }
 
 fn parse_go_source(source: String) -> Option<ParsedFile> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
+    let tree = crate::parse::parse_go(source.as_str())?;
     let package_name = package_name(tree.root_node(), &source);
     let line_starts = brokk_bifrost_core::text_utils::compute_line_starts(&source);
     let imports = collect_go_import_infos(tree.root_node(), &source);

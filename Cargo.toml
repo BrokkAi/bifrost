@@ -187,11 +187,18 @@ test-support = [
 ]
 
 [dev-dependencies]
+# Private grammar differentials exercise the public parser boundary directly.
+brokk-bifrost-core = { path = "crates/bifrost-core", version = "=0.11.3", features = ["test-support"] }
+brokk-bifrost-js-ts = { path = "crates/bifrost-js-ts", version = "=0.11.3" }
 # Cargo unifies this with the plain `[dependencies]` entry above for test targets, turning
 # on bifrost-analysis's test-only hooks (e.g. analyzer instrumentation,
 # usages::get_definition::scala_active_path_node_visits_for_test) for the integration tests
 # under `tests/` without affecting non-test builds of this package. See #1337.
 brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.11.3", features = ["test-support"] }
+# The Kotlin value-class producer (#2851) is language knowledge, not analyzer
+# state, so the integration suite rebuilds its exact adaptation witnesses from
+# the fixture source instead of restating a content-addressed digest by hand.
+brokk-bifrost-jvm = { path = "crates/bifrost-jvm", version = "=0.11.3" }
 # Same unification, for `SearchToolsService::new_manual_ephemeral`: the suites
 # under `tests/` build ephemeral manual services over inline fixtures, and that
 # constructor has no production caller, so it lives behind bifrost-mcp's

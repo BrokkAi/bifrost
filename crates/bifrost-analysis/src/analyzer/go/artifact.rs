@@ -18,7 +18,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GoDependencyPackAdapter;
@@ -423,21 +423,7 @@ fn produce_go_facts<'a>(
                 );
                 continue;
             };
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_go::LANGUAGE.into())
-                .expect("tree-sitter Go language must load");
-            let tree = if let Some(cancellation) = cancellation {
-                let mut read = |offset: usize, _| &source.as_bytes()[offset..];
-                let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-                parser.parse_with_options(
-                    &mut read,
-                    None,
-                    Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-                )
-            } else {
-                parser.parse(source, None)
-            };
+            let tree = brokk_bifrost_go::parse::parse_go_with_cancellation(source, cancellation);
             let Some(tree) = tree else {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     diagnostics.error(

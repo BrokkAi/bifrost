@@ -30,7 +30,12 @@ use crate::analyzer::{DispatchExtensibility, IAnalyzer, Language, ProjectFile, S
 use crate::hash::HashMap;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v9";
+use super::semantic_adaptation::{
+    AdaptationFailure, ScalaAdaptationCatalog, ScalaConversionCallableKind, SelectedAdaptationKind,
+    scala_nominal_types_match,
+};
+
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v14";
 
 /// Bound on the expression nodes examined while proving that a result
 /// expression already carries the callable's declared result type. The
@@ -113,6 +118,15 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
             };
 
         let semantic_model_overlay = self.semantic_model_overlay.clone();
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| (spec.callable.id(), spec.id))
+            .collect::<HashMap<_, _>>();
+        let adaptations = ScalaAdaptationCatalog::collect(
+            prepared.source(),
+            prepared.tree().root_node(),
+            &procedure_targets,
+        );
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -125,6 +139,7 @@ impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
                     staged_budget,
                     cancellation,
                     semantic_model_overlay.clone(),
+                    &adaptations,
                 )
             },
         )
@@ -588,10 +603,11 @@ struct CleanupRegion<'tree> {
     outer_scope: ScopeFrameId,
 }
 
-struct LoweringContext<'tree, 'targets> {
+struct LoweringContext<'tree, 'targets, 'catalog> {
     prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    adaptations: &'catalog ScalaAdaptationCatalog<'tree>,
     callable: Node<'tree>,
     procedure_kind: ProcedureKind,
     procedure_body_node_id: usize,
@@ -637,6 +653,7 @@ fn lower_procedure<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    adaptations: &ScalaAdaptationCatalog<'tree>,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), ScalaLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -659,6 +676,7 @@ fn lower_procedure<'tree>(
         prepared,
         session,
         semantic_model_overlay,
+        adaptations,
         callable: spec.callable,
         procedure_kind: spec.kind,
         procedure_body_node_id: spec.body.id(),
@@ -741,6 +759,7 @@ fn lower_procedure<'tree>(
     }
 
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
+    let mut pending = Vec::new();
     let body_next = if matches!(
         spec.kind,
         ProcedureKind::Constructor | ProcedureKind::Initializer
@@ -753,60 +772,89 @@ fn lower_procedure<'tree>(
             .map(|node| context.expression_value(&mut builder, node, expression_value_kind(node)))
             .transpose()?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
-        if let Some(result) = result
-            && result_node.is_some_and(|node| context.callable_result_has_identity_conversion(node))
+        let identity =
+            result_node.is_some_and(|node| context.callable_result_has_identity_conversion(node));
+        let mut adapted_return = false;
+        if !identity
+            && let (Some(result), Some(result_node)) = (result, result_node)
+            && !callable_declares_unit_result(spec.callable, context.prepared.source())
         {
+            if let Some((adapted, continuation)) = context.try_adapt(
+                &mut builder,
+                implicit_return,
+                function_scope,
+                &mut pending,
+                result,
+                result_node,
+                declared_result_type_identity(spec.callable, context.prepared.source()).as_deref(),
+            )? {
+                let return_point = continuation.unwrap_or(implicit_return);
+                context.append_effect(
+                    &mut builder,
+                    return_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: adapted,
+                        target: value,
+                    },
+                )?;
+                context.append_effect(
+                    &mut builder,
+                    return_point,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                context.edge(&mut builder, return_point, EdgeTarget::normal(normal_exit))?;
+                adapted_return = true;
+            } else {
+                context.session.add_gap_with_impacts(
+                    &mut builder,
+                    entry,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                    SemanticGapKind::Unknown,
+                    "Scala result adaptation may apply an implicit conversion before the method returns",
+                )?;
+            }
+        }
+        if !adapted_return {
+            if identity && let Some(result) = result {
+                context.append_effect(
+                    &mut builder,
+                    implicit_return,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: result,
+                        target: value,
+                    },
+                )?;
+            }
             context.append_effect(
                 &mut builder,
                 implicit_return,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Return,
-                    source: result,
-                    target: value,
-                },
+                SemanticEffect::ProcedureReturn { value: Some(value) },
             )?;
-        } else if result.is_some()
-            && !callable_declares_unit_result(spec.callable, context.prepared.source())
-        {
-            // A declared `Unit` result is a value discard: the body value is
-            // dropped, no conversion applies, and the return carries nothing,
-            // so omitting both the flow and the gap is the proven lowering.
-            context.session.add_gap_with_impacts(
+            context.edge(
                 &mut builder,
-                entry,
-                SemanticGapSubject::Value(value),
-                SemanticCapability::Values,
-                SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
-                SemanticGapKind::Unknown,
-                "Scala result adaptation may apply an implicit conversion before the method returns",
+                implicit_return,
+                EdgeTarget::normal(normal_exit),
             )?;
         }
-        context.append_effect(
-            &mut builder,
-            implicit_return,
-            SemanticEffect::ProcedureReturn { value: Some(value) },
-        )?;
-        context.edge(
-            &mut builder,
-            implicit_return,
-            EdgeTarget::normal(normal_exit),
-        )?;
         EdgeTarget::normal(implicit_return)
     };
     // `callable_shape` retains a bodyless template's declaration as its source
     // anchor. Its structured parent-constructor arguments still execute before
     // the template body, while the declaration itself is not an expression.
     let bodyless_template = spec.properties.is_synthetic && spec.body.id() == spec.callable.id();
-    let mut pending = if bodyless_template {
+    if bodyless_template {
         context.edge(&mut builder, body_entry, body_next)?;
-        Vec::new()
     } else {
-        vec![Work::Expression {
+        pending.push(Work::Expression {
             node: spec.body,
             entry: body_entry,
             next: body_next,
             scope: function_scope,
-        }]
+        });
     };
     context.schedule_expressions(
         &mut builder,
@@ -827,7 +875,7 @@ fn lower_procedure<'tree>(
     )
 }
 
-impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1566,20 +1614,90 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.edge(builder, entry, next)
                 }
             }
-            "typed_expression" => {
+            "typed_expression" | "ascription_expression" => {
                 let value =
                     first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
                 let terminal = self.point(builder, node, Vec::new())?;
                 let target = self.expression_value(builder, node, expression_value_kind(node))?;
-                self.add_gap(
+                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                let ascribed = node
+                    .child_by_field_name("type")
+                    .or_else(|| {
+                        named_children(node)
+                            .into_iter()
+                            .find(|child| !is_runtime_node(child.kind()))
+                    })
+                    .and_then(|declared| {
+                        let segments =
+                            super::scala_type_lookup_segments(declared, self.prepared.source());
+                        (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
+                    });
+                let identity = ascribed.as_deref().is_some_and(|ascribed| {
+                    self.expression_type_identity(value)
+                        .is_some_and(|identity| scala_nominal_types_match(&identity, ascribed))
+                });
+                if identity {
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                } else if let Some((adapted, continuation)) = self.try_adapt(
                     builder,
                     terminal,
-                    SemanticGapSubject::Value(target),
-                    SemanticCapability::Values,
-                    SemanticGapKind::Unknown,
-                    "Scala type ascription may require value adaptation or an implicit conversion",
-                )?;
-                self.edge(builder, terminal, next)?;
+                    scope,
+                    stack,
+                    source,
+                    value,
+                    ascribed.as_deref(),
+                )? {
+                    let store_point = continuation.unwrap_or(terminal);
+                    self.append_effect(
+                        builder,
+                        store_point,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: adapted,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        store_point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: adapted,
+                            target,
+                        },
+                    )?;
+                    if store_point == terminal {
+                        self.edge(builder, terminal, next)?;
+                    } else {
+                        self.edge(builder, store_point, next)?;
+                    }
+                } else {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "Scala type ascription may require value adaptation or an implicit conversion",
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                }
                 stack.push(Work::Expression {
                     node: value,
                     entry,
@@ -2422,29 +2540,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         let terminal = self.point(builder, node, Vec::new())?;
+        let mut continue_from_terminal = true;
         if let Some(pattern) = pattern.filter(|pattern| pattern.kind() == "identifier")
             && let Some(name) = node_text(self.prepared.source(), pattern)
             && let Some(target) = self.local_declaration_value(name, pattern.start_byte())
         {
             let source = self.expression_value(builder, value, expression_value_kind(value))?;
-            if self.definition_has_identity_initializer(node, value) {
-                self.append_effect(
+            let stored = if self.definition_has_identity_initializer(node, value) {
+                Some((source, terminal))
+            } else {
+                self.try_adapt(
                     builder,
                     terminal,
+                    scope,
+                    stack,
+                    source,
+                    value,
+                    node.child_by_field_name("type")
+                        .and_then(|declared| {
+                            let segments =
+                                super::scala_type_lookup_segments(declared, self.prepared.source());
+                            (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
+                        })
+                        .as_deref(),
+                )?
+                .map(|(adapted, continuation)| (adapted, continuation.unwrap_or(terminal)))
+            };
+            if let Some((stored, store_point)) = stored {
+                self.append_effect(
+                    builder,
+                    store_point,
                     SemanticEffect::Assignment {
                         target,
-                        value: source,
+                        value: stored,
                     },
                 )?;
                 self.append_effect(
                     builder,
-                    terminal,
+                    store_point,
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Local,
-                        source,
+                        source: stored,
                         target,
                     },
                 )?;
+                if store_point != terminal {
+                    self.edge(builder, store_point, next)?;
+                    continue_from_terminal = false;
+                }
                 // A `val`/`var` written directly in a template body is that
                 // template's member, and the primary constructor is where its
                 // initializer runs. Without this store a later
@@ -2463,16 +2606,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let member = self.declared_member_locator(pattern)?;
                     let location = self.session.add_memory_location(
                         builder,
-                        terminal,
+                        store_point,
                         MemoryLocationKind::Field { base, member },
                     )?;
                     self.append_effect(
                         builder,
-                        terminal,
+                        store_point,
                         SemanticEffect::MemoryStore {
                             kind: MemoryAccessKind::Field,
                             location,
-                            value: source,
+                            value: stored,
                         },
                     )?;
                 }
@@ -2497,7 +2640,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "implicit or given value selection requires contextual resolution",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        if continue_from_terminal {
+            self.edge(builder, terminal, next)?;
+        }
         stack.push(Work::Expression {
             node: value,
             entry,
@@ -2520,6 +2665,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let left = required_field(node, "left").or_else(|_| required_field(node, "target"))?;
         let right = required_field(node, "right").or_else(|_| required_field(node, "value"))?;
         let terminal = self.point(builder, node, Vec::new())?;
+        let mut continue_from_terminal = true;
         let mut evaluations = vec![left, right];
         let lexical_target = (left.kind() == "identifier")
             .then(|| node_text(self.prepared.source(), left))
@@ -2538,25 +2684,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // A Scala assignment evaluates to `Unit`, so its own result needs
             // no identity gap. What can still adapt is the stored value, and
             // only when the target's type differs from the assigned type.
-            if self.assigned_value_has_target_identity(left, right) {
-                let source = self.expression_value(builder, right, expression_value_kind(right))?;
-                self.append_effect(
+            let source = self.expression_value(builder, right, expression_value_kind(right))?;
+            let stored = if self.assigned_value_has_target_identity(left, right) {
+                Some((source, terminal))
+            } else {
+                let target_type = node_text(self.prepared.source(), left).and_then(|name| {
+                    self.binding_type_id_at(name, left.start_byte())
+                        .and_then(|id| self.type_identities.get(id.0).cloned())
+                });
+                self.try_adapt(
                     builder,
                     terminal,
+                    scope,
+                    stack,
+                    source,
+                    right,
+                    target_type.as_deref(),
+                )?
+                .map(|(adapted, continuation)| (adapted, continuation.unwrap_or(terminal)))
+            };
+            if let Some((stored, store_point)) = stored {
+                self.append_effect(
+                    builder,
+                    store_point,
                     SemanticEffect::Assignment {
                         target,
-                        value: source,
+                        value: stored,
                     },
                 )?;
                 self.append_effect(
                     builder,
-                    terminal,
+                    store_point,
                     SemanticEffect::ValueFlow {
                         kind,
-                        source,
+                        source: stored,
                         target,
                     },
                 )?;
+                if store_point != terminal {
+                    self.edge(builder, store_point, next)?;
+                    continue_from_terminal = false;
+                }
             } else {
                 self.add_gap(
                     builder,
@@ -2672,7 +2840,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "Scala destructuring or user-defined update assignment is not lowered into memory flow",
             )?;
         }
-        self.edge(builder, terminal, next)?;
+        if continue_from_terminal {
+            self.edge(builder, terminal, next)?;
+        }
         self.schedule_expressions(
             builder,
             entry,
@@ -2746,6 +2916,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let access = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base = self.expression_value(builder, object, expression_value_kind(object))?;
+        if let Some(field_name) = member_name
+            && let Some(wrapper_type) = self.expression_type_identity(object)
+            && self
+                .adaptations
+                .value_class_unwrap(self.prepared.source(), &wrapper_type, field_name, object)
+                .is_some()
+        {
+            self.emit_value_class_unwrap(builder, access, base, result)?;
+            self.edge(builder, access, next)?;
+            stack.push(Work::Expression {
+                node: object,
+                entry,
+                next: EdgeTarget::normal(access),
+                scope,
+            });
+            return Ok(());
+        }
         let (member, resolved) = self.memory_member_locator(field, object)?;
         let location = self.session.add_memory_location(
             builder,
@@ -2895,6 +3082,351 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    /// Apply a uniquely selected adaptation or report that none is modeled.
+    ///
+    /// `None` is typed incompleteness: competing implicits, a missing body, or
+    /// an unresolved pair. It is never an identity claim.
+    #[allow(clippy::too_many_arguments)]
+    fn try_adapt(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        target_type: Option<&[String]>,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        let Some(target_type) = target_type else {
+            return Ok(None);
+        };
+        let Some(source_type) = self.expression_type_identity(source_node) else {
+            return Ok(None);
+        };
+        match self.adaptations.select(
+            self.prepared.source(),
+            source_node,
+            &source_type,
+            target_type,
+        ) {
+            Ok(selected) => self.emit_selected_adaptation(
+                builder,
+                invoke,
+                scope,
+                stack,
+                source,
+                source_node,
+                &selected.kind,
+            ),
+            Err(AdaptationFailure::Unresolved | AdaptationFailure::Ambiguous) => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_selected_adaptation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        kind: &SelectedAdaptationKind,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        match *kind {
+            SelectedAdaptationKind::OpaqueWrap | SelectedAdaptationKind::OpaqueUnwrap => {
+                let target =
+                    self.source_value(builder, source_node, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    invoke,
+                    SemanticEffect::Assignment {
+                        target,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    invoke,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(ValueTransfer {
+                            kind: TransferKind::Conversion {
+                                preservation: ValuePreservation::Preserving,
+                            },
+                            operation: TransferOperation::None,
+                        }),
+                        source,
+                        target,
+                    },
+                )?;
+                Ok(Some((target, None)))
+            }
+            SelectedAdaptationKind::ImplicitCall {
+                procedure: None, ..
+            } => Ok(None),
+            SelectedAdaptationKind::ImplicitCall {
+                procedure: Some(procedure),
+                callable,
+            } => self.emit_conversion_call(
+                builder,
+                invoke,
+                scope,
+                stack,
+                source,
+                source_node,
+                procedure,
+                callable,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_conversion_call(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        source: ValueId,
+        source_node: Node<'tree>,
+        procedure: ProcedureId,
+        callable: ScalaConversionCallableKind,
+    ) -> Result<Option<(ValueId, Option<ProgramPointId>)>, ScalaLoweringError> {
+        let normal = self.point(builder, source_node, Vec::new())?;
+        let exceptional = self.point(builder, source_node, Vec::new())?;
+        let callee = self.source_value(builder, source_node, SemanticValueKind::Callable)?;
+        let result = self.source_value(builder, source_node, SemanticValueKind::Temporary)?;
+        let thrown = self.source_value(builder, source_node, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Proven(CallableTarget::Local(procedure));
+        let metadata = self.metadata(invoke)?;
+        let callable_kind = match callable {
+            ScalaConversionCallableKind::Function => CallableReferenceKind::Function,
+            ScalaConversionCallableKind::Constructor { .. } => CallableReferenceKind::Constructor,
+        };
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: callable_kind,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: vec![SemanticCallArgument::direct(
+                    source,
+                    ArgumentDomain::Positional,
+                )]
+                .into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        if let ScalaConversionCallableKind::Constructor { value_class } = callable {
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::Assignment {
+                    target: result,
+                    value: source,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                invoke,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(ValueTransfer {
+                        kind: TransferKind::Boxing,
+                        operation: TransferOperation::CallSite(call_site),
+                    }),
+                    source,
+                    target: result,
+                },
+            )?;
+            if !value_class {
+                self.session
+                    .add_allocation(builder, normal, result, AllocationKind::Object)?;
+            }
+        }
+        self.edge(builder, invoke, EdgeTarget::normal(normal))?;
+        self.edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        Ok(Some((result, Some(normal))))
+    }
+
+    fn value_class_construction(
+        &self,
+        function: Node<'tree>,
+        callable: Node<'tree>,
+        arguments: &[Node<'tree>],
+    ) -> Option<(ProcedureId, Node<'tree>)> {
+        let [payload] = arguments else {
+            return None;
+        };
+        let source = self.prepared.source();
+        let (type_path, use_site) = if function.kind() == "instance_expression" {
+            let constructed = scala_constructed_type_node(function)?;
+            (
+                super::scala_type_lookup_segments(constructed, source),
+                function,
+            )
+        } else if callable.kind() == "identifier" {
+            let name = node_text(source, callable)?;
+            if self.term_is_bound(name, callable.start_byte()) {
+                return None;
+            }
+            (vec![name.to_owned()], callable)
+        } else {
+            return None;
+        };
+        if type_path.is_empty() {
+            return None;
+        }
+        let class = self
+            .adaptations
+            .value_class_for_type(source, use_site, &type_path)?;
+        Some((class.constructor?, *payload))
+    }
+
+    fn term_is_bound(&self, name: &str, byte: usize) -> bool {
+        self.local_binding_at(name, byte).is_some() || self.parameters.contains_key(name)
+    }
+
+    fn emit_value_class_unwrap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        wrapper: ValueId,
+        result: ValueId,
+    ) -> Result<(), ScalaLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: result,
+                value: wrapper,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Unboxing,
+                    operation: TransferOperation::None,
+                }),
+                source: wrapper,
+                target: result,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_value_class_wrap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        invoke: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+        payload: ValueId,
+        result: ValueId,
+        source_node: Node<'tree>,
+        procedure: ProcedureId,
+    ) -> Result<(), ScalaLoweringError> {
+        let exceptional = self.point(builder, source_node, Vec::new())?;
+        let callee = self.source_value(builder, source_node, SemanticValueKind::Callable)?;
+        let thrown = self.source_value(builder, source_node, SemanticValueKind::Exception)?;
+        let resolution = CallableTargetResolution::Proven(CallableTarget::Local(procedure));
+        let metadata = self.metadata(invoke)?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Constructor,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        let call_site = self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver: None,
+                arguments: vec![SemanticCallArgument::direct(
+                    payload,
+                    ArgumentDomain::Positional,
+                )]
+                .into(),
+                normal_results: Box::new([]),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: next.point,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::Assignment {
+                target: result,
+                value: payload,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            invoke,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Transfer(ValueTransfer {
+                    kind: TransferKind::Boxing,
+                    operation: TransferOperation::CallSite(call_site),
+                }),
+                source: payload,
+                target: result,
+            },
+        )?;
+        self.edge(builder, invoke, next)?;
+        self.edge(
+            builder,
+            invoke,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
+        Ok(())
+    }
+
     /// Whether an annotated `val`/`var` initializer provably already has the
     /// declared type, so the binding applies no implicit conversion.
     ///
@@ -3007,37 +3539,74 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "non-local return boundary propagation is not lowered",
             )?;
+        } else if let Some(argument) = argument {
+            let source =
+                self.expression_value(builder, argument, expression_value_kind(argument))?;
+            let value = self.value(builder, terminal, SemanticValueKind::Return)?;
+            if self.callable_result_has_identity_conversion(argument) {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        target: value,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
+            } else if let Some((adapted, continuation)) = self.try_adapt(
+                builder,
+                terminal,
+                scope,
+                stack,
+                source,
+                argument,
+                declared_result_type_identity(self.callable, self.prepared.source()).as_deref(),
+            )? {
+                let return_point = continuation.unwrap_or(terminal);
+                self.append_effect(
+                    builder,
+                    return_point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source: adapted,
+                        target: value,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    return_point,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, return_point, scope, CompletionKind::Return, stack)?;
+            } else {
+                self.session.add_gap_with_impacts(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(value),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
+                    SemanticGapKind::Unknown,
+                    "Scala explicit return may apply an implicit conversion to the declared result type",
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ProcedureReturn { value: Some(value) },
+                )?;
+                self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
+            }
         } else {
-            let value = argument
-                .map(|argument| {
-                    let source =
-                        self.expression_value(builder, argument, expression_value_kind(argument))?;
-                    let value = self.value(builder, terminal, SemanticValueKind::Return)?;
-                    if self.callable_result_has_identity_conversion(argument) {
-                        self.append_effect(
-                            builder,
-                            terminal,
-                            SemanticEffect::ValueFlow {
-                                kind: ValueFlowKind::Return,
-                                source,
-                                target: value,
-                            },
-                        )?;
-                    } else {
-                        self.session.add_gap_with_impacts(
-                            builder,
-                            terminal,
-                            SemanticGapSubject::Value(value),
-                            SemanticCapability::Values,
-                            SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
-                            SemanticGapKind::Unknown,
-                            "Scala explicit return may apply an implicit conversion to the declared result type",
-                        )?;
-                    }
-                    Ok::<_, ScalaLoweringError>(value)
-                })
-                .transpose()?;
-            self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ProcedureReturn { value: None },
+            )?;
             self.abrupt(builder, terminal, scope, CompletionKind::Return, stack)?;
         }
         if let Some(argument) = argument {
@@ -3754,6 +4323,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .flat_map(|arguments| semantic_argument_nodes(*arguments))
             .collect::<Vec<_>>();
+        if let Some((constructor, payload_node)) =
+            self.value_class_construction(function, callable, &argument_nodes)
+        {
+            let invoke = self.point(builder, node, Vec::new())?;
+            let payload =
+                self.expression_value(builder, payload_node, expression_value_kind(payload_node))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.emit_value_class_wrap(
+                builder,
+                invoke,
+                next,
+                scope,
+                stack,
+                payload,
+                result,
+                node,
+                constructor,
+            )?;
+            let mut evaluations = vec![payload_node];
+            if let Some(receiver) = scala_bound_receiver(callable) {
+                evaluations.insert(0, receiver);
+            }
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
+        }
         let has_structured_argument = argument_lists
             .iter()
             .any(|arguments| has_structured_by_name_argument(*arguments));
@@ -3977,6 +4577,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .unwrap_or_default();
         if self.constructs_language_defined_array(node) {
             return self.array_allocation(builder, node, &arguments, entry, next, scope, stack);
+        }
+        if let Some((constructor, payload_node)) =
+            self.value_class_construction(node, node, &arguments)
+        {
+            let invoke = self.point(builder, node, Vec::new())?;
+            let payload =
+                self.expression_value(builder, payload_node, expression_value_kind(payload_node))?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.emit_value_class_wrap(
+                builder,
+                invoke,
+                next,
+                scope,
+                stack,
+                payload,
+                result,
+                node,
+                constructor,
+            )?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &[payload_node],
+                EdgeTarget::normal(invoke),
+                scope,
+                stack,
+            );
         }
         self.call_like_expression(
             builder,
@@ -5616,6 +6243,12 @@ fn identifier_has_auto_application_ambiguity(node: Node<'_>) -> bool {
                 | "type_arguments"
         )
     })
+}
+
+fn declared_result_type_identity(callable: Node<'_>, source: &str) -> Option<Arc<[String]>> {
+    let declared = callable.child_by_field_name("return_type")?;
+    let segments = super::scala_type_lookup_segments(declared, source);
+    (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
 }
 
 /// Whether the callable declares a `Unit` (or `scala.Unit`) result type.

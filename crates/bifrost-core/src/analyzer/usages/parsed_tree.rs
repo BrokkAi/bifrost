@@ -6,6 +6,7 @@
 //! `brokk-bifrost-analysis`.
 
 use crate::analyzer::ProjectFile;
+use crate::cancellation::CancellationToken;
 use crate::text_utils::compute_line_starts;
 use tree_sitter::{Language as TreeSitterLanguage, Parser, Tree};
 
@@ -15,25 +16,38 @@ pub struct ParsedTreeFile {
     pub line_starts: Vec<usize>,
 }
 
-/// A grammar plus the optional pre-parse that decides which bytes of a file the
-/// parser may read.
+/// A grammar plus whatever that grammar alone cannot parse correctly.
 ///
 /// Most languages parse the whole file, so [`ParseSpec::whole`] is the common
-/// form. C# is different: its grammar cannot represent a preprocessor directive
-/// inside a declaration, so C# hides directive lines and inactive conditional
-/// branches through tree-sitter included ranges (issue #1803). The pre-parse
-/// travels with the grammar so that a scan cannot parse a file differently from
-/// the declaration walk. Node offsets are unaffected: included ranges select
-/// bytes of the original source, they do not move them.
+/// form. Two languages need more, and they need it at opposite ends of the
+/// parse:
+///
+/// - C# cannot represent a preprocessor directive inside a declaration, so it
+///   hides directive lines and inactive conditional branches *before* the
+///   parse through tree-sitter included ranges ([`ParseSpec::restricted`],
+///   issue #1803).
+/// - Go's bundled grammar models `new` as a keyword whose argument must be a
+///   type, which Go 1.26's `new(expr)` is not. Only a tree can say whether a
+///   file contains that shape, so Go repairs *after* the parse
+///   ([`ParseSpec::recovering`], issue #3325) and an intact file pays nothing.
+///
+/// Either way the handling travels with the grammar, so a scan cannot parse a
+/// file differently from the declaration walk. Node offsets are unaffected:
+/// included ranges select bytes of the original source, they do not move them.
 #[derive(Clone, Copy)]
 pub struct ParseSpec<'a> {
     language: &'a TreeSitterLanguage,
     included_ranges: Option<IncludedRangesFn>,
+    reparse_grammar_gap: Option<ReparseGrammarGapFn>,
 }
 
 /// A language's pre-parse: the byte ranges of a source the parser may read, or
 /// `None` when that source needs no restriction.
 pub type IncludedRangesFn = fn(&str) -> Option<Vec<tree_sitter::Range>>;
+
+/// A language's post-parse repair: a tree re-parsed around syntax the bundled
+/// grammar cannot represent, or `None` when the first tree stands.
+pub type ReparseGrammarGapFn = fn(&str, &Tree, Option<&CancellationToken>) -> Option<Tree>;
 
 impl<'a> ParseSpec<'a> {
     /// Parse every byte of the file.
@@ -41,6 +55,7 @@ impl<'a> ParseSpec<'a> {
         Self {
             language,
             included_ranges: None,
+            reparse_grammar_gap: None,
         }
     }
 
@@ -50,6 +65,21 @@ impl<'a> ParseSpec<'a> {
         Self {
             language,
             included_ranges: Some(included_ranges),
+            reparse_grammar_gap: None,
+        }
+    }
+
+    /// Parse the whole file, then give `reparse_grammar_gap` the tree so the
+    /// language can re-parse around syntax its grammar cannot represent. The
+    /// function returns `None` when the first tree needs no repair.
+    pub fn recovering(
+        language: &'a TreeSitterLanguage,
+        reparse_grammar_gap: ReparseGrammarGapFn,
+    ) -> Self {
+        Self {
+            language,
+            included_ranges: None,
+            reparse_grammar_gap: Some(reparse_grammar_gap),
         }
     }
 
@@ -64,7 +94,11 @@ impl<'a> ParseSpec<'a> {
         if let Some(ranges) = self.included_ranges.and_then(|compute| compute(source)) {
             parser.set_included_ranges(&ranges).ok()?;
         }
-        parser.parse(source, None)
+        let tree = parser.parse(source, None)?;
+        let repaired = self
+            .reparse_grammar_gap
+            .and_then(|reparse| reparse(source, &tree, None));
+        Some(repaired.unwrap_or(tree))
     }
 }
 

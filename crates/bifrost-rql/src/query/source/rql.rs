@@ -3053,15 +3053,17 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
         for value in values {
             match field {
                 ConfigurationFactsFilterField::Keys => {
-                    let valid = value.as_string().is_some_and(|key| {
-                        !key.is_empty() && key.len() <= MAX_CONFIGURATION_KEY_LENGTH
-                    });
+                    // An empty authored key is a document state the decoder
+                    // accepts, so the editor must not mark it invalid.
+                    let valid = value
+                        .as_string()
+                        .is_some_and(|key| key.len() <= MAX_CONFIGURATION_KEY_LENGTH);
                     if !valid {
                         analysis.error(
                             value.range.clone(),
                             "wrong-value-shape",
                             format!(
-                                ":key values must contain 1 to {MAX_CONFIGURATION_KEY_LENGTH} bytes"
+                                ":key values must contain at most {MAX_CONFIGURATION_KEY_LENGTH} bytes"
                             ),
                         );
                     }

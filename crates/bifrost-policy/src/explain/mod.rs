@@ -6,9 +6,9 @@
 //! - [`explain_finding`] answers **why** a retained finding exists, by
 //!   projecting the evidence the run already kept. It executes nothing, so it
 //!   can never disagree with the report it reads. It serves `match`,
-//!   `assertion`, `flow` and `taint` findings, dispatching on the evidence the
-//!   finding carries; [`explain_match_finding`] is the `match` adapter a
-//!   caller that already knows the family can call directly.
+//!   `assertion`, `flow`, `taint` and `typestate` findings, dispatching on the
+//!   evidence the finding carries; [`explain_match_finding`] is the `match`
+//!   adapter a caller that already knows the family can call directly.
 //! - [`rank_near_misses`] answers **which came closest**, by relaxing the
 //!   policy's own declared predicates one at a time over a bounded candidate
 //!   set the caller either supplies or asks to have searched inside the
@@ -27,10 +27,18 @@
 //! solver queries, and it is designed separately.
 //!
 //! Both return a [`PolicyExplanation`]: a versioned root
-//! (`bifrost_policy_explanation/v1`) over a bounded tree of nodes, each with a
+//! (`bifrost_policy_explanation/v2`) over a bounded tree of nodes, each with a
 //! content-derived identifier, a kind, an outcome, optional expected/actual
 //! prose, an exact location where one exists, and per-node truncation
 //! counters.
+//!
+//! # One workspace, stated
+//!
+//! Every host-facing question takes an optional [`ExplanationGeneration`]: the
+//! analyzer's own whole-workspace content identity, which a caller pins so an
+//! answer about a workspace that has moved since the report is refused rather
+//! than produced. Each answer also states the generation it was produced under,
+//! which is where a caller gets the value to pin.
 //!
 //! # `failed` is not `unknown`
 //!
@@ -55,6 +63,7 @@ mod why_assertion;
 mod why_flow;
 mod why_not;
 mod why_not_relational;
+mod why_typestate;
 
 #[cfg(test)]
 mod tests;
@@ -63,10 +72,11 @@ pub use host::{
     ExplanationTarget, explain_loaded_policy, explain_policy_inputs, rank_policy_near_misses,
 };
 pub use model::{
-    ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNode, ExplanationNodeId,
-    ExplanationNodeKind, ExplanationOutcome, ExplanationQuestion, ExplanationSubject,
-    ExplanationTruncation, NEAR_MISS_ADAPTER_ANALYSIS_TYPES, POLICY_EXPLANATION_FORMAT,
-    PolicyExplanation, WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+    ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationGenerationParseError,
+    ExplanationLimits, ExplanationNode, ExplanationNodeId, ExplanationNodeKind, ExplanationOutcome,
+    ExplanationQuestion, ExplanationSubject, ExplanationTruncation,
+    NEAR_MISS_ADAPTER_ANALYSIS_TYPES, POLICY_EXPLANATION_FORMAT, PolicyExplanation,
+    WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
 };
 pub use near_miss::{
     NearMissCandidates, NearMissEntry, NearMissEnumeration, NearMissTruncation,

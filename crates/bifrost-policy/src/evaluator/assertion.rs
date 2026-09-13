@@ -988,6 +988,9 @@ fn whole_assertion_run(
             // This family reads no occurrence rows, so there is no adapter
             // role gap for it to report.
             Vec::new(),
+            // A rewrite path is a declaration cycle, not an effect relation.
+            Vec::new(),
+            0,
         ) else {
             return failed_policy_run_with_reason(
                 policy,
@@ -1932,6 +1935,10 @@ fn evaluate_assert_file(
                 violation.observed.clone(),
                 violation.actual_count,
                 capability.clone(),
+                // The capture families assert over occurrence and declaration
+                // rows; only the relational plan can bind an effect relation.
+                Vec::new(),
+                0,
             ) else {
                 return Err(Box::new(AssertFileFailure::Projection {
                     message: "a violated assertion could not be projected into validated policy evidence",
@@ -2331,7 +2338,15 @@ fn relational_run(
     use super::super::assertion_policy::{
         RelationalInput, RelationalViolationRow, evaluate_relational_assertion_rows,
     };
+    use super::super::finding::EffectDerivationEvidence;
     use super::super::relational::RelationCoverage;
+
+    /// How many declared-effect chains one violated group retains.
+    ///
+    /// The representative tuples are already bounded, so this is the second
+    /// bound rather than the first; it exists so a plan that raised its own
+    /// representative limit cannot make one finding's evidence unbounded.
+    const MAX_RETAINED_EFFECT_DERIVATIONS: usize = 16;
 
     let mut run_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
     let mut run_failures: Vec<PolicyFailureReason> = Vec::new();
@@ -2505,6 +2520,32 @@ fn relational_run(
             _ => Some(PolicySourceLocation::artifact(path)),
         }
     };
+    // An effect row is a derivation rather than a position: the chain that
+    // reaches the declared effect is its whole content, so a `why` answer that
+    // published only its location could not name what the effect policy is
+    // about (issue 3207). Every field below is read from the row's own declared
+    // field surface, the same way the conflict endpoints below are.
+    let row_effect_derivation = |row: &RelationalViolationRow| -> Option<EffectDerivationEvidence> {
+        let index = *binding_index_by_name.get(&row.binding)?;
+        let item = executed[index].items.get(row.row)?;
+        if item.domain != DetailedCodeQueryDomain::ProcedureEffect {
+            return None;
+        }
+        EffectDerivationEvidence::try_new(
+            row_text(item, "effect_id")?,
+            row_text(item, "classification")?,
+            row_text(item, "derivation")?,
+            row_text(item, "certainty").map(str::to_owned),
+            row_text(item, "timing").map(str::to_owned),
+            row_text(item, "execution_timing").map(str::to_owned),
+            row_number(item, "depth"),
+            row_text(item, "coverage")?,
+            row_text(item, "witness_chain").map(str::to_owned),
+            row_number(item, "witness_steps").unwrap_or(0),
+            row_boolean(item, "witness_truncated").unwrap_or(false),
+        )
+        .ok()
+    };
     // A conflict row states two access sites beside its own anchor, and both
     // are read from the row's declared field surface: the projected row is
     // what every path carries, and the surface is what the row publishes.
@@ -2573,8 +2614,17 @@ fn relational_run(
         let mut related = Vec::new();
         let mut related_truncated = false;
         let mut omitted_related = 0_u64;
+        let mut effect_derivations = Vec::new();
+        let mut omitted_effect_derivations = 0_u64;
         for (tuple_index, tuple) in violation.representatives.iter().enumerate() {
             for (row_index, row) in tuple.iter().enumerate() {
+                if let Some(derivation) = row_effect_derivation(row) {
+                    if effect_derivations.len() < MAX_RETAINED_EFFECT_DERIVATIONS {
+                        effect_derivations.push(derivation);
+                    } else {
+                        omitted_effect_derivations = omitted_effect_derivations.saturating_add(1);
+                    }
+                }
                 let relationship = if tuple_index == 0 && row_index == 0 {
                     PolicyLocationRelationship::Subject
                 } else {
@@ -2683,6 +2733,8 @@ fn relational_run(
             Some(observed),
             violation.actual,
             capability.clone(),
+            effect_derivations,
+            omitted_effect_derivations,
         ) else {
             return failed_policy_run_with_reason(
                 policy,
@@ -2797,6 +2849,18 @@ fn row_text<'a>(item: &'a UnitRowItem, field: &str) -> Option<&'a str> {
         | CodeQueryRowScalarRef::ConstrainedEnum(value)
         | CodeQueryRowScalarRef::DeclarationIdentity(value) => Some(value),
         CodeQueryRowScalarRef::Integer(_) | CodeQueryRowScalarRef::Boolean(_) => None,
+    }
+}
+
+/// One boolean scalar of a projected row, read like [`row_text`].
+fn row_boolean(item: &UnitRowItem, field: &str) -> Option<bool> {
+    match item.field(field).ok()?? {
+        CodeQueryRowScalarRef::Boolean(value) => Some(value),
+        CodeQueryRowScalarRef::Integer(_)
+        | CodeQueryRowScalarRef::StableId(_)
+        | CodeQueryRowScalarRef::String(_)
+        | CodeQueryRowScalarRef::ConstrainedEnum(_)
+        | CodeQueryRowScalarRef::DeclarationIdentity(_) => None,
     }
 }
 

@@ -28,12 +28,12 @@ use crate::report::PolicyReportDiagnosticCode;
 use crate::resolved::LoadedPolicy;
 use crate::source::PolicySourceIdentity;
 
-use super::host::{ExplanationTarget, explain_policy_inputs};
+use super::host::{ExplanationTarget, explain_policy_inputs, rank_policy_near_misses};
 use super::model::{
-    ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNodeKind,
-    ExplanationOutcome, ExplanationQuestion, ExplanationSubject, NEAR_MISS_ADAPTER_ANALYSIS_TYPES,
-    POLICY_EXPLANATION_FORMAT, PolicyExplanation, WHY_ADAPTER_ANALYSIS_TYPES,
-    WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+    ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationLimits,
+    ExplanationNodeKind, ExplanationOutcome, ExplanationQuestion, ExplanationSubject,
+    NEAR_MISS_ADAPTER_ANALYSIS_TYPES, POLICY_EXPLANATION_FORMAT, PolicyExplanation,
+    WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
 };
 use super::near_miss::{
     NearMissCandidates, NearMissEnumeration, POLICY_NEAR_MISS_FORMAT, PolicyNearMissRanking,
@@ -345,7 +345,7 @@ fn why_explanation_carries_the_versioned_format_and_subject() {
         explain_match_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
 
     assert_eq!(explanation.format(), POLICY_EXPLANATION_FORMAT);
-    assert_eq!(explanation.format(), "bifrost_policy_explanation/v1");
+    assert_eq!(explanation.format(), "bifrost_policy_explanation/v2");
     assert_eq!(explanation.question(), ExplanationQuestion::Why);
     assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Match);
     assert_eq!(explanation.outcome(), ExplanationOutcome::Satisfied);
@@ -525,36 +525,53 @@ fn the_match_only_why_adapter_still_refuses_a_non_match_run() {
 /// Issue 2439 slice 2: the missing-adapter condition names what *is*
 /// supported, so a caller learns the whole answer from one error. The two
 /// questions support different families, and the error says which.
+///
+/// Issue 3207 moved `typestate` into the `why` list, so the family that has no
+/// adapter at all is now only asked of `why-not`; the `why` half of this test
+/// asks about a family that *is* served and pins that the list it publishes is
+/// the truth rather than a copy.
 #[test]
 fn a_missing_adapter_names_the_supported_analysis_types() {
-    for (question, expected) in [
-        (
-            ExplanationQuestion::Why,
-            "supported analysis types: match, taint, assertion, flow",
-        ),
-        (
-            ExplanationQuestion::WhyNot,
-            "supported analysis types: match, assertion",
-        ),
-    ] {
-        let error = ExplainError::adapter_unavailable(PolicyAnalysisType::Typestate, question);
-        let ExplainError::ExplanationAdapterUnavailable { supported, .. } = &error else {
-            panic!("the constructor builds the adapter-unavailable condition");
-        };
-        assert!(!supported.contains(&PolicyAnalysisType::Typestate));
-        let rendered = error.to_string();
-        assert!(rendered.contains("not yet implemented"), "{rendered}");
-        assert!(
-            rendered.contains(expected),
-            "the error names the supported families: {rendered}"
-        );
-        assert!(rendered.contains(question.label()), "{rendered}");
-    }
+    let error = ExplainError::adapter_unavailable(
+        PolicyAnalysisType::Typestate,
+        ExplanationQuestion::WhyNot,
+    );
+    let ExplainError::ExplanationAdapterUnavailable { supported, .. } = &error else {
+        panic!("the constructor builds the adapter-unavailable condition");
+    };
+    assert!(!supported.contains(&PolicyAnalysisType::Typestate));
+    let rendered = error.to_string();
+    assert!(rendered.contains("not yet implemented"), "{rendered}");
+    assert!(
+        rendered.contains("supported analysis types: match, assertion"),
+        "the error names the supported families: {rendered}"
+    );
+    assert!(
+        rendered.contains(ExplanationQuestion::WhyNot.label()),
+        "{rendered}"
+    );
+
+    // The `why` list is now total over the families a run can produce, so the
+    // condition is unreachable for it; the constructor still publishes the
+    // list, and it must stay the truth about the adapters.
+    let why =
+        ExplainError::adapter_unavailable(PolicyAnalysisType::Typestate, ExplanationQuestion::Why);
+    let ExplainError::ExplanationAdapterUnavailable { supported, .. } = &why else {
+        panic!("the constructor builds the adapter-unavailable condition");
+    };
+    assert_eq!(supported, WHY_ADAPTER_ANALYSIS_TYPES);
+    assert!(
+        why.to_string()
+            .contains("supported analysis types: match, taint, typestate, assertion, flow"),
+        "{why}"
+    );
+
     assert_eq!(
         WHY_ADAPTER_ANALYSIS_TYPES,
         [
             PolicyAnalysisType::Match,
             PolicyAnalysisType::Taint,
+            PolicyAnalysisType::Typestate,
             PolicyAnalysisType::Assertion,
             PolicyAnalysisType::Flow
         ]
@@ -1994,6 +2011,7 @@ fn the_host_explains_a_relational_finding_from_a_workspace_policy_file() {
         None,
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect("the host answers why-not");
@@ -2007,6 +2025,7 @@ fn the_host_explains_a_relational_finding_from_a_workspace_policy_file() {
         &root,
         &inputs,
         &ExplanationTarget::Finding(id),
+        None,
         None,
         None,
         None,
@@ -2031,6 +2050,7 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
         &root,
         &[],
         &ExplanationTarget::Candidate(candidate.clone()),
+        None,
         None,
         None,
         None,
@@ -2060,6 +2080,7 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
         None,
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect_err("an explanation is about one policy");
@@ -2086,6 +2107,7 @@ fn cancellation_after_registration_wins_over_ambiguous_selection() {
             ),
         ],
         &ExplanationTarget::Candidate(candidate),
+        None,
         Some(&workspace),
         None,
         Some(&cancellation),
@@ -2115,6 +2137,7 @@ fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
         None,
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect_err("a missing policy file is a stated condition, not a panic");
@@ -2139,6 +2162,7 @@ fn the_host_honors_front_door_cancellation_before_loading_policy_inputs() {
             "policies/absent.rqlp",
         )],
         &ExplanationTarget::Candidate(candidate),
+        None,
         None,
         None,
         Some(&cancellation),
@@ -2194,6 +2218,7 @@ class Caller {
         None,
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect("owned-analyzer registration resolves both qualified locators");
@@ -2236,6 +2261,7 @@ fn the_host_explains_a_retained_finding_after_a_malformed_packs_document() {
         root,
         &inputs,
         &ExplanationTarget::Finding(finding_id),
+        None,
         None,
         None,
         None,
@@ -3825,5 +3851,690 @@ fn why_not_ir_replay_propagates_cancellation() {
     assert_eq!(
         result.unwrap_err(),
         RelationalAssertionEvaluationError::Cancelled
+    );
+}
+
+// --- typestate: why ---------------------------------------------------------
+
+/// A typestate policy over the same fixture. The protocol solver is faked
+/// below, so what the selector spells only has to load and resolve.
+const TYPESTATE_POLICY: &str = r#"(policy
+  :id "test.explain.typestate"
+  :name "Typestate"
+  :message "the resource was not closed"
+  :severity error
+  :analysis (analysis
+    :type typestate
+    :mode may
+    :subjects (subject-set :entries [
+      (subject :id resource :selector (rql (name "alpha"))
+        :subject return-value)])
+    :uncertainty (uncertainty :escape inconclusive)
+    :automaton (automaton
+      :states [open closed violated]
+      :initial open
+      :accepting-states [closed]
+      :error-states [violated]
+      :events [
+        (event :id finish :on (normal-procedure-exit :scope analysis-root))
+        (event :id fail :on (exceptional-procedure-exit :scope analysis-root))]
+      :transitions [
+        (transition :from open :on finish :to closed)
+        (transition :from open :on fail :to violated)]
+      :terminal-expectations [
+        (terminal-expectation :id normal-exit
+          :on (normal-procedure-exit :scope analysis-root)
+          :expected-states [closed])])))"#;
+
+/// Every child of one node, in producer order. The typestate answer mixes
+/// kinds by design -- a source fact, the violating comparison, the witness
+/// paths, and the obligations are one ordered story -- so the kind-filtered
+/// [`child_labels`] would hide the order under test.
+fn every_child_label(node: &super::model::ExplanationNode) -> Vec<(String, ExplanationOutcome)> {
+    node.children()
+        .iter()
+        .map(|child| (child.label().to_string(), child.outcome()))
+        .collect()
+}
+
+/// Which retained shape one faked protocol projection carries.
+#[derive(Debug, Clone, Copy)]
+struct FakeProtocol {
+    /// Report an error transition instead of an unmet terminal expectation.
+    error_transition: bool,
+    /// Retain one witness with two protocol steps.
+    witness: bool,
+}
+
+struct FakeProtocolAdapter {
+    shape: FakeProtocol,
+}
+
+impl crate::projection::sealed::TypestateAdapter for FakeProtocolAdapter {}
+
+impl crate::evaluator::TypestatePolicyEvaluator for FakeProtocolAdapter {
+    fn compilation_hashes(
+        &self,
+        _policy: &LoadedPolicy,
+        _spec: &crate::resolved::ResolvedTypestatePolicySpec,
+        _context: &PolicyEvaluationContext<'_>,
+        _budget: &PolicyBudget,
+    ) -> Result<
+        crate::projection::TypestateCompilationHashes,
+        crate::evaluator::TypestateCompilationFailure,
+    > {
+        Ok(crate::projection::TypestateCompilationHashes::new(
+            protocol_hash(),
+            binding_plan_hash(),
+        ))
+    }
+
+    fn evaluate_typestate(
+        &self,
+        _authority: &crate::projection::TypestateProjectionAuthority,
+        _policy: &LoadedPolicy,
+        spec: &crate::resolved::ResolvedTypestatePolicySpec,
+        _context: &PolicyEvaluationContext<'_>,
+        _budget: &PolicyBudget,
+    ) -> crate::projection::TypestateProjectionPayload {
+        crate::projection::TypestateProjectionPayload {
+            projections: vec![fake_protocol_projection(spec, self.shape)],
+            completion: PolicyRunCompletion::Complete,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
+            work: crate::finding::PolicyWorkReport::default(),
+        }
+    }
+}
+
+fn protocol_hash() -> crate::future_evidence::TypestateProtocolHash {
+    crate::future_evidence::TypestateProtocolHash::from_canonical_bytes(b"protocol")
+}
+
+fn binding_plan_hash() -> crate::future_evidence::TypestateBindingPlanHash {
+    crate::future_evidence::TypestateBindingPlanHash::from_canonical_bytes(b"bindings")
+}
+
+fn fake_protocol_projection(
+    spec: &crate::resolved::ResolvedTypestatePolicySpec,
+    shape: FakeProtocol,
+) -> crate::projection::TypestateProjectedFinding {
+    use crate::definition::{
+        PolicySemanticEvent, TypestateEventId, TypestateExitScope, TypestateExpectationId,
+        TypestateStateId,
+    };
+    use crate::finding::{
+        BoundedWitness, FindingCertainty, FindingCompleteness, PolicyLocationRelationship,
+        ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, WitnessStep,
+        WitnessStepKind,
+    };
+    use crate::finding_identity::{
+        AnalysisFindingId, AnalysisSubjectRef, StableSemanticIdentity, TypestateScenarioId,
+        WitnessId,
+    };
+    use crate::future_evidence::{
+        ResolvedTypestateTerminal, TypestateFindingAnchor, TypestatePolicyProjectionFacts,
+        TypestateViolationEvidence,
+    };
+
+    let path = brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("app.ts")
+        .expect("workspace-relative path");
+    let subject = &spec.subjects[0];
+    let dependency = spec
+        .endpoint_dependencies
+        .iter()
+        .find(|dependency| dependency.identity() == &subject.identity)
+        .expect("the subject endpoint is a declared dependency");
+    let site =
+        StableSemanticIdentity::protocol_violation_site("typescript", path.clone(), "normal-exit")
+            .expect("a violation-site identity");
+    let violation = if shape.error_transition {
+        TypestateViolationEvidence::error_transition(
+            TypestateEventId::new("fail").expect("an event id"),
+            None,
+            TypestateStateId::new("open").expect("a state id"),
+            TypestateStateId::new("violated").expect("a state id"),
+        )
+    } else {
+        TypestateViolationEvidence::try_terminal_expectation(
+            TypestateExpectationId::new("normal-exit").expect("an expectation id"),
+            ResolvedTypestateTerminal::SemanticEvent {
+                event: PolicySemanticEvent::NormalProcedureExit {
+                    scope: TypestateExitScope::AnalysisRoot,
+                },
+            },
+            TypestateStateId::new("open").expect("a state id"),
+            vec![TypestateStateId::new("closed").expect("a state id")],
+        )
+        .expect("a normalized terminal expectation")
+    };
+    let scenarios = vec![TypestateScenarioId::try_new("test", "root").expect("a scenario id")];
+    let facts = TypestatePolicyProjectionFacts::try_new(
+        spec.authoring_projection_hash,
+        protocol_hash(),
+        binding_plan_hash(),
+        subject.identity.clone(),
+        subject.semantic_hash,
+        subject.analysis_projection_hash,
+        dependency.model().categories.clone(),
+        dependency.model().display_name.clone(),
+        Some(site.clone()),
+        violation.clone(),
+        scenarios,
+        &PolicyBudget::default(),
+    )
+    .expect("valid projection facts");
+    let anchor = TypestateFindingAnchor::strong(
+        protocol_hash(),
+        StableSemanticIdentity::protocol_subject("typescript", path, "resource-instance")
+            .expect("a subject identity"),
+        site,
+        facts.scenario_set_hash,
+        &violation,
+    )
+    .expect("a strong anchor");
+
+    let witnesses = if shape.witness {
+        vec![
+            BoundedWitness::try_new(
+                WitnessId::try_new("test", "protocol-0").expect("a witness id"),
+                vec![
+                    WitnessStep::try_new(
+                        WitnessStepKind::Source,
+                        Some(origin_location()),
+                        "typestate seed",
+                        Vec::new(),
+                    )
+                    .expect("a valid step"),
+                    WitnessStep::try_new(
+                        WitnessStepKind::Propagation,
+                        Some(observation_location()),
+                        "typestate propagation",
+                        Vec::new(),
+                    )
+                    .expect("a valid step"),
+                ],
+                false,
+                0,
+            )
+            .expect("a valid witness"),
+        ]
+    } else {
+        Vec::new()
+    };
+    let witness_refs = witnesses
+        .iter()
+        .map(|witness| witness.id().clone())
+        .collect::<Vec<_>>();
+
+    crate::projection::TypestateProjectedFinding {
+        facts,
+        analysis_finding_id: AnalysisFindingId::try_new("test", "protocol-finding")
+            .expect("an analysis finding id"),
+        anchor,
+        subject: AnalysisSubjectRef::try_new("test", "resource-instance").expect("a subject ref"),
+        witness_refs,
+        witness_refs_truncated: false,
+        report: crate::projection::ProjectedFindingReport {
+            primary: observation_location(),
+            certainty: FindingCertainty::Definite,
+            completeness: FindingCompleteness::Complete,
+            related: vec![
+                RelatedPolicyLocation::try_new(
+                    PolicyLocationRelationship::Source,
+                    origin_location(),
+                    Vec::new(),
+                )
+                .expect("a valid related location"),
+            ],
+            related_truncated: false,
+            omitted_related_locations_lower_bound: 0,
+            evidence_refs_truncated: false,
+            omitted_evidence_refs_lower_bound: 0,
+            proof: ProofMetadata::try_new(
+                ProofState::Proven,
+                vec![ProofReason::TypestateWitness],
+                Vec::new(),
+            )
+            .expect("valid proof metadata"),
+            witnesses,
+            witnesses_truncated: false,
+            omitted_witnesses_lower_bound: 0,
+            display_path: None,
+        },
+    }
+}
+
+/// One evaluated typestate run whose protocol solver is the fake above.
+fn protocol_run(fixture: &Fixture, shape: FakeProtocol) -> PolicyRun {
+    let registry = registry(TYPESTATE_POLICY);
+    let policy = registry.policies().next().expect("one loaded policy");
+    let adapter = FakeProtocolAdapter { shape };
+    let run = DefaultPolicyEvaluator::new()
+        .with_typestate(&adapter)
+        .evaluate(policy, &fixture.context(), &mut PolicyBudget::default())
+        .expect("policy evaluation");
+    assert_eq!(
+        run.findings().len(),
+        1,
+        "the fake solver projects one finding; completion={:?} diagnostics={:?}",
+        run.completion(),
+        run.diagnostics()
+    );
+    run
+}
+
+/// Issue 3207 item 2. A typestate finding used to be the one family `why`
+/// refused; it now projects the retained protocol witness the same way the
+/// flow adapter projects a reachability witness.
+#[test]
+fn why_explains_a_typestate_finding_from_its_retained_protocol_witness() {
+    let fixture = Fixture::new();
+    let run = protocol_run(
+        &fixture,
+        FakeProtocol {
+            error_transition: false,
+            witness: true,
+        },
+    );
+    let finding = &run.findings()[0];
+    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
+        .expect("a typestate finding is explainable from its retained evidence");
+
+    assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Typestate);
+    assert_eq!(explanation.root().label(), "typestate_finding");
+    assert_eq!(explanation.root().outcome(), ExplanationOutcome::Satisfied);
+
+    let labels = every_child_label(explanation.root());
+    assert_eq!(
+        labels,
+        vec![
+            (
+                "protocol_subject".to_string(),
+                ExplanationOutcome::Satisfied
+            ),
+            ("source_row".to_string(), ExplanationOutcome::Satisfied),
+            (
+                "terminal_expectation".to_string(),
+                ExplanationOutcome::Failed
+            ),
+            ("witness_path".to_string(), ExplanationOutcome::Satisfied),
+            (
+                "protocol_scenarios".to_string(),
+                ExplanationOutcome::Satisfied
+            ),
+            (
+                "finding_certainty".to_string(),
+                ExplanationOutcome::Satisfied
+            ),
+            ("path_proof".to_string(), ExplanationOutcome::Satisfied),
+            (
+                "retained_witnesses".to_string(),
+                ExplanationOutcome::Satisfied
+            ),
+            (
+                "finding_completeness".to_string(),
+                ExplanationOutcome::Satisfied
+            ),
+            ("run_completion".to_string(), ExplanationOutcome::Satisfied),
+        ]
+    );
+
+    // The violating comparison is stated as expected-beside-actual, not as a
+    // bare "unexpected".
+    let violation = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "terminal_expectation")
+        .expect("the violating expectation node");
+    assert_eq!(violation.kind(), ExplanationNodeKind::Assertion);
+    assert_eq!(
+        violation.expected(),
+        Some(
+            "expectation `normal-exit` requires state `closed` at semantic event `normal_procedure_exit/analysis_root`"
+        )
+    );
+    assert_eq!(
+        violation.actual(),
+        Some("the subject was observed in state `open`")
+    );
+    assert_eq!(violation.location(), Some(finding.primary()));
+
+    // The witness projects with the same node kinds and step labels the flow
+    // adapter publishes, because it is the same retained type.
+    let witness = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "witness_path")
+        .expect("the retained witness path");
+    assert_eq!(witness.kind(), ExplanationNodeKind::Derivation);
+    assert_eq!(
+        every_child_label(witness),
+        vec![
+            ("source".to_string(), ExplanationOutcome::Satisfied),
+            ("propagation".to_string(), ExplanationOutcome::Satisfied),
+        ]
+    );
+}
+
+/// The error-transition family names the event and both states, which is the
+/// whole content of an automaton verdict.
+#[test]
+fn why_names_the_event_and_states_of_a_violating_transition() {
+    let fixture = Fixture::new();
+    let run = protocol_run(
+        &fixture,
+        FakeProtocol {
+            error_transition: true,
+            witness: false,
+        },
+    );
+    let finding = &run.findings()[0];
+    let explanation = explain_finding(&run, &finding.id(), &ExplanationLimits::default())
+        .expect("an error-transition finding is explainable");
+
+    let transition = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "error_transition")
+        .expect("the violating transition node");
+    assert_eq!(transition.outcome(), ExplanationOutcome::Failed);
+    assert_eq!(
+        transition.expected(),
+        Some("event `fail` does not move the subject out of state `open` into an error state")
+    );
+    assert_eq!(
+        transition.actual(),
+        Some("event `fail` moved the subject from `open` to `violated`")
+    );
+
+    // A complete scenario set is named in full.
+    let scenarios = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "protocol_scenarios")
+        .expect("the scenario obligation");
+    assert_eq!(scenarios.outcome(), ExplanationOutcome::Satisfied);
+    assert_eq!(
+        scenarios.actual(),
+        Some("1 retained scenario(s): test:root")
+    );
+
+    // A finding with no retained witness says so rather than showing an empty
+    // path, exactly as the flow adapter does.
+    let retained = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "retained_witnesses")
+        .expect("the witness-retention obligation");
+    assert_eq!(retained.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        retained
+            .actual()
+            .is_some_and(|actual| actual.contains("no path is available to walk")),
+        "{:?}",
+        retained.actual()
+    );
+}
+
+#[test]
+fn typestate_why_explanations_serialize_byte_identically_across_runs() {
+    let fixture = Fixture::new();
+    let shape = FakeProtocol {
+        error_transition: false,
+        witness: true,
+    };
+    let first = protocol_run(&fixture, shape);
+    let second = protocol_run(&fixture, shape);
+    let limits = ExplanationLimits::default();
+    assert_eq!(
+        explain_finding(&first, &first.findings()[0].id(), &limits)
+            .expect("first")
+            .to_json(),
+        explain_finding(&second, &second.findings()[0].id(), &limits)
+            .expect("second")
+            .to_json()
+    );
+}
+
+/// The published supported-family list must stay the truth about the adapters,
+/// because the adapter-unavailable error is built from it.
+#[test]
+fn the_why_adapter_list_now_names_every_family_a_run_can_produce() {
+    assert_eq!(
+        WHY_ADAPTER_ANALYSIS_TYPES,
+        &[
+            PolicyAnalysisType::Match,
+            PolicyAnalysisType::Taint,
+            PolicyAnalysisType::Typestate,
+            PolicyAnalysisType::Assertion,
+            PolicyAnalysisType::Flow,
+        ]
+    );
+}
+
+// --- stale-generation rejection ---------------------------------------------
+
+/// A generation no analyzer serves: the all-zero digest is a well-formed
+/// spelling that no analyzed file set can produce.
+fn absent_generation() -> ExplanationGeneration {
+    "0".repeat(64)
+        .parse::<ExplanationGeneration>()
+        .expect("64 lowercase hex characters are a generation")
+}
+
+#[test]
+fn a_workspace_generation_round_trips_through_its_wire_spelling() {
+    let generation = absent_generation();
+    assert_eq!(generation.to_string(), "0".repeat(64));
+    assert_eq!(
+        generation.to_string().parse::<ExplanationGeneration>(),
+        Ok(generation)
+    );
+    for rejected in [
+        "",
+        "0",
+        &"0".repeat(63),
+        &"0".repeat(65),
+        &"A".repeat(64),
+        &format!("{}zz", "0".repeat(62)),
+    ] {
+        assert!(
+            rejected.parse::<ExplanationGeneration>().is_err(),
+            "{rejected:?} is not a workspace generation"
+        );
+    }
+}
+
+/// Issue 3207 item 1 (and the remainder of issue 2509). An explanation
+/// re-evaluates against whatever the analyzer holds now, so a caller that
+/// obtained its finding identity under one workspace must be able to say so and
+/// be refused rather than answered about a different run.
+#[test]
+fn the_host_refuses_an_explanation_pinned_to_a_generation_the_workspace_lost() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let inputs = vec![PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+
+    // An unpinned request answers and states the generation it answered under,
+    // which is where a caller gets the value to pin.
+    let unpinned = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Candidate(candidate.clone()),
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("an unpinned explanation answers");
+    let current = unpinned
+        .workspace_generation()
+        .expect("the host states the generation it answered under");
+
+    // Pinning that same generation answers identically.
+    let pinned = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Candidate(candidate.clone()),
+        Some(current),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("the current generation is accepted");
+    assert_eq!(pinned.to_json(), unpinned.to_json());
+
+    // Pinning any other generation is refused with the typed condition, and
+    // the error names both sides so a caller can re-run and retry.
+    let stale = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Candidate(candidate),
+        Some(absent_generation()),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("a workspace that moved must not be silently explained");
+    assert_eq!(
+        stale,
+        ExplainError::StaleWorkspaceGeneration {
+            requested: absent_generation(),
+            current: Some(current),
+        }
+    );
+    assert!(stale.to_string().contains(&current.to_string()), "{stale}");
+}
+
+/// The `why` target crosses the same gate, and the refusal happens before the
+/// policy is evaluated rather than after a finding lookup fails.
+#[test]
+fn a_stale_generation_refuses_a_why_request_before_evaluating_the_policy() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let inputs = vec![PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+    let fixture = Fixture::with_source(RELATIONAL_FIXTURE);
+    let id = only_finding(&fixture.run(FORBID_READS_RELATIONAL));
+
+    let stale = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Finding(id),
+        Some(absent_generation()),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("a stale pin is refused");
+    assert!(
+        matches!(stale, ExplainError::StaleWorkspaceGeneration { .. }),
+        "{stale:?}"
+    );
+}
+
+/// A ranking is a question about the same workspace, so it honours the same
+/// pin and states the same generation.
+#[test]
+fn a_near_miss_ranking_honours_the_same_workspace_generation_pin() {
+    let temp = host_workspace(NEAR_MISS_FIXTURE, EXACT_MEMBER_POLICY);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let inputs = vec![PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+
+    let ranking = rank_policy_near_misses(
+        &root,
+        &inputs,
+        &NearMissCandidates::PolicySeedSearch,
+        None,
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("an unpinned ranking answers");
+    let current = ranking
+        .workspace_generation()
+        .expect("the host states the generation it ranked under");
+
+    rank_policy_near_misses(
+        &root,
+        &inputs,
+        &NearMissCandidates::PolicySeedSearch,
+        Some(current),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("the current generation is accepted");
+
+    let stale = rank_policy_near_misses(
+        &root,
+        &inputs,
+        &NearMissCandidates::PolicySeedSearch,
+        Some(absent_generation()),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("a stale pin is refused for a ranking too");
+    assert_eq!(
+        stale,
+        ExplainError::StaleWorkspaceGeneration {
+            requested: absent_generation(),
+            current: Some(current),
+        }
+    );
+}
+
+#[test]
+fn a_reopened_disk_workspace_rejects_a_generation_from_before_an_edit() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().unwrap();
+    let inputs = vec![PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+    let target =
+        ExplanationTarget::Candidate(ExplanationCandidate::at_offset("app.ts", 0).unwrap());
+    let limits = ExplanationLimits::default();
+    let old = explain_policy_inputs(&root, &inputs, &target, None, None, None, None, &limits)
+        .unwrap()
+        .workspace_generation()
+        .unwrap();
+    std::fs::write(
+        root.join("app.ts"),
+        format!("{RELATIONAL_FIXTURE}\nfunction newFunction() {{ return 42; }}\n"),
+    )
+    .unwrap();
+    let result = explain_policy_inputs(
+        &root,
+        &inputs,
+        &target,
+        Some(old),
+        None,
+        None,
+        None,
+        &limits,
+    );
+    assert!(
+        matches!(result, Err(ExplainError::StaleWorkspaceGeneration { .. })),
+        "stale generation must be rejected after source change and workspace reopen: {result:?}"
     );
 }

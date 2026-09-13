@@ -60,6 +60,23 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// A tree re-parsed around syntax the bundled grammar cannot represent, or
+    /// `None` when `tree` stands as parsed.
+    ///
+    /// Only Go overrides this. Its grammar models `new` as a keyword whose
+    /// argument must be a type, so Go 1.26's `new(expr)` fails to parse and
+    /// recovery swallows the expression -- and sometimes the statement after it
+    /// (issue #3325). Whether a file contains that shape is only visible in a
+    /// tree, which is why this runs after the parse rather than before it.
+    fn reparse_grammar_gap(
+        &self,
+        _source: &str,
+        _tree: &tree_sitter::Tree,
+        _cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<tree_sitter::Tree> {
+        None
+    }
+
     /// Context-sensitive refinement applied after table lookup. `enclosing`
     /// is the kind of the nearest enclosing normalized node, and `context` is
     /// the per-file [`CallSiteContext`] from [`Self::call_site_context`], for

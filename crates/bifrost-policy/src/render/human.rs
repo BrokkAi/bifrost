@@ -20,14 +20,14 @@ use super::super::{
     PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship, PolicyMessageSpec,
     PolicyObligation, PolicyOverlayScope, PolicyPackActivationReview, PolicyPackDecisionStatus,
     PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec,
-    PolicySourceLocation, PolicySuppressionDecision, PolicySuppressionMatchState,
-    PolicySuppressionOrphanState, PolicySuppressionPolicyHashState, PolicySuppressionReview,
-    PolicySuppressionTemporalState, ProofMetadata, ProofReason, ResolvedEndpointDependency,
-    ResolvedEndpointIdentity, ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas,
-    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
-    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
-    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySeveritySpec, PolicySourceLocation,
+    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
+    ProofMetadata, ProofReason, ResolvedEndpointDependency, ResolvedEndpointIdentity,
+    ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas, ResolvedMatchDirectoryManifest,
+    ResolvedPrecedenceEdge, ResolvedTypestateTerminal, SchemaVersionOrigin,
+    SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry,
+    TaintTrustBoundary, TypestateViolationEvidence,
 };
 
 use super::{
@@ -2251,9 +2251,13 @@ fn write_typestate_terminal<W: Write>(
             write_endpoint_identity(output, endpoint)?;
             write!(output, " ({})", endpoint_phase(*phase)).map_err(map_io_error)
         }
-        ResolvedTypestateTerminal::SemanticEvent { event } => {
-            write!(output, "semantic event {}", semantic_event(*event)).map_err(map_io_error)
-        }
+        ResolvedTypestateTerminal::SemanticEvent { event } => write!(
+            output,
+            "semantic event {}/{}",
+            event.label(),
+            event.scope().label()
+        )
+        .map_err(map_io_error),
     }
 }
 
@@ -3371,22 +3375,7 @@ const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
 }
 
 const fn endpoint_phase(value: EndpointObservationPhase) -> &'static str {
-    match value {
-        EndpointObservationPhase::AtMatch => "at_match",
-        EndpointObservationPhase::BeforeCall => "before_call",
-        EndpointObservationPhase::AfterNormalReturn => "after_normal_return",
-        EndpointObservationPhase::AfterExceptionalReturn => "after_exceptional_return",
-    }
-}
-
-const fn semantic_event(value: PolicySemanticEvent) -> &'static str {
-    match value {
-        PolicySemanticEvent::NormalProcedureExit { .. } => "normal_procedure_exit/analysis_root",
-        PolicySemanticEvent::ExceptionalProcedureExit { .. } => {
-            "exceptional_procedure_exit/analysis_root"
-        }
-        PolicySemanticEvent::SuspensionBoundary { .. } => "suspension_boundary/analysis_root",
-    }
+    value.label()
 }
 
 const fn analysis_type(value: PolicyAnalysisType) -> &'static str {

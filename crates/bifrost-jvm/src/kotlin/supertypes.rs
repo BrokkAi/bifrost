@@ -28,13 +28,26 @@ use crate::kotlin::declarations::kotlin_identifier_text;
 /// A function-type specifier (`class Handler : (Int) -> String`) names no
 /// declaration, so it yields no path rather than one that can never resolve.
 pub fn extract_kotlin_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
+    extract_kotlin_supertype_segments(declaration, source)
+        .into_iter()
+        .map(|segments| segments.join("."))
+        .collect()
+}
+
+/// The dotted *segments* of each supertype, in source order.
+///
+/// A consumer that resolves a supertype against a name scope needs the
+/// segments rather than the rendered path, because the leading segment is the
+/// one Kotlin looks up and the rest descend from it. Rendering and resolving
+/// therefore share one read of the tree instead of re-splitting a string.
+pub fn extract_kotlin_supertype_segments(declaration: Node<'_>, source: &str) -> Vec<Vec<String>> {
     named_children(declaration)
         .into_iter()
         .filter(|child| child.kind() == "delegation_specifier")
         .filter_map(|specifier| {
             let user_type = delegation_user_type(specifier)?;
             let segments = kotlin_user_type_segments(user_type, source);
-            (!segments.is_empty()).then(|| segments.join("."))
+            (!segments.is_empty()).then_some(segments)
         })
         .collect()
 }

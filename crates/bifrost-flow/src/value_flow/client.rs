@@ -825,12 +825,15 @@ impl From<SummaryDataflowError> for ValueFlowSolveError {
 /// kill is correct for it too; a name the resolver could not prove leaves more
 /// than one candidate object, which is a weak update and no kill at all.
 pub(crate) fn kills_target(rule: &super::plan::LocalRuleView) -> bool {
-    // Parameter and receiver relations are copies between a boundary port and
-    // a value carrier, so a distinct endpoint replaces the target carrier.
+    // Parameter and receiver relations copy between a boundary port and a
+    // value carrier. A return writes the one pending return slot: cleanup can
+    // replace it before the invocation exits. Mutually exclusive returns still
+    // join through control flow, but a later return kills the earlier value.
     match rule.kind {
         ValueFlowRelationKind::Assignment
         | ValueFlowRelationKind::Parameter
-        | ValueFlowRelationKind::Receiver => rule.source != rule.target,
+        | ValueFlowRelationKind::Receiver
+        | ValueFlowRelationKind::NormalReturn => rule.source != rule.target,
         ValueFlowRelationKind::MemoryStore => rule.strong_update,
         _ => false,
     }

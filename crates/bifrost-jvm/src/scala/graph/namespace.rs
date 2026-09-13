@@ -279,6 +279,30 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
     reference: Node<'tree>,
     root_name: &str,
 ) -> Option<ScalaUnindexedTypeBinding<'tree>> {
+    nearest_unindexed_type_binding_details(source, reference, root_name).map(|(binding, _)| binding)
+}
+
+/// Owner of the nearest authoritative unindexed type binding for `root_name`.
+///
+/// Anonymous refinements are not owners: they may still resolve to an indexed
+/// member of the constructed base. Callers that need a lexical barrier should
+/// use [`scala_unindexed_type_binding_shadows`].
+pub fn scala_nearest_unindexed_type_owner<'tree>(
+    source: &str,
+    reference: Node<'tree>,
+    root_name: &str,
+) -> Option<Node<'tree>> {
+    match nearest_unindexed_type_binding_details(source, reference, root_name) {
+        Some((ScalaUnindexedTypeBinding::Authoritative, owner)) => Some(owner),
+        _ => None,
+    }
+}
+
+fn nearest_unindexed_type_binding_details<'tree>(
+    source: &str,
+    reference: Node<'tree>,
+    root_name: &str,
+) -> Option<(ScalaUnindexedTypeBinding<'tree>, Node<'tree>)> {
     if root_name.is_empty() {
         return None;
     }
@@ -294,7 +318,7 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
         if let Some(parameters) = parameters
             && scala_type_parameters_declare(parameters, source, name)
         {
-            return Some(ScalaUnindexedTypeBinding::Authoritative);
+            return Some((ScalaUnindexedTypeBinding::Authoritative, node));
         }
 
         if node.kind() == "template_body"
@@ -316,12 +340,15 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
                 [definition] if definition.kind() == "type_definition" => {
                     let declaration_name = definition.child_by_field_name("name");
                     if declaration_name.is_some_and(|declared| declared == reference) {
-                        Some(ScalaUnindexedTypeBinding::Authoritative)
+                        Some((ScalaUnindexedTypeBinding::Authoritative, *definition))
                     } else {
-                        Some(ScalaUnindexedTypeBinding::AnonymousRefinement(instance))
+                        Some((
+                            ScalaUnindexedTypeBinding::AnonymousRefinement(instance),
+                            instance,
+                        ))
                     }
                 }
-                [_] | [_, _, ..] => Some(ScalaUnindexedTypeBinding::Authoritative),
+                [owner, ..] => Some((ScalaUnindexedTypeBinding::Authoritative, *owner)),
                 [] => {
                     current = node.parent();
                     continue;
@@ -331,7 +358,7 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
 
         if matches!(node.kind(), "block" | "indented_block") {
             let mut cursor = node.walk();
-            if node.named_children(&mut cursor).any(|child| {
+            let owner = node.named_children(&mut cursor).find(|child| {
                 matches!(child.kind(), "type_definition" | "type_declaration")
                     && child.start_byte() < reference.start_byte()
                     && child.child_by_field_name("name").is_some_and(|alias| {
@@ -339,8 +366,9 @@ pub fn scala_nearest_unindexed_type_binding<'tree>(
                             .get(alias.byte_range())
                             .is_some_and(|text| text.trim() == name)
                     })
-            }) {
-                return Some(ScalaUnindexedTypeBinding::Authoritative);
+            });
+            if let Some(owner) = owner {
+                return Some((ScalaUnindexedTypeBinding::Authoritative, owner));
             }
         }
         current = node.parent();

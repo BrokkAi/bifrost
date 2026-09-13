@@ -2570,18 +2570,11 @@ const fn inconclusive_policy_label(value: InconclusivePolicy) -> &'static str {
 }
 
 const fn typestate_exit_scope_label(value: TypestateExitScope) -> &'static str {
-    match value {
-        TypestateExitScope::AnalysisRoot => "analysis_root",
-    }
+    value.label()
 }
 
 const fn endpoint_observation_phase_label(value: EndpointObservationPhase) -> &'static str {
-    match value {
-        EndpointObservationPhase::AtMatch => "at_match",
-        EndpointObservationPhase::BeforeCall => "before_call",
-        EndpointObservationPhase::AfterNormalReturn => "after_normal_return",
-        EndpointObservationPhase::AfterExceptionalReturn => "after_exceptional_return",
-    }
+    value.label()
 }
 
 const fn any_or_all_label(value: AnyOrAll) -> &'static str {

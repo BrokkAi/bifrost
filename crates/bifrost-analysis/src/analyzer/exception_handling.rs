@@ -71,6 +71,7 @@ pub(crate) fn analyze_for_file(
             message: format!("failed to parse {}", file.rel_path().display()),
         };
     };
+    let tree = crate::analyzer::repaired_grammar_gap_tree(language, &source, tree);
     // Tree-sitter error nodes are recoverable syntax, not a failed parse. Real
     // C++ headers and C# files with preprocessor branches routinely contain
     // them while still exposing usable catch-clause fields elsewhere in the tree.

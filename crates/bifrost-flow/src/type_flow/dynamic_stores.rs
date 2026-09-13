@@ -250,6 +250,14 @@ pub(super) fn survey(
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
             }
+            // Planning cannot repair failed discovery. Preserve the same
+            // unsurveyed-caller uncertainty without building class seeds or
+            // correlations that the post-plan boundary check would discard.
+            if let Some(reason) = discovered.discovery_boundary() {
+                survey_failure.get_or_insert(reason);
+                mark_unsurveyed(writes, root, &mut caller_dependent);
+                return Ok(None);
+            }
             // Open effects cannot narrow again. Only pending writes can make
             // this root's class seeds or solve contribute further evidence.
             if discovered.excludes_procedures(writes.iter().zip(&effects).filter_map(

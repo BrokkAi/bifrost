@@ -978,27 +978,36 @@ mod tests {
         }
     }
 
-    /// A JSX attribute named by a reserved word (`class=`, as Preact and plain
-    /// DOM JSX spell it) is outside the JavaScript grammar's attribute rule, so
-    /// the parser derails and the element names and expression reads that follow
-    /// survive only as terminals below ERROR. Membership must back an inverse hit
-    /// on them (#3215) while the forward census keeps refusing to propose a site
-    /// it cannot grade. The prettier witness is this shape.
+    /// The prettier witness's shape: a JSX attribute named by a reserved word
+    /// (`class=`, as Preact and plain DOM JSX spell it).
+    const RESERVED_JSX_ATTRIBUTE: &str = concat!(
+        "import { Button, Panel } from './parts.js';\n",
+        "export const App = (settings) => (\n",
+        "  <div class=\"bar\">\n",
+        "    {settings.showFirst ? (\n",
+        "      <Panel name=\"first\" />\n",
+        "    ) : null}\n",
+        "    <Button onClick={settings.reset}>Clear</Button>\n",
+        "  </div>\n",
+        ");\n",
+    );
+
+    /// `class=` is outside the JavaScript grammar's JSX attribute rule, so a
+    /// `.js` file carrying JSX still derails: the element names and expression
+    /// reads that follow survive only as terminals below ERROR. Membership must
+    /// back an inverse hit on them (#3215) while the forward census keeps
+    /// refusing to propose a site it cannot grade.
+    ///
+    /// This is the residual #3322 left. `.jsx` moved to the TSX grammar, which
+    /// parses the attribute; a `.js` file cannot, because the TSX grammar is
+    /// not a superset of JavaScript -- it reads `await using x = ...` as an
+    /// assignment and `a < unique` as the start of a type -- so the JavaScript
+    /// grammar stays the one that reads `.js`.
     #[test]
     fn js_census_membership_backs_recovered_jsx_references_without_proposing_them() {
-        let source = concat!(
-            "import { Button, Panel } from './parts.js';\n",
-            "export const App = (settings) => (\n",
-            "  <div class=\"bar\">\n",
-            "    {settings.showFirst ? (\n",
-            "      <Panel name=\"first\" />\n",
-            "    ) : null}\n",
-            "    <Button onClick={settings.reset}>Clear</Button>\n",
-            "  </div>\n",
-            ");\n",
-        );
-        let census = census_offsets(Language::JavaScript, "app.jsx", source);
-        let membership = census_membership_offsets(Language::JavaScript, "app.jsx", source);
+        let source = RESERVED_JSX_ATTRIBUTE;
+        let census = census_offsets(Language::JavaScript, "app.js", source);
+        let membership = census_membership_offsets(Language::JavaScript, "app.js", source);
         let element = source.find("<Button onClick").expect("JSX element name") + 1;
         let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
         let intact = source.find("(settings)").expect("parameter binder") + 1;
@@ -1017,6 +1026,27 @@ mod tests {
             census.contains(&intact) && membership.contains(&intact),
             "the intact part of the file keeps both frontiers: {census:?} {membership:?}"
         );
+    }
+
+    /// The same source as a `.jsx` file has no recovery fallout at all: #3322
+    /// parses that dialect with the TSX grammar, so the element name and the
+    /// attribute read are ordinary references both frontiers agree on, and
+    /// nothing needs backing that the census cannot also grade.
+    #[test]
+    fn jsx_dialect_grades_the_references_a_reserved_attribute_used_to_derail() {
+        let source = RESERVED_JSX_ATTRIBUTE;
+        let census = census_offsets(Language::JavaScript, "app.jsx", source);
+        let membership = census_membership_offsets(Language::JavaScript, "app.jsx", source);
+        let element = source.find("<Button onClick").expect("JSX element name") + 1;
+        let read = source.find("{settings.reset}").expect("JSX attribute read") + 1;
+        let intact = source.find("(settings)").expect("parameter binder") + 1;
+
+        for offset in [element, read, intact] {
+            assert!(
+                census.contains(&offset) && membership.contains(&offset),
+                "the JSX dialect grades {offset} on both frontiers: {census:?} {membership:?}"
+            );
+        }
     }
 
     #[test]
@@ -1094,16 +1124,17 @@ mod tests {
         );
     }
 
-    /// Go 1.26 spells `new(expr)`, but tree-sitter-go still parses the first
-    /// argument of `new` and `make` as a type (`special_argument_list`), so both
-    /// of #3209's witness shapes land under an ERROR node: the conversion type
-    /// name as a bare `identifier` child of the ERROR (trivy's
-    /// `new(PackageURL(p))`), and the following statement's field write dragged
-    /// in and re-read as a `qualified_type` (etcd's `bwal.ents = ...`). The
-    /// inverse scan resolves both, so membership must hold them while the
-    /// forward census keeps refusing to grade misparse fallout.
+    /// Go 1.26 spells `new(expr)`, and #3325 taught the Go parse to read it:
+    /// the bundled grammar's `special_argument_list` demands a type, so both of
+    /// #3209's witness shapes used to land under an ERROR node -- trivy's
+    /// `new(PackageURL(p))` conversion name as a bare `identifier` child of the
+    /// ERROR, and etcd's following statement dragged in and re-read as a
+    /// `qualified_type`. Neither is recovery fallout any more, so both must now
+    /// reach the graded forward census as well as membership. The census cannot
+    /// grade what the parser never gave it a role for; this is the test that
+    /// says the parser gives it one.
     #[test]
-    fn go_census_membership_backs_recovered_references_without_proposing_them() {
+    fn go_1_26_new_expression_regions_reach_the_graded_census() {
         let source = concat!(
             "package purl\n",
             "\n",
@@ -1124,7 +1155,7 @@ mod tests {
             "\n",
             "func Build(rows []int, low int, high int) *Row {\n",
             "\tr := &Row{}\n",
-            "\tr.limit = new(max(low, high))\n",
+            "\tr.limit = *new(max(low, high))\n",
             "\tr.ents = rows\n",
             "\treturn r\n",
             "}\n",
@@ -1132,23 +1163,19 @@ mod tests {
         let census = census_offsets(Language::Go, "purl.go", source);
         let membership = census_membership_offsets(Language::Go, "purl.go", source);
         let conversion = source.find("new(PackageURL(p))").expect("conversion call") + "new(".len();
-        let field_write = source.find("r.ents = rows").expect("recovered write") + "r.".len();
+        let field_write = source.find("r.ents = rows").expect("following write") + "r.".len();
         let intact_read = source.find("len(r.ents)").expect("intact read") + "len(r.".len();
 
-        for offset in [conversion, field_write] {
+        for offset in [conversion, field_write, intact_read] {
             assert!(
-                !census.contains(&offset),
-                "recovery fallout must stay out of the graded census at {offset}: {census:?}"
+                census.contains(&offset),
+                "the repaired region is an ordinary reference at {offset}: {census:?}"
             );
             assert!(
                 membership.contains(&offset),
-                "the recovered reference at {offset} must back an inverse hit: {membership:?}"
+                "membership keeps backing the reference at {offset}: {membership:?}"
             );
         }
-        assert!(
-            census.contains(&intact_read) && membership.contains(&intact_read),
-            "the intact part of the file keeps both frontiers: {census:?} {membership:?}"
-        );
     }
 
     /// The C# recovery shapes from #3212. A `$@"..."` verbatim interpolation

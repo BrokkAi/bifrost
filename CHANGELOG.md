@@ -24,6 +24,15 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Local literal tuple index reads retain element classes through aliases.
+  Proven tuple mutations evaluate their operands and then follow exceptional
+  control flow, preserving handlers and cleanup without impossible stores.
+- Conditional value-flow sources share one key index for trigger validation
+  and binding, avoiding repeated full-locator searches.
+
+- Heap escape proofs reuse exact caller syntax across nonpublishing calls,
+  discarding preparation when the proof ends or is interrupted.
+
 - Python call-target lookup reuses completed local binding facts within each
   exact-source query context.
 
@@ -39,7 +48,8 @@ projection and its commit history does not contain every source commit.
 
 - Python type flow reuses completed class lookups within a query while
   preserving dependency reads and cancellation. Dynamic-write surveys avoid
-  constructing type-flow plans when completed discovery contains no pending write.
+  constructing type-flow plans when completed discovery contains no pending write
+  or already has a failure that prevents the survey from using its result.
 - Diff-tool requests now report their execution phases to the client while
   running, and analyzer cache build-lock waits are cancellable and
   self-naming.
@@ -74,6 +84,11 @@ projection and its commit history does not contain every source commit.
   declares.
 - C# attribute names resolve through the full type-name ladder, one segment
   at a time.
+- Go 1.26 `new(expr)` now parses: the conversion or call it allocates is an
+  ordinary reference again, and the statement following a `new(expr)`
+  assignment is no longer swallowed by parser recovery. `new(Type)` and
+  `make` are unchanged, and a `make` call with an expression argument stays
+  an explicit parse error.
 - Python usage seeding now covers classes and functions passed by reference
   and import-bound declarations, skips namespace imports, and no longer
   counts a star re-export as making a bare module read a usage.

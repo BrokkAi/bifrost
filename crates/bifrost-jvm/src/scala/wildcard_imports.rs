@@ -476,8 +476,9 @@ pub fn scala_package_prefixes_at(
     source: &str,
     reference_byte: usize,
 ) -> Vec<String> {
-    scala_package_prefixes_at_impl(root, source, reference_byte, None)
+    scala_package_scope_at_impl(root, source, reference_byte, None)
         .expect("unbounded Scala package traversal cannot stop")
+        .0
 }
 
 pub fn scala_package_prefixes_at_checked(
@@ -486,15 +487,31 @@ pub fn scala_package_prefixes_at_checked(
     reference_byte: usize,
     inspect: &mut dyn FnMut(Node<'_>) -> bool,
 ) -> Option<Vec<String>> {
-    scala_package_prefixes_at_impl(root, source, reference_byte, Some(inspect))
+    scala_package_scope_at_impl(root, source, reference_byte, Some(inspect))
+        .map(|(prefixes, _)| prefixes)
 }
 
-fn scala_package_prefixes_at_impl(
+/// Innermost enclosing package identity as parser field segments.
+///
+/// This is the structured form of [`scala_package_prefixes_at`]'s last prefix:
+/// each component comes from `scala_type_lookup_segments` on the package name
+/// node, never from splitting a rendered dotted string.
+pub fn scala_enclosing_package_segments_at(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> Vec<String> {
+    scala_package_scope_at_impl(root, source, reference_byte, None)
+        .map(|(_, segments)| segments)
+        .expect("unbounded Scala package traversal cannot stop")
+}
+
+fn scala_package_scope_at_impl(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,
     mut inspect: Option<&mut dyn FnMut(Node<'_>) -> bool>,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, Vec<String>)> {
     let mut prefixes = Vec::new();
     let mut segments = Vec::new();
     let mut container = root;
@@ -549,7 +566,7 @@ fn scala_package_prefixes_at_impl(
         };
         container = body;
     }
-    Some(prefixes)
+    Some((prefixes, segments))
 }
 
 fn inspect_named_subtree(

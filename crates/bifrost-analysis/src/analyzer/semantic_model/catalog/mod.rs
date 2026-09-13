@@ -61,7 +61,13 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// declaration it emits with an `ambient_use` role. Warm generated packs carry
 /// no such role, and absence there means "unreviewed", so a stale pack would
 /// silently withhold every Scala unused-import proof.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 21;
+/// 22: C++ header production withholds unproven brace pairings in damaged
+/// syntax, including the recovered exported-class partitioning used to emit
+/// dependency declarations. Warm generated packs may retain the old shape.
+/// 23: the Go source producer parses Go 1.26 new(expr) through the same
+/// structured repair as workspace analysis. Warm packs can retain declarations
+/// and signatures lost to the old grammar recovery (#3325).
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 23;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

@@ -226,6 +226,36 @@ pub enum RustPrimitive {
     F64,
 }
 
+/// Structured Scala conversion types. Identities are resolver- or
+/// declaration-backed; prelude names such as `Int` keep their structured
+/// segment path rather than a displayed spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalaConversionType {
+    /// Nominal type path (`Int`, `scala.Predef.String`, `Wrapper`).
+    Nominal(Box<[Box<str>]>),
+    Declaration(CodeUnit),
+}
+
+impl ScalaConversionType {
+    fn digest(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.scala.conversion-type.v1");
+        match self {
+            Self::Nominal(segments) => {
+                digest.push(b"nominal");
+                digest.push(&(segments.len() as u64).to_be_bytes());
+                for segment in segments {
+                    digest.push(segment.as_bytes());
+                }
+            }
+            Self::Declaration(unit) => {
+                digest.push(b"declaration");
+                digest.push(unit.declaration_id().as_str().as_bytes());
+            }
+        }
+        digest.finish()
+    }
+}
+
 /// Structured Rust conversion types. The language producer bounds nesting
 /// before construction; references describe conversion shape, not a proof of
 /// borrow validity or region inference. Nominals retain resolved declarations.
@@ -286,6 +316,7 @@ pub enum ResolvedConversionType {
     JavaPrimitive(JavaPrimitive),
     TypeScriptPrimitive(TypeScriptPrimitive),
     Rust(RustConversionType),
+    Scala(ScalaConversionType),
     Declaration(CodeUnit),
     /// Exact artifact/model declaration identity supplied by the resolver.
     External {
@@ -305,6 +336,11 @@ pub enum ConversionKind {
     RustDeref,
     RustUnsizing,
     RustReborrow,
+    ScalaIdentity,
+    ScalaImplicitConversion,
+    ScalaValueClassBoxing,
+    ScalaValueClassUnboxing,
+    ScalaOpaqueAdaptation,
 }
 
 impl ConversionKind {
@@ -319,6 +355,11 @@ impl ConversionKind {
         "rust_deref",
         "rust_unsizing",
         "rust_reborrow",
+        "scala_identity",
+        "scala_implicit_conversion",
+        "scala_value_class_boxing",
+        "scala_value_class_unboxing",
+        "scala_opaque_adaptation",
     ];
 
     pub const fn label(self) -> &'static str {
@@ -333,6 +374,11 @@ impl ConversionKind {
             Self::RustDeref => "rust_deref",
             Self::RustUnsizing => "rust_unsizing",
             Self::RustReborrow => "rust_reborrow",
+            Self::ScalaIdentity => "scala_identity",
+            Self::ScalaImplicitConversion => "scala_implicit_conversion",
+            Self::ScalaValueClassBoxing => "scala_value_class_boxing",
+            Self::ScalaValueClassUnboxing => "scala_value_class_unboxing",
+            Self::ScalaOpaqueAdaptation => "scala_opaque_adaptation",
         }
     }
 }
@@ -469,8 +515,12 @@ impl CallArgumentConversion {
     pub fn transfer(&self) -> Option<ValueTransfer> {
         let conversion = self.result.as_ref().ok()?;
         let kind = match conversion.kind {
-            ConversionKind::JavaBoxing => TransferKind::Boxing,
-            ConversionKind::JavaUnboxing => TransferKind::Unboxing,
+            ConversionKind::JavaBoxing | ConversionKind::ScalaValueClassBoxing => {
+                TransferKind::Boxing
+            }
+            ConversionKind::JavaUnboxing | ConversionKind::ScalaValueClassUnboxing => {
+                TransferKind::Unboxing
+            }
             ConversionKind::JavaPrimitiveWidening => {
                 use JavaPrimitive::{Double, Float, Int, Long};
                 let changing = matches!(
@@ -491,13 +541,20 @@ impl CallArgumentConversion {
                     },
                 }
             }
+            ConversionKind::ScalaImplicitConversion => TransferKind::Conversion {
+                preservation: ValuePreservation::Changing,
+            },
+            ConversionKind::ScalaOpaqueAdaptation => TransferKind::Conversion {
+                preservation: ValuePreservation::Preserving,
+            },
             ConversionKind::JavaIdentity
             | ConversionKind::TypeScriptIdentity
             | ConversionKind::TypeScriptStructuralAssignability
             | ConversionKind::RustIdentity
             | ConversionKind::RustDeref
             | ConversionKind::RustUnsizing
-            | ConversionKind::RustReborrow => return None,
+            | ConversionKind::RustReborrow
+            | ConversionKind::ScalaIdentity => return None,
         };
         Some(ValueTransfer {
             kind,
@@ -539,6 +596,10 @@ impl CallArgumentConversion {
                 }
                 ResolvedConversionType::Rust(identity) => {
                     digest.push(b"rust");
+                    digest.push(identity.digest().as_bytes());
+                }
+                ResolvedConversionType::Scala(identity) => {
+                    digest.push(b"scala");
                     digest.push(identity.digest().as_bytes());
                 }
                 ResolvedConversionType::Declaration(unit) => {
@@ -1260,6 +1321,11 @@ mod tests {
                 "rust_deref",
                 "rust_unsizing",
                 "rust_reborrow",
+                "scala_identity",
+                "scala_implicit_conversion",
+                "scala_value_class_boxing",
+                "scala_value_class_unboxing",
+                "scala_opaque_adaptation",
             ]
         );
         assert_eq!(

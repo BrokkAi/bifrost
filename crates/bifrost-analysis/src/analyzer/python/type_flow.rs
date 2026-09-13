@@ -2017,7 +2017,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // remainder.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-list-loads-v44",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-v45",
         )
         .expect("adapter name is non-empty")
     }
@@ -2557,23 +2557,24 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         }
         let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
         let mut exceeded = None;
-        let spans = super::semantic::closed_list_load_spans(callable, prepared.source(), || {
-            if request.cancellation.is_cancelled() || !session.scope_step() {
-                return false;
-            }
-            match request
-                .budget
-                .charge(crate::analyzer::semantic::SemanticWork {
-                    nested_entries: 1,
-                    ..crate::analyzer::semantic::SemanticWork::default()
-                }) {
-                Ok(()) => true,
-                Err(error) => {
-                    exceeded = Some(error);
-                    false
+        let spans =
+            super::semantic::closed_sequence_load_spans(callable, prepared.source(), || {
+                if request.cancellation.is_cancelled() || !session.scope_step() {
+                    return false;
                 }
-            }
-        });
+                match request
+                    .budget
+                    .charge(crate::analyzer::semantic::SemanticWork {
+                        nested_entries: 1,
+                        ..crate::analyzer::semantic::SemanticWork::default()
+                    }) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        exceeded = Some(error);
+                        false
+                    }
+                }
+            });
         if let Some(error) = exceeded {
             return Err(error);
         }

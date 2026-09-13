@@ -859,12 +859,12 @@ impl IAnalyzer for TypescriptAnalyzer {
         let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
-        detect_js_ts_test_assertion_smells(
-            file,
-            &source,
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            &weights,
-        )
+        let Some(grammar) =
+            crate::analyzer::parser_language_for_path(Language::TypeScript, file.rel_path())
+        else {
+            return Vec::new();
+        };
+        detect_js_ts_test_assertion_smells(file, &source, grammar, &weights)
     }
 
     fn find_structural_clone_smells(
@@ -894,15 +894,17 @@ impl IAnalyzer for TypescriptAnalyzer {
             Language::TypeScript,
         );
         let _query_scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        // Same per-file grammar rule the JavaScript adapter uses: a `.tsx`
+        // unit is parsed with the TSX grammar, and the plain TypeScript
+        // grammar cannot read the JSX in it.
         let all_candidates: Vec<CloneCandidateProfile> = corpus_units
             .iter()
             .filter_map(|code_unit| {
-                build_js_ts_clone_candidate_data(
-                    self,
-                    code_unit,
-                    weights,
-                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                )
+                let grammar = crate::analyzer::parser_language_for_path(
+                    Language::TypeScript,
+                    code_unit.source().rel_path(),
+                )?;
+                build_js_ts_clone_candidate_data(self, code_unit, weights, grammar)
             })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();

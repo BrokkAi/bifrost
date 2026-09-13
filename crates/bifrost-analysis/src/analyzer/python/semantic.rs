@@ -29,7 +29,7 @@ use brokk_bifrost_python::imports::python_import_infos_from_node;
 use brokk_bifrost_python::syntax::{python_static_attribute_path, python_static_type_path};
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v24";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v26";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -904,7 +904,18 @@ enum Work<'tree> {
         next: EdgeTarget,
         scope: ScopeFrameId,
     },
+    // A statement condition only routes control, preserving the shared arm
+    // targets that scope conditional analysis evidence.
     Condition {
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+    },
+    // A condition evaluated as an expression must also retain the selected
+    // operand value before continuing along its truth edge.
+    ValueCondition {
         node: Node<'tree>,
         entry: ProgramPointId,
         when_true: EdgeTarget,
@@ -947,6 +958,8 @@ struct LoweringContext<'tree, 'targets> {
     constant_index_values: HashMap<u64, ValueId>,
     field_locators: HashMap<Box<str>, SemanticLocator>,
     known_list_bindings: HashSet<Box<str>>,
+    known_sequence_bindings: HashSet<Box<str>>,
+    failing_tuple_mutations: HashSet<SourceSpan>,
     known_instance_bindings: HashMap<Box<str>, Box<str>>,
     known_instance_fields: HashMap<Box<str>, HashSet<Box<str>>>,
     known_binding_available_after: HashMap<Box<str>, usize>,
@@ -1035,6 +1048,8 @@ fn lower_procedure<'tree, 'targets>(
         constant_index_values: HashMap::default(),
         field_locators: HashMap::default(),
         known_list_bindings: HashSet::default(),
+        known_sequence_bindings: HashSet::default(),
+        failing_tuple_mutations: HashSet::default(),
         known_instance_bindings: HashMap::default(),
         known_instance_fields: HashMap::default(),
         known_binding_available_after: HashMap::default(),
@@ -1061,6 +1076,8 @@ fn lower_procedure<'tree, 'targets>(
         instance_field_proofs(prepared, prepared.source(), builtin_proofs.exception);
     let HeapBindingProofs {
         known_lists,
+        known_sequences,
+        failing_tuple_mutations,
         known_instances,
         known_fields,
         available_after,
@@ -1075,6 +1092,8 @@ fn lower_procedure<'tree, 'targets>(
     )
     .expect("an unmetered heap proof cannot stop");
     context.known_list_bindings = known_lists;
+    context.known_sequence_bindings = known_sequences;
+    context.failing_tuple_mutations = failing_tuple_mutations;
     context.known_instance_bindings = known_instances;
     context.known_instance_fields = known_fields;
     context.known_binding_available_after = available_after;
@@ -1175,8 +1194,10 @@ fn lower_procedure<'tree, 'targets>(
 }
 
 struct HeapBindingProofs {
-    closed_lists: HashSet<Box<str>>,
+    closed_sequences: HashSet<Box<str>>,
+    failing_tuple_mutations: HashSet<SourceSpan>,
     known_lists: HashSet<Box<str>>,
+    known_sequences: HashSet<Box<str>>,
     known_instances: HashMap<Box<str>, Box<str>>,
     known_fields: HashMap<Box<str>, HashSet<Box<str>>>,
     available_after: HashMap<Box<str>, usize>,
@@ -1199,9 +1220,16 @@ enum HeapOccurrence {
 }
 
 #[derive(Clone)]
+enum HeapCandidateKind {
+    List,
+    Tuple,
+    Instance(Box<str>),
+}
+
+#[derive(Clone)]
 struct HeapCandidate {
     root: Box<str>,
-    class_name: Option<Box<str>>,
+    kind: HeapCandidateKind,
     available_after: usize,
 }
 
@@ -1210,7 +1238,7 @@ struct HeapOccurrenceContext<'tree, 'source> {
     source: &'source str,
     assignments: &'source HashMap<Box<str>, Vec<(Node<'tree>, usize)>>,
     candidate_names: &'source HashSet<Box<str>>,
-    candidate_classes: &'source HashMap<Box<str>, Option<Box<str>>>,
+    candidate_kinds: &'source HashMap<Box<str>, HeapCandidateKind>,
     proven_instance_fields: &'source HashMap<Box<str>, HashSet<Box<str>>>,
     direct_field_ends: &'source HashMap<Box<str>, HashMap<Box<str>, usize>>,
 }
@@ -1259,17 +1287,23 @@ fn heap_binding_proofs<'tree>(
             continue;
         }
         let (value, available_after) = values[0];
-        let class_name =
-            constructed_local_class(value, source, class_names, proven_instance_fields);
-        if value.kind() == "list" || class_name.is_some() {
-            if value.kind() == "list" && sequence_initializer_is_expanded(value) {
+        let kind = match value.kind() {
+            "list" => Some(HeapCandidateKind::List),
+            "tuple" | "expression_list" => Some(HeapCandidateKind::Tuple),
+            _ => constructed_local_class(value, source, class_names, proven_instance_fields)
+                .map(HeapCandidateKind::Instance),
+        };
+        if let Some(kind) = kind {
+            if matches!(kind, HeapCandidateKind::List | HeapCandidateKind::Tuple)
+                && sequence_initializer_is_expanded(value)
+            {
                 expanded_roots.insert(name.clone());
             }
             candidates.insert(
                 name.clone(),
                 HeapCandidate {
                     root: name.clone(),
-                    class_name,
+                    kind,
                     available_after,
                 },
             );
@@ -1305,7 +1339,7 @@ fn heap_binding_proofs<'tree>(
                 name.clone(),
                 HeapCandidate {
                     root: source_candidate.root.clone(),
-                    class_name: source_candidate.class_name.clone(),
+                    kind: source_candidate.kind.clone(),
                     available_after,
                 },
             );
@@ -1327,9 +1361,9 @@ fn heap_binding_proofs<'tree>(
     // cannot retract the identity of an access that already ran, and it
     // records an escape byte that bounds the accesses that follow it instead.
     let candidate_names: HashSet<Box<str>> = candidates.keys().cloned().collect();
-    let candidate_classes: HashMap<Box<str>, Option<Box<str>>> = candidates
+    let candidate_kinds: HashMap<Box<str>, HeapCandidateKind> = candidates
         .iter()
-        .map(|(name, candidate)| (name.clone(), candidate.class_name.clone()))
+        .map(|(name, candidate)| (name.clone(), candidate.kind.clone()))
         .collect();
     let direct_field_ends = direct_instance_field_ends(body, source, &candidates);
     let occurrence_context = HeapOccurrenceContext {
@@ -1337,12 +1371,14 @@ fn heap_binding_proofs<'tree>(
         source,
         assignments: &assignments,
         candidate_names: &candidate_names,
-        candidate_classes: &candidate_classes,
+        candidate_kinds: &candidate_kinds,
         proven_instance_fields,
         direct_field_ends: &direct_field_ends,
     };
     let mut invalid_roots: HashSet<Box<str>> = HashSet::default();
     let mut deleted_roots = HashSet::default();
+    let mut mutated_tuple_roots = HashSet::default();
+    let mut tuple_mutations = Vec::new();
     let mut root_escapes: HashMap<Box<str>, usize> = HashMap::default();
     let mut occurrences = vec![body];
     while let Some(node) = occurrences.pop() {
@@ -1365,7 +1401,38 @@ fn heap_binding_proofs<'tree>(
                 if !scope_step() {
                     return None;
                 }
+                if matches!(candidate.kind, HeapCandidateKind::Tuple)
+                    && matches!(parent.kind(), "assignment" | "augmented_assignment")
+                    && parent.child_by_field_name("left").is_some_and(|left| {
+                        left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+                    })
+                    && node.parent().is_some_and(|access| {
+                        access.kind() == "subscript" && field_matches(access, "value", node)
+                    })
+                {
+                    let access = node.parent().expect("the mutation has a subscript parent");
+                    mutated_tuple_roots.insert(candidate.root.clone());
+                    if access.start_byte() > candidate.available_after {
+                        tuple_mutations.push((
+                            candidate.root.clone(),
+                            crate::analyzer::semantic::type_flow::source_span_for_node(access),
+                        ));
+                    }
+                }
                 if parent.kind() == "delete_statement" {
+                    if matches!(candidate.kind, HeapCandidateKind::Tuple)
+                        && let Some(access) = node.parent()
+                        && access.kind() == "subscript"
+                        && field_matches(access, "value", node)
+                    {
+                        mutated_tuple_roots.insert(candidate.root.clone());
+                        if access.start_byte() > candidate.available_after {
+                            tuple_mutations.push((
+                                candidate.root.clone(),
+                                crate::analyzer::semantic::type_flow::source_span_for_node(access),
+                            ));
+                        }
+                    }
                     deleted_roots.insert(candidate.root.clone());
                     break;
                 }
@@ -1418,7 +1485,8 @@ fn heap_binding_proofs<'tree>(
     }
 
     let mut known_lists = HashSet::default();
-    let mut closed_lists = HashSet::default();
+    let mut known_sequences = HashSet::default();
+    let mut closed_sequences = HashSet::default();
     let mut known_instances = HashMap::default();
     let mut known_fields = HashMap::default();
     let mut available_after = HashMap::default();
@@ -1433,15 +1501,22 @@ fn heap_binding_proofs<'tree>(
         if let Some(escape) = root_escapes.get(&candidate.root).copied() {
             escapes_after.insert(name.clone(), escape);
         }
-        if candidate.class_name.is_none() {
+        if matches!(
+            candidate.kind,
+            HeapCandidateKind::List | HeapCandidateKind::Tuple
+        ) {
             if !root_escapes.contains_key(&candidate.root)
                 && !expanded_roots.contains(&candidate.root)
                 && !deleted_roots.contains(&candidate.root)
+                && !mutated_tuple_roots.contains(&candidate.root)
             {
-                closed_lists.insert(name.clone());
+                closed_sequences.insert(name.clone());
             }
-            known_lists.insert(name.clone());
-        } else if let Some(class_name) = candidate.class_name {
+            if matches!(candidate.kind, HeapCandidateKind::List) {
+                known_lists.insert(name.clone());
+            }
+            known_sequences.insert(name.clone());
+        } else if let HeapCandidateKind::Instance(class_name) = candidate.kind {
             known_instances.insert(name.clone(), class_name);
             let fields = direct_field_ends
                 .get(&name)
@@ -1456,9 +1531,22 @@ fn heap_binding_proofs<'tree>(
         }
         available_after.insert(name, candidate.available_after);
     }
+    let failing_tuple_mutations = tuple_mutations
+        .into_iter()
+        .filter_map(|(root, span)| {
+            (!invalid_roots.contains(&root)
+                && !expanded_roots.contains(&root)
+                && root_escapes
+                    .get(&root)
+                    .is_none_or(|escape| span.end_byte() as usize <= *escape))
+            .then_some(span)
+        })
+        .collect();
     Some(HeapBindingProofs {
-        closed_lists,
+        closed_sequences,
+        failing_tuple_mutations,
         known_lists,
+        known_sequences,
         known_instances,
         known_fields,
         available_after,
@@ -1472,10 +1560,10 @@ fn sequence_initializer_is_expanded(node: Node<'_>) -> bool {
         .any(|child| matches!(child.kind(), "list_splat" | "parenthesized_list_splat"))
 }
 
-/// Plain local list loads whose full alias closure never escapes. This is
+/// Plain local sequence loads whose full alias closure never escapes. This is
 /// stronger than the source-order proof used to discharge indexing calls:
 /// a later escape can run before this load on a loop's next iteration.
-pub(super) fn closed_list_load_spans(
+pub(super) fn closed_sequence_load_spans(
     callable: Node<'_>,
     source: &str,
     mut scope_step: impl FnMut() -> bool,
@@ -1501,7 +1589,7 @@ pub(super) fn closed_list_load_spans(
             && let Some(value) = node.child_by_field_name("value")
             && value.kind() == "identifier"
             && let Some(name) = node_text(source, value)
-            && proofs.closed_lists.contains(name)
+            && proofs.closed_sequences.contains(name)
             && proofs
                 .available_after
                 .get(name)
@@ -1682,7 +1770,7 @@ fn classify_heap_occurrence<'tree, 'source>(
     let source = context.source;
     let assignments = context.assignments;
     let candidate_names = context.candidate_names;
-    let candidate_classes = context.candidate_classes;
+    let candidate_kinds = context.candidate_kinds;
     let proven_instance_fields = context.proven_instance_fields;
     let direct_field_ends = context.direct_field_ends;
     let Some(name) = node_text(source, node) else {
@@ -1728,7 +1816,7 @@ fn classify_heap_occurrence<'tree, 'source>(
             .child_by_field_name("object")
             .is_some_and(|object| object.id() == node.id())
     {
-        let Some(Some(class_name)) = candidate_classes.get(name) else {
+        let Some(HeapCandidateKind::Instance(class_name)) = candidate_kinds.get(name) else {
             return HeapOccurrence::Unproven;
         };
         let Some(attribute) = parent.child_by_field_name("attribute") else {
@@ -1782,8 +1870,10 @@ fn classify_heap_occurrence<'tree, 'source>(
             .child_by_field_name("value")
             .is_some_and(|value| value.id() == node.id())
     {
-        if candidate_classes.get(name).is_none_or(Option::is_some)
-            || !is_top_level_heap_use(node, body)
+        if !matches!(
+            candidate_kinds.get(name),
+            Some(HeapCandidateKind::List | HeapCandidateKind::Tuple)
+        ) || !is_top_level_heap_use(node, body)
         {
             return HeapOccurrence::Unproven;
         }
@@ -2476,7 +2566,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .is_some_and(|fields| fields.contains(attribute_name)))
     }
 
+    fn proven_tuple_mutation(&self, target: Node<'tree>) -> bool {
+        target.kind() == "subscript"
+            && (target
+                .child_by_field_name("value")
+                .is_some_and(|value| matches!(value.kind(), "tuple" | "expression_list"))
+                || self.failing_tuple_mutations.contains(
+                    &crate::analyzer::semantic::type_flow::source_span_for_node(target),
+                ))
+    }
+
+    fn tuple_mutation_failure(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let exception = self.value(builder, point, SemanticValueKind::Exception)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Throw {
+                value: Some(exception),
+            },
+        )?;
+        self.abrupt_throw(builder, point, scope, exception, stack)
+    }
+
     fn proven_list_index(
+        &self,
+        access: Node<'tree>,
+        value: Node<'tree>,
+        index: Node<'tree>,
+    ) -> bool {
+        node_text(self.prepared.source(), value)
+            .is_some_and(|name| self.known_list_bindings.contains(name))
+            && self.proven_sequence_index_read(access, value, index)
+    }
+
+    fn proven_sequence_index_read(
         &self,
         access: Node<'tree>,
         value: Node<'tree>,
@@ -2485,7 +2614,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(value_name) = node_text(self.prepared.source(), value) else {
             return false;
         };
-        self.known_list_bindings.contains(value_name)
+        self.known_sequence_bindings.contains(value_name)
             && self
                 .known_binding_available_after
                 .get(value_name)
@@ -2613,6 +2742,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 when_false,
                 scope,
             } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
+            Work::ValueCondition {
+                node,
+                entry,
+                when_true,
+                when_false,
+                scope,
+            } => self.value_condition(builder, node, entry, when_true, when_false, scope, stack),
             Work::ComprehensionClause {
                 node,
                 index,
@@ -2624,6 +2760,148 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
     #[allow(clippy::too_many_arguments)]
     fn condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        if let Some(value) = literal_truth_condition(node) {
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            self.session.add_guard_fact(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(GuardArm {
+                    target_point: when_true.point,
+                    kind: when_true.kind,
+                }),
+                (!value).then_some(GuardArm {
+                    target_point: when_false.point,
+                    kind: when_false.kind,
+                }),
+            )?;
+            return Ok(());
+        }
+        match (node.kind(), boolean_operator_kind(node)) {
+            ("boolean_operator", Some("and")) => {
+                let left = required_field(node, "left")?;
+                let right = required_field(node, "right")?;
+                let right_entry = self.point(builder, right, Vec::new())?;
+                stack.push(Work::Condition {
+                    node: right,
+                    entry: right_entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                stack.push(Work::Condition {
+                    node: left,
+                    entry,
+                    when_true: EdgeTarget {
+                        point: right_entry,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                    when_false,
+                    scope,
+                });
+                Ok(())
+            }
+            ("boolean_operator", Some("or")) => {
+                let left = required_field(node, "left")?;
+                let right = required_field(node, "right")?;
+                let right_entry = self.point(builder, right, Vec::new())?;
+                stack.push(Work::Condition {
+                    node: right,
+                    entry: right_entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                stack.push(Work::Condition {
+                    node: left,
+                    entry,
+                    when_true,
+                    when_false: EdgeTarget {
+                        point: right_entry,
+                        kind: ControlEdgeKind::ConditionalFalse,
+                    },
+                    scope,
+                });
+                Ok(())
+            }
+            ("not_operator", _) => {
+                let argument = required_field(node, "argument")?;
+                stack.push(Work::Condition {
+                    node: argument,
+                    entry,
+                    when_true: when_false,
+                    when_false: when_true,
+                    scope,
+                });
+                Ok(())
+            }
+            ("conditional_expression", _) => {
+                let (consequence, condition, alternative) = conditional_expression_parts(node)?;
+                let consequence_entry = self.point(builder, consequence, Vec::new())?;
+                let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                stack.push(Work::Condition {
+                    node: alternative,
+                    entry: alternative_entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                stack.push(Work::Condition {
+                    node: consequence,
+                    entry: consequence_entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                stack.push(Work::Condition {
+                    node: condition,
+                    entry,
+                    when_true: EdgeTarget {
+                        point: consequence_entry,
+                        kind: ControlEdgeKind::ConditionalTrue,
+                    },
+                    when_false: EdgeTarget {
+                        point: alternative_entry,
+                        kind: ControlEdgeKind::ConditionalFalse,
+                    },
+                    scope,
+                });
+                Ok(())
+            }
+            ("comparison_operator", _) => {
+                self.comparison_control(builder, node, entry, when_true, when_false, scope, stack)
+            }
+            ("parenthesized_expression", _) => {
+                let value =
+                    first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                stack.push(Work::Condition {
+                    node: value,
+                    entry,
+                    when_true,
+                    when_false,
+                    scope,
+                });
+                Ok(())
+            }
+            _ => self.atomic_condition(builder, node, entry, when_true, when_false, scope, stack),
+        }
+    }
+
+    // A condition evaluated as part of a value expression retains each
+    // selected operand before continuing along its truth edge.
+    #[allow(clippy::too_many_arguments)]
+    fn value_condition(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
@@ -2664,7 +2942,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_result_continuation(builder, right, result, when_false)?;
                 let left_selected =
                     self.expression_result_continuation(builder, left, result, when_false)?;
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: right,
                     entry: right_entry,
                     when_true: EdgeTarget {
@@ -2677,7 +2955,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                     scope,
                 });
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: left,
                     entry,
                     when_true: EdgeTarget {
@@ -2702,7 +2980,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_result_continuation(builder, right, result, when_false)?;
                 let left_selected =
                     self.expression_result_continuation(builder, left, result, when_true)?;
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: right,
                     entry: right_entry,
                     when_true: EdgeTarget {
@@ -2715,7 +2993,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                     scope,
                 });
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: left,
                     entry,
                     when_true: EdgeTarget {
@@ -2745,7 +3023,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     )?;
                     self.edge(builder, terminal, next)?;
                 }
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: argument,
                     entry,
                     when_true: EdgeTarget {
@@ -2768,7 +3046,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_result_continuation(builder, alternative, result, when_true)?;
                 let alternative_false =
                     self.expression_result_continuation(builder, alternative, result, when_false)?;
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: alternative,
                     entry: alternative_entry,
                     when_true: EdgeTarget {
@@ -2785,7 +3063,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_result_continuation(builder, consequence, result, when_true)?;
                 let consequence_false =
                     self.expression_result_continuation(builder, consequence, result, when_false)?;
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: consequence,
                     entry: consequence_entry,
                     when_true: EdgeTarget {
@@ -2823,7 +3101,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.expression_result_continuation(builder, value, result, when_true)?;
                 let false_result =
                     self.expression_result_continuation(builder, value, result, when_false)?;
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: value,
                     entry,
                     when_true: EdgeTarget {
@@ -2838,50 +3116,62 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 });
                 Ok(())
             }
-            _ => {
-                let decision = self.point(builder, node, Vec::new())?;
-                self.add_gap(
-                    builder,
-                    decision,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Calls,
-                    SemanticGapKind::Unknown,
-                    "truth testing may invoke __bool__ or __len__ and requires runtime refinement",
-                )?;
-                self.add_gap(
-                    builder,
-                    decision,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::ExceptionalControlFlow,
-                    SemanticGapKind::Unsupported,
-                    "truth-test dispatch and conversion failures are not lowered",
-                )?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                let (predicate, subject) = self.normalize_guard(builder, node)?;
-                self.session.add_guard_fact(
-                    builder,
-                    decision,
-                    predicate,
-                    subject,
-                    Some(GuardArm {
-                        target_point: when_true.point,
-                        kind: when_true.kind,
-                    }),
-                    Some(GuardArm {
-                        target_point: when_false.point,
-                        kind: when_false.kind,
-                    }),
-                )?;
-                stack.push(Work::Expression {
-                    node,
-                    entry,
-                    next: EdgeTarget::normal(decision),
-                    scope,
-                });
-                Ok(())
-            }
+            _ => self.atomic_condition(builder, node, entry, when_true, when_false, scope, stack),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn atomic_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        when_true: EdgeTarget,
+        when_false: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let decision = self.point(builder, node, Vec::new())?;
+        self.add_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            "truth testing may invoke __bool__ or __len__ and requires runtime refinement",
+        )?;
+        self.add_gap(
+            builder,
+            decision,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "truth-test dispatch and conversion failures are not lowered",
+        )?;
+        self.edge(builder, decision, when_true)?;
+        self.edge(builder, decision, when_false)?;
+        let (predicate, subject) = self.normalize_guard(builder, node)?;
+        self.session.add_guard_fact(
+            builder,
+            decision,
+            predicate,
+            subject,
+            Some(GuardArm {
+                target_point: when_true.point,
+                kind: when_true.kind,
+            }),
+            Some(GuardArm {
+                target_point: when_false.point,
+                kind: when_false.kind,
+            }),
+        )?;
+        stack.push(Work::Expression {
+            node,
+            entry,
+            next: EdgeTarget::normal(decision),
+            scope,
+        });
+        Ok(())
     }
 
     /// The binding a condition reads when the condition is a walrus assignment.
@@ -3164,8 +3454,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticGapKind::Unsupported,
                     "attribute, item, and name deletion failures are not lowered",
                 )?;
-                let values = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &values, next, scope, stack)
+                let mut pending = runtime_expression_children(node);
+                pending.reverse();
+                let mut previous = entry;
+                while let Some(target) = pending.pop() {
+                    if matches!(
+                        target.kind(),
+                        "tuple" | "list" | "expression_list" | "parenthesized_expression"
+                    ) {
+                        pending.extend(runtime_expression_children(target).into_iter().rev());
+                        continue;
+                    }
+                    let terminal = self.point(builder, target, Vec::new())?;
+                    if self.proven_tuple_mutation(target) {
+                        let runtime = assignment_target_runtime_nodes(target);
+                        self.schedule_expressions(
+                            builder,
+                            previous,
+                            &runtime,
+                            EdgeTarget::normal(terminal),
+                            scope,
+                            stack,
+                        )?;
+                        return self.tuple_mutation_failure(builder, terminal, scope, stack);
+                    }
+                    self.schedule_expressions(
+                        builder,
+                        previous,
+                        &[target],
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        stack,
+                    )?;
+                    previous = terminal;
+                }
+                self.edge(builder, previous, next)
             }
             "import_statement" | "import_from_statement" | "future_import_statement" => {
                 self.add_gap(
@@ -3441,7 +3764,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     ),
                     _ => unreachable!("guarded by boolean operator"),
                 };
-                stack.push(Work::Condition {
+                stack.push(Work::ValueCondition {
                     node: left,
                     entry,
                     when_true,
@@ -3557,7 +3880,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "subscript" => {
                 let value = required_field(node, "value")?;
                 let subscript = required_field(node, "subscript")?;
-                let proven = self.proven_list_index(node, value, subscript);
+                let proven = self.proven_sequence_index_read(node, value, subscript);
                 if !proven {
                     // The same split as the attribute arm above: the abort edge
                     // is a `Point`-subject implicit-exception gap, and the
@@ -3745,11 +4068,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .iter()
                 .all(|binding| is_assignment_target(*binding))
         {
-            let mut completion = boundary;
+            let mut completion = Some(boundary);
             for binding in bindings {
+                let Some(previous) = completion else {
+                    break;
+                };
                 completion = self.append_target_source_assignments(
                     builder,
-                    completion,
+                    previous,
                     node,
                     binding,
                     Some(source_node),
@@ -3758,7 +4084,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )?;
             }
-            if node.kind() == "named_expression" {
+            if node.kind() == "named_expression"
+                && let Some(completion) = completion
+            {
                 let source = self.expression_value(
                     builder,
                     source_node,
@@ -3784,12 +4112,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "Python assignment is missing a structured writable target or value",
             )?;
-            boundary
+            Some(boundary)
         };
         if operation_can_throw_implicitly(node) && !suppresses_implicit_exception {
             self.implicit_exception_gap(builder, boundary, node)?;
         }
-        self.edge(builder, completion, next)?;
+        if let Some(completion) = completion {
+            self.edge(builder, completion, next)?;
+        }
         // The entire RHS executes before unpacking or target evaluation.
         // Its own lowering publishes any call, allocation, or exceptional edge.
         let sources = source_node.into_iter().collect::<Vec<_>>();
@@ -3835,9 +4165,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result =
             self.unknown_target_value(builder, node, PYTHON_UNKNOWN_AUGMENTED_ASSIGNMENT)?;
         let store = self.point(builder, target, Vec::new())?;
-        self.append_target_assignment(builder, store, node, target, result)?;
+        if self.proven_tuple_mutation(target) {
+            self.tuple_mutation_failure(builder, store, scope, stack)?;
+        } else {
+            self.append_target_assignment(builder, store, node, target, result)?;
+            self.edge(builder, store, next)?;
+        }
         self.edge(builder, operation, EdgeTarget::normal(store))?;
-        self.edge(builder, store, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -3882,7 +4216,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         unknown_kind: &str,
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
-    ) -> Result<ProgramPointId, PythonLoweringError> {
+    ) -> Result<Option<ProgramPointId>, PythonLoweringError> {
         let steps = assignment_target_steps(target, source);
         if steps.is_empty()
             || !steps
@@ -3897,7 +4231,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "Python assignment target has no structured writable leaves",
             )?;
-            return Ok(point);
+            return Ok(Some(point));
         }
         let mut previous = point;
         for step in steps {
@@ -3912,6 +4246,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 AssignmentTargetStep::Leaf { target, source } => {
                     let target_point = self.point(builder, target, Vec::new())?;
+                    if self.proven_tuple_mutation(target) {
+                        let runtime = assignment_target_runtime_nodes(target);
+                        self.schedule_expressions(
+                            builder,
+                            previous,
+                            &runtime,
+                            EdgeTarget::normal(target_point),
+                            scope,
+                            stack,
+                        )?;
+                        self.tuple_mutation_failure(builder, target_point, scope, stack)?;
+                        return Ok(None);
+                    }
                     let value = match source {
                         Some(source) => {
                             self.expression_value(builder, source, expression_value_kind(source))?
@@ -3953,7 +4300,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
             }
         }
-        Ok(previous)
+        Ok(Some(previous))
     }
 
     fn unknown_target_value(
@@ -4687,7 +5034,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack,
             )?;
             let following = self.point(builder, following_node, Vec::new())?;
-            self.edge(builder, completion, EdgeTarget::normal(following))?;
+            if let Some(completion) = completion {
+                self.edge(builder, completion, EdgeTarget::normal(following))?;
+            }
             stack.push(Work::ComprehensionClause {
                 node,
                 index: index + 1,
@@ -4996,7 +5345,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 kind: ControlEdgeKind::ConditionalFalse,
             },
         )?;
-        self.edge(builder, binding_completion, EdgeTarget::normal(body_entry))?;
+        if let Some(binding_completion) = binding_completion {
+            self.edge(builder, binding_completion, EdgeTarget::normal(body_entry))?;
+        }
         if let (Some(alternative), Some(alternative_entry)) = (alternative, alternative_entry) {
             stack.push(Work::Statement {
                 node: alternative,
@@ -7873,10 +8224,109 @@ def run():
         ] {
             let tree = parse(source);
             let callable = first_node_of_kind(&tree, "function_definition");
-            let spans = closed_list_load_spans(callable, source, || true).unwrap();
+            let spans = closed_sequence_load_spans(callable, source, || true).unwrap();
             assert_eq!(!spans.is_empty(), closed, "{source}: {spans:?}");
-            assert!(closed_list_load_spans(callable, source, || false).is_none());
+            assert!(closed_sequence_load_spans(callable, source, || false).is_none());
         }
+    }
+
+    #[test]
+    fn closed_tuple_load_proofs_preserve_immutable_boundaries() {
+        for (source, closed) in [
+            (
+                "def run():\n    values = (1, 2)\n    return values[0]\n",
+                true,
+            ),
+            (
+                "def run():\n    values = (1, 2)\n    alias = values\n    return alias[0]\n",
+                true,
+            ),
+            (
+                "def run():\n    values = (*(1,), 2)\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run():\n    values = (1, 2)\n    values[0] = 3\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run():\n    values = (1, 2)\n    del values[0]\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run():\n    values = (1, 2)\n    values[0] += 3\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run():\n    values = CustomTuple((1, 2))\n    return values[0]\n",
+                false,
+            ),
+            ("def run(values):\n    return values[0]\n", false),
+        ] {
+            let tree = parse(source);
+            let callable = first_node_of_kind(&tree, "function_definition");
+            let spans = closed_sequence_load_spans(callable, source, || true).unwrap();
+            assert_eq!(!spans.is_empty(), closed, "{source}: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn tuple_mutation_evaluates_operands_in_order_and_stops_later_targets() {
+        let source = "def check():\n    (left(),)[index()] = holder().value = rhs()\n    after()\n";
+        let parts = lower_fixture_named(source, Some("check"));
+        let mut current = parts
+            .points
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Entry))
+            })
+            .expect("entry")
+            .id;
+        let mut visited = HashSet::default();
+        let mut calls = Vec::new();
+        let mut threw = false;
+        loop {
+            assert!(
+                visited.insert(current),
+                "straight-line fixture must not cycle"
+            );
+            let point = &parts.points[current.index()];
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Invoke { call_site } => {
+                        let call = &parts.call_sites[call_site.index()];
+                        let span = parts.source_mappings[call.source.index()]
+                            .locator
+                            .anchor()
+                            .span();
+                        calls.push(&source[span.start_byte() as usize..span.end_byte() as usize]);
+                    }
+                    SemanticEffect::Throw { .. } => {
+                        threw = true;
+                        assert!(!point.events.iter().any(|event| matches!(
+                            event.effect,
+                            SemanticEffect::MemoryStore { .. }
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            let successors = parts
+                .control_edges
+                .iter()
+                .filter(|edge| edge.source_point == current && edge.kind == ControlEdgeKind::Normal)
+                .collect::<Vec<_>>();
+            match successors.as_slice() {
+                [] => break,
+                [edge] => current = edge.target_point,
+                _ => panic!("fixture has one normal continuation: {successors:?}"),
+            }
+        }
+        assert!(threw, "the tuple store must abort");
+        assert_eq!(calls, ["rhs()", "left()", "index()"]);
     }
 
     #[test]

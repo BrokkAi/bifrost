@@ -198,7 +198,10 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// selectors for runtime-global reads. Revision 23 adds saved definition-time
 /// default argument values, selected
 /// by conditional call bindings rather than executed in the callee body.
-/// Revision 20 replaces the fieldless aggregate-copy value-flow marker with
+/// Revision 30 adds the value-carrier adaptation transfer operation, which
+/// binds a transfer to the exact declaration/member/boundary witness a
+/// language adapter proved for a declared value type whose runtime carrier
+/// differs from it. Revision 20 replaces the fieldless aggregate-copy value-flow marker with
 /// the identity-separating transfer vocabulary (copy, aggregate copy, move
 /// with invalidation, conversion with value preservation, boxing, unboxing,
 /// each with an exact selected-operation binding). Revision 19 added
@@ -212,7 +215,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 29;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 30;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1345,10 +1348,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "5dffe6ed03be90fb7a11e3c55c74b130a0f2d338d64fceab62e7fd6afc197dc3"
+            "6bdf1b527a53793b2724873874acc42b05ed8cc54eca2242d4123063379d2b64"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 29);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 30);
     }
 
     fn digest(label: &str) -> StableDigest {

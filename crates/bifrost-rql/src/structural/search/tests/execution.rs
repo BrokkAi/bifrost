@@ -6952,6 +6952,102 @@ func summarizedMixedAtomic() {
     go func() { atomic.StoreInt64(&value, 1) }()
     go func() { _ = value }()
 }
+func recursiveAtomicWrite(value *int64, depth int) {
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWrite(value, depth-1) }
+}
+func parameterAtomicWrite(value *int64) { atomic.StoreInt64(value, 1) }
+func summarizedParameterAtomic() {
+    var value int64
+    go parameterAtomicWrite(&value)
+    _ = atomic.LoadInt64(&value)
+}
+func summarizedDistinctParameterAtomic() {
+    var first int64
+    var second int64
+    go parameterAtomicWrite(&first)
+    _ = atomic.LoadInt64(&second)
+}
+func summarizedCopiedParameterAtomic() {
+    var first int64
+    second := first
+    go parameterAtomicWrite(&first)
+    _ = atomic.LoadInt64(&second)
+}
+func replaceParameterPointer(value **int64) { *value = new(int64) }
+func summarizedPointerCellAtomic() {
+    var value int64
+    pointer := &value
+    go replaceParameterPointer(&pointer)
+    _ = atomic.LoadInt64(&value)
+}
+func summarizedAddressMutex() {
+    var lock sync.Mutex
+    value := 0
+    go func() {
+        (&lock).Lock()
+        value = 1
+        (&lock).Unlock()
+    }()
+    (&lock).Lock()
+    _ = value
+    (&lock).Unlock()
+}
+func summarizedDistinctAddressMutex() {
+    var first sync.Mutex
+    var second sync.Mutex
+    value := 0
+    go func() {
+        (&first).Lock()
+        value = 1
+        (&first).Unlock()
+    }()
+    (&second).Lock()
+    _ = value
+    (&second).Unlock()
+}
+func summarizedCopiedAddressMutex() {
+    var first sync.Mutex
+    second := first
+    value := 0
+    go func() {
+        (&first).Lock()
+        value = 1
+        (&first).Unlock()
+    }()
+    (&second).Lock()
+    _ = value
+    (&second).Unlock()
+}
+func summarizedRecursiveAtomic() {
+    var value int64
+    go recursiveAtomicWrite(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+func summarizedRecursiveMixedAtomic() {
+    var value int64
+    go recursiveAtomicWrite(&value, 3)
+    _ = value
+}
+func recursiveChangingAtomic(value *int64, depth int) {
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveChangingAtomic(new(int64), depth-1) }
+}
+func summarizedRecursiveChangingAtomic() {
+    var value int64
+    go recursiveChangingAtomic(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+func recursiveUnknownAtomic(value *int64, depth int) {
+    atomic.StoreInt64(value, 1)
+    unknownAtomicBoundary()
+    if depth > 0 { recursiveUnknownAtomic(value, depth-1) }
+}
+func summarizedRecursiveUnknownAtomic() {
+    var value int64
+    go recursiveUnknownAtomic(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
 func summarizedDistinctAtomic() {
     var first int64
     var second int64
@@ -7422,6 +7518,226 @@ func unsupportedOnce() int {
             &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
         )
         .expect("atomic wrappers project");
+    let recursive_root = procedure("summarizedRecursiveAtomic");
+    let mut address_mutex_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let address_mutex_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &procedure("summarizedAddressMutex"),
+        &mut crate::analyzer::semantic::SemanticRequest::new(
+            &mut address_mutex_budget,
+            &cancellation,
+        ),
+    )
+    .expect("addressed mutex receiver report computes");
+    assert!(
+        address_mutex_report.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::CompatibleLock
+        }),
+        "addressed mutex receivers must name one lock: {address_mutex_report:#?}"
+    );
+    for name in [
+        "summarizedDistinctAddressMutex",
+        "summarizedCopiedAddressMutex",
+    ] {
+        let mut control_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &direct_provider,
+            &procedure(name),
+            &mut crate::analyzer::semantic::SemanticRequest::new(
+                &mut control_budget,
+                &cancellation,
+            ),
+        )
+        .expect("distinct addressed locks report computes");
+        assert!(
+            report.conflicts.iter().any(|conflict| {
+                conflict.proven
+                    && conflict.exhaustive
+                    && conflict.ordering
+                        == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                    && conflict.protection
+                        == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+            }),
+            "different lock cells cannot protect the shared value in {name}: {report:#?}"
+        );
+    }
+    for name in [
+        "summarizedDistinctParameterAtomic",
+        "summarizedCopiedParameterAtomic",
+        "summarizedPointerCellAtomic",
+    ] {
+        let mut control_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let control_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &direct_provider,
+            &procedure(name),
+            &mut crate::analyzer::semantic::SemanticRequest::new(
+                &mut control_budget,
+                &cancellation,
+            ),
+        )
+        .expect("distinct scalar address control computes");
+        // Exposing a cell also exposes its initialization before the spawn.
+        // Those ordered pairs are real; the two distinct atomic operands
+        // must never produce an atomic-only pair or an unordered conflict.
+        assert!(
+            control_report.conflicts.iter().all(|conflict| {
+                conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+                    && conflict.protection
+                        != brokk_bifrost_flow::concurrency::ConcurrentProtection::AtomicOnly
+            }),
+            "distinct scalar storage must not alias in {name}: {control_report:#?}"
+        );
+    }
+    let parameter_root = procedure("summarizedParameterAtomic");
+    let mut parameter_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let parameter_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &direct_provider,
+        &parameter_root,
+        &mut crate::analyzer::semantic::SemanticRequest::new(&mut parameter_budget, &cancellation),
+    )
+    .expect("nonrecursive pointer atomic report computes");
+    assert!(
+        parameter_report
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.proven
+                && conflict.exhaustive
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::AtomicOnly),
+        "nonrecursive pointer parameter must preserve the atomic location: {parameter_report:#?}"
+    );
+    let recursive_summaries =
+        brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&recursive_root),
+            &icfg,
+            &direct_provider,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("recursive atomic summaries project");
+    let recursive_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(recursive_summaries.clone()),
+    );
+    let mut recursive_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let recursive_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &recursive_provider,
+        &recursive_root,
+        &mut crate::analyzer::semantic::SemanticRequest::new(&mut recursive_budget, &cancellation),
+    )
+    .expect("recursive atomic report computes");
+    assert!(
+        !recursive_report
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::RecursiveExpansion),
+        "invariant recursive atomic effects must reach a complete fixed point: {recursive_report:#?}"
+    );
+    assert!(
+        recursive_report
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.proven
+                && conflict.exhaustive
+                && conflict.protection
+                    == brokk_bifrost_flow::concurrency::ConcurrentProtection::AtomicOnly),
+        "the complete recursive write/read pair is atomic-only: {recursive_report:#?}"
+    );
+    let recursive_repository =
+        brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new();
+    recursive_repository
+        .publish_components(
+            recursive_summaries.summaries(),
+            recursive_summaries.components(),
+        )
+        .expect("recursive atomic component publishes");
+    let retained =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&recursive_root),
+            &icfg,
+            &direct_provider,
+            &recursive_repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("recursive atomic component reacquires");
+    assert_eq!(
+        retained.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained
+    );
+    let retained_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot.clone()),
+        Some(retained.into_summaries()),
+    );
+    let mut retained_budget = crate::analyzer::semantic::SemanticBudget::default();
+    let retained_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &retained_provider,
+        &recursive_root,
+        &mut crate::analyzer::semantic::SemanticRequest::new(&mut retained_budget, &cancellation),
+    )
+    .expect("retained recursive atomic report computes");
+    assert_eq!(
+        retained_report, recursive_report,
+        "retained recursive inventories preserve the full report"
+    );
+    for (name, expected_protection) in [
+        (
+            "summarizedRecursiveMixedAtomic",
+            Some(brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected),
+        ),
+        ("summarizedRecursiveChangingAtomic", None),
+        ("summarizedRecursiveUnknownAtomic", None),
+    ] {
+        let root = procedure(name);
+        let summaries =
+            brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+                std::slice::from_ref(&root),
+                &icfg,
+                &direct_provider,
+                &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("recursive atomic control projects");
+        let provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+            &workspace,
+            Some(snapshot.clone()),
+            Some(summaries),
+        );
+        let mut control_budget = crate::analyzer::semantic::SemanticBudget::default();
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            &provider,
+            &root,
+            &mut crate::analyzer::semantic::SemanticRequest::new(
+                &mut control_budget,
+                &cancellation,
+            ),
+        )
+        .expect("recursive atomic control computes");
+        if let Some(protection) = expected_protection {
+            assert!(
+                !report.reasons.contains(
+                    &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::RecursiveExpansion
+                ) && report.conflicts.iter().any(|conflict| {
+                    conflict.proven
+                        && conflict.exhaustive
+                        && conflict.ordering
+                            == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                        && conflict.protection == protection
+                }),
+                "atomic recursion does not protect an ordinary read in {name}: {report:#?}"
+            );
+        } else {
+            assert!(
+                report.reasons.contains(
+                    &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::RecursiveExpansion
+                ) && report.conflicts.iter().all(|conflict| !conflict.exhaustive),
+                "changing objects or unresolved calls cannot use an invariant certificate in {name}: {report:#?}"
+            );
+        }
+    }
     let atomic_count = summaries.summaries().iter().flat_map(|summary| summary.effects())
         .filter(|effect| matches!(effect.key(),
             brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)

@@ -2881,18 +2881,11 @@ impl<'de> Deserialize<'de> for TypestateViolationEvidence {
 }
 
 fn endpoint_phase_label(value: EndpointObservationPhase) -> &'static str {
-    match value {
-        EndpointObservationPhase::AtMatch => "at_match",
-        EndpointObservationPhase::BeforeCall => "before_call",
-        EndpointObservationPhase::AfterNormalReturn => "after_normal_return",
-        EndpointObservationPhase::AfterExceptionalReturn => "after_exceptional_return",
-    }
+    value.label()
 }
 
 fn typestate_exit_scope_label(value: TypestateExitScope) -> &'static str {
-    match value {
-        TypestateExitScope::AnalysisRoot => "analysis_root",
-    }
+    value.label()
 }
 
 #[cfg(test)]

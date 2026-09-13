@@ -2730,6 +2730,9 @@ pub fn parse_tree_for_language(
     if language == Language::CSharp {
         return brokk_bifrost_csharp::preprocessor::parse_csharp(source);
     }
+    if language == Language::Go {
+        return brokk_bifrost_go::parse::parse_go(source);
+    }
     let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;

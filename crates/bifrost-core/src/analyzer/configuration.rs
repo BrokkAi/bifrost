@@ -121,7 +121,6 @@ impl ConfigurationSourceRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigurationModelError {
     InvalidRange { start_byte: usize, end_byte: usize },
-    InvalidRouteSegment,
     InvalidFactArena,
     InvalidIdentifier { kind: &'static str },
     InvalidPrecedenceEdge,
@@ -141,9 +140,6 @@ impl fmt::Display for ConfigurationModelError {
                 formatter,
                 "invalid configuration source range {start_byte}..{end_byte}"
             ),
-            Self::InvalidRouteSegment => {
-                write!(formatter, "invalid configuration route segment")
-            }
             Self::InvalidFactArena => {
                 write!(formatter, "invalid configuration fact arena")
             }
@@ -177,29 +173,35 @@ pub struct ConfigurationRouteSegment {
 }
 
 impl ConfigurationRouteSegment {
+    /// An authored key segment.
+    ///
+    /// The authored name may be empty: JSON, Java `.properties`, and TOML all
+    /// admit an empty key, and the length-delimited identity hash keeps such a
+    /// segment distinct from its siblings. Occurrences are one-based, so a
+    /// zero occurrence is a caller defect rather than a document state.
     pub fn key(
         name: impl Into<String>,
         occurrence: usize,
         evidence: ConfigurationSourceRange,
-    ) -> Result<Self, ConfigurationModelError> {
-        let name = name.into();
-        if name.is_empty() || occurrence == 0 {
-            return Err(ConfigurationModelError::InvalidRouteSegment);
-        }
-        Ok(Self {
-            selector: ConfigurationRouteSelector::Key { name, occurrence },
+    ) -> Self {
+        assert!(
+            occurrence > 0,
+            "configuration route key occurrences are one-based"
+        );
+        Self {
+            selector: ConfigurationRouteSelector::Key {
+                name: name.into(),
+                occurrence,
+            },
             evidence,
-        })
+        }
     }
 
-    pub fn index(
-        index: usize,
-        evidence: ConfigurationSourceRange,
-    ) -> Result<Self, ConfigurationModelError> {
-        Ok(Self {
+    pub fn index(index: usize, evidence: ConfigurationSourceRange) -> Self {
+        Self {
             selector: ConfigurationRouteSelector::Index(index),
             evidence,
-        })
+        }
     }
 
     pub const fn selector(&self) -> &ConfigurationRouteSelector {
@@ -374,15 +376,13 @@ pub struct ConfigurationKey {
 }
 
 impl ConfigurationKey {
-    pub fn new(
-        text: impl Into<String>,
-        evidence: ConfigurationSourceRange,
-    ) -> Result<Self, ConfigurationModelError> {
-        let text = text.into();
-        if text.is_empty() {
-            return Err(ConfigurationModelError::InvalidRouteSegment);
+    /// An authored member key. The text may be empty because `{"": 0}` and
+    /// `=value` are authored keys, not defects.
+    pub fn new(text: impl Into<String>, evidence: ConfigurationSourceRange) -> Self {
+        Self {
+            text: text.into(),
+            evidence,
         }
-        Ok(Self { text, evidence })
     }
 
     pub fn text(&self) -> &str {
@@ -1599,9 +1599,11 @@ mod tests {
 
     #[test]
     fn stable_ids_ignore_unrelated_siblings_and_ranges() {
-        let route = ConfigurationRoute::root().child(
-            ConfigurationRouteSegment::key("timeout", 1, range(10, 17)).expect("valid key segment"),
-        );
+        let route = ConfigurationRoute::root().child(ConfigurationRouteSegment::key(
+            "timeout",
+            1,
+            range(10, 17),
+        ));
         let member = |value_range: ConfigurationSourceRange| {
             ConfigurationFact::new(
                 None,
@@ -1609,7 +1611,7 @@ mod tests {
                 value_range,
                 ConfigurationNodeKind::Member {
                     role: ConfigurationMemberRole::ObjectMember,
-                    key: ConfigurationKey::new("timeout", range(10, 17)).expect("valid key"),
+                    key: ConfigurationKey::new("timeout", range(10, 17)),
                     value: None,
                 },
             )
@@ -1625,15 +1627,16 @@ mod tests {
     #[test]
     fn duplicate_occurrences_are_distinct_but_ordered() {
         let make_id = |occurrence: usize| {
-            let route = ConfigurationRoute::root().child(
-                ConfigurationRouteSegment::key("name", occurrence, range(0, 4))
-                    .expect("valid duplicate segment"),
-            );
+            let route = ConfigurationRoute::root().child(ConfigurationRouteSegment::key(
+                "name",
+                occurrence,
+                range(0, 4),
+            ));
             ConfigurationStableId::new(
                 ConfigurationFormat::Json,
                 &ConfigurationNodeKind::Member {
                     role: ConfigurationMemberRole::ObjectMember,
-                    key: ConfigurationKey::new("name", range(0, 4)).expect("valid key"),
+                    key: ConfigurationKey::new("name", range(0, 4)),
                     value: None,
                 },
                 &route,
@@ -1709,10 +1712,25 @@ mod tests {
                 end_byte: 1
             })
         );
-        assert_eq!(
-            ConfigurationRouteSegment::key("", 1, range(0, 1)),
-            Err(ConfigurationModelError::InvalidRouteSegment)
-        );
+        // An empty authored key is a document state, not a defect: it stays
+        // distinct from a sibling because the identity hash is length
+        // delimited.
+        let empty_key =
+            ConfigurationRoute::root().child(ConfigurationRouteSegment::key("", 1, range(0, 2)));
+        let short_key =
+            ConfigurationRoute::root().child(ConfigurationRouteSegment::key("a", 1, range(0, 3)));
+        let member = |route: &ConfigurationRoute, text: &str| {
+            ConfigurationStableId::new(
+                ConfigurationFormat::Json,
+                &ConfigurationNodeKind::Member {
+                    role: ConfigurationMemberRole::ObjectMember,
+                    key: ConfigurationKey::new(text, range(0, 2)),
+                    value: None,
+                },
+                route,
+            )
+        };
+        assert_ne!(member(&empty_key, ""), member(&short_key, "a"));
         let document = ConfigurationDocumentFacts::new(
             ConfigurationFormat::Json,
             Vec::new(),
@@ -1727,8 +1745,8 @@ mod tests {
                 .map(|segment| segment.selector()),
             None
         );
-        let route = ConfigurationRoute::root()
-            .child(ConfigurationRouteSegment::key("x", 1, range(0, 1)).expect("valid segment"));
+        let route =
+            ConfigurationRoute::root().child(ConfigurationRouteSegment::key("x", 1, range(0, 1)));
         assert_eq!(
             route.segments()[0].selector(),
             &ConfigurationRouteSelector::Key {
@@ -1837,13 +1855,21 @@ mod tests {
 
     #[test]
     fn effective_key_ignores_authored_ranges_but_not_structural_selectors() {
-        let authored_route = ConfigurationRoute::root()
-            .child(ConfigurationRouteSegment::key("port", 1, range(1, 5)).expect("authored key"));
-        let deployment_route = ConfigurationRoute::root().child(
-            ConfigurationRouteSegment::key("port", 1, range(40, 44)).expect("deployment key"),
-        );
-        let other_route = ConfigurationRoute::root()
-            .child(ConfigurationRouteSegment::key("host", 1, range(40, 44)).expect("other key"));
+        let authored_route = ConfigurationRoute::root().child(ConfigurationRouteSegment::key(
+            "port",
+            1,
+            range(1, 5),
+        ));
+        let deployment_route = ConfigurationRoute::root().child(ConfigurationRouteSegment::key(
+            "port",
+            1,
+            range(40, 44),
+        ));
+        let other_route = ConfigurationRoute::root().child(ConfigurationRouteSegment::key(
+            "host",
+            1,
+            range(40, 44),
+        ));
         assert_eq!(
             ConfigurationResolutionKey::from_route(&authored_route),
             ConfigurationResolutionKey::from_route(&deployment_route)

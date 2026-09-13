@@ -451,7 +451,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = Command::new(mcp_server_binary())
+    let mut command = Command::new(mcp_server_binary());
+    apply_test_request_budget(&mut command);
+    let mut child = command
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--mcp")
@@ -722,7 +724,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     );
     let report = test_assertion_smells["result"]["structuredContent"]["report"]
         .as_str()
-        .expect("report string");
+        .unwrap_or_else(|| panic!("report string: {test_assertion_smells}"));
     assert!(report.starts_with("## Test assertion smells"), "{report}");
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");

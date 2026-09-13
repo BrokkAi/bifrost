@@ -2014,9 +2014,37 @@ pub enum PolicySemanticEvent {
     SuspensionBoundary { scope: TypestateExitScope },
 }
 
+impl PolicySemanticEvent {
+    /// The stable snake_case tag, byte-identical to the canonical projection.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NormalProcedureExit { .. } => "normal_procedure_exit",
+            Self::ExceptionalProcedureExit { .. } => "exceptional_procedure_exit",
+            Self::SuspensionBoundary { .. } => "suspension_boundary",
+        }
+    }
+
+    pub const fn scope(self) -> TypestateExitScope {
+        match self {
+            Self::NormalProcedureExit { scope }
+            | Self::ExceptionalProcedureExit { scope }
+            | Self::SuspensionBoundary { scope } => scope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypestateExitScope {
     AnalysisRoot,
+}
+
+impl TypestateExitScope {
+    /// The stable snake_case tag, byte-identical to the canonical projection.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AnalysisRoot => "analysis_root",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2053,6 +2081,18 @@ pub enum EndpointObservationPhase {
     BeforeCall,
     AfterNormalReturn,
     AfterExceptionalReturn,
+}
+
+impl EndpointObservationPhase {
+    /// The stable snake_case tag, byte-identical to the canonical projection.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AtMatch => "at_match",
+            Self::BeforeCall => "before_call",
+            Self::AfterNormalReturn => "after_normal_return",
+            Self::AfterExceptionalReturn => "after_exceptional_return",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

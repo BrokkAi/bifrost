@@ -19,7 +19,6 @@
 use super::*;
 use crate::declarations::determine_go_package_name;
 use std::sync::Arc;
-use tree_sitter::Parser;
 
 /// One Go file the oracle read and parsed itself.
 struct ParsedGoFile {
@@ -126,15 +125,7 @@ impl OracleBuilder<'_> {
                 self.all_files_parsed = false;
                 continue;
             };
-            let mut parser = Parser::new();
-            if parser
-                .set_language(&tree_sitter_go::LANGUAGE.into())
-                .is_err()
-            {
-                self.all_files_parsed = false;
-                continue;
-            }
-            let Some(tree) = parser.parse(source.as_str(), None) else {
+            let Some(tree) = crate::parse::parse_go(source.as_str()) else {
                 self.all_files_parsed = false;
                 continue;
             };

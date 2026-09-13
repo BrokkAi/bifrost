@@ -25,6 +25,7 @@ pub mod graph;
 pub mod hierarchy;
 pub mod imports;
 pub mod packages;
+pub mod parse;
 pub mod queries;
 pub mod structural;
 pub mod test_detection;

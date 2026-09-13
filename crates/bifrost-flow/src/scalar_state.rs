@@ -7,8 +7,9 @@
 #[cfg(test)]
 use crate::analyzer::semantic::MoveInvalidation;
 use crate::analyzer::semantic::{
-    CallSiteId, ControlEdgeId, GuardPredicate, IntegerComparison, ProcedureHandle, ProcedureId,
-    ProgramPointId, SemanticEffect, SemanticGapImpact, SemanticGapSubject, SemanticValueKind,
+    CallSiteId, CaptureSource, ControlEdgeId, GuardPredicate, IntegerComparison,
+    MemoryLocationKind, ProcedureHandle, ProcedureId, ProgramPointId, SemanticCapability,
+    SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticValueKind,
     TransferKind, TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
@@ -417,6 +418,7 @@ impl ScalarStateDerivation {
         let semantics = procedure.semantics();
         let value_count = semantics.values().len();
         let point_count = semantics.points().len();
+        let closed_cells = closed_scalar_cells(procedure, call_effects.modeled_address_calls);
         let mut states = vec![None::<Box<[ScalarFact]>>; point_count];
         let mut incoming = vec![None::<Box<[ScalarFact]>>; point_count];
         let mut entry = vec![ScalarFact::Unreachable; value_count];
@@ -464,6 +466,7 @@ impl ScalarStateDerivation {
                 point,
                 &mut state,
                 call_effects.modeled_address_calls,
+                &closed_cells,
             );
             if states[point.index()].as_ref() == Some(&state) {
                 continue;
@@ -572,11 +575,49 @@ fn guards_by_edge(procedure: &ProcedureHandle) -> HashMap<ControlEdgeId, Vec<Edg
     result
 }
 
+/// Local cells can reuse the binding lattice only while their payload has no
+/// writer outside this procedure's explicit assignments and stores. The check
+/// is procedure-wide: an escape keeps the cell open even before publication.
+fn closed_scalar_cells(
+    procedure: &ProcedureHandle,
+    modeled_address_calls: &[CallSiteId],
+) -> HashSet<ValueId> {
+    let semantics = procedure.semantics();
+    if semantics.gaps().iter().any(|gap| {
+        (gap.impacts.contains(SemanticGapImpact::HeapWrite)
+            && gap.discharge != SemanticGapDischarge::NonRejoiningExceptionalExit)
+            || gap.capability == SemanticCapability::Captures
+    }) {
+        return HashSet::default();
+    }
+    semantics
+        .memory_locations()
+        .iter()
+        .filter_map(|location| {
+            let MemoryLocationKind::LexicalCell { binding } = location.kind else {
+                return None;
+            };
+            if semantics.captures().iter().any(|capture| {
+            matches!(capture.captured, CaptureSource::Location(captured) if captured == location.id)
+                || matches!(capture.captured, CaptureSource::Value(value) if value == binding)
+        }) {
+            return None;
+        }
+            let aliases =
+                crate::flow_state::address_alias_values(semantics, &HashSet::from_iter([binding]));
+            crate::flow_state::address_escape_points(semantics, &aliases, modeled_address_calls)
+                .is_empty()
+                .then_some(binding)
+        })
+        .collect()
+}
+
 fn transfer_point(
     procedure: &ProcedureHandle,
     point: ProgramPointId,
     state: &mut [ScalarFact],
     modeled_address_calls: &[CallSiteId],
+    closed_cells: &HashSet<ValueId>,
 ) {
     let semantics = procedure.semantics();
     let point = semantics
@@ -648,11 +689,36 @@ fn transfer_point(
                 target,
                 ..
             }
-            | SemanticEffect::MemoryLoad { result: target, .. }
             | SemanticEffect::AsyncResume {
                 result: Some(target),
                 ..
             } => state[target.index()] = ScalarFact::Unknown,
+            SemanticEffect::MemoryLoad {
+                location, result, ..
+            } => {
+                state[result.index()] = match semantics
+                    .memory_location(location)
+                    .map(|location| &location.kind)
+                {
+                    Some(MemoryLocationKind::LexicalCell { binding })
+                        if closed_cells.contains(binding) =>
+                    {
+                        fact_of(semantics, state, *binding)
+                    }
+                    _ => ScalarFact::Unknown,
+                };
+            }
+            SemanticEffect::MemoryStore {
+                location, value, ..
+            } => {
+                if let Some(MemoryLocationKind::LexicalCell { binding }) = semantics
+                    .memory_location(location)
+                    .map(|location| &location.kind)
+                    && closed_cells.contains(binding)
+                {
+                    state[binding.index()] = fact_of(semantics, state, value);
+                }
+            }
             SemanticEffect::Allocation { allocation } => {
                 let allocation = semantics
                     .allocation(allocation)
@@ -694,7 +760,6 @@ fn transfer_point(
             | SemanticEffect::NormalExit
             | SemanticEffect::ExceptionalExit
             | SemanticEffect::ValueUse { .. }
-            | SemanticEffect::MemoryStore { .. }
             | SemanticEffect::AggregateInitializer { .. }
             | SemanticEffect::CaptureBind { .. }
             | SemanticEffect::Synchronization { .. }
@@ -1026,6 +1091,10 @@ mod tests {
 
         fn field_base_facts(&self) -> Vec<ScalarFact> {
             let derivation = ScalarStateDerivation::derive(&self.procedure);
+            self.field_base_facts_from(&derivation)
+        }
+
+        fn field_base_facts_from(&self, derivation: &ScalarStateDerivation) -> Vec<ScalarFact> {
             let semantics = self.procedure.semantics();
             semantics
                 .points()
@@ -1604,5 +1673,57 @@ func run() int {
             })
             .collect::<Vec<_>>();
         assert_eq!(facts, vec![ScalarFact::NonNil], "{semantics:#?}");
+    }
+
+    #[test]
+    fn modeled_address_calls_do_not_close_published_or_indirectly_mutated_cells() {
+        for body in [
+            "mutate(&value); out <- &value",
+            "mutate(&value); go func() { value = nil }()",
+            "alias := &value; mutate(&value); *alias = nil",
+            "alias := &value; mutate(&value); unknown(alias)",
+        ] {
+            let fixture = Fixture::go(
+                &format!(
+                    r#"package sample
+type item struct {{ field int }}
+func mutate(value **item) {{}}
+func run(out chan **item) int {{
+    value := &item{{}}
+    {body}
+    return value.field
+}}
+"#
+                ),
+                "run",
+            );
+            let semantics = fixture.procedure.semantics();
+            let modeled_calls = semantics
+                .call_sites()
+                .iter()
+                .filter(|call| {
+                    call.arguments.iter().any(|argument| {
+                        semantics
+                            .value(argument.value)
+                            .is_some_and(|value| value.kind == SemanticValueKind::Address)
+                    })
+                })
+                .map(|call| call.id)
+                .collect::<Vec<_>>();
+            assert_eq!(modeled_calls.len(), 1, "{body}: {semantics:#?}");
+            let derivation = ScalarStateDerivation::derive_with_call_effects(
+                &fixture.procedure,
+                ScalarCallEffects {
+                    modeled_address_calls: &modeled_calls,
+                    edge_writes: &[],
+                    infeasible_edges: &[],
+                },
+            );
+            assert_eq!(
+                fixture.field_base_facts_from(&derivation),
+                vec![ScalarFact::Unknown],
+                "{body}: {semantics:#?}"
+            );
+        }
     }
 }

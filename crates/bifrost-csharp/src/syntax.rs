@@ -31,11 +31,28 @@ pub fn csharp_callable_dispatch_extensibility<'tree>(
     }
 
     let modifier_owner = csharp_enclosing_accessor_owner(node, ancestry).unwrap_or(node);
+    csharp_type_member_dispatch_extensibility(
+        source,
+        modifier_owner,
+        is_static,
+        csharp_enclosing_callable_type(modifier_owner, ancestry),
+    )
+}
+
+/// Classify a member using its established type owner. Parser recovery can
+/// detach a method into a local-function node, so lexical ancestry alone must
+/// not replace the ownership the declaration walk has already established.
+pub(crate) fn csharp_type_member_dispatch_extensibility(
+    source: &str,
+    modifier_owner: Node<'_>,
+    is_static: bool,
+    owner: Option<Node<'_>>,
+) -> DispatchExtensibility {
     let plain_private = csharp_has_modifier(source, modifier_owner, "private")
         && !csharp_has_modifier(source, modifier_owner, "protected");
     if plain_private
         || csharp_has_modifier(source, modifier_owner, "sealed")
-        || csharp_enclosing_callable_type(modifier_owner, ancestry).is_some_and(|owner| {
+        || owner.is_some_and(|owner| {
             matches!(
                 owner.kind(),
                 "struct_declaration" | "record_struct_declaration"
@@ -45,12 +62,11 @@ pub fn csharp_callable_dispatch_extensibility<'tree>(
         return DispatchExtensibility::Closed;
     }
 
-    let dynamically_dispatched = node.kind() == "destructor_declaration"
+    let dynamically_dispatched = modifier_owner.kind() == "destructor_declaration"
         || ["virtual", "abstract", "override"]
             .into_iter()
             .any(|modifier| csharp_has_modifier(source, modifier_owner, modifier))
-        || csharp_enclosing_callable_type(modifier_owner, ancestry)
-            .is_some_and(|owner| owner.kind() == "interface_declaration" && !is_static);
+        || owner.is_some_and(|owner| owner.kind() == "interface_declaration" && !is_static);
     if dynamically_dispatched {
         DispatchExtensibility::Open
     } else {
@@ -90,7 +106,11 @@ pub fn csharp_default_member_visibility<'tree>(
     node: Node<'tree>,
     ancestry: &ParentIndex<'tree>,
 ) -> DeclaredVisibility {
-    match csharp_enclosing_callable_type(node, ancestry) {
+    csharp_type_member_default_visibility(csharp_enclosing_callable_type(node, ancestry))
+}
+
+pub(crate) fn csharp_type_member_default_visibility(owner: Option<Node<'_>>) -> DeclaredVisibility {
+    match owner {
         Some(owner) if owner.kind() == "interface_declaration" => DeclaredVisibility::Public,
         _ => DeclaredVisibility::Private,
     }

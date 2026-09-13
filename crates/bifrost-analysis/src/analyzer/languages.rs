@@ -1150,7 +1150,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
                 registered,
                 matches!(
                     language,
-                    Language::Java | Language::TypeScript | Language::Rust
+                    Language::Java | Language::TypeScript | Language::Rust | Language::Scala
                 ),
                 "call conversion capability registration for {language:?}"
             );

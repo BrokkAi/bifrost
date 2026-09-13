@@ -520,7 +520,13 @@ fn visit_js_field(
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
-    let Some(name_node) = node.child_by_field_name("property") else {
+    // `field_definition` names its property through `property`; the TSX
+    // grammar's `public_field_definition`, which reads every `.jsx` file
+    // (#3322), names it through `name`.
+    let Some(name_node) = node
+        .child_by_field_name("property")
+        .or_else(|| node.child_by_field_name("name"))
+    else {
         return;
     };
     let name = node_text(name_node, source).trim_matches('"').trim();
@@ -1304,6 +1310,14 @@ fn js_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
         "assignment_pattern" => parameter.child_by_field_name("left"),
         "rest_pattern" => parameter.named_child(0).or(Some(parameter)),
         "object_pattern" | "array_pattern" => Some(parameter),
+        // The TSX grammar, which reads every `.jsx` file (#3322), wraps each
+        // parameter in `required_parameter`/`optional_parameter` and states
+        // the binding under `pattern`. A default value is the wrapper's
+        // `value` field rather than an `assignment_pattern`, so the binding
+        // under `pattern` is already the label in both spellings.
+        "required_parameter" | "optional_parameter" => parameter
+            .child_by_field_name("pattern")
+            .and_then(js_parameter_label_node),
         _ => None,
     }
 }
@@ -1605,6 +1619,17 @@ fn collect_js_assignment_binding_names(node: Node<'_>, source: &str, names: &mut
         "assignment_pattern" => {
             if let Some(left) = node.child_by_field_name("left") {
                 collect_js_assignment_binding_names(left, source, names);
+            }
+            return;
+        }
+        // The TSX grammar's spelling of the same parameter (#3322): the
+        // binding is `pattern` and the default is the sibling `value`, so
+        // falling through to "every named child" would bind the names the
+        // default expression merely reads -- `process` in
+        // `run(argv = process.argv.slice(2))`.
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                collect_js_assignment_binding_names(pattern, source, names);
             }
             return;
         }
@@ -2362,6 +2387,48 @@ mod private_field_assignment_tests {
                 .keys()
                 .map(|unit| unit.short_name().to_owned())
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod jsx_declaration_tests {
+    use super::*;
+
+    /// JavaScript declaration extraction understands the TSX field and
+    /// parameter wrappers used by the JSX dialect.
+    #[test]
+    fn jsx_fields_and_parameter_labels_survive_tsx_parsing() {
+        let source = "export class Panel {\n  label = \"panel\";\n  render(props) { return <div class=\"panel\" />; }\n}\n";
+        let directory = tempfile::tempdir().expect("temporary root");
+        let file = ProjectFile::new(directory.path().canonicalize().unwrap(), "panel.jsx");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let parsed = parse_javascript_file(&file, source, &tree);
+        assert!(
+            parsed
+                .ranges
+                .keys()
+                .any(|unit| unit.terminal_name() == "label"),
+            "{parsed:#?}"
+        );
+        let render = parsed
+            .signature_metadata
+            .iter()
+            .find(|(unit, _)| unit.terminal_name() == "render")
+            .and_then(|(_, metadata)| metadata.first())
+            .expect("render signature");
+        assert_eq!(
+            render
+                .parameters()
+                .iter()
+                .map(|parameter| parameter.label())
+                .collect::<Vec<_>>(),
+            ["props"]
         );
     }
 }

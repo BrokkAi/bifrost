@@ -23,7 +23,7 @@ use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::Node;
 
 use crate::graph::ast::{range_clause_binding_names, range_clause_is_short_declaration};
 use crate::graph::resolver::GoImportBindings;
@@ -81,7 +81,7 @@ pub fn collect_go_semantic_diagnostics(
         report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         return report;
     }
-    let Some(tree) = parse_go_tree(source) else {
+    let Some(tree) = crate::parse::parse_go(source) else {
         report.push_incomplete(
             None,
             vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -123,12 +123,6 @@ pub fn collect_go_semantic_diagnostics(
     };
     collector.scan_tree(tree.root_node());
     collector.report
-}
-
-fn parse_go_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    parser.parse(source, None)
 }
 
 struct GoDiagnosticCollector<'a> {

@@ -117,7 +117,26 @@ macro_rules! js_ts_kind_table {
     };
 }
 
-pub const JS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!();
+/// JavaScript's table is the union its two grammars need. `.jsx` is parsed
+/// with the TSX grammar (#3322), which spells a class name `type_identifier`
+/// and wraps every parameter in `required_parameter`/`optional_parameter`;
+/// without those entries a `.jsx` class name would stop being an Identifier
+/// fact the moment the dialect changed. `CompiledKinds` drops the entries a
+/// concrete grammar does not have, so tree-sitter-javascript keeps exactly the
+/// table it had before.
+pub const JS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
+    ("type_identifier", NormalizedKind::Identifier),
+    ("required_parameter", NormalizedKind::Parameter),
+    ("optional_parameter", NormalizedKind::Parameter),
+);
+
+/// The entries [`JS_KIND_TABLE`] carries only for the `.jsx` dialect's TSX
+/// grammar. tree-sitter-javascript has no node with any of these names.
+pub const JS_TSX_ONLY_KINDS: &[&str] = &[
+    "type_identifier",
+    "required_parameter",
+    "optional_parameter",
+];
 
 pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("abstract_class_declaration", NormalizedKind::Class),

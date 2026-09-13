@@ -715,7 +715,7 @@ pub fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclare
 /// Whether the declaration's `modifiers` list contains `keyword` as a modifier
 /// node (not as an annotation argument or an identifier that merely spells the
 /// same soft keyword elsewhere in the header).
-fn kotlin_has_modifier(node: Node<'_>, keyword: &str) -> bool {
+pub fn kotlin_has_modifier(node: Node<'_>, keyword: &str) -> bool {
     let Some(modifiers) = first_named_child(node, "modifiers") else {
         return false;
     };
@@ -735,14 +735,6 @@ fn kotlin_binding_keyword<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str
         .map(|binding| node_text_trimmed(binding, source))
 }
 
-const KOTLIN_TYPE_NODE_KINDS: &[&str] = &[
-    "user_type",
-    "nullable_type",
-    "not_nullable_type",
-    "function_type",
-    "parenthesized_type",
-];
-
 /// The declared type of a `variable_declaration`/`class_parameter`: the type
 /// node following its `:` token, when the declaration is explicitly typed.
 fn kotlin_declared_type_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -757,7 +749,7 @@ fn kotlin_declared_type_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a 
             }
             continue;
         }
-        if seen_colon && KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()) {
+        if seen_colon && crate::kotlin::syntax::KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()) {
             return Some(node_text_trimmed(child, source));
         }
     }

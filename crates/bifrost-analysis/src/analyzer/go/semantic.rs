@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v68";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v69";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -1407,6 +1407,41 @@ fn populate_capture_specs<'tree>(
     }
 
     let mut shared_bindings = vec![Vec::<GoSharedBindingSpec>::new(); specs.len()];
+    // Taking a binding's address exposes its storage even without a closure.
+    // Resolve the exact lexical owner before allocating the cell; package
+    // globals and addresses of members retain their existing open boundaries.
+    for (procedure_index, spec) in specs.iter().enumerate() {
+        try_walk_named_tree_preorder(spec.body, true, |node| {
+            charge_go_inventory_prepass(inventory, cancellation)?;
+            if node != spec.body && is_go_callable_kind(node.kind()) {
+                return Ok(WalkControl::SkipChildren);
+            }
+            if node.kind() == "unary_expression"
+                && unary_operator_kind(node) == Some("&")
+                && let Some(operand) = node.child_by_field_name("operand")
+                && let operand = transparent_parenthesized_expression(operand)
+                && is_go_binding_reference_kind(operand.kind())
+                && let Some(name) = node_text(source, operand).filter(|name| *name != "_")
+                && let Some(binding) = resolve_go_binding(
+                    specs,
+                    &lexical_bindings,
+                    procedure_index,
+                    name,
+                    operand.start_byte(),
+                    inventory,
+                    cancellation,
+                )?
+            {
+                shared_bindings[resolved_binding_procedure(binding).index()].push(
+                    GoSharedBindingSpec {
+                        name: name.into(),
+                        binding,
+                    },
+                );
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
     for captured in &mut captures {
         captured.sort_by(|left, right| {
             resolved_binding_sort_key(left.binding)
@@ -16455,6 +16490,79 @@ func observe(pointer *int, number int, unknown any) {
         assert_eq!(
             dereferences, 3,
             "only grammar-native unary stars are dereferences: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    fn uncaptured_address_taken_bindings_have_distinct_storage_cells() {
+        let procedures = lower_fixture(
+            r#"package main
+func consume(value *int) {}
+func owner() {
+    value := 1
+    untouched := 2
+    consume(&value)
+    {
+        value := 3
+        consume(&value)
+    }
+    consume(&((value)))
+    _ = untouched
+}
+"#,
+        );
+        let procedure = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.name().is_some_and(|name| name == "owner"))
+            })
+            .expect("owner procedure");
+        assert!(procedure.captures.is_empty());
+        let addresses = procedure
+            .values
+            .iter()
+            .filter(|value| value.kind == SemanticValueKind::Address)
+            .map(|value| value.id)
+            .collect::<HashSet<_>>();
+        let addressed = procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { target, value } if addresses.contains(&target) => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addressed.len(),
+            3,
+            "all address operations retain their binding"
+        );
+        let addressed_bindings = addressed.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            addressed_bindings.len(),
+            2,
+            "shadowing names distinct bindings"
+        );
+        let cells = procedure
+            .memory_locations
+            .iter()
+            .filter_map(|location| match location.kind {
+                MemoryLocationKind::LexicalCell { binding } => Some(binding),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 2, "only the two exposed bindings need cells");
+        assert_eq!(
+            cells.into_iter().collect::<HashSet<_>>(),
+            addressed_bindings
         );
     }
 

@@ -122,3 +122,66 @@ fn empty_or_unprovable_ranges_prove_nothing() {
         );
     }
 }
+
+/// A unique constructor still needs evidence that its actual fits the carrier.
+#[test]
+fn value_class_construction_requires_known_actual_compatibility() {
+    use crate::analyzer::{AnalyzerConfig, Language};
+    use crate::inline_project::InlineTestProject;
+
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file(
+            "value.kt",
+            "import kotlin.jvm.JvmInline\n@JvmInline value class Value(val raw: Long)\nfun known(raw: Long): Value = Value(raw)\nfun <T> unknown(raw: T): Value = Value(raw)\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("value.kt"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Kotlin semantic materialization succeeds")
+        .available_value()
+        .cloned()
+        .expect("Kotlin semantic artifact is available");
+    for (name, expected) in [("known", true), ("unknown", false)] {
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .expect("fixture procedure");
+        let transfers: Vec<_> = procedure
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(transfer),
+                    ..
+                } => Some(transfer),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(!transfers.is_empty(), expected, "{name}: {transfers:#?}");
+        if !expected {
+            assert!(
+                procedure.gaps().iter().any(|gap| {
+                    gap.detail.as_ref()
+                        == KotlinAdaptationIncomplete::UnderlyingTypeUnknown.detail()
+                }),
+                "missing typed compatibility gap: {procedure:#?}"
+            );
+        }
+    }
+}

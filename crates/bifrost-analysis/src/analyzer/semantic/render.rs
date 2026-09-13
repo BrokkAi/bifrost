@@ -960,6 +960,9 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                     TransferOperation::CallArgumentConversion(conversion) => {
                         write!(writer, " :operation-call-argument-conversion {conversion}")?;
                     }
+                    TransferOperation::ValueCarrierAdaptation(adaptation) => {
+                        write!(writer, " :operation-value-carrier-adaptation {adaptation}")?;
+                    }
                     TransferOperation::Unknown => {
                         writer.write_str(" :operation \"unknown\"")?;
                     }

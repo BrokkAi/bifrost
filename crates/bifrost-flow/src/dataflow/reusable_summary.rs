@@ -32,7 +32,7 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 /// contract. Embedded procedure summaries remain
 /// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 4;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 5;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1659,6 +1659,10 @@ pub enum SummaryEffectKey {
     /// boundary's proof and completeness without fabricating a heap location.
     UnknownCallBoundary {
         event: SummaryEventKey,
+        /// Exact external dispatch source. A client may account for this
+        /// boundary only with a complete reviewed inventory for that call.
+        /// Unresolved, truncated, and authored unknown boundaries have none.
+        external_call: Option<(SummaryEventKey, SummaryCallSourceWitness)>,
     },
     AmbiguousCall {
         event: SummaryEventKey,

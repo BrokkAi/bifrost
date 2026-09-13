@@ -157,9 +157,28 @@ mod structural_spec_tests {
 
     #[test]
     fn javascript_kind_table_matches_grammar() {
+        // JavaScript and JSX share one StructuralSpec, so its table is the
+        // union needed by both parser flavors (#3322). CompiledKinds drops
+        // entries absent from the concrete grammar. Check the non-JSX subset
+        // against tree-sitter-javascript here; the JSX test below checks the
+        // full union against TSX.
+        let plain_javascript_table = JS_KIND_TABLE
+            .iter()
+            .copied()
+            .filter(|(name, _)| !JS_TSX_ONLY_KINDS.contains(name))
+            .collect::<Vec<_>>();
         crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
             tree_sitter_javascript::LANGUAGE.into(),
             "tree-sitter-javascript",
+            &plain_javascript_table,
+        );
+    }
+
+    #[test]
+    fn javascript_jsx_kind_table_matches_tsx_grammar() {
+        crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tree-sitter-tsx",
             JS_KIND_TABLE,
         );
     }

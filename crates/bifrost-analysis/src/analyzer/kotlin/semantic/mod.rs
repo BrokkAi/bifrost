@@ -49,10 +49,17 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{KotlinAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::value_classes::{
+    KotlinActualEvidence, KotlinAdaptationIncomplete, KotlinAdaptationOutcome, KotlinCalleeBinding,
+    KotlinCarrier, KotlinConstructorSelection, KotlinUnderlyingMatch, KotlinValueAdaptation,
+    KotlinValueAdaptationFact, KotlinValueClassId, KotlinValueClassIndex, KotlinWrittenType,
+    kotlin_written_type_is_function, literal_type_names,
+};
 
-/// Bumped for #2833: direct immutable lexical captures now publish closure
-/// environments and capture bindings in the neutral IR.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v3";
+/// Bumped for #2851: `@JvmInline` value-class construction, underlying
+/// projection, and JVM carrier boxing/unboxing now publish identity-separating
+/// transfers instead of ordinary local flow and a wrapper allocation.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v6";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -159,6 +166,16 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                 work: inventory_work,
             });
         };
+        let Ok(value_classes) = KotlinValueClassIndex::build(
+            prepared.tree().root_node(),
+            prepared.source(),
+            &mut || cancellation.is_cancelled(),
+        ) else {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        };
 
         lower_procedure_batch(
             &specs,
@@ -171,6 +188,7 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                     spec,
                     &procedure_targets,
                     &constructible_types,
+                    &value_classes,
                     staged_budget,
                     cancellation,
                 )
@@ -338,6 +356,18 @@ struct LoweringContext<'tree, 'targets> {
     /// Classes this file declares, so a bare `Box(input)` call can be published
     /// as the allocation it provably is.
     constructible_types: &'targets HashSet<Box<str>>,
+    /// The file's `@JvmInline` value classes and the carrier each written type
+    /// selects (#2851).
+    value_classes: &'targets KotlinValueClassIndex<'tree>,
+    /// The JVM carrier each local and parameter holds. Only bindings a value
+    /// class reaches are recorded; everything else is absent, which reads as
+    /// [`KotlinCarrier::Unrelated`].
+    carriers: HashMap<ValueId, KotlinCarrier>,
+    /// The type node each local and parameter writes, for the member lookups a
+    /// field store needs.
+    declared_types: HashMap<ValueId, Node<'tree>>,
+    /// The return type this procedure's declaration writes, when it writes one.
+    declared_return_type: Option<Node<'tree>>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
     captured_bindings: HashMap<Box<str>, ValueId>,

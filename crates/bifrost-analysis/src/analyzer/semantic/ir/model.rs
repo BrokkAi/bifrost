@@ -1626,6 +1626,14 @@ pub enum TransferOperation {
     /// that complete conversion witness; it does not identify a callee
     /// invocation and carries no local graph identity.
     CallArgumentConversion(StableDigest),
+    /// A language adapter proved that a declared value type and its runtime
+    /// carrier differ here, and selected the exact adaptation the platform
+    /// runs. The copyable digest is opaque, content-addressed provenance for
+    /// that complete witness: the adapting declaration's identity, the member
+    /// that carries the value, the direction, and the boundary rule that
+    /// forced the adaptation. Kotlin's `@JvmInline` value classes are the
+    /// first consumer; nothing about the digest is Kotlin-specific.
+    ValueCarrierAdaptation(StableDigest),
     /// An operation runs but was not selected exactly. The event's evidence
     /// must not claim proven, complete knowledge.
     Unknown,
@@ -1665,6 +1673,7 @@ impl TransferOperation {
             Self::None => "none",
             Self::CallSite(_) => "call_site",
             Self::CallArgumentConversion(_) => "call_argument_conversion",
+            Self::ValueCarrierAdaptation(_) => "value_carrier_adaptation",
             Self::Unknown => "unknown",
         }
     }

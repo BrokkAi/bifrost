@@ -11,6 +11,7 @@ use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
 use brokk_bifrost_go::packages::{
     canonical_go_package_name, canonical_go_workspace_package_name, go_vendor_package_alias,
 };
+use brokk_bifrost_go::parse::go_reparse_grammar_gap;
 use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
 use brokk_bifrost_go::test_detection::go_contains_tests;
 use tree_sitter::Tree;
@@ -31,6 +32,15 @@ impl LanguageAdapter for GoAdapter {
 
     fn file_extension(&self) -> &'static str {
         GO_FILE_EXTENSION
+    }
+
+    fn reparse_grammar_gap(
+        &self,
+        source: &str,
+        tree: &Tree,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<Tree> {
+        go_reparse_grammar_gap(source, tree, cancellation)
     }
 
     fn storage_content_qualifier(

@@ -45,7 +45,7 @@ use crate::resolved::LoadedPolicy;
 use crate::taint_policy::ProductionTaintPolicyEvaluator;
 use crate::typestate_policy::ProductionTypestatePolicyEvaluator;
 
-use super::model::{ExplainError, ExplanationLimits, PolicyExplanation};
+use super::model::{ExplainError, ExplanationGeneration, ExplanationLimits, PolicyExplanation};
 use super::near_miss::{NearMissCandidates, PolicyNearMissRanking, rank_near_misses};
 use super::why::explain_finding;
 use super::why_not::{ExplanationCandidate, explain_candidate};
@@ -78,20 +78,33 @@ pub enum ExplanationTarget {
 /// `root` for the duration of the call, exactly as the coordinator does for a
 /// CLI policy run.
 ///
+/// `generation` pins the workspace the answer must be about. `None` answers
+/// about whatever the analyzer holds, which is what a caller that has not yet
+/// read a generation asks for; the produced document states the generation it
+/// was answered under so the next question can pin it.
+///
 /// # Errors
 ///
 /// - [`ExplainError::PolicyUnavailable`] when the root cannot be opened, the
 ///   policy cannot be registered, or the policy could not be evaluated. The
 ///   message is diagnostic text and is never parsed.
+/// - [`ExplainError::StaleWorkspaceGeneration`] when `generation` is not the
+///   generation the analyzer is serving.
 /// - [`ExplainError::AmbiguousPolicySelection`] when `policy_inputs` resolves
 ///   to more or fewer than one policy.
 /// - Everything the chosen adapter can return, including
 ///   [`ExplainError::ExplanationAdapterUnavailable`] and
 ///   [`ExplainError::FindingNotFound`].
+// Eight necessary inputs, none of them removable: a root, the policy selection,
+// the question, the workspace pin, the caller's analyzer and flow state, the
+// cancellation token, and the bounds. Folding any of them into a struct would
+// only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn explain_policy_inputs(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
     target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
     workspace: Option<&WorkspaceAnalyzer>,
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
@@ -100,10 +113,13 @@ pub fn explain_policy_inputs(
     with_one_policy(
         root,
         policy_inputs,
+        generation,
         workspace,
         flow_state,
         cancellation,
-        |policy, context, budget| explain_loaded_policy(policy, context, target, budget, limits),
+        |policy, context, budget| {
+            explain_loaded_policy(policy, context, target, generation, budget, limits)
+        },
     )
 }
 
@@ -116,14 +132,17 @@ pub fn explain_policy_inputs(
 ///
 /// # Errors
 ///
-/// [`ExplainError::PolicyUnavailable`] and
+/// [`ExplainError::PolicyUnavailable`],
+/// [`ExplainError::StaleWorkspaceGeneration`] and
 /// [`ExplainError::AmbiguousPolicySelection`] exactly as
 /// [`explain_policy_inputs`] reports them, plus everything
 /// [`rank_near_misses`] can return.
+#[allow(clippy::too_many_arguments)]
 pub fn rank_policy_near_misses(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
     candidates: &NearMissCandidates,
+    generation: Option<ExplanationGeneration>,
     workspace: Option<&WorkspaceAnalyzer>,
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
@@ -132,10 +151,16 @@ pub fn rank_policy_near_misses(
     with_one_policy(
         root,
         policy_inputs,
+        generation,
         workspace,
         flow_state,
         cancellation,
-        |policy, context, budget| rank_near_misses(policy, context, candidates, budget, limits),
+        |policy, context, budget| {
+            Ok(
+                rank_near_misses(policy, context, candidates, budget, limits)?
+                    .answered_under(ExplanationGeneration::of(context.analyzer)),
+            )
+        },
     )
 }
 
@@ -147,6 +172,7 @@ pub fn rank_policy_near_misses(
 fn with_one_policy<T>(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
+    generation: Option<ExplanationGeneration>,
     workspace: Option<&WorkspaceAnalyzer>,
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
@@ -195,6 +221,11 @@ fn with_one_policy<T>(
     let workspace = workspace
         .or(owned.as_ref())
         .expect("either the caller supplied a workspace or one was built");
+    // The earliest point a pinned generation can be checked: the analyzer
+    // exists, and nothing after this -- pack activation, registry loading,
+    // policy registration, evaluation -- is worth doing for a question about a
+    // workspace this one is not.
+    ExplanationGeneration::require_current(generation, workspace.analyzer())?;
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
     let workspace_activation = match owned.as_ref() {
@@ -299,17 +330,28 @@ fn with_one_policy<T>(
 /// so a model-backed finding is re-evaluated under the same model authority as
 /// an ordinary policy run.
 ///
+/// # The generation is enforced here too
+///
+/// This is a public boundary in its own right, so it refuses a stale pin on
+/// its own evidence rather than trusting a caller to have gone through
+/// [`explain_policy_inputs`]. The check is one comparison of a memoized
+/// content identity, so the host path paying for it twice costs nothing.
+///
 /// # Errors
 ///
 /// [`ExplainError::PolicyUnavailable`] when a `why` question could not evaluate
-/// the policy, plus everything the chosen adapter can return.
+/// the policy, [`ExplainError::StaleWorkspaceGeneration`] when `generation` is
+/// not the analyzer's, plus everything the chosen adapter can return.
 pub fn explain_loaded_policy(
     policy: &LoadedPolicy,
     context: &PolicyEvaluationContext<'_>,
     target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
     budget: &mut PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    ExplanationGeneration::require_current(generation, context.analyzer)?;
+    let answered_under = ExplanationGeneration::of(context.analyzer);
     let active_semantic_model_snapshot = context.analyzer.active_semantic_model_snapshot();
     // This public reuse boundary may be called without `with_one_policy`'s
     // host scope. Freeze one publication for every target so candidate prefix
@@ -349,6 +391,7 @@ pub fn explain_loaded_policy(
             explain_candidate(policy, context, candidate, budget, limits)
         }
     }
+    .map(|explanation| explanation.answered_under(answered_under))
 }
 
 fn open_registry(root: &Path) -> Result<PolicyRegistry, ExplainError> {

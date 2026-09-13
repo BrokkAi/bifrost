@@ -1,4 +1,5 @@
 use super::syntax::*;
+use super::values::KotlinConstructionProof;
 use super::*;
 
 pub(super) fn lower_procedure<'tree, 'targets>(
@@ -6,6 +7,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     constructible_types: &'targets HashSet<Box<str>>,
+    value_classes: &'targets KotlinValueClassIndex<'tree>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), KotlinLoweringError> {
@@ -42,6 +44,12 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         locals: HashMap::default(),
         local_callables: HashMap::default(),
         constructible_types,
+        value_classes,
+        carriers: HashMap::default(),
+        declared_types: HashMap::default(),
+        declared_return_type: (spec.callable.kind() == "function_declaration")
+            .then(|| kotlin_declared_return_type_node(spec.callable))
+            .flatten(),
         receiver: None,
         captured_receiver: None,
         captured_bindings: HashMap::default(),
@@ -51,6 +59,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         cleanups: Vec::new(),
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.bind_receiver_carrier(spec.callable);
     context.emit_capture_inputs(&mut builder, entry, spec)?;
     context.emit_local_bindings(&mut builder, spec.body.scan_root())?;
 
@@ -205,6 +214,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let point = self.point(builder, expression, Vec::new())?;
         let source =
             self.expression_value(builder, expression, expression_value_kind(expression))?;
+        let outcome = self.written_adaptation(expression, self.declared_return_type);
+        let source = self.adapted_value(builder, point, source, &outcome)?;
         let value = self.value(builder, point, SemanticValueKind::Return)?;
         self.append_effect(
             builder,
@@ -811,6 +822,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         let value =
             self.expression_value(builder, initializer, expression_value_kind(initializer))?;
+        // A delegated property's initializer is the delegate object, not the
+        // value the binding receives, so its carrier says nothing about the
+        // binding. A destructuring binding writes no per-name type either.
+        let (written, carried, outcome) = if delegate.is_some() {
+            (
+                None,
+                KotlinCarrier::Unrelated,
+                KotlinAdaptationOutcome::Unrelated,
+            )
+        } else {
+            let written = (binding.kind() == "variable_declaration")
+                .then(|| kotlin_binding_type_node(binding))
+                .flatten();
+            (
+                written,
+                self.expression_carrier(initializer),
+                self.written_adaptation(initializer, written),
+            )
+        };
         for name in names {
             let Some(text) = node_text(self.prepared.source(), name) else {
                 continue;
@@ -818,19 +848,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(target) = self.local_declaration_value(text, name.start_byte()) else {
                 continue;
             };
-            self.append_effect(
+            self.bind_carrier(target, written, carried);
+            self.append_carried_assignment(
                 builder,
                 terminal,
-                SemanticEffect::Assignment { target, value },
-            )?;
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
-                    source: value,
-                    target,
-                },
+                target,
+                value,
+                &outcome,
+                ValueFlowKind::Local,
             )?;
         }
         self.edge(builder, terminal, next)?;
@@ -873,19 +898,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         } else {
                             ValueFlowKind::Parameter
                         };
-                        self.append_effect(
-                            builder,
-                            terminal,
-                            SemanticEffect::Assignment { target, value },
-                        )?;
-                        self.append_effect(
-                            builder,
-                            terminal,
-                            SemanticEffect::ValueFlow {
-                                kind,
-                                source: value,
-                                target,
-                            },
+                        let outcome = self.binding_adaptation(value_node, target);
+                        self.append_carried_assignment(
+                            builder, terminal, target, value, &outcome, kind,
                         )?;
                     }
                 }
@@ -902,13 +917,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
                 self.add_field_identity_gap(builder, terminal, location)?;
+                let outcome = self.member_adaptation(base, member, value_node);
+                let stored = self.adapted_value(builder, terminal, value, &outcome)?;
                 self.append_effect(
                     builder,
                     terminal,
                     SemanticEffect::MemoryStore {
                         kind: MemoryAccessKind::Field,
                         location,
-                        value,
+                        value: stored,
                     },
                 )?;
                 evaluations.push(base);
@@ -1769,6 +1786,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let point = self.point(builder, node, Vec::new())?;
                     let source =
                         self.expression_value(builder, operand, expression_value_kind(operand))?;
+                    let outcome = self.written_adaptation(operand, self.declared_return_type);
+                    let source = self.adapted_value(builder, point, source, &outcome)?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
                     self.append_effect(
                         builder,
@@ -1939,6 +1958,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let access = self.point(builder, node, Vec::new())?;
         let base = self.expression_value(builder, receiver, expression_value_kind(receiver))?;
+        // Reading a value class's underlying property is not a heap field
+        // access: the unboxed carrier *is* the underlying value, and the boxed
+        // one hands it back. Either way the result depends on the carrier's
+        // value without sharing its wrapper identity.
+        if let Some(outcome) = self.underlying_projection(receiver, member) {
+            self.append_carried_assignment(
+                builder,
+                access,
+                result,
+                base,
+                &outcome,
+                ValueFlowKind::Local,
+            )?;
+            self.edge(builder, access, next)?;
+            return Ok(access);
+        }
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -2107,6 +2142,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             kotlin_call_arity(node),
             "argument evaluation and call arity must agree about the trailing lambda"
         );
+        // Bind the value-class construction facts before the call site takes
+        // ownership of the argument list.
+        let construction = self.construction_proof(node);
+        let underlying = match construction {
+            KotlinConstructionProof::Proven { index, .. } => {
+                argument_values.get(index).map(|argument| argument.value)
+            }
+            KotlinConstructionProof::Incomplete(_) | KotlinConstructionProof::Unrelated => None,
+        };
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
@@ -2122,9 +2166,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        if node.kind() == "constructor_invocation" || constructs_declared_class {
-            self.session
-                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        // A `@JvmInline` value class allocates nothing: its unboxed carrier is
+        // the underlying value, so the construction is a value-preserving
+        // conversion rather than a fresh object.
+        match construction {
+            KotlinConstructionProof::Proven { class, .. } => match underlying {
+                Some(argument) => {
+                    let outcome = self.value_classes.construction(class);
+                    self.append_carried_assignment(
+                        builder,
+                        normal,
+                        result,
+                        argument,
+                        &outcome,
+                        ValueFlowKind::Local,
+                    )?;
+                }
+                None => self.add_carrier_gap(
+                    builder,
+                    normal,
+                    SemanticGapSubject::Value(result),
+                    KotlinAdaptationIncomplete::UnderlyingProperty,
+                )?,
+            },
+            KotlinConstructionProof::Incomplete(reason) => {
+                self.add_carrier_gap(builder, normal, SemanticGapSubject::Value(result), reason)?
+            }
+            KotlinConstructionProof::Unrelated => {
+                if node.kind() == "constructor_invocation" || constructs_declared_class {
+                    self.session
+                        .add_allocation(builder, normal, result, AllocationKind::Object)?;
+                }
+            }
         }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(

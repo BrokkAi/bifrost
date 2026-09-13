@@ -75,6 +75,7 @@ tree-sitter-typescript = "0.23.2"
 tar = { version = "0.4.44", default-features = false }
 walkdir = "2.5.0"
 quick-xml = "0.40"
+toml_edit = "0.22.27"
 jclassfile = "0.6.0"
 jsonschema = { version = "0.48.0", default-features = false }
 serde_json_canonicalizer = "0.3.2"

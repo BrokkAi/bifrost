@@ -79,7 +79,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v19";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v20";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
@@ -1582,6 +1582,7 @@ where
                     call,
                     boundary,
                     boundary_index,
+                    call_ordinal,
                 )?);
             }
             if dispatch_complete && value.boundaries.is_empty() && !value.transfers.is_empty() {
@@ -2870,6 +2871,7 @@ fn project_boundary_effect(
     call: &SemanticCallSite,
     boundary: &CallBoundary,
     boundary_index: usize,
+    call_ordinal: usize,
 ) -> Result<SummaryEffect, SummaryValidationError> {
     let mapping = procedure
         .semantics()
@@ -2892,6 +2894,20 @@ fn project_boundary_effect(
     Ok(SummaryEffect::new(
         SummaryEffectKey::UnknownCallBoundary {
             event: SummaryEventKey::hash_bytes(bytes),
+            external_call: matches!(
+                boundary.dispatch.kind,
+                crate::analyzer::semantic::DispatchBoundaryKind::External(_)
+            )
+            .then(|| {
+                (
+                    SummaryEventKey::from_call_source(&mapping.locator, call_ordinal),
+                    SummaryCallSourceWitness::new(
+                        procedure.semantics().locator(),
+                        span.start_byte(),
+                        span.end_byte(),
+                    ),
+                )
+            }),
         },
         SummaryEvidence::from_semantic(&boundary.dispatch.proof, &boundary.dispatch.completeness)?,
     ))
@@ -2913,6 +2929,7 @@ fn project_open_call_effect(
     Ok(SummaryEffect::new(
         SummaryEffectKey::UnknownCallBoundary {
             event: SummaryEventKey::from_digest(digest.finish()),
+            external_call: None,
         },
         SummaryEvidence::try_new(vec![reason.to_owned()], vec![reason.to_owned()])?,
     ))

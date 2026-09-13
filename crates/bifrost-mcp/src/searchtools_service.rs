@@ -43,11 +43,11 @@ use crate::{
     file_tools::{find_files_containing, get_file_contents, search_file_contents},
     path_normalization::NormalizePath,
     policy::{
-        BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationLimits,
-        ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
-        POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation,
-        PolicyFailOn, PolicyFindingId, PolicyHostActivationContext, PolicyId,
+        BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationGeneration,
+        ExplanationLimits, ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN,
+        POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource,
+        PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
+        PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyHostActivationContext, PolicyId,
         PolicyNearMissRanking, PolicyReportDocument, PolicyRun, PolicyScopeOptions,
         PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
         built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
@@ -705,6 +705,11 @@ mod workspace_semantic_model_configuration_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
     InvalidParams,
+    /// The caller pinned a workspace snapshot this request cannot answer.
+    StaleWorkspaceGeneration {
+        requested: ExplanationGeneration,
+        current: Option<ExplanationGeneration>,
+    },
     UnknownTool,
     DeadlineExceeded,
     Internal,
@@ -887,6 +892,11 @@ struct DecodedRunPolicy {
 /// against one plan, so explaining a batch is not a question that has an
 /// answer. The target is exactly one of `finding_id` (why) or `candidate`
 /// (why-not); the schema states the exclusion and the handler enforces it.
+///
+/// `workspace_generation` is the optional pin: an agent that read a finding id
+/// under one workspace states that workspace here, and a request that arrives
+/// after the snapshot moved is refused rather than answered about a different
+/// run.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExplainPolicyParams {
@@ -901,6 +911,7 @@ struct ExplainPolicyParams {
     finding_id: Option<String>,
     candidate: Option<ExplainPolicyCandidate>,
     near_misses: Option<ExplainPolicyNearMisses>,
+    workspace_generation: Option<String>,
 }
 
 /// One explicit source position a caller believes should have matched.
@@ -1214,6 +1225,23 @@ fn explain_policy_candidate(
 /// Exactly one of the three targets must be present: a request with more than
 /// one would have more than one answer, and a request with none has no
 /// question. The schema states the exclusion and this enforces it.
+/// The workspace generation the request pins, if it pinned one.
+fn explain_policy_generation(
+    params: &ExplainPolicyParams,
+) -> Result<Option<ExplanationGeneration>, SearchToolsServiceError> {
+    params
+        .workspace_generation
+        .as_deref()
+        .map(|value| {
+            value.parse::<ExplanationGeneration>().map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid explain_policy workspace_generation `{value}`: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn explain_policy_question(
     params: &ExplainPolicyParams,
 ) -> Result<ExplainPolicyQuestion, SearchToolsServiceError> {
@@ -1395,7 +1423,17 @@ fn explain_policy_inputs_from(
 /// own message, so an agent reads one stated condition rather than a stack of
 /// wrappers.
 fn explain_error_to_service_error(error: ExplainError) -> SearchToolsServiceError {
-    SearchToolsServiceError::invalid_params(format!("explain_policy could not answer: {error}"))
+    match error {
+        ExplainError::StaleWorkspaceGeneration { requested, current } => SearchToolsServiceError {
+            code: SearchToolsServiceErrorCode::StaleWorkspaceGeneration { requested, current },
+            message: format!("explain_policy could not answer: {error}"),
+            // Reloading the current snapshot cannot restore an obsolete caller pin.
+            retryable_stale_generation: false,
+        },
+        _ => SearchToolsServiceError::invalid_params(format!(
+            "explain_policy could not answer: {error}"
+        )),
+    }
 }
 
 /// Wire-level coverage for `explain_policy` (issue 2439 slice 3).
@@ -1782,6 +1820,75 @@ mod explain_policy_tests {
             reversed.message.contains("exceeds end"),
             "{}",
             reversed.message
+        );
+    }
+
+    /// Issue 3207 item 1. An agent that read a finding id under one workspace
+    /// snapshot can state that snapshot, and a request that arrives after the
+    /// workspace moved is refused rather than answered about a different run.
+    #[test]
+    fn explain_policy_refuses_a_pinned_generation_the_workspace_no_longer_has() {
+        let (_temp, service) = service();
+        let arguments = json!({
+            "policy_files": ["policies/match.rqlp"],
+            "candidate": { "path": "Widget.java", "byte_start": byte_offset("Widget") }
+        });
+        let unpinned = service
+            .call_tool_value("explain_policy", arguments.clone())
+            .expect("an unpinned answer");
+        let current = unpinned["explanation"]["workspace_generation"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every answer states its generation: {unpinned:#}"))
+            .to_owned();
+
+        let mut pinned_arguments = arguments.clone();
+        pinned_arguments["workspace_generation"] = json!(current);
+        let pinned = service
+            .call_tool_value("explain_policy", pinned_arguments)
+            .expect("the current generation is accepted");
+        assert_eq!(
+            serde_json::to_string(&pinned).unwrap(),
+            serde_json::to_string(&unpinned).unwrap()
+        );
+
+        let mut stale_arguments = arguments;
+        stale_arguments["workspace_generation"] = json!("0".repeat(64));
+        let stale = service
+            .call_tool_value("explain_policy", stale_arguments)
+            .expect_err("a workspace that moved must not be silently explained");
+        assert!(
+            matches!(
+                stale.code,
+                SearchToolsServiceErrorCode::StaleWorkspaceGeneration { .. }
+            ),
+            "{stale:?}"
+        );
+        assert!(
+            stale.message.contains("pinned workspace generation")
+                && stale.message.contains(&current),
+            "{}",
+            stale.message
+        );
+    }
+
+    /// A malformed pin is a stated parameter error, never a silent no-op.
+    #[test]
+    fn explain_policy_rejects_a_malformed_workspace_generation() {
+        let (_temp, service) = service();
+        let error = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": 0 },
+                    "workspace_generation": "not-a-generation"
+                }),
+            )
+            .expect_err("a malformed generation is refused");
+        assert!(
+            error.message.contains("workspace_generation"),
+            "{}",
+            error.message
         );
     }
 
@@ -5263,6 +5370,7 @@ impl SearchToolsService {
             ))
         })?;
         let question = explain_policy_question(&params)?;
+        let generation = explain_policy_generation(&params)?;
         let policy_inputs = explain_policy_inputs_from(&params)?;
 
         loop {
@@ -5285,6 +5393,7 @@ impl SearchToolsService {
                                     &root,
                                     &policy_inputs,
                                     target,
+                                    generation,
                                     Some(&snapshot),
                                     Some(&self.flow_state),
                                     cancellation,
@@ -5301,6 +5410,7 @@ impl SearchToolsService {
                                     &root,
                                     &policy_inputs,
                                     candidates,
+                                    generation,
                                     Some(&snapshot),
                                     Some(&self.flow_state),
                                     cancellation,

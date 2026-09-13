@@ -24,6 +24,16 @@
 //! in `evaluator/assertion.rs`), which is why this adapter needs no read
 //! accessor on the evaluator and no re-execution.
 //!
+//! # Declared effects
+//!
+//! An effect policy asserts over the `procedure_effect` relation, so the rows
+//! behind its verdict are derivations rather than positions. The evaluator
+//! retains their chains on the finding
+//! ([`crate::finding::EffectDerivationEvidence`]), and this adapter publishes
+//! one `effect_derivation` node per chain under the assertion node, with the
+//! reviewed declaration, the propagation, and the timing classification as its
+//! children (issue 3207).
+//!
 //! # Outcomes
 //!
 //! The root is `satisfied`: the finding is established by retained evidence.
@@ -39,8 +49,8 @@
 //! own typed reasons.
 
 use crate::finding::{
-    AssertionFindingEvidence, PolicyFinding, PolicyLocationRelationship, PolicyObligation,
-    PolicyRun,
+    AssertionFindingEvidence, EffectDerivationEvidence, PolicyFinding, PolicyLocationRelationship,
+    PolicyObligation, PolicyRun,
 };
 
 use super::model::{
@@ -52,6 +62,10 @@ use super::why::coverage_node;
 /// The `assert_kind` the relational driver stamps on every row-plan finding.
 pub(super) const RELATIONAL_ASSERT_KIND: &str = "relational";
 
+/// The one `coverage` value of the effect relation that licenses an absence
+/// claim. Spelled once here rather than compared inline in two places.
+const EXHAUSTIVE_EFFECT_COVERAGE: &str = "exhaustive";
+
 /// Explain why one retained assertion finding exists.
 ///
 /// The tree is rooted at the finding projection and carries, in order:
@@ -59,7 +73,8 @@ pub(super) const RELATIONAL_ASSERT_KIND: &str = "relational";
 /// 1. the assertion node, holding the authored expectation beside the observed
 ///    value, with one `source_fact` child per retained representative row (the
 ///    finding's primary location first, then its related locations in the
-///    order the evaluator retained them);
+///    order the evaluator retained them), followed by one `effect_derivation`
+///    child per retained declared-effect chain;
 /// 2. the run's completion as a coverage obligation, satisfied when the run is
 ///    reliable and unknown otherwise;
 /// 3. one coverage-obligation node per unmet obligation the run retained *for
@@ -204,10 +219,128 @@ fn assertion_node(finding: &PolicyFinding, evidence: &AssertionFindingEvidence) 
             .with_location(Some(related.location().clone())),
         );
     }
+    for derivation in evidence.effect_derivations() {
+        node.push_child(effect_derivation_node(derivation));
+    }
     node.with_source_truncation(
-        finding.related_truncated(),
-        finding.omitted_related_locations_lower_bound(),
+        finding.related_truncated() || evidence.effect_derivations_truncated(),
+        finding
+            .omitted_related_locations_lower_bound()
+            .saturating_add(evidence.omitted_effect_derivations_lower_bound()),
     )
+}
+
+/// One declared-effect chain behind the asserted aggregate.
+///
+/// The three links the effect contract names are three children rather than
+/// three sentences in one string: the reviewed declaration the effect came
+/// from, the propagation the analyzer walked to reach it, and the timing that
+/// classification was composed under. A consumer branches on the labels; it
+/// never parses the prose.
+///
+/// The propagation child is one node and not one node per hop, because one
+/// bounded rendered chain is what the effect relation retains. Splitting that
+/// rendering into hops would mean reading a string the analyzer publishes as a
+/// whole, and a `why` answer is a projection of retained evidence rather than a
+/// second parse of it.
+///
+/// The chain node is `satisfied` -- the effect is attributed, which is why the
+/// finding exists -- while its coverage child is `unknown` whenever the effect
+/// relation did not declare the reachable call graph exhaustive or the chain
+/// complete. An open effect set never disproves anything; it states that the
+/// walk did not finish.
+fn effect_derivation_node(derivation: &EffectDerivationEvidence) -> RawNode {
+    let mut node = RawNode::new(
+        ExplanationNodeKind::EffectDerivation,
+        ExplanationOutcome::Satisfied,
+        "effect",
+    )
+    .with_expected(format!(
+        "the asserted aggregate counts the `{}` effect",
+        derivation.effect_id()
+    ))
+    .with_actual(match derivation.certainty() {
+        Some(certainty) => format!(
+            "{} effect `{}` ({}), {}",
+            derivation.classification(),
+            derivation.effect_id(),
+            certainty,
+            derivation.derivation()
+        ),
+        None => format!(
+            "{} effect `{}`, {}",
+            derivation.classification(),
+            derivation.effect_id(),
+            derivation.derivation()
+        ),
+    });
+
+    node.push_child(
+        RawNode::new(
+            ExplanationNodeKind::EffectDerivation,
+            ExplanationOutcome::Satisfied,
+            "effect_declaration",
+        )
+        .with_expected("a reviewed semantic model declares this effect on an exact procedure")
+        .with_actual(format!(
+            "derivation {} at depth {}",
+            derivation.derivation(),
+            derivation
+                .depth()
+                .map_or_else(|| String::from("unknown"), |depth| depth.to_string())
+        )),
+    );
+    node.push_child(
+        RawNode::new(
+            ExplanationNodeKind::EffectDerivation,
+            ExplanationOutcome::Satisfied,
+            "propagation_hop",
+        )
+        .with_expected("the call chain from the asserted procedure to the declaring one")
+        // The hop truncation is stated on the coverage obligation below rather
+        // than through this node's child-truncation pair: the pair means
+        // "children were dropped", and a chain node has no children to drop.
+        .with_actual(match derivation.witness_chain() {
+            Some(chain) => format!("{chain} [{} retained hop(s)]", derivation.witness_steps()),
+            None => format!(
+                "no chain is retained [{} retained hop(s)]",
+                derivation.witness_steps()
+            ),
+        }),
+    );
+    node.push_child(
+        RawNode::new(
+            ExplanationNodeKind::EffectDerivation,
+            ExplanationOutcome::Satisfied,
+            "timing_classification",
+        )
+        .with_expected("when the effect runs relative to the call that declares it")
+        .with_actual(format!(
+            "timing {}, execution timing {}",
+            derivation.timing().unwrap_or("unknown"),
+            derivation.execution_timing().unwrap_or("unknown")
+        )),
+    );
+    node.push_child(
+        RawNode::new(
+            ExplanationNodeKind::CoverageObligation,
+            if derivation.coverage() == EXHAUSTIVE_EFFECT_COVERAGE
+                && !derivation.witness_truncated()
+            {
+                ExplanationOutcome::Satisfied
+            } else {
+                ExplanationOutcome::Unknown
+            },
+            "effect_coverage",
+        )
+        .with_expected("the reachable call graph behind this effect was walked in full")
+        .with_actual(if derivation.witness_truncated() {
+            format!("{}; the retained chain omitted hops", derivation.coverage())
+        } else {
+            derivation.coverage().to_owned()
+        }),
+    );
+    node
 }
 
 /// One unmet obligation for this assertion.
@@ -237,8 +370,10 @@ fn obligation_node(obligation: &PolicyObligation) -> RawNode {
 ///
 /// The relational driver emits only `Subject` (the first representative row)
 /// and `Evidence` (every other one), but the mapping is total so a future
-/// assertion family cannot reach an unlabelled node.
-const fn relationship_label(relationship: PolicyLocationRelationship) -> &'static str {
+/// assertion family cannot reach an unlabelled node. Shared with the typestate
+/// adapter, whose projection tags `Source` and `Subject`, so one relationship
+/// reads the same in both answers.
+pub(super) const fn relationship_label(relationship: PolicyLocationRelationship) -> &'static str {
     match relationship {
         PolicyLocationRelationship::Subject => "subject_row",
         PolicyLocationRelationship::Evidence => "evidence_row",

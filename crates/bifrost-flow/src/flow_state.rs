@@ -2280,7 +2280,7 @@ fn result_alias_identity_is_closed(
         return false;
     }
 
-    !address_escape_points(semantics, &address_aliases)
+    !address_escape_points(semantics, &address_aliases, &[])
         .into_iter()
         .any(|escape| {
             result_origins.iter().any(|origin| {
@@ -2359,7 +2359,7 @@ where
     }) {
         return false;
     }
-    if address_escape_points(semantics, &address_aliases)
+    if address_escape_points(semantics, &address_aliases, &[])
         .into_iter()
         .any(|escape| {
             (point_reaches(graph, origin, escape, true)
@@ -2393,13 +2393,15 @@ fn indirect_address_write_points<'a>(
     })
 }
 
-fn address_escape_points(
+pub(crate) fn address_escape_points(
     semantics: &ProcedureSemantics,
     address_aliases: &HashSet<ValueId>,
+    modeled_address_calls: &[CallSiteId],
 ) -> HashSet<ProgramPointId> {
     let mut escape_points = semantics
         .call_sites()
         .iter()
+        .filter(|call| !modeled_address_calls.contains(&call.id))
         .filter(|call| {
             address_aliases.contains(&call.callee)
                 || call

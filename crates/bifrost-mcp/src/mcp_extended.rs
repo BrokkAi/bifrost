@@ -28,6 +28,10 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 /// as 32 lowercase hex bytes.
 pub(crate) const EXPLAIN_POLICY_FINDING_ID_LENGTH: usize = 64;
 
+/// The exact `explain_policy` workspace generation length: the analyzer's
+/// whole-workspace content identity renders as 32 lowercase hex bytes.
+pub(crate) const EXPLAIN_POLICY_WORKSPACE_GENERATION_LENGTH: usize = 64;
+
 /// The largest explicit near-miss candidate list `explain_policy` accepts.
 /// Larger than the default retained ranking, because a caller may nominate
 /// more subjects than it wants back and let the ranking choose.
@@ -1184,7 +1188,10 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                  other family reports an explicit adapter-unavailable condition. Candidates are \
                  never scanned for by default: supply the position you want explained, supply the \
                  list you want ranked, or ask `near_misses.enumerate_from_policy_seed` for a \
-                 separately budgeted search that the policy's own seed scope bounds.",
+                 separately budgeted search that the policy's own seed scope bounds. Every answer \
+                 states the `workspace_generation` it was produced under; pass that value back as \
+                 `workspace_generation` to be refused rather than answered once the workspace has \
+                 moved on.",
                 brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
                 brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
                 analysis_type_list(brokk_bifrost_policy::WHY_ADAPTER_ANALYSIS_TYPES),
@@ -1252,6 +1259,13 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "candidate": explain_policy_candidate_schema(
                         "Ask why-not: one explicit source position the policy did not report."
                     ),
+                    "workspace_generation": {
+                        "type": "string",
+                        "minLength": EXPLAIN_POLICY_WORKSPACE_GENERATION_LENGTH,
+                        "maxLength": EXPLAIN_POLICY_WORKSPACE_GENERATION_LENGTH,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Answer only if the workspace still has this generation, and otherwise refuse with a stated mismatch instead of explaining a different workspace. The value is the workspace_generation field every explanation and ranking returns: read one answer, then pin it on every later question about the same report."
+                    },
                     "near_misses": {
                         "type": "object",
                         "properties": {
@@ -1906,6 +1920,27 @@ mod tests {
         assert_eq!(candidate["additionalProperties"], false);
         assert_eq!(candidate["properties"]["byte_end"]["type"], "integer");
         assert_eq!(candidate["properties"]["byte_start"]["minimum"], 0);
+
+        // The workspace pin is spelled exactly as the answer prints it, so a
+        // caller can round-trip the value it read without reformatting.
+        let generation = &schema["properties"]["workspace_generation"];
+        assert_eq!(generation["pattern"], "^[0-9a-f]{64}$");
+        assert_eq!(
+            generation["minLength"],
+            EXPLAIN_POLICY_WORKSPACE_GENERATION_LENGTH
+        );
+        assert_eq!(
+            generation["maxLength"],
+            EXPLAIN_POLICY_WORKSPACE_GENERATION_LENGTH
+        );
+        assert!(
+            schema["oneOf"]
+                .as_array()
+                .expect("the three questions")
+                .iter()
+                .all(|branch| branch["required"] != json!(["workspace_generation"])),
+            "the pin is not a fourth question: {schema:#}"
+        );
 
         // Nothing gate-shaped: an explanation is a query.
         for gating in ["fail_on", "diff_base", "baseline_file", "evaluation_date"] {

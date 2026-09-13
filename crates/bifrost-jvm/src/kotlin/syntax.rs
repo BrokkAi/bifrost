@@ -416,19 +416,51 @@ pub fn kotlin_declared_return_type_components(
     function: Node<'_>,
     source: &str,
 ) -> Option<Vec<String>> {
+    kotlin_type_name_components(kotlin_declared_return_type_node(function)?, source)
+}
+
+/// The return-type node a `function_declaration` writes, or `None` when it
+/// writes none.
+///
+/// The return type is the only bare type node among a function's children:
+/// parameters live inside `function_value_parameters`, and an extension's
+/// receiver sits behind the `receiver` field, which is why the receiver is
+/// excluded by node identity rather than by position.
+pub fn kotlin_declared_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
     let receiver = function
         .child_by_field_name("receiver")
         .map(|node| node.id());
     named_children(function)
         .into_iter()
         .filter(|child| Some(child.id()) != receiver)
-        .find_map(|child| kotlin_type_name_components(child, source))
+        .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
 }
 
 pub fn kotlin_binding_type_components(binding: Node<'_>, source: &str) -> Option<Vec<String>> {
+    kotlin_type_name_components(kotlin_binding_type_node(binding)?, source)
+}
+
+/// The node kinds that spell a written Kotlin type.
+pub const KOTLIN_TYPE_NODE_KINDS: &[&str] = &[
+    "user_type",
+    "nullable_type",
+    "not_nullable_type",
+    "function_type",
+    "parenthesized_type",
+];
+
+/// The type node a binding writes, or `None` when it writes none.
+///
+/// A `variable_declaration` (`val base: Base`), a `class_parameter`
+/// (`class D(val base: Base)`) and a `parameter` (`fun f(base: Base)`) all
+/// spell the bound name first and the type after the `:`, so the written type
+/// is the first named child of a type kind. A consumer that needs the type
+/// *node* -- to classify it, rather than to render its name -- takes it from
+/// here instead of re-deriving the position.
+pub fn kotlin_binding_type_node(binding: Node<'_>) -> Option<Node<'_>> {
     named_children(binding)
         .into_iter()
-        .find_map(|child| kotlin_type_name_components(child, source))
+        .find(|child| KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()))
 }
 
 pub fn kotlin_extension_receiver_components(

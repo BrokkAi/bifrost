@@ -458,11 +458,7 @@ fn go_fqn_candidates(
 static GO_TREES: super::TreeParseMemo = super::TreeParseMemo::new();
 
 pub(crate) fn parse_go_tree(source: &str) -> Option<Tree> {
-    GO_TREES.parse(source, |source| {
-        let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-        parser.parse(source, None)
-    })
+    GO_TREES.parse(source, brokk_bifrost_go::parse::parse_go)
 }
 
 pub(crate) fn resolve_go_bounded(

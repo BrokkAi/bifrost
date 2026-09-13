@@ -4,7 +4,7 @@ use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preor
 use brokk_bifrost_core::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::declarations::{collect_go_import_infos, go_node_text};
 
@@ -321,11 +321,7 @@ fn collect_go_assertions(
 }
 
 fn collect_testify_assertions(source: &str) -> Vec<GoAssertionSignal> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .expect("failed to load go parser");
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = crate::parse::parse_go(source) else {
         return Vec::new();
     };
     let root = tree.root_node();

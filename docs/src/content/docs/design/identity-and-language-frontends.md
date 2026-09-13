@@ -43,8 +43,10 @@ unsupported relation from an empty one.
 A source file moves through a series of explicit contracts:
 
 1. **Select language and dialect.** File classification chooses the adapter and
-   parser configuration. Dialects such as C versus C++, or TypeScript versus
-   TSX, remain visible to storage and semantic validity keys.
+   parser configuration. Dialects such as C versus C++, TypeScript versus TSX,
+   or JavaScript versus JSX, remain visible to storage and semantic validity
+   keys. A dialect is derived from the path alone, because the storage key it
+   selects is needed before any source is read.
 2. **Parse the exact bytes.** Disk content or an editor overlay is paired with
    its content identity and parsed under a cancellation budget.
 3. **Extract structured facts.** The adapter walks tree nodes and fields to

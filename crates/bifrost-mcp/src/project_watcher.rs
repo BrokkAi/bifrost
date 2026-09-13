@@ -2,8 +2,7 @@ use crate::hash::HashSet;
 use crate::path_normalization::NormalizePath;
 use crate::{BIFROST_IGNORE_FILE_NAME, Project, ProjectFile};
 use notify::{
-    Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
-    recommended_watcher,
+    Config, Event, EventKind, PathOp, PollWatcher, RecommendedWatcher, Watcher, recommended_watcher,
 };
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -341,10 +340,9 @@ fn watch_project_paths(
     claimed_files: &[ProjectFile],
 ) -> Result<(), String> {
     let recursive_roots = watch_roots(project, claimed_files)?;
+    let mut operations = Vec::new();
     if !recursive_roots.iter().any(|path| path == project.root()) {
-        watcher
-            .watch(project.root(), RecursiveMode::NonRecursive)
-            .map_err(|err| format!("Failed to watch {}: {err}", project.root().display()))?;
+        operations.push(PathOp::watch_non_recursive(project.root()));
     }
 
     let mut configuration_directories = crate::hash::HashSet::default();
@@ -371,17 +369,21 @@ fn watch_project_paths(
             .iter()
             .any(|root| directory.starts_with(root))
         {
-            watcher
-                .watch(&directory, RecursiveMode::NonRecursive)
-                .map_err(|err| format!("Failed to watch {}: {err}", directory.display()))?;
+            operations.push(PathOp::watch_non_recursive(directory));
         }
     }
 
     for path in recursive_roots {
-        watcher
-            .watch(&path, RecursiveMode::Recursive)
-            .map_err(|err| format!("Failed to watch {}: {err}", path.display()))?;
+        operations.push(PathOp::watch_recursive(path));
     }
+
+    // FSEvents represents all paths in one stream. Adding them one at a time
+    // stops and restarts that stream between calls, which can race the run-loop
+    // thread before it begins waiting. Install the initial set atomically so
+    // startup creates the stream only after every path has been registered.
+    watcher
+        .update_paths(operations)
+        .map_err(|err| format!("Failed to watch project paths: {err:?}"))?;
     Ok(())
 }
 
@@ -440,7 +442,8 @@ fn watch_roots(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIFROST_IGNORE_FILE_NAME, PendingChanges, ProjectChangeWatcher, handle_event, watch_roots,
+        BIFROST_IGNORE_FILE_NAME, PendingChanges, ProjectChangeWatcher, handle_event,
+        watch_project_paths, watch_roots,
     };
     use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
@@ -464,6 +467,71 @@ mod tests {
         }
         let project = Arc::new(FilesystemProject::new(root).unwrap()) as Arc<dyn Project>;
         (temp, project)
+    }
+
+    #[derive(Default)]
+    struct BatchOnlyWatcher {
+        batches: Vec<Vec<(std::path::PathBuf, notify::RecursiveMode)>>,
+    }
+
+    impl notify::Watcher for BatchOnlyWatcher {
+        fn new<F: notify::EventHandler>(
+            _event_handler: F,
+            _config: notify::Config,
+        ) -> notify::Result<Self> {
+            Ok(Self::default())
+        }
+
+        fn watch(
+            &mut self,
+            _path: &std::path::Path,
+            _recursive_mode: notify::RecursiveMode,
+        ) -> notify::Result<()> {
+            panic!("watcher startup must not install paths one at a time")
+        }
+
+        fn unwatch(&mut self, _path: &std::path::Path) -> notify::Result<()> {
+            panic!("watcher startup never removes paths")
+        }
+
+        fn update_paths(
+            &mut self,
+            operations: Vec<notify::PathOp>,
+        ) -> Result<(), notify::UpdatePathsError> {
+            self.batches.push(
+                operations
+                    .into_iter()
+                    .map(|operation| match operation {
+                        notify::PathOp::Watch(path, config) => (path, config.recursive_mode()),
+                        notify::PathOp::Unwatch(_) => panic!("watcher startup never removes paths"),
+                    })
+                    .collect(),
+            );
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    #[test]
+    fn watcher_startup_installs_initial_paths_in_one_batch() {
+        let (_temp, project) = project_with_files(&["src/main.rs", "tests/a.rs"]);
+        let mut watcher = BatchOnlyWatcher::default();
+
+        watch_project_paths(&mut watcher, project.as_ref(), &[]).unwrap();
+
+        assert_eq!(watcher.batches.len(), 1);
+        let batch = &watcher.batches[0];
+        assert!(batch.iter().any(|(path, mode)| {
+            path == project.root() && *mode == notify::RecursiveMode::NonRecursive
+        }));
+        for directory in ["src", "tests"] {
+            assert!(batch.iter().any(|(path, mode)| {
+                path == &project.root().join(directory) && *mode == notify::RecursiveMode::Recursive
+            }));
+        }
     }
 
     #[test]

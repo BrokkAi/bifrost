@@ -1160,7 +1160,10 @@ fn lower_effect(
             input: lower_input(summary, binding, input)?,
         },
         CompiledSummaryEffect::UnknownCallBoundary { .. } => {
-            SummaryEffectKey::UnknownCallBoundary { event }
+            SummaryEffectKey::UnknownCallBoundary {
+                event,
+                external_call: None,
+            }
         }
         CompiledSummaryEffect::Sanitize { .. } => unreachable!("sanitize handled above"),
         CompiledSummaryEffect::AmbiguousCall {

@@ -16,15 +16,16 @@ use brokk_bifrost::mcp_registry::{
     single_shot_only_tool_descriptors,
 };
 use brokk_bifrost::policy::{
-    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits,
-    ExplanationTarget, HumanRenderColor, HumanRenderDetail, HumanRenderOptions, NearMissCandidates,
-    POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions,
-    PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
-    PolicyEvaluationOptions, PolicyFailOn, PolicyFindingId, PolicyRenderError,
-    PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions,
-    PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog, escape_terminal_text,
-    evaluate_policy_inputs, explain_policy_inputs, rank_policy_near_misses,
-    relation_schema_catalog, write_policy_human, write_policy_json, write_policy_sarif,
+    BuiltInPolicyCatalogManifest, BuiltInPolicySelection, ExplanationCandidate,
+    ExplanationGeneration, ExplanationLimits, ExplanationTarget, HumanRenderColor,
+    HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
+    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
+    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
+    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyReportDocument, PolicyScopeOptions,
+    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
+    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
+    rank_policy_near_misses, relation_schema_catalog, write_policy_human, write_policy_json,
+    write_policy_sarif,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -172,6 +173,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--explain-finding"
                 | "--explain-candidate"
                 | "--explain-near-misses"
+                | "--explain-generation"
         ) {
             return true;
         }
@@ -212,6 +214,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--explain-finding"
             | "--explain-candidate"
             | "--explain-near-misses"
+            | "--explain-generation"
     )
 }
 
@@ -294,6 +297,7 @@ fn run_inner(
     let mut require_explicit_schema_versions = false;
     let mut explain_finding: Option<String> = None;
     let mut explain_candidate: Option<(String, u64, Option<u64>)> = None;
+    let mut explain_generation: Option<ExplanationGeneration> = None;
     let mut explain_near_misses: Option<usize> = None;
 
     while let Some(arg) = args.next() {
@@ -448,6 +452,19 @@ fn run_inner(
                     return Err("--explain-candidate may only be provided once".to_string());
                 }
                 explain_candidate = Some(parse_explain_candidate(&value)?);
+            }
+            "--explain-generation" => {
+                let value = args.next().ok_or_else(|| {
+                    "--explain-generation requires the workspace generation an explanation reports"
+                        .to_string()
+                })?;
+                if explain_generation.is_some() {
+                    return Err("--explain-generation may only be provided once".to_string());
+                }
+                explain_generation =
+                    Some(value.parse::<ExplanationGeneration>().map_err(|error| {
+                        format!("Invalid --explain-generation `{value}`: {error}")
+                    })?);
             }
             "--explain-near-misses" => {
                 let value = args.next().ok_or_else(|| {
@@ -642,9 +659,10 @@ fn run_inner(
             if explain_finding.is_some()
                 || explain_candidate.is_some()
                 || explain_near_misses.is_some()
+                || explain_generation.is_some()
             {
                 return Err(format!(
-                    "{flag} cannot be combined with --explain-finding, --explain-candidate, or --explain-near-misses"
+                    "{flag} cannot be combined with --explain-finding, --explain-candidate, --explain-near-misses, or --explain-generation"
                 ));
             }
             if !policy_files.is_empty()
@@ -715,6 +733,12 @@ fn run_inner(
         }
         let explain_mode =
             explanation_mode(explain_finding, explain_candidate, explain_near_misses)?;
+        if explain_mode.is_none() && explain_generation.is_some() {
+            return Err(
+                "--explain-generation requires --explain-finding, --explain-candidate, or --explain-near-misses"
+                    .to_string(),
+            );
+        }
         if explain_mode.is_some() {
             // An explanation is a query about one policy, not a gate over a
             // workspace, so every option that shapes a gate is refused rather
@@ -779,12 +803,20 @@ fn run_inner(
         );
         if let Some(mode) = explain_mode {
             let status = match mode {
-                ExplanationMode::Explanation(target) => {
-                    run_policy_explain_mode(&root, &policy_inputs, &target, policy_output)
-                }
-                ExplanationMode::NearMiss(max_candidates) => {
-                    run_policy_near_miss_mode(&root, &policy_inputs, max_candidates, policy_output)
-                }
+                ExplanationMode::Explanation(target) => run_policy_explain_mode(
+                    &root,
+                    &policy_inputs,
+                    &target,
+                    explain_generation,
+                    policy_output,
+                ),
+                ExplanationMode::NearMiss(max_candidates) => run_policy_near_miss_mode(
+                    &root,
+                    &policy_inputs,
+                    max_candidates,
+                    explain_generation,
+                    policy_output,
+                ),
             };
             return Ok(CliRunResult::PolicyStatus(status));
         }
@@ -1372,12 +1404,14 @@ fn run_policy_explain_mode(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
     target: &ExplanationTarget,
+    generation: Option<ExplanationGeneration>,
     output: Option<PathBuf>,
 ) -> u8 {
     let explanation = match explain_policy_inputs(
         root,
         policy_inputs,
         target,
+        generation,
         None,
         None,
         None,
@@ -1416,12 +1450,14 @@ fn run_policy_near_miss_mode(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
     max_candidates: usize,
+    generation: Option<ExplanationGeneration>,
     output: Option<PathBuf>,
 ) -> u8 {
     let ranking = match rank_policy_near_misses(
         root,
         policy_inputs,
         &NearMissCandidates::PolicySeedSearch,
+        generation,
         None,
         None,
         None,
@@ -2025,7 +2061,13 @@ OPTIONS:
                            its kind union, language filter and path globs -- so a policy whose
                            seed declares no such scope is refused rather than scanned; the
                            repository is never walked
-                           All three explanation flags are queries, not gates: a produced answer
+    --explain-generation HEX
+                           Answer only if the workspace still has this generation, and otherwise
+                           exit 2 with a stated mismatch instead of explaining a different
+                           workspace. The value is the workspace_generation field every
+                           explanation and ranking prints, so read one answer, then pin it on
+                           every later question about the same report
+                           The three question flags are queries, not gates: a produced answer
                            exits 0 even when its outcome is failed or unknown and even when a
                            ranking is empty, and only a failure to produce one exits 2. They
                            exclude each other, and none can be combined with --format,
@@ -2548,6 +2590,61 @@ mod policy_explain_cli_tests {
         );
     }
 
+    /// Issue 3207 item 1 on the CLI. The pin is one flag over all three
+    /// questions, it is refused without one, and a spelling that is not a
+    /// generation fails at parse time rather than after a workspace build.
+    #[test]
+    fn the_workspace_generation_pin_is_validated_before_any_workspace_is_built() {
+        let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-generation"]);
+        assert!(
+            message.contains("--explain-generation requires"),
+            "{message}"
+        );
+
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-candidate",
+            "app.ts:0",
+            "--explain-generation",
+            "not-a-generation",
+        ]);
+        assert!(
+            message.contains("Invalid --explain-generation"),
+            "{message}"
+        );
+
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-candidate",
+            "app.ts:0",
+            "--explain-generation",
+            &"0".repeat(64),
+            "--explain-generation",
+            &"1".repeat(64),
+        ]);
+        assert_eq!(message, "--explain-generation may only be provided once");
+
+        // A pin with no question has nothing to pin.
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-generation",
+            &"0".repeat(64),
+        ]);
+        assert!(
+            message.contains("--explain-generation requires --explain-finding"),
+            "{message}"
+        );
+
+        // And it is policy syntax, so it reaches policy mode at all.
+        assert!(has_policy_syntax(&[
+            "--explain-generation".to_string(),
+            "0".repeat(64)
+        ]));
+    }
+
     #[test]
     fn an_explanation_still_requires_a_policy_selection() {
         for question in [
@@ -2728,8 +2825,9 @@ mod row_schema_listing_cli_tests {
 #[cfg(test)]
 mod policy_explain_exit_status_tests {
     use super::{
-        ExplanationCandidate, ExplanationTarget, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationInput, run_policy_explain_mode, run_policy_near_miss_mode,
+        ExplanationCandidate, ExplanationGeneration, ExplanationTarget, POLICY_EXIT_CLEAN,
+        POLICY_EXIT_UNRELIABLE, PolicyEvaluationInput, run_policy_explain_mode,
+        run_policy_near_miss_mode,
     };
     use serde_json::Value;
 
@@ -2767,6 +2865,7 @@ mod policy_explain_exit_status_tests {
                 "policies/explain.rqlp",
             )],
             &ExplanationTarget::Candidate(candidate),
+            None,
             Some(destination.clone()),
         );
         assert_eq!(status, POLICY_EXIT_CLEAN);
@@ -2779,6 +2878,45 @@ mod policy_explain_exit_status_tests {
         );
         assert_eq!(value["question"], "why_not");
         assert_eq!(value["policy_id"], "test.cli.explain");
+
+        // The answer states the workspace it is about, and pinning that same
+        // value answers again while any other value exits 2 (issue 3207).
+        let generation = value["workspace_generation"]
+            .as_str()
+            .unwrap_or_else(|| panic!("every answer states its generation: {value}"))
+            .parse::<ExplanationGeneration>()
+            .expect("the printed generation round-trips");
+        let candidate =
+            ExplanationCandidate::at_offset("Widget.java", 0).expect("a workspace candidate");
+        assert_eq!(
+            run_policy_explain_mode(
+                &root,
+                &[PolicyEvaluationInput::workspace_file(
+                    "policies/explain.rqlp",
+                )],
+                &ExplanationTarget::Candidate(candidate.clone()),
+                Some(generation),
+                None,
+            ),
+            POLICY_EXIT_CLEAN
+        );
+        assert_eq!(
+            run_policy_explain_mode(
+                &root,
+                &[PolicyEvaluationInput::workspace_file(
+                    "policies/explain.rqlp",
+                )],
+                &ExplanationTarget::Candidate(candidate),
+                Some(
+                    "0".repeat(64)
+                        .parse::<ExplanationGeneration>()
+                        .expect("a well-formed generation")
+                ),
+                None,
+            ),
+            POLICY_EXIT_UNRELIABLE,
+            "a workspace that moved is a failure to answer, not an answer"
+        );
     }
 
     #[test]
@@ -2793,6 +2931,7 @@ mod policy_explain_exit_status_tests {
                 "policies/absent.rqlp",
             )],
             &ExplanationTarget::Candidate(candidate),
+            None,
             None,
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
@@ -2809,6 +2948,7 @@ mod policy_explain_exit_status_tests {
                 "policies/explain.rqlp",
             )],
             4,
+            None,
             Some(destination.clone()),
         );
         assert_eq!(status, POLICY_EXIT_CLEAN);
@@ -2841,6 +2981,7 @@ mod policy_explain_exit_status_tests {
                 "policies/absent.rqlp",
             )],
             4,
+            None,
             None,
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);

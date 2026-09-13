@@ -2153,19 +2153,47 @@ there. That is different from `unknown`, which means the analyzer never
 established the answer. A consumer may act on `failed`; a consumer must not
 read `unknown` as evidence of absence.
 
-`explain_finding` serves `match`, `assertion`, `flow`, and `taint` findings; a
-relational assertion finding explains its assertion, group key, contributing
-rows, and any coverage obligations. `explain_candidate` serves `match` and
-`assertion` policies, and a relational candidate reports the first complete
-binding query it is absent from. Row-local RQL filters and projections execute
-as part of that binding query and are not a second policy-level replay stage.
-Joins, group keys, and aggregates are still not replayed, so a candidate that
-survives every binding is `unknown`, never `satisfied`. The families each entry point does not serve — `typestate`
-for `why`, and `flow`, `taint`, and `typestate` for `why-not` — are refused
-with an explicit adapter-unavailable answer that names the supported analysis
-types. `why-not` over a flow or taint policy is not a projection of anything
-the run retained: it needs candidate-specific solver queries, and it is
-designed separately.
+`explain_finding` serves every family a run can produce: `match`, `assertion`,
+`flow`, `taint`, and `typestate`. A relational assertion finding explains its
+assertion, group key, contributing rows, and any coverage obligations; when
+those rows are `procedure_effect` rows it also publishes one `effect_derivation`
+node per declared-effect chain, naming the reviewed declaration, the call chain
+that reached it, and the timing that classification was composed under. A
+typestate finding explains its protocol subject, the violating transition or
+unmet terminal expectation stated as expected beside observed, and the same
+bounded witness paths a flow finding publishes. `explain_candidate` serves
+`match` and `assertion` policies, and a relational candidate reports the first
+complete binding query it is absent from. Row-local RQL filters and projections
+execute as part of that binding query and are not a second policy-level replay
+stage. Joins, group keys, and aggregates are still not replayed, so a candidate
+that survives every binding is `unknown`, never `satisfied`. The families
+`why-not` does not serve — `flow`, `taint`, and `typestate` — are refused with
+an explicit adapter-unavailable answer that names the supported analysis types.
+`why-not` over a flow or taint policy is not a projection of anything the run
+retained: it needs candidate-specific solver queries, and it is designed
+separately.
+
+### Pinning the workspace an answer is about
+
+A `why` answer re-evaluates the policy and a `why-not` answer re-executes
+bounded prefixes, both against whatever the analyzer holds now — while the
+finding identity or candidate position you are asking about came from a report
+produced over one exact workspace. Every answer therefore states the
+`workspace_generation` it was produced under: the analyzer's own content
+identity over the analyzed file set, each language's analysis epoch, and the
+analyzer configuration. It carries no absolute path and no process-local
+counter, so it survives a process boundary and compares equal across two
+byte-equal checkouts.
+
+Read that value once, then pass it back — `--explain-generation <HEX>` on the
+CLI, `workspace_generation` on the MCP tool — and a request that arrives after
+the workspace moved is refused with a stated mismatch instead of being answered
+about a different run. Omitting it keeps the previous behaviour: the answer is
+about whatever the analyzer currently holds.
+
+For MCP, the JSON-RPC error data has `kind: "stale_workspace_generation"`,
+`requested`, `current`, and `retryable: true`. Read a current generation before
+retrying; resending the obsolete pin cannot make it current.
 
 ### Ranking the near misses
 
@@ -2174,7 +2202,7 @@ refining a rule you usually want the opposite question: which subjects nearly
 matched, and which predicate stopped each one. That is the bounded near-miss
 ranking, published as its own versioned document,
 `bifrost_policy_near_miss/v1`, rather than as a node kind inside
-`bifrost_policy_explanation/v1` — an explanation is a tree about one subject,
+`bifrost_policy_explanation/v2` — an explanation is a tree about one subject,
 and a ranking is an ordered list over many.
 
 The distance is the policy's own declared predicates and nothing else. A
@@ -2233,7 +2261,8 @@ document. The CLI accepts `--explain-finding <ID>`, `--explain-candidate
 <PATH:BYTE_START[-BYTE_END]>`, or `--explain-near-misses <N>` beside
 `--policy-file` and prints the same JSON. All three exit 0 whenever an answer
 was produced, whatever its outcome and even when a ranking is empty, and 2 only
-when none could be.
+when none could be. Both surfaces also accept the optional workspace-generation
+pin described above, on any of the three questions.
 
 Both surfaces bound the ranking explicitly: how many subjects to retain, and
 how many queries the ladder may run. What a bound removed is reported in the
@@ -2257,7 +2286,7 @@ than explained from a differently-modeled run.
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
 | Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
-| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered; a relational `why-not` replays each complete RQL binding query as one membership decision and reports the plan's joins, group keys, and aggregates as unreplayed |
+| Explanations | `explain_finding` over `match`, `assertion`, `flow`, `taint`, and `typestate` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags, each accepting an optional workspace-generation pin | A `why` answer projects retained evidence only, so it is exactly as complete as the report; an effect chain names the reviewed declaration, the retained call chain, and the timing, and publishes no hop the effect relation did not retain; every `why-not` over a flow, taint, or typestate policy is refused rather than answered; a relational `why-not` replays each complete RQL binding query as one membership decision and reports the plan's joins, group keys, and aggregates as unreplayed |
 | Near-miss ranking | `rank_near_misses` over `match` and `assertion` policies, published as `bifrost_policy_near_miss/v1`, plus the MCP `explain_policy` `near_misses` form and the CLI `--explain-near-misses N` flag | Distance is the count of unsatisfied declared predicates and nothing else; candidates are the caller's list or the policy's own seed scope, never a repository scan, and a seed with no kind union is refused; a relational subject that clears every row binding is `unknown`, because the joins, group keys, and aggregates are not replayed |
 | Model activation | Two routes, above; the CLI policy runner activates both | A `review_required` workspace model stays inert without an `enable` entry, reported as a warning |
 

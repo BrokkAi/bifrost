@@ -549,6 +549,12 @@ pub enum ValueTransferOperation {
     /// pair. This digest identifies the complete conversion witness and does
     /// not identify a callee invocation.
     CallArgumentConversion { id: StableDigest },
+    /// Adapter-proven provenance for one adaptation between a declared value
+    /// type and the runtime carrier the platform uses for it. The digest
+    /// identifies the complete witness -- adapting declaration, carrying
+    /// member, direction, and the boundary rule that forced the adaptation --
+    /// and does not identify a callee invocation.
+    ValueCarrierAdaptation { id: StableDigest },
     /// An operation runs but was not selected exactly. The edge's own proof
     /// and completeness must not claim proven, complete knowledge.
     Unknown,

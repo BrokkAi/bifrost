@@ -1,10 +1,12 @@
 mod adapter;
+mod call_conversion;
 mod clones;
 pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
+mod semantic_adaptation;
 mod structural;
 
 use crate::analyzer::Range;
@@ -105,8 +107,8 @@ use clones::build_scala_clone_candidate_data;
 pub(crate) use wildcard_imports::{
     ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
     resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
-    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
-    scala_package_prefixes_at, scala_package_prefixes_at_checked,
+    scala_enclosing_package_segments_at, scala_import_path, scala_import_path_candidates,
+    scala_import_visible_at, scala_package_prefixes_at, scala_package_prefixes_at_checked,
 };
 
 /// Decode one persisted [`FileState`] into the thirteen per-file facts the
@@ -2287,6 +2289,13 @@ pub(crate) struct ScalaSupport;
 impl LanguageSupport for ScalaSupport {
     fn language(&self) -> Language {
         Language::Scala
+    }
+
+    fn call_argument_conversion_prover(
+        &self,
+    ) -> Option<&'static dyn crate::analyzer::usages::call_conversion::CallArgumentConversionProver>
+    {
+        Some(&call_conversion::CALL_ARGUMENT_CONVERSION_PROVER)
     }
 
     /// The trailing `$` marks a companion object in the indexed name and is not part of

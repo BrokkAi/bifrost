@@ -78,7 +78,7 @@
 //!
 //! A ranking is published as `bifrost_policy_near_miss/v1`
 //! ([`POLICY_NEAR_MISS_FORMAT`]), not as a new node kind inside
-//! `bifrost_policy_explanation/v1`. The two answer different shapes of
+//! `bifrost_policy_explanation/v2`. The two answer different shapes of
 //! question: an explanation is a tree about one subject, a ranking is an
 //! ordered list over many, and forcing the list into the tree would have made
 //! every existing consumer's root-outcome contract ambiguous. The explanation
@@ -111,8 +111,8 @@ use crate::resolved::LoadedPolicy;
 use crate::retained::{RetainedSize, retained_extra};
 
 use super::model::{
-    ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationOutcome,
-    ExplanationQuestion, ExplanationSubject, truncate_text_to,
+    ExplainError, ExplanationBudgetLimit, ExplanationGeneration, ExplanationLimits,
+    ExplanationOutcome, ExplanationQuestion, ExplanationSubject, truncate_text_to,
 };
 use super::why_not::{
     ExplanationCandidate, MATCH_SELECTOR_PATH, PrefixExecution, absence_reasons,
@@ -349,6 +349,11 @@ pub struct PolicyNearMissRanking {
     executions_used: u64,
     entries: Vec<NearMissEntry>,
     truncation: NearMissTruncation,
+    /// The workspace generation this ranking was produced under, when the
+    /// surface that produced it knew one. Stated for the same reason an
+    /// explanation states it: a caller pins it on the next question.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_generation: Option<ExplanationGeneration>,
 }
 
 impl PolicyNearMissRanking {
@@ -384,6 +389,20 @@ impl PolicyNearMissRanking {
     }
     pub const fn truncation(&self) -> &NearMissTruncation {
         &self.truncation
+    }
+    pub const fn workspace_generation(&self) -> Option<ExplanationGeneration> {
+        self.workspace_generation
+    }
+
+    /// State the workspace generation this ranking was produced under. Set at
+    /// the host boundary, exactly as [`PolicyExplanation::answered_under`] is.
+    #[must_use]
+    pub(super) const fn answered_under(
+        mut self,
+        generation: Option<ExplanationGeneration>,
+    ) -> Self {
+        self.workspace_generation = generation;
+        self
     }
 
     /// Serialize to canonical JSON. Field order is declaration order, so two
@@ -1236,5 +1255,6 @@ fn build_ranking(
         executions_used: u64::try_from(ladder.rungs.len()).unwrap_or(u64::MAX),
         entries,
         truncation,
+        workspace_generation: None,
     }
 }

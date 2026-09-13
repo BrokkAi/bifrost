@@ -142,7 +142,7 @@ fn extract_file_facts_limited_with_tree(
         {
             return LimitedFileFacts::Unavailable;
         }
-        if let Some(cancellation) = cancellation {
+        let parsed = if let Some(cancellation) = cancellation {
             let mut read = |offset: usize, _| &source.as_bytes()[offset..];
             let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
             parser.parse_with_options(
@@ -152,7 +152,13 @@ fn extract_file_facts_limited_with_tree(
             )
         } else {
             parser.parse(source, None)
-        }
+        };
+        // Go's grammar cannot represent `new(expr)`; the repaired tree is the
+        // one its facts must come from.
+        parsed.map(|tree| {
+            spec.reparse_grammar_gap(source, &tree, cancellation)
+                .unwrap_or(tree)
+        })
     } else {
         None
     };

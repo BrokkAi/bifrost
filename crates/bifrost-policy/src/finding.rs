@@ -916,6 +916,176 @@ impl RetainedSize for PolicyFindingEvidence {
 /// capability list means the verdict was produced over rows the analyzer
 /// already declared incomplete, which never reaches a finding because the run
 /// is inconclusive first.
+/// One declared-effect row that contributed to a violated assertion aggregate.
+///
+/// An effect policy asserts over the `procedure_effect` relation, so the rows
+/// behind its verdict are not source positions -- they are derivations: an
+/// effect declared by a reviewed semantic model on some procedure, reached from
+/// the asserted one through a bounded call chain, under a composed execution
+/// timing. Retaining only the row's location (issue 2439's first assertion
+/// slice) left a `why` answer able to point at the procedure but unable to name
+/// the chain, which is the whole content of the finding.
+///
+/// Every field is read from the row's own declared field surface. Nothing here
+/// is derived, re-executed, or parsed out of prose: `witness_chain` is the
+/// bounded rendering the effect relation itself publishes, and the explanation
+/// republishes it verbatim rather than splitting it into hops the relation does
+/// not retain (issue 3207).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EffectDerivationEvidence {
+    /// The namespaced effect this row carries, for example `acme.network_io`.
+    effect_id: String,
+    /// `direct` when the declaring procedure is the asserted one or a callee
+    /// written in its own body, `transitive` otherwise.
+    classification: String,
+    /// How the effect was obtained: `declared`, `none`, `incomplete` or
+    /// `unsupported`.
+    derivation: String,
+    /// `definite` or `possible`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certainty: Option<String>,
+    /// The semantic pack's authored schedule, propagated across call edges.
+    /// This is the deferred/callback classification an effect policy reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timing: Option<String>,
+    /// The canonical execution timing composed across every retained call edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_timing: Option<String>,
+    /// Call hops to the declaring procedure. `0` is a declaration on the
+    /// asserted procedure itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u64>,
+    /// Coverage of the whole reachable call graph behind this row.
+    coverage: String,
+    /// The bounded rendered chain, `caller -> ... -> declaring procedure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    witness_chain: Option<String>,
+    /// Retained hops in that chain.
+    witness_steps: u64,
+    /// Whether the chain hit the relation's retained-step bound.
+    witness_truncated: bool,
+}
+
+impl EffectDerivationEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        effect_id: impl Into<String>,
+        classification: impl Into<String>,
+        derivation: impl Into<String>,
+        certainty: Option<String>,
+        timing: Option<String>,
+        execution_timing: Option<String>,
+        depth: Option<u64>,
+        coverage: impl Into<String>,
+        witness_chain: Option<String>,
+        witness_steps: u64,
+        witness_truncated: bool,
+    ) -> Result<Self, ReportValueError> {
+        let mut effect_id = effect_id.into();
+        let mut classification = classification.into();
+        let mut derivation = derivation.into();
+        let mut coverage = coverage.into();
+        let mut certainty = certainty;
+        let mut timing = timing;
+        let mut execution_timing = execution_timing;
+        let mut witness_chain = witness_chain;
+        validate_report_identifier(&effect_id)?;
+        validate_report_identifier(&classification)?;
+        validate_report_identifier(&derivation)?;
+        validate_report_identifier(&coverage)?;
+        for value in [&certainty, &timing, &execution_timing]
+            .into_iter()
+            .flatten()
+        {
+            validate_report_identifier(value)?;
+        }
+        if let Some(chain) = witness_chain.as_ref() {
+            validate_report_prose(chain)?;
+        }
+        tighten_string(&mut effect_id);
+        tighten_string(&mut classification);
+        tighten_string(&mut derivation);
+        tighten_string(&mut coverage);
+        for value in [&mut certainty, &mut timing, &mut execution_timing]
+            .into_iter()
+            .flatten()
+        {
+            tighten_string(value);
+        }
+        if let Some(chain) = witness_chain.as_mut() {
+            tighten_string(chain);
+        }
+        Ok(Self {
+            effect_id,
+            classification,
+            derivation,
+            certainty,
+            timing,
+            execution_timing,
+            depth,
+            coverage,
+            witness_chain,
+            witness_steps,
+            witness_truncated,
+        })
+    }
+
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+    pub fn classification(&self) -> &str {
+        &self.classification
+    }
+    pub fn derivation(&self) -> &str {
+        &self.derivation
+    }
+    pub fn certainty(&self) -> Option<&str> {
+        self.certainty.as_deref()
+    }
+    pub fn timing(&self) -> Option<&str> {
+        self.timing.as_deref()
+    }
+    pub fn execution_timing(&self) -> Option<&str> {
+        self.execution_timing.as_deref()
+    }
+    pub const fn depth(&self) -> Option<u64> {
+        self.depth
+    }
+    pub fn coverage(&self) -> &str {
+        &self.coverage
+    }
+    pub fn witness_chain(&self) -> Option<&str> {
+        self.witness_chain.as_deref()
+    }
+    pub const fn witness_steps(&self) -> u64 {
+        self.witness_steps
+    }
+    pub const fn witness_truncated(&self) -> bool {
+        self.witness_truncated
+    }
+}
+
+impl RetainedSize for EffectDerivationEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.effect_id.capacity())
+            .saturating_add(self.classification.capacity())
+            .saturating_add(self.derivation.capacity())
+            .saturating_add(self.coverage.capacity())
+            .saturating_add(self.certainty.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.timing.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.execution_timing.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.witness_chain.as_ref().map_or(0, String::capacity))
+    }
+}
+
+/// The most effect derivations one assertion finding retains.
+///
+/// A violated group states its complete aggregate already; these exist so a
+/// reader can walk the chains behind it, exactly as the representative rows
+/// exist so a reader can walk to exact source ranges.
+const MAX_EFFECT_DERIVATIONS: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssertionFindingEvidence {
     anchor: super::finding_identity::AssertionFindingAnchor,
@@ -931,6 +1101,13 @@ pub struct AssertionFindingEvidence {
     observed: Option<String>,
     actual_count: u64,
     capability: Vec<PolicyCapability>,
+    /// The declared-effect chains behind the contributing rows, in the order
+    /// the evaluator retained the rows. Empty for every assertion whose rows
+    /// are not effect rows, which is every family but the effect relation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    effect_derivations: Vec<EffectDerivationEvidence>,
+    effect_derivations_truncated: bool,
+    omitted_effect_derivations_lower_bound: u64,
 }
 
 impl AssertionFindingEvidence {
@@ -944,6 +1121,8 @@ impl AssertionFindingEvidence {
         observed: Option<String>,
         actual_count: u64,
         mut capability: Vec<PolicyCapability>,
+        mut effect_derivations: Vec<EffectDerivationEvidence>,
+        omitted_effect_derivations_lower_bound: u64,
     ) -> Result<Self, ReportValueError> {
         if capability.len() > MAX_CAPABILITIES {
             return Err(ReportValueError::TooManyItems {
@@ -951,10 +1130,17 @@ impl AssertionFindingEvidence {
                 max_items: MAX_CAPABILITIES,
             });
         }
+        if effect_derivations.len() > MAX_EFFECT_DERIVATIONS {
+            return Err(ReportValueError::TooManyItems {
+                field: "assertion_effect_derivations",
+                max_items: MAX_EFFECT_DERIVATIONS,
+            });
+        }
         for entry in &capability {
             entry.validate()?;
         }
         tighten_vec(&mut capability);
+        tighten_vec(&mut effect_derivations);
         let mut assert_kind = assert_kind.into();
         let mut asserted_role = asserted_role.into();
         let mut expected_class = expected_class.into();
@@ -979,6 +1165,9 @@ impl AssertionFindingEvidence {
             observed,
             actual_count,
             capability,
+            effect_derivations,
+            effect_derivations_truncated: omitted_effect_derivations_lower_bound > 0,
+            omitted_effect_derivations_lower_bound,
         };
         if u64::try_from(evidence.retained_size()).unwrap_or(u64::MAX) > MAX_EVIDENCE_BYTES {
             return Err(ReportValueError::TooManyBytes {
@@ -1020,6 +1209,18 @@ impl AssertionFindingEvidence {
     pub fn capability(&self) -> &[PolicyCapability] {
         &self.capability
     }
+
+    pub fn effect_derivations(&self) -> &[EffectDerivationEvidence] {
+        &self.effect_derivations
+    }
+
+    pub const fn effect_derivations_truncated(&self) -> bool {
+        self.effect_derivations_truncated
+    }
+
+    pub const fn omitted_effect_derivations_lower_bound(&self) -> u64 {
+        self.omitted_effect_derivations_lower_bound
+    }
 }
 
 impl RetainedSize for AssertionFindingEvidence {
@@ -1036,6 +1237,7 @@ impl RetainedSize for AssertionFindingEvidence {
                     .map_or(0, |observed| observed.capacity()),
             )
             .saturating_add(retained_extra(&self.capability))
+            .saturating_add(retained_extra(&self.effect_derivations))
     }
 }
 
@@ -4951,6 +5153,50 @@ impl<'de> Deserialize<'de> for MatchFindingEvidence {
     }
 }
 
+impl<'de> Deserialize<'de> for EffectDerivationEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            effect_id: String,
+            classification: String,
+            derivation: String,
+            #[serde(default)]
+            certainty: Option<String>,
+            #[serde(default)]
+            timing: Option<String>,
+            #[serde(default)]
+            execution_timing: Option<String>,
+            #[serde(default)]
+            depth: Option<u64>,
+            coverage: String,
+            #[serde(default)]
+            witness_chain: Option<String>,
+            witness_steps: u64,
+            witness_truncated: bool,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(
+            wire.effect_id,
+            wire.classification,
+            wire.derivation,
+            wire.certainty,
+            wire.timing,
+            wire.execution_timing,
+            wire.depth,
+            wire.coverage,
+            wire.witness_chain,
+            wire.witness_steps,
+            wire.witness_truncated,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
 impl<'de> Deserialize<'de> for AssertionFindingEvidence {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -4968,9 +5214,18 @@ impl<'de> Deserialize<'de> for AssertionFindingEvidence {
             observed: Option<String>,
             actual_count: u64,
             capability: Vec<PolicyCapability>,
+            #[serde(default)]
+            effect_derivations: Vec<EffectDerivationEvidence>,
+            effect_derivations_truncated: bool,
+            omitted_effect_derivations_lower_bound: u64,
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        if wire.effect_derivations_truncated != (wire.omitted_effect_derivations_lower_bound > 0) {
+            return Err(de::Error::custom(
+                "assertion effect-derivation truncation disagrees with its omitted lower bound",
+            ));
+        }
         Self::try_new(
             wire.anchor,
             wire.assert_kind,
@@ -4980,6 +5235,8 @@ impl<'de> Deserialize<'de> for AssertionFindingEvidence {
             wire.observed,
             wire.actual_count,
             wire.capability,
+            wire.effect_derivations,
+            wire.omitted_effect_derivations_lower_bound,
         )
         .map_err(de::Error::custom)
     }
@@ -5484,6 +5741,8 @@ mod tests {
                 Some("one value reference".to_string()),
                 1,
                 vec![PolicyCapability::query_feature("rust", "occurrences").unwrap()],
+                Vec::new(),
+                0,
             )
             .unwrap(),
         }

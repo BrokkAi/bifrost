@@ -92,6 +92,7 @@ fn normalize_tree_sitter_clone_source(
     let Some(tree) = parser.parse(source, None) else {
         return (Vec::new(), String::new(), false);
     };
+    let tree = crate::analyzer::repaired_grammar_gap_tree(profile.language, source, tree);
 
     let mut normalized_tokens = Vec::new();
     let mut ast_labels = Vec::new();

@@ -14,6 +14,7 @@
 //! position, its own content, and its children's identifiers.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -24,10 +25,17 @@ use crate::finding_identity::PolicyFindingId;
 use crate::identity::PolicySemanticHash;
 use crate::retained::{RetainedSize, retained_extra};
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePathError;
 
 /// The versioned format tag every explanation document carries.
-pub const POLICY_EXPLANATION_FORMAT: &str = "bifrost_policy_explanation/v1";
+///
+/// `v2` added the `effect_derivation` node kind and the `workspace_generation`
+/// field (issue 3207). Both were additive, but a node kind that names an
+/// analysis derivation is exactly what a consumer of the effect reference
+/// policy switches on, so this one is versioned rather than folded into `v1`
+/// the way `relation_binding` and `derivation` were.
+pub const POLICY_EXPLANATION_FORMAT: &str = "bifrost_policy_explanation/v2";
 
 /// Domain separator for node identifiers. Changing the node encoding requires
 /// changing this string and the format tag together.
@@ -81,8 +89,11 @@ impl ExplanationQuestion {
 /// and `derivation` was added with the flow/taint adapter (issue 2497). Each
 /// addition is strictly additive -- no existing node changed kind, shape, or
 /// identity, and no previously emitted document contains the new tag -- so the
-/// format string stays `v1` (see the ExecPlan Decision Log for issue 2439
-/// slices 2-3).
+/// format string stayed `v1` for both (see the ExecPlan Decision Log for issue
+/// 2439 slices 2-3). `effect_derivation` (issue 3207) is additive in the same
+/// way but carries the format to `v2`, because an effect chain is the answer a
+/// consumer of the effect reference policy reads rather than one more interior
+/// node it can fall through on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplanationNodeKind {
@@ -100,6 +111,13 @@ pub enum ExplanationNodeKind {
     /// nothing about it was re-executed, and its order is the path's, not the
     /// plan's.
     Derivation,
+    /// One link of a declared-effect chain: the effect a contributing row
+    /// carries, the reviewed declaration it was declared by, the propagation
+    /// the analyzer walked to reach it, or the timing that classification was
+    /// composed under. An effect chain is not a solver witness -- nothing was
+    /// proved about a value -- and it is not a source fact, because its whole
+    /// content is the derivation between two procedures.
+    EffectDerivation,
     /// One authored assertion and the verdict its aggregate produced.
     Assertion,
     /// What the run's coverage does or does not license.
@@ -116,6 +134,7 @@ impl ExplanationNodeKind {
             Self::SelectorStage => "selector_stage",
             Self::RelationBinding => "relation_binding",
             Self::Derivation => "derivation",
+            Self::EffectDerivation => "effect_derivation",
             Self::Assertion => "assertion",
             Self::CoverageObligation => "coverage_obligation",
             Self::FindingProjection => "finding_projection",
@@ -403,6 +422,134 @@ impl RetainedSize for ExplanationTruncation {
     }
 }
 
+/// Bytes of a workspace generation. The analyzer's whole-workspace content
+/// identity is a SHA-256 digest, and this is its whole width.
+const GENERATION_BYTES: usize = 32;
+
+/// Which workspace an explanation is about.
+///
+/// A `why` answer re-evaluates the policy and a `why-not` answer re-executes
+/// bounded prefixes. Both read whatever the analyzer holds *now*, while the
+/// finding identity or candidate position a caller asks about came from a
+/// report produced over one exact workspace. Pinning the generation is how a
+/// caller states which one, so a workspace that moved between the report and
+/// the question is refused instead of silently answered about a different run
+/// (issues 2439 and 2509).
+///
+/// The value is the analyzer's own whole-workspace content identity: a digest
+/// over the analyzed file set, each language's analysis epoch, and the
+/// analyzer configuration. It carries no absolute path and no process-local
+/// counter, so it survives a process boundary and compares equal across two
+/// byte-equal checkouts -- which is exactly what a CLI invocation, an MCP
+/// request, and a library call need in order to mean the same thing by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExplanationGeneration([u8; GENERATION_BYTES]);
+
+impl ExplanationGeneration {
+    /// The generation `analyzer` is currently serving.
+    ///
+    /// `None` is an analyzer that attests no content identity at all. It is
+    /// never a match: a request that pinned a generation cannot be shown to be
+    /// about this workspace, so [`Self::require_current`] refuses it rather
+    /// than answering under an unproven assumption.
+    pub fn of(analyzer: &dyn IAnalyzer) -> Option<Self> {
+        analyzer
+            .workspace_content_identity()
+            .map(|identity| Self(*identity.as_bytes()))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; GENERATION_BYTES] {
+        &self.0
+    }
+
+    /// Refuse `requested` unless it is the generation `analyzer` serves.
+    ///
+    /// An absent request is today's contract and answers about whatever the
+    /// analyzer holds; the caller simply did not ask for the guarantee.
+    ///
+    /// # Errors
+    ///
+    /// [`ExplainError::StaleWorkspaceGeneration`] when the pinned generation
+    /// is not the analyzer's, including when the analyzer attests none.
+    pub fn require_current(
+        requested: Option<Self>,
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<(), ExplainError> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let current = Self::of(analyzer);
+        if current == Some(requested) {
+            return Ok(());
+        }
+        Err(ExplainError::StaleWorkspaceGeneration { requested, current })
+    }
+}
+
+impl fmt::Display for ExplanationGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ExplanationGeneration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+/// Why a spelling is not a workspace generation. The message is diagnostic
+/// text for a caller that mistyped a flag or an argument; nothing parses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplanationGenerationParseError;
+
+impl fmt::Display for ExplanationGenerationParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a workspace generation is {} lowercase hex characters",
+            GENERATION_BYTES * 2
+        )
+    }
+}
+
+impl std::error::Error for ExplanationGenerationParseError {}
+
+impl FromStr for ExplanationGeneration {
+    type Err = ExplanationGenerationParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.len() != GENERATION_BYTES * 2 {
+            return Err(ExplanationGenerationParseError);
+        }
+        let mut bytes = [0u8; GENERATION_BYTES];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let pair = text
+                .get(index * 2..index * 2 + 2)
+                .ok_or(ExplanationGenerationParseError)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| ExplanationGenerationParseError)?;
+        }
+        // `from_str_radix` admits `+7f` and uppercase; the rendering is exactly
+        // lowercase hex, so a value that does not round-trip is not one of ours.
+        if Self(bytes).to_string() != text {
+            return Err(ExplanationGenerationParseError);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl RetainedSize for ExplanationGeneration {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
 /// A complete explanation document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyExplanation {
@@ -416,6 +563,11 @@ pub struct PolicyExplanation {
     node_count: u64,
     root: ExplanationNode,
     truncation: ExplanationTruncation,
+    /// The workspace generation this answer was produced under, when the
+    /// surface that produced it knew one. A caller reads it once and pins it
+    /// on every later question about the same report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_generation: Option<ExplanationGeneration>,
 }
 
 impl PolicyExplanation {
@@ -449,6 +601,23 @@ impl PolicyExplanation {
     }
     pub const fn truncation(&self) -> &ExplanationTruncation {
         &self.truncation
+    }
+    pub const fn workspace_generation(&self) -> Option<ExplanationGeneration> {
+        self.workspace_generation
+    }
+
+    /// State the workspace generation this answer was produced under.
+    ///
+    /// Set at the host boundary rather than threaded through every adapter:
+    /// the adapters read a retained run or a bounded prefix and none of them
+    /// owns an analyzer, while the boundary that opened the workspace does.
+    #[must_use]
+    pub(super) const fn answered_under(
+        mut self,
+        generation: Option<ExplanationGeneration>,
+    ) -> Self {
+        self.workspace_generation = generation;
+        self
     }
 
     /// Every retained node in deterministic pre-order, root first.
@@ -628,6 +797,7 @@ impl ExplanationBudgetLimit {
 pub const WHY_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] = &[
     PolicyAnalysisType::Match,
     PolicyAnalysisType::Taint,
+    PolicyAnalysisType::Typestate,
     PolicyAnalysisType::Assertion,
     PolicyAnalysisType::Flow,
 ];
@@ -653,6 +823,17 @@ pub const NEAR_MISS_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
 pub enum ExplainError {
     /// No retained finding in the run carries this identity.
     FindingNotFound { finding: PolicyFindingId },
+    /// The request pinned a workspace generation this analyzer is not serving,
+    /// so the answer would be about a different workspace than the report the
+    /// subject came from.
+    ///
+    /// `current` is `None` when the analyzer attests no content identity at
+    /// all. That is refused for the same reason a mismatch is: the request
+    /// asked for a guarantee nothing here can establish.
+    StaleWorkspaceGeneration {
+        requested: ExplanationGeneration,
+        current: Option<ExplanationGeneration>,
+    },
     /// This policy family has no explanation adapter for this question yet.
     ///
     /// `supported` names the families that *do* have one, so a caller learns
@@ -719,6 +900,18 @@ impl fmt::Display for ExplainError {
                     "the run retains no finding with identity {finding}"
                 )
             }
+            Self::StaleWorkspaceGeneration { requested, current } => match current {
+                Some(current) => write!(
+                    formatter,
+                    "the request pinned workspace generation {requested}, \
+                     but the analyzer is serving {current}"
+                ),
+                None => write!(
+                    formatter,
+                    "the request pinned workspace generation {requested}, \
+                     but the analyzer attests no workspace generation"
+                ),
+            },
             Self::ExplanationAdapterUnavailable {
                 analysis_type,
                 question,
@@ -939,6 +1132,7 @@ pub(super) fn build_explanation(
         node_count,
         root,
         truncation,
+        workspace_generation: None,
     })
 }
 

@@ -248,13 +248,44 @@ fn set_parser_for_file<A: LanguageAdapter + ?Sized>(
     }
 }
 
+/// The tree the rest of the pipeline must use for `source`.
+///
+/// A language whose bundled grammar cannot represent some of its own syntax
+/// answers `reparse_grammar_gap` with a repaired tree; every other language
+/// keeps the tree it was parsed into. Applied at every parse the analyzer
+/// drives, so a declaration walk, a prepared syntax tree, and a complexity
+/// walk cannot disagree about one file's node ranges.
+///
+/// `bound` is the deadline the first parse already ran under, carried in a
+/// child token so the repair cannot extend a budget the caller documented: the
+/// child shares explicit cancellation with `cancellation` and adds the
+/// deadline. A caller whose own parse was unbounded passes `None` and the
+/// repair is likewise unbounded, which is the honest reading of that site.
+fn tree_after_grammar_gap_repair<A: LanguageAdapter + ?Sized>(
+    adapter: &A,
+    source: &str,
+    tree: Tree,
+    cancellation: Option<&CancellationToken>,
+    bound: Option<Instant>,
+) -> Tree {
+    let bounded = bound.map(|deadline| {
+        cancellation
+            .cloned()
+            .unwrap_or_default()
+            .with_deadline(deadline)
+    });
+    let token = bounded.as_ref().or(cancellation);
+    adapter
+        .reparse_grammar_gap(source, &tree, token)
+        .unwrap_or(tree)
+}
+
 fn parse_complete_file_bounded(
     parser: &mut Parser,
     source: &str,
     cancellation: Option<&CancellationToken>,
-    budget: Duration,
+    deadline: Instant,
 ) -> BoundedParse {
-    let deadline = Instant::now() + budget;
     let mut timed_out = false;
     let mut read = |offset: usize, _| &source.as_bytes()[offset..];
     let mut progress = |_: &tree_sitter::ParseState| {
@@ -831,6 +862,23 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         _file: &ProjectFile,
         _source: &str,
     ) -> Option<Vec<tree_sitter::Range>> {
+        None
+    }
+    /// A tree re-parsed around syntax the bundled grammar cannot represent, or
+    /// `None` when the tree this adapter was handed stands as parsed.
+    ///
+    /// Only Go overrides this. tree-sitter-go models `new` as a keyword whose
+    /// argument must be a type, so Go 1.26's `new(expr)` fails to parse and the
+    /// recovery swallows the expression -- and, in an assignment, the statement
+    /// that follows (issue #3325). Unlike C#'s pre-parse above, only a tree can
+    /// say whether a file contains that shape, so this runs after the parse and
+    /// an intact file never pays for a second one.
+    fn reparse_grammar_gap(
+        &self,
+        _source: &str,
+        _tree: &Tree,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<Tree> {
         None
     }
     /// The storage key this specific `file` was (or would be) persisted
@@ -3979,8 +4027,13 @@ where
         if !set_parser_for_file(parser, adapter, file, source.as_str()) {
             return None;
         }
-        let tree = match parse_complete_file_bounded(parser, &source, None, budget) {
-            BoundedParse::Complete(tree) => tree,
+        // One deadline for the parse and for any repair that follows it, so the
+        // budget this function documents bounds both.
+        let deadline = Instant::now() + budget;
+        let tree = match parse_complete_file_bounded(parser, &source, None, deadline) {
+            BoundedParse::Complete(tree) => {
+                tree_after_grammar_gap_repair(adapter, source.as_str(), tree, None, Some(deadline))
+            }
             BoundedParse::TimedOut => {
                 let mut parsed = ParsedFile::new(String::new());
                 parsed.add_file_scope(file, &source);
@@ -6993,18 +7046,21 @@ where
         }
         self.record_file_tier_access(InformationTier::Syntax, file);
         let exact_source = source.source();
-        let tree = match parse_complete_file_bounded(
-            &mut parser,
-            exact_source,
-            cancellation,
-            COMPLETE_FILE_PARSE_BUDGET,
-        ) {
-            BoundedParse::Complete(tree) => tree,
-            BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
-            BoundedParse::TimedOut | BoundedParse::Rejected => {
-                return PreparedSyntaxPreparation::Complete(None);
-            }
-        };
+        let deadline = Instant::now() + COMPLETE_FILE_PARSE_BUDGET;
+        let tree =
+            match parse_complete_file_bounded(&mut parser, exact_source, cancellation, deadline) {
+                BoundedParse::Complete(tree) => tree_after_grammar_gap_repair(
+                    self.adapter.as_ref(),
+                    exact_source,
+                    tree,
+                    cancellation,
+                    Some(deadline),
+                ),
+                BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
+                BoundedParse::TimedOut | BoundedParse::Rejected => {
+                    return PreparedSyntaxPreparation::Complete(None);
+                }
+            };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxPreparation::Cancelled;
         }
@@ -14285,6 +14341,9 @@ where
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();
         };
+        // This walk's own parse is unbounded, so the repair is too rather than
+        // claiming a budget this site never had.
+        let tree = tree_after_grammar_gap_repair(self.adapter.as_ref(), source, tree, None, None);
         let root = tree.root_node();
 
         // Walk the declared code-unit hierarchy to enumerate every function

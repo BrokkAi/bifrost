@@ -7,7 +7,9 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, WalkControl, node_range, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -77,7 +79,8 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
 
 /// The type declaration whose body is currently being walked.
 #[derive(Clone)]
-struct CSharpEnclosingType {
+struct CSharpEnclosingType<'tree> {
+    declaration: Node<'tree>,
     unit: CodeUnit,
     /// The type declaration's own `name` field text, exactly as written. This is
     /// neither `unit.short_name()` (which carries the `Outer$` nesting prefix)
@@ -88,15 +91,26 @@ struct CSharpEnclosingType {
 }
 
 #[derive(Clone)]
-struct CSharpScope {
+struct CSharpScope<'tree> {
     package_name: String,
     lexical_scope: Vec<String>,
-    enclosing_type: Option<CSharpEnclosingType>,
+    enclosing_type: Option<CSharpEnclosingType<'tree>>,
 }
 
-struct CSharpWork<'tree> {
-    node: Node<'tree>,
-    scope: CSharpScope,
+/// One node the declaration walk still owes a visit.
+enum CSharpWork<'tree> {
+    /// A node visited in the scope its lexical position gives it.
+    Node {
+        node: Node<'tree>,
+        scope: CSharpScope<'tree>,
+    },
+    /// A member declaration parser recovery detached from a type body, visited
+    /// in the member scope of the type that really owns it. See
+    /// [`CSharpVisitor::truncated_type_member_scope`].
+    RecoveredMember {
+        node: Node<'tree>,
+        scope: CSharpScope<'tree>,
+    },
 }
 
 struct CSharpVisitor<'context, 'tree> {
@@ -119,14 +133,19 @@ impl CSharpVisitor<'_, '_> {
             &mut stack,
         );
         while let Some(work) = stack.pop() {
-            self.visit_node(work.node, &work.scope, &mut stack);
+            match work {
+                CSharpWork::Node { node, scope } => self.visit_node(node, &scope, &mut stack),
+                CSharpWork::RecoveredMember { node, scope } => {
+                    self.visit_recovered_member(node, &scope)
+                }
+            }
         }
     }
 
     fn push_children<'tree>(
         &self,
         node: Node<'tree>,
-        scope: CSharpScope,
+        scope: CSharpScope<'tree>,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
         let mut cursor = node.walk();
@@ -136,29 +155,124 @@ impl CSharpVisitor<'_, '_> {
         // it so their package_name is populated. Block namespaces keep a body and flow
         // through `queue_namespace`.
         let mut current = scope;
-        let mut scoped: Vec<(Node<'tree>, CSharpScope)> = Vec::with_capacity(children.len());
+        let mut scoped: Vec<CSharpWork<'tree>> = Vec::with_capacity(children.len());
+        // The type declaration a following `global_statement` would belong to
+        // if parser recovery truncated it, read through
+        // `truncated_type_member_scope` only when such a statement actually
+        // arrives. Only a declaration container resets it: recovery leaves
+        // stray `}` ERROR siblings between the statements it detached, and
+        // those say nothing about ownership.
+        let mut preceding_type: Option<Node<'tree>> = None;
         for child in children {
-            if child.kind() == "file_scoped_namespace_declaration" {
-                if let Some(namespace_path) = self.namespace_scope_path(child) {
-                    let package_name =
-                        csharp_join_namespace(&current.package_name, &namespace_path);
-                    let mut lexical_scope = current.lexical_scope.clone();
-                    lexical_scope.extend(namespace_path);
-                    current = CSharpScope {
-                        package_name,
-                        lexical_scope,
-                        enclosing_type: current.enclosing_type.clone(),
-                    };
+            match child.kind() {
+                "file_scoped_namespace_declaration" => {
+                    if let Some(namespace_path) = self.namespace_scope_path(child) {
+                        let package_name =
+                            csharp_join_namespace(&current.package_name, &namespace_path);
+                        let mut lexical_scope = current.lexical_scope.clone();
+                        lexical_scope.extend(namespace_path);
+                        current = CSharpScope {
+                            package_name,
+                            lexical_scope,
+                            enclosing_type: current.enclosing_type.clone(),
+                        };
+                    }
+                    preceding_type = None;
+                    continue;
                 }
-                continue;
+                "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "record_struct_declaration" => preceding_type = Some(child),
+                "namespace_declaration" => preceding_type = None,
+                "global_statement" => {
+                    if let Some(owner) = preceding_type
+                        && let Some(member) = csharp_recovered_type_member(child)
+                        && let Some(member_scope) =
+                            self.truncated_type_member_scope(owner, &current)
+                    {
+                        scoped.push(CSharpWork::RecoveredMember {
+                            node: member,
+                            scope: member_scope,
+                        });
+                        continue;
+                    }
+                }
+                _ => {}
             }
-            scoped.push((child, current.clone()));
-        }
-        for (child, child_scope) in scoped.into_iter().rev() {
-            stack.push(CSharpWork {
+            scoped.push(CSharpWork::Node {
                 node: child,
-                scope: child_scope,
+                scope: current.clone(),
             });
+        }
+        for work in scoped.into_iter().rev() {
+            stack.push(work);
+        }
+    }
+
+    /// The member scope of `node` when parser recovery truncated its body, or
+    /// `None` when the body parsed cleanly.
+    ///
+    /// C# permits top-level statements only before the file's type and
+    /// namespace declarations, and forbids them outright in a file with a
+    /// file-scoped namespace, so a `global_statement` that follows a type whose
+    /// own subtree carries a parse error is the remainder of that type's body
+    /// rather than a program entry point. The scope this returns is the same
+    /// one [`Self::visit_type_declaration`] builds for the members that stayed
+    /// inside the body, so an adopted member is indexed exactly as its
+    /// surviving siblings are.
+    ///
+    /// What truncates a body in practice, and what this cannot repair
+    /// (#3326): `brokk-tree-sitter-c-sharp` 0.23.6 lists `async`, `file` and
+    /// `scoped` in `_reserved_identifier` but not `partial` or `required`, so
+    /// a statement that opens with either of those as an ordinary identifier
+    /// (`partial.State = ...;` in StockSharp's `CandleBuilderManager.cs`)
+    /// lexes as a modifier list, and the recovery that follows spends the
+    /// brace that would have closed the method on the class instead. Only the
+    /// declarations recovery re-emits as whole statements come back here; the
+    /// statements inside the method it derailed stay `ERROR` soup, and a
+    /// detached field, property, constructor or nested type keeps whatever
+    /// top-level shape recovery gave it. Repairing those needs the grammar to
+    /// accept both contextual keywords as identifiers.
+    fn truncated_type_member_scope<'tree>(
+        &self,
+        node: Node<'tree>,
+        scope: &CSharpScope<'tree>,
+    ) -> Option<CSharpScope<'tree>> {
+        if !node.has_error() {
+            return None;
+        }
+        let (unit, declared_name, identity_name) =
+            csharp_type_code_unit(self.file, self.source, node, scope)?;
+        let mut lexical_scope = scope.lexical_scope.clone();
+        lexical_scope.push(identity_name);
+        Some(CSharpScope {
+            package_name: scope.package_name.clone(),
+            lexical_scope,
+            enclosing_type: Some(CSharpEnclosingType {
+                declaration: node,
+                unit,
+                declared_name,
+            }),
+        })
+    }
+
+    /// Index a member declaration parser recovery detached from its type body.
+    ///
+    /// The member is indexed exactly as if it had stayed in the body, and the
+    /// owner's recorded range grows to contain it: a container that adopts a
+    /// member must contain it (#3291).
+    fn visit_recovered_member(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
+        let owner = &scope
+            .enclosing_type
+            .as_ref()
+            .expect("a recovered member carries the member scope of the type that owns it")
+            .unit;
+        if self.visit_method(node, scope).is_some() {
+            self.parsed
+                .extend_declaration_range(owner, node_range(node));
         }
     }
 
@@ -169,7 +283,7 @@ impl CSharpVisitor<'_, '_> {
     fn visit_node<'tree>(
         &mut self,
         node: Node<'tree>,
-        scope: &CSharpScope,
+        scope: &CSharpScope<'tree>,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
         match node.kind() {
@@ -182,7 +296,9 @@ impl CSharpVisitor<'_, '_> {
             | "enum_declaration"
             | "record_declaration"
             | "record_struct_declaration" => self.visit_type_declaration(node, scope, stack),
-            "method_declaration" => self.visit_method(node, scope),
+            "method_declaration" => {
+                self.visit_method(node, scope);
+            }
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
             "field_declaration" => self.visit_field_declaration(node, scope),
@@ -205,7 +321,7 @@ impl CSharpVisitor<'_, '_> {
     fn queue_namespace<'tree>(
         &mut self,
         node: Node<'tree>,
-        scope: &CSharpScope,
+        scope: &CSharpScope<'tree>,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
         let Some(namespace_path) = self.namespace_scope_path(node) else {
@@ -230,7 +346,7 @@ impl CSharpVisitor<'_, '_> {
     fn visit_type_declaration<'tree>(
         &mut self,
         node: Node<'tree>,
-        scope: &CSharpScope,
+        scope: &CSharpScope<'tree>,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
         let Some((code_unit, name, identity_name)) =
@@ -281,6 +397,7 @@ impl CSharpVisitor<'_, '_> {
                     package_name: scope.package_name.clone(),
                     lexical_scope,
                     enclosing_type: Some(CSharpEnclosingType {
+                        declaration: node,
                         unit: code_unit,
                         declared_name: name,
                     }),
@@ -290,20 +407,19 @@ impl CSharpVisitor<'_, '_> {
         }
     }
 
-    fn visit_method(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(enclosing) = &scope.enclosing_type else {
-            return;
-        };
+    /// Index one callable member of `scope`'s enclosing type, and report the
+    /// unit it minted so a caller that adopted the declaration can grow the
+    /// owner's range with it.
+    fn visit_method(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) -> Option<CodeUnit> {
+        let enclosing = scope.enclosing_type.as_ref()?;
         let parent = &enclosing.unit;
         if csharp_method_has_runnable_test_attribute(node, self.source) {
             self.parsed.mark_test_region(parent);
         }
-        let Some(name_node) = node.child_by_field_name("name") else {
-            return;
-        };
+        let name_node = node.child_by_field_name("name")?;
         let name = cs_ident_text(name_node, self.source);
         if name.is_empty() {
-            return;
+            return None;
         }
         let signature_key = csharp_method_signature_key(node, self.source);
         let fq = parent
@@ -328,7 +444,7 @@ impl CSharpVisitor<'_, '_> {
         );
         let signature = csharp_method_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
-            code_unit,
+            code_unit.clone(),
             csharp_signature_metadata(
                 signature,
                 node,
@@ -336,16 +452,25 @@ impl CSharpVisitor<'_, '_> {
                 &scope.lexical_scope,
                 self.ancestry,
             )
+            .with_dispatch_extensibility(crate::syntax::csharp_type_member_dispatch_extensibility(
+                self.source,
+                node,
+                csharp_has_modifier(self.source, node, "static"),
+                Some(enclosing.declaration),
+            ))
             .with_callable_modifiers(
                 csharp_has_modifier(self.source, node, "static"),
                 false,
                 csharp_declared_visibility(
                     node,
                     self.source,
-                    csharp_default_member_visibility(node, self.ancestry),
+                    crate::syntax::csharp_type_member_default_visibility(Some(
+                        enclosing.declaration,
+                    )),
                 ),
             ),
         );
+        Some(code_unit)
     }
 
     /// A primary constructor (`record Point(int X, int Y)`, and the C# 12
@@ -363,7 +488,7 @@ impl CSharpVisitor<'_, '_> {
     fn visit_primary_constructor(
         &mut self,
         node: Node<'_>,
-        scope: &CSharpScope,
+        scope: &CSharpScope<'_>,
         parent: &CodeUnit,
         declared_name: &str,
     ) {
@@ -418,7 +543,7 @@ impl CSharpVisitor<'_, '_> {
         );
     }
 
-    fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
         let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
@@ -480,7 +605,7 @@ impl CSharpVisitor<'_, '_> {
         );
     }
 
-    fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
         let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
@@ -523,7 +648,7 @@ impl CSharpVisitor<'_, '_> {
         );
     }
 
-    fn visit_field_declaration(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn visit_field_declaration(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
         let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
@@ -587,7 +712,7 @@ impl CSharpVisitor<'_, '_> {
         }
     }
 
-    fn visit_enum_member(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn visit_enum_member(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
         let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
@@ -631,11 +756,33 @@ fn csharp_namespace_path_from_declaration(node: Node<'_>, source: &str) -> Optio
     csharp_namespace_path(name_node, source)
 }
 
+/// The member declaration a top-level `global_statement` holds when parser
+/// recovery detached it from a type body, or `None` when the statement holds
+/// no declaration this walk can place.
+///
+/// Only the statement's own `local_function_statement` qualifies. A local
+/// function nested deeper inside a detached statement is a genuine local
+/// function of the method the recovery lost, and a field, property or
+/// constructor reaches the top level wearing a shape a genuine top-level
+/// statement spells the same way -- `local_declaration_statement` for both a
+/// field and a `var`, a bare `block` for a constructor body -- so those stay
+/// unowned rather than guessed at.
+fn csharp_recovered_type_member(node: Node<'_>) -> Option<Node<'_>> {
+    debug_assert_eq!(
+        node.kind(),
+        "global_statement",
+        "only a top-level statement can hold a detached member"
+    );
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "local_function_statement")
+}
+
 fn csharp_type_code_unit(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    scope: &CSharpScope,
+    scope: &CSharpScope<'_>,
 ) -> Option<(CodeUnit, String, String)> {
     let name_node = node.child_by_field_name("name")?;
     let name = cs_ident_text(name_node, source);
@@ -1720,6 +1867,32 @@ mod grammar_regression_tests {
                 "ArrayConverterCore.F",
                 "ArrayConverterCore.Write",
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovered_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_virtual_member_retains_open_dispatch() {
+        let source = "class Box { void Broken() { var required = Make(); required = required.Clone(); } public virtual void Recovered() {} }";
+        let tree = crate::preprocessor::parse_csharp(source).unwrap();
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "Box.cs");
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let method = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.identifier() == "Recovered")
+            .expect("the recovered method must be published");
+        assert_eq!(method.short_name(), "Box.Recovered");
+        let metadata = &parsed.signature_metadata[method];
+        assert!(
+            metadata
+                .iter()
+                .all(|row| row.dispatch_extensibility() == Some(DispatchExtensibility::Open)),
+            "a recovered virtual member remains open: {metadata:?}"
         );
     }
 }

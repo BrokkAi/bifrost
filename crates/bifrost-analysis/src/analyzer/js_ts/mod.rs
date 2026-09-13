@@ -665,8 +665,17 @@ impl LanguageSupport for JavascriptSupport {
         true
     }
 
-    fn parser_language(&self, _flavor: ParserFlavor) -> tree_sitter::Language {
-        tree_sitter_javascript::LANGUAGE.into()
+    /// `.jsx` parses under the TSX grammar. tree-sitter-javascript's
+    /// `_jsx_attribute_name` admits only `identifier`/`jsx_identifier`, so a
+    /// reserved word as an attribute name (`class=`, `for=`, `in=`) leaves the
+    /// rest of the enclosing expression as `ERROR` and `regex_pattern` soup and
+    /// every declaration and usage below it is lost; the TSX grammar has no
+    /// reserved words in that position (#3322).
+    fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language {
+        match flavor {
+            ParserFlavor::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ParserFlavor::Default => tree_sitter_javascript::LANGUAGE.into(),
+        }
     }
 
     fn publishes_single_segment_external_owners(&self) -> bool {
@@ -795,7 +804,7 @@ impl LanguageSupport for TypescriptSupport {
     /// the TSX grammar while sharing the TypeScript adapter and structural spec.
     fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language {
         match flavor {
-            ParserFlavor::TypeScriptTsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            ParserFlavor::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             ParserFlavor::Default => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         }
     }

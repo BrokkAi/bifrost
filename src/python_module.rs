@@ -100,7 +100,10 @@ impl SearchToolsNativeSession {
 
 fn service_error_to_py(err: SearchToolsServiceError) -> PyErr {
     match err.code {
-        SearchToolsServiceErrorCode::InvalidParams => PyValueError::new_err(err.message),
+        SearchToolsServiceErrorCode::InvalidParams
+        | SearchToolsServiceErrorCode::StaleWorkspaceGeneration { .. } => {
+            PyValueError::new_err(err.message)
+        }
         SearchToolsServiceErrorCode::UnknownTool
         | SearchToolsServiceErrorCode::DeadlineExceeded
         | SearchToolsServiceErrorCode::Internal => PyRuntimeError::new_err(err.message),

@@ -2167,3 +2167,146 @@ fn xml_configuration_recovered_document_stays_typed_incomplete() {
     );
     assert!(!run.diagnostics().is_empty(), "{run:#?}");
 }
+
+fn configuration_toml_fixture(
+    body: &str,
+) -> (
+    crate::inline_project::BuiltInlineTestProject,
+    TypescriptAnalyzer,
+    String,
+) {
+    let project = crate::inline_project::InlineTestProject::with_language(Language::TypeScript)
+        .file("server.toml", body)
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer, body.to_string())
+}
+
+fn toml_configuration_policy_source(route: &str) -> String {
+    format!(
+        r#"(policy
+      :id "test.toml-configuration-fact"
+      :name "TOML configuration fact"
+      :message "Matched TOML server host"
+      :severity warning
+      :analysis (analysis
+        :type match
+        :selector (rql (configuration-facts
+          :format toml
+          :node-kind member
+          :role table_entry
+          :scalar-kind string
+          :key "host"
+          :route [[{route}]]))))"#
+    )
+}
+
+fn evaluate_toml_configuration_selector_policy(
+    analyzer: &TypescriptAnalyzer,
+    source: &str,
+) -> PolicyRun {
+    let registry = policy_registry("test:toml-configuration-fact", source);
+    let policy = registry.policies().next().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+    };
+    let mut budget = PolicyBudget::default();
+    DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut budget)
+        .unwrap()
+}
+
+#[test]
+fn toml_configuration_selector_policy_anchors_dotted_and_indexed_routes() {
+    let source = r#"[server]
+host = "primary.example"
+hostname = "near-miss.example"
+
+[[route]]
+host = "health.example"
+"#;
+    let (_temp, analyzer, source) = configuration_toml_fixture(source);
+
+    let table_run = evaluate_toml_configuration_selector_policy(
+        &analyzer,
+        &toml_configuration_policy_source(r#"(key "server") (key "host")"#),
+    );
+    assert_eq!(
+        table_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{table_run:#?}"
+    );
+    assert_eq!(table_run.findings().len(), 1, "{table_run:#?}");
+    let finding = &table_run.findings()[0];
+    assert!(
+        finding.primary().path().ends_with("server.toml"),
+        "{finding:#?}"
+    );
+    let member_start = source
+        .find("host = \"primary.example\"")
+        .expect("host member");
+    assert_eq!(
+        finding
+            .primary()
+            .byte_span()
+            .map(|span| span.start()..span.end()),
+        Some(member_start as u64..(member_start + "host = \"primary.example\"".len()) as u64),
+        "{finding:#?}"
+    );
+
+    // The same key under an array of tables is a different route, and the
+    // index segment is required to reach it.
+    let indexed_run = evaluate_toml_configuration_selector_policy(
+        &analyzer,
+        &toml_configuration_policy_source(r#"(key "route") (index 0) (key "host")"#),
+    );
+    assert_eq!(
+        indexed_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{indexed_run:#?}"
+    );
+    assert_eq!(indexed_run.findings().len(), 1, "{indexed_run:#?}");
+    assert_ne!(indexed_run.findings()[0].id(), finding.id());
+
+    let near_miss_run = evaluate_toml_configuration_selector_policy(
+        &analyzer,
+        &toml_configuration_policy_source(r#"(key "route") (key "host")"#),
+    );
+    assert_eq!(
+        near_miss_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{near_miss_run:#?}"
+    );
+    assert!(near_miss_run.findings().is_empty(), "{near_miss_run:#?}");
+}
+
+#[test]
+fn toml_configuration_rejected_document_stays_typed_inconclusive() {
+    // A duplicate key is a TOML error, so no authored row survives and the
+    // run must report absence of evidence rather than a clean pass.
+    let (_temp, analyzer, _source) =
+        configuration_toml_fixture("[server]\nhost = \"one\"\nhost = \"two\"\n");
+    let run = evaluate_toml_configuration_selector_policy(
+        &analyzer,
+        &toml_configuration_policy_source(r#"(key "server") (key "host")"#),
+    );
+
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{run:#?}"
+    );
+    assert!(run.findings().is_empty(), "{run:#?}");
+    // The gap is the rejected document itself, not a missing adapter.
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("malformed syntax")),
+        "{run:#?}"
+    );
+}

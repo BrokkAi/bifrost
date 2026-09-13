@@ -210,16 +210,31 @@ impl Language {
 
 /// A source language plus the dialect needed to interpret one file.
 ///
-/// Most languages have one grammar and one set of scoping rules. Two are
+/// Most languages have one grammar and one set of scoping rules. Three are
 /// exceptions:
 ///
 /// - TypeScript, because `.ts` and `.tsx` files use distinct tree-sitter
 ///   grammars while sharing the same normalized language adapter.
+/// - JavaScript, because tree-sitter-javascript cannot parse a reserved word
+///   as a JSX attribute name -- `_jsx_attribute_name` admits only `identifier`
+///   and `jsx_identifier`, and every one of the grammar's 32 global reserved
+///   words plus `null`/`true`/`false` is therefore outside it. `class=`,
+///   `for=`, `in=` and friends are ordinary in JSX that targets web
+///   components, Preact or Vue, and error recovery does not fail locally: one
+///   `<div class="x">` folds the rest of the expression into `ERROR` and
+///   `regex_pattern` soup, losing every declaration and usage below it
+///   (#3322). The TSX grammar has no reserved words in that position and
+///   accepts the same source, so `.jsx` is parsed with it.
 /// - C++, because `Language::Cpp` also claims C. A `.c` file is parsed with the
 ///   same tree-sitter-cpp grammar but obeys C scoping rules, most visibly that
 ///   a struct/union/enum tag declared inside another aggregate's member list
 ///   has the scope of the outer declaration rather than a nested one
 ///   (C17 6.2.1, 6.7.2.3).
+///
+/// A dialect is always derived from the path alone, never from the file's
+/// contents: it selects the analyzer store's language key, and
+/// `LanguageAdapter::storage_language_key_for_file` is asked for a key before
+/// any source is read.
 ///
 /// Resolving a dialect to an actual `tree_sitter::Language` needs the grammar
 /// registry, which is `brokk-bifrost-analysis` machinery: see
@@ -228,6 +243,9 @@ impl Language {
 pub enum LanguageDialect {
     Standard(Language),
     TypeScriptTsx,
+    /// A JavaScript file parsed with the TSX grammar, which accepts the JSX
+    /// attribute names tree-sitter-javascript rejects.
+    JavaScriptJsx,
     /// A translation unit compiled as C rather than C++.
     CppC,
 }
@@ -246,6 +264,12 @@ impl LanguageDialect {
         ) {
             return Some(Self::TypeScriptTsx);
         }
+        if matches!(
+            normalized.as_str(),
+            "jsx" | "javascriptreact" | "javascriptjsx"
+        ) {
+            return Some(Self::JavaScriptJsx);
+        }
         // Plain `c` stays a spelling of `Language::Cpp` (it is one of that
         // language's extensions), so the C dialect needs its own label.
         if normalized.as_str() == "cppc" {
@@ -262,6 +286,11 @@ impl LanguageDialect {
         {
             return Self::TypeScriptTsx;
         }
+        if language == Language::JavaScript
+            && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("jsx"))
+        {
+            return Self::JavaScriptJsx;
+        }
         // Exactly lowercase `.c`, never case-insensitively: `.C` conventionally
         // means C++ and must keep C++ semantics. Every other C/C++ extension,
         // headers included, has no intrinsic compilation language and stays on
@@ -276,6 +305,7 @@ impl LanguageDialect {
         match self {
             Self::Standard(language) => language,
             Self::TypeScriptTsx => Language::TypeScript,
+            Self::JavaScriptJsx => Language::JavaScript,
             Self::CppC => Language::Cpp,
         }
     }
@@ -287,19 +317,22 @@ impl LanguageDialect {
         match self {
             Self::Standard(language) => language.config_label(),
             Self::TypeScriptTsx => "typescript-tsx",
+            Self::JavaScriptJsx => "javascript-jsx",
             Self::CppC => "cpp-c",
         }
     }
 
     /// Language identity used to select semantic-pack content.
     ///
-    /// TSX needs its own durable dialect identity for parsing and indexed
-    /// artifacts, but TypeScript procedure summaries describe the same runtime
-    /// APIs in `.ts` and `.tsx` files. Keep the dialect label everywhere else
-    /// and fold it only at the semantic-pack boundary.
+    /// TSX and JSX need their own durable dialect identities for parsing and
+    /// indexed artifacts, but TypeScript and JavaScript procedure summaries
+    /// describe the same runtime APIs whichever grammar read the file. Keep the
+    /// dialect label everywhere else and fold it only at the semantic-pack
+    /// boundary.
     pub fn semantic_pack_label(self) -> &'static str {
         match self {
             Self::TypeScriptTsx => Language::TypeScript.config_label(),
+            Self::JavaScriptJsx => Language::JavaScript.config_label(),
             Self::Standard(_) | Self::CppC => self.stable_label(),
         }
     }
@@ -309,6 +342,7 @@ impl LanguageDialect {
         match self {
             Self::Standard(language) => language.config_label(),
             Self::TypeScriptTsx => "tsx",
+            Self::JavaScriptJsx => "jsx",
             // Not `c`: `Language::from_config_label("c")` already answers
             // `Language::Cpp`, so the short spelling belongs to the language.
             Self::CppC => "cpp-c",
@@ -319,7 +353,7 @@ impl LanguageDialect {
         Language::ANALYZABLE
             .iter()
             .map(|language| language.config_label())
-            .chain(["tsx", "cpp-c"])
+            .chain(["tsx", "jsx", "cpp-c"])
     }
 }
 
@@ -340,7 +374,7 @@ mod language_dialect_tests {
     use super::*;
 
     #[test]
-    fn semantic_pack_identity_folds_only_typescript_tsx() {
+    fn semantic_pack_identity_folds_the_grammar_only_dialects() {
         assert_eq!(
             LanguageDialect::TypeScriptTsx.stable_label(),
             "typescript-tsx"
@@ -353,7 +387,41 @@ mod language_dialect_tests {
             LanguageDialect::Standard(Language::TypeScript).semantic_pack_label(),
             "typescript"
         );
+        assert_eq!(
+            LanguageDialect::JavaScriptJsx.stable_label(),
+            "javascript-jsx"
+        );
+        assert_eq!(
+            LanguageDialect::JavaScriptJsx.semantic_pack_label(),
+            "javascript"
+        );
         assert_eq!(LanguageDialect::CppC.semantic_pack_label(), "cpp-c");
+    }
+
+    /// `.jsx` selects the TSX grammar, and it does so from the path alone:
+    /// the dialect is the analyzer store's language key, which is asked for
+    /// before any source is read (#3322).
+    #[test]
+    fn jsx_extension_selects_the_javascript_jsx_dialect() {
+        for path in ["Playground.jsx", "deep/nested/Playground.JSX"] {
+            assert_eq!(
+                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
+                LanguageDialect::JavaScriptJsx,
+                "{path}"
+            );
+        }
+        for path in ["index.js", "index.mjs", "index.cjs"] {
+            assert_eq!(
+                LanguageDialect::for_path(Language::JavaScript, Path::new(path)),
+                LanguageDialect::Standard(Language::JavaScript),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            LanguageDialect::from_config_label("jsx"),
+            Some(LanguageDialect::JavaScriptJsx)
+        );
+        assert!(LanguageDialect::config_labels().any(|label| label == "jsx"));
     }
 }
 

@@ -281,7 +281,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 15;
+    const ALGORITHM_VERSION: u32 = 20;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -2432,6 +2432,100 @@ mod tests {
         ) -> Vec<DynamicFieldWrite> {
             self.inner.dynamic_field_writes(workspace, procedure)
         }
+    }
+
+    #[test]
+    fn dynamic_write_survey_keeps_truncated_callers_open_without_seeding_them() {
+        let mut source = String::from(
+            "class Value:\n    pass\ndef write(target, name):\n    setattr(target, name, 1)\ndef caller():\n    write(Value(), 'extra')\n",
+        );
+        // Exceed the production survey's 128-procedure closure limit. Each
+        // distinct reachable callee is necessary to exercise that boundary.
+        for index in 0..130 {
+            source.push_str(&format!("    leaf{index}()\n"));
+        }
+        for index in 0..130 {
+            source.push_str(&format!("def leaf{index}():\n    pass\n"));
+        }
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", &source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut collected = CollectedSlots::default();
+        for procedure in &procedures {
+            collect_procedure(
+                &workspace,
+                &adapter,
+                procedure,
+                &mut collected,
+                &cancellation,
+            )
+            .unwrap();
+        }
+        assert_eq!(collected.dynamic_writes.len(), 1);
+        let mut slots =
+            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        slots.store_survey.dynamic_effects = collected
+            .dynamic_writes
+            .iter()
+            .map(|write| ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad))
+            .collect();
+        let caller = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .semantics()
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("caller")
+            })
+            .unwrap();
+        adapter.constructed_queries.store(0, Ordering::Relaxed);
+        let effects = super::super::dynamic_stores::survey(
+            &workspace,
+            &adapter,
+            &slots,
+            std::slice::from_ref(caller),
+            &collected.dynamic_writes,
+            &mut budget,
+            &mut SolverBudget::default(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(
+            effects[0].evidence.reason,
+            Some(UnknownReason::Truncated),
+            "{effects:?}"
+        );
+        assert!(
+            effects[0].classes.is_empty(),
+            "a truncated caller cannot bound the write: {effects:?}"
+        );
+        assert_eq!(
+            adapter.constructed_queries.load(Ordering::Relaxed),
+            0,
+            "class seeding cannot repair a discovery the survey already rejects"
+        );
     }
 
     #[test]

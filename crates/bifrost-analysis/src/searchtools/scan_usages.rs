@@ -6009,14 +6009,7 @@ fn go_authored_model_references(
         let Some(source) = analyzer.indexed_source(&file) else {
             continue;
         };
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_go::LANGUAGE.into())
-            .is_err()
-        {
-            continue;
-        }
-        let Some(tree) = parser.parse(&source, None) else {
+        let Some(tree) = brokk_bifrost_go::parse::parse_go(&source) else {
             continue;
         };
         let mut candidates = Vec::new();

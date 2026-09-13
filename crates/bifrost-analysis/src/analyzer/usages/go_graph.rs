@@ -7,7 +7,6 @@
 //! side data the go crate takes, and [`build_go_edges`], whose workspace fan-out
 //! needs an analyzer handle for each file's declaration index.
 
-use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
@@ -76,7 +75,7 @@ where
             analyzer,
             file,
             domain,
-            ParseSpec::whole(&language),
+            brokk_bifrost_go::parse::go_parse_spec(&language),
             |input| {
                 let (alias_packages, dot_packages) = index.namespace_packages(file);
                 let import_binding_names = index.import_binding_names(file);

@@ -131,7 +131,7 @@ pub struct TypeFlowPlan {
     /// an untyped transient resolver-budget stop, which sets the flag alone.
     field_slot_semantic_exhausted: bool,
     field_slot_semantic_exhaustion: Option<SemanticBudgetExceeded>,
-    provider_failure_observed: bool,
+    discovery_failure: Option<UnknownReason>,
     field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
     refinement_budget_exhausted: bool,
     /// The first semantic charge a procedure-local refinement could not pay.
@@ -1199,6 +1199,21 @@ impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
         })
     }
 
+    pub(super) fn discovery_boundary(&self) -> Option<UnknownReason> {
+        if closure_has_provider_failure(&self.closure) {
+            Some(UnknownReason::IncompleteRoot)
+        } else if self
+            .closure
+            .coverage
+            .values()
+            .any(|coverage| coverage.truncated)
+        {
+            Some(UnknownReason::Truncated)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn excludes_procedures<'a>(
         &self,
         procedures: impl IntoIterator<Item = &'a ProcedureHandle>,
@@ -1337,6 +1352,7 @@ impl TypeFlowPlan {
         cancellation: &CancellationToken,
         refinements: &mut ProcedureRefinements,
     ) -> Result<Self, TypeFlowPlanError> {
+        let discovery_failure = discovery.discovery_boundary();
         let TypeFlowDiscovery {
             root,
             provider,
@@ -1347,7 +1363,6 @@ impl TypeFlowPlan {
         if closure.root_snapshot.is_none() {
             return Err(TypeFlowPlanError::RootRelationsUnavailable);
         }
-        let provider_failure_observed = closure_has_provider_failure(&closure);
         let dispatch_reads = canonical_dispatch_read_contracts(
             &closure.procedures,
             dispatch_reads.observations(),
@@ -1658,7 +1673,7 @@ impl TypeFlowPlan {
             summary_cuts,
             field_slot_semantic_exhausted: field_slots.semantic_budget_exhausted(),
             field_slot_semantic_exhaustion: field_slots.semantic_budget_exhaustion(),
-            provider_failure_observed,
+            discovery_failure,
             field_refinements,
             refinement_budget_exhausted: refinement_exhaustion.is_some(),
             refinement_exhaustion,
@@ -1670,12 +1685,8 @@ impl TypeFlowPlan {
     pub(super) fn discovery_boundary(&self) -> Option<UnknownReason> {
         if self.field_slot_semantic_budget_exhausted() {
             Some(UnknownReason::SemanticBudget)
-        } else if self.provider_failure_observed {
-            Some(UnknownReason::IncompleteRoot)
-        } else if self.coverage.values().any(|coverage| coverage.truncated) {
-            Some(UnknownReason::Truncated)
         } else {
-            None
+            self.discovery_failure.clone()
         }
     }
 
@@ -2210,7 +2221,7 @@ impl TypeFlowPlan {
     }
 
     pub(crate) const fn provider_failure_observed(&self) -> bool {
-        self.provider_failure_observed
+        matches!(self.discovery_failure, Some(UnknownReason::IncompleteRoot))
     }
 }
 

@@ -38,8 +38,8 @@ imports, containment, supertypes, and other inputs used by higher layers.
 
 For Git-tracked source, the blob object ID supplies content identity. The same
 bytes can reuse parsed facts at another path, revision, or linked worktree.
-Language and dialect also enter that identity: TypeScript and TSX, or C and C++,
-can produce different facts from byte-identical input.
+Language and dialect also enter that identity: TypeScript and TSX, JavaScript
+and JSX, or C and C++, can produce different facts from byte-identical input.
 
 A parse or extraction job prepares its complete fact set, then publishes that
 set with a completion marker in one transaction. Cancellation, timeout, parser

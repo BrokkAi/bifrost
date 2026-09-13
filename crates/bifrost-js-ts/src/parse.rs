@@ -1,9 +1,12 @@
 //! Grammar selection for a JS/TS source file, and the one dialect no grammar
 //! here serves.
 //!
-//! TypeScript is the only language whose grammar depends on the file path --
-//! `.tsx` needs `LANGUAGE_TSX`, everything else `LANGUAGE_TYPESCRIPT` -- and the
-//! decision itself is core ([`LanguageDialect::for_path`]). Before the
+//! Both languages choose their grammar by file path -- `.tsx` and `.jsx` need
+//! `LANGUAGE_TSX`, `.ts` needs `LANGUAGE_TYPESCRIPT`, and the rest of
+//! JavaScript needs `tree_sitter_javascript` -- and the decision itself is core
+//! ([`LanguageDialect::for_path`]). `.jsx` joined the TSX side in #3322:
+//! tree-sitter-javascript cannot parse a reserved word as a JSX attribute name,
+//! and one `<div class="x">` costs the whole rest of the file. Before the
 //! extraction this was `js_ts_tree_sitter_language_for_file` in
 //! `analyzer/usages/parsed_tree.rs`, a JS/TS-named free function in a framework
 //! file that routed the same question through the analysis-side grammar
@@ -42,7 +45,9 @@ pub fn js_ts_tree_sitter_language_for_file(
     language: Language,
 ) -> Option<TreeSitterLanguage> {
     match LanguageDialect::for_path(language, file.rel_path()) {
-        LanguageDialect::TypeScriptTsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        LanguageDialect::TypeScriptTsx | LanguageDialect::JavaScriptJsx => {
+            Some(tree_sitter_typescript::LANGUAGE_TSX.into())
+        }
         LanguageDialect::Standard(Language::TypeScript) => {
             Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
         }

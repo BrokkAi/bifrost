@@ -5,8 +5,8 @@ use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationFeatureSemantics, ConfigurationFeatureState, ConfigurationFormat,
     ConfigurationKey, ConfigurationMemberRole, ConfigurationModelError, ConfigurationNodeKind,
     ConfigurationPathClassification, ConfigurationRecovery, ConfigurationRecoveryReason,
-    ConfigurationRoute, ConfigurationRouteSegment, ConfigurationScalarKind,
-    ConfigurationSourceRange, classify_configuration_path,
+    ConfigurationRoute, ConfigurationRouteSegment, ConfigurationRouteSelector,
+    ConfigurationScalarKind, ConfigurationSourceRange, classify_configuration_path,
 };
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -14,9 +14,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use toml_edit::{Array, ArrayOfTables, ImDocument, Item, Key, TableLike, Value};
 use tree_sitter::{Language, Node, Parser};
 
-const JSON_ADAPTER_SCHEMA_VERSION: u32 = 1;
+const JSON_ADAPTER_SCHEMA_VERSION: u32 = 2;
+const TOML_ADAPTER_SCHEMA_VERSION: u32 = 1;
 const XML_ADAPTER_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,7 @@ pub fn ingest_configuration_document(path: &Path, bytes: &[u8]) -> Configuration
     };
     let result = match format {
         ConfigurationFormat::Json => ingest_json(source),
+        ConfigurationFormat::Toml => ingest_toml(source),
         ConfigurationFormat::Xml => ingest_xml(source),
         _ => {
             return ConfigurationIngestionOutcome::Unsupported {
@@ -69,6 +72,15 @@ pub fn ingest_configuration_document(path: &Path, bytes: &[u8]) -> Configuration
         Ok(facts) => ConfigurationIngestionOutcome::Facts(facts),
         Err(error) => ConfigurationIngestionOutcome::Incomplete { reason: error },
     }
+}
+
+/// Cache compatibility identity for the TOML adapter and its pinned parser.
+pub fn toml_configuration_adapter_epoch() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost-configuration-toml-adapter\n");
+    hasher.update(TOML_ADAPTER_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(b"toml_edit-0.22.27");
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn xml_configuration_adapter_epoch() -> String {
@@ -163,18 +175,44 @@ fn ingest_json(source: &str) -> Result<ConfigurationDocumentFacts, Configuration
         kind: PendingKind::Document(None),
     }];
     let mut recoveries = collect_recoveries(root)?;
-    if let Some(value) = first_named_child(root) {
-        let mut stack = vec![Work {
-            node: value,
-            parent: 0,
-            link: Link::DocumentRoot,
-            route: ConfigurationRoute::root(),
-        }];
-        while let Some(work) = stack.pop() {
-            add_node(source, work, &mut pending, &mut stack, &mut recoveries)?;
+    // RFC 8259 admits exactly one top-level value, but the grammar's document
+    // rule repeats values, so a document with none or with more than one is
+    // authored evidence this model cannot represent as a single root.
+    let mut cursor = root.walk();
+    let mut values = root
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_error() && !node.is_missing() && node.kind() != "comment");
+    match values.next() {
+        Some(value) => {
+            let mut stack = vec![Work {
+                node: value,
+                parent: 0,
+                link: Link::DocumentRoot,
+                route: ConfigurationRoute::root(),
+            }];
+            while let Some(work) = stack.pop() {
+                add_node(source, work, &mut pending, &mut stack, &mut recoveries)?;
+            }
+            for extra in values {
+                recoveries.push(ConfigurationRecovery::new(
+                    ConfigurationRecoveryReason::MalformedSyntax,
+                    source_range(extra)?,
+                ));
+            }
         }
+        None => recoveries.push(ConfigurationRecovery::new(
+            ConfigurationRecoveryReason::MalformedSyntax,
+            document_range,
+        )),
     }
     let facts = finalize(pending)?;
+    recoveries.sort_by_key(|recovery| {
+        (
+            recovery.evidence().start_byte(),
+            recovery.evidence().end_byte(),
+        )
+    });
+    recoveries.dedup();
     let completeness = if recoveries.is_empty() {
         ConfigurationCompleteness::Complete
     } else {
@@ -189,6 +227,13 @@ fn ingest_json(source: &str) -> Result<ConfigurationDocumentFacts, Configuration
     .map_err(model_error)
 }
 
+/// Map one tree-sitter node onto the shared fact model.
+///
+/// The parent link is recorded only after the node maps to a fact. A node the
+/// adapter does not represent (recovered syntax, or a grammar extra such as a
+/// comment reached through a value position) contributes typed recovery
+/// evidence and no arena entry, so the parent can never reference a fact that
+/// was never pushed.
 fn add_node<'tree>(
     source: &str,
     work: Work<'tree>,
@@ -196,145 +241,205 @@ fn add_node<'tree>(
     stack: &mut Vec<Work<'tree>>,
     recoveries: &mut Vec<ConfigurationRecovery>,
 ) -> Result<(), ConfigurationIngestionError> {
-    let id = pending.len();
-    attach(&mut pending[work.parent].kind, work.link, id)?;
     let range = source_range(work.node)?;
-    match work.node.kind() {
+    let id = pending.len();
+    let mut children = Vec::new();
+    let kind = match work.node.kind() {
         "object" => {
-            pending.push(PendingFact {
-                parent: Some(work.parent),
-                route: work.route.clone(),
-                range,
-                kind: PendingKind::Object(Vec::new()),
-            });
             let mut occurrences = HashMap::<String, usize>::new();
-            let mut children = Vec::new();
             let mut cursor = work.node.walk();
             for pair in work.node.named_children(&mut cursor) {
-                if pair.kind() != "pair" {
+                if pair.kind() == "comment" {
                     continue;
                 }
                 let Some(key_node) = pair.child_by_field_name("key") else {
+                    recoveries.push(ConfigurationRecovery::new(
+                        ConfigurationRecoveryReason::MalformedSyntax,
+                        source_range(pair)?,
+                    ));
                     continue;
                 };
-                let key = decode_json_string(source, key_node)?;
+                let key_range = source_range(key_node)?;
+                let key = decode_json_key(source, key_node, key_range, recoveries)?;
                 let occurrence = occurrences.entry(key.clone()).or_default();
                 *occurrence += 1;
-                let key_range = source_range(key_node)?;
-                let route = work.route.clone().child(
-                    ConfigurationRouteSegment::key(key.clone(), *occurrence, key_range)
-                        .map_err(model_error)?,
-                );
-                children.push((pair, route, key, key_range));
-            }
-            for (pair, route, key, key_range) in children.into_iter().rev() {
-                stack.push(Work {
+                children.push(Work {
                     node: pair,
                     parent: id,
                     link: Link::ObjectMember,
-                    route,
+                    route: work.route.clone().child(ConfigurationRouteSegment::key(
+                        key,
+                        *occurrence,
+                        key_range,
+                    )),
                 });
-                let _ = (key, key_range);
             }
+            PendingKind::Object(Vec::new())
         }
         "array" => {
-            pending.push(PendingFact {
-                parent: Some(work.parent),
-                route: work.route.clone(),
-                range,
-                kind: PendingKind::Sequence(Vec::new()),
-            });
             let mut cursor = work.node.walk();
-            let children: Vec<_> = work.node.named_children(&mut cursor).enumerate().collect();
-            for (index, child) in children.into_iter().rev() {
-                let route = work.route.clone().child(
-                    ConfigurationRouteSegment::index(index, source_range(child)?)
-                        .map_err(model_error)?,
-                );
-                stack.push(Work {
+            // Comments are grammar extras and hold no element position; every
+            // other child occupies one, so a recovered element keeps the
+            // authored indexes of the elements after it.
+            for (index, child) in work
+                .node
+                .named_children(&mut cursor)
+                .filter(|node| node.kind() != "comment")
+                .enumerate()
+            {
+                children.push(Work {
                     node: child,
                     parent: id,
                     link: Link::SequenceItem,
-                    route,
+                    route: work.route.clone().child(ConfigurationRouteSegment::index(
+                        index,
+                        source_range(child)?,
+                    )),
                 });
             }
+            PendingKind::Sequence(Vec::new())
         }
         "pair" => {
-            let key_node = work.node.child_by_field_name("key").ok_or_else(|| {
-                ConfigurationIngestionError::InvalidFactModel(
-                    "JSON pair has no structured key field".into(),
-                )
-            })?;
-            let key = ConfigurationKey::new(
-                decode_json_string(source, key_node)?,
-                source_range(key_node)?,
-            )
-            .map_err(model_error)?;
-            pending.push(PendingFact {
-                parent: Some(work.parent),
-                route: work.route.clone(),
-                range,
-                kind: PendingKind::Member {
-                    role: ConfigurationMemberRole::ObjectMember,
-                    key,
-                    value: None,
-                },
-            });
+            // The object arm queues every pair with its own decoded key
+            // segment, so the authored key never needs a second decode.
+            let Some(segment) = work.route.segments().last() else {
+                unreachable!("a JSON pair is only queued with its own key route segment");
+            };
+            let ConfigurationRouteSelector::Key { name, .. } = segment.selector() else {
+                unreachable!("a JSON pair route segment is always an authored key");
+            };
+            let key = ConfigurationKey::new(name.clone(), segment.evidence());
             if let Some(value) = work.node.child_by_field_name("value") {
-                stack.push(Work {
+                children.push(Work {
                     node: value,
                     parent: id,
                     link: Link::MemberValue,
-                    route: work.route,
+                    route: work.route.clone(),
                 });
             }
+            PendingKind::Member {
+                role: ConfigurationMemberRole::ObjectMember,
+                key,
+                value: None,
+            }
         }
-        "string" => pending.push(PendingFact {
-            parent: Some(work.parent),
-            route: work.route,
-            range,
-            kind: PendingKind::Scalar(ConfigurationScalarKind::String),
-        }),
-        "number" => {
-            let text = work.node.utf8_text(source.as_bytes()).map_err(|_| {
-                ConfigurationIngestionError::InvalidFactModel(
-                    "JSON number range is not UTF-8".into(),
-                )
-            })?;
-            let kind = if text.contains(['.', 'e', 'E']) {
-                ConfigurationScalarKind::Decimal
-            } else {
-                ConfigurationScalarKind::Integer
-            };
-            pending.push(PendingFact {
-                parent: Some(work.parent),
-                route: work.route,
+        "string" => PendingKind::Scalar(json_string_scalar_kind(source, work.node, recoveries)?),
+        "number" => PendingKind::Scalar(json_number_scalar_kind(source, work.node, recoveries)?),
+        "true" | "false" => PendingKind::Scalar(ConfigurationScalarKind::Boolean),
+        "null" => PendingKind::Scalar(ConfigurationScalarKind::Null),
+        "ERROR" => {
+            recoveries.push(ConfigurationRecovery::new(
+                ConfigurationRecoveryReason::MalformedSyntax,
                 range,
-                kind: PendingKind::Scalar(kind),
-            });
+            ));
+            return Ok(());
         }
-        "true" | "false" => pending.push(PendingFact {
-            parent: Some(work.parent),
-            route: work.route,
-            range,
-            kind: PendingKind::Scalar(ConfigurationScalarKind::Boolean),
-        }),
-        "null" => pending.push(PendingFact {
-            parent: Some(work.parent),
-            route: work.route,
-            range,
-            kind: PendingKind::Scalar(ConfigurationScalarKind::Null),
-        }),
-        "ERROR" => recoveries.push(ConfigurationRecovery::new(
-            ConfigurationRecoveryReason::MalformedSyntax,
-            range,
-        )),
-        _ => recoveries.push(ConfigurationRecovery::new(
-            ConfigurationRecoveryReason::UnsupportedScalar,
-            range,
-        )),
-    }
+        _ => {
+            recoveries.push(ConfigurationRecovery::new(
+                ConfigurationRecoveryReason::UnsupportedScalar,
+                range,
+            ));
+            return Ok(());
+        }
+    };
+    attach(&mut pending[work.parent].kind, work.link, id)?;
+    pending.push(PendingFact {
+        parent: Some(work.parent),
+        route: work.route,
+        range,
+        kind,
+    });
+    // The stack is LIFO, so queueing in reverse keeps authored order.
+    stack.extend(children.into_iter().rev());
     Ok(())
+}
+
+/// Whether one authored token is a valid JSON token.
+///
+/// `serde::de::IgnoredAny` is the maintained parser's syntax verdict without
+/// its representation limits: it rejects the constructs tree-sitter-json's
+/// tolerant grammar accepts (`1.`, `01`, `"\u"`, an unescaped control
+/// character) while accepting a number outside `f64` range and an unpaired
+/// surrogate escape, which are authored JSON that Rust's own `f64` and
+/// `String` cannot hold.
+fn json_token_is_valid(token: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(token).is_ok()
+}
+
+fn json_token_text<'source>(
+    source: &'source str,
+    node: Node<'_>,
+) -> Result<&'source str, ConfigurationIngestionError> {
+    node.utf8_text(source.as_bytes()).map_err(|_| {
+        ConfigurationIngestionError::InvalidFactModel("JSON token range is not UTF-8".into())
+    })
+}
+
+/// tree-sitter-json emits `number` as one opaque token, so the authored form
+/// is the only structure available for the integer/decimal distinction. The
+/// maintained parser still supplies the validity verdict, because the grammar
+/// also accepts numbers JSON does not.
+fn json_number_scalar_kind(
+    source: &str,
+    node: Node<'_>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<ConfigurationScalarKind, ConfigurationIngestionError> {
+    let text = json_token_text(source, node)?;
+    if !json_token_is_valid(text) {
+        recoveries.push(ConfigurationRecovery::new(
+            ConfigurationRecoveryReason::UnsupportedScalar,
+            source_range(node)?,
+        ));
+        return Ok(ConfigurationScalarKind::Opaque);
+    }
+    Ok(if text.contains(['.', 'e', 'E']) {
+        ConfigurationScalarKind::Decimal
+    } else {
+        ConfigurationScalarKind::Integer
+    })
+}
+
+fn json_string_scalar_kind(
+    source: &str,
+    node: Node<'_>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<ConfigurationScalarKind, ConfigurationIngestionError> {
+    if json_token_is_valid(json_token_text(source, node)?) {
+        return Ok(ConfigurationScalarKind::String);
+    }
+    recoveries.push(ConfigurationRecovery::new(
+        ConfigurationRecoveryReason::UnsupportedScalar,
+        source_range(node)?,
+    ));
+    Ok(ConfigurationScalarKind::Opaque)
+}
+
+/// The authored text of one object key.
+///
+/// A key that the maintained parser cannot decode into a Rust `String` is
+/// typed recovery evidence, never a whole-document failure: the member keeps
+/// the authored content the grammar recorded in the token's `string_content`
+/// and `escape_sequence` children.
+fn decode_json_key(
+    source: &str,
+    node: Node<'_>,
+    range: ConfigurationSourceRange,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<String, ConfigurationIngestionError> {
+    let token = json_token_text(source, node)?;
+    if let Ok(text) = serde_json::from_str::<String>(token) {
+        return Ok(text);
+    }
+    recoveries.push(ConfigurationRecovery::new(
+        ConfigurationRecoveryReason::UnsupportedScalar,
+        range,
+    ));
+    let mut cursor = node.walk();
+    let mut authored = String::new();
+    for child in node.named_children(&mut cursor) {
+        authored.push_str(json_token_text(source, child)?);
+    }
+    Ok(authored)
 }
 
 fn attach(
@@ -401,29 +506,13 @@ fn source_range(node: Node<'_>) -> Result<ConfigurationSourceRange, Configuratio
     ConfigurationSourceRange::new(node.start_byte(), node.end_byte()).map_err(model_error)
 }
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).next()
-}
-
-fn decode_json_string(source: &str, node: Node<'_>) -> Result<String, ConfigurationIngestionError> {
-    let token = node.utf8_text(source.as_bytes()).map_err(|_| {
-        ConfigurationIngestionError::InvalidFactModel("JSON key range is not UTF-8".into())
-    })?;
-    serde_json::from_str::<String>(token).map_err(|error| {
-        ConfigurationIngestionError::InvalidFactModel(format!(
-            "JSON grammar produced an invalid string token: {error}"
-        ))
-    })
-}
-
 fn collect_recoveries(
     root: Node<'_>,
 ) -> Result<Vec<ConfigurationRecovery>, ConfigurationIngestionError> {
     let mut recoveries = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.is_error() || node.is_missing() {
+        if node.is_error() || node.is_missing() || node.kind() == "comment" {
             recoveries.push(ConfigurationRecovery::new(
                 ConfigurationRecoveryReason::MalformedSyntax,
                 source_range(node)?,
@@ -444,6 +533,270 @@ fn collect_recoveries(
 
 fn model_error(error: ConfigurationModelError) -> ConfigurationIngestionError {
     ConfigurationIngestionError::InvalidFactModel(error.to_string())
+}
+
+/// One TOML subtree waiting to become a fact.
+///
+/// The adapter walks the parsed document with this explicit stack rather than
+/// with Rust recursion, so a deeply nested authored document cannot exhaust
+/// the thread stack.
+struct TomlWork<'doc> {
+    node: TomlNode<'doc>,
+    parent: usize,
+    link: Link,
+    route: ConfigurationRoute,
+    /// Exact evidence for the fact this work item creates.
+    range: ConfigurationSourceRange,
+}
+
+enum TomlNode<'doc> {
+    /// One authored key and the item it names.
+    Entry {
+        key: &'doc Key,
+        item: &'doc Item,
+    },
+    /// A standard table, a `[parent.child]` header table, a dotted-key proxy,
+    /// or an inline table: every one of them is an ordered key/value
+    /// container, so they share this arm.
+    Table(&'doc dyn TableLike),
+    /// An inline array such as `ciphers = ["a", "b"]`.
+    Array(&'doc Array),
+    /// An array of tables declared with repeated `[[header]]` blocks.
+    ArrayOfTables(&'doc ArrayOfTables),
+    Scalar(ConfigurationScalarKind),
+}
+
+fn ingest_toml(source: &str) -> Result<ConfigurationDocumentFacts, ConfigurationIngestionError> {
+    let document_range = ConfigurationSourceRange::new(0, source.len()).map_err(model_error)?;
+    let mut pending = vec![PendingFact {
+        parent: None,
+        route: ConfigurationRoute::root(),
+        range: document_range,
+        kind: PendingKind::Document(None),
+    }];
+    // TOML has no partial document: the format rejects a duplicate key, a
+    // redefined table, a dotted key that reopens a header table, and malformed
+    // syntax outright. A rejected document therefore recovers no root and
+    // reports the parser's own byte range as its recovery evidence, so its
+    // absent rows can never read as a clean empty answer.
+    let document = match ImDocument::parse(source) {
+        Ok(document) => document,
+        Err(error) => {
+            let evidence = match error.span() {
+                Some(span) => {
+                    ConfigurationSourceRange::new(span.start, span.end).map_err(model_error)?
+                }
+                None => document_range,
+            };
+            return ConfigurationDocumentFacts::new(
+                ConfigurationFormat::Toml,
+                finalize(pending)?,
+                ConfigurationCompleteness::Incomplete {
+                    recoveries: vec![ConfigurationRecovery::new(
+                        ConfigurationRecoveryReason::MalformedSyntax,
+                        evidence,
+                    )],
+                },
+                ConfigurationFeatureSemantics::not_applicable(),
+            )
+            .map_err(model_error);
+        }
+    };
+    // A TOML document is its root table. The parser's own root span covers
+    // only the bare top-level keys, so the whole buffer is the exact evidence.
+    let mut stack = vec![TomlWork {
+        node: TomlNode::Table(document.as_table()),
+        parent: 0,
+        link: Link::DocumentRoot,
+        route: ConfigurationRoute::root(),
+        range: document_range,
+    }];
+    while let Some(work) = stack.pop() {
+        add_toml_node(work, &mut pending, &mut stack)?;
+    }
+    ConfigurationDocumentFacts::new(
+        ConfigurationFormat::Toml,
+        finalize(pending)?,
+        ConfigurationCompleteness::Complete,
+        // TOML has no anchors, aliases, includes, interpolation, or document
+        // merge: none of them can be structurally authored in the format, so
+        // every axis is not applicable rather than unresolved.
+        ConfigurationFeatureSemantics::not_applicable(),
+    )
+    .map_err(model_error)
+}
+
+fn add_toml_node<'doc>(
+    work: TomlWork<'doc>,
+    pending: &mut Vec<PendingFact>,
+    stack: &mut Vec<TomlWork<'doc>>,
+) -> Result<(), ConfigurationIngestionError> {
+    let id = pending.len();
+    attach(&mut pending[work.parent].kind, work.link, id)?;
+    match work.node {
+        TomlNode::Entry { key, item } => {
+            let key_range = toml_span(key.span(), "key")?;
+            pending.push(PendingFact {
+                parent: Some(work.parent),
+                route: work.route.clone(),
+                range: work.range,
+                kind: PendingKind::Member {
+                    // Every TOML key/value pair is an entry of some table: a
+                    // header table, a dotted-key proxy, or an inline table.
+                    role: ConfigurationMemberRole::TableEntry,
+                    key: ConfigurationKey::new(key.get().to_owned(), key_range),
+                    value: None,
+                },
+            });
+            let (node, range) = match item {
+                Item::Table(table) => (TomlNode::Table(table), table.span()),
+                Item::ArrayOfTables(tables) => (TomlNode::ArrayOfTables(tables), tables.span()),
+                Item::Value(value) => (toml_value_node(value), value.span()),
+                Item::None => return Ok(()),
+            };
+            // A table the parser synthesised was never authored as a header or
+            // a brace of its own, so the key that named it is its exact
+            // evidence. That covers an implicit `[parent.child]` parent, a
+            // dotted-key proxy under a header, and a dotted-key proxy inside
+            // an inline table, which is an unspanned value rather than a
+            // table item.
+            let range = toml_span_or(range, key_range)?;
+            stack.push(TomlWork {
+                node,
+                parent: id,
+                link: Link::MemberValue,
+                route: work.route,
+                range,
+            });
+        }
+        TomlNode::Table(table) => {
+            pending.push(PendingFact {
+                parent: Some(work.parent),
+                route: work.route.clone(),
+                range: work.range,
+                kind: PendingKind::Object(Vec::new()),
+            });
+            let mut entries = Vec::new();
+            for (name, _) in table.iter() {
+                let (key, item) = table.get_key_value(name).ok_or_else(|| {
+                    ConfigurationIngestionError::InvalidFactModel(format!(
+                        "toml_edit listed key {name:?} that its own table does not hold"
+                    ))
+                })?;
+                let key_range = toml_span(key.span(), "key")?;
+                // A member spans from its key to the end of the value it
+                // names, the same extent a JSON pair covers.
+                let member_end = item.span().map_or(key_range.end_byte(), |span| span.end);
+                let member_range =
+                    ConfigurationSourceRange::new(key_range.start_byte(), member_end)
+                        .map_err(model_error)?;
+                entries.push(TomlWork {
+                    node: TomlNode::Entry { key, item },
+                    parent: id,
+                    link: Link::ObjectMember,
+                    // TOML rejects a duplicate key, so a name occurs at most
+                    // once per table and every occurrence is the first.
+                    route: work.route.clone().child(ConfigurationRouteSegment::key(
+                        key.get(),
+                        1,
+                        key_range,
+                    )),
+                    range: member_range,
+                });
+            }
+            stack.extend(entries.into_iter().rev());
+        }
+        TomlNode::Array(array) => {
+            pending.push(PendingFact {
+                parent: Some(work.parent),
+                route: work.route.clone(),
+                range: work.range,
+                kind: PendingKind::Sequence(Vec::new()),
+            });
+            let mut items = Vec::new();
+            for (index, value) in array.iter().enumerate() {
+                let range = toml_span(value.span(), "array item")?;
+                items.push(TomlWork {
+                    node: toml_value_node(value),
+                    parent: id,
+                    link: Link::SequenceItem,
+                    route: work
+                        .route
+                        .clone()
+                        .child(ConfigurationRouteSegment::index(index, range)),
+                    range,
+                });
+            }
+            stack.extend(items.into_iter().rev());
+        }
+        TomlNode::ArrayOfTables(tables) => {
+            pending.push(PendingFact {
+                parent: Some(work.parent),
+                route: work.route.clone(),
+                range: work.range,
+                kind: PendingKind::Sequence(Vec::new()),
+            });
+            let mut items = Vec::new();
+            for (index, table) in tables.iter().enumerate() {
+                let range = toml_span(table.span(), "array-of-tables element")?;
+                items.push(TomlWork {
+                    node: TomlNode::Table(table),
+                    parent: id,
+                    link: Link::SequenceItem,
+                    route: work
+                        .route
+                        .clone()
+                        .child(ConfigurationRouteSegment::index(index, range)),
+                    range,
+                });
+            }
+            stack.extend(items.into_iter().rev());
+        }
+        TomlNode::Scalar(scalar_kind) => pending.push(PendingFact {
+            parent: Some(work.parent),
+            route: work.route,
+            range: work.range,
+            kind: PendingKind::Scalar(scalar_kind),
+        }),
+    }
+    Ok(())
+}
+
+fn toml_value_node(value: &Value) -> TomlNode<'_> {
+    match value {
+        Value::String(_) => TomlNode::Scalar(ConfigurationScalarKind::String),
+        Value::Integer(_) => TomlNode::Scalar(ConfigurationScalarKind::Integer),
+        Value::Float(_) => TomlNode::Scalar(ConfigurationScalarKind::Decimal),
+        Value::Boolean(_) => TomlNode::Scalar(ConfigurationScalarKind::Boolean),
+        // A TOML date-time is a first-class scalar that the format-neutral
+        // kind registry does not name. Opaque keeps its route, its kind, and
+        // its exact bytes queryable; it is not a gap the parser left behind.
+        Value::Datetime(_) => TomlNode::Scalar(ConfigurationScalarKind::Opaque),
+        Value::Array(array) => TomlNode::Array(array),
+        Value::InlineTable(table) => TomlNode::Table(table),
+    }
+}
+
+fn toml_span(
+    span: Option<std::ops::Range<usize>>,
+    node: &'static str,
+) -> Result<ConfigurationSourceRange, ConfigurationIngestionError> {
+    let span = span.ok_or_else(|| {
+        ConfigurationIngestionError::InvalidFactModel(format!(
+            "toml_edit recorded no source span for a parsed {node}"
+        ))
+    })?;
+    ConfigurationSourceRange::new(span.start, span.end).map_err(model_error)
+}
+
+fn toml_span_or(
+    span: Option<std::ops::Range<usize>>,
+    authored_by: ConfigurationSourceRange,
+) -> Result<ConfigurationSourceRange, ConfigurationIngestionError> {
+    match span {
+        Some(span) => ConfigurationSourceRange::new(span.start, span.end).map_err(model_error),
+        None => Ok(authored_by),
+    }
 }
 
 struct XmlFrame {
@@ -634,10 +987,11 @@ fn add_xml_element(
             Link::DocumentRoot,
         )
     };
-    let route = route.child(
-        ConfigurationRouteSegment::key(name.clone(), occurrence, name_range)
-            .map_err(model_error)?,
-    );
+    let route = route.child(ConfigurationRouteSegment::key(
+        name.clone(),
+        occurrence,
+        name_range,
+    ));
     let member = pending.len();
     attach(&mut pending[parent].kind, link, member)?;
     pending.push(PendingFact {
@@ -646,7 +1000,7 @@ fn add_xml_element(
         range: name_range,
         kind: PendingKind::Member {
             role: ConfigurationMemberRole::XmlElement,
-            key: ConfigurationKey::new(name, name_range).map_err(model_error)?,
+            key: ConfigurationKey::new(name, name_range),
             value: None,
         },
     });
@@ -692,10 +1046,11 @@ fn add_xml_element(
             .to_owned();
         let occurrence = occurrences.entry(key.clone()).or_default();
         *occurrence += 1;
-        let attribute_route = route.clone().child(
-            ConfigurationRouteSegment::key(key.clone(), *occurrence, key_range)
-                .map_err(model_error)?,
-        );
+        let attribute_route = route.clone().child(ConfigurationRouteSegment::key(
+            key.clone(),
+            *occurrence,
+            key_range,
+        ));
         let attribute_member = pending.len();
         if let PendingKind::Section { members, .. } = &mut pending[section].kind {
             members.push(attribute_member);
@@ -706,7 +1061,7 @@ fn add_xml_element(
             range: key_range,
             kind: PendingKind::Member {
                 role: ConfigurationMemberRole::XmlAttribute,
-                key: ConfigurationKey::new(key, key_range).map_err(model_error)?,
+                key: ConfigurationKey::new(key, key_range),
                 value: None,
             },
         });
@@ -872,17 +1227,269 @@ mod tests {
     }
 
     #[test]
-    fn adapter_epoch_is_stable_and_nonempty() {
+    fn malformed_json_prefix_keeps_the_following_root() {
+        let document = facts(r#"@ {"kept":true}"#);
+        assert!(!document.completeness().is_complete());
+        assert_eq!(member_keys(&document), vec!["kept"]);
+    }
+
+    #[test]
+    fn json_comments_keep_facts_with_exact_malformed_evidence() {
+        let source = "// header\n{\"kept\":true}";
+        let document = facts(source);
+        assert_eq!(member_keys(&document), vec!["kept"]);
+        let ConfigurationCompleteness::Incomplete { recoveries } = document.completeness() else {
+            panic!("a JSON comment is malformed syntax: {document:#?}");
+        };
+        assert!(
+            recoveries.iter().any(|recovery| {
+                recovery.reason() == ConfigurationRecoveryReason::MalformedSyntax
+                    && &source[recovery.evidence().start_byte()..recovery.evidence().end_byte()]
+                        == "// header"
+            }),
+            "{recoveries:#?}"
+        );
+    }
+
+    #[test]
+    fn adapter_epochs_are_stable_and_distinct_per_adapter() {
+        for epoch in [
+            json_configuration_adapter_epoch(),
+            xml_configuration_adapter_epoch(),
+        ] {
+            assert_eq!(epoch.len(), 64, "{epoch}");
+            assert!(
+                epoch
+                    .chars()
+                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
+                "{epoch}"
+            );
+        }
         assert_eq!(
             json_configuration_adapter_epoch(),
             json_configuration_adapter_epoch()
         );
-        assert_eq!(json_configuration_adapter_epoch().len(), 64);
         assert_eq!(
             xml_configuration_adapter_epoch(),
             xml_configuration_adapter_epoch()
         );
-        assert_eq!(xml_configuration_adapter_epoch().len(), 64);
+        // Two adapters over the same document model must never share a cache
+        // compatibility identity.
+        assert_ne!(
+            json_configuration_adapter_epoch(),
+            xml_configuration_adapter_epoch()
+        );
+    }
+
+    /// Every referenced child exists exactly once and agrees with its parent.
+    fn arena_children_are_exclusive(document: &ConfigurationDocumentFacts) {
+        let mut referenced = vec![0usize; document.facts().len()];
+        for (index, fact) in document.facts().iter().enumerate() {
+            let children: Vec<_> = match fact.kind() {
+                ConfigurationNodeKind::Document { root } => root.iter().copied().collect(),
+                ConfigurationNodeKind::Object { members } => members.clone(),
+                ConfigurationNodeKind::Section { header, members } => header
+                    .iter()
+                    .copied()
+                    .chain(members.iter().copied())
+                    .collect(),
+                ConfigurationNodeKind::Sequence { items } => items.clone(),
+                ConfigurationNodeKind::Member { value, .. } => value.iter().copied().collect(),
+                ConfigurationNodeKind::Scalar { .. } => Vec::new(),
+            };
+            for child in children {
+                referenced[child.index()] += 1;
+                assert_eq!(
+                    document.fact(child).and_then(ConfigurationFact::parent),
+                    ConfigurationFactId::new(index),
+                    "{document:#?}"
+                );
+            }
+        }
+        for (index, count) in referenced.iter().enumerate().skip(1) {
+            assert_eq!(*count, 1, "fact {index} in {document:#?}");
+        }
+    }
+
+    fn recovery_reasons(document: &ConfigurationDocumentFacts) -> Vec<ConfigurationRecoveryReason> {
+        match document.completeness() {
+            ConfigurationCompleteness::Complete => Vec::new(),
+            ConfigurationCompleteness::Incomplete { recoveries } => recoveries
+                .iter()
+                .map(ConfigurationRecovery::reason)
+                .collect(),
+        }
+    }
+
+    fn member_keys(document: &ConfigurationDocumentFacts) -> Vec<&str> {
+        document
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact.kind() {
+                ConfigurationNodeKind::Member { key, .. } => Some(key.text()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scalar_kinds(document: &ConfigurationDocumentFacts) -> Vec<ConfigurationScalarKind> {
+        document
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact.kind() {
+                ConfigurationNodeKind::Scalar { scalar_kind } => Some(*scalar_kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recovered_json_keeps_its_surviving_facts_and_an_exclusive_arena() {
+        // tree-sitter-json 0.24.8 does not accept a `+` exponent, so this
+        // authored member is valid JSON that the grammar recovers from. Before
+        // the parent link moved behind fact creation, the recovered value left
+        // a dangling child id and the whole document returned no facts at all.
+        let document = facts(r#"{"kept": "value", "budget": 1e+9}"#);
+        arena_children_are_exclusive(&document);
+        assert!(member_keys(&document).contains(&"kept"), "{document:#?}");
+        assert!(
+            recovery_reasons(&document)
+                .iter()
+                .all(|reason| *reason == ConfigurationRecoveryReason::MalformedSyntax),
+            "{document:#?}"
+        );
+
+        // A grammar extra in an element position must not alias the next real
+        // element's arena entry.
+        let commented = facts("[1, /* note */ 2]");
+        arena_children_are_exclusive(&commented);
+        assert_eq!(
+            scalar_kinds(&commented),
+            vec![
+                ConfigurationScalarKind::Integer,
+                ConfigurationScalarKind::Integer
+            ],
+            "{commented:#?}"
+        );
+        let indexes: Vec<_> = commented
+            .facts()
+            .iter()
+            .filter_map(
+                |fact| match fact.route().segments().last().map(|s| s.selector()) {
+                    Some(ConfigurationRouteSelector::Index(index)) => Some(*index),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert_eq!(indexes, vec![0, 1], "{commented:#?}");
+    }
+
+    #[test]
+    fn an_empty_authored_key_is_a_member_rather_than_a_lost_document() {
+        // `{"": ...}` occurs in released JSON configuration (for example
+        // SchemaStore's cloudify.json and bun.lock.json); the model must hold
+        // it instead of discarding every fact in the file.
+        let document = facts(r#"{"": 0, "a": 1}"#);
+        assert!(document.completeness().is_complete(), "{document:#?}");
+        arena_children_are_exclusive(&document);
+        assert_eq!(member_keys(&document), vec!["", "a"], "{document:#?}");
+        let ids: Vec<_> = document
+            .facts()
+            .iter()
+            .filter(|fact| matches!(fact.kind(), ConfigurationNodeKind::Member { .. }))
+            .map(|fact| fact.stable_id(ConfigurationFormat::Json))
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn json_scalar_kinds_and_exact_ranges_follow_the_authored_document() {
+        let source = r#"{"s":"t","b":true,"i":-7,"d":1.5e2,"n":null,"nested":{"list":[0,"x"]}}"#;
+        let document = facts(source);
+        assert!(document.completeness().is_complete(), "{document:#?}");
+        assert_eq!(
+            scalar_kinds(&document),
+            vec![
+                ConfigurationScalarKind::String,
+                ConfigurationScalarKind::Boolean,
+                ConfigurationScalarKind::Integer,
+                ConfigurationScalarKind::Decimal,
+                ConfigurationScalarKind::Null,
+                ConfigurationScalarKind::Integer,
+                ConfigurationScalarKind::String,
+            ],
+            "{document:#?}"
+        );
+        for fact in document.facts() {
+            assert!(source.is_char_boundary(fact.evidence().start_byte()));
+            assert!(source.is_char_boundary(fact.evidence().end_byte()));
+            if let ConfigurationNodeKind::Member { key, .. } = fact.kind() {
+                // The authored key evidence is the quoted token, and decoding
+                // it reproduces the member's key text exactly.
+                let token = &source[key.evidence().start_byte()..key.evidence().end_byte()];
+                assert_eq!(
+                    serde_json::from_str::<String>(token).expect("authored key token"),
+                    key.text()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grammar_tolerated_scalars_are_typed_rather_than_clean() {
+        // The grammar accepts a missing fraction, a truncated escape, and a
+        // raw control character; JSON does not. Each keeps its authored fact
+        // and adds exact recovery evidence.
+        for source in [r#"{"a":1.}"#, r#"{"a":"\u"}"#, "{\"a\":\"x\ty\"}"] {
+            let document = facts(source);
+            assert_eq!(
+                recovery_reasons(&document),
+                vec![ConfigurationRecoveryReason::UnsupportedScalar],
+                "{source}: {document:#?}"
+            );
+            assert_eq!(
+                scalar_kinds(&document),
+                vec![ConfigurationScalarKind::Opaque],
+                "{source}: {document:#?}"
+            );
+            arena_children_are_exclusive(&document);
+        }
+        // A number outside f64 range is still authored JSON syntax.
+        assert!(facts(r#"{"a":1e400}"#).completeness().is_complete());
+    }
+
+    #[test]
+    fn json_document_root_cardinality_is_typed() {
+        for source in ["", "   \n", "{}{}", "[] []"] {
+            let document = facts(source);
+            assert_eq!(
+                recovery_reasons(&document),
+                vec![ConfigurationRecoveryReason::MalformedSyntax],
+                "{source:?}: {document:#?}"
+            );
+        }
+        // A comment is malformed JSON, but never a second top-level value.
+        let document = facts("{\"a\":1} // trailing");
+        assert!(!document.completeness().is_complete());
+        assert_eq!(member_keys(&document), vec!["a"]);
+    }
+
+    #[test]
+    fn json_feature_semantics_are_all_not_applicable() {
+        let document = facts(r#"{"a":{"b":[1]}}"#);
+        let features = document.features();
+        for state in [
+            features.anchors(),
+            features.aliases(),
+            features.includes(),
+            features.interpolation(),
+            features.format_merge(),
+        ] {
+            assert!(
+                matches!(state, ConfigurationFeatureState::NotApplicable),
+                "{features:#?}"
+            );
+        }
     }
 
     #[test]
@@ -1036,5 +1643,48 @@ mod tests {
                 .stable_id(ConfigurationFormat::Xml)
         };
         assert_eq!(enabled(&before), enabled(&after));
+    }
+
+    #[test]
+    fn toml_table_member_has_authored_key_and_scalar_evidence() {
+        let source = "[server]\nhost = \"example\"\n";
+        let ConfigurationIngestionOutcome::Facts(document) =
+            ingest_configuration_document(Path::new("config.toml"), source.as_bytes())
+        else {
+            panic!("TOML adapter must return facts")
+        };
+        assert!(document.completeness().is_complete());
+        let member = document
+            .facts()
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.kind(), ConfigurationNodeKind::Member { key, .. } if key.text() == "host"
+                )
+            })
+            .expect("host member");
+        let ConfigurationNodeKind::Member {
+            key,
+            value: Some(value),
+            ..
+        } = member.kind()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            &source[key.evidence().start_byte()..key.evidence().end_byte()],
+            "host"
+        );
+        let value = document.fact(*value).unwrap();
+        assert!(matches!(
+            value.kind(),
+            ConfigurationNodeKind::Scalar {
+                scalar_kind: ConfigurationScalarKind::String
+            }
+        ));
+        assert_eq!(
+            &source[value.evidence().start_byte()..value.evidence().end_byte()],
+            "\"example\""
+        );
     }
 }

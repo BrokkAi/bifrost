@@ -2280,329 +2280,335 @@ fn mapped_formals_for_actual(
     formals
 }
 
-#[allow(clippy::too_many_arguments)]
-fn callee_formal_is_nonpublishing(
-    oracle: &WorkspaceSemanticOracle<'_>,
-    procedure: &ProcedureHandle,
-    formal: &ProcedurePortHandle,
-    context: &crate::analyzer::semantic::OracleCallContext,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-    active_calls: &mut HashSet<crate::analyzer::semantic::CallSiteHandle>,
-) -> Result<bool, InterruptionOrProvider> {
-    let Some(formal_value) = formal_value_id(procedure, formal.kind()) else {
-        return Ok(false);
-    };
-
-    let mut copies = Vec::new();
-    for point in procedure.semantics().points() {
-        if cancellation.is_cancelled() {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        staged.charge(SemanticWork {
-            program_points: 1,
-            events: point.events.len(),
-            ..SemanticWork::default()
-        })?;
-        for (event_index, event) in point.events.iter().enumerate() {
-            match event.effect {
-                SemanticEffect::Assignment { target, value }
-                    if assignment_transfer(&point.events, event_index, value, target).is_none() =>
-                {
-                    copies.push((value, target));
-                }
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
-                    source,
-                    target,
-                } => copies.push((source, target)),
-                _ => {}
-            }
-        }
-    }
-
-    let mut names = HashSet::default();
-    names.insert(formal_value);
-    let mut pending = vec![formal_value];
-    while let Some(current) = pending.pop() {
-        if cancellation.is_cancelled() {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        staged.charge(SemanticWork {
-            values: 1,
-            ..SemanticWork::default()
-        })?;
-        for (source, target) in &copies {
-            if *source == current && names.insert(*target) {
-                pending.push(*target);
-            }
-        }
-    }
-
-    for point in procedure.semantics().points() {
-        if cancellation.is_cancelled() {
-            return Err(InterruptionOrProvider::Interruption(
-                Interruption::Cancelled,
-            ));
-        }
-        staged.charge(SemanticWork {
-            events: point.events.len(),
-            ..SemanticWork::default()
-        })?;
-        for event in &point.events {
-            match event.effect {
-                SemanticEffect::AggregateInitializer {
-                    aggregate, value, ..
-                } => {
-                    // Unrefined aggregate operands cannot certify nonpublication.
-                    if names.contains(&aggregate) || names.contains(&value) {
-                        return Ok(false);
-                    }
-                }
-                SemanticEffect::MemoryStore {
-                    location, value, ..
-                } => {
-                    let location_uses_formal = procedure
-                        .semantics()
-                        .memory_location(location)
-                        .is_some_and(|location| {
-                            names.iter().any(|value| location.kind.uses_value(*value))
-                        });
-                    if names.contains(&value) || location_uses_formal {
-                        return Ok(false);
-                    }
-                }
-                SemanticEffect::MemoryLoad { location, .. } => {
-                    if procedure
-                        .semantics()
-                        .memory_location(location)
-                        .is_some_and(|location| location.kind.uses_value(formal_value))
-                    {
-                        // A load is the read-only callback case.
-                    }
-                }
-                SemanticEffect::CaptureBind { capture } => {
-                    let captures_formal = procedure
-                        .semantics()
-                        .captures()
-                        .iter()
-                        .find(|capture_row| capture_row.id == capture)
-                        .is_some_and(|capture_row| match capture_row.captured {
-                            CaptureSource::Value(value) => names.contains(&value),
-                            CaptureSource::Location(location) => procedure
-                                .semantics()
-                                .memory_location(location)
-                                .is_some_and(|location| {
-                                    names.iter().any(|value| location.kind.uses_value(*value))
-                                }),
-                        });
-                    if captures_formal {
-                        return Ok(false);
-                    }
-                }
-                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value }
-                    if value.is_some_and(|value| names.contains(&value)) =>
-                {
-                    return Ok(false);
-                }
-                SemanticEffect::AsyncSuspend { awaited, .. }
-                    if awaited.is_some_and(|value| names.contains(&value)) =>
-                {
-                    return Ok(false);
-                }
-                SemanticEffect::ValueFlow {
-                    kind:
-                        ValueFlowKind::Parameter
-                        | ValueFlowKind::Receiver
-                        | ValueFlowKind::Return
-                        | ValueFlowKind::IndexedReturn { .. }
-                        | ValueFlowKind::LanguageDefined,
-                    source,
-                    ..
-                } if names.contains(&source) => return Ok(false),
-                SemanticEffect::CallableCreation { ref callable, .. }
-                | SemanticEffect::CallableReference { ref callable, .. }
-                    if callable
-                        .bound_receiver
-                        .is_some_and(|receiver| names.contains(&receiver)) =>
-                {
-                    return Ok(false);
-                }
-                SemanticEffect::Invoke { call_site } => {
-                    let Some(call) = procedure.semantics().call_site(call_site) else {
-                        return Ok(false);
-                    };
-                    if !call_names_any(call, &names) {
-                        continue;
-                    }
-                    let Some(call_handle) = procedure.call_site_handle(call_site) else {
-                        return Ok(false);
-                    };
-                    if !call_is_nonpublishing(
-                        oracle,
-                        &call_handle,
-                        &names,
-                        context,
-                        staged,
-                        cancellation,
-                        active_calls,
-                    )? {
-                        return Ok(false);
-                    }
-                }
-                SemanticEffect::Gap { gap } => {
-                    let Some(gap) = procedure.semantics().gap(gap) else {
-                        return Ok(false);
-                    };
-                    let unresolved_effect = gap_impacts_heap(gap)
-                        || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                        || gap.impacts.contains(SemanticGapImpact::ValueFlow);
-                    if unresolved_effect && publication_gap_affects_names(procedure, gap, &names) {
-                        return Ok(false);
-                    }
-                }
-                SemanticEffect::Entry
-                | SemanticEffect::NormalExit
-                | SemanticEffect::ExceptionalExit
-                | SemanticEffect::ProcedureReturn { .. }
-                | SemanticEffect::Throw { .. }
-                | SemanticEffect::AsyncSuspend { .. }
-                | SemanticEffect::Assignment { .. }
-                | SemanticEffect::ValueFlow { .. }
-                | SemanticEffect::ValueUse { .. }
-                | SemanticEffect::Allocation { .. }
-                | SemanticEffect::CallableCreation { .. }
-                | SemanticEffect::CallableReference { .. }
-                | SemanticEffect::CallContinuation { .. }
-                | SemanticEffect::AsyncResume { .. }
-                | SemanticEffect::Synchronization { .. } => {}
-            }
-        }
-    }
-    Ok(true)
+/// Call proofs share exact syntax only while their enclosing escape proof is
+/// alive. Dropping this session also drops preparation whose staged charge
+/// might later roll back; no unpaid source survives into another heap query.
+struct EscapeCallSession<'a> {
+    oracle: WorkspaceSemanticOracle<'a>,
+    dispatch: super::dispatch::PreparedWorkspaceDispatchPool<'a>,
+    active_calls: HashSet<crate::analyzer::semantic::CallSiteHandle>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn call_is_nonpublishing(
-    oracle: &WorkspaceSemanticOracle<'_>,
-    call: &crate::analyzer::semantic::CallSiteHandle,
-    names: &HashSet<crate::analyzer::semantic::ValueId>,
-    context: &crate::analyzer::semantic::OracleCallContext,
-    staged: &mut WorkStager,
-    cancellation: &crate::cancellation::CancellationToken,
-    active_calls: &mut HashSet<crate::analyzer::semantic::CallSiteHandle>,
-) -> Result<bool, InterruptionOrProvider> {
-    if !active_calls.insert(call.clone()) {
-        return Ok(false);
-    }
-    let result = (|| {
-        let dispatch_outcome = {
-            let mut request = staged.request(cancellation);
-            oracle
-                .resolve_call(call, &mut request)
-                .map_err(InterruptionOrProvider::Provider)?
-        };
-        staged.work = staged.work.conservative_add(dispatch_outcome.work());
-        if let Some(interruption) = outcome_interruption(&dispatch_outcome) {
-            return Err(InterruptionOrProvider::Interruption(interruption));
-        }
-        let Some(dispatch) = dispatch_outcome.available_value() else {
+impl EscapeCallSession<'_> {
+    fn callee_formal_is_nonpublishing(
+        &mut self,
+        procedure: &ProcedureHandle,
+        formal: &ProcedurePortHandle,
+        context: &crate::analyzer::semantic::OracleCallContext,
+        staged: &mut WorkStager,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<bool, InterruptionOrProvider> {
+        let Some(formal_value) = formal_value_id(procedure, formal.kind()) else {
             return Ok(false);
         };
-        if dispatch.coverage() != CandidateCoverage::Exhaustive
-            || !dispatch.boundaries().is_empty()
-            || dispatch.candidates().len() != 1
-        {
-            return Ok(false);
-        }
-        let candidate = &dispatch.candidates()[0];
-        if !matches!(candidate.proof(), ProofStatus::Proven)
-            || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
-        {
-            return Ok(false);
-        }
-        let bindings_outcome = {
-            let mut request = staged.request(cancellation);
-            oracle
-                .call_bindings(call, candidate, context, &mut request)
-                .map_err(InterruptionOrProvider::Provider)?
-        };
-        staged.work = staged.work.conservative_add(bindings_outcome.work());
-        if let Some(interruption) = outcome_interruption(&bindings_outcome) {
-            return Err(InterruptionOrProvider::Interruption(interruption));
-        }
-        let Some(bindings) = bindings_outcome.available_value() else {
-            return Ok(false);
-        };
-        if bindings.coverage() != CandidateCoverage::Exhaustive {
-            return Ok(false);
-        }
 
-        let callee_context = context.extended(call.clone(), *oracle.limits());
-        if callee_context.was_truncated() {
-            return Ok(false);
-        }
-        let flow_outcome = {
-            let mut request = staged.request(cancellation);
-            oracle
-                .procedure_relations(candidate.target(), &callee_context, &mut request)
-                .map_err(InterruptionOrProvider::Provider)?
-        };
-        staged.work = staged.work.conservative_add(flow_outcome.work());
-        if let Some(interruption) = outcome_interruption(&flow_outcome) {
-            return Err(InterruptionOrProvider::Interruption(interruption));
-        }
-        let Some(flow) = flow_outcome.available_value() else {
-            return Ok(false);
-        };
-        if flow.coverage() != CandidateCoverage::Exhaustive {
-            return Ok(false);
-        }
-
-        let call_row = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .ok_or_else(|| {
-                InterruptionOrProvider::Provider(SemanticProviderError::internal(
-                    "escape proof reached a stale call site",
-                ))
-            })?;
-        let touched = std::iter::once(call_row.callee)
-            .chain(call_row.receiver)
-            .chain(call_row.arguments.iter().map(|argument| argument.value))
-            .filter(|value| names.contains(value))
-            .collect::<HashSet<_>>();
-        if touched.is_empty() {
-            return Ok(true);
-        }
-        for actual in touched {
-            let formals = mapped_formals_for_actual(bindings, actual);
-            if formals.is_empty() {
-                return Ok(false);
+        let mut copies = Vec::new();
+        for point in procedure.semantics().points() {
+            if cancellation.is_cancelled() {
+                return Err(InterruptionOrProvider::Interruption(
+                    Interruption::Cancelled,
+                ));
             }
-            for formal in formals {
-                if !callee_formal_is_nonpublishing(
-                    oracle,
-                    candidate.target(),
-                    &formal,
-                    &callee_context,
-                    staged,
-                    cancellation,
-                    active_calls,
-                )? {
-                    return Ok(false);
+            staged.charge(SemanticWork {
+                program_points: 1,
+                events: point.events.len(),
+                ..SemanticWork::default()
+            })?;
+            for (event_index, event) in point.events.iter().enumerate() {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value }
+                        if assignment_transfer(&point.events, event_index, value, target)
+                            .is_none() =>
+                    {
+                        copies.push((value, target));
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+                        source,
+                        target,
+                    } => copies.push((source, target)),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut names = HashSet::default();
+        names.insert(formal_value);
+        let mut pending = vec![formal_value];
+        while let Some(current) = pending.pop() {
+            if cancellation.is_cancelled() {
+                return Err(InterruptionOrProvider::Interruption(
+                    Interruption::Cancelled,
+                ));
+            }
+            staged.charge(SemanticWork {
+                values: 1,
+                ..SemanticWork::default()
+            })?;
+            for (source, target) in &copies {
+                if *source == current && names.insert(*target) {
+                    pending.push(*target);
+                }
+            }
+        }
+
+        for point in procedure.semantics().points() {
+            if cancellation.is_cancelled() {
+                return Err(InterruptionOrProvider::Interruption(
+                    Interruption::Cancelled,
+                ));
+            }
+            staged.charge(SemanticWork {
+                events: point.events.len(),
+                ..SemanticWork::default()
+            })?;
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::AggregateInitializer {
+                        aggregate, value, ..
+                    } => {
+                        // Unrefined aggregate operands cannot certify nonpublication.
+                        if names.contains(&aggregate) || names.contains(&value) {
+                            return Ok(false);
+                        }
+                    }
+                    SemanticEffect::MemoryStore {
+                        location, value, ..
+                    } => {
+                        let location_uses_formal = procedure
+                            .semantics()
+                            .memory_location(location)
+                            .is_some_and(|location| {
+                                names.iter().any(|value| location.kind.uses_value(*value))
+                            });
+                        if names.contains(&value) || location_uses_formal {
+                            return Ok(false);
+                        }
+                    }
+                    SemanticEffect::MemoryLoad { location, .. } => {
+                        if procedure
+                            .semantics()
+                            .memory_location(location)
+                            .is_some_and(|location| location.kind.uses_value(formal_value))
+                        {
+                            // A load is the read-only callback case.
+                        }
+                    }
+                    SemanticEffect::CaptureBind { capture } => {
+                        let captures_formal = procedure
+                            .semantics()
+                            .captures()
+                            .iter()
+                            .find(|capture_row| capture_row.id == capture)
+                            .is_some_and(|capture_row| match capture_row.captured {
+                                CaptureSource::Value(value) => names.contains(&value),
+                                CaptureSource::Location(location) => procedure
+                                    .semantics()
+                                    .memory_location(location)
+                                    .is_some_and(|location| {
+                                        names.iter().any(|value| location.kind.uses_value(*value))
+                                    }),
+                            });
+                        if captures_formal {
+                            return Ok(false);
+                        }
+                    }
+                    SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value }
+                        if value.is_some_and(|value| names.contains(&value)) =>
+                    {
+                        return Ok(false);
+                    }
+                    SemanticEffect::AsyncSuspend { awaited, .. }
+                        if awaited.is_some_and(|value| names.contains(&value)) =>
+                    {
+                        return Ok(false);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind:
+                            ValueFlowKind::Parameter
+                            | ValueFlowKind::Receiver
+                            | ValueFlowKind::Return
+                            | ValueFlowKind::IndexedReturn { .. }
+                            | ValueFlowKind::LanguageDefined,
+                        source,
+                        ..
+                    } if names.contains(&source) => return Ok(false),
+                    SemanticEffect::CallableCreation { ref callable, .. }
+                    | SemanticEffect::CallableReference { ref callable, .. }
+                        if callable
+                            .bound_receiver
+                            .is_some_and(|receiver| names.contains(&receiver)) =>
+                    {
+                        return Ok(false);
+                    }
+                    SemanticEffect::Invoke { call_site } => {
+                        let Some(call) = procedure.semantics().call_site(call_site) else {
+                            return Ok(false);
+                        };
+                        if !call_names_any(call, &names) {
+                            continue;
+                        }
+                        let Some(call_handle) = procedure.call_site_handle(call_site) else {
+                            return Ok(false);
+                        };
+                        if !self.call_is_nonpublishing(
+                            &call_handle,
+                            &names,
+                            context,
+                            staged,
+                            cancellation,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                    SemanticEffect::Gap { gap } => {
+                        let Some(gap) = procedure.semantics().gap(gap) else {
+                            return Ok(false);
+                        };
+                        let unresolved_effect = gap_impacts_heap(gap)
+                            || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                            || gap.impacts.contains(SemanticGapImpact::ValueFlow);
+                        if unresolved_effect
+                            && publication_gap_affects_names(procedure, gap, &names)
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    SemanticEffect::Entry
+                    | SemanticEffect::NormalExit
+                    | SemanticEffect::ExceptionalExit
+                    | SemanticEffect::ProcedureReturn { .. }
+                    | SemanticEffect::Throw { .. }
+                    | SemanticEffect::AsyncSuspend { .. }
+                    | SemanticEffect::Assignment { .. }
+                    | SemanticEffect::ValueFlow { .. }
+                    | SemanticEffect::ValueUse { .. }
+                    | SemanticEffect::Allocation { .. }
+                    | SemanticEffect::CallableCreation { .. }
+                    | SemanticEffect::CallableReference { .. }
+                    | SemanticEffect::CallContinuation { .. }
+                    | SemanticEffect::AsyncResume { .. }
+                    | SemanticEffect::Synchronization { .. } => {}
                 }
             }
         }
         Ok(true)
-    })();
-    active_calls.remove(call);
-    result
+    }
+
+    fn call_is_nonpublishing(
+        &mut self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        names: &HashSet<crate::analyzer::semantic::ValueId>,
+        context: &crate::analyzer::semantic::OracleCallContext,
+        staged: &mut WorkStager,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<bool, InterruptionOrProvider> {
+        if !self.active_calls.insert(call.clone()) {
+            return Ok(false);
+        }
+        let result = (|| {
+            let dispatch_outcome = {
+                let mut request = staged.request(cancellation);
+                self.dispatch
+                    .resolve_call(call, &mut request)
+                    .map_err(InterruptionOrProvider::Provider)?
+            };
+            staged.work = staged.work.conservative_add(dispatch_outcome.work());
+            if let Some(interruption) = outcome_interruption(&dispatch_outcome) {
+                return Err(InterruptionOrProvider::Interruption(interruption));
+            }
+            let Some(dispatch) = dispatch_outcome.available_value() else {
+                return Ok(false);
+            };
+            if dispatch.coverage() != CandidateCoverage::Exhaustive
+                || !dispatch.boundaries().is_empty()
+                || dispatch.candidates().len() != 1
+            {
+                return Ok(false);
+            }
+            let candidate = &dispatch.candidates()[0];
+            if !matches!(candidate.proof(), ProofStatus::Proven)
+                || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+            {
+                return Ok(false);
+            }
+            let bindings_outcome = {
+                let mut request = staged.request(cancellation);
+                self.oracle
+                    .call_bindings(call, candidate, context, &mut request)
+                    .map_err(InterruptionOrProvider::Provider)?
+            };
+            staged.work = staged.work.conservative_add(bindings_outcome.work());
+            if let Some(interruption) = outcome_interruption(&bindings_outcome) {
+                return Err(InterruptionOrProvider::Interruption(interruption));
+            }
+            let Some(bindings) = bindings_outcome.available_value() else {
+                return Ok(false);
+            };
+            if bindings.coverage() != CandidateCoverage::Exhaustive {
+                return Ok(false);
+            }
+
+            let callee_context = context.extended(call.clone(), *self.oracle.limits());
+            if callee_context.was_truncated() {
+                return Ok(false);
+            }
+            let flow_outcome = {
+                let mut request = staged.request(cancellation);
+                self.oracle
+                    .procedure_relations(candidate.target(), &callee_context, &mut request)
+                    .map_err(InterruptionOrProvider::Provider)?
+            };
+            staged.work = staged.work.conservative_add(flow_outcome.work());
+            if let Some(interruption) = outcome_interruption(&flow_outcome) {
+                return Err(InterruptionOrProvider::Interruption(interruption));
+            }
+            let Some(flow) = flow_outcome.available_value() else {
+                return Ok(false);
+            };
+            if flow.coverage() != CandidateCoverage::Exhaustive {
+                return Ok(false);
+            }
+
+            let call_row = call
+                .procedure()
+                .semantics()
+                .call_site(call.id())
+                .ok_or_else(|| {
+                    InterruptionOrProvider::Provider(SemanticProviderError::internal(
+                        "escape proof reached a stale call site",
+                    ))
+                })?;
+            let touched = std::iter::once(call_row.callee)
+                .chain(call_row.receiver)
+                .chain(call_row.arguments.iter().map(|argument| argument.value))
+                .filter(|value| names.contains(value))
+                .collect::<HashSet<_>>();
+            if touched.is_empty() {
+                return Ok(true);
+            }
+            for actual in touched {
+                let formals = mapped_formals_for_actual(bindings, actual);
+                if formals.is_empty() {
+                    return Ok(false);
+                }
+                for formal in formals {
+                    if !self.callee_formal_is_nonpublishing(
+                        candidate.target(),
+                        &formal,
+                        &callee_context,
+                        staged,
+                        cancellation,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })();
+        self.active_calls.remove(call);
+        result
+    }
 }
 
 fn resolve_fresh_object_publications(
@@ -3165,6 +3171,11 @@ fn object_escape_status(
         }
     }
 
+    let mut calls = EscapeCallSession {
+        oracle: oracle.clone(),
+        dispatch: oracle.prepare_workspace_dispatch_pool(),
+        active_calls: HashSet::default(),
+    };
     for point in semantics.points() {
         staged.charge(SemanticWork {
             events: point.events.len(),
@@ -3201,15 +3212,12 @@ fn object_escape_status(
                         let Some(call_handle) = procedure.call_site_handle(call_site) else {
                             return Ok(EscapeStatus::MayEscape);
                         };
-                        let mut active_calls = HashSet::default();
-                        !call_is_nonpublishing(
-                            oracle,
+                        !calls.call_is_nonpublishing(
                             &call_handle,
                             &names,
                             context,
                             staged,
                             cancellation,
-                            &mut active_calls,
                         )?
                     }
                 }
@@ -3903,6 +3911,141 @@ mod tests {
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn escape_proof_shares_only_paid_caller_source() {
+        let source = "def inspect(value):\n    pass\n\ndef caller():\n    items = [1]\n    inspect(items)\n    inspect(items)\n    items[0] = 2\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Python, &[("calls.py", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "calls.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("materialization runs")
+            .available_value()
+            .cloned()
+            .expect("artifact");
+        let allocation = artifact
+            .procedures()
+            .iter()
+            .find_map(|semantics| {
+                let allocation = semantics.allocations().first()?;
+                artifact
+                    .procedure_handle(semantics.id())?
+                    .allocation_handle(allocation.id)
+            })
+            .expect("list allocation");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let identity = AbstractObjectIdentity::Allocation(allocation);
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = source.len() - 1;
+        let mut tight = SemanticBudget::new(limits).expect("positive source limit");
+        let request = SemanticRequest::new(&mut tight, &cancellation);
+        let mut failed = WorkStager::new(&request);
+        assert!(matches!(
+            object_escape_status(
+                &oracle,
+                &identity,
+                &OracleCallContext::empty(),
+                &mut failed,
+                &cancellation
+            ),
+            Err(InterruptionOrProvider::Interruption(Interruption::Budget(
+                _
+            )))
+        ));
+        assert_eq!(tight.used().source_bytes, 0, "failed work is not committed");
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let mut cancelled_budget = SemanticBudget::default();
+        let request = SemanticRequest::new(&mut cancelled_budget, &cancelled);
+        let mut interrupted = WorkStager::new(&request);
+        assert!(matches!(
+            object_escape_status(
+                &oracle,
+                &identity,
+                &OracleCallContext::empty(),
+                &mut interrupted,
+                &cancelled
+            ),
+            Err(InterruptionOrProvider::Interruption(
+                Interruption::Cancelled
+            ))
+        ));
+        assert_eq!(interrupted.work.source_bytes, 0);
+
+        let mut budget = SemanticBudget::default();
+        let request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut staged = WorkStager::new(&request);
+        let escape = object_escape_status(
+            &oracle,
+            &identity,
+            &OracleCallContext::empty(),
+            &mut staged,
+            &cancellation,
+        )
+        .unwrap_or_else(|failure| match failure {
+            InterruptionOrProvider::Interruption(error) => {
+                panic!("escape proof interrupted: {error:?}")
+            }
+            InterruptionOrProvider::Provider(error) => panic!("escape provider failed: {error:?}"),
+        });
+        assert_eq!(escape, EscapeStatus::DoesNotEscape);
+        assert_eq!(
+            staged.work.source_bytes,
+            source.len(),
+            "one exact caller source is sufficient for both nonpublishing calls"
+        );
+    }
+
+    #[test]
+    fn escape_proof_reused_source_does_not_hide_publication() {
+        let source = "def inspect(value):\n    pass\n\ndef publish(value):\n    global saved\n    saved = value\n\ndef caller():\n    items = [1]\n    inspect(items)\n    publish(items)\n    items[0] = 2\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Python, &[("calls.py", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "calls.py");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("materialization runs")
+            .available_value()
+            .cloned()
+            .expect("artifact");
+        let allocation = artifact
+            .procedures()
+            .iter()
+            .find_map(|semantics| {
+                let allocation = semantics.allocations().first()?;
+                artifact
+                    .procedure_handle(semantics.id())?
+                    .allocation_handle(allocation.id)
+            })
+            .expect("list allocation");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let mut budget = SemanticBudget::default();
+        let request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut staged = WorkStager::new(&request);
+        assert!(matches!(
+            object_escape_status(
+                &oracle,
+                &AbstractObjectIdentity::Allocation(allocation),
+                &OracleCallContext::empty(),
+                &mut staged,
+                &cancellation,
+            ),
+            Ok(EscapeStatus::MayEscape)
+        ));
+        assert_eq!(staged.work.source_bytes, source.len());
+    }
 
     #[test]
     fn moves_stop_identity_traces_on_both_sides() {

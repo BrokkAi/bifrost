@@ -257,6 +257,15 @@ impl StructuralSpec for GoStructuralSpec {
         GO_KIND_TABLE
     }
 
+    fn reparse_grammar_gap(
+        &self,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Option<tree_sitter::Tree> {
+        crate::parse::go_reparse_grammar_gap(source, tree, cancellation)
+    }
+
     fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
         kind != NormalizedKind::Assignment
             || !matches!(node.kind(), "var_spec" | "const_spec")

@@ -1849,6 +1849,17 @@ fn unbound_workspace_error() -> ErrorData {
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> ErrorData {
     match code {
         SearchToolsServiceErrorCode::InvalidParams => ErrorData::invalid_params(message, None),
+        SearchToolsServiceErrorCode::StaleWorkspaceGeneration { requested, current } => {
+            ErrorData::invalid_params(
+                message,
+                Some(serde_json::json!({
+                    "kind": "stale_workspace_generation",
+                    "requested": requested,
+                    "current": current,
+                    "retryable": true,
+                })),
+            )
+        }
         SearchToolsServiceErrorCode::UnknownTool => {
             ErrorData::new(rmcp::model::ErrorCode::METHOD_NOT_FOUND, message, None)
         }
@@ -2842,5 +2853,29 @@ mod cold_workspace_deadline_tests {
             "search_symbols",
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod explanation_generation_tests {
+    use super::*;
+
+    #[test]
+    fn stale_explanation_pin_has_machine_readable_wire_details() {
+        let requested = "0".repeat(64).parse().unwrap();
+        let current = "1".repeat(64).parse().unwrap();
+        let error = map_service_error(
+            SearchToolsServiceErrorCode::StaleWorkspaceGeneration {
+                requested,
+                current: Some(current),
+            },
+            "the workspace changed".to_owned(),
+        );
+        let wire = serde_json::to_value(error).unwrap();
+        assert_eq!(wire["code"], -32602);
+        assert_eq!(wire["data"]["kind"], "stale_workspace_generation");
+        assert_eq!(wire["data"]["requested"], "0".repeat(64));
+        assert_eq!(wire["data"]["current"], "1".repeat(64));
+        assert_eq!(wire["data"]["retryable"], true);
     }
 }

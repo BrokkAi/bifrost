@@ -1567,3 +1567,29 @@ fn language_family_help_and_validation_use_fixed_expansions() {
     assert_eq!(&source[error.range.clone()], "jvmm");
     assert!(format!("{:?}", error.fix).contains("jvm"));
 }
+
+#[test]
+fn configuration_key_validation_matches_the_decoder() {
+    // The editor validator and the canonical decoder must agree on which
+    // authored keys are selectable, including the empty key that JSON admits.
+    let empty_key = r#"(configuration-facts :format json :key "")"#;
+    assert!(
+        validate_query_source(empty_key).is_empty(),
+        "{:#?}",
+        validate_query_source(empty_key)
+    );
+    assert!(crate::structural::CodeQuery::from_sexp(empty_key).is_ok());
+
+    let oversized = format!(
+        r#"(configuration-facts :format json :key "{}")"#,
+        "k".repeat(MAX_CONFIGURATION_KEY_LENGTH + 1)
+    );
+    let diagnostics = validate_query_source(&oversized);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "wrong-value-shape"),
+        "{diagnostics:#?}"
+    );
+    assert!(crate::structural::CodeQuery::from_sexp(&oversized).is_err());
+}
