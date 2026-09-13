@@ -480,6 +480,10 @@ pub struct CodeQueryClassSetRow {
     pub class: Option<String>,
     pub origin: String,
     pub status: &'static str,
+    /// True when membership follows only from guarding an unmodeled producer.
+    /// Absent for unknown atoms; false does not prove full path feasibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_only: Option<bool>,
 }
 
 /// A member access whose receiver class set is fully known and contains a

@@ -281,7 +281,7 @@ impl FieldStoreSurvey {
 
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
-    const ALGORITHM_VERSION: u32 = 6;
+    const ALGORITHM_VERSION: u32 = 15;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -1016,6 +1016,9 @@ impl FieldSlotIndex {
         class: &ClassIdentity,
         member: &str,
     ) -> MemberStoreEvidence {
+        if adapter.member_surface_is_closed(workspace, class) {
+            return MemberStoreEvidence::NoStore;
+        }
         let has_store = |owner: &ClassIdentity| {
             self.store_survey
                 .stores
@@ -1047,12 +1050,15 @@ impl FieldSlotIndex {
 
     pub(super) fn dynamic_write_evidence(
         &self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
         class: &ClassIdentity,
     ) -> impl Iterator<Item = &DynamicWriteEvidence> {
+        let closed = adapter.member_surface_is_closed(workspace, class);
         self.store_survey
             .dynamic_effects
             .iter()
-            .filter(move |write| write.affects(class))
+            .filter(move |write| !closed && write.affects(class))
             .map(|write| &write.evidence)
     }
 
@@ -2045,7 +2051,7 @@ const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
         SourceSiteKind::DeclaredParameter => "declared_parameter",
         SourceSiteKind::RootReceiver => "root_receiver",
         SourceSiteKind::Unknown => "unknown",
-        SourceSiteKind::NarrowingGuard => {
+        SourceSiteKind::NarrowingGuard | SourceSiteKind::ConditionalNarrowingGuard => {
             panic!("a field-slot source is never a guard-proved class")
         }
     }
@@ -2053,7 +2059,7 @@ const fn source_kind_label(kind: SourceSiteKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2271,6 +2277,7 @@ mod tests {
         inner: &'static dyn TypeFlowAdapter,
         semantics: crate::analyzer::semantic::AdapterSemanticsVersion,
         constructed_seed: Option<ClassSeed>,
+        constructed_queries: AtomicUsize,
         block_hierarchy: bool,
         entered: Barrier,
         release: Barrier,
@@ -2285,6 +2292,7 @@ mod tests {
                 inner,
                 semantics: inner.semantics_version(),
                 constructed_seed: None,
+                constructed_queries: AtomicUsize::new(0),
                 block_hierarchy: true,
                 entered: Barrier::new(2),
                 release: Barrier::new(2),
@@ -2334,6 +2342,7 @@ mod tests {
             procedure: &ProcedureHandle,
             call: &SemanticCallSite,
         ) -> ClassSeed {
+            self.constructed_queries.fetch_add(1, Ordering::Relaxed);
             self.constructed_seed
                 .clone()
                 .unwrap_or_else(|| self.inner.constructed_class(workspace, procedure, call))
@@ -2423,6 +2432,241 @@ mod tests {
         ) -> Vec<DynamicFieldWrite> {
             self.inner.dynamic_field_writes(workspace, procedure)
         }
+    }
+
+    #[test]
+    fn dynamic_write_survey_does_not_seed_disjoint_roots() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                concat!(
+                    "class Value:\n    pass\n",
+                    "def unrelated():\n    return Value()\n",
+                    "def unrelated_indexed():\n    return [Value()][0]\n",
+                    "def unrelated_opaque():\n    class Hidden:\n        pass\n    return Value()\n",
+                    "def write(target, name):\n    setattr(target, name, 1)\n",
+                    "def caller():\n    write(Value(), 'extra')\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut collected = CollectedSlots::default();
+        for procedure in &procedures {
+            collect_procedure(
+                &workspace,
+                &adapter,
+                procedure,
+                &mut collected,
+                &cancellation,
+            )
+            .unwrap();
+        }
+        assert_eq!(collected.dynamic_writes.len(), 1);
+        let mut slots =
+            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        slots.store_survey.dynamic_effects = collected
+            .dynamic_writes
+            .iter()
+            .map(|write| ScopedDynamicWrite::open(write.site.clone(), UnknownReason::UnmodeledLoad))
+            .collect();
+        for name in [
+            "unrelated",
+            "unrelated_indexed",
+            "unrelated_opaque",
+            "caller",
+        ] {
+            let root = procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap();
+            adapter.constructed_queries.store(0, Ordering::Relaxed);
+            let effects = super::super::dynamic_stores::survey(
+                &workspace,
+                &adapter,
+                &slots,
+                std::slice::from_ref(root),
+                &collected.dynamic_writes,
+                &mut budget,
+                &mut SolverBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            if name == "unrelated_opaque" {
+                assert!(
+                    adapter.constructed_queries.load(Ordering::Relaxed) > 0,
+                    "missing control topology must retain the original plan boundary path"
+                );
+            } else if name != "caller" {
+                assert_eq!(
+                    adapter.constructed_queries.load(Ordering::Relaxed),
+                    0,
+                    "discovery proves this root cannot reach the surveyed write"
+                );
+                assert!(effects[0].classes.is_empty());
+            } else {
+                assert!(
+                    effects[0]
+                        .classes
+                        .iter()
+                        .any(|class| class.qualified_name() == "app.Value"),
+                    "the connected caller must contribute its actual receiver: {effects:?}"
+                );
+                assert!(adapter.constructed_queries.load(Ordering::Relaxed) > 0);
+                let provider = crate::value_flow::WorkspaceValueFlowProvider::new(
+                    &workspace,
+                    crate::value_flow::ValueFlowCache::default(),
+                );
+                let stopped = super::super::plan::TypeFlowDiscovery::new(
+                    root,
+                    &provider,
+                    ClosureLimits { max_procedures: 1 },
+                    &mut budget,
+                    &cancellation,
+                )
+                .unwrap();
+                assert!(
+                    !stopped.excludes_procedures(
+                        collected
+                            .dynamic_writes
+                            .iter()
+                            .map(|write| &write.procedure)
+                    ),
+                    "a procedure cap must not hide the connected write"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_write_survey_skips_roots_that_only_reach_open_writes() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                concat!(
+                    "class Value:\n    pass\n",
+                    "def open_write(name):\n    setattr([Value()][0], name, 1)\n",
+                    "def redundant(name):\n    value = Value()\n    open_write(name)\n",
+                    "def pending_write(name):\n    setattr(Value(), name, 1)\n",
+                ),
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .unwrap();
+        let procedures = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut collected = CollectedSlots::default();
+        for procedure in &procedures {
+            collect_procedure(
+                &workspace,
+                &adapter,
+                procedure,
+                &mut collected,
+                &cancellation,
+            )
+            .unwrap();
+        }
+        assert_eq!(collected.dynamic_writes.len(), 2);
+        let slots =
+            FieldSlotIndex::finish(&workspace, &adapter, collected.clone(), &cancellation).unwrap();
+        let root = |name| {
+            procedures
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .semantics()
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .unwrap()
+                .clone()
+        };
+        let mut outcomes = Vec::new();
+        for roots in [
+            vec![root("open_write"), root("pending_write")],
+            vec![root("open_write"), root("redundant"), root("pending_write")],
+        ] {
+            adapter.constructed_queries.store(0, Ordering::Relaxed);
+            let effects = super::super::dynamic_stores::survey(
+                &workspace,
+                &adapter,
+                &slots,
+                &roots,
+                &collected.dynamic_writes,
+                &mut SemanticBudget::default(),
+                &mut SolverBudget::default(),
+                &cancellation,
+            )
+            .unwrap();
+            let open = effects
+                .iter()
+                .find(|effect| effect.evidence.reason.is_some())
+                .unwrap();
+            assert_eq!(open.evidence.reason, Some(UnknownReason::UnmodeledLoad));
+            let pending = effects
+                .iter()
+                .find(|effect| effect.evidence.reason.is_none())
+                .unwrap();
+            assert!(
+                pending
+                    .classes
+                    .iter()
+                    .any(|class| class.qualified_name() == "app.Value"),
+                "the pending write must still receive its actual class: {effects:?}"
+            );
+            outcomes.push((effects, adapter.constructed_queries.load(Ordering::Relaxed)));
+        }
+        assert_eq!(
+            outcomes[0].0, outcomes[1].0,
+            "adding the redundant root cannot change effects"
+        );
+        assert_eq!(
+            outcomes[0].1, outcomes[1].1,
+            "a root that reaches only an already-open write must not seed another plan"
+        );
     }
 
     #[test]

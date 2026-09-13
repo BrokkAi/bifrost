@@ -1055,17 +1055,17 @@ pub fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGap) -> b
         || gap.impacts.contains(SemanticGapImpact::HeapWrite)
 }
 
-/// A value-scoped, read-only heap gap is irrelevant when that exact local
-/// identity and every identity-preserving alias are only written, never read
-/// or published. This keeps an append replacement's unmodeled copy of prior
-/// elements from poisoning the independently proven new-backing separation,
-/// while any later read, return, capture, or call still fails closed.
-fn unobserved_local_heap_read_gap_is_discharged(
+/// An isolated heap partition cannot affect value flow when its local result
+/// and every identity-preserving alias are never read or published. This covers
+/// missing prior-element reads and missing writes into a fresh collection;
+/// returning, capturing, loading, or passing that collection remains open.
+fn unobserved_local_heap_gap_is_discharged(
     procedure: &ProcedureHandle,
     gap: &crate::analyzer::semantic::SemanticGap,
 ) -> bool {
-    if gap.impacts
-        != crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+    let read = crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapRead);
+    let write = crate::analyzer::semantic::SemanticGapImpacts::single(SemanticGapImpact::HeapWrite);
+    if (gap.impacts != read && gap.impacts != write)
         || gap.discharge != SemanticGapDischarge::ModeledEffectPartition
     {
         return false;
@@ -1073,6 +1073,16 @@ fn unobserved_local_heap_read_gap_is_discharged(
     let SemanticGapSubject::Value(subject) = gap.subject else {
         return false;
     };
+
+    if gap.impacts == write
+        && !procedure
+            .semantics()
+            .allocations()
+            .iter()
+            .any(|allocation| allocation.result == subject)
+    {
+        return false;
+    }
 
     let mut aliases = HashSet::from([subject]);
     let mut changed = true;
@@ -3496,7 +3506,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
                     && !constructor_call_gap_is_discharged(procedure.semantics(), gap)
                     && !canonical_index_identity_discharged
-                    && !unobserved_local_heap_read_gap_is_discharged(procedure, gap)
+                    && !unobserved_local_heap_gap_is_discharged(procedure, gap)
                     && !implicit_abort_gap_is_discharged(gap, abort_user_code)
                     && !super::external_constant_field_read_discharges_gap(
                         gap,

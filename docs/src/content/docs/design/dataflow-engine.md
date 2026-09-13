@@ -171,6 +171,19 @@ leave the remainder open. Class-qualified calls keep the class-selected callable
 the explicit receiver argument does not select a different method. Feedback runs
 under the request's existing iteration, work, and cancellation limits.
 
+Class membership and evidence of a value alternative are distinct. A guard
+can establish a class conditional on entering its arm even when its input
+comes from an unmodeled load or call. That class remains useful for member
+lookup and dispatch, but a guard-only origin cannot support a Proven
+missing-member finding. The finding client requires an independent same-class
+source or an unconstrained entry parameter that admits the guarded class.
+Conditional origins stay conditional through later guards; when independent
+and conditional sources meet, the independent origin takes precedence.
+The raw receiver result retains this source provenance. The `class_set`
+projection exposes `guard_only: true` for such class rows and preserves it on
+persistent replay. Unknown rows omit that field. Its `known` status reports
+membership; `guard_only: false` does not prove a realizable full runtime path. Neither interface claims general runtime path feasibility.
+
 Python member absence needs more than a declaration lookup: another procedure
 can install an instance attribute. The class-set engine consults the cached
 workspace store survey before accepting declaration-only absence. Attributed
@@ -190,12 +203,26 @@ and replay accounting. Surveys requiring dynamic receiver propagation remain
 request-local; their additional solver work is not covered by artifact-only
 persistent replay.
 
+Python conditional expressions copy the selected arm's value to their result
+when that arm completes normally. Short-circuit `and` and `or` similarly
+return the selected operand value, including when that operand is itself a
+conditional or boolean expression. Each operand is evaluated once; an
+exceptional exit bypasses the result assignment. Known literal truth values
+control which operand can run, and unmodeled value alternatives remain open.
+
 Class sets follow ordered binding writes, including writes to parameters,
 receivers, loop targets, and unpacking targets. A guard on a saved read can
 constrain the current binding only while that read still names its current
 value. For ordinary receiver fields, a procedure-local analysis tracks stores
 and guards across control-flow joins. Calls and potentially effectful lookups
 invalidate those field constraints; they retain explicit uncertainty.
+
+Indexed loads retain an unknown value remainder unless a separate proof shows
+that modeled stores account for all possible values. Python can certify
+supported constant-index reads from fully initialized local lists whose aliases
+never escape. The proof retains the ordinary heap transfers and overwrites;
+it does not infer an element class from the container class. Expanded
+initialization, deletion, escaped mutation, and custom indexing remain open.
 
 Boolean flags can also preserve a local relationship between branch-specific
 assignments. The engine excludes a class on a flag's guard edge only when every

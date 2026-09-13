@@ -58,6 +58,46 @@ impl DefinitionSources {
         Ok(Self { incoming, queried })
     }
 
+    /// Observe the boundary after all local effects and explicit sources.
+    /// Entry receiver ports use this boundary because root seeds are installed
+    /// after entry effects, while actual caller bindings arrive at entry.
+    pub fn after(
+        &self,
+        plan: &ValueFlowPlan,
+        point: &ProgramPointHandle,
+        carrier: &ValueFlowCarrier,
+        budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<(ValueFlowSourceId, bool)>>, CorrelationError> {
+        let observed = self
+            .before(plan, point, usize::MAX, carrier, budget, cancellation)?
+            .unwrap_or_default();
+        charge_entries(budget, observed.len())?;
+        let mut sources = observed.into_iter().collect::<Sources>();
+        let Some(target) = plan.carrier_id(carrier) else {
+            return Ok(None);
+        };
+        for source in plan.sources_at(point, ValueFlowObservationPhase::AfterEffects) {
+            check_cancelled(cancellation)?;
+            charge_entries(budget, 1)?;
+            if source.carrier != target {
+                continue;
+            }
+            let uncertain = source_is_uncertain(source.spec.proof(), source.spec.completeness());
+            sources
+                .entry(source.id)
+                .and_modify(|old| *old |= uncertain)
+                .or_insert(uncertain);
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        charge_entries(budget, sources.len())?;
+        let mut sources = sources.into_iter().collect::<Vec<_>>();
+        sources.sort_unstable_by_key(|(source, _)| *source);
+        Ok(Some(sources))
+    }
+
     pub fn before(
         &self,
         plan: &ValueFlowPlan,

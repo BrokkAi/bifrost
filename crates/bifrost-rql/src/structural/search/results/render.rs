@@ -652,11 +652,16 @@ impl CodeQueryResult {
                     }
                     CodeQueryResultValue::ClassSetRow { value } => {
                         out.push_str(&format!(
-                            "{}:{}:{} [class set; {}] {} <- {}\n",
+                            "{}:{}:{} [class set; {}{}] {} <- {}\n",
                             value.file,
                             value.range.start_line,
                             value.range.start_column,
                             value.status,
+                            if value.guard_only == Some(true) {
+                                "; membership from guard only"
+                            } else {
+                                ""
+                            },
                             value.member,
                             value.class.as_deref().unwrap_or(&value.origin),
                         ));

@@ -133,7 +133,7 @@ impl StructuralNodeIndex {
         let content = facts.source_identity();
         assert_eq!(
             content,
-            ContentIdentity::hash_bytes(prepared.source().as_bytes()),
+            ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256())),
             "structural facts must be extracted from the semantic artifact source"
         );
         Ok(StructuralNodeIndexOutcome::Complete {

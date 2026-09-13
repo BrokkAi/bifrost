@@ -157,6 +157,7 @@ pub use go::{
     resolve_go_semantic_pack_dependencies,
 };
 pub use i_analyzer::AnalyzerStreamingFileScope;
+pub(crate) use i_analyzer::replay_query_reads;
 pub use i_analyzer::{
     AnalyzerBuildTierAccess, AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch,
     QueryReadIncomplete, SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex,

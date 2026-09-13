@@ -3214,6 +3214,7 @@ pub(super) fn render_class_set_row(
         class: value.class.clone(),
         origin: value.origin.clone(),
         status: value.status,
+        guard_only: value.class.as_ref().map(|_| value.guard_only),
     }
 }
 

@@ -32,7 +32,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 64;
+const CURRENT_MIGRATION_VERSION: i64 = 65;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -126,8 +126,10 @@ const CLASS_SET_CLASS_OBJECT_SQL: &str =
     include_str!("../migrations/cache/0063-class-set-class-object.sql");
 const CLASS_SET_UNMODELED_PREDICATE_REMAINDER_SQL: &str =
     include_str!("../migrations/cache/0064-class-set-unmodeled-predicate-remainder.sql");
+const CLASS_SET_GUARD_ONLY_SQL: &str =
+    include_str!("../migrations/cache/0065-class-set-guard-only.sql");
 const CURRENT_FRESH_SCHEMA_SQL: &str =
-    include_str!("../migrations/cache/0064-current-fresh-schema.sql");
+    include_str!("../migrations/cache/0065-current-fresh-schema.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -148,7 +150,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 46] = [
+const CACHE_MIGRATIONS: [CacheMigration; 47] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -333,6 +335,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 46] = [
         version: 64,
         sql: CLASS_SET_UNMODELED_PREDICATE_REMAINDER_SQL,
     },
+    CacheMigration {
+        version: 65,
+        sql: CLASS_SET_GUARD_ONLY_SQL,
+    },
 ];
 
 // The store file is named for the schema version that wrote it, so the list
@@ -379,8 +385,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    0x48, 0x13, 0x97, 0x93, 0x8c, 0x7a, 0x1f, 0xdf, 0xdb, 0x6a, 0x27, 0x10, 0xfa, 0x47, 0x5b, 0x7a,
-    0x4a, 0x9e, 0x12, 0x7a, 0xd2, 0x4f, 0x71, 0xd4, 0xb2, 0x7e, 0x4b, 0x63, 0x68, 0x52, 0x7c, 0xe1,
+    0x84, 0xd8, 0xd6, 0xf4, 0x94, 0x64, 0xdf, 0x55, 0xb7, 0x15, 0x60, 0x03, 0xa2, 0xa2, 0x27, 0x46,
+    0x33, 0xfc, 0xb8, 0xa9, 0xf8, 0x5c, 0x54, 0x2e, 0x4d, 0x8b, 0xbf, 0x3f, 0x2e, 0x34, 0xb7, 0xf1,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -6010,7 +6016,10 @@ mod tests {
             4
         );
         conn.execute(
-            "INSERT INTO class_set_finding_free_root_rows VALUES(
+            "INSERT INTO class_set_finding_free_root_rows(
+               result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
+               end_byte,end_line,end_byte_column,member,atom_kind,class_name,
+               unknown_reason,class_set_status,guard_class) VALUES(
                ?1,4,'src/app.py',40,3,0,41,3,1,'missing','unknown',NULL,
                'unmodeled_guard','partial','unknown_module.Thing')",
             [result_id],
@@ -6040,7 +6049,10 @@ mod tests {
         // The class-creation remainder schema 62 admits. `guard_class` belongs
         // to the unmodeled-guard reason alone, so this row leaves it null.
         conn.execute(
-            "INSERT INTO class_set_finding_free_root_rows VALUES(
+            "INSERT INTO class_set_finding_free_root_rows(
+               result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
+               end_byte,end_line,end_byte_column,member,atom_kind,class_name,
+               unknown_reason,class_set_status,guard_class) VALUES(
                ?1,5,'src/app.py',36,2,6,37,2,7,'created','unknown',NULL,
                'class_creation','partial',NULL)",
             [result_id],
@@ -6049,7 +6061,10 @@ mod tests {
 
         // The class-object remainder schema 63 admits.
         conn.execute(
-            "INSERT INTO class_set_finding_free_root_rows VALUES(
+            "INSERT INTO class_set_finding_free_root_rows(
+               result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
+               end_byte,end_line,end_byte_column,member,atom_kind,class_name,
+               unknown_reason,class_set_status,guard_class) VALUES(
                ?1,6,'src/app.py',38,2,8,39,2,9,'class','unknown',NULL,
                'class_object','partial',NULL)",
             [result_id],
@@ -6059,7 +6074,10 @@ mod tests {
         // The unmodeled-predicate remainder schema 64 admits. It names no
         // class, so `guard_class` is null here too.
         conn.execute(
-            "INSERT INTO class_set_finding_free_root_rows VALUES(
+            "INSERT INTO class_set_finding_free_root_rows(
+               result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
+               end_byte,end_line,end_byte_column,member,atom_kind,class_name,
+               unknown_reason,class_set_status,guard_class) VALUES(
                ?1,7,'src/app.py',40,2,10,41,2,11,'guarded','unknown',NULL,
                'unmodeled_predicate','partial',NULL)",
             [result_id],
@@ -6073,6 +6091,29 @@ mod tests {
             )
             .is_err(),
             "the unmodeled-predicate reason must not carry a guard class"
+        );
+
+        conn.execute(
+            "UPDATE class_set_finding_free_root_rows SET guard_only=1 WHERE row_ordinal=0",
+            [],
+        )
+        .unwrap();
+        for ordinal in [1, 4, 7] {
+            assert!(
+                conn.execute(
+                    "UPDATE class_set_finding_free_root_rows SET guard_only=1 WHERE row_ordinal=?1",
+                    [ordinal],
+                )
+                .is_err(),
+                "unknown atoms cannot claim guard-only class evidence"
+            );
+        }
+        assert!(
+            conn.execute(
+                "UPDATE class_set_finding_free_root_rows SET guard_only=2 WHERE row_ordinal=0",
+                []
+            )
+            .is_err()
         );
 
         conn.execute("DELETE FROM blobs WHERE lang='python'", [])

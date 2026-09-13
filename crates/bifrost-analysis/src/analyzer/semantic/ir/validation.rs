@@ -745,13 +745,14 @@ fn validate_procedure(
             && (!matches!(gap.subject, SemanticGapSubject::Value(_))
                 || gap.capability != SemanticCapability::IndexMemory
                 || gap.kind != SemanticGapKind::Unsupported
-                || gap.impacts != SemanticGapImpacts::single(SemanticGapImpact::HeapRead))
+                || (gap.impacts != SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                    && gap.impacts != SemanticGapImpacts::single(SemanticGapImpact::HeapWrite)))
         {
             return Err(SemanticIrError::procedure(
                 id,
                 SemanticIrErrorKind::GapContract,
                 format!(
-                    "gap {} declares a modeled effect partition outside a value-scoped unsupported index-memory read",
+                    "gap {} declares a modeled effect partition outside a value-scoped unsupported index-memory read or write",
                     gap.id
                 ),
             ));

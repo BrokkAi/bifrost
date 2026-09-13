@@ -105,6 +105,7 @@ pub struct PersistedClassSetRootRow {
     pub member: Box<str>,
     pub atom: PersistedClassSetAtom,
     pub status: PersistedClassSetStatus,
+    pub guard_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +250,7 @@ impl FindingFreeClassSetRootResult {
                 }
             }
             hash.text(row.status.label());
+            hash.tag(u8::from(row.guard_only));
         }
         Ok(hash.finish())
     }
@@ -328,7 +330,7 @@ pub(crate) const CLASS_SET_ROOT_RESULT_ROWS_SQL: &str =
               + length(CAST(class_set_status AS BLOB)),
             row_ordinal,rel_path,start_byte,start_line,start_byte_column,
             end_byte,end_line,end_byte_column,member,atom_kind,class_name,
-            unknown_reason,class_set_status,guard_class
+            unknown_reason,class_set_status,guard_class,guard_only
      FROM class_set_finding_free_root_rows
      WHERE result_id=?1 ORDER BY row_ordinal LIMIT ?2";
 
@@ -838,6 +840,7 @@ fn load_rows(
             member,
             atom,
             status,
+            guard_only: row.get(15)?,
         });
     }
     if rows.len() != expected_count {
@@ -938,8 +941,8 @@ fn insert_result(
             "INSERT INTO class_set_finding_free_root_rows(
                result_id,row_ordinal,rel_path,start_byte,start_line,start_byte_column,
                end_byte,end_line,end_byte_column,member,atom_kind,class_name,
-               unknown_reason,class_set_status,guard_class)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+               unknown_reason,class_set_status,guard_class,guard_only)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 result_id,
                 row.ordinal,
@@ -956,6 +959,7 @@ fn insert_result(
                 unknown_reason,
                 row.status.label(),
                 guard_class,
+                row.guard_only,
             ],
         )?;
     }
@@ -1069,6 +1073,9 @@ fn validate_row(row: &PersistedClassSetRootRow) -> Result<()> {
         return Err(StoreError::new("class-set root-result row is invalid"));
     }
     match &row.atom {
+        PersistedClassSetAtom::Unknown(_) if row.guard_only => {
+            Err(StoreError::new("guard-only evidence requires a class atom"))
+        }
         PersistedClassSetAtom::Unknown(UnknownReason::DynamicFieldWrite) => Err(StoreError::new(
             "dynamic field write evidence is request-local",
         )),
@@ -1114,6 +1121,7 @@ fn row_payload_order(
         .then_with(|| left.member.cmp(&right.member))
         .then_with(|| left.atom.cmp(&right.atom))
         .then_with(|| left.status.cmp(&right.status))
+        .then_with(|| left.guard_only.cmp(&right.guard_only))
 }
 
 fn payload_text_bytes(
@@ -1394,6 +1402,7 @@ mod tests {
             },
             vec![
                 PersistedClassSetRootRow {
+                    guard_only: false,
                     ordinal: 100,
                     relative_path: PathBuf::from("src/app.py"),
                     span: source_span(40, 46),
@@ -1402,6 +1411,7 @@ mod tests {
                     status: PersistedClassSetStatus::Partial,
                 },
                 PersistedClassSetRootRow {
+                    guard_only: false,
                     ordinal: 99,
                     relative_path: PathBuf::from("src/app.py"),
                     span: source_span(30, 36),
@@ -1410,6 +1420,7 @@ mod tests {
                     status: PersistedClassSetStatus::Partial,
                 },
                 PersistedClassSetRootRow {
+                    guard_only: true,
                     ordinal: 88,
                     relative_path: PathBuf::from("src/app.py"),
                     span: source_span(10, 15),
@@ -1425,6 +1436,7 @@ mod tests {
     fn result_with_rows(count: u32) -> FindingFreeClassSetRootResult {
         let rows = (0..count)
             .map(|ordinal| PersistedClassSetRootRow {
+                guard_only: false,
                 ordinal,
                 relative_path: PathBuf::from("src/app.py"),
                 span: source_span(ordinal.saturating_mul(2), ordinal.saturating_mul(2) + 1),
@@ -1631,6 +1643,16 @@ mod tests {
             )
             .is_err()
         );
+        let mut invalid_evidence = result(1);
+        invalid_evidence.rows[1].guard_only = true;
+        assert!(
+            FindingFreeClassSetRootResult::try_new(
+                invalid_evidence.key,
+                invalid_evidence.attachment,
+                invalid_evidence.rows,
+            )
+            .is_err()
+        );
         let mut invalid_generation = result(1);
         invalid_generation.key.generation.representation_version = 0;
         assert!(
@@ -1647,6 +1669,7 @@ mod tests {
     fn dynamic_write_rows_are_rejected_before_publication() {
         let mut candidate = result(1);
         candidate.rows[0].atom = PersistedClassSetAtom::Unknown(UnknownReason::DynamicFieldWrite);
+        candidate.rows[0].guard_only = false;
         let error = FindingFreeClassSetRootResult::try_new(
             candidate.key,
             candidate.attachment,

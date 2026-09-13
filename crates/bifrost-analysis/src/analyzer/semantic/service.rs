@@ -31,7 +31,7 @@ use super::{
     SemanticArtifact, SemanticArtifactBuildError, SemanticArtifactKey, SemanticCallSite,
     SemanticCapabilities, SemanticEvent, SemanticGap, SemanticIrVersion, SemanticLocator,
     SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticWork,
-    SourceMapping, SourceRevision, WorkspaceMountId, WorkspaceRelativePath,
+    SourceMapping, SourceRevision, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
 };
 
 const DEFAULT_COMPLETE_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
@@ -694,10 +694,9 @@ fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     }
 
     let identity = lowerer.identity();
-    // The one derivation that hashes the source, and the one place that pays
-    // for it. Recording the digest against the blob identity of exactly these
-    // bytes is what lets the next touch of this content skip both.
-    let content = ContentIdentity::hash_bytes(prepared.source().as_bytes());
+    // Reuse the prepared snapshot's digest. Recording it against the blob
+    // identity also lets the next touch skip source preparation entirely.
+    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
     analyzer
         .semantic_source_digests()
         .record(source_identity, content);

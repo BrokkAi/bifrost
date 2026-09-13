@@ -32,8 +32,9 @@ use super::oracle::CandidateCoverage;
 use super::{
     AdapterSemanticsVersion, AllocationSite, CallSiteId, ContentIdentity, GuardFact,
     LengthDelimitedDigest, MemoryLocation, OverlaySnapshotId, ProcedureHandle, ProcedureId,
-    SemanticArtifactKey, SemanticCallSite, SemanticLocator, SemanticValue, SourcePosition,
-    SourceRevision, SourceSpan, StableDigest, ValueId, WorkspaceMountId, WorkspaceRelativePath,
+    ProgramPointId, SemanticArtifactKey, SemanticCallSite, SemanticLocator, SemanticValue,
+    SourcePosition, SourceRevision, SourceSpan, StableDigest, ValueId, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 
 /// One class a value may be an instance of, or the honest statement that
@@ -449,7 +450,7 @@ pub fn validate_prepared_syntax_for_procedure(
     let key = procedure.artifact().key();
     let path_matches =
         WorkspaceRelativePath::try_from_path(file.rel_path()).is_ok_and(|path| &path == key.path());
-    let content = ContentIdentity::hash_bytes(prepared.source().as_bytes());
+    let content = ContentIdentity::from_digest(StableDigest::from_array(prepared.source_sha256()));
     let revision_matches = match (key.revision(), prepared.origin()) {
         (SourceRevision::Disk { content: expected }, PreparedSourceOrigin::Disk) => {
             content == expected
@@ -501,6 +502,9 @@ pub enum SourceSiteKind {
     /// finding witness prefers a site that did, so this kind ranks last when
     /// one class has more than one origin.
     NarrowingGuard,
+    /// Membership follows from entering a guard arm, but the activating source
+    /// does not independently admit this class as a value alternative.
+    ConditionalNarrowingGuard,
     /// Unclassified origin syntax; independent of whether its class is known.
     Unknown,
 }
@@ -808,6 +812,7 @@ fn source_site_kind_tag(kind: SourceSiteKind) -> u8 {
         SourceSiteKind::Unknown => 5,
         // Appended: the tags of the kinds above are persisted.
         SourceSiteKind::NarrowingGuard => 6,
+        SourceSiteKind::ConditionalNarrowingGuard => 7,
     }
 }
 
@@ -1055,6 +1060,19 @@ pub trait TypeFlowAdapter: Send + Sync {
         procedure: &ProcedureHandle,
         ordinal: u32,
     ) -> ClassSeed;
+    /// Program points and results of plain local memory loads whose modeled stores exhaust the
+    /// possible values. A certificate requires closed initialization, aliases
+    /// and mutation effects; plain indexing alone is not sufficient. Missing
+    /// or stopped proofs leave the load's unknown remainder in place.
+    fn closed_memory_loads(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _request: &mut super::SemanticRequest<'_>,
+    ) -> Result<Vec<(ProgramPointId, ValueId)>, super::SemanticBudgetExceeded> {
+        Ok(Vec::new())
+    }
+
     fn accessed_member(
         &self,
         workspace: &WorkspaceAnalyzer,
@@ -1075,6 +1093,28 @@ pub trait TypeFlowAdapter: Send + Sync {
         _procedure: &ProcedureHandle,
     ) -> Option<ClassIdentity> {
         None
+    }
+
+    /// Whether the receiver binding retains its entry identity throughout the
+    /// procedure, including syntax whose effects are not represented in IR.
+    /// This proves binding stability, not membership in the enclosing class:
+    /// callers can still supply a different object through an unbound call.
+    fn receiver_binding_is_stable(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+    ) -> bool {
+        false
+    }
+
+    /// Whether the exact class's member names cannot be extended by runtime
+    /// writes. This does not imply that subclasses or stored contents are closed.
+    fn member_surface_is_closed(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _class: &ClassIdentity,
+    ) -> bool {
+        false
     }
 
     fn class_hierarchy(

@@ -12,7 +12,7 @@
 //! -- is storage machinery. Only the three facts below are part of the
 //! contract, so the trait names exactly those and `FileState` implements it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::model::{CodeUnit, ImportInfo, LanguageDialect, Range};
@@ -89,6 +89,7 @@ pub enum PreparedSourceOrigin {
 #[derive(Debug)]
 pub struct PreparedSyntaxTree {
     source: PreparedSyntaxSource,
+    source_sha256: OnceLock<[u8; 32]>,
     tree: Tree,
     line_starts: Vec<usize>,
     dialect: LanguageDialect,
@@ -110,6 +111,7 @@ impl PreparedSyntaxTree {
     ) -> Self {
         Self {
             source,
+            source_sha256: OnceLock::new(),
             tree,
             line_starts,
             dialect,
@@ -120,6 +122,14 @@ impl PreparedSyntaxTree {
 
     pub fn source(&self) -> &str {
         self.source.source()
+    }
+
+    /// SHA-256 of the exact immutable source bytes, computed once per prepared
+    /// snapshot. Revalidating several nodes must not rehash the whole file.
+    pub fn source_sha256(&self) -> [u8; 32] {
+        *self
+            .source_sha256
+            .get_or_init(|| crate::analyzer::canonical_hash::sha256_bytes(self.source().as_bytes()))
     }
 
     /// Which backing this tree was prepared from. An `Exact` snapshot carries

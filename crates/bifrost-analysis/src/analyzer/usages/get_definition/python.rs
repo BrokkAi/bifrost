@@ -17,7 +17,7 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_python::bindings::{
-    PythonLexicalNameResolution, python_comprehension_binds_name_at,
+    PythonLexicalNameResolution, PythonLexicalScopeBindings, python_comprehension_binds_name_at,
     python_direct_scope_bindings_bounded, python_module_or_class_scope_binds_name_bounded,
     python_type_parameter_binds_name_at, python_unambiguous_module_class_binding_bounded,
 };
@@ -56,15 +56,6 @@ pub(super) struct PythonDefinitionContextRequestMemo {
         KeyedPoolSafeMemo<PythonDefinitionContextKey, Replayable<Arc<PythonDefinitionContext>>>,
     #[cfg(test)]
     build_counters: Arc<PythonDefinitionBuildCounters>,
-}
-
-fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
-    for key in reads.keys() {
-        analyzer.record_read(key);
-    }
-    for _ in 0..reads.unattributed_reads() {
-        analyzer.record_unattributed_read();
-    }
 }
 
 fn definition_context_key(
@@ -118,7 +109,7 @@ pub(super) fn request_definition_context(
         }
     });
     if !built_here.get() {
-        replay_query_reads(analyzer, &entry.reads);
+        crate::analyzer::replay_query_reads(analyzer, &entry.reads);
     }
     Arc::clone(&entry.value)
 }
@@ -2173,7 +2164,7 @@ pub(super) fn resolve_python(
             let (shadow_name, shadow_site) = python_attribute_root_identifier(object)
                 .map(|root| (python_slice(root, source), root))
                 .unwrap_or((object_text, object));
-            let object_shadowed = python_name_shadowed_at(shadow_name, shadow_site, source);
+            let object_shadowed = ctx.name_shadowed_at(shadow_name, shadow_site, source);
             if !object_shadowed && let Some(module) = ctx.namespace_module_for_node(object, source)
             {
                 return python_fqn_outcome(
@@ -2281,7 +2272,7 @@ pub(super) fn resolve_python(
                     candidates_outcome(candidates)
                 };
             }
-            if python_name_shadowed_at(text, identifier, source) {
+            if ctx.name_shadowed_at(text, identifier, source) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{text}` is a local Python value"),
@@ -2644,7 +2635,7 @@ fn python_visible_module_import_binding<'a>(
     reference: Node<'_>,
     source: &str,
 ) -> Option<&'a PythonImportBinding> {
-    if python_name_shadowed_at(local_name, reference, source) {
+    if python_name_shadowed_at(local_name, reference, source, &mut HashMap::default()) {
         return None;
     }
     let reference_start = reference.start_byte();
@@ -3091,6 +3082,7 @@ pub(super) struct PythonDefinitionContext {
     namespace: HashMap<String, String>,
     same_file: HashMap<String, Vec<CodeUnit>>,
     scope_facts: OnceLock<Replayable<Arc<PythonScopeFacts>>>,
+    lexical_scopes: Mutex<HashMap<(usize, usize), PythonLexicalScopeBindings>>,
     module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
     scoped_import_bindings: OnceLock<Arc<Vec<PythonImportBinding>>>,
     receiver_types: Mutex<PythonReceiverTypeCache>,
@@ -3113,6 +3105,16 @@ impl PythonReceiverTypeCache {
 }
 
 impl PythonDefinitionContext {
+    fn name_shadowed_at(&self, name: &str, reference: Node<'_>, source: &str) -> bool {
+        // The context key already names the exact source. Cached inventories
+        // contain owned binding facts, never nodes borrowed from another tree.
+        let mut scopes = self
+            .lexical_scopes
+            .lock()
+            .expect("Python lexical scope cache poisoned");
+        python_name_shadowed_at(name, reference, source, &mut scopes)
+    }
+
     pub(super) fn build(
         py: &PythonAnalyzer,
         analyzer: &dyn IAnalyzer,
@@ -3155,6 +3157,7 @@ impl PythonDefinitionContext {
             namespace,
             same_file,
             scope_facts: OnceLock::new(),
+            lexical_scopes: Mutex::default(),
             module_bindings: OnceLock::new(),
             scoped_import_bindings: OnceLock::new(),
             receiver_types: Mutex::new(PythonReceiverTypeCache::new(
@@ -3227,7 +3230,7 @@ impl PythonDefinitionContext {
             .values
             .get(&key)
         {
-            replay_query_reads(analyzer, &cached.reads);
+            crate::analyzer::replay_query_reads(analyzer, &cached.reads);
             return cached.value.clone();
         }
 
@@ -3322,7 +3325,7 @@ impl PythonDefinitionContext {
             }
         });
         if !built_here.get() {
-            replay_query_reads(analyzer, &entry.reads);
+            crate::analyzer::replay_query_reads(analyzer, &entry.reads);
         }
         Arc::clone(&entry.value)
     }
@@ -4072,7 +4075,12 @@ fn python_import_binding_is_workspace_internal(
     python_workspace_module_exists(support, module)
 }
 
-fn python_name_shadowed_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+fn python_name_shadowed_at(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    scopes: &mut HashMap<(usize, usize), PythonLexicalScopeBindings>,
+) -> bool {
     if python_comprehension_binds_name_at(name, reference, source) {
         return true;
     }
@@ -4082,11 +4090,18 @@ fn python_name_shadowed_at(name: &str, reference: Node<'_>, source: &str) -> boo
         if !matches!(current.kind(), "function_definition" | "lambda") {
             continue;
         }
-        let Some(inventory) = python_lexical_scope_inventory_bounded(current, source, || true)
-        else {
-            return true;
+        let bindings = match scopes.entry((current.start_byte(), current.end_byte())) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(inventory) =
+                    python_lexical_scope_inventory_bounded(current, source, || true)
+                else {
+                    return true;
+                };
+                entry.insert(inventory.into_bindings())
+            }
         };
-        match inventory.name_resolution_at(name, reference) {
+        match bindings.name_resolution_at(name, reference) {
             PythonLexicalNameResolution::Local => return true,
             PythonLexicalNameResolution::Global => return false,
             PythonLexicalNameResolution::Nonlocal | PythonLexicalNameResolution::Unbound => {}
@@ -4217,6 +4232,85 @@ mod bounded_tests {
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn python_shadowing_context_keeps_supplied_source_identities_separate() {
+        let original = "def read(local):\n    local.use()\n";
+        let changed = "def read(other):\n    local.use()\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file("app.py", original)
+            .build();
+        let workspace = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).unwrap();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        for (source, expected) in [(original, true), (changed, false), (original, true)] {
+            let context = request_definition_context(
+                py,
+                analyzer,
+                scope.token(),
+                &project.file("app.py"),
+                source,
+            );
+            let tree = parse_python_tree(source).unwrap();
+            let reference = tree
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("body")
+                .unwrap()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap()
+                .child_by_field_name("function")
+                .unwrap()
+                .child_by_field_name("object")
+                .unwrap();
+            assert_eq!(
+                context.name_shadowed_at("local", reference, source),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn python_shadowing_reuses_completed_bindings_across_reparsed_references() {
+        let source = "def first(local):\n    local.use()\n    imported.use()\ndef second():\n    local.use()\n";
+        let mut scopes = HashMap::default();
+        for _ in 0..2 {
+            // Each parse owns different nodes; retained facts must use source
+            // positions and preserve both local and module binding behavior.
+            let tree = parse_python_tree(source).unwrap();
+            let mut pending = vec![tree.root_node()];
+            let mut answers = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "attribute" {
+                    let reference = node.child_by_field_name("object").unwrap();
+                    answers.push((
+                        reference.start_byte(),
+                        python_name_shadowed_at(
+                            python_slice(reference, source),
+                            reference,
+                            source,
+                            &mut scopes,
+                        ),
+                    ));
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            answers.sort_unstable();
+            assert_eq!(
+                answers
+                    .into_iter()
+                    .map(|(_, shadowed)| shadowed)
+                    .collect::<Vec<_>>(),
+                [true, false, false]
+            );
+            assert_eq!(scopes.len(), 2, "one completed inventory per callable");
+        }
+    }
 
     #[test]
     fn external_decorator_binding_distinguishes_absence_and_lexical_shadowing() {

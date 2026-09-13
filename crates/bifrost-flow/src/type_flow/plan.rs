@@ -26,7 +26,7 @@ use crate::analyzer::semantic::{
     ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
     SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticLocator,
     SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
-    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
+    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot, ValueId,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -447,7 +447,10 @@ fn narrowing_member_lookup(
 ) -> MemberLookup {
     match adapter.member_lookup(workspace, MemberAccessKind::Load, class, member) {
         MemberLookup::Absent | MemberLookup::DeclarationAbsent
-            if field_slots.dynamic_write_evidence(class).next().is_some() =>
+            if field_slots
+                .dynamic_write_evidence(workspace, adapter, class)
+                .next()
+                .is_some() =>
         {
             MemberLookup::Unknown(UnknownReason::DynamicFieldWrite)
         }
@@ -513,6 +516,11 @@ fn guard_transfers(
     // answer for these sources instead (issue #3296). The list grows with the
     // remainders the loop installs, so a later guard sees an earlier guard's.
     let mut unknown_sources = Vec::<ValueFlowEventKey>::new();
+    let mut source_evidence = tables
+        .sources
+        .iter()
+        .map(|(source, atom, site)| (source.key().clone(), (atom.clone(), site.kind)))
+        .collect::<HashMap<_, _>>();
     for (source, atom, _) in &tables.sources {
         match atom {
             ClassAtom::Class(class) => sources_by_class
@@ -627,6 +635,13 @@ fn guard_transfers(
                                         .iter()
                                         .flat_map(|(_, sources)| sources.iter().cloned())
                                         .collect(),
+                                );
+                                source_evidence.insert(
+                                    key.clone(),
+                                    (
+                                        ClassAtom::Unknown(UnknownReason::UnmodeledPredicate),
+                                        SourceSiteKind::ConditionalNarrowingGuard,
+                                    ),
                                 );
                                 unknown_sources.push(key.clone());
                                 if let Some(join) = guard_join(
@@ -758,15 +773,52 @@ fn guard_transfers(
                 let point = procedure
                     .point_handle(guard.point)
                     .expect("a retained guard point is live");
+                // Separate activations: an unrelated admitted source in the
+                // plan must not certify a different input that reaches here.
+                let mut classified_sources = Vec::new();
                 for (atom, inputs) in true_arm_sources {
+                    let (admitted, conditional): (Vec<_>, Vec<_>) =
+                        inputs.into_iter().partition(|input| {
+                            let (input_atom, kind) = &source_evidence[input];
+                            if *kind == SourceSiteKind::ConditionalNarrowingGuard {
+                                return false;
+                            }
+                            match (&atom, input_atom) {
+                                (ClassAtom::Class(target), ClassAtom::Class(source)) => {
+                                    target == source
+                                }
+                                (
+                                    ClassAtom::Class(_),
+                                    ClassAtom::Unknown(UnknownReason::RootParameter),
+                                ) => true,
+                                _ => false,
+                            }
+                        });
+                    if !admitted.is_empty() {
+                        classified_sources.push((
+                            atom.clone(),
+                            admitted,
+                            SourceSiteKind::NarrowingGuard,
+                        ));
+                    }
+                    if !conditional.is_empty() {
+                        classified_sources.push((
+                            atom,
+                            conditional,
+                            SourceSiteKind::ConditionalNarrowingGuard,
+                        ));
+                    }
+                }
+                for (atom, inputs, kind) in classified_sources {
                     let site = source_site(
                         workspace,
                         procedure,
                         mapping_span(procedure, guard.source),
-                        source_kind_for_atom(&atom, SourceSiteKind::NarrowingGuard),
+                        kind,
                     )
                     .expect("a workspace guard retains its source file");
                     let key = tables.event_key(&point, ValueFlowEventKind::Source);
+                    source_evidence.insert(key.clone(), (atom.clone(), kind));
                     // The arm's own source is an ordinary plan source: a
                     // later guard classifies it like any other.
                     match &atom {
@@ -931,7 +983,7 @@ fn push_guard_remainder(
         workspace,
         procedure,
         mapping_span(procedure, guard.source),
-        SourceSiteKind::Unknown,
+        SourceSiteKind::ConditionalNarrowingGuard,
     )
     .expect("a workspace guard retains its source file");
     let key = tables.event_key(point, ValueFlowEventKind::Source);
@@ -1005,6 +1057,7 @@ pub struct ProcedureRefinements {
     bindings: HashMap<StableDigest, DerivedRefinement<GuardBindings>>,
     correlations: HashMap<StableDigest, DerivedRefinement<CorrelationAnalysis>>,
     fields: HashMap<StableDigest, DerivedRefinement<Vec<FieldLoadRefinement>>>,
+    closed_loads: HashMap<StableDigest, DerivedRefinement<HashSet<(ProgramPointId, ValueId)>>>,
 }
 
 #[derive(Debug)]
@@ -1077,6 +1130,146 @@ fn procedure_semantics_identity(
     digest
 }
 
+/// Closure discovery is independent of class seeding and field refinement.
+/// Surveys can establish that a root has no relevant snapshot before paying
+/// to construct the source and sink universe for that root.
+pub(super) struct TypeFlowDiscovery<'provider, 'workspace> {
+    root: ProcedureHandle,
+    provider: &'provider WorkspaceValueFlowProvider<'workspace>,
+    closure: DiscoveredClosure,
+    dispatch_reads: DispatchReadCollector,
+}
+
+struct NoSummaryCuts;
+impl ClosureCutDecider for NoSummaryCuts {
+    fn should_cut(
+        &mut self,
+        _procedure: &ProcedureHandle,
+        _snapshot: &crate::value_flow::ValueFlowInput<crate::analyzer::semantic::ValueFlowSnapshot>,
+        _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
+        _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> bool {
+        false
+    }
+}
+
+impl<'provider, 'workspace> TypeFlowDiscovery<'provider, 'workspace> {
+    pub(super) fn new(
+        root: &ProcedureHandle,
+        provider: &'provider WorkspaceValueFlowProvider<'workspace>,
+        limits: ClosureLimits,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, TypeFlowPlanError> {
+        Self::with_summary_cuts(
+            root,
+            provider,
+            limits,
+            semantic_budget,
+            cancellation,
+            &mut NoSummaryCuts,
+        )
+    }
+
+    fn with_summary_cuts<C: ClosureCutDecider>(
+        root: &ProcedureHandle,
+        provider: &'provider WorkspaceValueFlowProvider<'workspace>,
+        limits: ClosureLimits,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        cuts: &mut C,
+    ) -> Result<Self, TypeFlowPlanError> {
+        let _scope = profiling::scope("type_flow.discovery");
+        let dispatch_reads = DispatchReadCollector::default();
+        let observed_provider = provider.observing_dispatch_reads(dispatch_reads.clone());
+        let closure = discover_closure_with_cuts(
+            &observed_provider,
+            root,
+            limits,
+            semantic_budget,
+            cancellation,
+            cuts,
+        )
+        .map_err(TypeFlowPlanError::Discovery)?;
+        Ok(Self {
+            root: root.clone(),
+            provider,
+            closure,
+            dispatch_reads,
+        })
+    }
+
+    pub(super) fn excludes_procedures<'a>(
+        &self,
+        procedures: impl IntoIterator<Item = &'a ProcedureHandle>,
+    ) -> bool {
+        // A stopped discovery or missing control topology is not a negative
+        // answer about omitted work. Incomplete value relations alone do not
+        // omit procedures: discovery enumerates the IR call-site inventory,
+        // and class seeding cannot add a procedure to that closure.
+        self.closure.root_snapshot.is_some()
+            && !self.closure.truncated
+            && self.closure.skipped.is_empty()
+            && !closure_has_provider_failure(&self.closure)
+            && self
+                .closure
+                .snapshots
+                .iter()
+                .map(ValueFlowInput::status)
+                .chain(self.closure.bindings.iter().map(ValueFlowInput::status))
+                .all(|status| {
+                    !matches!(
+                        status,
+                        SemanticInputStatus::ExceededBudget { .. } | SemanticInputStatus::Cancelled
+                    )
+                })
+            && self.closure.snapshots.iter().all(|input| {
+                let snapshot = input.value();
+                snapshot.procedure().semantics().gaps().iter().all(|gap| {
+                    gap.capability != SemanticCapability::NormalControlFlow
+                        || gap.discharge == SemanticGapDischarge::RetainedControlTopology
+                        || snapshot.gap_is_discharged(gap.id)
+                })
+            })
+            && self.closure.coverage.values().all(|coverage| {
+                !coverage.truncated
+                    && dispatch_status(&coverage.dispatch)
+                        .budget_exceeded()
+                        .is_none()
+                    && coverage.bindings.iter().all(|binding| {
+                        !matches!(binding,
+                        BindingCoverage::Answered { status } if status.budget_exceeded().is_some())
+                    })
+            })
+            && !procedures.into_iter().any(|procedure| {
+                self.closure
+                    .snapshots
+                    .iter()
+                    .any(|input| input.value().procedure() == procedure)
+            })
+    }
+
+    pub(super) fn into_plan(
+        self,
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        field_slots: &FieldSlotIndex,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        refinements: &mut ProcedureRefinements,
+    ) -> Result<TypeFlowPlan, TypeFlowPlanError> {
+        TypeFlowPlan::from_discovery(
+            workspace,
+            adapter,
+            field_slots,
+            self,
+            semantic_budget,
+            cancellation,
+            refinements,
+        )
+    }
+}
+
 impl TypeFlowPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
@@ -1090,20 +1283,6 @@ impl TypeFlowPlan {
         cancellation: &CancellationToken,
         refinements: &mut ProcedureRefinements,
     ) -> Result<Self, TypeFlowPlanError> {
-        struct NoSummaryCuts;
-        impl ClosureCutDecider for NoSummaryCuts {
-            fn should_cut(
-                &mut self,
-                _procedure: &ProcedureHandle,
-                _snapshot: &crate::value_flow::ValueFlowInput<
-                    crate::analyzer::semantic::ValueFlowSnapshot,
-                >,
-                _coverage: &HashMap<(DurableProcedureKey, CallSiteId), CallSiteCoverage>,
-                _request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
-            ) -> bool {
-                false
-            }
-        }
         Self::build_with_summary_cuts(
             workspace,
             adapter,
@@ -1131,20 +1310,39 @@ impl TypeFlowPlan {
         refinements: &mut ProcedureRefinements,
         cuts: &mut C,
     ) -> Result<Self, TypeFlowPlanError> {
-        let dispatch_reads = DispatchReadCollector::default();
-        let mut closure = {
-            let _scope = profiling::scope("type_flow.discovery");
-            let observed_provider = provider.observing_dispatch_reads(dispatch_reads.clone());
-            discover_closure_with_cuts(
-                &observed_provider,
-                root,
-                limits,
-                semantic_budget,
-                cancellation,
-                cuts,
-            )
-            .map_err(TypeFlowPlanError::Discovery)?
-        };
+        TypeFlowDiscovery::with_summary_cuts(
+            root,
+            provider,
+            limits,
+            semantic_budget,
+            cancellation,
+            cuts,
+        )?
+        .into_plan(
+            workspace,
+            adapter,
+            field_slots,
+            semantic_budget,
+            cancellation,
+            refinements,
+        )
+    }
+
+    fn from_discovery(
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        field_slots: &FieldSlotIndex,
+        discovery: TypeFlowDiscovery<'_, '_>,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &CancellationToken,
+        refinements: &mut ProcedureRefinements,
+    ) -> Result<Self, TypeFlowPlanError> {
+        let TypeFlowDiscovery {
+            root,
+            provider,
+            mut closure,
+            dispatch_reads,
+        } = discovery;
         let _scope = profiling::scope("type_flow.plan_build");
         if closure.root_snapshot.is_none() {
             return Err(TypeFlowPlanError::RootRelationsUnavailable);
@@ -1283,6 +1481,45 @@ impl TypeFlowPlan {
             if cancellation.is_cancelled() {
                 return Err(TypeFlowPlanError::Cancelled);
             }
+            let closed_loads = match reused_or_derived(
+                &mut refinements.closed_loads,
+                procedure_semantics_identity(b"bifrost-type-flow-closed-loads-v1", procedure)
+                    .finish(),
+                semantic_budget,
+                |budget| {
+                    let loads = adapter
+                        .closed_memory_loads(
+                            workspace,
+                            procedure,
+                            &mut crate::analyzer::semantic::SemanticRequest::new(
+                                budget,
+                                cancellation,
+                            ),
+                        )
+                        .map_err(CorrelationError::Budget)?;
+                    if cancellation.is_cancelled() {
+                        return Err(CorrelationError::Cancelled {
+                            timed_out: cancellation.is_timed_out(),
+                        });
+                    }
+                    budget
+                        .charge(SemanticWork {
+                            nested_entries: loads.len(),
+                            ..SemanticWork::default()
+                        })
+                        .map_err(CorrelationError::Budget)?;
+                    Ok(loads.into_iter().collect())
+                },
+            ) {
+                Ok(loads) => loads,
+                Err(CorrelationError::Budget(exceeded)) => {
+                    refinement_exhaustion.get_or_insert(exceeded);
+                    HashSet::default()
+                }
+                Err(CorrelationError::Cancelled { .. }) => {
+                    return Err(TypeFlowPlanError::Cancelled);
+                }
+            };
             seed_procedure(
                 workspace,
                 adapter,
@@ -1292,6 +1529,7 @@ impl TypeFlowPlan {
                 procedure,
                 &mut tables,
                 &fields,
+                &closed_loads,
             );
             field_refinements.extend(fields.into_iter().map(|field| (procedure.clone(), field)));
         }
@@ -2050,6 +2288,7 @@ fn seed_procedure(
     procedure: &ProcedureHandle,
     tables: &mut SeedTables,
     field_refinements: &[FieldLoadRefinement],
+    closed_loads: &HashSet<(ProgramPointId, ValueId)>,
 ) {
     let semantics = procedure.semantics();
     let is_root = procedure.durable_key() == root_key;
@@ -2427,8 +2666,9 @@ fn seed_procedure(
                                 }
                             }
                         }
-                    } else if let Some(site) =
-                        source_site(workspace, procedure, span, SourceSiteKind::Unknown)
+                    } else if !closed_loads.contains(&(point.id, *result))
+                        && let Some(site) =
+                            source_site(workspace, procedure, span, SourceSiteKind::Unknown)
                     {
                         tables.push_source(
                             &point_handle,
@@ -2905,7 +3145,7 @@ mod tests {
         let project = InlineTestProject::with_language(Language::Python)
             .file(
                 "app.py",
-                "def incomplete():\n    return [x for x in ()]\ndef complete():\n    return []\n",
+                "def incomplete():\n    class Local:\n        pass\n    return []\ndef comprehension():\n    return [x for x in ()]\ndef complete():\n    return []\n",
             )
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
@@ -2922,6 +3162,7 @@ mod tests {
             .expect("source semantics are available");
         for (name, expected) in [
             ("incomplete", Some(UnknownReason::IncompleteRoot)),
+            ("comprehension", None),
             ("complete", None),
         ] {
             let callee = artifact

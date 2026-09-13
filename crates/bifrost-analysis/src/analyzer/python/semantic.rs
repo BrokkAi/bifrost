@@ -29,7 +29,7 @@ use brokk_bifrost_python::imports::python_import_infos_from_node;
 use brokk_bifrost_python::syntax::{python_static_attribute_path, python_static_type_path};
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v18";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v24";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -125,6 +125,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
             }
         };
 
+        let mut binding_inventories = HashMap::default();
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -140,6 +141,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     &class_constructors,
                     builtin_proofs,
                     self.overlay.as_deref(),
+                    &mut binding_inventories,
                     staged_budget,
                     cancellation,
                 )
@@ -199,6 +201,7 @@ struct ProcedureSpec<'tree> {
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
     properties: ProcedureProperties,
+    mutable_captures: HashSet<Box<str>>,
 }
 
 struct PythonProcedureInventory<'tree> {
@@ -371,8 +374,39 @@ fn enumerate_procedures<'tree>(
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
+                mutable_captures: HashSet::default(),
             });
             callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
+        }
+
+        if frame.node.kind() == "nonlocal_statement"
+            && let Some(callable) = frame.lexical_parent
+        {
+            for declaration in named_children(frame.node) {
+                let Some(name) = node_text(prepared.source(), declaration) else {
+                    continue;
+                };
+                // Capture writes are not modeled yet. Conservatively open this
+                // name in enclosing callables; a nearer binding may shadow it.
+                // Reuse enumeration rather than rescanning each ancestor body.
+                let mut ancestor = specs[callable.index()].lexical_parent;
+                while let Some(owner) = ancestor {
+                    if cancellation.is_cancelled() {
+                        return Ok(inventory.cancelled());
+                    }
+                    if let Err(stop) = inventory.observe_additional_work(SemanticWork {
+                        nested_entries: 1,
+                        owned_text_bytes: name.len(),
+                        ..SemanticWork::default()
+                    }) {
+                        return Ok(stop.into_outcome());
+                    }
+                    let spec = &mut specs[owner.index()];
+                    assert_eq!(spec.id, owner);
+                    spec.mutable_captures.insert(name.into());
+                    ancestor = spec.lexical_parent;
+                }
+            }
         }
 
         for child_index in (0..frame.node.child_count()).rev() {
@@ -863,6 +897,13 @@ enum Work<'tree> {
         next: EdgeTarget,
         scope: ScopeFrameId,
     },
+    ComprehensionClause {
+        node: Node<'tree>,
+        index: usize,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+    },
     Condition {
         node: Node<'tree>,
         entry: ProgramPointId,
@@ -892,6 +933,12 @@ impl<'tree> CleanupBody<'tree> {
     }
 }
 
+struct ComprehensionBindings<'tree> {
+    values: HashMap<Box<str>, ValueId>,
+    outer_iterables: Vec<Node<'tree>>,
+    clauses: Vec<Node<'tree>>,
+}
+
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     callable: Node<'tree>,
@@ -912,6 +959,8 @@ struct LoweringContext<'tree, 'targets> {
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, ValueId>,
+    comprehension_bindings: HashMap<usize, ComprehensionBindings<'tree>>,
+    mutable_captures: &'targets HashSet<Box<str>>,
     receiver: Option<ValueId>,
     enclosing_class: Option<Box<str>>,
     module_bindings: &'targets HashMap<Box<str>, PythonModuleBinding<'tree>>,
@@ -920,7 +969,8 @@ struct LoweringContext<'tree, 'targets> {
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
     overlay: Option<&'targets SemanticModelOverlay>,
-    bindings: PythonLexicalScopeInventory<'tree>,
+    bindings: &'targets PythonLexicalScopeInventory<'tree>,
+    binding_inventories: &'targets HashMap<usize, PythonLexicalScopeInventory<'tree>>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
@@ -934,6 +984,7 @@ fn lower_procedure<'tree, 'targets>(
     class_constructors: &'targets HashMap<Box<str>, ProcedureId>,
     builtin_proofs: PythonBuiltinProofs,
     overlay: Option<&'targets SemanticModelOverlay>,
+    binding_inventories: &mut HashMap<usize, PythonLexicalScopeInventory<'tree>>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -954,12 +1005,28 @@ fn lower_procedure<'tree, 'targets>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
-    let bindings = collect_semantic_binding_inventory(
-        spec.callable,
-        prepared.source(),
-        &mut builder,
-        cancellation,
-    )?;
+    // Inventories contain syntax nodes from this prepared file. Own them for
+    // this batch only, and charge the real walk once rather than rebuilding
+    // an enclosing scope for every name in every nested callable.
+    let mut current = Some(spec.callable);
+    while let Some(node) = current {
+        charge_python_binding_step(&mut builder, cancellation)?;
+        if matches!(node.kind(), "function_definition" | "lambda")
+            && let std::collections::hash_map::Entry::Vacant(entry) =
+                binding_inventories.entry(node.id())
+        {
+            entry.insert(collect_semantic_binding_inventory(
+                node,
+                prepared.source(),
+                &mut builder,
+                cancellation,
+            )?);
+        }
+        current = node.parent();
+    }
+    let bindings = binding_inventories
+        .get(&spec.callable.id())
+        .expect("the callable inventory was prepared before lowering");
     let mut context = LoweringContext {
         prepared,
         callable: spec.callable,
@@ -976,6 +1043,8 @@ fn lower_procedure<'tree, 'targets>(
         catch_binders: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        comprehension_bindings: HashMap::default(),
+        mutable_captures: &spec.mutable_captures,
         receiver: None,
         enclosing_class: enclosing_class_name(prepared.source(), spec.callable).map(Into::into),
         module_bindings,
@@ -985,6 +1054,7 @@ fn lower_procedure<'tree, 'targets>(
         builtin_proofs,
         overlay,
         bindings,
+        binding_inventories,
         cleanups: Vec::new(),
     };
     let proven_instance_fields =
@@ -995,12 +1065,15 @@ fn lower_procedure<'tree, 'targets>(
         known_fields,
         available_after,
         escapes_after,
+        ..
     } = heap_binding_proofs(
         spec.callable,
         prepared.source(),
         class_names,
         &proven_instance_fields,
-    );
+        || true,
+    )
+    .expect("an unmetered heap proof cannot stop");
     context.known_list_bindings = known_lists;
     context.known_instance_bindings = known_instances;
     context.known_instance_fields = known_fields;
@@ -1102,6 +1175,7 @@ fn lower_procedure<'tree, 'targets>(
 }
 
 struct HeapBindingProofs {
+    closed_lists: HashSet<Box<str>>,
     known_lists: HashSet<Box<str>>,
     known_instances: HashMap<Box<str>, Box<str>>,
     known_fields: HashMap<Box<str>, HashSet<Box<str>>>,
@@ -1146,11 +1220,15 @@ fn heap_binding_proofs<'tree>(
     source: &str,
     class_names: &HashSet<Box<str>>,
     proven_instance_fields: &HashMap<Box<str>, HashSet<Box<str>>>,
-) -> HeapBindingProofs {
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<HeapBindingProofs> {
     let body = callable.child_by_field_name("body").unwrap_or(callable);
     let mut assignments: HashMap<Box<str>, Vec<(Node<'tree>, usize)>> = HashMap::default();
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node != body && is_nested_execution_boundary(node) {
             continue;
         }
@@ -1172,7 +1250,11 @@ fn heap_binding_proofs<'tree>(
     }
 
     let mut candidates: HashMap<Box<str>, HeapCandidate> = HashMap::default();
+    let mut expanded_roots = HashSet::default();
     for (name, values) in &assignments {
+        if !scope_step() {
+            return None;
+        }
         if values.len() != 1 {
             continue;
         }
@@ -1180,6 +1262,9 @@ fn heap_binding_proofs<'tree>(
         let class_name =
             constructed_local_class(value, source, class_names, proven_instance_fields);
         if value.kind() == "list" || class_name.is_some() {
+            if value.kind() == "list" && sequence_initializer_is_expanded(value) {
+                expanded_roots.insert(name.clone());
+            }
             candidates.insert(
                 name.clone(),
                 HeapCandidate {
@@ -1195,8 +1280,14 @@ fn heap_binding_proofs<'tree>(
     // point keeps this bounded and handles an alias chain without recursive
     // source-tree or binding walks.
     for _ in 0..=assignments.len() {
+        if !scope_step() {
+            return None;
+        }
         let mut changed = false;
         for (name, values) in &assignments {
+            if !scope_step() {
+                return None;
+            }
             if values.len() != 1 || candidates.contains_key(name) {
                 continue;
             }
@@ -1251,9 +1342,13 @@ fn heap_binding_proofs<'tree>(
         direct_field_ends: &direct_field_ends,
     };
     let mut invalid_roots: HashSet<Box<str>> = HashSet::default();
+    let mut deleted_roots = HashSet::default();
     let mut root_escapes: HashMap<Box<str>, usize> = HashMap::default();
     let mut occurrences = vec![body];
     while let Some(node) = occurrences.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node != body && is_nested_execution_boundary(node) {
             occurrences.extend(heap_occurrence_children(node));
             continue;
@@ -1262,6 +1357,23 @@ fn heap_binding_proofs<'tree>(
             && let Some(name) = node_text(source, node)
             && let Some(candidate) = candidates.get(name)
         {
+            // Deletion can shift a list's remaining elements. The ordinary
+            // indexing proof only concerns dispatch; it does not certify
+            // those value changes as modeled stores.
+            let mut ancestor = node.parent();
+            while let Some(parent) = ancestor {
+                if !scope_step() {
+                    return None;
+                }
+                if parent.kind() == "delete_statement" {
+                    deleted_roots.insert(candidate.root.clone());
+                    break;
+                }
+                if is_statement_kind(parent.kind()) {
+                    break;
+                }
+                ancestor = parent.parent();
+            }
             match classify_heap_occurrence(node, &occurrence_context) {
                 HeapOccurrence::Structured => {}
                 HeapOccurrence::Escapes => {
@@ -1283,9 +1395,15 @@ fn heap_binding_proofs<'tree>(
     // by such a boundary invalidates the outer allocation root.
     let mut nested = vec![body];
     while let Some(node) = nested.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node != body && is_nested_execution_boundary(node) {
             let mut nested_nodes = vec![node];
             while let Some(nested_node) = nested_nodes.pop() {
+                if !scope_step() {
+                    return None;
+                }
                 if nested_node.kind() == "identifier"
                     && let Some(name) = node_text(source, nested_node)
                     && let Some(candidate) = candidates.get(name)
@@ -1300,11 +1418,15 @@ fn heap_binding_proofs<'tree>(
     }
 
     let mut known_lists = HashSet::default();
+    let mut closed_lists = HashSet::default();
     let mut known_instances = HashMap::default();
     let mut known_fields = HashMap::default();
     let mut available_after = HashMap::default();
     let mut escapes_after = HashMap::default();
     for (name, candidate) in candidates {
+        if !scope_step() {
+            return None;
+        }
         if invalid_roots.contains(&candidate.root) {
             continue;
         }
@@ -1312,6 +1434,12 @@ fn heap_binding_proofs<'tree>(
             escapes_after.insert(name.clone(), escape);
         }
         if candidate.class_name.is_none() {
+            if !root_escapes.contains_key(&candidate.root)
+                && !expanded_roots.contains(&candidate.root)
+                && !deleted_roots.contains(&candidate.root)
+            {
+                closed_lists.insert(name.clone());
+            }
             known_lists.insert(name.clone());
         } else if let Some(class_name) = candidate.class_name {
             known_instances.insert(name.clone(), class_name);
@@ -1328,13 +1456,67 @@ fn heap_binding_proofs<'tree>(
         }
         available_after.insert(name, candidate.available_after);
     }
-    HeapBindingProofs {
+    Some(HeapBindingProofs {
+        closed_lists,
         known_lists,
         known_instances,
         known_fields,
         available_after,
         escapes_after,
+    })
+}
+
+fn sequence_initializer_is_expanded(node: Node<'_>) -> bool {
+    runtime_expression_children(node)
+        .iter()
+        .any(|child| matches!(child.kind(), "list_splat" | "parenthesized_list_splat"))
+}
+
+/// Plain local list loads whose full alias closure never escapes. This is
+/// stronger than the source-order proof used to discharge indexing calls:
+/// a later escape can run before this load on a loop's next iteration.
+pub(super) fn closed_list_load_spans(
+    callable: Node<'_>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<HashSet<SourceSpan>> {
+    let proofs = heap_binding_proofs(
+        callable,
+        source,
+        &HashSet::default(),
+        &HashMap::default(),
+        &mut scope_step,
+    )?;
+    let body = callable.child_by_field_name("body").unwrap_or(callable);
+    let mut pending = vec![body];
+    let mut spans = HashSet::default();
+    while let Some(node) = pending.pop() {
+        if !scope_step() {
+            return None;
+        }
+        if node != body && is_nested_execution_boundary(node) {
+            continue;
+        }
+        if node.kind() == "subscript"
+            && let Some(value) = node.child_by_field_name("value")
+            && value.kind() == "identifier"
+            && let Some(name) = node_text(source, value)
+            && proofs.closed_lists.contains(name)
+            && proofs
+                .available_after
+                .get(name)
+                .is_some_and(|end| node.start_byte() > *end)
+            && node
+                .child_by_field_name("subscript")
+                .is_some_and(|index| is_structural_constant_index(source, index).is_some())
+        {
+            spans.insert(crate::analyzer::semantic::type_flow::source_span_for_node(
+                node,
+            ));
+        }
+        pending.extend(named_children(node));
     }
+    Some(spans)
 }
 
 fn direct_instance_field_ends<'tree>(
@@ -2094,6 +2276,51 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .or_else(|| self.parameters.get(name).copied())
     }
 
+    fn scoped_binding_value(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        name: &str,
+    ) -> Result<Option<(ValueId, ValueFlowKind)>, PythonLoweringError> {
+        // Walrus writes belong to the enclosing function, even when their
+        // value expression reads comprehension-local names.
+        let walrus_target = node.parent().is_some_and(|parent| {
+            parent.kind() == "named_expression" && field_matches(parent, "name", node)
+        });
+        if !walrus_target && !self.comprehension_bindings.is_empty() {
+            let mut current = node;
+            while let Some(parent) = current.parent() {
+                charge_python_binding_step(builder, self.session.cancellation())?;
+                if let Some(bindings) = self.comprehension_bindings.get(&parent.id())
+                    && !bindings.outer_iterables.iter().any(|iterable| {
+                        iterable.start_byte() <= node.start_byte()
+                            && node.end_byte() <= iterable.end_byte()
+                    })
+                    && let Some(value) = bindings.values.get(name)
+                {
+                    return Ok(Some((*value, ValueFlowKind::Local)));
+                }
+                if matches!(
+                    parent.kind(),
+                    "function_definition" | "lambda" | "class_definition" | "module"
+                ) {
+                    break;
+                }
+                current = parent;
+            }
+        }
+        Ok(self.binding_value(name).map(|value| {
+            let kind = if Some(value) == self.receiver {
+                ValueFlowKind::Receiver
+            } else if self.locals.get(name) == Some(&value) {
+                ValueFlowKind::Local
+            } else {
+                ValueFlowKind::Parameter
+            };
+            (value, kind)
+        }))
+    }
+
     fn module_class_fallback_allowed(
         &self,
         builder: &mut ProcedureCfgBuilder,
@@ -2132,12 +2359,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     body.start_byte() <= reference_start && reference_end <= body.end_byte()
                 })
             {
-                let inventory = collect_semantic_binding_inventory(
-                    parent,
-                    self.prepared.source(),
-                    builder,
-                    self.session.cancellation(),
-                )?;
+                let inventory = self
+                    .binding_inventories
+                    .get(&parent.id())
+                    .expect("enclosing callable inventory was prepared before lowering");
                 match inventory.name_resolution_at(name, reference) {
                     PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
                         return Ok(false);
@@ -2278,17 +2503,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
-    ) -> Result<Option<ValueId>, PythonLoweringError> {
+    ) -> Result<Option<(ValueId, u128)>, PythonLoweringError> {
         let Some(index) = is_structural_constant_index(self.prepared.source(), node) else {
             return Ok(None);
         };
         if let Some(value) = self.constant_index_values.get(&index) {
             self.expression_values.insert(node.id(), *value);
-            return Ok(Some(*value));
+            return Ok(Some((*value, u128::from(index))));
         }
         let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
         self.constant_index_values.insert(index, value);
-        Ok(Some(value))
+        Ok(Some((value, u128::from(index))))
     }
 
     fn add_dynamic_index_gap(
@@ -2321,16 +2546,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(name) = node_text(self.prepared.source(), node) else {
             return Ok(());
         };
-        let Some(source) = self.binding_value(name) else {
+        let Some((source, kind)) = self.scoped_binding_value(builder, node, name)? else {
             return Ok(());
         };
-        let kind = if Some(source) == self.receiver {
-            ValueFlowKind::Receiver
-        } else if self.locals.get(name) == Some(&source) {
-            ValueFlowKind::Local
-        } else {
-            ValueFlowKind::Parameter
-        };
+        if self.mutable_captures.contains(name) && self.binding_value(name) == Some(source) {
+            let unknown =
+                self.unknown_target_value(builder, node, "python.unknown_capture_write")?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::Assignment {
+                    target,
+                    value: unknown,
+                },
+            )?;
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Value(target),
+                SemanticCapability::Captures,
+                SemanticGapKind::Unknown,
+                "a nested nonlocal declaration can rebind this captured value",
+            )?;
+            return Ok(());
+        }
         if source != target {
             self.append_effect(
                 builder,
@@ -2374,6 +2613,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 when_false,
                 scope,
             } => self.condition(builder, node, entry, when_true, when_false, scope, stack),
+            Work::ComprehensionClause {
+                node,
+                index,
+                entry,
+                next,
+                scope,
+            } => self.comprehension_clause(builder, node, index, entry, next, scope, stack),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -2387,7 +2633,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
-        if let Some(value) = boolean_literal_condition(node) {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if let Some(value) = literal_truth_condition(node) {
             let taken = if value { when_true } else { when_false };
             self.edge(builder, entry, taken)?;
             self.session.add_guard_fact(
@@ -2411,11 +2658,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                let right_true =
+                    self.expression_result_continuation(builder, right, result, when_true)?;
+                let right_false =
+                    self.expression_result_continuation(builder, right, result, when_false)?;
+                let left_selected =
+                    self.expression_result_continuation(builder, left, result, when_false)?;
                 stack.push(Work::Condition {
                     node: right,
                     entry: right_entry,
-                    when_true,
-                    when_false,
+                    when_true: EdgeTarget {
+                        point: right_true.point,
+                        ..when_true
+                    },
+                    when_false: EdgeTarget {
+                        point: right_false.point,
+                        ..when_false
+                    },
                     scope,
                 });
                 stack.push(Work::Condition {
@@ -2425,7 +2684,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         point: right_entry,
                         kind: ControlEdgeKind::ConditionalTrue,
                     },
-                    when_false,
+                    when_false: EdgeTarget {
+                        point: left_selected.point,
+                        ..when_false
+                    },
                     scope,
                 });
                 Ok(())
@@ -2434,17 +2696,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                let right_true =
+                    self.expression_result_continuation(builder, right, result, when_true)?;
+                let right_false =
+                    self.expression_result_continuation(builder, right, result, when_false)?;
+                let left_selected =
+                    self.expression_result_continuation(builder, left, result, when_true)?;
                 stack.push(Work::Condition {
                     node: right,
                     entry: right_entry,
-                    when_true,
-                    when_false,
+                    when_true: EdgeTarget {
+                        point: right_true.point,
+                        ..when_true
+                    },
+                    when_false: EdgeTarget {
+                        point: right_false.point,
+                        ..when_false
+                    },
                     scope,
                 });
                 stack.push(Work::Condition {
                     node: left,
                     entry,
-                    when_true,
+                    when_true: EdgeTarget {
+                        point: left_selected.point,
+                        ..when_true
+                    },
                     when_false: EdgeTarget {
                         point: right_entry,
                         kind: ControlEdgeKind::ConditionalFalse,
@@ -2455,11 +2732,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             ("not_operator", _) => {
                 let argument = required_field(node, "argument")?;
+                let source =
+                    self.expression_value(builder, argument, expression_value_kind(argument))?;
+                let true_result = self.point(builder, node, Vec::new())?;
+                let false_result = self.point(builder, node, Vec::new())?;
+                for (terminal, next) in [(true_result, when_true), (false_result, when_false)] {
+                    self.session.append_language_defined_value_flows(
+                        builder,
+                        terminal,
+                        [source],
+                        result,
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                }
                 stack.push(Work::Condition {
                     node: argument,
                     entry,
-                    when_true: when_false,
-                    when_false: when_true,
+                    when_true: EdgeTarget {
+                        point: false_result,
+                        ..when_false
+                    },
+                    when_false: EdgeTarget {
+                        point: true_result,
+                        ..when_true
+                    },
                     scope,
                 });
                 Ok(())
@@ -2468,18 +2764,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let (consequence, condition, alternative) = conditional_expression_parts(node)?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                let alternative_true =
+                    self.expression_result_continuation(builder, alternative, result, when_true)?;
+                let alternative_false =
+                    self.expression_result_continuation(builder, alternative, result, when_false)?;
                 stack.push(Work::Condition {
                     node: alternative,
                     entry: alternative_entry,
-                    when_true,
-                    when_false,
+                    when_true: EdgeTarget {
+                        point: alternative_true.point,
+                        ..when_true
+                    },
+                    when_false: EdgeTarget {
+                        point: alternative_false.point,
+                        ..when_false
+                    },
                     scope,
                 });
+                let consequence_true =
+                    self.expression_result_continuation(builder, consequence, result, when_true)?;
+                let consequence_false =
+                    self.expression_result_continuation(builder, consequence, result, when_false)?;
                 stack.push(Work::Condition {
                     node: consequence,
                     entry: consequence_entry,
-                    when_true,
-                    when_false,
+                    when_true: EdgeTarget {
+                        point: consequence_true.point,
+                        ..when_true
+                    },
+                    when_false: EdgeTarget {
+                        point: consequence_false.point,
+                        ..when_false
+                    },
                     scope,
                 });
                 stack.push(Work::Condition {
@@ -2503,11 +2819,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ("parenthesized_expression", _) => {
                 let value =
                     first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
+                let true_result =
+                    self.expression_result_continuation(builder, value, result, when_true)?;
+                let false_result =
+                    self.expression_result_continuation(builder, value, result, when_false)?;
                 stack.push(Work::Condition {
                     node: value,
                     entry,
-                    when_true,
-                    when_false,
+                    when_true: EdgeTarget {
+                        point: true_result.point,
+                        ..when_true
+                    },
+                    when_false: EdgeTarget {
+                        point: false_result.point,
+                        ..when_false
+                    },
                     scope,
                 });
                 Ok(())
@@ -3001,6 +3327,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, entry, next)
     }
 
+    /// Copy only the selected operand after it completes normally. Exceptional
+    /// exits bypass this point, and the caller schedules each operand once.
+    fn expression_result_continuation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        operand: Node<'tree>,
+        result: ValueId,
+        next: EdgeTarget,
+    ) -> Result<EdgeTarget, PythonLoweringError> {
+        let terminal = self.point(builder, operand, Vec::new())?;
+        let source = self.expression_value(builder, operand, expression_value_kind(operand))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: source,
+            },
+        )?;
+        self.edge(builder, terminal, next)?;
+        Ok(EdgeTarget::normal(terminal))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn expression(
         &mut self,
@@ -3027,18 +3376,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let (consequence, condition, alternative) = conditional_expression_parts(node)?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
-                stack.push(Work::Expression {
-                    node: alternative,
-                    entry: alternative_entry,
-                    next,
-                    scope,
-                });
-                stack.push(Work::Expression {
-                    node: consequence,
-                    entry: consequence_entry,
-                    next,
-                    scope,
-                });
+                for (arm, arm_entry) in [
+                    (alternative, alternative_entry),
+                    (consequence, consequence_entry),
+                ] {
+                    let completion =
+                        self.expression_result_continuation(builder, arm, result, next)?;
+                    stack.push(Work::Expression {
+                        node: arm,
+                        entry: arm_entry,
+                        next: completion,
+                        scope,
+                    });
+                }
                 stack.push(Work::Condition {
                     node: condition,
                     entry,
@@ -3058,10 +3408,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.point(builder, right, Vec::new())?;
+                let left_completion =
+                    self.expression_result_continuation(builder, left, result, next)?;
+                let right_completion =
+                    self.expression_result_continuation(builder, right, result, next)?;
                 stack.push(Work::Expression {
                     node: right,
                     entry: right_entry,
-                    next,
+                    next: right_completion,
                     scope,
                 });
                 let (when_true, when_false) = match boolean_operator_kind(node) {
@@ -3071,13 +3425,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                         EdgeTarget {
-                            point: next.point,
+                            point: left_completion.point,
                             kind: ControlEdgeKind::ConditionalFalse,
                         },
                     ),
                     Some("or") => (
                         EdgeTarget {
-                            point: next.point,
+                            point: left_completion.point,
                             kind: ControlEdgeKind::ConditionalTrue,
                         },
                         EdgeTarget {
@@ -3226,8 +3580,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     access,
                     MemoryLocationKind::Index {
                         base,
-                        index,
-                        constant_index: None,
+                        index: index.map(|(value, _)| value),
+                        constant_index: index.map(|(_, magnitude)| magnitude),
                         identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                     },
                 )?;
@@ -3256,12 +3610,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "list_comprehension" | "set_comprehension" | "dictionary_comprehension" => {
                 self.session
                     .add_allocation(builder, entry, result, AllocationKind::Object)?;
-                self.comprehension_expression(builder, node, entry, None, scope, stack)
+                self.eager_comprehension_expression(builder, node, entry, next, scope, stack)
             }
             "generator_expression" => {
                 self.session
                     .add_allocation(builder, entry, result, AllocationKind::Object)?;
-                self.comprehension_expression(builder, node, entry, Some(next), scope, stack)
+                self.generator_expression(builder, node, entry, next, scope, stack)
             }
             "assignment" | "named_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
@@ -3269,17 +3623,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "augmented_assignment" => {
                 self.augmented_assignment_expression(builder, node, entry, next, scope, stack)
             }
-            "list" | "set" | "dictionary" => {
+            "set" | "dictionary" => {
                 self.session
                     .add_allocation(builder, entry, result, AllocationKind::Object)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
-            "tuple" => {
-                self.session
-                    .add_allocation(builder, entry, result, AllocationKind::Array)?;
-                let children = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            "list" | "tuple" | "expression_list" => {
+                self.sequence_literal_expression(builder, node, entry, next, scope, stack)
             }
             "binary_operator" | "unary_operator" | "not_operator" => {
                 if operation_can_throw_implicitly(node) {
@@ -3315,8 +3666,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "expression_list"
-            | "pair"
+            "pair"
             | "slice"
             | "argument_list"
             | "keyword_argument"
@@ -3635,7 +3985,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "Python assignment has an invalid identifier range".into(),
                     )
                 })?;
-                let Some(target_value) = self.binding_value(name) else {
+                let Some((target_value, kind)) =
+                    self.scoped_binding_value(builder, target, name)?
+                else {
                     return Ok(());
                 };
                 self.append_effect(
@@ -3646,13 +3998,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     },
                 )?;
-                let kind = if Some(target_value) == self.receiver {
-                    ValueFlowKind::Receiver
-                } else if self.locals.get(name) == Some(&target_value) {
-                    ValueFlowKind::Local
-                } else {
-                    ValueFlowKind::Parameter
-                };
                 self.append_effect(
                     builder,
                     point,
@@ -3714,8 +4059,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     point,
                     MemoryLocationKind::Index {
                         base,
-                        index,
-                        constant_index: None,
+                        index: index.map(|(value, _)| value),
+                        constant_index: index.map(|(_, magnitude)| magnitude),
                         identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
                     },
                 )?;
@@ -3955,19 +4300,89 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn comprehension_expression(
+    fn sequence_literal_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         entry: ProgramPointId,
-        continuation: Option<EdgeTarget>,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let kind = if node.kind() == "list" {
+            AllocationKind::Object
+        } else {
+            AllocationKind::Array
+        };
+        self.session.add_allocation(builder, entry, result, kind)?;
+        let children = runtime_expression_children(node);
+        let terminal = self.point(builder, node, Vec::new())?;
+        if sequence_initializer_is_expanded(node) {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::IndexMemory,
+                SemanticGapKind::Unsupported,
+                "expanded Python sequence initializer positions are not modeled",
+            )?;
+        } else {
+            // Operand temporaries retain their evaluated values. Publish the
+            // initialized sequence only after all operands return normally.
+            for (ordinal, child) in children.iter().enumerate() {
+                let value =
+                    self.expression_value(builder, *child, expression_value_kind(*child))?;
+                let metadata = self.value_mapping(builder, *child)?;
+                let index = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::UnsignedInteger(ordinal as u128),
+                )?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    terminal,
+                    MemoryLocationKind::Index {
+                        base: result,
+                        index: Some(index),
+                        constant_index: Some(ordinal as u128),
+                        identity: crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+        }
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn generator_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        continuation: EdgeTarget,
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
         let outer_iterables = first_comprehension_iterables(node)?;
         let boundary = self.point(builder, node, Vec::new())?;
-        if let Some(continuation) = continuation {
-            self.add_gap(
+        self.add_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3975,15 +4390,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unsupported,
                 "generator-expression body, filters, and nested clauses execute after construction and are not lowered",
             )?;
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::GeneratorSuspension,
-                SemanticGapKind::Unsupported,
-                "generator-expression suspension and resumption are not lowered",
-            )?;
-            self.add_gap(
+        self.add_gap(
+            builder,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticCapability::GeneratorSuspension,
+            SemanticGapKind::Unsupported,
+            "generator-expression suspension and resumption are not lowered",
+        )?;
+        self.add_gap(
                 builder,
                 boundary,
                 SemanticGapSubject::Point,
@@ -3991,41 +4406,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticGapKind::Unknown,
                 "outer iterator acquisition and deferred generator protocol calls require runtime refinement",
             )?;
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "outer iterator acquisition and deferred generator failures are not lowered",
-            )?;
-            self.edge(builder, boundary, continuation)?;
-        } else {
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::NormalControlFlow,
-                SemanticGapKind::Unsupported,
-                "eager comprehension iteration, filtering, and nested scope are not lowered",
-            )?;
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::Calls,
-                SemanticGapKind::Unknown,
-                "eager comprehension iterator protocol calls require runtime refinement",
-            )?;
-            self.add_gap(
-                builder,
-                boundary,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "eager comprehension iteration and filtering failures are not lowered",
-            )?;
-        }
+        self.add_gap(
+            builder,
+            boundary,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+            "outer iterator acquisition and deferred generator failures are not lowered",
+        )?;
+        self.edge(builder, boundary, continuation)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -4034,6 +4423,280 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
             stack,
         )
+    }
+
+    fn eager_comprehension_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let clauses: Vec<_> = runtime_expression_children(node)
+            .into_iter()
+            .filter(|child| matches!(child.kind(), "for_in_clause" | "if_clause"))
+            .collect();
+        let outer_iterables = first_comprehension_iterables(node)?;
+        if clauses
+            .iter()
+            .any(|clause| has_direct_token(*clause, "async"))
+        {
+            let boundary = self.point(builder, node, Vec::new())?;
+            for capability in [
+                SemanticCapability::NormalControlFlow,
+                SemanticCapability::AsyncSuspendResume,
+                SemanticCapability::Calls,
+                SemanticCapability::ExceptionalControlFlow,
+            ] {
+                self.add_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    capability,
+                    SemanticGapKind::Unsupported,
+                    "async comprehension iteration is not lowered",
+                )?;
+            }
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &outer_iterables,
+                EdgeTarget::normal(boundary),
+                scope,
+                stack,
+            );
+        }
+        assert!(!clauses.is_empty() && clauses[0].kind() == "for_in_clause");
+        let first_clause = clauses[0];
+        if !self.comprehension_bindings.contains_key(&node.id()) {
+            let mut values = HashMap::default();
+            for clause in &clauses {
+                if clause.kind() != "for_in_clause" {
+                    continue;
+                }
+                for step in assignment_target_steps(required_field(*clause, "left")?, None) {
+                    if let AssignmentTargetStep::Leaf { target, .. } = step
+                        && matches!(target.kind(), "identifier" | "keyword_identifier")
+                    {
+                        let name = node_text(self.prepared.source(), target)
+                            .expect("valid identifier range");
+                        if !values.contains_key(name) {
+                            let metadata = self.value_mapping(builder, target)?;
+                            let value = self.session.add_value_with_metadata(
+                                builder,
+                                metadata,
+                                SemanticValueKind::Local,
+                            )?;
+                            values.insert(Box::<str>::from(name), value);
+                        }
+                    }
+                }
+            }
+            self.comprehension_bindings.insert(
+                node.id(),
+                ComprehensionBindings {
+                    values,
+                    outer_iterables,
+                    clauses,
+                },
+            );
+        }
+        let first = self.point(builder, first_clause, Vec::new())?;
+        self.edge(builder, entry, EdgeTarget::normal(first))?;
+        stack.push(Work::ComprehensionClause {
+            node,
+            index: 0,
+            entry: first,
+            next,
+            scope,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn comprehension_clause(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        index: usize,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let bindings = self
+            .comprehension_bindings
+            .get(&node.id())
+            .expect("comprehension scope precedes clause work");
+        let clause = bindings.clauses.get(index).copied();
+        let body = required_field(node, "body")?;
+        let Some(clause) = clause else {
+            let insertion = self.point(builder, node, Vec::new())?;
+            let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.session.add_partitioned_gap(
+                builder,
+                insertion,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::IndexMemory,
+                SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                SemanticGapKind::Unsupported,
+                "comprehension result element identities are not modeled",
+            )?;
+            if matches!(
+                node.kind(),
+                "set_comprehension" | "dictionary_comprehension"
+            ) {
+                for capability in [
+                    SemanticCapability::Calls,
+                    SemanticCapability::ExceptionalControlFlow,
+                ] {
+                    self.add_gap(
+                        builder,
+                        insertion,
+                        SemanticGapSubject::Point,
+                        capability,
+                        SemanticGapKind::Unknown,
+                        "comprehension insertion can invoke hashing and equality",
+                    )?;
+                }
+            }
+            self.edge(builder, insertion, next)?;
+            stack.push(Work::Expression {
+                node: body,
+                entry,
+                next: EdgeTarget::normal(insertion),
+                scope,
+            });
+            return Ok(());
+        };
+        let following_node = bindings.clauses.get(index + 1).copied().unwrap_or(body);
+        if clause.kind() == "if_clause" {
+            let following = self.point(builder, following_node, Vec::new())?;
+            stack.push(Work::ComprehensionClause {
+                node,
+                index: index + 1,
+                entry: following,
+                next,
+                scope,
+            });
+            stack.push(Work::Condition {
+                node: first_runtime_named_child(clause).expect("filter expression"),
+                entry,
+                when_true: EdgeTarget::normal(following),
+                when_false: next,
+                scope,
+            });
+            return Ok(());
+        }
+        let target = required_field(clause, "left")?;
+        let iterables = children_by_field_name(clause, "right");
+        let literal = if iterables.len() == 1 {
+            unpack_source_children(iterables[0])
+        } else {
+            None
+        };
+        let mut iterations = Vec::new();
+        let first_iteration = if let Some(items) = literal {
+            let entries = items
+                .iter()
+                .map(|_| self.point(builder, target, Vec::new()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for (item_index, item) in items.into_iter().enumerate() {
+                let following = entries
+                    .get(item_index + 1)
+                    .copied()
+                    .map(EdgeTarget::normal)
+                    .unwrap_or(next);
+                iterations.push((Some(item), entries[item_index], following));
+            }
+            if entries.is_empty() {
+                // Retain source facts for the unreachable body, as with a
+                // constant-false branch, without an executable entry edge.
+                let unreachable = self.point(builder, following_node, Vec::new())?;
+                stack.push(Work::ComprehensionClause {
+                    node,
+                    index: index + 1,
+                    entry: unreachable,
+                    next,
+                    scope,
+                });
+            }
+            entries
+                .first()
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next)
+        } else {
+            let test = self.point(builder, clause, Vec::new())?;
+            let binding = self.point(builder, target, Vec::new())?;
+            for capability in [
+                SemanticCapability::Calls,
+                SemanticCapability::ExceptionalControlFlow,
+            ] {
+                self.add_gap(
+                    builder,
+                    test,
+                    SemanticGapSubject::Point,
+                    capability,
+                    SemanticGapKind::Unsupported,
+                    "comprehension iterator protocol requires runtime refinement",
+                )?;
+            }
+            self.edge(builder, test, EdgeTarget::normal(binding))?;
+            self.edge(builder, test, next)?;
+            iterations.push((
+                None,
+                binding,
+                EdgeTarget {
+                    point: test,
+                    kind: ControlEdgeKind::LoopBack,
+                },
+            ));
+            EdgeTarget::normal(test)
+        };
+        for (source, binding, continuation) in iterations {
+            if binding_requires_runtime_protocol(target) {
+                for capability in [
+                    SemanticCapability::Calls,
+                    SemanticCapability::ExceptionalControlFlow,
+                ] {
+                    self.add_gap(
+                        builder,
+                        binding,
+                        SemanticGapSubject::Point,
+                        capability,
+                        SemanticGapKind::Unknown,
+                        "comprehension target assignment may invoke runtime protocols",
+                    )?;
+                }
+            }
+            let completion = self.append_target_source_assignments(
+                builder,
+                binding,
+                node,
+                target,
+                source,
+                if is_unpacking_target(target) {
+                    PYTHON_UNKNOWN_UNPACK_ELEMENT
+                } else {
+                    PYTHON_UNKNOWN_ITERATION_ELEMENT
+                },
+                scope,
+                stack,
+            )?;
+            let following = self.point(builder, following_node, Vec::new())?;
+            self.edge(builder, completion, EdgeTarget::normal(following))?;
+            stack.push(Work::ComprehensionClause {
+                node,
+                index: index + 1,
+                entry: following,
+                next: continuation,
+                scope,
+            });
+        }
+        self.schedule_expressions(builder, entry, &iterables, first_iteration, scope, stack)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6145,10 +6808,10 @@ fn boolean_operator_kind(node: Node<'_>) -> Option<&'static str> {
     }
 }
 
-fn boolean_literal_condition(node: Node<'_>) -> Option<bool> {
+fn literal_truth_condition(node: Node<'_>) -> Option<bool> {
     match node.kind() {
         "true" => Some(true),
-        "false" => Some(false),
+        "false" | "none" => Some(false),
         _ => None,
     }
 }
@@ -6443,6 +7106,80 @@ mod tests {
             })
             .expect("the Python attribute publishes its implicit-exception gap");
         assert_eq!(gap.discharge, SemanticGapDischarge::None);
+    }
+
+    #[test]
+    fn comma_expression_allocates_a_tuple_without_parentheses() {
+        let parts = lower_fixture_named("def pair():\n    return 1, 2\n", Some("pair"));
+        let [allocation] = parts.allocations.as_slice() else {
+            panic!(
+                "comma expression must allocate one tuple: {:?}",
+                parts.allocations
+            );
+        };
+        assert_eq!(allocation.kind, AllocationKind::Array);
+        let value = &parts.values[allocation.result.index()];
+        let mapping = &parts.source_mappings[value.source.index()];
+        let span = mapping.locator.anchor().span();
+        assert_eq!(
+            &"def pair():\n    return 1, 2\n"[span.start_byte() as usize..span.end_byte() as usize],
+            "1, 2"
+        );
+    }
+
+    #[test]
+    fn comprehension_target_flow_is_distinct_from_the_enclosing_parameter() {
+        let source = "def run(item):\n    return [item for item in ('local',)]\n";
+        let parts = lower_fixture_named(source, Some("run"));
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let function = tree.root_node().named_child(0).unwrap();
+        let comprehension = required_field(function, "body")
+            .unwrap()
+            .named_child(0)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        assert_eq!(comprehension.kind(), "list_comprehension");
+        let body = required_field(comprehension, "body").unwrap();
+        let target = required_field(comprehension.named_child(1).unwrap(), "left").unwrap();
+        let parameter = parts
+            .values
+            .iter()
+            .find(|value| matches!(value.kind, SemanticValueKind::Parameter { ordinal: 0, .. }))
+            .unwrap()
+            .id;
+        let target = value_for_node(&parts, target, SemanticValueKind::Local);
+        let body = value_for_node(&parts, body, SemanticValueKind::Temporary);
+        assert!(flow_reaches(&parts, target, body));
+        assert!(!flow_reaches(&parts, parameter, body));
+    }
+
+    #[test]
+    fn sequence_literal_initializers_publish_exact_indexed_stores() {
+        let parts = lower_fixture_named(
+            "def make(left, right):\n    return [left, right]\n",
+            Some("make"),
+        );
+        let mut indices = parts
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::MemoryStore { location, .. } => {
+                    match parts.memory_locations[location.index()].kind {
+                        MemoryLocationKind::Index { constant_index, .. } => constant_index,
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        assert_eq!(indices, [0, 1]);
     }
 
     fn value_for_node(
@@ -6851,7 +7588,7 @@ mod tests {
                 let condition = node
                     .child_by_field_name("condition")
                     .expect("if condition field");
-                return boolean_literal_condition(condition);
+                return literal_truth_condition(condition);
             }
             stack.extend(named_children(node).into_iter().rev());
         }
@@ -6888,9 +7625,10 @@ mod tests {
     }
 
     #[test]
-    fn boolean_literal_condition_routes_only_its_feasible_edge() {
+    fn literal_truth_condition_routes_only_its_feasible_edge() {
         assert_eq!(condition_literal("if True:\n    pass\n"), Some(true));
         assert_eq!(condition_literal("if False:\n    pass\n"), Some(false));
+        assert_eq!(condition_literal("if None:\n    pass\n"), Some(false));
         assert_eq!(condition_literal("if value:\n    pass\n"), None);
     }
 
@@ -6993,6 +7731,28 @@ mod tests {
     }
 
     #[test]
+    fn enclosing_inventory_preserves_shadowing_and_explicit_global_resolution() {
+        for (declaration, proven) in [("", false), ("        global Holder\n", true)] {
+            let source = format!(
+                "class Holder:\n    def __init__(self):\n        self.value = 0\ndef outer(Holder):\n    def inner():\n{declaration}        Holder()\n"
+            );
+            let parts = lower_fixture_named(&source, Some("inner"));
+            let [call] = parts.call_sites.as_slice() else {
+                panic!("inner must contain exactly one call")
+            };
+            assert_eq!(
+                matches!(
+                    call.declared_targets,
+                    CallableTargetResolution::Proven(CallableTarget::Local(_))
+                ),
+                proven,
+                "{source}: {:?}",
+                call.declared_targets
+            );
+        }
+    }
+
+    #[test]
     fn proven_module_class_call_names_its_local_constructor() {
         let source = "class Holder:\n    def __init__(self):\n        self.value = 0\n\ndef run():\n    Holder()\n";
         let parts = lower_fixture_named(source, Some("run"));
@@ -7086,6 +7846,40 @@ def run():
     }
 
     #[test]
+    fn closed_list_load_proofs_reject_escapes_and_expanded_initialization() {
+        for (source, closed) in [
+            ("def run():\n    values = [1]\n    return values[0]\n", true),
+            (
+                "def run():\n    values = [1]\n    alias = values\n    return alias[0]\n",
+                true,
+            ),
+            (
+                "def run(mutate):\n    values = [1]\n    mutate(values)\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run(mutate):\n    values = [1]\n    for n in (0, 1):\n        item = values[0]\n        mutate(values)\n",
+                false,
+            ),
+            (
+                "def run():\n    values = [*(1,)]\n    return values[0]\n",
+                false,
+            ),
+            (
+                "def run():\n    values = [1, 2]\n    del values[0]\n    return values[0]\n",
+                false,
+            ),
+            ("def run(values):\n    return values[0]\n", false),
+        ] {
+            let tree = parse(source);
+            let callable = first_node_of_kind(&tree, "function_definition");
+            let spans = closed_list_load_spans(callable, source, || true).unwrap();
+            assert_eq!(!spans.is_empty(), closed, "{source}: {spans:?}");
+            assert!(closed_list_load_spans(callable, source, || false).is_none());
+        }
+    }
+
+    #[test]
     fn unknown_root_does_not_gain_heap_proof() {
         let source = "def run():\n    values = external()\n    sink(values[0])\n";
         let tree = parse(source);
@@ -7096,7 +7890,7 @@ def run():
             known_lists,
             known_instances,
             ..
-        } = heap_binding_proofs(callable, source, &class_names, &fields);
+        } = heap_binding_proofs(callable, source, &class_names, &fields, || true).unwrap();
         assert!(known_lists.is_empty());
         assert!(known_instances.is_empty());
     }

@@ -159,7 +159,7 @@ struct MergedClassSet {
     file: ProjectFile,
     span: SourceSpan,
     member: String,
-    classes: Vec<ClassIdentity>,
+    classes: Vec<(ClassIdentity, bool)>,
     unknown: Vec<UnknownReason>,
     dynamic_origins: Vec<String>,
     status: ClassSetStatus,
@@ -180,6 +180,7 @@ pub(super) struct ClassSetRowValue {
     pub(super) class: Option<String>,
     pub(super) origin: String,
     pub(super) status: &'static str,
+    pub(super) guard_only: bool,
 }
 
 /// One absent-member finding with the site that introduced the class.
@@ -1118,7 +1119,7 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v9";
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v10";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -1158,9 +1159,17 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
                 merged.last_mut().expect("the set was just pushed")
             }
         };
-        for (identity, _) in &set.classes {
-            if !entry.classes.contains(identity) {
-                entry.classes.push(identity.clone());
+        for (identity, source) in &set.classes {
+            let guard_only = source.kind
+                == brokk_bifrost_flow::type_flow::SourceSiteKind::ConditionalNarrowingGuard;
+            if let Some((_, existing)) = entry
+                .classes
+                .iter_mut()
+                .find(|(class, _)| class == identity)
+            {
+                *existing &= guard_only;
+            } else {
+                entry.classes.push((identity.clone(), guard_only));
             }
         }
         for reason in &set.unknown {
@@ -1180,7 +1189,7 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
     for set in &merged {
         let range = source_range(set.span);
         let portable_path = WorkspaceRelativePath::try_from_path(set.file.rel_path()).ok();
-        for identity in &set.classes {
+        for (identity, guard_only) in &set.classes {
             let class = identity.qualified_name().to_string();
             let origin = match identity {
                 ClassIdentity::Workspace(_) => "workspace".to_string(),
@@ -1202,6 +1211,7 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
                 portable_path: portable_path.clone(),
                 member: set.member.clone(),
                 class: Some(class),
+                guard_only: *guard_only,
                 origin,
                 status: set.status.label(),
             });
@@ -1229,6 +1239,7 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
                 portable_path: portable_path.clone(),
                 member: set.member.clone(),
                 class: None,
+                guard_only: false,
                 origin,
                 status: set.status.label(),
             });
@@ -1262,6 +1273,7 @@ fn project_class_sets(result: &TypeFlowRootResult) -> Vec<ClassSetRowValue> {
             && left.class == right.class
             && left.origin == right.origin
             && left.status == right.status
+            && left.guard_only == right.guard_only
     });
     rows
 }
@@ -1312,6 +1324,7 @@ fn persisted_class_set_row(
         member: row.member.clone().into_boxed_str(),
         atom,
         status: PersistedClassSetStatus::from_label(row.status)?,
+        guard_only: row.guard_only,
     })
 }
 
@@ -1374,6 +1387,7 @@ fn persisted_class_set_rows(
                 class,
                 origin,
                 status: row.status.label(),
+                guard_only: row.guard_only,
             }
         })
         .collect()
@@ -1727,7 +1741,7 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v9",
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v10",
             "unsupported callee returns must not reuse falsely complete root results"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");

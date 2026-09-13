@@ -22,34 +22,41 @@ pub enum PythonDirectScopeBindingKind {
 ///
 /// Comprehensions create an implicit scope even at module level. The element
 /// expression is textually before its `for` clauses but evaluates after their
-/// binders, while a clause's own iterable evaluates before that clause binds
-/// its target. This structured walk models that ordering without source-text
-/// parsing.
+/// binders. Only the first iterable evaluates in the enclosing scope; later
+/// iterables use comprehension-local names, including not-yet-bound targets.
+/// This structured walk models those scopes without source-text parsing.
 pub fn python_comprehension_binds_name_at(name: &str, reference: Node<'_>, source: &str) -> bool {
     let mut current = reference;
     while let Some(parent) = current.parent() {
         if is_comprehension(parent.kind()) {
             let mut cursor = parent.walk();
-            for clause in parent
+            let clauses = parent
                 .named_children(&mut cursor)
                 .filter(|child| child.kind() == "for_in_clause")
-            {
+                .collect::<Vec<_>>();
+            let in_outer_iterable = clauses.first().is_some_and(|clause| {
+                let mut cursor = clause.walk();
+                clause
+                    .children_by_field_name("right", &mut cursor)
+                    .any(|right| {
+                        right.start_byte() <= reference.start_byte()
+                            && reference.end_byte() <= right.end_byte()
+                    })
+            });
+            if in_outer_iterable {
+                current = parent;
+                continue;
+            }
+            for clause in clauses {
                 let Some(target) = clause.child_by_field_name("left") else {
                     continue;
                 };
                 let mut bound = false;
-                let _ = collect_binding_targets(target, source, &mut || true, |candidate, _| {
+                collect_binding_targets(target, source, &mut || true, |candidate, _| {
                     bound |= candidate == name;
-                });
-                if !bound {
-                    continue;
-                }
-                let inside_own_iterable =
-                    clause.child_by_field_name("right").is_some_and(|right| {
-                        right.start_byte() <= reference.start_byte()
-                            && reference.end_byte() <= right.end_byte()
-                    });
-                if !inside_own_iterable {
+                })
+                .expect("unbounded comprehension target collection completes");
+                if bound {
                     return true;
                 }
             }
@@ -266,13 +273,83 @@ struct PythonComprehensionBinding {
 /// iterative and every inspected node is gated by `scope_step`; `None` means
 /// the caller stopped discovery and must conservatively avoid module fallback.
 pub struct PythonLexicalScopeInventory<'tree> {
-    parameters: HashSet<Box<str>>,
     locals: Vec<PythonLocalBinding<'tree>>,
+    bindings: PythonLexicalScopeBindings,
+}
+
+/// Completed function binding facts without borrowed tree-sitter nodes.
+/// Retain these only under the identity of the exact source that produced them.
+pub struct PythonLexicalScopeBindings {
+    parameters: HashSet<Box<str>>,
     local_names: HashMap<Box<str>, PythonLocalBindingKind>,
     binding_writes: HashSet<Box<str>>,
     globals: HashSet<Box<str>>,
     nonlocals: HashSet<Box<str>>,
     comprehensions: Vec<PythonComprehensionBinding>,
+}
+
+impl PythonLexicalScopeBindings {
+    pub fn name_resolution_at(
+        &self,
+        name: &str,
+        reference: Node<'_>,
+    ) -> PythonLexicalNameResolution {
+        let reference_byte = reference.start_byte();
+        if self.comprehensions.iter().any(|binding| {
+            binding.name.as_ref() == name
+                && binding.start_byte <= reference_byte
+                && reference_byte < binding.end_byte
+                && !binding
+                    .enclosing_iterable_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
+        }) {
+            return PythonLexicalNameResolution::Local;
+        }
+        if self.nonlocals.contains(name) {
+            return PythonLexicalNameResolution::Nonlocal;
+        }
+        if self.globals.contains(name) {
+            return PythonLexicalNameResolution::Global;
+        }
+        if self.parameters.contains(name) || self.local_names.contains_key(name) {
+            PythonLexicalNameResolution::Local
+        } else {
+            PythonLexicalNameResolution::Unbound
+        }
+    }
+
+    pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
+        let reference_byte = reference.start_byte();
+        !self.parameters.contains(name)
+            && !self.comprehensions.iter().any(|binding| {
+                binding.name.as_ref() == name
+                    && binding.start_byte <= reference_byte
+                    && reference_byte < binding.end_byte
+                    && !binding
+                        .enclosing_iterable_ranges
+                        .iter()
+                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
+            })
+            && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly)
+    }
+
+    /// Whether the active callable obtains `name` from a runtime binding
+    /// rather than an untouched function or import declaration.
+    pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {
+        let reference_byte = reference.start_byte();
+        self.parameters.contains(name)
+            || self.binding_writes.contains(name)
+            || self.comprehensions.iter().any(|binding| {
+                binding.name.as_ref() == name
+                    && binding.start_byte <= reference_byte
+                    && reference_byte < binding.end_byte
+                    && !binding
+                        .enclosing_iterable_ranges
+                        .iter()
+                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -295,13 +372,15 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         mut scope_step: impl FnMut() -> bool,
     ) -> Option<Self> {
         let mut inventory = Self {
-            parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
             locals: Vec::new(),
-            local_names: HashMap::default(),
-            binding_writes: HashSet::default(),
-            globals: HashSet::default(),
-            nonlocals: HashSet::default(),
-            comprehensions: Vec::new(),
+            bindings: PythonLexicalScopeBindings {
+                parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
+                local_names: HashMap::default(),
+                binding_writes: HashSet::default(),
+                globals: HashSet::default(),
+                nonlocals: HashSet::default(),
+                comprehensions: Vec::new(),
+            },
         };
         let Some(body) = callable.child_by_field_name("body") else {
             return Some(inventory);
@@ -343,13 +422,13 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             match node.kind() {
                 "global_statement" => {
                     collect_direct_identifier_names(node, source, &mut scope_step, |name| {
-                        inventory.globals.insert(name.into());
+                        inventory.bindings.globals.insert(name.into());
                     })?;
                     continue;
                 }
                 "nonlocal_statement" => {
                     collect_direct_identifier_names(node, source, &mut scope_step, |name| {
-                        inventory.nonlocals.insert(name.into());
+                        inventory.bindings.nonlocals.insert(name.into());
                     })?;
                     continue;
                 }
@@ -502,12 +581,15 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                     {
                         if let Some(target) = clause.child_by_field_name("left") {
                             collect_binding_targets(target, source, &mut scope_step, |name, _| {
-                                inventory.comprehensions.push(PythonComprehensionBinding {
-                                    name: name.into(),
-                                    start_byte: range.0,
-                                    end_byte: range.1,
-                                    enclosing_iterable_ranges: enclosing_iterable_ranges.clone(),
-                                });
+                                inventory.bindings.comprehensions.push(
+                                    PythonComprehensionBinding {
+                                        name: name.into(),
+                                        start_byte: range.0,
+                                        end_byte: range.1,
+                                        enclosing_iterable_ranges: enclosing_iterable_ranges
+                                            .clone(),
+                                    },
+                                );
                             })?;
                         }
                     }
@@ -528,14 +610,18 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         // `global` and `nonlocal` are whole-function directives regardless of
         // source order. Neither declaration may become a semantic local.
         inventory.locals.retain(|binding| {
-            !inventory.globals.contains(binding.name.as_ref())
-                && !inventory.nonlocals.contains(binding.name.as_ref())
+            !inventory.bindings.globals.contains(binding.name.as_ref())
+                && !inventory.bindings.nonlocals.contains(binding.name.as_ref())
         });
-        inventory.local_names.retain(|name, _| {
-            !inventory.globals.contains(name.as_ref())
-                && !inventory.nonlocals.contains(name.as_ref())
+        inventory.bindings.local_names.retain(|name, _| {
+            !inventory.bindings.globals.contains(name.as_ref())
+                && !inventory.bindings.nonlocals.contains(name.as_ref())
         });
         Some(inventory)
+    }
+
+    pub fn into_bindings(self) -> PythonLexicalScopeBindings {
+        self.bindings
     }
 
     pub fn name_resolution_at(
@@ -543,61 +629,16 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         name: &str,
         reference: Node<'_>,
     ) -> PythonLexicalNameResolution {
-        let reference_byte = reference.start_byte();
-        if self.comprehensions.iter().any(|binding| {
-            binding.name.as_ref() == name
-                && binding.start_byte <= reference_byte
-                && reference_byte < binding.end_byte
-                && !binding
-                    .enclosing_iterable_ranges
-                    .iter()
-                    .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-        }) {
-            return PythonLexicalNameResolution::Local;
-        }
-        if self.nonlocals.contains(name) {
-            return PythonLexicalNameResolution::Nonlocal;
-        }
-        if self.globals.contains(name) {
-            return PythonLexicalNameResolution::Global;
-        }
-        if self.parameters.contains(name) || self.local_names.contains_key(name) {
-            PythonLexicalNameResolution::Local
-        } else {
-            PythonLexicalNameResolution::Unbound
-        }
+        self.bindings.name_resolution_at(name, reference)
     }
 
     pub fn resolves_to_local_function(&self, name: &str, reference: Node<'_>) -> bool {
-        let reference_byte = reference.start_byte();
-        !self.parameters.contains(name)
-            && !self.comprehensions.iter().any(|binding| {
-                binding.name.as_ref() == name
-                    && binding.start_byte <= reference_byte
-                    && reference_byte < binding.end_byte
-                    && !binding
-                        .enclosing_iterable_ranges
-                        .iter()
-                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-            })
-            && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly)
+        self.bindings.resolves_to_local_function(name, reference)
     }
 
-    /// Whether the active callable obtains `name` from a runtime binding
-    /// rather than an untouched function or import declaration.
     pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {
-        let reference_byte = reference.start_byte();
-        self.parameters.contains(name)
-            || self.binding_writes.contains(name)
-            || self.comprehensions.iter().any(|binding| {
-                binding.name.as_ref() == name
-                    && binding.start_byte <= reference_byte
-                    && reference_byte < binding.end_byte
-                    && !binding
-                        .enclosing_iterable_ranges
-                        .iter()
-                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-            })
+        self.bindings
+            .has_runtime_callable_binding_at(name, reference)
     }
 
     pub fn local_function_declaration(
@@ -636,7 +677,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
         } else {
             PythonLocalBindingKind::Other
         };
-        match self.local_names.entry(name.into()) {
+        match self.bindings.local_names.entry(name.into()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(binding_kind);
                 self.locals.push(PythonLocalBinding {
@@ -652,7 +693,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
 
     fn record_binding_write(&mut self, name: &str, declaration: Node<'tree>) {
         if !name.is_empty() {
-            self.binding_writes.insert(name.into());
+            self.bindings.binding_writes.insert(name.into());
         }
         self.record_local(name, declaration);
     }
@@ -1290,4 +1331,39 @@ fn is_pattern_literal(kind: &str) -> bool {
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_source_text_trimmed(node, source)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_the_first_comprehension_iterable_uses_the_enclosing_scope() {
+        let source = "def run(first, second):\n    return [second for first in first for second in second]\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let comprehension = loop {
+            let node = stack.pop().expect("fixture contains a comprehension");
+            if node.kind() == "list_comprehension" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        };
+        let mut cursor = comprehension.walk();
+        let clauses = comprehension
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "for_in_clause")
+            .collect::<Vec<_>>();
+        let outer = clauses[0].child_by_field_name("right").unwrap();
+        let inner = clauses[1].child_by_field_name("right").unwrap();
+        assert!(!super::python_comprehension_binds_name_at(
+            "first", outer, source
+        ));
+        assert!(super::python_comprehension_binds_name_at(
+            "second", inner, source
+        ));
+    }
 }

@@ -109,8 +109,10 @@ pub struct ReceiverClassSet {
     pub status: ClassSetStatus,
 }
 
-/// A member access whose receiver provably holds a class that does not
-/// declare the member.
+/// A member access with complete receiver classes and an admitted value
+/// alternative whose class does not declare the member. Membership inferred
+/// only by guarding an unmodeled producer is insufficient. This is not a proof
+/// that every control-flow condition on a runtime path is jointly feasible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsentMemberFinding {
     pub root: ProcedureHandle,
@@ -1406,7 +1408,7 @@ fn reached_class_set(
                 lookup,
                 MemberLookup::Absent | MemberLookup::DeclarationAbsent
             ) {
-                for evidence in field_slots.dynamic_write_evidence(identity) {
+                for evidence in field_slots.dynamic_write_evidence(workspace, adapter, identity) {
                     if !dynamic_writes.contains(evidence) {
                         dynamic_writes.push(evidence.clone());
                     }
@@ -1442,6 +1444,9 @@ fn reached_class_set(
         if complete_receiver_set && unknown.is_empty() {
             for index in absent {
                 let (identity, origin) = &classes[index];
+                if origin.kind == SourceSiteKind::ConditionalNarrowingGuard {
+                    continue;
+                }
                 findings.push(AbsentMemberFinding {
                     root: root.clone(),
                     site: site.clone(),
@@ -1466,7 +1471,11 @@ fn reached_class_set(
 
 /// Orders a guard-proved origin after every origin that produced a value.
 fn narrowing_guard_rank(site: &SourceSite) -> u8 {
-    u8::from(site.kind == SourceSiteKind::NarrowingGuard)
+    match site.kind {
+        SourceSiteKind::ConditionalNarrowingGuard => 2,
+        SourceSiteKind::NarrowingGuard => 1,
+        _ => 0,
+    }
 }
 
 fn push_reason(reasons: &mut Vec<UnknownReason>, reason: UnknownReason) {

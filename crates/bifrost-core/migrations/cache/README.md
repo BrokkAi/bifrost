@@ -6,7 +6,7 @@ produces, not for its position. The numbered files beside it carry a store
 forward through the current version; version numbers remain explicit because
 this chain can deliberately skip an unpublished number.
 
-`0064-current-fresh-schema.sql` is SQLite's rendering of the same final schema
+`0065-current-fresh-schema.sql` is SQLite's rendering of the same final schema
 after the complete migration chain. A database with version zero and no schema
 objects may install it directly, avoiding obsolete table rewrites. Existing
 stores still run every pending numbered migration, and tests require the direct
@@ -316,3 +316,7 @@ the class an `isinstance`-style guard spelled and the adapter could not model.
 It follows `0063-class-set-class-object.sql`, so its rebuilt table keeps the
 `class_object` reason that migration added as well. The migration rebuilds only
 the constrained leaf row table and carries every schema-63 row across.
+
+Migration `0065-class-set-guard-only.sql` retains whether a class alternative
+comes only from guarding an unmodeled producer. The Boolean is constrained to
+class rows; unknown atoms cannot claim guard-only class evidence.

@@ -1175,6 +1175,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("member", Scalar::String),
                     CodeQueryRowField::optional("class", Scalar::String),
+                    CodeQueryRowField::optional("guard_only", Scalar::Boolean),
                     CodeQueryRowField::required_open_enum(
                         "origin",
                         "an unknown origin embeds the engine's unknown:<reason> label, and the type-flow reason vocabulary grows with the language adapters"
@@ -2810,6 +2811,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ClassSetRow { value }, "origin") => {
             Some(Scalar::ConstrainedEnum(&value.origin))
+        }
+        (CodeQueryResultValue::ClassSetRow { value }, "guard_only") => {
+            value.guard_only.map(Scalar::Boolean)
         }
         (CodeQueryResultValue::ClassSetRow { value }, "status") => {
             Some(Scalar::ConstrainedEnum(value.status))

@@ -2139,6 +2139,81 @@ fn non_rejoining_exceptional_exit_requires_a_local_exceptional_gap() {
 }
 
 #[test]
+fn modeled_heap_partitions_reject_unpartitioned_effects() {
+    for (impacts, valid) in [
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead),
+            true,
+        ),
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+            true,
+        ),
+        (
+            SemanticGapImpacts::single(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::ValueFlow),
+            false,
+        ),
+        (SemanticGapImpacts::NONE, false),
+    ] {
+        let key = key();
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.values.push(SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Temporary,
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        parts.gaps.push(SemanticGap {
+            id: SemanticGapId::new(0),
+            point: ProgramPointId::new(0),
+            subject: SemanticGapSubject::Value(ValueId::new(0)),
+            capability: SemanticCapability::IndexMemory,
+            impacts,
+            kind: SemanticGapKind::Unsupported,
+            budget: None,
+            discharge: SemanticGapDischarge::ModeledEffectPartition,
+            detail: "isolated heap effect".into(),
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        });
+        let mut events = parts.points[0].events.to_vec();
+        events.push(SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            SourceMappingId::new(0),
+            EvidenceId::new(0),
+        ));
+        parts.points[0].events = events.into_boxed_slice();
+        let mut caps = SemanticCapabilities::builder();
+        for capability in [
+            SemanticCapability::Procedures,
+            SemanticCapability::EntryBoundary,
+            SemanticCapability::NormalExitBoundary,
+            SemanticCapability::ExceptionalExitBoundary,
+            SemanticCapability::BasicBlocks,
+            SemanticCapability::ProgramPoints,
+            SemanticCapability::Values,
+            SemanticCapability::NormalControlFlow,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            caps = caps.complete(capability);
+        }
+        let result = SemanticArtifact::try_new(
+            key,
+            caps.partial(SemanticCapability::IndexMemory).build(),
+            vec![parts],
+        );
+        if valid {
+            result.expect("one isolated heap partition is valid");
+        } else {
+            assert_eq!(result.unwrap_err().kind(), SemanticIrErrorKind::GapContract);
+        }
+    }
+}
+
+#[test]
 fn exit_only_procedure_completion_requires_a_local_completion_gap() {
     let key = key();
     let procedure_with_gap = |capability, subject, kind| {

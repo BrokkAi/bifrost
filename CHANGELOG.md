@@ -9,6 +9,10 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- Go data-race analysis now composes witnessed task and join effects for
+  errgroup and WaitGroup patterns from source summaries.
+- Python conditional type refinements now survive semantic-pack and CSMI
+  wire round trips, with exact binding and preserved provenance.
 - Configuration facts are now exposed through canonical CodeQuery and RQL.
 - Scala semantic-model packs now record contextual declaration roles.
 - Reusable procedure summaries now publish typed dimension coverage, making
@@ -20,6 +24,22 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Python call-target lookup reuses completed local binding facts within each
+  exact-source query context.
+
+- Python type flow propagates selected values through conditional expressions
+  and nested short-circuit `and`/`or` expressions.
+
+- Missing-member findings now require value evidence beyond class membership
+  inferred only by guarding an unmodeled load or call.
+
+- Python type flow closes indexed values for fully initialized local lists
+  whose aliases never escape, preserving modeled overwrites and avoiding
+  impossible guarded missing-member findings for those loads.
+
+- Python type flow reuses completed class lookups within a query while
+  preserving dependency reads and cancellation. Dynamic-write surveys avoid
+  constructing type-flow plans when completed discovery contains no pending write.
 - Diff-tool requests now report their execution phases to the client while
   running, and analyzer cache build-lock waits are cancellable and
   self-naming.
@@ -30,6 +50,15 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Python semantic analysis now follows synchronous comprehension loops and
+  filters, preserves comprehension-local targets and enclosing walrus writes,
+  and keeps unmodeled collection contents and mutable captures explicit.
+- Go data-race analysis no longer invents joins through copied errgroup or
+  WaitGroup values, recognizes channel payloads as binding-address escapes,
+  retains send endpoints when transport identity is unknown, and lets census
+  membership descend parser recovery.
+- Python type flow now preserves tuple identity and exact native member
+  closure.
 - Windows filesystem watchers no longer rearm a closed handle during
   shutdown, preventing intermittent workspace cleanup hangs.
 - Type flow: an instance guard's true arm now replaces the Unknown remainder

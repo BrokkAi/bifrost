@@ -2510,6 +2510,16 @@ pub(crate) fn capture_nested_reads<T>(
     (result, captured.keys())
 }
 
+/// Replay all dependencies of a completed query into its current caller.
+pub(crate) fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::ReadLedger) {
+    for key in reads.keys() {
+        analyzer.record_read(key);
+    }
+    for _ in 0..reads.unattributed_reads() {
+        analyzer.record_unattributed_read();
+    }
+}
+
 /// Capture the dependency reads of a replayable query without changing its
 /// enclosing caller's ledger. Unlike a resolver funnel, the query subsumes no
 /// dependencies: all captured reads, including unattributed crossings, are

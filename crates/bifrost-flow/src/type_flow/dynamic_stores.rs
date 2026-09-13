@@ -1,17 +1,17 @@
 //! Solve receiver scopes before using dynamic writes as absence evidence.
 
 use super::correlations::CorrelationError;
-use super::field_slots::FieldSlotIndex;
-use super::plan::{ProcedureRefinements, TypeFlowPlan, TypeFlowPlanError};
+use super::field_slots::{FieldSlotIndex, receiver_values};
+use super::plan::{ProcedureRefinements, TypeFlowDiscovery, TypeFlowPlanError};
 use super::refinement_sources::DefinitionSources;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
-    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, ProcedureHandle, ProgramPointId,
-    SemanticBudget, SemanticEffect, SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason,
-    ValueId, WorkspaceIcfgProvider,
+    CancellationToken, ClassAtom, ClassIdentity, IcfgProvider, ProcedureHandle,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, SemanticBudget, SemanticEffect,
+    SourceSite, SourceSiteKind, TypeFlowAdapter, UnknownReason, ValueId, WorkspaceIcfgProvider,
 };
 use crate::dataflow::{DataflowRequest, SolverBudget};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::value_flow::{
     ClosureLimits, ValueFlowCache, ValueFlowCarrier, WorkspaceValueFlowProvider,
     solve_value_flow_with_summaries,
@@ -115,6 +115,26 @@ fn observation_point(write: &PendingDynamicWrite) -> Option<(ProgramPointId, usi
     })
 }
 
+enum WriteObservation {
+    Event {
+        point: ProgramPointHandle,
+        event: usize,
+        carrier: ValueFlowCarrier,
+    },
+    ReceiverEntry {
+        point: ProgramPointHandle,
+        carrier: ValueFlowCarrier,
+    },
+}
+
+impl WriteObservation {
+    fn point(&self) -> &ProgramPointHandle {
+        match self {
+            Self::Event { point, .. } | Self::ReceiverEntry { point, .. } => point,
+        }
+    }
+}
+
 /// Each workspace procedure is an entry context, just as in the public
 /// workspace solve. Root-parameter unknowns supply no concrete workspace
 /// callers; their actual arguments are observed in the callers' closures.
@@ -146,6 +166,53 @@ pub(super) fn survey(
             },
         })
         .collect::<Vec<_>>();
+    // An immutable receiver has the same identity before an unsupported
+    // continuation as at the write. Observe its entry port, including actual
+    // unbound-call arguments; the enclosing class alone is not that proof.
+    let mut stable_receivers = HashMap::default();
+    let observations = writes
+        .iter()
+        .map(|write| {
+            let receiver = write.receiver?;
+            let stable = stable_receivers
+                .entry(write.procedure.durable_key())
+                .or_insert_with(|| {
+                    let receivers = receiver_values(&write.procedure);
+                    if !receivers.is_empty()
+                        && adapter.receiver_binding_is_stable(workspace, &write.procedure)
+                    {
+                        receivers
+                    } else {
+                        HashSet::default()
+                    }
+                });
+            if stable.contains(&receiver) {
+                let entry = write.procedure.semantics().entry_point();
+                Some(WriteObservation::ReceiverEntry {
+                    point: write.procedure.point_handle(entry).expect("entry is live"),
+                    carrier: ValueFlowCarrier::Port(
+                        ProcedurePortHandle::receiver(write.procedure.clone())
+                            .expect("a proven receiver has an entry port"),
+                    ),
+                })
+            } else {
+                let (point, event) = observation_point(write)?;
+                Some(WriteObservation::Event {
+                    point: write
+                        .procedure
+                        .point_handle(point)
+                        .expect("write point is live"),
+                    event,
+                    carrier: ValueFlowCarrier::Value(
+                        write
+                            .procedure
+                            .value_handle(receiver)
+                            .expect("adapter receiver is live"),
+                    ),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
     // A write whose receiver reaches a root parameter takes its identity from
     // an actual argument supplied by some caller. A root whose survey failed
     // may have carried that caller, so such a write cannot be trusted as
@@ -170,10 +237,7 @@ pub(super) fn survey(
         {
             break;
         }
-        let plan = match TypeFlowPlan::build(
-            workspace,
-            adapter,
-            slots,
+        let plan = match TypeFlowDiscovery::new(
             root,
             &discovery,
             ClosureLimits {
@@ -181,9 +245,31 @@ pub(super) fn survey(
             },
             budget,
             cancellation,
-            &mut refinements,
-        ) {
-            Ok(plan) => plan,
+        )
+        .and_then(|discovered| {
+            if cancellation.is_cancelled() {
+                return Err(TypeFlowPlanError::Cancelled);
+            }
+            // Open effects cannot narrow again. Only pending writes can make
+            // this root's class seeds or solve contribute further evidence.
+            if discovered.excludes_procedures(writes.iter().zip(&effects).filter_map(
+                |(write, effect)| effect.evidence.reason.is_none().then_some(&write.procedure),
+            )) {
+                return Ok(None);
+            }
+            discovered
+                .into_plan(
+                    workspace,
+                    adapter,
+                    slots,
+                    budget,
+                    cancellation,
+                    &mut refinements,
+                )
+                .map(Some)
+        }) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => continue,
             Err(TypeFlowPlanError::Cancelled) => return Err(TypeFlowPlanError::Cancelled),
             // A failed discovery may have omitted a path to a surveyed write.
             // Record it and survey the remaining roots; the writes this root
@@ -236,25 +322,13 @@ pub(super) fn survey(
         }
         // The evidence index is built for exactly the points this survey asks
         // about, so the observation each write resolves to is settled first.
-        let observations = writes
-            .iter()
-            .zip(&effects)
-            .map(|(write, effect)| {
-                (plan.value_flow().has_snapshot(&write.procedure)
-                    && effect.evidence.reason.is_none())
-                .then(|| observation_point(write))
-                .flatten()
-            })
-            .collect::<Vec<_>>();
         let mut queried = HashSet::default();
-        for (write, observation) in writes.iter().zip(&observations) {
-            if let Some((point, _)) = observation {
-                queried.insert(
-                    write
-                        .procedure
-                        .point_handle(*point)
-                        .expect("write point is live"),
-                );
+        for ((write, observation), effect) in writes.iter().zip(&observations).zip(&effects) {
+            if plan.value_flow().has_snapshot(&write.procedure)
+                && effect.evidence.reason.is_none()
+                && let Some(observation) = observation
+            {
+                queried.insert(observation.point().clone());
             }
         }
         let evidence = match DefinitionSources::new(&result, queried, budget, cancellation) {
@@ -271,29 +345,28 @@ pub(super) fn survey(
             {
                 continue;
             }
-            let (Some(receiver), Some((point, event))) = (write.receiver, observations[index])
-            else {
+            let Some(observation) = &observations[index] else {
                 effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);
                 continue;
             };
-            let carrier = ValueFlowCarrier::Value(
-                write
-                    .procedure
-                    .value_handle(receiver)
-                    .expect("adapter receiver is live"),
-            );
-            let point = write
-                .procedure
-                .point_handle(point)
-                .expect("write point is live");
-            let sources = match evidence.before(
-                plan.value_flow(),
-                &point,
-                event,
-                &carrier,
-                budget,
-                cancellation,
-            ) {
+            let observed = match observation {
+                WriteObservation::Event {
+                    point,
+                    event,
+                    carrier,
+                } => evidence.before(
+                    plan.value_flow(),
+                    point,
+                    *event,
+                    carrier,
+                    budget,
+                    cancellation,
+                ),
+                WriteObservation::ReceiverEntry { point, carrier } => {
+                    evidence.after(plan.value_flow(), point, carrier, budget, cancellation)
+                }
+            };
+            let sources = match observed {
                 Ok(Some(sources)) => sources,
                 Ok(None) => {
                     effect.evidence.reason = Some(UnknownReason::UnmodeledLoad);

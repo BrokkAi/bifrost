@@ -8,13 +8,13 @@
 //! source text is parsed or scanned here; reading a node's text at an
 //! AST-provided span is structured access.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSyntaxSource, PreparedSyntaxTree};
 use brokk_bifrost_python::bindings::{
     PythonDirectScopeBindingKind, PythonLexicalNameResolution, python_comprehension_binds_name_at,
     python_module_or_class_scope_binds_name_bounded, python_type_parameter_binds_name_at,
-    python_unambiguous_module_binding_bounded, python_unambiguous_module_class_binding_bounded,
+    python_unambiguous_module_binding_bounded,
 };
 use brokk_bifrost_python::declarations::{python_base_origin_node, python_first_parameter_name};
 use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
@@ -34,8 +34,9 @@ use crate::analyzer::semantic::type_flow::{
 };
 use crate::analyzer::semantic::{
     AdapterSemanticsVersion, AllocationSite, CandidateCoverage, GuardFact, GuardPredicate,
-    MemoryLocationKind, ProcedureHandle, ProcedureKind, SemanticCallSite, SemanticEffect,
-    SemanticValue, SemanticValueKind, SourceMappingKind, SourceSpan, ValueFlowKind, ValueId,
+    MemoryLocationKind, ProcedureHandle, ProcedureKind, ProgramPointId, SemanticCallSite,
+    SemanticEffect, SemanticValue, SemanticValueKind, SourceMappingKind, SourceSpan, ValueFlowKind,
+    ValueId,
 };
 use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
@@ -55,7 +56,7 @@ use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, CodeUnitIndex, Language, ProjectFile, QueryScope,
     TypeHierarchyProvider, WorkspaceAnalyzer, resolve_analyzer,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 
 /// The Python [`TypeFlowAdapter`]. Zero-sized: every method receives the
@@ -1191,6 +1192,73 @@ fn identifier_reads_an_enclosing_local(reference: Node<'_>, source: &str) -> boo
     false
 }
 
+type PythonModuleBindingAnswers = HashMap<Box<str>, Option<PythonDirectScopeBindingKind>>;
+
+/// Successful syntax-only answers retained for one active query. Exact source
+/// bytes determine these bindings; workspace/model identities do not. A stopped
+/// walk is never cached, and hits still check the current session for stopping.
+#[derive(Default)]
+struct PythonModuleBindingRequestMemo {
+    bindings: Mutex<HashMap<[u8; 32], PythonModuleBindingAnswers>>,
+}
+
+impl PythonModuleBindingRequestMemo {
+    fn binding(
+        &self,
+        prepared: &PreparedSyntaxTree,
+        name: &str,
+        session: &ResolutionSession,
+    ) -> Option<Option<PythonDirectScopeBindingKind>> {
+        if !session.scope_step() {
+            return None;
+        }
+        let source = prepared.source_sha256();
+        if let Some(binding) = self
+            .bindings
+            .lock()
+            .expect("module binding memo lock poisoned")
+            .get(&source)
+            .and_then(|bindings| bindings.get(name))
+            .copied()
+        {
+            return Some(binding);
+        }
+        let binding = python_unambiguous_module_binding_bounded(
+            prepared.tree().root_node(),
+            prepared.source(),
+            name,
+            || session.scope_step(),
+        )?;
+        self.bindings
+            .lock()
+            .expect("module binding memo lock poisoned")
+            .entry(source)
+            .or_default()
+            .insert(name.into(), binding);
+        Some(binding)
+    }
+}
+
+fn module_binding(
+    workspace: &WorkspaceAnalyzer,
+    prepared: &PreparedSyntaxTree,
+    name: &str,
+    session: &ResolutionSession,
+) -> Option<Option<PythonDirectScopeBindingKind>> {
+    if let Some(memo) =
+        python_analyzer(workspace).active_query_request_memo::<PythonModuleBindingRequestMemo>()
+    {
+        memo.binding(prepared, name, session)
+    } else {
+        python_unambiguous_module_binding_bounded(
+            prepared.tree().root_node(),
+            prepared.source(),
+            name,
+            || session.scope_step(),
+        )
+    }
+}
+
 /// The seed for a bare name that denotes a module-level declaration or import.
 ///
 /// A name that denotes a class evaluates to the class object itself, not to an
@@ -1230,12 +1298,7 @@ fn declaration_reference_seed(
         return ClassSeed::NotApplicable;
     };
     let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
-    let binding = match python_unambiguous_module_binding_bounded(
-        prepared.tree().root_node(),
-        source,
-        name,
-        || session.scope_step(),
-    ) {
+    let binding = match module_binding(workspace, prepared, name, &session) {
         None => return ClassSeed::Unknown(UnknownReason::SemanticBudget),
         Some(Some(
             binding @ (PythonDirectScopeBindingKind::ClassDeclaration
@@ -1466,6 +1529,23 @@ fn builtin_class_reference(
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PythonClassLookupKey {
+    file: ProjectFile,
+    source: [u8; 32],
+    span: SourceSpan,
+    language_content: crate::analyzer::semantic::StableDigest,
+    project_generation: u64,
+    semantic_overlay: Option<Box<str>>,
+}
+
+#[derive(Default)]
+struct PythonClassLookupRequestMemo {
+    answers: Mutex<HashMap<PythonClassLookupKey, (ClassSeed, Arc<crate::analyzer::ReadLedger>)>>,
+    #[cfg(test)]
+    lookups: std::sync::atomic::AtomicUsize,
+}
+
 /// Resolve the expression at `span` in `file` and interpret it as a class seed.
 fn resolve_class_at_span(
     workspace: &WorkspaceAnalyzer,
@@ -1480,6 +1560,60 @@ fn resolve_class_at_span(
     {
         return ClassSeed::Unknown(UnknownReason::UncertainFlow);
     }
+    let python = python_analyzer(workspace);
+    if python
+        .inner
+        .active_query_cancellation()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return ClassSeed::Unknown(UnknownReason::SemanticBudget);
+    }
+    let Some(memo) = python.active_query_request_memo::<PythonClassLookupRequestMemo>() else {
+        return resolve_indexed_class_at_span(workspace, file, span, prepared);
+    };
+    let key = PythonClassLookupKey {
+        file: file.clone(),
+        source: prepared.source_sha256(),
+        span,
+        language_content: python.inner.language_content_identity(),
+        project_generation: workspace.analyzer().project().analysis_generation(),
+        semantic_overlay: overlay_of(workspace)
+            .map(|overlay| Box::from(overlay.active_model_set_hash())),
+    };
+    let cached = memo
+        .answers
+        .lock()
+        .expect("class lookup memo lock poisoned")
+        .get(&key)
+        .cloned();
+    if let Some((answer, reads)) = cached {
+        crate::analyzer::replay_query_reads(workspace.analyzer(), &reads);
+        return answer;
+    }
+    #[cfg(test)]
+    memo.lookups
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (answer, reads) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+        resolve_indexed_class_at_span(workspace, file, span, prepared)
+    });
+    // A stopped lookup is not a completed answer. Later work must retain the
+    // opportunity to resolve it, rather than inherit a prior exhausted walk.
+    if answer != ClassSeed::Unknown(UnknownReason::SemanticBudget) {
+        memo.answers
+            .lock()
+            .expect("class lookup memo lock poisoned")
+            .insert(key, (answer.clone(), reads));
+    }
+    answer
+}
+
+fn resolve_indexed_class_at_span(
+    workspace: &WorkspaceAnalyzer,
+    file: ProjectFile,
+    span: SourceSpan,
+    prepared: &PreparedSyntaxTree,
+) -> ClassSeed {
+    let indexed_source = prepared.source();
     if let Some(reference) = node_at_span(prepared, span)
         && let Some(seed) = builtin_class_reference(
             overlay_of(workspace).as_deref(),
@@ -1883,7 +2017,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // remainder.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-v38",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-list-loads-v44",
         )
         .expect("adapter name is non-empty")
     }
@@ -1943,6 +2077,12 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         value: &SemanticValue,
     ) -> ClassSeed {
+        if matches!(value.kind, SemanticValueKind::UnsignedInteger(_)) {
+            // Implicit initializer indices carry their magnitude in IR; their
+            // source anchor names the element, not an integer source token.
+            let mut cache = ExternalClassCache::default();
+            return external_seed(overlay_of(workspace).as_deref(), "builtins.int", &mut cache);
+        }
         let mapping = procedure
             .semantics()
             .source_mapping(value.source)
@@ -1992,12 +2132,8 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 let Ok(name) = function.utf8_text(prepared.source().as_bytes()) else {
                     return ClassSeed::Unknown(UnknownReason::UncertainFlow);
                 };
-                if python_unambiguous_module_class_binding_bounded(
-                    prepared.tree().root_node(),
-                    prepared.source(),
-                    name,
-                    || session.scope_step(),
-                ) != Some(true)
+                if module_binding(workspace, &prepared, name, &session)
+                    != Some(Some(PythonDirectScopeBindingKind::ClassDeclaration))
                 {
                     return ClassSeed::Unknown(UnknownReason::UncertainFlow);
                 }
@@ -2174,9 +2310,14 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         if shared_with_call {
             return ClassSeed::NotApplicable;
         }
+        // The entry point can belong to a surrounding expression (for example
+        // parentheses). The allocated result retains the literal's own span.
+        let result = semantics
+            .value(allocation.result)
+            .expect("an allocation has a live result");
         let mapping = semantics
-            .source_mapping(allocation.source)
-            .expect("an allocation retains a source mapping");
+            .source_mapping(result.source)
+            .expect("an allocation result retains a source mapping");
         let Some(file) = file_for_locator(workspace, &mapping.locator) else {
             return ClassSeed::NotApplicable;
         };
@@ -2191,12 +2332,90 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
             "list" | "list_comprehension" => "builtins.list",
             "dictionary" | "dictionary_comprehension" => "builtins.dict",
             "set" | "set_comprehension" => "builtins.set",
-            "tuple" => "builtins.tuple",
+            "tuple" | "expression_list" => "builtins.tuple",
             "generator_expression" => "typing.Generator",
             _ => return ClassSeed::NotApplicable,
         };
         let mut cache = ExternalClassCache::default();
         external_seed(overlay_of(workspace).as_deref(), name, &mut cache)
+    }
+
+    fn member_surface_is_closed(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        class: &ClassIdentity,
+    ) -> bool {
+        matches!(class, ClassIdentity::External { .. }) && is_builtin_value_class(class)
+    }
+
+    fn receiver_binding_is_stable(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+    ) -> bool {
+        if !procedure
+            .semantics()
+            .values()
+            .iter()
+            .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
+        {
+            return false;
+        }
+        let Some(file) = file_for_locator(workspace, procedure.semantics().locator()) else {
+            return false;
+        };
+        let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+            return false;
+        };
+        let Some(callable) =
+            node_at_span(&prepared, procedure.semantics().locator().anchor().span())
+        else {
+            return false;
+        };
+        if callable.has_error() {
+            return false;
+        }
+        let Some(name) = python_first_parameter_name(callable, prepared.source()) else {
+            return false;
+        };
+        let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+        let Some(inventory) =
+            python_lexical_scope_inventory_bounded(callable, prepared.source(), || {
+                session.scope_step()
+            })
+        else {
+            return false;
+        };
+        // This inventory includes assignments in unsupported comprehensions,
+        // including walrus targets that bind in the enclosing callable.
+        if inventory
+            .local_bindings()
+            .any(|(binding, _)| binding == name)
+        {
+            return false;
+        }
+        // A nested callable can change the binding through nonlocal even
+        // though the outer procedure has no assignment event of its own.
+        let mut pending = vec![callable];
+        while let Some(node) = pending.pop() {
+            if !session.scope_step() {
+                return false;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if node.kind() == "nonlocal_statement"
+                    && child.kind() == "identifier"
+                    && child.utf8_text(prepared.source().as_bytes()).ok() == Some(name.as_str())
+                {
+                    return false;
+                }
+                if !session.scope_step() {
+                    return false;
+                }
+                pending.push(child);
+            }
+        }
+        true
     }
 
     fn declared_parameter_class(
@@ -2305,6 +2524,90 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         } else {
             ClassSeed::ClassWithOpenBound(class)
         }
+    }
+
+    fn closed_memory_loads(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        procedure: &ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Vec<(ProgramPointId, ValueId)>, crate::analyzer::semantic::SemanticBudgetExceeded>
+    {
+        if !procedure
+            .semantics()
+            .memory_locations()
+            .iter()
+            .any(|location| matches!(location.kind, MemoryLocationKind::Index { .. }))
+        {
+            return Ok(Vec::new());
+        }
+        let Some(file) = file_for_locator(workspace, procedure.semantics().locator()) else {
+            return Ok(Vec::new());
+        };
+        let Ok(prepared) = prepared_for_procedure(workspace, procedure, &file) else {
+            return Ok(Vec::new());
+        };
+        let Some(callable) =
+            node_at_span(&prepared, procedure.semantics().locator().anchor().span())
+        else {
+            return Ok(Vec::new());
+        };
+        if callable.has_error() {
+            return Ok(Vec::new());
+        }
+        let session = ResolutionSession::bounded(INTERACTIVE_TYPE_LOOKUP_BUDGET, None);
+        let mut exceeded = None;
+        let spans = super::semantic::closed_list_load_spans(callable, prepared.source(), || {
+            if request.cancellation.is_cancelled() || !session.scope_step() {
+                return false;
+            }
+            match request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: 1,
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                }) {
+                Ok(()) => true,
+                Err(error) => {
+                    exceeded = Some(error);
+                    false
+                }
+            }
+        });
+        if let Some(error) = exceeded {
+            return Err(error);
+        }
+        let Some(spans) = spans else {
+            return Ok(Vec::new());
+        };
+        Ok(procedure
+            .semantics()
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter().map(move |event| (point.id, event)))
+            .filter_map(|(point, event)| {
+                let SemanticEffect::MemoryLoad {
+                    result, location, ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                let location = procedure
+                    .semantics()
+                    .memory_location(location)
+                    .expect("a load location is live");
+                if !matches!(location.kind, MemoryLocationKind::Index { .. }) {
+                    return None;
+                }
+                let mapping = procedure
+                    .semantics()
+                    .source_mapping(event.source)
+                    .expect("a load source is live");
+                (mapping.kind == SourceMappingKind::Exact
+                    && spans.contains(&mapping.locator.anchor().span()))
+                .then_some((point, result))
+            })
+            .collect())
     }
 
     fn accessed_member(
@@ -3233,6 +3536,121 @@ mod tests {
     use crate::inline_project::InlineTestProject;
 
     #[test]
+    fn class_lookup_reuses_answer_and_dependency_reads_within_request() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("models.py", "class Widget:\n    pass\n")
+            .file("app.py", "import models\nresult = models.Widget()\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("app.py");
+        let python = super::python_analyzer(&workspace);
+        let prepared = super::current_indexed_prepared(python, &file).unwrap();
+        let assignment = prepared
+            .tree()
+            .root_node()
+            .named_child(1)
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        let callee = assignment
+            .child_by_field_name("right")
+            .unwrap()
+            .child_by_field_name("function")
+            .unwrap();
+        let span = super::span_for_node(callee);
+        let cancellation = CancellationToken::default();
+        let _scope = crate::analyzer::AnalyzerQueryScope::with_cancellation(
+            workspace.analyzer(),
+            &cancellation,
+        );
+        let memo = python
+            .active_query_request_memo::<super::PythonClassLookupRequestMemo>()
+            .unwrap();
+        let resolve = || {
+            crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+                super::resolve_class_at_span(&workspace, file.clone(), span, &prepared)
+            })
+        };
+        let (cold, cold_reads) = resolve();
+        assert!(
+            matches!(&cold, ClassSeed::Class(class) if class.qualified_name() == "models.Widget")
+        );
+        assert!(
+            !cold_reads.is_empty(),
+            "resolved declaration must retain dependencies"
+        );
+        for _ in 0..8 {
+            let (warm, warm_reads) = resolve();
+            assert_eq!(warm, cold);
+            assert_eq!(warm_reads.keys(), cold_reads.keys());
+            assert_eq!(
+                warm_reads.unattributed_reads(),
+                cold_reads.unattributed_reads()
+            );
+        }
+        assert_eq!(memo.lookups.load(std::sync::atomic::Ordering::Relaxed), 1);
+        cancellation.cancel();
+        assert_eq!(
+            super::resolve_class_at_span(&workspace, file.clone(), span, &prepared),
+            ClassSeed::Unknown(UnknownReason::SemanticBudget)
+        );
+        drop(_scope);
+        let fresh = super::resolve_class_at_span(&workspace, file, span, &prepared);
+        assert_eq!(fresh, cold, "a fresh uncached query is the answer oracle");
+    }
+
+    #[test]
+    fn module_binding_reuse_preserves_budget_failure_and_exact_source_identity() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "class Target:\n    pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("app.py");
+        let prepared = super::current_indexed_prepared(super::python_analyzer(&workspace), &file)
+            .expect("indexed class snapshot");
+        let memo = super::PythonModuleBindingRequestMemo::default();
+        let session = |steps| {
+            let mut limits = super::INTERACTIVE_TYPE_LOOKUP_BUDGET;
+            limits.max_scope_nodes = steps;
+            super::ResolutionSession::bounded(limits, None)
+        };
+        assert_eq!(memo.binding(&prepared, "Target", &session(1)), None);
+        let class = Some(Some(super::PythonDirectScopeBindingKind::ClassDeclaration));
+        assert_eq!(memo.binding(&prepared, "Target", &session(200_000)), class);
+        assert_eq!(
+            memo.binding(&prepared, "Target", &session(1)),
+            class,
+            "a successful prior lookup must avoid repeating its syntax walk"
+        );
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let cancelled = super::ResolutionSession::bounded(
+            super::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            Some(&cancellation),
+        );
+        assert_eq!(memo.binding(&prepared, "Target", &cancelled), None);
+        assert_eq!(
+            memo.binding(&prepared, "absent", &session(200_000)),
+            Some(None)
+        );
+        assert_eq!(memo.binding(&prepared, "absent", &session(1)), Some(None));
+
+        std::fs::write(file.abs_path(), "def Target():\n    pass\n").expect("replace fixture");
+        let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let changed =
+            super::current_indexed_prepared(super::python_analyzer(&changed_workspace), &file)
+                .expect("indexed changed snapshot");
+        assert_eq!(memo.binding(&changed, "Target", &session(1)), None);
+        assert_eq!(
+            memo.binding(&changed, "Target", &session(200_000)),
+            Some(Some(
+                super::PythonDirectScopeBindingKind::FunctionDeclaration
+            ))
+        );
+        assert_eq!(memo.binding(&prepared, "Target", &session(1)), class);
+    }
+
+    #[test]
     fn prepared_syntax_validator_accepts_exact_content_and_rejects_changed_content() {
         let project = InlineTestProject::with_language(Language::Python)
             .file("app.py", "def target():\n    return 1\n")
@@ -3256,16 +3674,98 @@ mod tests {
             .and_then(|procedure| artifact.procedure_handle(procedure.id()))
             .expect("fixture has one procedure");
 
-        assert!(prepared_for_procedure(&workspace, &procedure, &file).is_ok());
+        let prepared = prepared_for_procedure(&workspace, &procedure, &file)
+            .expect("unchanged syntax validates");
+        let expected =
+            crate::analyzer::semantic::ContentIdentity::hash_bytes(prepared.source().as_bytes());
+        for _ in 0..100 {
+            assert_eq!(&prepared.source_sha256(), expected.as_bytes());
+            assert!(prepared_for_procedure(&workspace, &procedure, &file).is_ok());
+        }
 
         std::fs::write(file.abs_path(), "def target():\n    return 2\n")
             .expect("change fixture content");
         let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let changed =
+            super::current_indexed_prepared(super::python_analyzer(&changed_workspace), &file)
+                .expect("changed snapshot is indexed");
+        assert_ne!(prepared.source_sha256(), changed.source_sha256());
+        assert_eq!(
+            &changed.source_sha256(),
+            crate::analyzer::semantic::ContentIdentity::hash_bytes(changed.source().as_bytes())
+                .as_bytes(),
+        );
         assert_eq!(
             prepared_for_procedure(&changed_workspace, &procedure, &file)
                 .expect_err("changed content cannot validate an old artifact"),
             UnknownReason::UncertainFlow
         );
+    }
+
+    #[test]
+    fn receiver_stability_accounts_for_comprehension_binding_scope() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "class Holder:\n    def stable(this):\n        data = [this for this in ()]\n        return this\n    def rebound(this):\n        data = [(this := x) for x in (1,)]\n        return this\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("method semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("method semantics are available");
+        for (name, expected) in [("stable", true), ("rebound", false)] {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("fixture declares the method");
+            assert_eq!(
+                PythonTypeFlowAdapter.receiver_binding_is_stable(&workspace, &procedure),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_member_closure_does_not_close_a_workspace_subclass() {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", "class Text(str):\n    pass\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer())
+            .expect("workspace has the Python analyzer");
+        let text = python
+            .top_level_declarations(&project.file("app.py"))
+            .into_iter()
+            .find(|unit| unit.is_class())
+            .expect("Text is declared");
+        assert!(
+            !PythonTypeFlowAdapter
+                .member_surface_is_closed(&workspace, &ClassIdentity::Workspace(text))
+        );
+        assert!(PythonTypeFlowAdapter.member_surface_is_closed(
+            &workspace,
+            &ClassIdentity::External {
+                qualified_name: "builtins.str".into(),
+                symbol_id: "type.builtins-str".into(),
+            }
+        ));
     }
 
     #[test]

@@ -16681,7 +16681,7 @@ fn field_slot_profile_reopens_persisted_index_without_rebuild_or_republication()
 fn finding_free_root_result_persistence_reopens_before_discovery_and_serves_both_projections() {
     let project = InlineTestProject::with_language(Language::Python)
         .with_git()
-        .file("app.py", "def normalize():\n    return ''.strip()\n")
+        .file("app.py", "class Missing:\n    pass\ndef normalize(items):\n    ''.strip()\n    item = items[0]\n    if isinstance(item, Missing):\n        return item.absent\n")
         .build();
     let branch = json!({
         "languages": ["python"],
@@ -16775,6 +16775,35 @@ fn finding_free_root_result_persistence_reopens_before_discovery_and_serves_both
         )),
         "the cold solve must publish a nonempty known external projection: {cold:#?}"
     );
+    assert!(
+        cold.result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::ClassSetRow { value }
+                if value.class.as_deref() == Some("app.Missing")
+                    && value.guard_only == Some(true)
+        )),
+        "guard-only evidence survives the projection: {cold:#?}"
+    );
+    assert!(
+        cold.result
+            .render_text()
+            .contains("membership from guard only")
+    );
+    let guarded = cold
+        .result
+        .results
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.value, CodeQueryResultValue::ClassSetRow { value }
+                    if value.class.as_deref() == Some("app.Missing")
+            )
+        })
+        .expect("guarded class row");
+    assert!(matches!(
+        guarded.value.row().field("guard_only"),
+        Ok(Some(CodeQueryRowScalarRef::Boolean(true)))
+    ));
     assert_eq!(
         serde_json::to_value(&cold.result.results).expect("cold rows serialize"),
         serde_json::to_value(&warm.result.results).expect("warm rows serialize"),
