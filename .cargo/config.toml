@@ -3,3 +3,5 @@
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
 BIFROST_PARALLELISM = { value = "1", force = false }
 RAYON_NUM_THREADS = { value = "1", force = false }
+# Fixture tests and their subprocesses do not need the bulk-import writer cache.
+BIFROST_SQLITE_WRITER_CACHE_KIB = { value = "8192", force = false }

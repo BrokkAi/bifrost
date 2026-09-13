@@ -447,69 +447,7 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
                 reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
             };
         };
-        let mut targets = Vec::new();
-        let mut open = false;
-        for point in semantics.points() {
-            for event in &point.events {
-                let callable = match &event.effect {
-                    SemanticEffect::CallableCreation { result, callable }
-                    | SemanticEffect::CallableReference { result, callable }
-                        if *result == value =>
-                    {
-                        callable
-                    }
-                    SemanticEffect::ValueFlow {
-                        source,
-                        target,
-                        kind: crate::analyzer::semantic::ValueFlowKind::Local,
-                    } if *target == value => {
-                        for source_point in semantics.points() {
-                            for source_event in &source_point.events {
-                                let source_callable = match &source_event.effect {
-                                    SemanticEffect::CallableCreation { result, callable }
-                                    | SemanticEffect::CallableReference { result, callable }
-                                        if result == source =>
-                                    {
-                                        callable
-                                    }
-                                    _ => continue,
-                                };
-                                collect_local_callable_targets(
-                                    call.procedure(),
-                                    &source_callable.targets,
-                                    &mut targets,
-                                    &mut open,
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                    _ => continue,
-                };
-                collect_local_callable_targets(
-                    call.procedure(),
-                    &callable.targets,
-                    &mut targets,
-                    &mut open,
-                );
-            }
-        }
-        // Sorted by the mount-free procedure wire id, which is the identity
-        // the conflict rows publish: a total order that is the same at every
-        // workspace root, so the dedup below removes the same duplicates and
-        // the callee list arrives in the same order in a base export as in the
-        // head. Cached because the key is a digest over the procedure's
-        // locator, not a field read.
-        targets.sort_by_cached_key(super::semantic::procedure_wire_id);
-        targets.dedup();
-        if !open && !targets.is_empty() {
-            ConcurrencyAnswer::Proven(targets)
-        } else {
-            ConcurrencyAnswer::Open {
-                partial: targets,
-                reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
-            }
-        }
+        brokk_bifrost_flow::concurrency::source_callable_targets(call.procedure(), value)
     }
 
     fn declaration_has_concurrency_model(
@@ -1607,39 +1545,6 @@ impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
             ObservationPhase::AfterEffects,
             request,
         )
-    }
-}
-
-fn collect_local_callable_targets(
-    procedure: &ProcedureHandle,
-    resolution: &CallableTargetResolution,
-    targets: &mut Vec<ProcedureHandle>,
-    open: &mut bool,
-) {
-    match resolution {
-        CallableTargetResolution::Proven(CallableTarget::Local(target)) => targets.push(
-            procedure
-                .artifact()
-                .procedure_handle(*target)
-                .expect("validated local callable target exists"),
-        ),
-        CallableTargetResolution::Proven(_) => *open = true,
-        CallableTargetResolution::Ambiguous(candidates)
-        | CallableTargetResolution::Unproven(candidates)
-        | CallableTargetResolution::ExceededBudget(candidates) => {
-            *open = true;
-            for target in candidates {
-                if let CallableTarget::Local(target) = target {
-                    targets.push(
-                        procedure
-                            .artifact()
-                            .procedure_handle(*target)
-                            .expect("validated local callable target exists"),
-                    );
-                }
-            }
-        }
-        CallableTargetResolution::Unknown | CallableTargetResolution::Unsupported => *open = true,
     }
 }
 
@@ -5219,6 +5124,141 @@ func mutualShiftRoot() {
     }
 
     #[test]
+    fn dependency_edit_invalidates_retained_concurrency_without_caller_edit() {
+        use crate::analyzer::semantic::SemanticBudget;
+        use brokk_bifrost_flow::typestate::{
+            ProductionSemanticSummaryAcquisitionKind, acquire_production_semantic_summaries,
+            project_production_semantic_summaries,
+        };
+        let project = InlineTestProject::with_language(Language::Go)
+            .file(
+                "main.go",
+                "package main\nfunc root() { c := &cell{}; go write(c); c.n = 2 }\n",
+            )
+            .file(
+                "helper.go",
+                "package main\ntype cell struct { n int }\nfunc write(c *cell) {}\n",
+            )
+            .build();
+        let config = || AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        };
+        let workspace = project.workspace_analyzer(config());
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let root = |workspace: &WorkspaceAnalyzer| {
+            let mut budget = SemanticBudget::default();
+            let artifact = workspace
+                .materialize_program_semantics(
+                    &project.file("main.go"),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap()
+                .available_value()
+                .unwrap()
+                .clone();
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("root")
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap()
+        };
+        let project_for = |workspace: &WorkspaceAnalyzer, root: &ProcedureHandle| {
+            let mut budget = SemanticBudget::default();
+            project_production_semantic_summaries(
+                std::slice::from_ref(root),
+                &workspace.icfg_provider(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+        };
+        let report = |workspace: &WorkspaceAnalyzer, root: &ProcedureHandle, summaries| {
+            let provider = WorkspaceConcurrencyProvider::new(workspace, None, Some(summaries));
+            let mut budget = SemanticBudget::default();
+            brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+                &provider,
+                root,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+        };
+        let original_root = root(&workspace);
+        let original = project_for(&workspace, &original_root);
+        let original_report = report(&workspace, &original_root, original.clone());
+        assert!(
+            original_report.conflicts.is_empty(),
+            "original callee has no shared access: {original_report:#?}"
+        );
+        let repository = brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new();
+        repository
+            .publish_components(original.summaries(), original.components())
+            .unwrap();
+        let helper = project.file("helper.go");
+        helper
+            .write("package main\ntype cell struct { n int }\nfunc write(c *cell) { c.n = 1 }\n")
+            .unwrap();
+        let updated_workspace = workspace.update(&std::collections::BTreeSet::from([helper]));
+        let updated_root = root(&updated_workspace);
+        let mut budget = SemanticBudget::default();
+        let reads = CountingSummaryReads::default();
+        let updated = acquire_production_semantic_summaries(
+            std::slice::from_ref(&updated_root),
+            &updated_workspace.icfg_provider(),
+            &repository,
+            &reads,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.kind(),
+            ProductionSemanticSummaryAcquisitionKind::Projected
+        );
+        assert_eq!(
+            reads.0.get(),
+            0,
+            "changed callee rejects the retained caller closure"
+        );
+        let updated = updated.into_summaries();
+        let fresh_workspace = project.workspace_analyzer(config());
+        let fresh_root = root(&fresh_workspace);
+        let fresh = project_for(&fresh_workspace, &fresh_root);
+        assert_eq!(
+            updated
+                .summaries()
+                .iter()
+                .map(|summary| (summary.key(), summary))
+                .collect::<std::collections::HashMap<_, _>>(),
+            fresh
+                .summaries()
+                .iter()
+                .map(|summary| (summary.key(), summary))
+                .collect::<std::collections::HashMap<_, _>>()
+        );
+        let updated_report = report(&updated_workspace, &updated_root, updated);
+        let fresh_report = report(&fresh_workspace, &fresh_root, fresh);
+        assert_eq!(stable_report(&updated_report), stable_report(&fresh_report));
+        assert!(
+            updated_report
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.proven
+                    && conflict.exhaustive
+                    && conflict.ordering
+                        == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered),
+            "edited callee's concurrent write must be visible: {updated_report:#?}"
+        );
+    }
+
+    #[test]
     fn unpublished_summary_invalidates_when_the_allocation_becomes_published() {
         const PRIVATE_SOURCE: &str = r#"package main
 
@@ -5257,6 +5297,10 @@ func root(c *cell) {
 
         let project = InlineTestProject::with_language(Language::Go)
             .file("main.go", PRIVATE_SOURCE)
+            .file(
+                "unrelated/unused.go",
+                "package unrelated\nfunc unused() int { return 1 }\n",
+            )
             .build();
         let file = project.file("main.go");
         let workspace = project.workspace_analyzer(AnalyzerConfig {
@@ -5440,6 +5484,120 @@ func root(c *cell) {
                     .iter()
                     .all(|conflict| !conflict.proven),
             "publishing the recursive allocation rejects the private fixed point without fabricating a conflict: {updated_report:#?}"
+        );
+        file.write(PRIVATE_SOURCE)
+            .expect("restore the private allocation source");
+        let restored_workspace =
+            updated_workspace.update(&std::collections::BTreeSet::from([file.clone()]));
+        let restored_artifact = materialize(&restored_workspace);
+        let restored_root = procedure(&restored_artifact, "root");
+        let restored_provider = restored_workspace.icfg_provider();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let restored_reads = CountingSummaryReads::default();
+        let restored = brokk_bifrost_flow::typestate::acquire_production_semantic_summaries(
+            std::slice::from_ref(&restored_root),
+            &restored_provider,
+            &repository,
+            &restored_reads,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("restored private closure acquires");
+        assert_eq!(
+            restored.kind(),
+            brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained,
+            "restoring exact source can reuse the original private closure"
+        );
+        assert!(
+            restored_reads.0.get() > 0,
+            "restoration must observe retained reads"
+        );
+        let restored_summaries = restored.into_summaries();
+        let restored_fresh_workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let restored_fresh_artifact = materialize(&restored_fresh_workspace);
+        let restored_fresh_root = procedure(&restored_fresh_artifact, "root");
+        let restored_fresh_summaries =
+            project_summaries(&restored_fresh_workspace, &restored_fresh_root);
+        assert_eq!(
+            restored_summaries
+                .summaries()
+                .iter()
+                .map(|summary| (summary.key(), summary))
+                .collect::<std::collections::HashMap<_, _>>(),
+            restored_fresh_summaries
+                .summaries()
+                .iter()
+                .map(|summary| (summary.key(), summary))
+                .collect::<std::collections::HashMap<_, _>>(),
+            "restored retained summaries must match a fresh workspace"
+        );
+        let restored_report = report(&restored_workspace, &restored_root, restored_summaries);
+        let restored_fresh_report = report(
+            &restored_fresh_workspace,
+            &restored_fresh_root,
+            restored_fresh_summaries,
+        );
+        assert_eq!(
+            stable_report(&restored_report),
+            stable_report(&restored_fresh_report)
+        );
+        assert_eq!(
+            stable_report(&restored_report),
+            stable_report(&private_report),
+            "the edit round trip must not retain stale publication facts"
+        );
+        let unrelated_file = project.file("unrelated/unused.go");
+        unrelated_file
+            .write("package unrelated\nfunc unused() int { return 2 }\n")
+            .expect("edit a file outside the summary closure");
+        let unrelated_workspace =
+            restored_workspace.update(&std::collections::BTreeSet::from([unrelated_file]));
+        let unrelated_artifact = materialize(&unrelated_workspace);
+        let unrelated_root = procedure(&unrelated_artifact, "root");
+        let unrelated_provider = unrelated_workspace.icfg_provider();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let unrelated_reads = CountingSummaryReads::default();
+        let unrelated = brokk_bifrost_flow::typestate::acquire_production_semantic_summaries(
+            std::slice::from_ref(&unrelated_root),
+            &unrelated_provider,
+            &repository,
+            &unrelated_reads,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("unrelated edit preserves available summaries");
+        assert_eq!(
+            unrelated.kind(),
+            brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Projected,
+            "a changed workspace dispatch identity must invalidate the non-leaf closure"
+        );
+        assert_eq!(unrelated_reads.0.get(), 0);
+        let leaf = procedure(&unrelated_artifact, "unknownWrite");
+        let leaf_reads = CountingSummaryReads::default();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let retained_leaf = brokk_bifrost_flow::typestate::acquire_production_semantic_summaries(
+            std::slice::from_ref(&leaf),
+            &unrelated_provider,
+            &repository,
+            &leaf_reads,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("provider-independent leaf survives unrelated edit");
+        assert_eq!(
+            retained_leaf.kind(),
+            brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained
+        );
+        assert!(leaf_reads.0.get() > 0);
+        let unrelated_report = report(
+            &unrelated_workspace,
+            &unrelated_root,
+            unrelated.into_summaries(),
+        );
+        assert_eq!(
+            stable_report(&unrelated_report),
+            stable_report(&private_report),
+            "an unrelated edit cannot change the concurrency result"
         );
     }
 

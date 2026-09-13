@@ -13392,6 +13392,44 @@ func errgroupJoined() int {
     return value
 }
 
+func summarizedErrgroupJoined() int { return summarizedErrgroupBody() }
+func summarizedErrgroupBody() int {
+    group := &errgroup.Group{}
+    value := 0
+    group.Go(func() error { value = 1; return nil })
+    _ = group.Wait()
+    return value
+}
+
+func summarizedErrgroupDistinct() int { return summarizedErrgroupDistinctBody() }
+func summarizedErrgroupDistinctBody() int {
+    group := &errgroup.Group{}
+    other := &errgroup.Group{}
+    value := 0
+    group.Go(func() error { value = 1; return nil })
+    _ = other.Wait()
+    return value
+}
+
+func summarizedErrgroupCopied() int { return summarizedErrgroupCopiedBody() }
+func summarizedErrgroupCopiedBody() int {
+    group := errgroup.Group{}
+    other := group
+    value := 0
+    group.Go(func() error { value = 1; return nil })
+    _ = other.Wait()
+    return value
+}
+
+func summarizedErrgroupUnknown(callback func() error) {
+    summarizedErrgroupUnknownBody(callback)
+}
+func summarizedErrgroupUnknownBody(callback func() error) {
+    group := &errgroup.Group{}
+    group.Go(callback)
+    _ = group.Wait()
+}
+
 type modeledCell struct { value int }
 
 func setWrapped(mutex *sync.RWMutex, cell *modeledCell) {
@@ -13658,6 +13696,20 @@ func wrappedValueCopy() {
     let copied = procedure("wrappedValueCopy");
     let set_wrapped = procedure("setWrapped");
     let set_copied = procedure("setCopied");
+    let joined = procedure("summarizedErrgroupJoined");
+    let joined_body = procedure("summarizedErrgroupBody");
+    let distinct = procedure("summarizedErrgroupDistinct");
+    let unknown = procedure("summarizedErrgroupUnknown");
+    let unknown_body = procedure("summarizedErrgroupUnknownBody");
+    let copied_group = procedure("summarizedErrgroupCopied");
+    let roots = [
+        wrapped.clone(),
+        copied.clone(),
+        joined.clone(),
+        distinct.clone(),
+        unknown.clone(),
+        copied_group.clone(),
+    ];
     let icfg =
         crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
             &workspace,
@@ -13665,18 +13717,35 @@ func wrappedValueCopy() {
         );
     let projection_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
         &workspace,
-        Some(snapshot),
+        Some(snapshot.clone()),
         None,
     );
     let mut budget = SemanticBudget::default();
     let summaries =
         brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
-            &[wrapped.clone(), copied.clone()],
+            &roots,
             &icfg,
             &projection_provider,
             &mut SemanticRequest::new(&mut budget, &cancellation),
         )
         .expect("modeled wrapper summaries project");
+    let unknown_summary = summaries
+        .summary_for(&unknown_body)
+        .expect("unknown callback summary");
+    assert!(!unknown_summary.effects().iter().any(|effect| matches!(effect.key(),
+        brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+            if matches!(effect.kind(), brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn { .. })
+    )), "an unavailable callback must not acquire an exhaustive task inventory: {unknown_summary:#?}");
+    let joined_summary = summaries
+        .summary_for(&joined_body)
+        .expect("joined helper summary");
+    assert_eq!(joined_summary.effects().iter().filter(|effect| matches!(
+        effect.key(),
+        brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+            if matches!(effect.kind(),
+                brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskSpawn { .. }
+                | brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::TaskJoin { .. })
+    )).count(), 2, "the exact Go/Wait pair must retain task and join effects: {joined_summary:#?}");
     for helper in [&set_wrapped, &set_copied] {
         let summary = summaries
             .summary_for(helper)
@@ -13720,12 +13789,212 @@ func wrappedValueCopy() {
         );
     }
 
+    let mut budget = SemanticBudget::default();
+    let direct_joined = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projection_provider,
+        &joined,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("direct errgroup report computes");
+    assert!(
+        direct_joined.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+        }),
+        "the direct Go/Wait pair must order the captured write before the parent read: {direct_joined:#?}"
+    );
+
+    let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        Some(snapshot),
+        Some(summaries.clone()),
+    );
+    let mut budget = SemanticBudget::default();
+    let projected_joined = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projected_provider,
+        &joined,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("fresh projected task report computes");
+    assert_eq!(
+        projected_joined, direct_joined,
+        "fresh task summaries preserve the direct report"
+    );
+    let repository = brokk_bifrost_flow::dataflow::ProductionSemanticSummaryRepository::new();
+    repository
+        .publish_components(summaries.summaries(), summaries.components())
+        .expect("task summaries publish");
+    let mut budget = SemanticBudget::default();
+    let acquisition =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            &roots,
+            &icfg,
+            &projection_provider,
+            &repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("task summaries reacquire");
+    assert_eq!(
+        acquisition.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained
+    );
+    let summaries = acquisition.into_summaries();
+
     // The consumer deliberately has no active semantic models. Its only lock
     // inventory is the stable, source-witnessed summary projected above.
     let retained_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
         &workspace,
         None,
         Some(summaries),
+    );
+    let no_models =
+        super::super::concurrency::WorkspaceConcurrencyProvider::new(&workspace, None, None);
+    let no_models_icfg =
+        crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            &workspace, None,
+        );
+    let mut budget = SemanticBudget::default();
+    let changed_models =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&joined),
+            &no_models_icfg,
+            &no_models,
+            &repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("model removal recomputes the closure");
+    assert_eq!(
+        changed_models.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Projected,
+        "removing the errgroup model must reject the old modeled closure"
+    );
+    let changed_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+        &workspace,
+        None,
+        Some(changed_models.into_summaries()),
+    );
+    let mut budget = SemanticBudget::default();
+    let changed_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &changed_provider,
+        &joined,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("model removal reports missing behavior");
+    assert!(
+        changed_report
+            .reasons
+            .contains(&brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget),
+        "removed models cannot leave a complete-looking retained report: {changed_report:#?}"
+    );
+    let mut budget = SemanticBudget::default();
+    let no_models_direct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &no_models,
+        &joined,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("direct analysis without models computes");
+    assert_eq!(
+        changed_report, no_models_direct,
+        "model-removal recomputation must equal direct analysis in that model environment"
+    );
+    let mut budget = SemanticBudget::default();
+    let restored_models =
+        brokk_bifrost_flow::typestate::acquire_production_semantic_summaries_with_concurrency(
+            std::slice::from_ref(&joined),
+            &icfg,
+            &projection_provider,
+            &repository,
+            &brokk_bifrost_flow::dataflow::NoSummaryReadObserver,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("original model selection reacquires");
+    assert_eq!(
+        restored_models.kind(),
+        brokk_bifrost_flow::typestate::ProductionSemanticSummaryAcquisitionKind::Retained,
+        "restoring exact model behavior can reuse the original closure"
+    );
+    let mut budget = SemanticBudget::default();
+    let replay_joined = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &retained_provider,
+        &joined,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("stored errgroup task and join effects apply without live models");
+    assert_eq!(
+        replay_joined.conflicts, direct_joined.conflicts,
+        "stored Go/Wait effects must preserve task accesses and their ordering; unavailable dispatch remains explicit in report reasons"
+    );
+    for provider in [&projection_provider, &retained_provider] {
+        let mut budget = SemanticBudget::default();
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            provider,
+            &unknown,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("unavailable callback report computes");
+        assert!(
+            report.reasons.contains(
+                &brokk_bifrost_flow::concurrency::ConcurrencyOpenReason::UnresolvedTarget
+            ),
+            "an unavailable callback must remain explicitly unresolved: {report:#?}"
+        );
+    }
+    let mut budget = SemanticBudget::default();
+    for provider in [&projection_provider, &retained_provider] {
+        let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+            provider,
+            &copied_group,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("copied errgroup report computes");
+        assert!(
+            !report.conflicts.is_empty() || !report.reasons.is_empty(),
+            "copied-group analysis must not silently lose the task: {report:#?}"
+        );
+        assert!(
+            !report.conflicts.iter().any(|conflict| {
+                conflict.proven
+                    && conflict.ordering
+                        == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+                    && [&conflict.first, &conflict.second].iter().any(|site| {
+                        site.mode == brokk_bifrost_flow::concurrency::ConcurrentAccessMode::Read
+                            && site.access_kind
+                                == crate::analyzer::semantic::MemoryAccessKind::LexicalCell
+                    })
+            }),
+            "waiting on a value copy cannot join the original group task: {report:#?}"
+        );
+    }
+    let mut budget = SemanticBudget::default();
+    let direct_distinct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &projection_provider,
+        &distinct,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("direct distinct-group report computes");
+    assert!(
+        direct_distinct.conflicts.iter().any(|conflict| {
+            conflict.proven
+                && conflict.exhaustive
+                && conflict.ordering
+                    == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+        }),
+        "waiting on a distinct group must leave the shared access unordered: {direct_distinct:#?}"
+    );
+    let mut budget = SemanticBudget::default();
+    let replay_distinct = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+        &retained_provider,
+        &distinct,
+        &mut SemanticRequest::new(&mut budget, &cancellation),
+    )
+    .expect("stored distinct-group report computes");
+    assert_eq!(
+        replay_distinct.conflicts, direct_distinct.conflicts,
+        "summary replay must preserve distinct group identity"
     );
     let mut budget = SemanticBudget::default();
     let retained = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
@@ -14935,7 +15204,6 @@ func mutatedBeforePredicate(path string) string {
     assert_single_open_unknown_result_contract(&result);
 }
 
-#[cfg_attr(not(scheduled_tests), ignore = "scheduled-only")]
 #[test]
 fn channel_send_address_escape_keeps_condition_identity_open() {
     let result = execute_conditional_result_contract_fixture(
@@ -14953,6 +15221,48 @@ func publishedCondition(path string, ch chan<- *error) string {
     );
 
     assert_single_open_unknown_result_contract(&result);
+}
+
+#[test]
+fn channel_send_address_alias_and_selected_send_keep_condition_identity_open() {
+    for publish in [
+        "pointer := &err; ch <- pointer",
+        "select { case ch <- &err: default: }",
+    ] {
+        let result = execute_conditional_result_contract_fixture(&format!(
+            r#"package main
+import "os"
+func publishedCondition(path string, ch chan<- *error) string {{
+    file, err := os.Open(path)
+    {publish}
+    if err != nil {{ return "" }}
+    return file.Name()
+}}
+"#,
+        ));
+        assert_single_open_unknown_result_contract(&result);
+    }
+}
+
+#[test]
+fn channel_send_of_independent_value_keeps_original_condition_guard() {
+    for (channel_type, publish) in [
+        ("error", "ch <- err"),
+        ("*error", "copied := err; ch <- &copied"),
+    ] {
+        let result = execute_conditional_result_contract_fixture(&format!(
+            r#"package main
+import "os"
+func copiedCondition(path string, ch chan<- {channel_type}) string {{
+    file, err := os.Open(path)
+    {publish}
+    if err != nil {{ return "" }}
+    return file.Name()
+}}
+"#,
+        ));
+        assert_single_guarded_open_unknown_result_contract(&result);
+    }
 }
 
 #[test]

@@ -79,7 +79,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v18";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v19";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
@@ -1722,12 +1722,72 @@ fn project_modeled_call_effects(
     };
     let mut stable = Vec::with_capacity(modeled.len());
     for effect in modeled {
+        if let ResolvedConcurrencyEffect::TaskSpawn {
+            callable,
+            targets,
+            group,
+        } = &effect
+        {
+            let recovered = crate::concurrency::source_callable_targets(procedure, *callable);
+            if !matches!(recovered, ConcurrencyAnswer::Proven(ref recovered) if recovered == targets)
+            {
+                return Ok(());
+            }
+            let ordinals = call
+                .arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, argument)| (argument.value == *callable).then_some(ordinal))
+                .collect::<Vec<_>>();
+            let [ordinal] = ordinals.as_slice() else {
+                return Ok(());
+            };
+            let group = if let Some(group) = group {
+                let DirectConcurrencyPath::Boundary(location) =
+                    direct_concurrency_modeled_subject_path(
+                        procedure,
+                        call,
+                        group.value,
+                        provider,
+                        request,
+                    )?
+                else {
+                    return Ok(());
+                };
+                Some(crate::dataflow::SummaryConcurrencyTaskGroup {
+                    location,
+                    identity: match group.identity {
+                        ConcurrencySubjectIdentity::Value => {
+                            SummaryConcurrencySubjectIdentity::Value
+                        }
+                        ConcurrencySubjectIdentity::Backing => {
+                            SummaryConcurrencySubjectIdentity::Backing
+                        }
+                    },
+                })
+            } else {
+                None
+            };
+            let kind = SummaryConcurrencyEffectKind::TaskSpawn {
+                callable: crate::dataflow::SummaryConcurrencyCallable::SourceArgument(
+                    u32::try_from(*ordinal).expect("validated call argument ordinal fits u32"),
+                ),
+                target_coverage: crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive,
+                group,
+            };
+            if stable.contains(&kind) {
+                return Ok(());
+            }
+            stable.push(kind);
+            continue;
+        }
         let subject = match &effect {
             ResolvedConcurrencyEffect::LockAcquire { lock, .. }
             | ResolvedConcurrencyEffect::LockRelease { lock, .. } => lock,
             ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
             | ResolvedConcurrencyEffect::WaitGroupDone { group }
             | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
+            ResolvedConcurrencyEffect::TaskJoin { group } => group,
             ResolvedConcurrencyEffect::Atomic { location, .. }
                 if location.identity == ConcurrencySubjectIdentity::Value =>
             {
@@ -1750,6 +1810,12 @@ fn project_modeled_call_effects(
             ConcurrencySubjectIdentity::Backing => SummaryConcurrencySubjectIdentity::Backing,
         };
         let kind = match effect {
+            ResolvedConcurrencyEffect::TaskJoin { .. } => SummaryConcurrencyEffectKind::TaskJoin {
+                group: crate::dataflow::SummaryConcurrencyTaskGroup {
+                    location: path,
+                    identity,
+                },
+            },
             ResolvedConcurrencyEffect::WaitGroupAdd { delta, .. } => {
                 SummaryConcurrencyEffectKind::WaitGroupAdd {
                     group: path,

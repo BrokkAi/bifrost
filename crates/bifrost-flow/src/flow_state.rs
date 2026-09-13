@@ -42,8 +42,8 @@ use crate::analyzer::semantic::{
     SemanticCallSite, SemanticCapabilities, SemanticCapability, SemanticEffect, SemanticGap,
     SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
     SemanticOutcome, SemanticRequest, SemanticValueKind, SemanticWork, SourceMappingId,
-    SourceMappingKind, SourceSpan, StableDigest, ValueFlowKind, ValueFlowOracle, ValueId,
-    WorkspaceIcfgProvider,
+    SourceMappingKind, SourceSpan, StableDigest, SynchronizationOperation, SynchronizationPayload,
+    ValueFlowKind, ValueFlowOracle, ValueId, WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
@@ -2443,6 +2443,14 @@ fn address_escape_points(
     }));
     escape_points.extend(semantics.points().iter().flat_map(|point| {
         point.events.iter().filter_map(|event| match event.effect {
+            // A retained channel payload publishes the address even when the
+            // channel's control topology is known. Later reads cannot assume
+            // that the receiver left the original binding unchanged.
+            SemanticEffect::Synchronization {
+                operation: SynchronizationOperation::ChannelSend,
+                payload: Some(SynchronizationPayload::Send { value, .. }),
+                ..
+            } if address_aliases.contains(&value) => Some(point.id),
             SemanticEffect::MemoryStore { value, .. } if address_aliases.contains(&value) => {
                 Some(point.id)
             }

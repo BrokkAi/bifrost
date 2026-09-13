@@ -1852,8 +1852,8 @@ impl SynchronizationOperation {
 
 /// The part of a synchronization operation that carries a language value.
 ///
-/// A send records a payload only when the language front end can prove how
-/// the channel element copy preserves object identity. A receive records its
+/// A send records its value independently of whether the language front end
+/// can prove how the element copy preserves object identity. A receive records its
 /// result independently; a consumer must still pair it with one exact send
 /// before relating the two values. Missing payload metadata is an unsupported
 /// transport fact, never evidence that no value crossed the operation.
@@ -1868,9 +1868,11 @@ pub enum SynchronizationPayload {
     },
 }
 
-/// The identity-preserving part of a channel element copy.
+/// What is known about identity preservation by a channel element copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SynchronizationPayloadCopy {
+    /// The sent value is known, but its transport identity is not proved.
+    Unknown,
     /// A pointer or channel descriptor preserves the referenced object.
     Reference,
     /// A container descriptor preserves its backing store. The indexed
@@ -1882,6 +1884,7 @@ pub enum SynchronizationPayloadCopy {
 impl SynchronizationPayloadCopy {
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Unknown => "unknown",
             Self::Reference => "reference",
             Self::BackingStore { .. } => "backing_store",
         }

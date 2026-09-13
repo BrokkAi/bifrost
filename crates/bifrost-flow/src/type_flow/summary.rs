@@ -66,7 +66,7 @@ use super::{FieldSlotIndex, TypeFlowPlan};
 // Persisted surfaces from before #3124 must not replay the old value target,
 // and surfaces from before #3296 do not carry the true-arm sources and kills
 // a guard that proves a class now installs on the remainder.
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v10";
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v11";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";

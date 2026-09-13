@@ -417,6 +417,7 @@ const CACHE_PAGE_SIZE_BYTES: i64 = 32 * 1024;
 /// enlarged persist batches below keep their dirty pages cached until commit
 /// instead of spilling mid-transaction (issue #2326 measured configuration).
 const WRITER_PAGE_CACHE_KIB: i64 = -524288;
+const WRITER_PAGE_CACHE_ENV: &str = "BIFROST_SQLITE_WRITER_CACHE_KIB";
 const INITIALIZATION_RETRY_DEADLINE: Duration = BUSY_TIMEOUT;
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -1785,6 +1786,19 @@ fn install_busy_timeout(conn: &Connection) -> Result<()> {
 }
 
 fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> {
+    let writer_page_cache_kib = match std::env::var(WRITER_PAGE_CACHE_ENV) {
+        Err(std::env::VarError::NotPresent) => WRITER_PAGE_CACHE_KIB,
+        value => {
+            let raw = value.map_err(|error| format!("{WRITER_PAGE_CACHE_ENV}: {error}"))?;
+            let kib = raw.parse::<i32>().ok().filter(|kib| *kib > 0).ok_or_else(|| {
+                format!(
+                    "{WRITER_PAGE_CACHE_ENV} must be a positive integer in KiB (at most {}), got {raw:?}",
+                    i32::MAX
+                )
+            })?;
+            -i64::from(kib)
+        }
+    };
     if conn.path().is_some_and(|path| !path.is_empty()) {
         // Page size is an optional performance tuning choice. Initialize it
         // before the first schema write, but do not rebuild an existing store
@@ -1830,7 +1844,7 @@ fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> 
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    conn.pragma_update(None, "cache_size", WRITER_PAGE_CACHE_KIB)
+    conn.pragma_update(None, "cache_size", writer_page_cache_kib)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "mmap_size", 268435456i64)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
@@ -3512,6 +3526,66 @@ mod tests {
             duplicate_normalized.is_err(),
             "identity normalization is represented by NULL, not a duplicate string"
         );
+    }
+
+    #[test]
+    fn writer_page_cache_environment_is_process_local() {
+        const EXPECTED_ENV: &str = "BIFROST_TEST_WRITER_CACHE_EXPECTED";
+        if let Ok(expected) = std::env::var(EXPECTED_ENV) {
+            let temp = tempfile::tempdir().unwrap();
+            let result = open_unified_connection(&temp.path().join(cache_db_file_name()));
+            if expected == "invalid" {
+                let error = result.unwrap_err();
+                assert!(error.contains(WRITER_PAGE_CACHE_ENV), "{error}");
+                assert!(error.contains("positive integer"), "{error}");
+            } else {
+                let conn = result.unwrap();
+                let actual: i64 = conn
+                    .query_row("PRAGMA cache_size", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(actual, expected.parse::<i64>().unwrap());
+                let mut memory = Connection::open_in_memory().unwrap();
+                configure_connection(&mut memory).unwrap();
+                let actual: i64 = memory
+                    .query_row("PRAGMA cache_size", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(actual, expected.parse::<i64>().unwrap());
+            }
+            return;
+        }
+
+        for (value, expected) in [
+            (None, "-524288"),
+            (Some("8192"), "-8192"),
+            (Some("16384"), "-16384"),
+            (Some(""), "invalid"),
+            (Some("0"), "invalid"),
+            (Some("-1"), "invalid"),
+            (Some("eight"), "invalid"),
+            (Some("2147483648"), "invalid"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "cache_db::tests::writer_page_cache_environment_is_process_local",
+                    "--nocapture",
+                ])
+                .env(EXPECTED_ENV, expected);
+            match value {
+                Some(value) => {
+                    child.env(WRITER_PAGE_CACHE_ENV, value);
+                }
+                None => {
+                    child.env_remove(WRITER_PAGE_CACHE_ENV);
+                }
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "writer cache {value:?}: {output:?}"
+            );
+        }
     }
 
     #[test]

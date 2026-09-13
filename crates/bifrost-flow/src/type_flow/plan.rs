@@ -24,9 +24,9 @@ use crate::analyzer::semantic::{
     GuardPredicate, LengthDelimitedDigest, MemberAccessKind, MemberAccessQuery, MemberLookup,
     MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle,
     ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticEffect, SemanticLocator, SemanticProviderError, SemanticValueKind, SemanticWork,
-    SourceSite, SourceSiteKind, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
-    ValueFlowEndpoint, ValueFlowSnapshot,
+    SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticLocator,
+    SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
+    StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::dataflow::SemanticInputStatus;
@@ -1984,7 +1984,8 @@ impl TypeFlowPlan {
 /// boundary, the call entered nothing, or no coverage row exists. `None` when
 /// the closure covers the call. The seeds and `interpret` share this
 /// derivation so an uncovered call is named identically at seed time and at a
-/// sink.
+/// sink. An entered callee with unsupported normal control flow retains an
+/// `IncompleteRoot` return alternative even when dispatch is exhaustive.
 pub(crate) fn uncovered_reason(coverage: Option<&CallSiteCoverage>) -> Option<UnknownReason> {
     match coverage {
         Some(coverage) => {
@@ -2002,6 +2003,17 @@ pub(crate) fn uncovered_reason(coverage: Option<&CallSiteCoverage>) -> Option<Un
                 })
             {
                 Some(UnknownReason::SemanticBudget)
+            } else if coverage.entered.iter().any(|callee| {
+                callee.semantics().gaps().iter().any(|gap| {
+                    gap.capability == SemanticCapability::NormalControlFlow
+                        && gap.discharge != SemanticGapDischarge::RetainedControlTopology
+                })
+            }) {
+                // An unsupported continuation can hide a normal return even
+                // when dispatch and argument binding are exhaustive. Retain
+                // that return alternative at the caller rather than treating
+                // the callee's remaining return classes as a complete set.
+                Some(UnknownReason::IncompleteRoot)
             } else if coverage.has_uncovered_boundary
                 || (coverage.entered.is_empty()
                     && !matches!(
@@ -2882,6 +2894,60 @@ mod tests {
         );
 
         assert_eq!(uncovered_reason(Some(&absent_member)), None);
+    }
+
+    #[test]
+    fn exhaustive_dispatch_does_not_prove_unsupported_callee_returns_complete() {
+        use crate::analyzer::semantic::SemanticRequest;
+        use crate::analyzer::{AnalyzerConfig, Language};
+        use crate::inline_project::InlineTestProject;
+
+        let project = InlineTestProject::with_language(Language::Python)
+            .file(
+                "app.py",
+                "def incomplete():\n    return [x for x in ()]\ndef complete():\n    return []\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("source semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("source semantics are available");
+        for (name, expected) in [
+            ("incomplete", Some(UnknownReason::IncompleteRoot)),
+            ("complete", None),
+        ] {
+            let callee = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .expect("source declares the callee");
+            let mut call = coverage(
+                DispatchStatus::Resolved {
+                    status: SemanticInputStatus::Complete,
+                    coverage: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
+                },
+                Vec::new(),
+            );
+            call.entered.push(callee);
+            assert_eq!(uncovered_reason(Some(&call)), expected, "{name}");
+        }
     }
 
     #[test]

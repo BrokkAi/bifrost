@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v67";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v68";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -2557,7 +2557,7 @@ fn go_index_value_type_from_type(
 
 fn go_channel_payload_storage_kind(copy: SynchronizationPayloadCopy) -> Option<GoStorageKind> {
     match copy {
-        SynchronizationPayloadCopy::Reference => None,
+        SynchronizationPayloadCopy::Unknown | SynchronizationPayloadCopy::Reference => None,
         SynchronizationPayloadCopy::BackingStore {
             identity: IndexedLocationIdentity::Element,
         } => Some(GoStorageKind::Slice),
@@ -5285,6 +5285,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         copy: SynchronizationPayloadCopy,
     ) -> bool {
         match copy {
+            SynchronizationPayloadCopy::Unknown => false,
             SynchronizationPayloadCopy::Reference => {
                 self.expression_type_identity(node, node.start_byte())
                     .is_some_and(|identity| identity.pointer_depth > 0)
@@ -8389,17 +8390,16 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 let value_node = node
                     .child_by_field_name("value")
                     .ok_or_else(|| missing_field(node, "value"))?;
-                self.expression_channel_payload_copy(channel, channel.start_byte())
+                let copy = self
+                    .expression_channel_payload_copy(channel, channel.start_byte())
                     .filter(|copy| self.expression_supports_channel_payload_copy(value_node, *copy))
-                    .map(|copy| {
-                        self.expression_value(
-                            builder,
-                            value_node,
-                            self.expression_value_kind(value_node),
-                        )
-                        .map(|value| SynchronizationPayload::Send { value, copy })
-                    })
-                    .transpose()?
+                    .unwrap_or(SynchronizationPayloadCopy::Unknown);
+                let value = self.expression_value(
+                    builder,
+                    value_node,
+                    self.expression_value_kind(value_node),
+                )?;
+                Some(SynchronizationPayload::Send { value, copy })
             }
             SynchronizationOperation::ChannelReceive => {
                 let receive = node
@@ -9104,13 +9104,31 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 .ok_or_else(|| missing_field(communication, "channel communication"))?;
             let subject =
                 self.expression_value(builder, channel, self.expression_value_kind(channel))?;
+            let payload = if operation == SynchronizationOperation::ChannelSend {
+                let value_node = communication
+                    .child_by_field_name("value")
+                    .ok_or_else(|| missing_field(communication, "value"))?;
+                let value = self.expression_value(
+                    builder,
+                    value_node,
+                    self.expression_value_kind(value_node),
+                )?;
+                // Preserve the selected send's escape endpoint without proving
+                // a unique send/receive pairing across alternative clauses.
+                Some(SynchronizationPayload::Send {
+                    value,
+                    copy: SynchronizationPayloadCopy::Unknown,
+                })
+            } else {
+                None
+            };
             self.append_effect(
                 builder,
                 clause_entry,
                 SemanticEffect::Synchronization {
                     operation,
                     subject,
-                    payload: None,
+                    payload,
                 },
             )?;
             if communication.kind() == "receive_statement"
@@ -17069,8 +17087,18 @@ func send(
                 ..
             }))
         ));
-        assert_eq!(payloads.get("structs"), Some(&None));
-        assert_eq!(payloads.get("interfaces"), Some(&None));
+        for channel in ["structs", "interfaces"] {
+            assert!(
+                matches!(
+                    payloads.get(channel),
+                    Some(Some(SynchronizationPayload::Send {
+                        copy: SynchronizationPayloadCopy::Unknown,
+                        ..
+                    }))
+                ),
+                "the send endpoint survives unknown copy semantics: {payloads:?}"
+            );
+        }
     }
 
     #[test]

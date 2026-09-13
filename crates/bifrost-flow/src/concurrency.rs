@@ -2778,6 +2778,8 @@ pub fn concurrent_access_conflicts(
                                                 | SummaryConcurrencyEffectKind::WaitGroupAdd { .. }
                                                 | SummaryConcurrencyEffectKind::WaitGroupDone { .. }
                                                 | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
+                                                | SummaryConcurrencyEffectKind::TaskSpawn { .. }
+                                                | SummaryConcurrencyEffectKind::TaskJoin { .. }
                                         ) =>
                                 {
                                     Some((candidate_effect, candidate.evidence()))
@@ -2900,7 +2902,9 @@ pub fn concurrent_access_conflicts(
                     if matches!(effect.kind(), SummaryConcurrencyEffectKind::Lock { .. } | SummaryConcurrencyEffectKind::Atomic { .. }
                         | SummaryConcurrencyEffectKind::WaitGroupAdd { .. }
                         | SummaryConcurrencyEffectKind::WaitGroupDone { .. }
-                        | SummaryConcurrencyEffectKind::WaitGroupWait { .. })
+                        | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
+                        | SummaryConcurrencyEffectKind::TaskSpawn { .. }
+                        | SummaryConcurrencyEffectKind::TaskJoin { .. })
                         && !replayed_summary_modeled_events.contains(&effect.event()))
             }) {
                 report
@@ -6941,6 +6945,9 @@ fn propagate_reference_identities(
             value: result,
         };
         match send.1 {
+            SynchronizationPayloadCopy::Unknown => {
+                unreachable!("only proved channel copies enter sends")
+            }
             SynchronizationPayloadCopy::Reference => pending.push(PendingReferenceIdentity {
                 destination,
                 sources: Some(vec![send.0.clone()]),
@@ -8254,6 +8261,106 @@ fn append_atomic_accesses(
                 storage_origin,
             });
         }
+    }
+}
+
+/// Recover local callable targets from the same structured source events for
+/// live modeled spawns and retained modeled-call replay.
+pub fn source_callable_targets(
+    procedure: &ProcedureHandle,
+    value: ValueId,
+) -> ConcurrencyAnswer<Vec<ProcedureHandle>> {
+    let semantics = procedure.semantics();
+    let mut targets = Vec::new();
+    let mut open = false;
+    for point in semantics.points() {
+        for event in &point.events {
+            let callable = match &event.effect {
+                SemanticEffect::CallableCreation { result, callable }
+                | SemanticEffect::CallableReference { result, callable }
+                    if *result == value =>
+                {
+                    callable
+                }
+                SemanticEffect::ValueFlow {
+                    source,
+                    target,
+                    kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                } if *target == value => {
+                    for source_point in semantics.points() {
+                        for source_event in &source_point.events {
+                            let source_callable = match &source_event.effect {
+                                SemanticEffect::CallableCreation { result, callable }
+                                | SemanticEffect::CallableReference { result, callable }
+                                    if result == source =>
+                                {
+                                    callable
+                                }
+                                _ => continue,
+                            };
+                            collect_local_callable_targets(
+                                procedure,
+                                &source_callable.targets,
+                                &mut targets,
+                                &mut open,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            collect_local_callable_targets(procedure, &callable.targets, &mut targets, &mut open);
+        }
+    }
+    // Sorted by the mount-free procedure wire id, which is the identity
+    // the conflict rows publish: a total order that is the same at every
+    // workspace root, so the dedup below removes the same duplicates and
+    // the callee list arrives in the same order in a base export as in the
+    // head. Cached because the key is a digest over the procedure's
+    // locator, not a field read.
+    targets.sort_by_cached_key(crate::flow_state::procedure_wire_id);
+    targets.dedup();
+    if !open && !targets.is_empty() {
+        ConcurrencyAnswer::Proven(targets)
+    } else {
+        ConcurrencyAnswer::Open {
+            partial: targets,
+            reasons: vec![ConcurrencyOpenReason::UnresolvedTarget],
+        }
+    }
+}
+
+fn collect_local_callable_targets(
+    procedure: &ProcedureHandle,
+    resolution: &CallableTargetResolution,
+    targets: &mut Vec<ProcedureHandle>,
+    open: &mut bool,
+) {
+    match resolution {
+        CallableTargetResolution::Proven(CallableTarget::Local(target)) => targets.push(
+            procedure
+                .artifact()
+                .procedure_handle(*target)
+                .expect("validated local callable target exists"),
+        ),
+        CallableTargetResolution::Proven(_) => *open = true,
+        CallableTargetResolution::Ambiguous(candidates)
+        | CallableTargetResolution::Unproven(candidates)
+        | CallableTargetResolution::ExceededBudget(candidates) => {
+            *open = true;
+            for target in candidates {
+                if let CallableTarget::Local(target) = target {
+                    targets.push(
+                        procedure
+                            .artifact()
+                            .procedure_handle(*target)
+                            .expect("validated local callable target exists"),
+                    );
+                }
+            }
+        }
+        CallableTargetResolution::Unknown | CallableTargetResolution::Unsupported => *open = true,
     }
 }
 
@@ -9917,24 +10024,53 @@ fn source_summary_modeled_call(
     Ok((call_site, point))
 }
 
+fn source_summary_modeled_subject(
+    procedure: &ProcedureHandle,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    path: &SummaryConcurrencyAccessPath,
+    identity: SummaryConcurrencySubjectIdentity,
+    provider: &dyn ConcurrencyProvider,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ResolvedConcurrencySubject, &'static str> {
+    let mut values = Vec::new();
+    for value in call
+        .receiver
+        .into_iter()
+        .chain(call.arguments.iter().map(|argument| argument.value))
+    {
+        let candidate = crate::typestate::direct_concurrency_modeled_subject_path(
+            procedure, call, value, provider, request,
+        )
+        .map_err(|_| "summary modeled subject path proof is unavailable")?;
+        if matches!(candidate, crate::typestate::DirectConcurrencyPath::Boundary(ref candidate) if candidate == path)
+        {
+            values.push(value);
+        }
+    }
+    let [value] = values.as_slice() else {
+        return Err("summary modeled effect subject is unavailable or ambiguous");
+    };
+    let value = *value;
+    if identity == SummaryConcurrencySubjectIdentity::Backing && call.receiver != Some(value) {
+        return Err("summary modeled effect subject is ambiguous");
+    }
+    Ok(ResolvedConcurrencySubject {
+        value,
+        canonical: None,
+        reasons: Vec::new(),
+        identity: match identity {
+            SummaryConcurrencySubjectIdentity::Value => ConcurrencySubjectIdentity::Value,
+            SummaryConcurrencySubjectIdentity::Backing => ConcurrencySubjectIdentity::Backing,
+        },
+    })
+}
+
 fn source_summary_modeled_effect(
     pending: &PendingSummaryEffect,
     expected_call: CallSiteId,
     provider: &dyn ConcurrencyProvider,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ResolvedConcurrencyEffect, &'static str> {
-    let (path, identity) = match pending.effect.kind() {
-        SummaryConcurrencyEffectKind::Lock { lock, identity, .. } => (lock, *identity),
-        SummaryConcurrencyEffectKind::WaitGroupAdd {
-            group, identity, ..
-        }
-        | SummaryConcurrencyEffectKind::WaitGroupDone { group, identity }
-        | SummaryConcurrencyEffectKind::WaitGroupWait { group, identity } => (group, *identity),
-        SummaryConcurrencyEffectKind::Atomic { location, .. } => {
-            (location, SummaryConcurrencySubjectIdentity::Value)
-        }
-        _ => return Err("summary modeled effect has an incompatible kind"),
-    };
     let Some((point, _, event)) = live_summary_event(pending) else {
         return Err("summary modeled effect witness is unavailable");
     };
@@ -9953,42 +10089,72 @@ fn source_summary_modeled_effect(
     if call.point != point {
         return Err("summary modeled effect point does not match its invocation");
     }
-    let mut values = Vec::new();
-    for value in call
-        .receiver
-        .into_iter()
-        .chain(call.arguments.iter().map(|argument| argument.value))
+    if let SummaryConcurrencyEffectKind::TaskSpawn {
+        callable,
+        target_coverage,
+        group,
+    } = pending.effect.kind()
     {
-        let candidate = crate::typestate::direct_concurrency_modeled_subject_path(
-            &pending.context.procedure,
-            call,
-            value,
-            provider,
-            request,
-        )
-        .map_err(|_| "summary modeled subject path proof is unavailable")?;
-        if matches!(candidate, crate::typestate::DirectConcurrencyPath::Boundary(ref candidate) if candidate == path)
-        {
-            values.push(value);
+        if *target_coverage != crate::dataflow::SummaryConcurrencyTargetCoverage::Exhaustive {
+            return Err("summary task target coverage is incomplete");
         }
+        let crate::dataflow::SummaryConcurrencyCallable::SourceArgument(ordinal) = callable else {
+            return Err("summary task callable has no witnessed source argument");
+        };
+        let callable = call
+            .arguments
+            .get(*ordinal as usize)
+            .ok_or("summary task callable argument is unavailable")?
+            .value;
+        let ConcurrencyAnswer::Proven(targets) =
+            source_callable_targets(&pending.context.procedure, callable)
+        else {
+            return Err("summary task callable targets are unavailable");
+        };
+        let group = group
+            .as_ref()
+            .map(|group| {
+                source_summary_modeled_subject(
+                    &pending.context.procedure,
+                    call,
+                    &group.location,
+                    group.identity,
+                    provider,
+                    request,
+                )
+            })
+            .transpose()?;
+        return Ok(ResolvedConcurrencyEffect::TaskSpawn {
+            callable,
+            targets,
+            group,
+        });
     }
-    let [value] = values.as_slice() else {
-        return Err("summary modeled effect subject is unavailable or ambiguous");
+    let (path, identity) = match pending.effect.kind() {
+        SummaryConcurrencyEffectKind::Lock { lock, identity, .. } => (lock, *identity),
+        SummaryConcurrencyEffectKind::WaitGroupAdd {
+            group, identity, ..
+        }
+        | SummaryConcurrencyEffectKind::WaitGroupDone { group, identity }
+        | SummaryConcurrencyEffectKind::WaitGroupWait { group, identity } => (group, *identity),
+        SummaryConcurrencyEffectKind::TaskJoin { group } => (&group.location, group.identity),
+        SummaryConcurrencyEffectKind::Atomic { location, .. } => {
+            (location, SummaryConcurrencySubjectIdentity::Value)
+        }
+        _ => return Err("summary modeled effect has an incompatible kind"),
     };
-    let value = *value;
-    if identity == SummaryConcurrencySubjectIdentity::Backing && call.receiver != Some(value) {
-        return Err("summary modeled effect subject is ambiguous");
-    }
-    let subject = ResolvedConcurrencySubject {
-        value,
-        canonical: None,
-        reasons: Vec::new(),
-        identity: match identity {
-            SummaryConcurrencySubjectIdentity::Value => ConcurrencySubjectIdentity::Value,
-            SummaryConcurrencySubjectIdentity::Backing => ConcurrencySubjectIdentity::Backing,
-        },
-    };
+    let subject = source_summary_modeled_subject(
+        &pending.context.procedure,
+        call,
+        path,
+        identity,
+        provider,
+        request,
+    )?;
     Ok(match pending.effect.kind() {
+        SummaryConcurrencyEffectKind::TaskJoin { .. } => {
+            ResolvedConcurrencyEffect::TaskJoin { group: subject }
+        }
         SummaryConcurrencyEffectKind::WaitGroupAdd { delta, .. } => {
             let delta = match delta {
                 crate::dataflow::SummaryConcurrencyInteger::Constant(delta) => {

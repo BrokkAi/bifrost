@@ -1207,13 +1207,24 @@ fn lower_concurrency_effect(
         }
         CompiledConcurrencyEffect::TaskSpawn { callable, group } => {
             SummaryConcurrencyEffectKind::TaskSpawn {
-                callable: lower(callable)?,
+                callable: crate::dataflow::SummaryConcurrencyCallable::Boundary(lower(callable)?),
                 target_coverage: SummaryConcurrencyTargetCoverage::Exhaustive,
-                group: group.as_ref().map(path).transpose()?,
+                group: group
+                    .as_ref()
+                    .map(|group| {
+                        Ok(crate::dataflow::SummaryConcurrencyTaskGroup {
+                            location: path(group)?,
+                            identity: identity(group),
+                        })
+                    })
+                    .transpose()?,
             }
         }
         CompiledConcurrencyEffect::TaskJoin { group } => SummaryConcurrencyEffectKind::TaskJoin {
-            group: path(group)?,
+            group: crate::dataflow::SummaryConcurrencyTaskGroup {
+                location: path(group)?,
+                identity: identity(group),
+            },
         },
         CompiledConcurrencyEffect::LockAcquire { lock, mode }
         | CompiledConcurrencyEffect::LockRelease { lock, mode } => {

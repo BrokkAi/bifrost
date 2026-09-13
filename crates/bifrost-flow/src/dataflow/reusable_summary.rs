@@ -32,7 +32,7 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 /// contract. Embedded procedure summaries remain
 /// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 3;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 4;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1480,6 +1480,21 @@ impl SummaryCallSourceWitness {
     }
 }
 
+/// A callable supplied through a procedure boundary, or an argument of the
+/// exact source invocation named by the effect witness. Source arguments are
+/// not procedure parameters and are not substituted during composition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyCallable {
+    Boundary(SummaryPort),
+    SourceArgument(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryConcurrencyTaskGroup {
+    pub location: SummaryConcurrencyAccessPath,
+    pub identity: SummaryConcurrencySubjectIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SummaryConcurrencyEffectKind {
     Unsupported {
@@ -1498,12 +1513,12 @@ pub enum SummaryConcurrencyEffectKind {
         target: SummaryConcurrencyAccessPath,
     },
     TaskSpawn {
-        callable: SummaryPort,
+        callable: SummaryConcurrencyCallable,
         target_coverage: SummaryConcurrencyTargetCoverage,
-        group: Option<SummaryConcurrencyAccessPath>,
+        group: Option<SummaryConcurrencyTaskGroup>,
     },
     TaskJoin {
-        group: SummaryConcurrencyAccessPath,
+        group: SummaryConcurrencyTaskGroup,
     },
     /// Complete reviewed-model effect inventory for one source call. Effects
     /// sharing this event may replace live model lookup only when their count
@@ -3202,13 +3217,31 @@ fn substitute_concurrency_effect_kind(
             target_coverage,
             group,
         } => SummaryConcurrencyEffectKind::TaskSpawn {
-            callable: port(callable)?,
+            callable: match callable {
+                SummaryConcurrencyCallable::Boundary(boundary) => {
+                    SummaryConcurrencyCallable::Boundary(port(boundary)?)
+                }
+                SummaryConcurrencyCallable::SourceArgument(ordinal) => {
+                    SummaryConcurrencyCallable::SourceArgument(*ordinal)
+                }
+            },
             target_coverage: *target_coverage,
-            group: group.as_ref().map(path).transpose()?,
+            group: group
+                .as_ref()
+                .map(|group| {
+                    Ok(SummaryConcurrencyTaskGroup {
+                        location: path(&group.location)?,
+                        identity: group.identity,
+                    })
+                })
+                .transpose()?,
         },
         SummaryConcurrencyEffectKind::TaskJoin { group } => {
             SummaryConcurrencyEffectKind::TaskJoin {
-                group: path(group)?,
+                group: SummaryConcurrencyTaskGroup {
+                    location: path(&group.location)?,
+                    identity: group.identity,
+                },
             }
         }
         SummaryConcurrencyEffectKind::ModeledCall { effect_count } => {
@@ -4899,11 +4932,11 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         SummaryConcurrencyEffectKind::Alias { source, target } => {
             path_bytes(source).saturating_add(path_bytes(target))
         }
-        SummaryConcurrencyEffectKind::TaskSpawn { group, .. } => {
-            group.as_ref().map_or(0, path_bytes)
-        }
-        SummaryConcurrencyEffectKind::TaskJoin { group }
-        | SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
+        SummaryConcurrencyEffectKind::TaskSpawn { group, .. } => group
+            .as_ref()
+            .map_or(0, |group| path_bytes(&group.location)),
+        SummaryConcurrencyEffectKind::TaskJoin { group } => path_bytes(&group.location),
+        SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupDone { group, .. }
         | SummaryConcurrencyEffectKind::WaitGroupWait { group, .. } => path_bytes(group),
         SummaryConcurrencyEffectKind::ModeledCall { .. } => 0,
