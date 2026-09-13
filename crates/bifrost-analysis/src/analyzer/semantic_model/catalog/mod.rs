@@ -67,7 +67,10 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 /// 23: the Go source producer parses Go 1.26 new(expr) through the same
 /// structured repair as workspace analysis. Warm packs can retain declarations
 /// and signatures lost to the old grammar recovery (#3325).
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 23;
+/// 24: the C++ header producer publishes namespace owners and the exact
+/// explicit value operations of std::basic_string. Warm generated packs
+/// predate those owner and operation facts.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 24;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.

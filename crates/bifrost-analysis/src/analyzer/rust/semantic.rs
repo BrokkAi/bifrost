@@ -522,6 +522,7 @@ fn callable_shape<'tree>(
             dispatch_extensibility: rust_callable_dispatch_extensibility(node),
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
+            construction_return: Default::default(),
         },
     ))
 }

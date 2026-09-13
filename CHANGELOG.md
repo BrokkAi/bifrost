@@ -21,6 +21,17 @@ projection and its commit history does not contain every source commit.
   per-operator cancellation.
 - Policies now support a treat-may-as-finding verdict on unknown evidence,
   reporting may-findings as findings when requested.
+- C++ value flow proves `std::string` by-value dependence from the standard
+  library's own declarations. Construction from character data, copy and move
+  construction, copy and move assignment including explicit `std::move`,
+  return by value, `assign`, `append` and `operator+=`, and the `c_str` and
+  `data` read projections all carry a string's value. Copies keep a storage
+  identity distinct from their source, a move takes the value away from the
+  object it came from, an extension adds to what the receiver already held
+  while an assignment replaces it, a read projection reads the string's own
+  character storage, and references and pointers stay aliases. An operation
+  the declarations do not prove stays an explicit decline rather than an
+  assumed flow, so a same-named class of your own gets none of this.
 
 ### Changed
 

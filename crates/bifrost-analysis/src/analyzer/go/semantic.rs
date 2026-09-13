@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v69";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v70";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -104,9 +104,9 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
                 spec.callable
                     .child_by_field_name("name")
                     .and_then(|name| nonempty_node_text(prepared.source(), name))
-                    .map(Box::<str>::from)
+                    .map(|name| (Box::<str>::from(name), spec.callable))
             })
-            .collect::<HashSet<_>>();
+            .collect::<HashMap<_, _>>();
         let procedure_targets = specs
             .iter()
             .map(|spec| {
@@ -1036,6 +1036,39 @@ fn enumerate_procedures<'tree>(
                 entry_precharged,
             });
         }
+    }
+
+    // A defined type's fields are its underlying struct's fields: `type D S`
+    // selects the same members as `S`. The chain can only be followed once
+    // every type declaration in the file is known, so this runs after the
+    // traversal rather than inside it.
+    let defined_type_structures = named_type_definitions
+        .values()
+        .flatten()
+        .filter(|definition| !direct_struct_fields.contains_key(&definition.declaration))
+        .filter_map(|definition| {
+            let underlying = go_file_underlying_type(
+                definition.underlying,
+                prepared.source(),
+                &named_type_definitions,
+                definition.underlying.start_byte(),
+            )?;
+            (underlying.kind() == "struct_type").then_some((definition.declaration, underlying))
+        })
+        .collect::<Vec<_>>();
+    for (declaration, structure) in defined_type_structures {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+        record_direct_struct_fields(
+            &mut direct_struct_fields,
+            declaration,
+            structure,
+            prepared.source(),
+        );
     }
 
     let method_inventory = match go_same_file_method_inventory(
@@ -2469,8 +2502,19 @@ fn go_storage_kind_from_type(
     named_types: &GoNamedTypeDefinitions<'_>,
     use_byte: usize,
 ) -> Option<GoStorageKind> {
-    match go_file_underlying_type(kind, source, named_types, use_byte)?.kind() {
+    go_storage_kind_of_underlying(go_file_underlying_type(
+        kind,
+        source,
+        named_types,
+        use_byte,
+    )?)
+}
+
+/// The storage a value of an already-resolved underlying type holds.
+fn go_storage_kind_of_underlying(underlying: Node<'_>) -> Option<GoStorageKind> {
+    match underlying.kind() {
         "array_type" | "implicit_length_array_type" => Some(GoStorageKind::Array),
+        "struct_type" => Some(GoStorageKind::Struct),
         "slice_type" => Some(GoStorageKind::Slice),
         "map_type" => Some(GoStorageKind::Map),
         "channel_type" => Some(GoStorageKind::Channel),
@@ -3796,7 +3840,7 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     omitted_capture_names: &'procedure [Box<str>],
     call_exposure_origins: &'procedure [GoCallExposureOrigin],
     import_bindings: &'imports HashMap<Box<str>, Box<str>>,
-    package_functions: &'imports HashSet<Box<str>>,
+    package_functions: &'imports HashMap<Box<str>, Node<'tree>>,
     package_values: &'imports HashSet<Box<str>>,
     package_value_locators: &'imports HashMap<Box<str>, SemanticLocator>,
     method_inventory: &'imports GoMethodInventory,
@@ -3828,11 +3872,66 @@ struct GoTypeIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GoStorageKind {
     Array,
+    /// A struct value holds its fields inline, so assigning one duplicates the
+    /// whole aggregate into independent field storage, exactly like an array.
+    Struct,
     Slice,
     Map,
     /// A channel descriptor is copied by value while retaining the channel
     /// object it refers to, like a slice or map descriptor.
     Channel,
+}
+
+impl GoStorageKind {
+    /// Whether a value of this storage holds its contents inline, so that
+    /// assigning, passing, returning, or converting it duplicates the whole
+    /// aggregate instead of sharing a runtime object.
+    const fn is_value_aggregate(self) -> bool {
+        matches!(self, Self::Array | Self::Struct)
+    }
+}
+
+/// The value flow one exact Go by-value aggregate duplication publishes.
+///
+/// Go copies the whole aggregate bitwise, so the destination receives the
+/// source's value in its own storage and no distinct operation runs.
+const GO_AGGREGATE_COPY_FLOW: ValueFlowKind = ValueFlowKind::Transfer(ValueTransfer {
+    kind: TransferKind::AggregateCopy,
+    operation: TransferOperation::None,
+});
+
+/// One structured Go conversion expression.
+///
+/// Go writes a conversion two ways and tree-sitter keeps them apart: an
+/// explicit `type_conversion_expression` carries `type` and `operand` fields,
+/// while a conversion whose target is a plain type name parses as a
+/// `call_expression`. `target` is the conversion's type syntax exactly as
+/// written, including any pointer wrapper, so a pointer conversion cannot be
+/// mistaken for a value-aggregate duplication.
+#[derive(Debug, Clone, Copy)]
+struct GoTypeConversion<'tree> {
+    target: Node<'tree>,
+    operand: Node<'tree>,
+}
+
+/// One field an exact struct copy duplicates into the destination's storage.
+#[derive(Debug, Clone)]
+struct GoCopiedField {
+    name: Box<str>,
+    anchor: SourceAnchor,
+    storage: GoCompositeFieldStorage,
+}
+
+/// What this file can state about the contents one by-value copy duplicates.
+#[derive(Debug)]
+enum GoAggregateContents {
+    /// Every field of the copied struct, with its proven storage kind.
+    Struct(Vec<GoCopiedField>),
+    /// An array copy, whose element identity the indexed memory model already
+    /// carries and whose element snapshot belongs to issue #2831.
+    ArrayElements,
+    /// The aggregate's layout is not proven here, for this exact reason.
+    Unproven(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3932,7 +4031,7 @@ fn lower_procedure<'tree>(
     direct_struct_fields: &DirectStructFields,
     named_type_definitions: &GoNamedTypeDefinitions<'tree>,
     import_bindings: &HashMap<Box<str>, Box<str>>,
-    package_functions: &HashSet<Box<str>>,
+    package_functions: &HashMap<Box<str>, Node<'tree>>,
     method_inventory: &GoMethodInventory,
     procedure_targets: &HashMap<usize, GoProcedureTarget>,
     indirect_callable_targets: &HashMap<usize, usize>,
@@ -4933,7 +5032,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return true;
         };
         self.binding_value(name, node.start_byte()).map_or_else(
-            || !self.package_functions.contains(name),
+            || !self.package_functions.contains_key(name),
             |binding| self.call_exposed_bindings.contains(&binding),
         )
     }
@@ -5113,19 +5212,23 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             self.exact_slice_shapes.remove(&target);
         }
         self.append_effect(builder, point, SemanticEffect::Assignment { target, value })?;
+        // Go duplicates a whole array or struct value into independent
+        // aggregate storage; no distinct operation runs. A fresh literal or
+        // zero value is the destination's own storage, not a copy of an
+        // already-owned aggregate, so it keeps the plain local flow.
+        let aggregate_copy = kind == ValueFlowKind::Local
+            && storage.is_some_and(GoStorageKind::is_value_aggregate)
+            && !self.fresh_binding_values.contains(&value);
         let kind = if kind == ValueFlowKind::Local {
             match storage {
                 Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
                     offset: BackingStoreOffset::Zero,
                 },
-                Some(GoStorageKind::Array) if !self.fresh_binding_values.contains(&value) => {
-                    // A Go array assignment duplicates the whole aggregate
-                    // bitwise; no distinct operation runs.
-                    ValueFlowKind::Transfer(ValueTransfer {
-                        kind: TransferKind::AggregateCopy,
-                        operation: TransferOperation::None,
-                    })
-                }
+                // A proven inline aggregate duplicates the whole value
+                // bitwise; no distinct operation runs. The structural storage
+                // kind proves this for a named struct, an inline struct type,
+                // and an array alike.
+                _ if aggregate_copy => GO_AGGREGATE_COPY_FLOW,
                 None if !self.fresh_binding_values.contains(&value)
                     && self.value_types.get(&value).is_some_and(|identity| {
                         identity.pointer_depth == 0
@@ -5181,8 +5284,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         }
                     }
                 }
-                Some(GoStorageKind::Array) | None => kind,
-                Some(GoStorageKind::Channel) => kind,
+                Some(GoStorageKind::Array | GoStorageKind::Struct | GoStorageKind::Channel)
+                | None => kind,
             }
         } else {
             kind
@@ -5196,6 +5299,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 target,
             },
         )?;
+        if let Some(storage) = storage.filter(|_| aggregate_copy) {
+            self.append_aggregate_copy_contents(builder, point, storage, value, target)?;
+        }
         // The cell receives the post-transfer value. Storing the original
         // source would bypass the copy's identity boundary through captures.
         let stored_value = if matches!(kind, ValueFlowKind::Transfer(_)) {
@@ -5215,6 +5321,297 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             )?;
         }
         Ok(())
+    }
+
+    /// Copy the proven contents of one by-value aggregate into the
+    /// destination's own storage.
+    ///
+    /// Go's assignment, argument passing, return, and defined-type conversion
+    /// all duplicate a struct's fields into independent storage while a
+    /// reference-typed field goes on naming the same runtime object. The copy
+    /// is therefore a field-by-field load and store, not a deep copy: a pointer
+    /// field's copied value is the pointer. A nested aggregate field is itself
+    /// a by-value copy and receives its own transfer barrier, and the contents
+    /// behind that barrier stay explicitly incomplete.
+    ///
+    /// Array elements are left exactly as the existing array transfer leaves
+    /// them: their indexed identity is already carried across the copy, and
+    /// the element snapshot is #2831's. A struct copy this method cannot model
+    /// publishes a typed field-memory gap naming the exact reason rather than
+    /// leaving the destination silently covered.
+    fn append_aggregate_copy_contents(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        storage: GoStorageKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), GoLoweringError> {
+        let fields = match self.aggregate_copy_contents(storage, source, target) {
+            GoAggregateContents::Struct(fields) => fields,
+            // An array copy's elements are already carried by the indexed
+            // memory model the array transfer has always used, so this ticket
+            // neither restates that coverage nor declares it absent; the
+            // element snapshot itself is #2831's.
+            GoAggregateContents::ArrayElements => return Ok(()),
+            GoAggregateContents::Unproven(reason) => {
+                return self.add_gap(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::FieldMemory,
+                    SemanticGapKind::Unsupported,
+                    &format!(
+                        "Go aggregate copy separates storage identity, but the copied field contents are not modeled: {reason}"
+                    ),
+                );
+            }
+        };
+        let mut nested_aggregates = Vec::new();
+        for field in fields {
+            let member = self.member_locator(field.anchor);
+            let loaded_from = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: source,
+                    member: member.clone(),
+                },
+            )?;
+            let loaded = self.value(builder, point, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location: loaded_from,
+                    result: loaded,
+                },
+            )?;
+            let stored = if field.storage == GoCompositeFieldStorage::InlineAggregate {
+                nested_aggregates.push(field.name);
+                let copied = self.value(builder, point, SemanticValueKind::Temporary)?;
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::Assignment {
+                        target: copied,
+                        value: loaded,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: GO_AGGREGATE_COPY_FLOW,
+                        source: loaded,
+                        target: copied,
+                    },
+                )?;
+                copied
+            } else {
+                loaded
+            };
+            // Copying a reference-typed member duplicates the reference, not
+            // the object it names, so the destination member names the same
+            // runtime object as the source member. Stating that here is what
+            // lets a read through the copied member reach that object.
+            let stored_into = self.session.add_memory_location_with_value_copy(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: target,
+                    member,
+                },
+                match field.storage {
+                    GoCompositeFieldStorage::Reference => MemoryValueCopy::Reference,
+                    GoCompositeFieldStorage::InlineAggregate
+                    | GoCompositeFieldStorage::InlineScalar => MemoryValueCopy::Value,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location: stored_into,
+                    value: stored,
+                },
+            )?;
+        }
+        if !nested_aggregates.is_empty() {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Value(target),
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::Unsupported,
+                &format!(
+                    "Go aggregate copy duplicates these nested aggregate fields into independent storage, but their own copied contents are not modeled: {nested_aggregates:?}"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Duplicate a by-value aggregate into fresh storage and answer with the
+    /// value that now holds the copy.
+    ///
+    /// Go copies an aggregate when it crosses a call boundary in either
+    /// direction: an argument is copied into the callee's parameter and a
+    /// result is copied into the caller's storage. A value whose storage this
+    /// procedure just established is already that independent storage and is
+    /// transported directly rather than copied twice.
+    fn append_transferred_aggregate(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let Some(storage) = self
+            .value_storage_kinds
+            .get(&source)
+            .copied()
+            .filter(|storage| storage.is_value_aggregate())
+        else {
+            return Ok(source);
+        };
+        if self.fresh_binding_values.contains(&source) {
+            return Ok(source);
+        }
+        let copied = self.source_value(builder, source_node, SemanticValueKind::Temporary)?;
+        if let Some(identity) = self.value_types.get(&source).cloned() {
+            self.value_types.insert(copied, identity);
+        }
+        if let Some(type_node) = self.value_type_nodes.get(&source).copied() {
+            self.value_type_nodes.insert(copied, type_node);
+        }
+        self.value_storage_kinds.insert(copied, storage);
+        self.fresh_binding_values.insert(copied);
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target: copied,
+                value: source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: GO_AGGREGATE_COPY_FLOW,
+                source,
+                target: copied,
+            },
+        )?;
+        // No snapshot stores here on purpose. This temporary exists only to be
+        // consumed by the boundary that created it, an argument position or a
+        // return, so nothing in this procedure ever loads its members. The
+        // boundary carries the copied contents through the transfer itself;
+        // restating them as stores would publish caller-side member accesses
+        // that stand for no source-level load of the copy.
+        Ok(copied)
+    }
+
+    /// A returned copy publishes the members that cross the return port.
+    /// Argument temporaries are consumed by the actual/formal binder; return
+    /// temporaries need their own contents for the callee's exit snapshot.
+    fn append_returned_aggregate(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source_node: Node<'tree>,
+        source: ValueId,
+    ) -> Result<ValueId, GoLoweringError> {
+        let copied = self.append_transferred_aggregate(builder, point, source_node, source)?;
+        if copied != source {
+            let storage = self.value_storage_kinds[&copied];
+            self.append_aggregate_copy_contents(builder, point, storage, source, copied)?;
+        }
+        Ok(copied)
+    }
+
+    /// What this file can state about the contents an exact by-value copy of
+    /// `source` duplicates. `target` supplies the declared type when the copied
+    /// expression carries none of its own.
+    fn aggregate_copy_contents(
+        &self,
+        storage: GoStorageKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> GoAggregateContents {
+        if storage == GoStorageKind::Array {
+            return GoAggregateContents::ArrayElements;
+        }
+        let Some(underlying) = self
+            .value_underlying_type(source)
+            .or_else(|| self.value_underlying_type(target))
+        else {
+            return GoAggregateContents::Unproven(
+                "the copied value has no resolved structured type".into(),
+            );
+        };
+        if underlying.kind() != "struct_type" {
+            return GoAggregateContents::Unproven(
+                "the copied value's underlying type is not a struct".into(),
+            );
+        }
+        let Some(fields) = go_struct_literal_fields(underlying, self.prepared.source()) else {
+            return GoAggregateContents::Unproven("the struct field layout is ambiguous".into());
+        };
+        let mut copied = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(type_node) = field.type_node else {
+                return GoAggregateContents::Unproven(
+                    format!(
+                        "embedded field {:?} declares no direct field storage",
+                        field.name
+                    )
+                    .into(),
+                );
+            };
+            let Some(storage) = self.composite_field_storage(type_node) else {
+                return GoAggregateContents::Unproven(
+                    format!("field {:?} has no resolved storage kind", field.name).into(),
+                );
+            };
+            copied.push(GoCopiedField {
+                name: field.name,
+                anchor: field.anchor,
+                storage,
+            });
+        }
+        GoAggregateContents::Struct(copied)
+    }
+
+    /// The underlying type a value's proven declared type resolves to, whether
+    /// that type was named or written inline.
+    fn value_underlying_type(&self, value: ValueId) -> Option<Node<'tree>> {
+        if let Some(identity) = self.value_types.get(&value)
+            && identity.pointer_depth == 0
+            && let Some(declaration) = identity.declaration
+            && let Some(definition) = self.named_type_definition_for_declaration(declaration)
+        {
+            return self
+                .file_underlying_type(definition.underlying, definition.underlying.start_byte());
+        }
+        let type_node = self.value_type_nodes.get(&value).copied()?;
+        self.file_underlying_type(type_node, type_node.start_byte())
+    }
+
+    /// One memory-location identity for a member declared at `anchor`.
+    fn member_locator(&self, anchor: SourceAnchor) -> SemanticLocator {
+        let procedure = self.session.locator();
+        SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        )
     }
 
     fn assignment_conversion_value(
@@ -5348,12 +5745,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let field = selector.child_by_field_name("field")?;
         let field_name = nonempty_node_text(self.prepared.source(), field)?;
         let identity = self.expression_type_identity(operand, operand.start_byte())?;
-        let declaration = identity.declaration?;
-        let definition = self
-            .named_type_definitions
-            .values()
-            .flatten()
-            .find(|definition| definition.declaration == declaration)?;
+        let definition = self.named_type_definition_for_declaration(identity.declaration?)?;
         let structure = self.file_underlying_type(definition.underlying, selector.start_byte())?;
         named_children(structure)
             .into_iter()
@@ -5422,10 +5814,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
             self.value_types.insert(value, identity);
         }
+        if let Some(type_node) = self.expression_type_node(node, node.start_byte()) {
+            self.value_type_nodes.insert(value, type_node);
+        }
         if let Some(storage) = self.expression_storage_kind(node, node.start_byte()) {
             self.value_storage_kinds.insert(value, storage);
         }
-        if transparent_parenthesized_expression(node).kind() == "composite_literal" {
+        if self.establishes_fresh_binding(node) {
             self.fresh_binding_values.insert(value);
         }
         let index_value_copy = self.expression_index_value_copy(node, node.start_byte());
@@ -5445,6 +5840,63 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             self.exact_slice_shapes.insert(value, shape);
         }
         Ok(value)
+    }
+
+    /// A same-file, unshadowed, nongeneric function states its single result
+    /// type in the declaration. Keep that type on the call result so a later
+    /// member read uses the declaration's field identity.
+    fn call_result_type_node(&self, call: Node<'tree>) -> Option<Node<'tree>> {
+        let function = transparent_parenthesized_expression(call.child_by_field_name("function")?);
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), function)?;
+        if self.binding_value(name, function.start_byte()).is_some() {
+            return None;
+        }
+        let declaration = *self.package_functions.get(name)?;
+        if declaration.child_by_field_name("type_parameters").is_some() {
+            return None;
+        }
+        let results = go_callable_result_types(declaration)?;
+        match results.as_slice() {
+            [result] => Some(*result),
+            _ => None,
+        }
+    }
+
+    /// The declared type syntax this expression's value carries.
+    ///
+    /// Only a declared or written type counts: a binding's own declaration, a
+    /// literal's type, or an assertion's type. This is what lets an inline
+    /// struct type, which has no name to resolve, still state its layout.
+    fn expression_type_node(&self, node: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+        let node = transparent_parenthesized_expression(node);
+        match node.kind() {
+            "identifier" | "true" | "false" | "nil" | "iota" => {
+                let name = node_text(self.prepared.source(), node)?;
+                let value = self.binding_value(name, byte)?;
+                self.value_type_nodes.get(&value).copied()
+            }
+            "composite_literal" | "type_assertion_expression" => node.child_by_field_name("type"),
+            "call_expression" => self.call_result_type_node(node),
+            _ => None,
+        }
+    }
+
+    /// Whether this expression establishes its own storage instead of reading a
+    /// value another binding already owns.
+    ///
+    /// A composite literal and an exact value-aggregate conversion both
+    /// materialize a completed value, so binding one is not a second
+    /// duplication of an already-owned value.
+    fn establishes_fresh_binding(&self, node: Node<'tree>) -> bool {
+        let node = transparent_parenthesized_expression(node);
+        node.kind() == "composite_literal"
+            || self.type_conversion(node).is_some_and(|conversion| {
+                self.exact_value_aggregate_conversion(conversion, node.start_byte())
+                    .is_some()
+            })
     }
 
     fn source_value(
@@ -5487,6 +5939,42 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         byte: usize,
     ) -> Option<GoNamedTypeDefinition<'tree>> {
         visible_go_named_type(self.named_type_definitions, name, byte)
+    }
+
+    /// The declaration whose declared type is literally the struct a named type
+    /// resolves to.
+    ///
+    /// A defined type's fields are its underlying struct's fields, so `D` in
+    /// `type D S` must name the same field memory locations as `S`. Without
+    /// this, every field of a defined type fell back to an occurrence identity
+    /// and a store through one spelling could not meet a load through the other.
+    fn struct_declaration_for_declaration(&self, declaration: usize) -> Option<usize> {
+        let definition = self.named_type_definition_for_declaration(declaration)?;
+        let underlying =
+            self.file_underlying_type(definition.underlying, definition.underlying.start_byte())?;
+        if underlying.kind() != "struct_type" {
+            return None;
+        }
+        underlying
+            .parent()
+            .filter(|parent| parent.kind() == "type_spec")
+            .map(|parent| parent.id())
+    }
+
+    /// The named-type definition one resolved declaration identity names.
+    ///
+    /// A `GoTypeIdentity` already carries the declaration a name resolved to,
+    /// so consumers recover the definition from that identity instead of
+    /// resolving the spelling a second time in a possibly different scope.
+    fn named_type_definition_for_declaration(
+        &self,
+        declaration: usize,
+    ) -> Option<GoNamedTypeDefinition<'tree>> {
+        self.named_type_definitions
+            .values()
+            .flatten()
+            .find(|definition| definition.declaration == declaration)
+            .copied()
     }
 
     fn type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
@@ -5629,11 +6117,23 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 self.expression_index_value_type(node.child_by_field_name("operand")?, byte)
             }
             "composite_literal" => self.type_identity(node.child_by_field_name("type")?, byte),
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some() =>
+            {
+                // A conversion names its result type exactly. Reading it is the
+                // structured answer, not an inference from the operand.
+                let conversion = self.type_conversion(node)?;
+                self.conversion_target_identity(conversion.target, byte)
+            }
             "call_expression" if self.is_builtin_new_call(node) => {
                 let argument = all_call_arguments(node).into_iter().next()?;
                 let mut identity = self.type_identity(argument, byte)?;
                 identity.pointer_depth = identity.pointer_depth.checked_add(1)?;
                 Some(identity)
+            }
+            "call_expression" => {
+                let result = self.call_result_type_node(node)?;
+                self.type_identity(result, result.start_byte())
             }
             _ => None,
         }
@@ -5651,22 +6151,19 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             "type_assertion_expression" => {
                 self.type_storage_kind(node.child_by_field_name("type")?, byte)
             }
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some() =>
+            {
+                let conversion = self.type_conversion(node)?;
+                go_storage_kind_of_underlying(self.conversion_target_underlying(conversion.target)?)
+            }
             "selector_expression" => {
                 let operand = node.child_by_field_name("operand")?;
                 let field = node.child_by_field_name("field")?;
                 let field_name = nonempty_node_text(self.prepared.source(), field)?;
                 let declaration = self.expression_type_identity(operand, byte)?.declaration?;
-                let definition = self
-                    .named_type_definitions
-                    .values()
-                    .flatten()
-                    .find(|definition| definition.declaration == declaration)?;
-                let structure = go_file_underlying_type(
-                    definition.underlying,
-                    self.prepared.source(),
-                    self.named_type_definitions,
-                    byte,
-                )?;
+                let definition = self.named_type_definition_for_declaration(declaration)?;
+                let structure = self.file_underlying_type(definition.underlying, byte)?;
                 named_children(structure)
                     .into_iter()
                     .filter(|child| child.kind() == "field_declaration_list")
@@ -5716,6 +6213,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             }
             "call_expression" if self.builtin_append_source(node).is_some() => {
                 Some(GoStorageKind::Slice)
+            }
+            "call_expression" => {
+                let result = self.call_result_type_node(node)?;
+                self.type_storage_kind(result, result.start_byte())
             }
             _ => None,
         }
@@ -6020,6 +6521,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let declaration = identity.declaration?;
             self.struct_field_anchors
                 .get(&(declaration, name.into()))
+                .or_else(|| {
+                    let declaring = self.struct_declaration_for_declaration(declaration)?;
+                    self.struct_field_anchors.get(&(declaring, name.into()))
+                })
                 .copied()
         });
         if let Some(name) = name
@@ -6033,15 +6538,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             Some(anchor) => anchor,
             None => source_anchor(field, 0).map_err(GoLoweringError::Invalid)?,
         };
-        let procedure = self.session.locator();
-        let locator = SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        );
+        let locator = self.member_locator(anchor);
         if !resolved && let Some(name) = name {
             self.field_locators.insert(name.into(), locator.clone());
         }
@@ -6062,15 +6559,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return Ok(locator.clone());
         }
         let anchor = source_anchor(field, 0).map_err(GoLoweringError::Invalid)?;
-        let procedure = self.session.locator();
-        let locator = SemanticLocator::new(
-            procedure.mount(),
-            procedure.path().clone(),
-            procedure.language(),
-            procedure.declaration().clone(),
-            SemanticRole::MemoryLocation,
-            anchor,
-        );
+        let locator = self.member_locator(anchor);
         if let Some(qualified) = qualified {
             self.imported_static_locators
                 .insert(qualified, locator.clone());
@@ -6139,21 +6628,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 // anything that is not storage at all.
                 if self.package_values.contains(name)
                     || self.import_bindings.contains_key(name)
-                    || self.package_functions.contains(name)
+                    || self.package_functions.contains_key(name)
                     || is_go_predeclared_constant_kind(node.kind())
                 {
                     return Ok(None);
                 }
                 let anchor = source_anchor(node, 0).map_err(GoLoweringError::Invalid)?;
-                let procedure = self.session.locator();
-                SemanticLocator::new(
-                    procedure.mount(),
-                    procedure.path().clone(),
-                    procedure.language(),
-                    procedure.declaration().clone(),
-                    SemanticRole::MemoryLocation,
-                    anchor,
-                )
+                self.member_locator(anchor)
             }
         };
         let location = self.session.add_memory_location(
@@ -6457,13 +6938,118 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let name = node_text(self.prepared.source(), function)?;
         let byte = function.start_byte();
         let value_shadowed = self.binding_value(name, byte).is_some()
-            || self.package_functions.contains(name)
+            || self.package_functions.contains_key(name)
             || self.package_values.contains(name)
             || self.import_bindings.contains_key(name);
         (!value_shadowed
             && (is_predeclared_go_type(name)
                 || visible_go_named_type(self.named_type_definitions, name, byte).is_some()))
         .then_some(*operand)
+    }
+
+    /// The structured conversion this expression performs, in either spelling.
+    fn type_conversion(&self, node: Node<'tree>) -> Option<GoTypeConversion<'tree>> {
+        if node.kind() == "type_conversion_expression" {
+            return Some(GoTypeConversion {
+                target: node.child_by_field_name("type")?,
+                operand: node.child_by_field_name("operand")?,
+            });
+        }
+        let operand = self.call_shaped_type_conversion_operand(node)?;
+        let mut target = node.child_by_field_name("function")?;
+        while target.kind() == "parenthesized_expression" {
+            target = first_named_child(target)?;
+        }
+        Some(GoTypeConversion { target, operand })
+    }
+
+    /// The underlying type a conversion's target syntax names.
+    ///
+    /// A conversion whose target is a plain type name parses as a call, so
+    /// tree-sitter labels that name `identifier` rather than `type_identifier`.
+    /// Resolving it through the file's named-type inventory is the structured
+    /// answer; the rest of the type syntax resolves as written.
+    fn conversion_target_underlying(&self, target: Node<'tree>) -> Option<Node<'tree>> {
+        let Some(definition) = self.conversion_target_definition(target) else {
+            return self.file_underlying_type(target, target.start_byte());
+        };
+        self.file_underlying_type(definition.underlying, definition.underlying.start_byte())
+    }
+
+    /// The named-type definition a call-shaped conversion target names.
+    fn conversion_target_definition(
+        &self,
+        target: Node<'tree>,
+    ) -> Option<GoNamedTypeDefinition<'tree>> {
+        if target.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), target)?;
+        self.visible_named_type_definition(name, target.start_byte())
+    }
+
+    /// The type identity a conversion establishes for its result.
+    fn conversion_target_identity(
+        &self,
+        target: Node<'tree>,
+        byte: usize,
+    ) -> Option<GoTypeIdentity> {
+        if target.kind() != "identifier" {
+            return self.type_identity(target, byte);
+        }
+        let name = nonempty_node_text(self.prepared.source(), target)?;
+        Some(GoTypeIdentity {
+            pointer_depth: 0,
+            name: name.into(),
+            declaration: self
+                .conversion_target_definition(target)
+                .map(|definition| definition.declaration),
+        })
+    }
+
+    /// The underlying aggregate an exact by-value conversion produces.
+    ///
+    /// Go converts between two types when their underlying types are
+    /// identical, and the conversion of a value aggregate duplicates the whole
+    /// value. Identity is proved by reaching one underlying type node from both
+    /// sides through the file's named-type inventory, never by comparing
+    /// rendered spellings, so two separately written but structurally equal
+    /// struct literals stay unproven here.
+    fn exact_value_aggregate_conversion(
+        &self,
+        conversion: GoTypeConversion<'tree>,
+        byte: usize,
+    ) -> Option<Node<'tree>> {
+        let target = self.conversion_target_underlying(conversion.target)?;
+        if !matches!(
+            target.kind(),
+            "struct_type" | "array_type" | "implicit_length_array_type"
+        ) {
+            return None;
+        }
+        let operand = transparent_parenthesized_expression(conversion.operand);
+        (self.expression_underlying_type(operand, byte)?.id() == target.id()).then_some(target)
+    }
+
+    /// The underlying type this expression's proven type resolves to.
+    fn expression_underlying_type(&self, node: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+        let node = transparent_parenthesized_expression(node);
+        if let Some(conversion) = self.type_conversion(node) {
+            return self.conversion_target_underlying(conversion.target);
+        }
+        if matches!(
+            node.kind(),
+            "composite_literal" | "type_assertion_expression"
+        ) && let Some(type_node) = node.child_by_field_name("type")
+        {
+            return self.file_underlying_type(type_node, byte);
+        }
+        let identity = self.expression_type_identity(node, byte)?;
+        if identity.pointer_depth != 0 {
+            return None;
+        }
+        let definition = self.named_type_definition_for_declaration(identity.declaration?)?;
+        self.file_underlying_type(definition.underlying, definition.underlying.start_byte())
     }
 
     fn builtin_make_allocation_kind(&self, node: Node<'tree>) -> Option<AllocationKind> {
@@ -7349,6 +7935,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let identity_preserving =
                 self.return_shape_supported && source_node.kind() != "type_conversion_expression";
             if identity_preserving {
+                let source =
+                    self.append_returned_aggregate(builder, terminal, *source_node, source)?;
                 self.append_effect(
                     builder,
                     terminal,
@@ -7408,6 +7996,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     self.expression_value_kind(source_node),
                 )?;
                 let identity_preserving = self.named_results.is_empty();
+                let source = if identity_preserving {
+                    self.append_returned_aggregate(builder, terminal, source_node, source)?
+                } else {
+                    source
+                };
                 self.append_effect(
                     builder,
                     terminal,
@@ -8234,7 +8827,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         continue;
                     };
                     if !self.value_types.contains_key(&target)
-                        && self.value_storage_kinds.get(&target) != Some(&GoStorageKind::Array)
+                        && !self
+                            .value_storage_kinds
+                            .get(&target)
+                            .is_some_and(|storage| storage.is_value_aggregate())
                     {
                         self.add_gap(
                             builder,
@@ -8259,7 +8855,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     let zero = self.source_value(builder, *name_node, zero_kind)?;
                     if let Some(storage) = self.value_storage_kinds.get(&target).copied() {
                         self.value_storage_kinds.insert(zero, storage);
-                        if storage == GoStorageKind::Array {
+                        if storage.is_value_aggregate() {
                             self.fresh_binding_values.insert(zero);
                         }
                     }
@@ -9833,6 +10429,62 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
         match node.kind() {
+            "type_conversion_expression" | "call_expression"
+                if self.type_conversion(node).is_some_and(|conversion| {
+                    self.exact_value_aggregate_conversion(conversion, node.start_byte())
+                        .is_some()
+                }) =>
+            {
+                // Go converts between two types whose underlying types are
+                // identical, and converting a value aggregate duplicates the
+                // whole value into the result's own storage. Only the type
+                // name changes, so no distinct operation runs.
+                let conversion = self
+                    .type_conversion(node)
+                    .expect("guard proves one structured conversion");
+                let boundary = self.point(builder, node, Vec::new())?;
+                let source = self.expression_value(
+                    builder,
+                    conversion.operand,
+                    self.expression_value_kind(conversion.operand),
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value: source,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    boundary,
+                    SemanticEffect::ValueFlow {
+                        kind: GO_AGGREGATE_COPY_FLOW,
+                        source,
+                        target: result,
+                    },
+                )?;
+                let storage = self
+                    .exact_value_aggregate_conversion(conversion, node.start_byte())
+                    .and_then(go_storage_kind_of_underlying)
+                    .expect("guard proves one exact value-aggregate conversion");
+                self.append_aggregate_copy_contents(builder, boundary, storage, source, result)?;
+                self.edge(builder, boundary, next)?;
+                let children = if node.kind() == "type_conversion_expression" {
+                    runtime_expression_children(node)
+                } else {
+                    vec![conversion.operand]
+                };
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(boundary),
+                    scope,
+                    stack,
+                )
+            }
             "call_expression" if self.call_shaped_type_conversion_operand(node).is_some() => {
                 let operand = self
                     .call_shaped_type_conversion_operand(node)
@@ -11286,13 +11938,21 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         .and_then(|capture| capture.arguments.get(index))
                         .map(|captured| captured.target)
                     {
+                        // A deferred call already captured its operand at
+                        // registration time and owns that copy's semantics.
                         captured
                     } else {
-                        self.expression_value(
+                        let value = self.expression_value(
                             builder,
                             value_node,
                             self.expression_value_kind(value_node),
-                        )?
+                        )?;
+                        // Go passes every argument by value. An inline aggregate
+                        // actual therefore reaches the callee as the callee's
+                        // own storage holding the caller's members: the callee
+                        // observes those members, and a write to its parameter
+                        // is not observable here.
+                        self.append_transferred_aggregate(builder, invoke, value_node, value)?
                     };
                     Ok(if argument.kind() == "variadic_argument" {
                         SemanticCallArgument {
@@ -12259,15 +12919,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let value =
                 self.expression_value(builder, value_node, self.expression_value_kind(value_node))?;
             let field = fields[field_index].clone();
-            let procedure = self.session.locator();
-            let member = SemanticLocator::new(
-                procedure.mount(),
-                procedure.path().clone(),
-                procedure.language(),
-                procedure.declaration().clone(),
-                SemanticRole::MemoryLocation,
-                field.anchor,
-            );
+            let member = self.member_locator(field.anchor);
             let Some(field_storage) = field
                 .type_node
                 .and_then(|node| self.composite_field_storage(node))
@@ -12632,7 +13284,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 offset: BackingStoreOffset::Zero,
             },
             Some(GoStorageKind::Channel) => ValueFlowKind::Local,
-            Some(GoStorageKind::Array) | None => ValueFlowKind::LanguageDefined,
+            Some(GoStorageKind::Array | GoStorageKind::Struct) | None => {
+                ValueFlowKind::LanguageDefined
+            }
         }
     }
 
@@ -13538,7 +14192,7 @@ struct GoAggregateInitializer {
     value: ValueId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GoCompositeFieldStorage {
     InlineAggregate,
     InlineScalar,

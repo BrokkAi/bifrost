@@ -2570,6 +2570,67 @@
         }
       ]
     },
+    "ExplicitValueOperation": {
+      "description": "A declaration-level role for a value operation the call site writes out.\n\n[`ImplicitOperation`] describes an operation a language rule selects for an\nexpression nobody spelled. These roles are the opposite case: the source\nnames the member, so a consumer binds it through the receiver's or\nargument's exact modeled type together with this member's own declaration\nid, never through a rendered member name.\n\nEach role states only what the operation does to the values involved. It\nsays nothing about the member's other behavior, and a member whose role\nthe producer did not review carries no role at all rather than a neutral\none.",
+      "oneOf": [
+        {
+          "description": "The receiver's value becomes the first argument's value. The receiver\nobject is written, not replaced, so its storage identity is unchanged\nand stays distinct from the argument's.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver_assign"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "The first argument's value is added to what the receiver already holds.\nThe receiver keeps its previous value as well, so this states added\ndependence rather than replacement.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver_extend"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "The normal result reads the receiver's value out of the receiver's own\nstorage. The result is a view of that storage rather than an\nindependent object, so writing through it writes the receiver.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver_projection"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "The normal result denotes the single argument's own object as an\nexpiring value. No operation runs and no storage is created; the result\nexists so the surrounding context can select the operation it performs\non an expiring operand.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "argument_expiring_cast"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
     "GeneratorRule": {
       "type": "object",
       "properties": {
@@ -2993,6 +3054,17 @@
           "description": "The authored declarations contain every callable with this member's\nexact owner, name, receiver form, and fixed arity.\n\nThis is narrower than pack or owner-surface completeness. It permits\nan exact external-call binding for this one structural family while a\ncurated declaration pack remains globally partial. Same-family\nduplicates still conflict, and variadic families cannot yet make this\nclaim.",
           "type": "boolean",
           "default": false
+        },
+        "explicit_operation": {
+          "description": "Reviewed role of this exact member in a value operation the call site\nspells. The member's own stable `id` is the operation identity.\n\nSerialized only when reviewed, so adding the field leaves the\ncanonical bytes and content digest of every member that does not carry\na role unchanged.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExplicitValueOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "extension_receiver": {
           "anyOf": [

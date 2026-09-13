@@ -1605,6 +1605,7 @@ fn push_member(
             is_abstract,
             is_virtual: is_abstract,
             implicit_operation: None,
+            explicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver,

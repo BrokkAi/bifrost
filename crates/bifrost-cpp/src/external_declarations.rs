@@ -6,15 +6,15 @@
 
 use crate::adapter::parse_cpp_file;
 use crate::declarations::{
-    CppComparableSlot, CppParameterType, cpp_callable_parameter_type_identities,
-    cpp_callable_return_type_identity, cpp_comparable_parameter_shapes, cpp_function_declarator_at,
-    node_text,
+    CppComparableNode, CppComparableSlot, CppParameterType, cpp_active_template_type_parameter,
+    cpp_callable_parameter_type_identities, cpp_callable_return_type_identity,
+    cpp_comparable_parameter_shapes, cpp_function_declarator_at, node_text,
 };
 use crate::graph::resolver::cpp_name_for;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnit, CodeUnitType, CppTemplateMetadata, SignatureMetadata,
-    StructuredTypeIdentity,
+    StructuredTypeIdentity, StructuredTypeNodeView,
 };
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, collect_parse_errors};
 use brokk_bifrost_core::hash::HashMap;
@@ -54,11 +54,50 @@ pub enum CppExternalVisibility {
     Private,
 }
 
+/// What a reached external declaration set indexed at one name.
+///
+/// A namespace is kept because it is the declaration owner of every free
+/// function written inside it. Dropping it left those declarations owner-less,
+/// and a consumer that publishes a declaration model has no place to put a
+/// member whose owner it never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CppExternalTypeKind {
+    Class,
+    Namespace,
+    TypeAlias,
+}
+
+/// The nearest indexed declaration that scopes one external member.
+///
+/// A type owner and a namespace owner are deliberately distinct: only a type
+/// owner gives its members a receiver and value semantics, while a namespace
+/// scopes a declaration without either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CppExternalOwner {
+    Type(String),
+    Namespace(String),
+}
+
+impl CppExternalOwner {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Type(name) | Self::Namespace(name) => name,
+        }
+    }
+
+    pub fn type_name(&self) -> Option<&str> {
+        match self {
+            Self::Type(name) => Some(name),
+            Self::Namespace(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CppExternalType {
     pub name: String,
     pub source_name: String,
-    pub is_type_alias: bool,
+    pub kind: CppExternalTypeKind,
     pub underlying_type: Option<StructuredTypeIdentity>,
     /// Structured template declaration metadata, when the class declaration
     /// was reached through a template declaration.  Keeping this alongside
@@ -72,7 +111,7 @@ pub struct CppExternalType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CppExternalMember {
-    pub owner: Option<String>,
+    pub owner: Option<CppExternalOwner>,
     pub name: String,
     pub qualified_name: String,
     pub kind: CppExternalMemberKind,
@@ -94,6 +133,10 @@ pub struct CppExternalMember {
     /// Whether a constructor is available to implicit conversion.
     pub explicitness: Option<CppCallableExplicitness>,
     pub return_type: Option<StructuredTypeIdentity>,
+    /// The sole forwarding-reference parameter's type is returned as an
+    /// rvalue reference, directly or through `remove_reference<T>::type`.
+    /// This preserves a declaration relationship, not a function-body claim.
+    pub returns_forwarding_reference: bool,
     pub source_path: PathBuf,
 }
 
@@ -251,10 +294,24 @@ pub fn extract_external_declarations(
             break;
         }
         match declaration.kind() {
+            CodeUnitType::Module => types.push(CppExternalType {
+                name: declaration.fq_name(),
+                source_name: cpp_name_for(&declaration),
+                kind: CppExternalTypeKind::Namespace,
+                underlying_type: None,
+                template_metadata: None,
+                visibility: CppExternalVisibility::Public,
+                source_path: source_path.to_path_buf(),
+                direct_bases: Vec::new(),
+            }),
             CodeUnitType::Class => types.push(CppExternalType {
                 name: declaration.fq_name(),
                 source_name: cpp_name_for(&declaration),
-                is_type_alias: parsed.type_aliases.contains(&declaration),
+                kind: if parsed.type_aliases.contains(&declaration) {
+                    CppExternalTypeKind::TypeAlias
+                } else {
+                    CppExternalTypeKind::Class
+                },
                 underlying_type: parsed
                     .signature_metadata
                     .get(&declaration)
@@ -304,8 +361,18 @@ pub fn extract_external_declarations(
                             cpp_callable_return_type_identity(declarator, source, &ancestry)
                         })
                     });
+                let returns_forwarding_reference = function_declarator.is_some_and(|declarator| {
+                    cpp_returns_forwarding_reference(
+                        declarator,
+                        source,
+                        &ancestry,
+                        parameter_types.as_deref(),
+                        parameter_shapes.as_deref(),
+                        return_type.as_ref(),
+                    )
+                });
                 members.push(CppExternalMember {
-                    owner: nearest_type_owner(&declaration, &parent_by_child),
+                    owner: nearest_declaration_owner(&declaration, &parent_by_child),
                     name: declaration.terminal_name().to_owned(),
                     qualified_name: cpp_name_for(&declaration),
                     kind: match declaration.kind() {
@@ -325,10 +392,11 @@ pub fn extract_external_declarations(
                     callable_arity: metadata.and_then(SignatureMetadata::callable_arity),
                     explicitness: function_declarator.and_then(cpp_callable_explicitness),
                     return_type,
+                    returns_forwarding_reference,
                     source_path: source_path.to_path_buf(),
                 });
             }
-            CodeUnitType::Module | CodeUnitType::FileScope => {}
+            CodeUnitType::FileScope => {}
         }
     }
 
@@ -403,14 +471,146 @@ fn cpp_callable_explicitness(mut declarator: Node<'_>) -> Option<CppCallableExpl
     Some(explicit.unwrap_or(CppCallableExplicitness::Implicit))
 }
 
-fn nearest_type_owner(
+fn cpp_returns_forwarding_reference<'tree>(
+    declarator: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+    parameters: Option<&[CppParameterType]>,
+    shapes: Option<&[CppComparableSlot]>,
+    returns: Option<&StructuredTypeIdentity>,
+) -> bool {
+    let (
+        Some([CppParameterType::Structured(parameter)]),
+        Some([CppComparableSlot::Shape(shape)]),
+        Some(returns),
+    ) = (parameters, shapes, returns)
+    else {
+        return false;
+    };
+    let Some(StructuredTypeNodeView::RvalueReference(inner)) = parameter.view(parameter.root_id())
+    else {
+        return false;
+    };
+    let Some(StructuredTypeNodeView::Named(name)) = parameter.view(inner) else {
+        return false;
+    };
+    let [parameter_name] = name.path() else {
+        return false;
+    };
+    let CppComparableNode::Reference { inner } = shape.node(shape.root()) else {
+        return false;
+    };
+    if !matches!(
+        shape.node(*inner),
+        CppComparableNode::Named {
+            konst: false,
+            volatil: false,
+            ..
+        }
+    ) || name.is_absolute()
+        || !cpp_active_template_type_parameter(declarator, parameter_name, source, ancestry)
+        || !matches!(
+            returns.view(returns.root_id()),
+            Some(StructuredTypeNodeView::RvalueReference(_))
+        )
+    {
+        return false;
+    }
+
+    // Keep the dependent return's template argument. Its nominal structured
+    // name alone flattens `remove_reference<T>::type` and loses the `T`.
+    let mut current = declarator;
+    while let Some(parent) = ancestry.parent(current) {
+        if matches!(
+            parent.kind(),
+            "function_definition" | "declaration" | "field_declaration"
+        ) {
+            let mut cursor = parent.walk();
+            if parent.named_children(&mut cursor).any(|child| {
+                child.kind() == "type_qualifier"
+                    && matches!(node_text(child, source), "const" | "volatile")
+            }) {
+                return false;
+            }
+            return parent
+                .child_by_field_name("type")
+                .is_some_and(|return_node| {
+                    cpp_forwarded_return_type(return_node, source, parameter_name)
+                });
+        }
+        current = parent;
+    }
+    false
+}
+
+fn cpp_forwarded_return_type(node: Node<'_>, source: &str, parameter: &str) -> bool {
+    let mut components = Vec::new();
+    let mut removals = 0;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "type_identifier" | "namespace_identifier" => {
+                components.push(node_text(current, source));
+            }
+            "dependent_type" => {
+                if current.named_child_count() != 1 {
+                    return false;
+                }
+                stack.push(current.named_child(0).expect("one named child"));
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                let Some(name) = current.child_by_field_name("name") else {
+                    return false;
+                };
+                stack.push(name);
+                if let Some(scope) = current.child_by_field_name("scope") {
+                    stack.push(scope);
+                }
+            }
+            "template_type" => {
+                let (Some(name), Some(arguments)) = (
+                    current.child_by_field_name("name"),
+                    current.child_by_field_name("arguments"),
+                ) else {
+                    return false;
+                };
+                if !matches!(name.kind(), "identifier" | "type_identifier")
+                    || node_text(name, source) != "remove_reference"
+                    || arguments.named_child_count() != 1
+                {
+                    return false;
+                }
+                let mut argument = arguments.named_child(0).expect("one named argument");
+                if argument.kind() == "type_descriptor" && argument.named_child_count() == 1 {
+                    argument = argument.named_child(0).expect("one named type");
+                }
+                if !matches!(argument.kind(), "identifier" | "type_identifier")
+                    || node_text(argument, source) != parameter
+                {
+                    return false;
+                }
+                removals += 1;
+                stack.push(name);
+            }
+            _ => return false,
+        }
+    }
+    (removals == 0 && components == [parameter])
+        || (removals == 1
+            && (components == ["std", "remove_reference", "type"]
+                || components == ["remove_reference", "type"]))
+}
+
+fn nearest_declaration_owner(
     declaration: &CodeUnit,
     parent_by_child: &HashMap<CodeUnit, CodeUnit>,
-) -> Option<String> {
+) -> Option<CppExternalOwner> {
     let mut current = declaration;
     while let Some(parent) = parent_by_child.get(current) {
-        if parent.kind() == CodeUnitType::Class {
-            return Some(parent.fq_name());
+        match parent.kind() {
+            CodeUnitType::Class => return Some(CppExternalOwner::Type(parent.fq_name())),
+            CodeUnitType::Module => return Some(CppExternalOwner::Namespace(parent.fq_name())),
+            _ => {}
         }
         current = parent;
     }
@@ -499,7 +699,7 @@ mod tests {
         );
         assert!(
             declarations.members.iter().any(|record| {
-                record.owner.as_deref() == Some("std.vector")
+                record.owner.as_ref().and_then(CppExternalOwner::type_name) == Some("std.vector")
                     && record.name == "push_back"
                     && record.visibility == CppExternalVisibility::Public
             }),
@@ -507,7 +707,8 @@ mod tests {
         );
         assert!(
             declarations.members.iter().any(|record| {
-                record.owner.as_deref() == Some("std.vector") && record.name == "size"
+                record.owner.as_ref().and_then(CppExternalOwner::type_name) == Some("std.vector")
+                    && record.name == "size"
             }),
             "{declarations:#?}"
         );
@@ -526,7 +727,10 @@ mod tests {
         let constructors = declarations
             .members
             .iter()
-            .filter(|member| member.owner.as_deref() == Some("Widget") && member.name == "Widget")
+            .filter(|member| {
+                member.owner.as_ref().and_then(CppExternalOwner::type_name) == Some("Widget")
+                    && member.name == "Widget"
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(constructors.len(), 2, "{declarations:#?}");
@@ -578,7 +782,9 @@ mod tests {
             .members
             .iter()
             .filter(|member| {
-                member.owner.as_deref() == Some("std.basic_string") && member.name == "basic_string"
+                member.owner.as_ref().and_then(CppExternalOwner::type_name)
+                    == Some("std.basic_string")
+                    && member.name == "basic_string"
             })
             .collect::<Vec<_>>();
 
@@ -704,7 +910,7 @@ mod tests {
             .iter()
             .find(|record| record.name == "std.string")
             .unwrap_or_else(|| panic!("string alias: {declarations:#?}"));
-        assert!(alias.is_type_alias, "{alias:#?}");
+        assert_eq!(CppExternalTypeKind::TypeAlias, alias.kind, "{alias:#?}");
         let identity = alias
             .underlying_type
             .as_ref()
@@ -731,7 +937,7 @@ mod tests {
             .members
             .iter()
             .filter(|member| member.name == "add")
-            .filter_map(|member| member.owner.clone())
+            .filter_map(|member| member.owner.as_ref().map(|owner| owner.name().to_owned()))
             .collect::<Vec<_>>();
         owners.sort();
 

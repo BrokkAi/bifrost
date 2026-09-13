@@ -18058,7 +18058,7 @@ fn semantic_budget_exhaustion_is_a_reason_label_and_a_diagnostic() {
             semantic: CodeQuerySemanticLimits {
                 rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
                     if dimension == SemanticBudgetDimension::ProgramPoints {
-                        24
+                        26
                     } else {
                         1 << 20
                     }

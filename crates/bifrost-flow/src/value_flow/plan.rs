@@ -1211,7 +1211,7 @@ fn parameter_index_gap_is_refined_by_call_bindings<'snapshot>(
             && matches!(actuals[0].1, ProofStatus::Proven)
             && matches!(actuals[0].2, EvidenceCompleteness::Complete)
             && {
-                let origins = caller_origin_paths(
+                let origins = caller_storage_origins(
                     actuals[0].0,
                     caller_snapshot,
                     limits.max_carriers,
@@ -2102,18 +2102,18 @@ impl ValueFlowPlan {
         bindings.sort_by(|left, right| compare_bindings(left.value(), right.value()));
         sources.sort_by(|left, right| left.key().cmp(right.key()));
         sinks.sort_by(|left, right| left.key().cmp(right.key()));
-        for kill in &mut edge_kills {
-            kill.sources.sort();
-            kill.sources.dedup();
-        }
-        edge_kills.sort_by(compare_edge_kills);
-        edge_kills.dedup();
         if adjacent_duplicate(sources.iter().map(ValueFlowSourceSpec::key))
             || adjacent_duplicate(sinks.iter().map(ValueFlowSinkSpec::key))
         {
             return Err(ValueFlowPlanError::DuplicateEventKey);
         }
         let source_ids = SourceKeyIndex::new(&sources);
+        for kill in &mut edge_kills {
+            source_ids.sort_keys(&mut kill.sources);
+            kill.sources.dedup();
+        }
+        edge_kills.sort_by(compare_edge_kills);
+        edge_kills.dedup();
         let source_activation_triggers = bind_source_activation_triggers(&sources, &source_ids)?;
 
         let mount = root.artifact().key().mount();
@@ -3114,7 +3114,7 @@ impl ValueFlowPlan {
         }
 
         for kill in &mut edge_kills {
-            kill.sources.sort_unstable();
+            source_ids.sort_keys(&mut kill.sources);
             kill.sources.dedup();
         }
         edge_kills.sort_by(compare_edge_kills);
@@ -5225,7 +5225,7 @@ mod tests {
         assert_eq!(actuals[0].id(), actuals[1].id(), "same local numbering");
         let limits = call_location_oracle_limits(8);
         let mut indexes = CallerOriginIndexes::default();
-        let limited = caller_origin_paths(
+        let limited = caller_storage_origins(
             &CallArgumentEndpoint::Value(actuals[0].clone()),
             Some(&snapshots[0]),
             0,
@@ -5236,7 +5236,7 @@ mod tests {
         assert!(limited.origins.is_empty());
         for ordinal in [0, 1, 0, 1] {
             let snapshot = &snapshots[ordinal];
-            let search = caller_origin_paths(
+            let search = caller_storage_origins(
                 &CallArgumentEndpoint::Value(actuals[ordinal].clone()),
                 Some(snapshot),
                 8,
@@ -5260,7 +5260,7 @@ mod tests {
                 EvidenceCompleteness::Complete
             );
         }
-        let foreign = caller_origin_paths(
+        let foreign = caller_storage_origins(
             &CallArgumentEndpoint::Value(actuals[1].clone()),
             Some(&snapshots[0]),
             8,
@@ -6119,8 +6119,32 @@ fn value_location(
 }
 
 fn relation_has_identity_barrier(relation: &crate::analyzer::semantic::ValueFlowRelation) -> bool {
-    if relation.transfer.is_some() {
-        return true;
+    relation_transfer(relation).is_some()
+}
+
+/// Whether this relation stops the source's member *contents* from reaching the
+/// other side.
+///
+/// A duplicating transfer separates storage while starting the destination out
+/// holding what the source held, so a member read on the destination still
+/// observes the source's member. Only a transfer that restructures or changes
+/// the value stops that.
+fn relation_discards_copied_contents(
+    relation: &crate::analyzer::semantic::ValueFlowRelation,
+) -> bool {
+    relation_transfer(relation)
+        .is_some_and(|transfer| !transfer.is_some_and(ValueTransfer::preserves_member_contents))
+}
+
+/// The transfer this relation crosses, when it crosses one.
+///
+/// The outer `Option` is whether a transfer applies at all; the inner one is
+/// whether its exact payload is retained on the relation.
+fn relation_transfer(
+    relation: &crate::analyzer::semantic::ValueFlowRelation,
+) -> Option<Option<ValueTransfer>> {
+    if let Some(transfer) = relation.transfer {
+        return Some(Some(transfer));
     }
     let Some(point) = relation
         .point
@@ -6129,18 +6153,35 @@ fn relation_has_identity_barrier(relation: &crate::analyzer::semantic::ValueFlow
         .point(relation.point.id())
     else {
         debug_assert!(false, "validated value-flow relation names a live point");
-        return true;
+        return Some(None);
     };
-    matches!(
-        point
-            .events
-            .get(relation.event_index as usize)
-            .map(|event| &event.effect),
+    match point
+        .events
+        .get(relation.event_index as usize)
+        .map(|event| &event.effect)
+    {
         Some(SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::Transfer(_),
+            kind: ValueFlowKind::Transfer(transfer),
             ..
-        })
-    )
+        }) => Some(Some(*transfer)),
+        // An exact transfer is one definition written as two adjacent events,
+        // and the oracle publishes a relation for each. Reading the assignment
+        // alone would let a walk cross the very barrier its paired transfer
+        // states, so the pair is resolved here exactly as the IR contract
+        // spells it.
+        Some(SemanticEffect::Assignment { target, value }) => point
+            .events
+            .get(relation.event_index as usize + 1)
+            .and_then(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(transfer),
+                    source,
+                    target: flow_target,
+                } if source == *value && flow_target == *target => Some(Some(transfer)),
+                _ => None,
+            }),
+        _ => None,
+    }
 }
 
 fn append_origin(
@@ -6170,6 +6211,50 @@ fn append_origin(
     });
 }
 
+/// The caller locations whose *storage* the formal shares.
+///
+/// Any transfer stops this walk: an identity-separating copy means a callee
+/// write can never be observed through the caller's own storage.
+fn caller_storage_origins<'snapshot>(
+    actual: &CallArgumentEndpoint,
+    snapshot: Option<&'snapshot ValueFlowSnapshot>,
+    max_origins: usize,
+    path_limits: OracleLimits,
+    indexes: &mut CallerOriginIndexes<'snapshot>,
+) -> CallerOriginSearch {
+    caller_origin_paths(
+        actual,
+        snapshot,
+        max_origins,
+        path_limits,
+        indexes,
+        relation_has_identity_barrier,
+    )
+}
+
+/// The caller locations whose *contents* the formal starts out holding.
+///
+/// A duplicating transfer is crossed here: passing an aggregate by value gives
+/// the callee its own storage holding the caller's members, so a member read in
+/// the callee observes the caller's member even though a write does not travel
+/// back.
+fn caller_content_origins<'snapshot>(
+    actual: &CallArgumentEndpoint,
+    snapshot: Option<&'snapshot ValueFlowSnapshot>,
+    max_origins: usize,
+    path_limits: OracleLimits,
+    indexes: &mut CallerOriginIndexes<'snapshot>,
+) -> CallerOriginSearch {
+    caller_origin_paths(
+        actual,
+        snapshot,
+        max_origins,
+        path_limits,
+        indexes,
+        relation_discards_copied_contents,
+    )
+}
+
 // One temporary index per exact snapshot, shared by gap checks and call
 // projection. Full handles preserve materialization identity; bare ValueIds
 // would conflate different files or two materializations of the same file.
@@ -6184,16 +6269,14 @@ struct CallerOriginIndex<'snapshot> {
         &'snapshot crate::analyzer::semantic::ValueHandle,
         Vec<&'snapshot crate::analyzer::semantic::ValueFlowRelation>,
     >,
+    member_owners: HashSet<&'snapshot crate::analyzer::semantic::ValueHandle>,
 }
 
 impl<'snapshot> CallerOriginIndexes<'snapshot> {
-    fn incoming(
+    fn for_snapshot(
         &mut self,
         snapshot: &'snapshot ValueFlowSnapshot,
-    ) -> &HashMap<
-        &'snapshot crate::analyzer::semantic::ValueHandle,
-        Vec<&'snapshot crate::analyzer::semantic::ValueFlowRelation>,
-    > {
+    ) -> &CallerOriginIndex<'snapshot> {
         let index = if let Some(index) = self
             .entries
             .iter()
@@ -6202,15 +6285,27 @@ impl<'snapshot> CallerOriginIndexes<'snapshot> {
             index
         } else {
             let mut incoming = HashMap::<_, Vec<_>>::default();
+            let mut member_owners = HashSet::default();
             for relation in snapshot.relations() {
                 if let ValueFlowEndpoint::Value(target) = &relation.target {
                     incoming.entry(target).or_default().push(relation);
                 }
+                if relation.kind == ValueFlowRelationKind::MemoryStore
+                    && let ValueFlowEndpoint::Location(location) = &relation.target
+                    && !location.path().selectors().is_empty()
+                    && let AccessPathRoot::Value(owner) = location.path().root()
+                {
+                    member_owners.insert(owner);
+                }
             }
-            self.entries.push(CallerOriginIndex { snapshot, incoming });
+            self.entries.push(CallerOriginIndex {
+                snapshot,
+                incoming,
+                member_owners,
+            });
             self.entries.len() - 1
         };
-        &self.entries[index].incoming
+        &self.entries[index]
     }
 }
 
@@ -6220,6 +6315,7 @@ fn caller_origin_paths<'snapshot>(
     max_origins: usize,
     path_limits: OracleLimits,
     indexes: &mut CallerOriginIndexes<'snapshot>,
+    stops_walk: fn(&crate::analyzer::semantic::ValueFlowRelation) -> bool,
 ) -> CallerOriginSearch {
     if let CallArgumentEndpoint::Location { location, .. } = actual {
         let mut search = CallerOriginSearch::default();
@@ -6252,7 +6348,9 @@ fn caller_origin_paths<'snapshot>(
     let CallArgumentEndpoint::Value(actual) = actual else {
         unreachable!("location call argument endpoint returned above")
     };
-    let incoming = indexes.incoming(snapshot);
+    let index = indexes.for_snapshot(snapshot);
+    let incoming = &index.incoming;
+    let member_owners = &index.member_owners;
 
     #[derive(Debug, Clone)]
     struct PendingOrigin {
@@ -6277,15 +6375,47 @@ fn caller_origin_paths<'snapshot>(
             search.incomplete = true;
             continue;
         }
-        let Some(relations) = incoming.get(&current.value) else {
+        if current.value.procedure() != snapshot.procedure() {
             search.incomplete = true;
+            continue;
+        }
+        // Explicit destination members are the caller's current snapshot.
+        // Walking back across a copy would instead read the source at call
+        // time, after intervening writes may have changed it.
+        if member_owners.contains(&current.value) {
+            match value_location(&current.value, path_limits) {
+                Ok(location) => append_origin(
+                    &mut search,
+                    location,
+                    current.proof,
+                    current.completeness,
+                    max_origins,
+                ),
+                Err(_) => search.incomplete = true,
+            }
+            continue;
+        }
+        let Some(relations) = incoming.get(&current.value) else {
+            // A value no relation defines is its own storage root, the same
+            // canonicalization the oracle applies to a value with no load
+            // origin.
+            match value_location(&current.value, path_limits) {
+                Ok(location) => append_origin(
+                    &mut search,
+                    location,
+                    current.proof.clone(),
+                    current.completeness.clone(),
+                    max_origins,
+                ),
+                Err(_) => search.incomplete = true,
+            }
             continue;
         };
         for relation in relations {
             let proof = merge_call_rule_proof(&current.proof, relation.proof.clone());
             let completeness =
                 merge_call_rule_completeness(&current.completeness, relation.completeness.clone());
-            if relation_has_identity_barrier(relation) {
+            if stops_walk(relation) {
                 // A transfer may carry ordinary value dependence but never
                 // proves that the caller and callee observe one backing store.
                 continue;
@@ -6363,13 +6493,27 @@ fn append_projected_location_rules<'snapshot>(
     if callee_locations.is_empty() {
         return;
     }
-    let origins = caller_origin_paths(
-        actual,
-        caller_snapshot,
-        max_origins,
-        path_limits,
-        caller_origins,
-    );
+    let origins = match kind {
+        // Reading the formal's member at entry observes the caller's member,
+        // whether the actual was aliased or duplicated by value.
+        CallFlowRuleKind::Call => caller_content_origins(
+            actual,
+            caller_snapshot,
+            max_origins,
+            path_limits,
+            caller_origins,
+        ),
+        // Observing a callee write in the caller requires shared storage.
+        CallFlowRuleKind::NormalReturn | CallFlowRuleKind::ExceptionalReturn => {
+            caller_storage_origins(
+                actual,
+                caller_snapshot,
+                max_origins,
+                path_limits,
+                caller_origins,
+            )
+        }
+    };
     if origins.origins.is_empty() {
         return;
     }
@@ -6379,6 +6523,7 @@ fn append_projected_location_rules<'snapshot>(
             let (location, truncated) = match substitute_call_location(
                 &origin.location,
                 &formal_location.location,
+                bindings.call().procedure(),
                 path_limits,
             ) {
                 Ok(location) => location,
@@ -6412,8 +6557,13 @@ fn append_projected_location_rules<'snapshot>(
                 call: bindings.call().clone(),
                 callee: bindings.callee().clone(),
                 kind,
+                // The caller side of both directions is the same projected
+                // location: the actual's own storage with the formal's
+                // selectors appended. Using the bare origin in the call
+                // direction asked whether the whole container is tainted rather
+                // than the member the callee reads, so no member rule fired.
                 source: if kind == CallFlowRuleKind::Call {
-                    ValueFlowCarrier::Location(Box::new(origin.location.clone()))
+                    ValueFlowCarrier::Location(Box::new(location.clone()))
                 } else {
                     ValueFlowCarrier::Location(Box::new(formal_location.location.clone()))
                 },
@@ -6552,16 +6702,50 @@ fn append_call_location_rules<'snapshot>(
     Ok(())
 }
 
+/// Spell one callee member selector the way the caller spells the same member.
+///
+/// A member locator carries the enclosing declaration chain of the *use site*,
+/// which is why the storage key in
+/// [`crate::dataflow::reusable_summary::SummaryLocationKey::from_locator`]
+/// deliberately leaves that chain out: one field declaration is shared by
+/// accesses from different procedures. Grafting the callee's spelling onto a
+/// caller root would therefore build a location the caller never names, and the
+/// caller's own store or load of that member could never meet it. Respelling
+/// keeps the declaration-backed identity -- path, language, role and anchor --
+/// and takes only the accessor chain from the caller. A member declared outside
+/// the caller's own artifact keeps its spelling, because the caller has no
+/// scope to name it in.
+fn caller_member_selector(selector: &AccessSelector, caller: &ProcedureHandle) -> AccessSelector {
+    let AccessSelector::Field(member) = selector else {
+        return selector.clone();
+    };
+    if !Arc::ptr_eq(member.scope(), caller.artifact()) {
+        return selector.clone();
+    }
+    let locator = member.locator();
+    let respelled = crate::analyzer::semantic::SemanticLocator::new(
+        locator.mount(),
+        locator.path().clone(),
+        locator.language(),
+        caller.semantics().locator().declaration().clone(),
+        locator.role(),
+        locator.anchor(),
+    );
+    crate::analyzer::semantic::ScopedSemanticLocator::new(member.scope().clone(), respelled)
+        .map_or_else(|_| selector.clone(), AccessSelector::Field)
+}
+
 fn substitute_call_location(
     actual: &AbstractLocation,
     formal: &AbstractLocation,
+    caller: &ProcedureHandle,
     limits: OracleLimits,
 ) -> Result<(AbstractLocation, bool), ValueFlowPlanError> {
     let mut selectors = actual.path().selectors().to_vec();
     let mut lossy = !actual.path().is_exact() || !formal.path().is_exact();
     for selector in formal.path().selectors() {
         selectors.push(match selector {
-            AccessSelector::Field(field) => AccessSelector::Field(field.clone()),
+            AccessSelector::Field(_) => caller_member_selector(selector, caller),
             AccessSelector::Property(property) => AccessSelector::Property(property.clone()),
             AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(value)) => {
                 AccessSelector::Index(crate::analyzer::semantic::IndexSelector::Constant(*value))
@@ -7269,6 +7453,13 @@ impl<'a> SourceKeyIndex<'a> {
         }
     }
 
+    fn sort_keys(&self, keys: &mut [ValueFlowEventKey]) {
+        // IDs have the same order as the complete keys. Cache one lookup per
+        // key instead of comparing full locators throughout the sort. Missing
+        // keys remain rejected by the subsequent structured kill validation.
+        keys.sort_by_cached_key(|key| self.get(key));
+    }
+
     fn get(&self, key: &ValueFlowEventKey) -> Option<ValueFlowSourceId> {
         self.ids
             .get_or_init(|| {
@@ -7456,6 +7647,12 @@ mod activation_properties {
                 carrier: carrier.clone(),
                 sources: ordinals.iter().map(|ordinal| sources[(ordinal % count) as usize].key().clone()).collect(),
             };
+            let mut expected = kill.sources.clone();
+            expected.sort();
+            expected.dedup();
+            index.sort_keys(&mut kill.sources);
+            kill.sources.dedup();
+            prop_assert_eq!(&kill.sources, &expected);
             let kills = build_edge_kill_index(std::slice::from_ref(&kill), &carriers, &index).expect("valid kill");
             let bound_kill = &kills.by_edge.values().next().expect("one edge")[0];
             prop_assert_eq!(bound_kill.carrier, carrier_id);

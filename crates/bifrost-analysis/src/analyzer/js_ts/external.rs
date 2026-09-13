@@ -1863,6 +1863,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             is_abstract: false,
             is_virtual: draft.member_kind == MemberKind::Method && !draft.is_static,
             implicit_operation: None,
+            explicit_operation: None,
             callable_family_complete: false,
             signature: draft.signature,
             receiver: None,

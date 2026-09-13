@@ -1351,6 +1351,7 @@ fn callable_shape<'tree>(
             invocation: immediate,
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
+            construction_return: Default::default(),
             // A lambda or block body is not a named member of anything, so no
             // later declaration can redefine or override the callable this
             // literal names: its dispatch is closed. Every other Ruby callable

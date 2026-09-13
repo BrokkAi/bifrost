@@ -20,7 +20,13 @@ use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v7";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v10";
+
+/// How many declared slots one value-type copy duplicates.
+///
+/// A copy is one bounded step of the lowering, not a traversal, so a type with
+/// more slots than this keeps a typed decline rather than growing the graph.
+const CSHARP_MAX_COPIED_SLOTS: usize = 32;
 
 impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
 
@@ -76,6 +82,8 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
             static_callable_returns,
             type_receiver_shadows,
             member_declarations,
+            type_index,
+            conversion_operators,
         } = procedure_inventory;
         lower_procedure_batch(
             &specs,
@@ -89,6 +97,8 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
                     &static_callable_returns,
                     &type_receiver_shadows,
                     &member_declarations,
+                    &type_index,
+                    &conversion_operators,
                     staged_budget,
                     cancellation,
                 )
@@ -195,6 +205,643 @@ struct MemberDeclaration {
 /// [`StaticCallableReturnTypes`] performs for an overloaded static method.
 type MemberDeclarations = HashMap<TypeMemberKey, Option<MemberDeclaration>>;
 
+/// One of C#'s predefined types, read from the grammar's `predefined_type`
+/// keyword rather than from a rendered type spelling.
+///
+/// These are the types no user code can extend: a program can declare neither
+/// an operator on `int` nor a conversion to or from `object`. That closure is
+/// what lets every conversion between them be decided from the language
+/// definition alone, with no declaration to resolve (#2847).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CSharpPredefinedType {
+    Bool,
+    SByte,
+    Byte,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    NInt,
+    NUInt,
+    Char,
+    Float,
+    Double,
+    Decimal,
+    Object,
+    String,
+}
+
+impl CSharpPredefinedType {
+    fn from_keyword(keyword: &str) -> Option<Self> {
+        Some(match keyword {
+            "bool" => Self::Bool,
+            "sbyte" => Self::SByte,
+            "byte" => Self::Byte,
+            "short" => Self::Short,
+            "ushort" => Self::UShort,
+            "int" => Self::Int,
+            "uint" => Self::UInt,
+            "long" => Self::Long,
+            "ulong" => Self::ULong,
+            "nint" => Self::NInt,
+            "nuint" => Self::NUInt,
+            "char" => Self::Char,
+            "float" => Self::Float,
+            "double" => Self::Double,
+            "decimal" => Self::Decimal,
+            "object" => Self::Object,
+            "string" => Self::String,
+            _ => return None,
+        })
+    }
+
+    /// Whether a value of this type lives in its own storage. `object` and
+    /// `string` are the two predefined reference types.
+    const fn is_value_type(self) -> bool {
+        !matches!(self, Self::Object | Self::String)
+    }
+
+    /// Whether an assignment converts `self` to `target` with no cast and no
+    /// user code, and whether the converted value is still the same number.
+    ///
+    /// This is the language's own implicit numeric conversion table. The
+    /// conversions the specification names as possibly losing precision --
+    /// the integral types to `float`, and the 64-bit integral types to
+    /// `double` -- are the ones that replace the tracked value rather than
+    /// re-representing it.
+    fn implicit_numeric_conversion(self, target: Self) -> Option<ValuePreservation> {
+        use CSharpPredefinedType::{
+            Byte, Char, Decimal, Double, Float, Int, Long, NInt, NUInt, SByte, Short, UInt, ULong,
+            UShort,
+        };
+        let widening = matches!(
+            (self, target),
+            (SByte, Short | Int | Long | NInt | Float | Double | Decimal)
+                | (
+                    Byte,
+                    Short
+                        | UShort
+                        | Int
+                        | UInt
+                        | Long
+                        | ULong
+                        | NInt
+                        | NUInt
+                        | Float
+                        | Double
+                        | Decimal
+                )
+                | (Short, Int | Long | NInt | Float | Double | Decimal)
+                | (
+                    UShort,
+                    Int | UInt | Long | ULong | NInt | NUInt | Float | Double | Decimal
+                )
+                | (Int, Long | NInt | Float | Double | Decimal)
+                | (UInt, Long | ULong | NUInt | Float | Double | Decimal)
+                | (Long | ULong, Float | Double | Decimal)
+                | (NInt, Long | Float | Double | Decimal)
+                | (NUInt, ULong | Float | Double | Decimal)
+                | (
+                    Char,
+                    UShort | Int | UInt | Long | ULong | NInt | NUInt | Float | Double | Decimal
+                )
+                | (Float, Double)
+        );
+        if !widening {
+            return None;
+        }
+        let loses_precision = matches!(
+            (self, target),
+            (Int | UInt | Long | ULong | NInt | NUInt, Float)
+                | (Long | ULong | NInt | NUInt, Double)
+        );
+        Some(if loses_precision {
+            ValuePreservation::Changing
+        } else {
+            ValuePreservation::Preserving
+        })
+    }
+
+    /// Whether a cast converts `self` to `target` with no user code.
+    ///
+    /// Every pair of C# numeric types has an explicit conversion, so a cast
+    /// admits the implicit table plus the narrowing, sign-reinterpreting, and
+    /// truncating remainder. `bool` participates in none of them.
+    fn cast_numeric_conversion(self, target: Self) -> Option<ValuePreservation> {
+        if let Some(preservation) = self.implicit_numeric_conversion(target) {
+            return Some(preservation);
+        }
+        let numeric = |candidate: Self| candidate.is_value_type() && candidate != Self::Bool;
+        (numeric(self) && numeric(target)).then_some(ValuePreservation::Changing)
+    }
+}
+
+/// The exact type a C# type node names, when this file can resolve it.
+///
+/// Identity is the resolved declaration, not the spelling: two locals declared
+/// `Point` share one identity because they resolve to one `struct_declaration`,
+/// while a `Point` this file does not declare resolves to nothing at all
+/// rather than to its own name. A spelling this file cannot resolve therefore
+/// cannot be mistaken for a match with an equal spelling elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CSharpTypeIdentity {
+    Predefined(CSharpPredefinedType),
+    /// One type declared in this file. `start_byte` is the identity: one file
+    /// holds at most one declaration at a byte, and `kind` is a property of
+    /// that same declaration rather than a second identity.
+    Declared {
+        start_byte: usize,
+        kind: CSharpDeclaredTypeKind,
+    },
+}
+
+impl CSharpTypeIdentity {
+    /// Whether values of this type live in their own storage rather than
+    /// naming a shared object.
+    const fn is_value_type(self) -> bool {
+        match self {
+            Self::Predefined(predefined) => predefined.is_value_type(),
+            Self::Declared { kind, .. } => !matches!(kind, CSharpDeclaredTypeKind::Reference),
+        }
+    }
+
+    /// The copy an exact same-type carry performs: one scalar, or a whole
+    /// aggregate whose copied member contents remain a separate concern.
+    const fn same_type_copy(self) -> Option<TransferKind> {
+        match self {
+            Self::Predefined(predefined) if predefined.is_value_type() => Some(TransferKind::Copy),
+            Self::Declared {
+                kind: CSharpDeclaredTypeKind::Struct,
+                ..
+            } => Some(TransferKind::AggregateCopy),
+            Self::Declared {
+                kind: CSharpDeclaredTypeKind::Enum,
+                ..
+            } => Some(TransferKind::Copy),
+            Self::Predefined(_)
+            | Self::Declared {
+                kind: CSharpDeclaredTypeKind::Reference,
+                ..
+            } => None,
+        }
+    }
+}
+
+/// How carrying a value of one exact type into a destination of another exact
+/// type relates the two.
+///
+/// The three answers are different in kind. A transfer gives the destination
+/// its own storage while keeping the value dependence; an alias means both
+/// names denote one object; and a user-defined operator is ordinary user code
+/// whose result depends on its operand only as far as its own body says, so it
+/// is published as the call it is rather than as a transfer whose preservation
+/// this file cannot state.
+#[derive(Debug, Clone, Copy)]
+enum CSharpValueCarry {
+    Transfer(TransferKind),
+    Alias,
+    UserDefined(CSharpConversionOperator),
+}
+
+impl CSharpValueCarry {
+    /// The value-flow edge a transfer or an alias publishes next to its
+    /// assignment, given the flow kind the destination would otherwise carry.
+    /// A user-defined operator publishes a call instead and has no edge here.
+    const fn flow_kind(self, alias: ValueFlowKind) -> Option<ValueFlowKind> {
+        match self {
+            Self::Transfer(kind) => Some(ValueFlowKind::Transfer(ValueTransfer {
+                kind,
+                // C# selects a copy, a boxing, or a predefined conversion from
+                // the types alone: no procedure runs, so the transfer names no
+                // call site.
+                operation: TransferOperation::None,
+            })),
+            Self::Alias => Some(alias),
+            Self::UserDefined(_) => None,
+        }
+    }
+}
+
+/// Whether a declared type's values are copied into independent storage or
+/// share one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CSharpDeclaredTypeKind {
+    /// A `struct` or `record struct`: an aggregate copied member by member.
+    Struct,
+    /// An `enum`: one scalar value.
+    Enum,
+    /// A `class`, `record`, `interface`, or `delegate`: a shared object.
+    Reference,
+}
+
+#[derive(Debug, Clone)]
+struct CSharpTypeDeclaration {
+    start_byte: usize,
+    kind: CSharpDeclaredTypeKind,
+    /// The declaring type's start byte when this declaration is nested. An
+    /// unqualified occurrence outside that type does not name it.
+    container: Option<usize>,
+    /// The namespace this declaration sits in. An unqualified occurrence names
+    /// it from inside that namespace or one nested in it, and not otherwise.
+    namespace: Box<[Box<str>]>,
+}
+
+/// Type declarations by the simple name a type node can spell, keyed the way
+/// an unqualified occurrence names them.
+///
+/// A `None` value records a name that more than one declaration in this file
+/// claims. Such a name resolves to no single declaration, so an occurrence of
+/// it must decline -- the same collapse [`MemberDeclarations`] performs.
+type TypeDeclarations = HashMap<Box<str>, Option<CSharpTypeDeclaration>>;
+
+/// One exact ordinary static callable and its declared parameter types.
+#[derive(Debug)]
+struct CSharpStaticCallable {
+    procedure: ProcedureId,
+    parameters: Box<[(Box<str>, CSharpTypeIdentity)]>,
+}
+
+/// Everything a bare type name has to clear before it names one of this
+/// file's type declarations.
+///
+/// A name is not a type identity just because a declaration in the file spells
+/// it the same way. A method or type parameter binds the name to a
+/// substitution this pass knows nothing about; a `using X = ...;` alias binds
+/// it to another type entirely; and a declaration nested in another type, or
+/// sitting in a namespace this position is not inside, is not in scope
+/// unqualified. Each of those must resolve to nothing rather than to the
+/// same-named declaration (#2847).
+#[derive(Debug, Default)]
+struct CSharpTypeIndex {
+    declarations: TypeDeclarations,
+    /// Names bound by a `using X = ...;` alias anywhere in this file.
+    aliases: HashSet<Box<str>>,
+    /// Instance storage per declared type, keyed by the declaration's start
+    /// byte. A value-type copy duplicates exactly these slots.
+    members: HashMap<usize, CSharpTypeMembers>,
+    /// What each declaration is, keyed by its start byte, so a lexically
+    /// enclosing type resolves without a name lookup that a shadowing name
+    /// could divert.
+    kinds: HashMap<usize, CSharpDeclaredTypeKind>,
+    callables: HashMap<(usize, Box<str>), Option<CSharpStaticCallable>>,
+}
+
+/// One instance member whose storage a value-type copy duplicates.
+///
+/// The anchor is the *declaration's*, which is the same anchor an ordinary
+/// member access uses, so the copy writes the very location a later read of
+/// the destination addresses.
+#[derive(Debug, Clone)]
+struct CSharpTypeMember {
+    name: Box<str>,
+    anchor: SourceAnchor,
+    value_copy: MemoryValueCopy,
+    type_identity: Option<CSharpTypeIdentity>,
+    type_spelling: Option<Box<str>>,
+}
+
+/// The instance state one declared type holds, as this file sees it.
+#[derive(Debug, Default, Clone)]
+struct CSharpTypeMembers {
+    /// Declared instance fields, auto-properties, and field-like events, in
+    /// declaration order.
+    members: Vec<CSharpTypeMember>,
+    /// Whether this file enumerated every slot the type holds. A `partial`
+    /// declaration, a positional record, and a member whose own type is
+    /// another aggregate each leave state a one-level copy does not carry.
+    exact: bool,
+}
+
+impl CSharpTypeIndex {
+    /// The exact type a type node names at its own position.
+    fn resolve(&self, node: Node<'_>, source: &str) -> Option<CSharpTypeIdentity> {
+        match node.kind() {
+            "predefined_type" => nonempty_node_text(source, node)
+                .and_then(CSharpPredefinedType::from_keyword)
+                .map(CSharpTypeIdentity::Predefined),
+            "identifier" => {
+                let name = nonempty_node_text(source, node)?;
+                if self.aliases.contains(name) || type_parameter_binds(node, name, source) {
+                    return None;
+                }
+                let declaration = self.declarations.get(name)?.as_ref()?;
+                declaration_is_visible_from(declaration, node, source).then_some(
+                    CSharpTypeIdentity::Declared {
+                        start_byte: declaration.start_byte,
+                        kind: declaration.kind,
+                    },
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The exact type one declaration in this file is, addressed by the
+    /// declaration itself rather than by a name that could be shadowed.
+    fn declared_at(&self, start_byte: usize) -> Option<CSharpTypeIdentity> {
+        self.kinds
+            .get(&start_byte)
+            .map(|kind| CSharpTypeIdentity::Declared {
+                start_byte,
+                kind: *kind,
+            })
+    }
+
+    fn member(&self, owner: CSharpTypeIdentity, name: &str) -> Option<&CSharpTypeMember> {
+        let CSharpTypeIdentity::Declared { start_byte, .. } = owner else {
+            return None;
+        };
+        let mut matches = self
+            .members
+            .get(&start_byte)?
+            .members
+            .iter()
+            .filter(|member| member.name.as_ref() == name);
+        let member = matches.next()?;
+        matches.next().is_none().then_some(member)
+    }
+
+    /// The instance storage a declared type holds.
+    fn storage_of(&self, start_byte: usize) -> Option<&CSharpTypeMembers> {
+        self.members.get(&start_byte)
+    }
+}
+
+/// Whether a type parameter in scope at `node` binds `name`.
+///
+/// The walk covers every enclosing declaration that can introduce one: a
+/// generic method or local function, and every enclosing generic type. A
+/// method type parameter `T` and a file-level `struct T` are different types,
+/// and only the parameter is in scope inside the method.
+fn type_parameter_binds(node: Node<'_>, name: &str, source: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        // The list is found by kind rather than by field: a
+        // `method_declaration` labels it `type_parameters`, a
+        // `class_declaration` carries it unlabelled.
+        let parameters = candidate
+            .child_by_field_name("type_parameters")
+            .or_else(|| {
+                named_children(candidate)
+                    .into_iter()
+                    .find(|child| child.kind() == "type_parameter_list")
+            });
+        if let Some(parameters) = parameters {
+            for parameter in named_children(parameters) {
+                if parameter.kind() == "type_parameter"
+                    && parameter
+                        .child_by_field_name("name")
+                        .or_else(|| first_named_child(parameter))
+                        .and_then(|declared| nonempty_node_text(source, declared))
+                        == Some(name)
+                {
+                    return true;
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+/// Whether an unqualified occurrence at `node` can name `declaration`.
+///
+/// A nested type is reachable unqualified only from inside the type that
+/// declares it. A namespace-scope type is reachable from its own namespace and
+/// from any namespace nested in it, which is the outward search C# performs.
+/// A `using` import could widen this; leaving it out only declines, which is
+/// the safe direction.
+fn declaration_is_visible_from(
+    declaration: &CSharpTypeDeclaration,
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    if let Some(container) = declaration.container {
+        let mut current = enclosing_type_node(node);
+        while let Some(owner) = current {
+            if owner.start_byte() == container {
+                return true;
+            }
+            current = enclosing_type_node(owner);
+        }
+        return false;
+    }
+    let occurrence = enclosing_namespace_path(source, node);
+    declaration.namespace.len() <= occurrence.len()
+        && declaration
+            .namespace
+            .iter()
+            .zip(occurrence.iter())
+            .all(|(declared, enclosing)| declared == enclosing)
+}
+
+/// One `implicit`/`explicit operator` declaration whose source and target
+/// types this file resolved exactly.
+#[derive(Debug, Clone, Copy)]
+struct CSharpConversionOperator {
+    procedure: ProcedureId,
+    /// Whether the operator runs without a cast. An `explicit` operator is
+    /// selected only by a cast expression.
+    implicit: bool,
+}
+
+/// User-defined conversion operators keyed by the exact `(source, target)`
+/// pair they convert between.
+///
+/// A `None` value records a pair that more than one declaration claims. C#
+/// rejects such a program, and this file cannot say which operator a
+/// half-edited one would run, so the pair selects nothing.
+type ConversionOperators =
+    HashMap<(CSharpTypeIdentity, CSharpTypeIdentity), Option<CSharpConversionOperator>>;
+
+/// One conversion operator awaiting the completed type index.
+///
+/// The operator's own source and target types are ordinary type nodes, so they
+/// can only be resolved once every declaration in the file has been recorded.
+struct PendingConversionOperator<'tree> {
+    procedure: ProcedureId,
+    declaration: Node<'tree>,
+}
+
+/// Record a type declaration under its simple name, collapsing a name that
+/// more than one declaration in this file claims.
+///
+/// The declaration also opens its own instance-storage row. A `partial`
+/// declaration and a positional record each declare state elsewhere, so the
+/// row starts inexact for them and a copy of that type keeps a typed decline.
+fn record_type_declaration(
+    types: &mut TypeDeclarations,
+    members: &mut HashMap<usize, CSharpTypeMembers>,
+    kinds: &mut HashMap<usize, CSharpDeclaredTypeKind>,
+    node: Node<'_>,
+    source: &str,
+) {
+    let kind = match node.kind() {
+        "struct_declaration" | "record_struct_declaration" => CSharpDeclaredTypeKind::Struct,
+        "enum_declaration" => CSharpDeclaredTypeKind::Enum,
+        "class_declaration" | "interface_declaration" | "delegate_declaration" => {
+            CSharpDeclaredTypeKind::Reference
+        }
+        // A `record` is a class unless it spells `record struct`, which some
+        // grammar generations report under this one kind rather than under
+        // `record_struct_declaration`.
+        "record_declaration" => {
+            if has_direct_token(node, "struct") {
+                CSharpDeclaredTypeKind::Struct
+            } else {
+                CSharpDeclaredTypeKind::Reference
+            }
+        }
+        _ => return,
+    };
+    let Some(name) = declaration_container_name(source, node) else {
+        return;
+    };
+    let declaration = CSharpTypeDeclaration {
+        start_byte: node.start_byte(),
+        kind,
+        container: enclosing_type_node(node).map(|owner| owner.start_byte()),
+        namespace: enclosing_namespace_path(source, node),
+    };
+    kinds.insert(node.start_byte(), kind);
+    members.insert(
+        node.start_byte(),
+        CSharpTypeMembers {
+            members: Vec::new(),
+            exact: !has_modifier(source, node, "partial")
+                && node.child_by_field_name("parameters").is_none(),
+        },
+    );
+    match types.entry(name) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            // A partial type declares one type in several places, but this
+            // file cannot tell a second part from a second type, so both
+            // collapse into a decline.
+            entry.insert(None);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(declaration));
+        }
+    }
+}
+
+/// One declared instance slot awaiting the completed type index.
+///
+/// Whether a slot is copyable one level deep depends on its own declared type,
+/// which can only be resolved once every declaration in the file is recorded.
+struct PendingTypeMember<'tree> {
+    owner: usize,
+    member: CSharpTypeMember,
+    declared_type: Option<Node<'tree>>,
+}
+
+/// Whether a property declares storage of its own.
+///
+/// An auto-property is a slot; a property with an accessor body or an
+/// expression body computes its value from slots that are already recorded, so
+/// copying it would duplicate state the copy already carries.
+fn property_declares_storage(node: Node<'_>) -> bool {
+    let Some(accessors) = named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "accessor_list")
+    else {
+        return false;
+    };
+    let declared = named_children(accessors)
+        .into_iter()
+        .filter(|child| child.kind() == "accessor_declaration")
+        .collect::<Vec<_>>();
+    !declared.is_empty()
+        && declared.iter().all(|accessor| {
+            accessor.child_by_field_name("body").is_none()
+                && accessor.child_by_field_name("value").is_none()
+        })
+}
+
+/// Record the instance slots a type declaration holds, so a value-type copy
+/// can duplicate them one level deep.
+fn record_type_members<'tree>(
+    pending: &mut Vec<PendingTypeMember<'tree>>,
+    inexact: &mut HashSet<usize>,
+    node: Node<'tree>,
+    source: &str,
+) {
+    let names: Vec<Node<'tree>> = match node.kind() {
+        "field_declaration" | "event_field_declaration" => named_children(node)
+            .into_iter()
+            .filter(|child| child.kind() == "variable_declaration")
+            .flat_map(named_children)
+            .filter(|child| child.kind() == "variable_declarator")
+            .filter_map(|declarator| {
+                declarator
+                    .child_by_field_name("name")
+                    .or_else(|| first_runtime_named_child(declarator))
+            })
+            .collect(),
+        "property_declaration" if property_declares_storage(node) => {
+            node.child_by_field_name("name").into_iter().collect()
+        }
+        // A fixed-size buffer is inline storage this pass does not address.
+        "fixed_size_buffer_declaration" => {
+            if let Some(owner) = enclosing_type_node(node) {
+                inexact.insert(owner.start_byte());
+            }
+            return;
+        }
+        _ => return,
+    };
+    let Some(owner) = enclosing_type_node(node) else {
+        return;
+    };
+    if has_modifier(source, node, "static") || has_modifier(source, node, "const") {
+        return;
+    }
+    let declared_type = named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "variable_declaration")
+        .and_then(|declaration| declaration.child_by_field_name("type"))
+        .or_else(|| node.child_by_field_name("type"));
+    for name_node in names {
+        let Some(name) = nonempty_node_text(source, name_node) else {
+            inexact.insert(owner.start_byte());
+            continue;
+        };
+        let Ok(anchor) = source_anchor(name_node, 0) else {
+            inexact.insert(owner.start_byte());
+            continue;
+        };
+        pending.push(PendingTypeMember {
+            owner: owner.start_byte(),
+            member: CSharpTypeMember {
+                name: Box::from(name),
+                anchor,
+                value_copy: MemoryValueCopy::Unknown,
+                type_identity: None,
+                type_spelling: declared_type.and_then(|ty| declared_type_spelling(ty, source)),
+            },
+            declared_type,
+        });
+    }
+}
+
+/// The single parameter's declared type node of a conversion operator.
+///
+/// A conversion operator takes exactly one parameter. Anything else is a
+/// half-written declaration whose selected operand type is unknown.
+fn conversion_operator_parameter_type<'tree>(declaration: Node<'tree>) -> Option<Node<'tree>> {
+    let parameters = declaration.child_by_field_name("parameters")?;
+    let declared = named_children(parameters)
+        .into_iter()
+        .filter(|child| child.kind() == "parameter")
+        .collect::<Vec<_>>();
+    let [parameter] = declared.as_slice() else {
+        return None;
+    };
+    parameter.child_by_field_name("type")
+}
+
 #[derive(Debug, Default)]
 struct TypeReceiverShadows {
     resolution_open: bool,
@@ -208,6 +855,8 @@ struct ProcedureInventory<'tree> {
     static_callable_returns: StaticCallableReturnTypes,
     type_receiver_shadows: TypeReceiverShadowIndex,
     member_declarations: MemberDeclarations,
+    type_index: CSharpTypeIndex,
+    conversion_operators: ConversionOperators,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
@@ -232,6 +881,14 @@ fn enumerate_procedures<'tree>(
     let mut static_callable_returns = StaticCallableReturnTypes::default();
     let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
     let mut member_declarations = MemberDeclarations::default();
+    let mut type_declarations = TypeDeclarations::default();
+    let mut type_aliases = HashSet::<Box<str>>::default();
+    let mut type_members = HashMap::<usize, CSharpTypeMembers>::default();
+    let mut type_kinds = HashMap::<usize, CSharpDeclaredTypeKind>::default();
+    let mut pending_members: Vec<PendingTypeMember<'tree>> = Vec::new();
+    let mut callable_nodes = Vec::new();
+    let mut inexact_types = HashSet::<usize>::default();
+    let mut pending_conversions: Vec<PendingConversionOperator<'tree>> = Vec::new();
     let root_path = file_scoped_namespace_path(prepared.source(), root, &mut inventory)?;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -268,12 +925,40 @@ fn enumerate_procedures<'tree>(
             }
         }
         record_type_receiver_shadow(&mut type_receiver_shadows, frame.node, prepared.source());
+        if frame.node.kind() == "method_declaration" {
+            callable_nodes.push(frame.node);
+        }
         record_static_callable_return_type(
             &mut static_callable_returns,
             frame.node,
             prepared.source(),
         );
         record_member_declarations(&mut member_declarations, frame.node, prepared.source());
+        record_type_declaration(
+            &mut type_declarations,
+            &mut type_members,
+            &mut type_kinds,
+            frame.node,
+            prepared.source(),
+        );
+        record_type_members(
+            &mut pending_members,
+            &mut inexact_types,
+            frame.node,
+            prepared.source(),
+        );
+        // `using X = ...;` binds one name to another type, so a declaration in
+        // this file that spells the same name is not what an occurrence means.
+        if frame.node.kind() == "using_directive"
+            && has_direct_token(frame.node, "=")
+            && let Some(alias) = frame
+                .node
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier")
+                .and_then(|name| nonempty_node_text(prepared.source(), name))
+        {
+            type_aliases.insert(Box::from(alias));
+        }
 
         let mut child_parent = frame.lexical_parent;
         if let Some((kind, segment_kind, body, properties)) =
@@ -291,6 +976,12 @@ fn enumerate_procedures<'tree>(
                 Ok(identity) => identity,
                 Err(stop) => return Ok(stop.into_outcome()),
             };
+            if frame.node.kind() == "conversion_operator_declaration" {
+                pending_conversions.push(PendingConversionOperator {
+                    procedure: identity.id,
+                    declaration: frame.node,
+                });
+            }
             let spec = ProcedureSpec {
                 id: identity.id,
                 body,
@@ -316,11 +1007,177 @@ fn enumerate_procedures<'tree>(
         }
     }
 
+    // A slot's own declared type, and an operator's source and target types,
+    // are ordinary type nodes: they resolve only now that every declaration in
+    // the file is recorded.
+    let mut type_index = CSharpTypeIndex {
+        declarations: type_declarations,
+        aliases: type_aliases,
+        members: type_members,
+        kinds: type_kinds,
+        callables: HashMap::default(),
+    };
+    for owner in inexact_types {
+        if let Some(row) = type_index.members.get_mut(&owner) {
+            row.exact = false;
+        }
+    }
+    for pending in pending_members {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+        // A slot holding another aggregate carries state of its own, and a
+        // slot whose type this file cannot resolve might. Copying either one
+        // level deep is partial, so the owner's copy keeps a typed decline.
+        let identity = pending
+            .declared_type
+            .and_then(|node| type_index.resolve(node, prepared.source()));
+        let carries_nested_state = identity.is_none_or(|identity| {
+            matches!(
+                identity,
+                CSharpTypeIdentity::Declared {
+                    kind: CSharpDeclaredTypeKind::Struct,
+                    ..
+                }
+            )
+        });
+        let mut member = pending.member;
+        member.type_identity = identity;
+        member.value_copy = identity.map_or(MemoryValueCopy::Unknown, |identity| {
+            if identity.is_value_type() {
+                MemoryValueCopy::Value
+            } else {
+                MemoryValueCopy::Reference
+            }
+        });
+        if let Some(row) = type_index.members.get_mut(&pending.owner) {
+            row.members.push(member);
+            row.exact &= !carries_nested_state;
+        }
+    }
+
+    let procedures_by_start = specs
+        .iter()
+        .map(|spec| (spec.callable.start_byte(), spec.id))
+        .collect::<HashMap<_, _>>();
+    for callable in callable_nodes {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+        let Some(owner) = enclosing_type_node(callable) else {
+            continue;
+        };
+        let Some(name) = callable
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(prepared.source(), name))
+        else {
+            continue;
+        };
+        let exact = (|| {
+            if !has_modifier(prepared.source(), callable, "static")
+                || has_modifier(prepared.source(), callable, "async")
+            {
+                return None;
+            }
+            let mut ancestor = Some(callable);
+            while let Some(node) = ancestor {
+                if node.child_by_field_name("type_parameters").is_some()
+                    || has_modifier(prepared.source(), node, "partial")
+                {
+                    return None;
+                }
+                ancestor = node.parent();
+            }
+            let procedure = *procedures_by_start.get(&callable.start_byte())?;
+            let layout =
+                formal_parameter_slots_for_owner(Language::CSharp, callable, prepared.source())?;
+            let mut parameters = Vec::new();
+            for slot in layout.slots {
+                if slot.receiver || slot.variadic.is_some() || slot.default_range.is_some() {
+                    return None;
+                }
+                let parameter = callable.named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )?;
+                if ["ref", "out", "in", "params", "this"]
+                    .iter()
+                    .any(|modifier| {
+                        has_direct_token(parameter, modifier)
+                            || has_modifier(prepared.source(), parameter, modifier)
+                    })
+                {
+                    return None;
+                }
+                let identity = type_index
+                    .resolve(parameter.child_by_field_name("type")?, prepared.source())?;
+                parameters.push((Box::from(slot.unique_name()?), identity));
+            }
+            Some(CSharpStaticCallable {
+                procedure,
+                parameters: parameters.into_boxed_slice(),
+            })
+        })();
+        match type_index
+            .callables
+            .entry((owner.start_byte(), Box::from(name)))
+        {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(exact);
+            }
+        }
+    }
+
+    let mut conversion_operators = ConversionOperators::default();
+    for pending in pending_conversions {
+        if cancellation.is_cancelled() {
+            return Ok(inventory.cancelled());
+        }
+        if let Err(stop) = inventory.charge_traversal_entry() {
+            return Ok(stop.into_outcome());
+        }
+        let Some(target) = pending
+            .declaration
+            .child_by_field_name("type")
+            .and_then(|node| type_index.resolve(node, prepared.source()))
+        else {
+            continue;
+        };
+        let Some(source_type) = conversion_operator_parameter_type(pending.declaration)
+            .and_then(|node| type_index.resolve(node, prepared.source()))
+        else {
+            continue;
+        };
+        let operator = CSharpConversionOperator {
+            procedure: pending.procedure,
+            implicit: has_direct_token(pending.declaration, "implicit"),
+        };
+        match conversion_operators.entry((source_type, target)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(operator));
+            }
+        }
+    }
+
     Ok(inventory.complete(ProcedureInventory {
         specs,
         static_callable_returns,
         type_receiver_shadows,
         member_declarations,
+        type_index,
+        conversion_operators,
     }))
 }
 
@@ -691,8 +1548,20 @@ fn callable_shape<'tree>(
             dispatch_extensibility,
             call_boundary: ProcedureCallBoundary::Direct,
             receiver_binding: Default::default(),
+            construction_return: Default::default(),
         },
     ))
+}
+
+/// The declared return type node of a callable, when it spells one.
+///
+/// A constructor, a lambda, an accessor body, and a `void` method each spell
+/// no returned type, so a value returned from one carries into nothing this
+/// pass can name.
+fn callable_return_type(callable: Node<'_>) -> Option<Node<'_>> {
+    callable
+        .child_by_field_name("returns")
+        .or_else(|| callable.child_by_field_name("type"))
 }
 
 fn callable_body(node: Node<'_>) -> Option<Node<'_>> {
@@ -840,6 +1709,11 @@ struct LoweringContext<'tree, 'targets> {
     static_callable_returns: &'targets StaticCallableReturnTypes,
     type_receiver_shadows: &'targets TypeReceiverShadowIndex,
     member_declarations: &'targets MemberDeclarations,
+    type_index: &'targets CSharpTypeIndex,
+    conversion_operators: &'targets ConversionOperators,
+    /// The declared return type of the procedure being lowered, when the
+    /// callable spells one.
+    return_type: Option<Node<'tree>>,
     /// One value per distinct constant subscript spelling in this procedure.
     ///
     /// An element location is identified by its base and index *values*, so
@@ -851,7 +1725,13 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     parameter_types: HashMap<Box<str>, Box<str>>,
+    parameter_resolved_types: HashMap<Box<str>, CSharpTypeIdentity>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// `var` declarators awaiting their initializer's resolved type. A local
+    /// with no declared type node takes the type of the value it is given, and
+    /// that value can name an earlier local, so the resolution runs after
+    /// every binding in the body exists.
+    implicit_locals: Vec<ImplicitLocalBinding<'tree>>,
     receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
@@ -872,14 +1752,27 @@ struct LocalBinding {
     scope_end: usize,
     value: ValueId,
     type_identity: Option<Box<str>>,
+    /// The exact declaration or predefined type this local holds, when this
+    /// file resolved it (#2847).
+    resolved_type: Option<CSharpTypeIdentity>,
 }
 
+/// One `var` declarator whose type is the type of its initializer.
+struct ImplicitLocalBinding<'tree> {
+    name: Box<str>,
+    declaration_start: usize,
+    initializer: Node<'tree>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     static_callable_returns: &'targets StaticCallableReturnTypes,
     type_receiver_shadows: &'targets TypeReceiverShadowIndex,
     member_declarations: &'targets MemberDeclarations,
+    type_index: &'targets CSharpTypeIndex,
+    conversion_operators: &'targets ConversionOperators,
     budget: &'targets SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CSharpLoweringError> {
@@ -905,18 +1798,24 @@ fn lower_procedure<'tree, 'targets>(
         static_callable_returns,
         type_receiver_shadows,
         member_declarations,
+        type_index,
+        conversion_operators,
+        return_type: callable_return_type(spec.callable),
         constant_index_values: HashMap::default(),
         callable_type_parameters: callable_type_parameter_names(spec.callable, prepared.source()),
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
         parameter_types: HashMap::default(),
+        parameter_resolved_types: HashMap::default(),
         locals: HashMap::default(),
+        implicit_locals: Vec::new(),
         receiver: None,
         cleanups: Vec::new(),
     };
     context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
+    context.resolve_implicit_local_types();
 
     if spec.lexical_parent.is_some() {
         context.add_gap(
@@ -1157,14 +2056,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
                 value
             };
-            let type_identity = (!slot.receiver)
+            let declared_type = (!slot.receiver)
                 .then(|| node.child_by_field_name("type"))
-                .flatten()
+                .flatten();
+            let type_identity = declared_type
                 .and_then(|type_node| declared_type_spelling(type_node, self.prepared.source()));
+            let resolved_type = declared_type
+                .and_then(|type_node| self.type_index.resolve(type_node, self.prepared.source()));
             for name in slot.names {
                 if let Some(type_identity) = &type_identity {
                     self.parameter_types
                         .insert(name.clone().into_boxed_str(), type_identity.clone());
+                }
+                if let Some(resolved_type) = resolved_type {
+                    self.parameter_resolved_types
+                        .insert(name.clone().into_boxed_str(), resolved_type);
                 }
                 self.parameters.insert(name.into_boxed_str(), value);
             }
@@ -1221,12 +2127,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                let type_identity = node
+                let declared_type = node
                     .parent()
-                    .and_then(|declaration| declaration.child_by_field_name("type"))
-                    .and_then(|type_node| {
-                        declared_type_spelling(type_node, self.prepared.source())
+                    .and_then(|declaration| declaration.child_by_field_name("type"));
+                let type_identity = declared_type.and_then(|type_node| {
+                    declared_type_spelling(type_node, self.prepared.source())
+                });
+                let resolved_type = declared_type.and_then(|type_node| {
+                    self.type_index.resolve(type_node, self.prepared.source())
+                });
+                // A `var` local has no declared type node at all; it takes the
+                // type of the value it is initialized with, which is resolved
+                // once every binding in the body exists.
+                if declared_type.is_some_and(|type_node| type_node.kind() == "implicit_type")
+                    && let Some(initializer) = variable_declarator_initializer(node)
+                {
+                    self.implicit_locals.push(ImplicitLocalBinding {
+                        name: text.into(),
+                        declaration_start: name.start_byte(),
+                        initializer,
                     });
+                }
                 self.locals
                     .entry(text.into())
                     .or_default()
@@ -1237,6 +2158,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_end,
                         value,
                         type_identity,
+                        resolved_type,
                     });
             }
             Ok(WalkControl::Continue)
@@ -1252,6 +2174,317 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.local_binding_at(name, byte)
             .and_then(|binding| binding.type_identity.as_deref())
             .or_else(|| self.parameter_types.get(name).map(Box::as_ref))
+    }
+
+    /// Fill in the type of every `var` local from the value it is given.
+    ///
+    /// Preorder collection means an earlier declaration is resolved before a
+    /// later one that reads it, so a chain of `var` locals resolves in one
+    /// bounded pass rather than by recursion.
+    fn resolve_implicit_local_types(&mut self) {
+        for pending in std::mem::take(&mut self.implicit_locals) {
+            let Some(resolved) = self.expression_type_identity(pending.initializer) else {
+                continue;
+            };
+            if let Some(binding) = self.locals.get_mut(&pending.name).and_then(|bindings| {
+                bindings
+                    .iter_mut()
+                    .find(|binding| binding.declaration_start == pending.declaration_start)
+            }) {
+                binding.resolved_type = Some(resolved);
+            }
+        }
+    }
+
+    /// The exact type a named binding holds, when this file resolved it.
+    ///
+    /// A local shadowing a parameter answers for the local even when the local
+    /// itself has no resolved type: the parameter is not what the name means
+    /// at that byte.
+    fn binding_resolved_type(&self, name: &str, byte: usize) -> Option<CSharpTypeIdentity> {
+        match self.local_binding_at(name, byte) {
+            Some(binding) => binding.resolved_type,
+            None => self.parameter_resolved_types.get(name).copied(),
+        }
+    }
+
+    /// Follow declared member types from an exact lexical binding. The
+    /// explicit stack keeps deeply nested member expressions stack-safe.
+    fn expression_type_identity(&self, node: Node<'tree>) -> Option<CSharpTypeIdentity> {
+        let mut current = node;
+        let mut members = Vec::new();
+        let mut identity = loop {
+            match current.kind() {
+                "parenthesized_expression" | "checked_expression" => {
+                    current = first_runtime_named_child(current)?;
+                }
+                "member_access_expression" => {
+                    let name = current.child_by_field_name("name")?;
+                    if name.kind() != "identifier" {
+                        return None;
+                    }
+                    members.push(nonempty_node_text(self.prepared.source(), name)?);
+                    current = current.child_by_field_name("expression")?;
+                }
+                "cast_expression" => {
+                    break self.type_node_identity(current.child_by_field_name("type")?)?;
+                }
+                "identifier" => {
+                    let name = node_text(self.prepared.source(), current)?;
+                    break self.binding_resolved_type(name, current.start_byte())?;
+                }
+                "this" => {
+                    break enclosing_type_node(current)
+                        .and_then(|owner| self.type_index.declared_at(owner.start_byte()))?;
+                }
+                _ => return None,
+            }
+        };
+        for name in members.into_iter().rev() {
+            identity = self.type_index.member(identity, name)?.type_identity?;
+        }
+        Some(identity)
+    }
+
+    fn access_member_declaration(
+        &self,
+        base: Node<'tree>,
+        name: &str,
+        access: Node<'tree>,
+    ) -> Option<MemberDeclaration> {
+        if let Some(owner) = self.expression_type_identity(base)
+            && let Some(member) = self.type_index.member(owner, name)
+        {
+            return Some(MemberDeclaration {
+                anchor: member.anchor,
+                is_static: false,
+                type_spelling: member.type_spelling.clone(),
+            });
+        }
+        self.access_owner_type(base)
+            .and_then(|owner| self.member_declaration_for(&owner, name, access))
+    }
+
+    fn type_node_identity(&self, node: Node<'tree>) -> Option<CSharpTypeIdentity> {
+        self.type_index.resolve(node, self.prepared.source())
+    }
+
+    /// The carry every C# conversion context shares.
+    ///
+    /// An exact same-type carry copies a value type and aliases a reference
+    /// type. `object` is the one destination no user-defined conversion may
+    /// claim -- the language reserves conversions to and from it -- so a
+    /// carry into it is boxing or a reference alias and nothing else.
+    fn language_carry(
+        &self,
+        source: CSharpTypeIdentity,
+        destination: CSharpTypeIdentity,
+    ) -> Option<CSharpValueCarry> {
+        if source == destination {
+            return Some(
+                destination
+                    .same_type_copy()
+                    .map_or(CSharpValueCarry::Alias, CSharpValueCarry::Transfer),
+            );
+        }
+        if destination == CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object) {
+            return Some(if source.is_value_type() {
+                CSharpValueCarry::Transfer(TransferKind::Boxing)
+            } else {
+                CSharpValueCarry::Alias
+            });
+        }
+        None
+    }
+
+    /// The carry an assignment, initialization, or return performs, where C#
+    /// admits only an implicit conversion.
+    fn assignment_carry(
+        &self,
+        source: CSharpTypeIdentity,
+        destination: CSharpTypeIdentity,
+    ) -> Option<CSharpValueCarry> {
+        if let Some(carry) = self.language_carry(source, destination) {
+            return Some(carry);
+        }
+        if let (CSharpTypeIdentity::Predefined(source), CSharpTypeIdentity::Predefined(destination)) =
+            (source, destination)
+            && let Some(preservation) = source.implicit_numeric_conversion(destination)
+        {
+            return Some(CSharpValueCarry::Transfer(TransferKind::Conversion {
+                preservation,
+            }));
+        }
+        self.conversion_operator(source, destination)
+            .filter(|operator| operator.implicit)
+            .map(CSharpValueCarry::UserDefined)
+    }
+
+    /// The carry a cast performs, where C# admits the explicit conversions as
+    /// well.
+    fn cast_carry(
+        &self,
+        source: CSharpTypeIdentity,
+        destination: CSharpTypeIdentity,
+    ) -> Option<CSharpValueCarry> {
+        if let Some(carry) = self.language_carry(source, destination) {
+            return Some(carry);
+        }
+        if source == CSharpTypeIdentity::Predefined(CSharpPredefinedType::Object) {
+            // Unboxing extracts the contained value into its own storage; a
+            // reference cast keeps naming the same object. Neither can run
+            // user code, because conversions from `object` are reserved.
+            return Some(if destination.is_value_type() {
+                CSharpValueCarry::Transfer(TransferKind::Unboxing)
+            } else {
+                CSharpValueCarry::Alias
+            });
+        }
+        if let (CSharpTypeIdentity::Predefined(source), CSharpTypeIdentity::Predefined(destination)) =
+            (source, destination)
+            && let Some(preservation) = source.cast_numeric_conversion(destination)
+        {
+            return Some(CSharpValueCarry::Transfer(TransferKind::Conversion {
+                preservation,
+            }));
+        }
+        self.conversion_operator(source, destination)
+            .map(CSharpValueCarry::UserDefined)
+    }
+
+    /// The single user-defined operator this file selects for a pair, if any.
+    /// A pair more than one declaration claims selects none.
+    fn conversion_operator(
+        &self,
+        source: CSharpTypeIdentity,
+        destination: CSharpTypeIdentity,
+    ) -> Option<CSharpConversionOperator> {
+        self.conversion_operators
+            .get(&(source, destination))
+            .copied()
+            .flatten()
+    }
+
+    /// The carry a `return` performs into the callable's declared return type,
+    /// with that type, so an aggregate copy can carry its contents.
+    fn return_carry(&self, value: Node<'tree>) -> Option<(CSharpValueCarry, CSharpTypeIdentity)> {
+        let destination = self.type_node_identity(self.return_type?)?;
+        let source = self.expression_type_identity(value)?;
+        self.assignment_carry(source, destination)
+            .map(|carry| (carry, destination))
+    }
+
+    /// Publish one assignment and the edge that says what the destination now
+    /// holds.
+    ///
+    /// A transfer edge is the adjacent identity-separating marker the shared
+    /// contract requires, so an access-path or heap walk stops there instead
+    /// of mistaking the destination for the source's storage.
+    fn emit_assignment_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: ValueFlowKind,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), CSharpLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind,
+                source,
+                target,
+            },
+        )
+    }
+
+    /// Publish the exact user-defined operator a conversion selects as the
+    /// call it is, and return the point its normal completion reaches.
+    ///
+    /// The operator is ordinary user code: whether its result depends on its
+    /// operand is a property of its body, not of its signature. Publishing the
+    /// exact call lets that body answer, and lets a conversion that drops the
+    /// operand stay disconnected instead of inheriting a transfer edge it did
+    /// not earn.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_user_defined_conversion(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        node: Node<'tree>,
+        scope: ScopeFrameId,
+        operator: CSharpConversionOperator,
+        source: ValueId,
+        target: ValueId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<ProgramPointId, CSharpLoweringError> {
+        let normal = self.point(builder, node, Vec::new())?;
+        let exceptional = self.point(builder, node, Vec::new())?;
+        let callee = self.source_value(builder, node, SemanticValueKind::Callable)?;
+        let thrown = self.source_value(builder, node, SemanticValueKind::Exception)?;
+        let resolution =
+            CallableTargetResolution::Proven(CallableTarget::Local(operator.procedure));
+        let metadata = self.metadata(point)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::CallableReference {
+                result: callee,
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Function,
+                    targets: resolution.clone(),
+                    target_evidence: metadata.evidence,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            },
+        )?;
+        self.session.add_call_site(
+            builder,
+            CallSiteScaffold {
+                point,
+                callee,
+                receiver: None,
+                arguments: vec![SemanticCallArgument::direct(
+                    source,
+                    ArgumentDomain::Positional,
+                )]
+                .into_boxed_slice(),
+                normal_results: Box::new([]),
+                result: Some(target),
+                thrown: Some(thrown),
+                declared_targets: resolution,
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
+            },
+        )?;
+        self.edge(builder, point, EdgeTarget::normal(normal))?;
+        self.edge(
+            builder,
+            point,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.abrupt(
+            builder,
+            exceptional,
+            scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )?;
+        Ok(normal)
     }
 
     fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
@@ -1417,6 +2650,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
             let value =
                 self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
+            // A `var` local has no declared type of its own: it takes the type
+            // of the value it is given, so the initializer answers for both
+            // ends of the carry.
+            let destination = declared_type.and_then(|declared_type| {
+                if declared_type.kind() == "implicit_type" {
+                    self.expression_type_identity(*initializer)
+                } else {
+                    self.type_node_identity(declared_type)
+                }
+            });
+            let carry = destination
+                .zip(self.expression_type_identity(*initializer))
+                .and_then(|(destination, source)| self.assignment_carry(source, destination));
             let identity_conversion = declared_type.is_some_and(|declared_type| {
                 declared_type.kind() == "implicit_type"
                     || self.identity_is_preserved(
@@ -1424,37 +2670,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         *initializer,
                     )
             });
-            if identity_conversion {
-                self.append_effect(
-                    builder,
-                    terminals[index],
-                    SemanticEffect::Assignment { target, value },
-                )?;
-                self.append_effect(
-                    builder,
-                    terminals[index],
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local,
-                        source: value,
+            let mut continuation = terminals[index];
+            match carry {
+                Some(CSharpValueCarry::UserDefined(operator)) => {
+                    continuation = self.emit_user_defined_conversion(
+                        builder,
+                        terminals[index],
+                        *initializer,
+                        scope,
+                        operator,
+                        value,
                         target,
-                    },
-                )?;
-            } else {
-                self.add_gap(
-                    builder,
-                    terminals[index],
-                    SemanticGapSubject::Value(target),
-                    SemanticCapability::Values,
-                    SemanticGapKind::Unknown,
-                    "explicitly typed C# local initialization may invoke a user-defined conversion",
-                )?;
+                        stack,
+                    )?;
+                }
+                Some(carry) => {
+                    let destination =
+                        destination.expect("a carry is selected from a resolved destination");
+                    self.emit_carried_value(
+                        builder,
+                        terminals[index],
+                        carry,
+                        ValueFlowKind::Local,
+                        (
+                            self.expression_type_identity(*initializer)
+                                .expect("carry source is resolved"),
+                            destination,
+                        ),
+                        value,
+                        target,
+                    )?;
+                }
+                None if identity_conversion => {
+                    self.emit_assignment_flow(
+                        builder,
+                        terminals[index],
+                        ValueFlowKind::Local,
+                        value,
+                        target,
+                    )?;
+                }
+                None => {
+                    self.add_gap(
+                        builder,
+                        terminals[index],
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "explicitly typed C# local initialization may invoke a user-defined conversion",
+                    )?;
+                }
             }
             let following = expression_entries
                 .get(index + 1)
                 .copied()
                 .map(EdgeTarget::normal)
                 .unwrap_or(next);
-            self.edge(builder, terminals[index], following)?;
+            self.edge(builder, continuation, following)?;
             stack.push(Work::Expression {
                 node: *initializer,
                 entry: expression_entries[index],
@@ -1642,9 +2914,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         else {
             return Ok(None);
         };
-        let declaration = self
-            .access_owner_type(base)
-            .and_then(|owner| self.member_declaration_for(&owner, &name, access));
+        let declaration = self.access_member_declaration(base, &name, access);
         let member = self.member_locator(name_node, declaration.as_ref())?;
         // A `static` or `const` member is one class-wide slot, addressed by
         // nothing: it has no base object for a `Field` location to name.
@@ -1860,8 +3130,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.prepared.source(),
                     target.child_by_field_name("name")?,
                 )?;
-                let owner = self.access_owner_type(base)?;
-                self.member_declaration_for(&owner, name, target)?
+                self.access_member_declaration(base, name, target)?
                     .type_spelling
             }
             "element_access_expression" => {
@@ -1989,6 +3258,201 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    /// Publish a proven carry: the assignment, the edge that says what the
+    /// destination holds, and, for an aggregate copy, the contents themselves.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_carried_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        carry: CSharpValueCarry,
+        alias: ValueFlowKind,
+        types: (CSharpTypeIdentity, CSharpTypeIdentity),
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), CSharpLoweringError> {
+        let kind = carry
+            .flow_kind(alias)
+            .expect("a user-defined operator is published as its call by the caller");
+        self.emit_assignment_flow(builder, point, kind, source, target)?;
+        let copy_type = match carry {
+            CSharpValueCarry::Transfer(TransferKind::Boxing) => Some(types.0),
+            CSharpValueCarry::Transfer(TransferKind::AggregateCopy | TransferKind::Unboxing) => {
+                Some(types.1)
+            }
+            _ => None,
+        };
+        if let Some(identity) = copy_type {
+            self.emit_aggregate_copy_contents(builder, point, identity, source, target)?;
+        }
+        Ok(())
+    }
+
+    /// Put the source aggregate's contents into the destination's own storage.
+    ///
+    /// The adjacent `Transfer` says the destination is separate storage; this
+    /// is what makes that storage hold the copied value. Each declared slot is
+    /// loaded from the source and stored into the destination, so a scalar
+    /// slot becomes independent while a reference slot keeps naming the same
+    /// object -- which is exactly what copying a C# struct does. The
+    /// destination also gets its own allocation identity, because without one
+    /// nothing distinguishes two reads of it as addressing one location.
+    ///
+    /// A type whose slots this file cannot enumerate exactly keeps a typed
+    /// decline instead of a silently partial copy.
+    fn emit_aggregate_copy_contents(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        identity: CSharpTypeIdentity,
+        source: ValueId,
+        target: ValueId,
+    ) -> Result<(), CSharpLoweringError> {
+        let CSharpTypeIdentity::Declared {
+            start_byte,
+            kind: CSharpDeclaredTypeKind::Struct,
+        } = identity
+        else {
+            return Ok(());
+        };
+        let Some(storage) = self.type_index.storage_of(start_byte) else {
+            return Ok(());
+        };
+        let exact = storage.exact;
+        let slots = storage.members.clone();
+        if slots.len() > CSHARP_MAX_COPIED_SLOTS {
+            return self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Value(target),
+                SemanticCapability::FieldMemory,
+                SemanticGapKind::ExceededBudget,
+                "value-type copy holds more declared slots than one copy duplicates",
+            );
+        }
+        self.session
+            .add_allocation(builder, point, target, AllocationKind::Object)?;
+        for slot in &slots {
+            let member = self.declared_member_locator(slot.anchor);
+            let from = self.session.add_memory_location_with_value_copy(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: source,
+                    member: member.clone(),
+                },
+                slot.value_copy,
+            )?;
+            let loaded = self.value(builder, point, SemanticValueKind::Temporary)?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Field,
+                    location: from,
+                    result: loaded,
+                },
+            )?;
+            let into = self.session.add_memory_location_with_value_copy(
+                builder,
+                point,
+                MemoryLocationKind::Field {
+                    base: target,
+                    member,
+                },
+                slot.value_copy,
+            )?;
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Field,
+                    location: into,
+                    value: loaded,
+                },
+            )?;
+        }
+        if exact {
+            return Ok(());
+        }
+        let copied = slots
+            .iter()
+            .map(|slot| slot.name.as_ref())
+            .collect::<Vec<_>>();
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::Value(target),
+            SemanticCapability::FieldMemory,
+            SemanticGapKind::Unknown,
+            &format!(
+                "value-type copy carries the declared slots this file resolved ({copied:?}); the type holds further state it does not enumerate"
+            ),
+        )
+    }
+
+    /// A member location anchored at its declaration, so a copy addresses the
+    /// very location an ordinary member access addresses.
+    fn declared_member_locator(&self, anchor: SourceAnchor) -> SemanticLocator {
+        let procedure = self.session.locator();
+        SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        )
+    }
+
+    /// Publish an object initializer's member write as a store into the
+    /// object under construction.
+    fn emit_object_initializer_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        creation: Node<'tree>,
+        name_node: Node<'tree>,
+        value: ValueId,
+    ) -> Result<Option<Box<str>>, CSharpLoweringError> {
+        let Some(name) = nonempty_node_text(self.prepared.source(), name_node) else {
+            return Ok(None);
+        };
+        let declaration = creation
+            .child_by_field_name("type")
+            .and_then(|created| declared_type_spelling(created, self.prepared.source()))
+            .and_then(|owner| self.member_declaration_for(&owner, name, creation));
+        // A `static` member has no per-object slot, so an initializer cannot
+        // name one; declining keeps the write out of the heap stratum.
+        if declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.is_static)
+        {
+            return Ok(None);
+        }
+        let declared_type = declaration
+            .as_ref()
+            .and_then(|declaration| declaration.type_spelling.clone());
+        let base = self.expression_value(builder, creation, expression_value_kind(creation))?;
+        let member = self.member_locator(name_node, declaration.as_ref())?;
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field { base, member },
+        )?;
+        self.emit_memory_store(
+            builder,
+            point,
+            MemoryTarget {
+                location,
+                kind: MemoryAccessKind::Field,
+                resolved: declaration.is_some(),
+            },
+            value,
+        )?;
+        Ok(declared_type)
+    }
+
     fn assignment_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2004,52 +3468,90 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = self.expression_value(builder, right, expression_value_kind(right))?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
 
+        let mut continuation = terminal;
         let evaluations = if left.kind() == "identifier" {
             let name = node_text(self.prepared.source(), left).ok_or_else(|| {
                 CSharpLoweringError::Invalid("assignment has invalid target range".into())
             })?;
+            // The initializer's assignment names a member even when a local
+            // or parameter has the same name. Its right side still uses the
+            // ordinary lexical scope.
+            let initializer_member = object_initializer_member_target(node);
             let local = self.local_at(name, left.start_byte());
-            let target = local.or_else(|| self.parameters.get(name).copied());
-            // The declared type of the assignment target decides whether a
-            // user-defined implicit conversion can intervene, the same
-            // question a declaration with an initializer asks (#2661).
-            let preserved =
-                self.identity_is_preserved(self.binding_type_at(name, left.start_byte()), right);
+            let target = initializer_member
+                .is_none()
+                .then(|| local.or_else(|| self.parameters.get(name).copied()))
+                .flatten();
+            let mut initializer_member_type = None;
+            if let Some(creation) = initializer_member {
+                initializer_member_type =
+                    self.emit_object_initializer_store(builder, terminal, creation, left, value)?;
+            }
+            // The declared type of the assignment target decides what carrying
+            // the value into it does: copy it, share it, or run a user-defined
+            // conversion first (#2661, #2847).
+            let destination =
+                target.and_then(|_| self.binding_resolved_type(name, left.start_byte()));
+            let carry = destination
+                .zip(self.expression_type_identity(right))
+                .and_then(|(destination, source)| self.assignment_carry(source, destination));
+            // An initializer's target is the member, not a binding of that
+            // name, so its declared type is what answers the conversion
+            // question.
+            let preserved = if initializer_member.is_some() {
+                initializer_member_type
+                    .as_deref()
+                    .is_some_and(|declared| self.identity_is_preserved(Some(declared), right))
+            } else {
+                self.identity_is_preserved(self.binding_type_at(name, left.start_byte()), right)
+            };
             if let Some(target) = target {
-                if preserved {
-                    let kind = if local.is_some() {
-                        ValueFlowKind::Local
-                    } else {
-                        ValueFlowKind::Parameter
-                    };
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::Assignment { target, value },
-                    )?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::ValueFlow {
-                            kind,
-                            source: value,
-                            target,
-                        },
-                    )?;
+                let alias = if local.is_some() {
+                    ValueFlowKind::Local
                 } else {
-                    self.add_gap(
-                        builder,
-                        terminal,
-                        SemanticGapSubject::Value(target),
-                        SemanticCapability::Values,
-                        SemanticGapKind::Unknown,
-                        "C# assignment target identity is unavailable until implicit conversion resolution is available",
-                    )?;
+                    ValueFlowKind::Parameter
+                };
+                match carry {
+                    Some(CSharpValueCarry::UserDefined(operator)) => {
+                        continuation = self.emit_user_defined_conversion(
+                            builder, terminal, right, scope, operator, value, target, stack,
+                        )?;
+                    }
+                    Some(carry) => {
+                        let destination =
+                            destination.expect("a carry is selected from a resolved destination");
+                        self.emit_carried_value(
+                            builder,
+                            terminal,
+                            carry,
+                            alias,
+                            (
+                                self.expression_type_identity(right)
+                                    .expect("carry source is resolved"),
+                                destination,
+                            ),
+                            value,
+                            target,
+                        )?;
+                    }
+                    None if preserved => {
+                        self.emit_assignment_flow(builder, terminal, alias, value, target)?;
+                    }
+                    None => {
+                        self.add_gap(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Value(target),
+                            SemanticCapability::Values,
+                            SemanticGapKind::Unknown,
+                            "C# assignment target identity is unavailable until implicit conversion resolution is available",
+                        )?;
+                    }
                 }
             }
             // The value of an assignment expression is the value that was
-            // assigned, once no conversion can have replaced it.
-            if preserved {
+            // assigned, once this file knows which operation assigned it.
+            if preserved || carry.is_some() {
                 self.append_effect(
                     builder,
                     terminal,
@@ -2124,7 +3626,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.implicit_exception_gap(builder, terminal, node)?;
             runtime_expression_children(node)
         };
-        self.edge(builder, terminal, next)?;
+        self.edge(builder, continuation, next)?;
         self.schedule_expressions(
             builder,
             entry,
@@ -2180,18 +3682,55 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CSharpLoweringError> {
         let terminal = self.point(builder, node, Vec::new())?;
         let target = self.expression_value(builder, node, expression_value_kind(node))?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Value(target),
-            SemanticCapability::Values,
-            SemanticGapKind::Unknown,
-            "C# cast/as identity is provisional until conversion resolution is available",
-        )?;
+        // Only a cast names its result type. `x as T` yields either a `T` or
+        // null, and neither the choice nor the null is represented yet.
+        let carry = (node.kind() == "cast_expression")
+            .then(|| {
+                let destination = self.type_node_identity(node.child_by_field_name("type")?)?;
+                let source = self.expression_type_identity(value)?;
+                self.cast_carry(source, destination)
+                    .map(|carry| (carry, destination))
+            })
+            .flatten();
+        let mut continuation = terminal;
+        match carry {
+            Some((CSharpValueCarry::UserDefined(operator), _)) => {
+                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                continuation = self.emit_user_defined_conversion(
+                    builder, terminal, node, scope, operator, source, target, stack,
+                )?;
+            }
+            Some((carry, destination)) => {
+                let source = self.expression_value(builder, value, expression_value_kind(value))?;
+                self.emit_carried_value(
+                    builder,
+                    terminal,
+                    carry,
+                    ValueFlowKind::Local,
+                    (
+                        self.expression_type_identity(value)
+                            .expect("carry source is resolved"),
+                        destination,
+                    ),
+                    source,
+                    target,
+                )?;
+            }
+            None => {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "C# cast/as identity is provisional until conversion resolution is available",
+                )?;
+            }
+        }
         if node.kind() == "cast_expression" {
             self.implicit_exception_gap(builder, terminal, node)?;
         }
-        self.edge(builder, terminal, next)?;
+        self.edge(builder, continuation, next)?;
         stack.push(Work::Expression {
             node: value,
             entry,
@@ -2420,6 +3959,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let source =
                         self.expression_value(builder, value_node, expression_value_kind(value_node))?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
+                    // A by-value return leaves the returned expression's
+                    // storage behind: the caller receives its own copy, so the
+                    // returned value gets independent storage here rather than
+                    // being republished as the local the body still owns.
+                    let source = match self.return_carry(value_node) {
+                        Some((carry @ CSharpValueCarry::Transfer(_), destination)) => {
+                            let transferred =
+                                self.value(builder, point, SemanticValueKind::Temporary)?;
+                            self.emit_carried_value(
+                                builder,
+                                point,
+                                carry,
+                                ValueFlowKind::Local,
+                                (self.expression_type_identity(value_node).expect("carry source is resolved"), destination),
+                                source,
+                                transferred,
+                            )?;
+                            transferred
+                        }
+                        Some((CSharpValueCarry::Alias | CSharpValueCarry::UserDefined(_), _))
+                        | None => source,
+                    };
                     self.append_effect(
                         builder,
                         point,
@@ -3943,6 +5504,103 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )
     }
 
+    /// Bind an ordinary static call only when the AST names one declaration
+    /// and every argument has its exact formal type. Overloads, defaults,
+    /// generic substitutions and by-reference formals retain normal dispatch
+    /// uncertainty instead of inventing by-value copy evidence.
+    fn exact_static_call(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(ProcedureId, Vec<CSharpTypeIdentity>)> {
+        let function = node.child_by_field_name("function")?;
+        let (owner, name_node) = match function.kind() {
+            "identifier" => (enclosing_type_node(node)?.start_byte(), function),
+            "member_access_expression" => {
+                let receiver = function.child_by_field_name("expression")?;
+                if receiver.kind() != "identifier" {
+                    return None;
+                }
+                let name = nonempty_node_text(self.prepared.source(), receiver)?;
+                if self.local_at(name, node.start_byte()).is_some()
+                    || self.parameters.contains_key(name)
+                    || receiver_name_is_lexically_shadowed(node, name, self.type_receiver_shadows)
+                {
+                    return None;
+                }
+                let CSharpTypeIdentity::Declared { start_byte, .. } =
+                    self.type_index.resolve(receiver, self.prepared.source())?
+                else {
+                    return None;
+                };
+                (start_byte, function.child_by_field_name("name")?)
+            }
+            _ => return None,
+        };
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), name_node)?;
+        if function.kind() == "identifier" {
+            if self.local_at(name, node.start_byte()).is_some()
+                || self.parameters.contains_key(name)
+                || receiver_name_is_lexically_shadowed(node, name, self.type_receiver_shadows)
+            {
+                return None;
+            }
+            let mut ancestor = node.parent();
+            while let Some(scope) = ancestor {
+                if scope.kind() == "block"
+                    && named_children(scope).iter().any(|child| {
+                        child.kind() == "local_function_statement"
+                            && child
+                                .child_by_field_name("name")
+                                .and_then(|n| nonempty_node_text(self.prepared.source(), n))
+                                == Some(name)
+                    })
+                {
+                    return None;
+                }
+                ancestor = scope.parent();
+            }
+        }
+        let callable = self
+            .type_index
+            .callables
+            .get(&(owner, Box::from(name)))?
+            .as_ref()?;
+        let arguments = call_arguments(node);
+        if arguments.len() != callable.parameters.len() {
+            return None;
+        }
+        let mut bound = HashSet::default();
+        let mut identities = Vec::with_capacity(arguments.len());
+        for (ordinal, argument) in arguments.into_iter().enumerate() {
+            let formal = match csharp_call_argument_shape(argument) {
+                CSharpCallArgumentShape::Positional => ordinal,
+                CSharpCallArgumentShape::Named => {
+                    let name = nonempty_node_text(
+                        self.prepared.source(),
+                        argument.child_by_field_name("name")?,
+                    )?;
+                    callable
+                        .parameters
+                        .iter()
+                        .position(|(parameter, _)| parameter.as_ref() == name)?
+                }
+                CSharpCallArgumentShape::ByReference => return None,
+            };
+            if !bound.insert(formal) {
+                return None;
+            }
+            let identity = callable.parameters[formal].1;
+            if self.expression_type_identity(call_argument_value(argument)?) != Some(identity) {
+                return None;
+            }
+            identities.push(identity);
+        }
+        Some((callable.procedure, identities))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn call_expression(
         &mut self,
@@ -3964,7 +5622,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
-        let receiver_node = function.and_then(csharp_call_receiver);
+        let exact = self.exact_static_call(node);
+        let receiver_node = if exact.is_some() {
+            None
+        } else {
+            function.and_then(csharp_call_receiver)
+        };
         let receiver = receiver_node
             .map(|receiver_node| {
                 self.expression_value(builder, receiver_node, expression_value_kind(receiver_node))
@@ -3983,7 +5646,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::Function
         };
-        let resolution = if matches!(
+        let resolution = if let Some((procedure, _)) = &exact {
+            CallableTargetResolution::Proven(CallableTarget::Local(*procedure))
+        } else if matches!(
             node.kind(),
             "implicit_object_creation_expression" | "constructor_initializer"
         ) {
@@ -4007,17 +5672,48 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
+        // A call observes its arguments before its own effects. Materialize
+        // by-value copies at a preceding point so scalar payloads, as well
+        // as copied member contents, already exist at the call boundary.
+        let argument_copy = if exact.as_ref().is_some_and(|(_, identities)| {
+            identities
+                .iter()
+                .any(|identity| identity.same_type_copy().is_some())
+        }) {
+            let point = self.point(builder, node, Vec::new())?;
+            self.edge(builder, point, EdgeTarget::normal(invoke))?;
+            point
+        } else {
+            invoke
+        };
         let arguments = call_arguments(node);
         let mut argument_nodes = Vec::with_capacity(arguments.len());
         let mut argument_values = Vec::with_capacity(arguments.len());
         let mut incomplete_argument_mapping = false;
-        for argument in arguments {
+        for (ordinal, argument) in arguments.into_iter().enumerate() {
             let Some(value_node) = call_argument_value(argument) else {
                 continue;
             };
             argument_nodes.push(value_node);
-            let value =
+            let mut value =
                 self.expression_value(builder, value_node, expression_value_kind(value_node))?;
+            if let Some((_, identities)) = &exact {
+                let identity = identities[ordinal];
+                if let Some(kind) = identity.same_type_copy() {
+                    let copied =
+                        self.value(builder, argument_copy, SemanticValueKind::Temporary)?;
+                    self.emit_carried_value(
+                        builder,
+                        argument_copy,
+                        CSharpValueCarry::Transfer(kind),
+                        ValueFlowKind::Local,
+                        (identity, identity),
+                        value,
+                        copied,
+                    )?;
+                    value = copied;
+                }
+            }
             let semantic_argument = match csharp_call_argument_shape(argument) {
                 CSharpCallArgumentShape::Positional => {
                     SemanticCallArgument::direct(value, ArgumentDomain::Positional)
@@ -4102,7 +5798,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
-        if !constructor {
+        if !constructor && exact.is_none() {
             self.add_gap(
                 builder,
                 invoke,
@@ -4136,7 +5832,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder,
                 conditional_entry,
                 &evaluations,
-                EdgeTarget::normal(invoke),
+                EdgeTarget::normal(argument_copy),
                 scope,
                 stack,
             )?;
@@ -4169,7 +5865,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             builder,
             entry,
             &evaluations,
-            EdgeTarget::normal(invoke),
+            EdgeTarget::normal(argument_copy),
             scope,
             stack,
         )
@@ -5237,6 +6933,24 @@ fn conditional_access_binding(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.id() != condition.id())
 }
 
+/// The object creation whose initializer this assignment writes a member of.
+///
+/// `new S { N = value }` writes the member `N` of the object under
+/// construction, not a local of that name. Only an assignment directly inside
+/// the creation's own initializer names a member this way; a nested
+/// collection, index, or `with` initializer is a different construct and keeps
+/// the decline it had.
+fn object_initializer_member_target<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    let initializer = node.parent()?;
+    if initializer.kind() != "initializer_expression" {
+        return None;
+    }
+    let creation = initializer.parent()?;
+    (creation.kind() == "object_creation_expression"
+        && object_initializer(creation).is_some_and(|own| own.id() == initializer.id()))
+    .then_some(creation)
+}
+
 fn object_initializer(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("initializer").or_else(|| {
         named_children(node)
@@ -5505,5 +7219,114 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+    use crate::text_utils::compute_line_starts;
+    use std::sync::Arc;
+
+    fn lower(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::CSharp),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "initializer.cs");
+        let SemanticOutcome::Complete {
+            value: procedures, ..
+        } = CSharpSemanticLowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        else {
+            panic!("fixture lowering must complete");
+        };
+        procedures
+    }
+
+    #[test]
+    fn object_initializer_writes_member_despite_same_named_local() {
+        let source = "public struct S { public string N; } public class Program { public static void Run() { string N = \"local\"; S value = new S { N = \"member\" }; } }";
+        let procedures = lower(source);
+        let run = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("Run")
+            })
+            .unwrap();
+        assert!(
+            run.points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Field,
+                        ..
+                    }
+                )),
+            "an object initializer must publish the field store"
+        );
+    }
+
+    #[test]
+    fn exact_struct_argument_has_its_own_copied_storage() {
+        let procedures = lower(
+            "public struct S { public string N; } public static class Program { public static void Change(S value) { value.N = \"changed\"; } public static void Run(S original) { Change(original); } }",
+        );
+        let run = procedures
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("Run")
+            })
+            .unwrap();
+        let call = run
+            .call_sites
+            .iter()
+            .find(|call| !call.arguments.is_empty())
+            .unwrap();
+        let copied = call.arguments[0].value;
+        assert!(run.points.iter().flat_map(|point| &point.events).any(|event| matches!(event.effect,
+            SemanticEffect::ValueFlow { kind: ValueFlowKind::Transfer(transfer), source, target }
+            if transfer.kind == TransferKind::AggregateCopy && target == copied && source != target
+        )), "a by-value struct argument must bind a fresh copy");
+        assert!(
+            run.memory_locations
+                .iter()
+                .any(|location| matches!(location.kind,
+                    MemoryLocationKind::Field { base, .. } if base == copied
+                )),
+            "the argument copy must carry its declared field storage"
+        );
     }
 }

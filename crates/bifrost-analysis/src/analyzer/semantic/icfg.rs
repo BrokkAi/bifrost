@@ -38,14 +38,20 @@ use super::{
 };
 
 const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
+// Shared copied-member and return-port transport changes provider answers even
+// when a language artifact is unchanged. Rotate both persisted behavior halves
+// so field surveys, class-set roots and read-verified summaries cannot reuse
+// answers produced before that transport was represented (#2848), or before
+// construction results were separated from initializer returns, including
+// constructors resolved across workspace files (#3347).
 const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-behavior/v8";
+    b"bifrost-icfg-provider/workspace-behavior/v11";
 /// The domain of the same behavior without the workspace's content identity.
 ///
 /// Its own domain rather than a shorter message under the one above, so that
 /// no read half can ever equal a full identity by accident.
 const WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN: &[u8] =
-    b"bifrost-icfg-provider/workspace-read-behavior/v7";
+    b"bifrost-icfg-provider/workspace-read-behavior/v10";
 
 /// Why one dispatch lookup could not be named by a replayable read key.
 ///

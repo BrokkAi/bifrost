@@ -4,17 +4,19 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
-use brokk_bifrost_core::analyzer::model::StructuredTypeIdentity;
+use brokk_bifrost_core::analyzer::model::{StructuredTypeIdentity, StructuredTypeNodeView};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_cpp::call_match::cpp_literal_arg_type;
 use brokk_bifrost_cpp::declarations::{
     cpp_callable_declaration_return_type_identity, cpp_declaration_type_identity,
+    cpp_structured_type_path,
 };
 use brokk_bifrost_cpp::raii::CppTemporaryFreeCallIndex;
 use tree_sitter::Node;
 
 use crate::analyzer::cpp::external::{
-    CppExternalTypeModelResolution, external_structured_type_model_resolution,
+    CppExternalTypeModelResolution, external_namespace_model_resolution,
+    external_structured_type_model_resolution,
 };
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
@@ -23,7 +25,8 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::semantic_model::{
-    ImplicitOperation, SemanticModelMemberTargetDisposition, TypeMoveSemantics,
+    ExplicitValueOperation, ImplicitOperation, SemanticModelMemberTargetDisposition,
+    TypeMoveSemantics,
 };
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
@@ -38,7 +41,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v12";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v15";
 
 impl_program_semantics_provider!(CppAnalyzer, |analyzer| CppSemanticLowerer::new(analyzer));
 
@@ -1318,6 +1321,11 @@ struct LoweringContext<'tree, 'targets> {
     /// limited to non-const by-value parameters; named locals remain declined
     /// because NRVO makes their selected transfer conditional.
     implicit_move_return_parameters: HashSet<ValueId>,
+    /// Bindings whose by-value return selects the copy constructor exactly.
+    /// See [`cpp_binding_return_selects_copy`] for the two declared shapes
+    /// that are neither implicitly movable nor elidable.
+    exact_copy_return_bindings: HashSet<ValueId>,
+    const_qualified_bindings: HashSet<ValueId>,
     /// Exact modeled owner of this procedure's by-value return type.
     return_model_type_id: Option<Box<str>>,
     /// One value per distinct constant subscript spelling in this procedure.
@@ -1392,6 +1400,7 @@ enum ExactModeledOperation {
     MoveConstructor,
     ValuePreservingConstructor,
     CopyAssignment,
+    MoveAssignment,
 }
 
 impl ExactModeledOperation {
@@ -1401,19 +1410,26 @@ impl ExactModeledOperation {
             Self::MoveConstructor => ImplicitOperation::MoveConstructor,
             Self::ValuePreservingConstructor => ImplicitOperation::ValuePreservingConstructor,
             Self::CopyAssignment => ImplicitOperation::CopyAssignment,
+            Self::MoveAssignment => ImplicitOperation::MoveAssignment,
         }
     }
 
     const fn transfer_kind(self) -> TransferKind {
         match self {
             Self::CopyConstructor | Self::CopyAssignment => TransferKind::Copy,
-            Self::MoveConstructor => TransferKind::Move {
+            Self::MoveConstructor | Self::MoveAssignment => TransferKind::Move {
                 invalidation: MoveInvalidation::Invalidated,
             },
             Self::ValuePreservingConstructor => TransferKind::Conversion {
                 preservation: ValuePreservation::Preserving,
             },
         }
+    }
+
+    /// Whether the operation takes the source's value away from it, so the
+    /// owner's own move semantics have to prove the invalidation first.
+    const fn is_move(self) -> bool {
+        matches!(self, Self::MoveConstructor | Self::MoveAssignment)
     }
 }
 
@@ -1478,6 +1494,8 @@ fn lower_procedure<'tree, 'targets>(
         function_pointer_targets: HashMap::default(),
         prepared_tree: prepared,
         implicit_move_return_parameters: HashSet::default(),
+        exact_copy_return_bindings: HashSet::default(),
+        const_qualified_bindings: HashSet::default(),
         return_model_type_id: None,
         constant_index_values: HashMap::default(),
         receiver: None,
@@ -1837,6 +1855,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         if let Some(owner_id) = self.resolved_model_owner(&identity) {
                             self.binding_model_type_ids.insert(value, owner_id);
                         }
+                        if cpp_binding_return_selects_copy(
+                            declaration,
+                            declarator,
+                            &identity,
+                            self.source,
+                        ) {
+                            self.exact_copy_return_bindings.insert(value);
+                        }
+                        if cpp_declaration_is_const_qualified(declaration, self.source) {
+                            self.const_qualified_bindings.insert(value);
+                        }
                         self.binding_type_identities.insert(value, identity);
                     }
                     if cpp_declarator_contains_kind(declarator, "pointer_declarator") {
@@ -2003,6 +2032,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     if let Some(owner_id) = self.resolved_model_owner(&identity) {
                         self.binding_model_type_ids.insert(value, owner_id);
                     }
+                    if cpp_binding_return_selects_copy(node, declarator, &identity, self.source) {
+                        self.exact_copy_return_bindings.insert(value);
+                    }
+                    if cpp_declaration_is_const_qualified(node, self.source) {
+                        self.const_qualified_bindings.insert(value);
+                    }
                     self.binding_type_identities.insert(value, identity);
                 }
                 self.locals
@@ -2054,6 +2089,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         {
             if let Some(owner_id) = self.resolved_model_owner(&identity) {
                 self.binding_model_type_ids.insert(value, owner_id);
+            }
+            if cpp_binding_return_selects_copy(parameter, declarator, &identity, self.source) {
+                self.exact_copy_return_bindings.insert(value);
+            }
+            if cpp_declaration_is_const_qualified(parameter, self.source) {
+                self.const_qualified_bindings.insert(value);
             }
             self.binding_type_identities.insert(value, identity);
         }
@@ -2294,6 +2335,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// Resolve one initializer callable through the language's bounded
     /// structured resolver, then require it to be one exact mounted function.
     fn exact_function_target(&self, target: Node<'tree>) -> Option<ProcedureId> {
+        let definition = self.exact_function_definition(target)?;
+        self.function_procedures
+            .exact_procedure(self.analyzer, self.file, &definition)
+    }
+
+    fn exact_function_definition(&self, target: Node<'tree>) -> Option<CodeUnit> {
         let text = nonempty_node_text(self.source, target)?.to_string();
         let start = target.start_byte();
         let end = target.end_byte();
@@ -2327,8 +2374,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if outcome.status != DefinitionLookupStatus::Resolved || outcome.definitions.len() != 1 {
             return None;
         }
-        self.function_procedures
-            .exact_procedure(self.analyzer, self.file, &outcome.definitions[0])
+        outcome
+            .definitions
+            .into_iter()
+            .next()
+            .filter(CodeUnit::is_function)
     }
 
     /// Select an exact modeled value transfer from an identifier operand.
@@ -2353,6 +2403,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if self.binding_model_type_ids.get(&source) != Some(owner_id) {
             return None;
         }
+        // An expiring const object cannot bind the reviewed non-const move
+        // formal. Its const-reference copy overload remains applicable.
+        let operation = if self.const_qualified_bindings.contains(&source) {
+            match operation {
+                ExactModeledOperation::MoveConstructor => ExactModeledOperation::CopyConstructor,
+                ExactModeledOperation::MoveAssignment => ExactModeledOperation::CopyAssignment,
+                other => other,
+            }
+        } else {
+            operation
+        };
         self.exact_modeled_transfer_on_owner(source, owner_id, operation)
     }
 
@@ -2363,7 +2424,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         operation: ExactModeledOperation,
     ) -> Option<ExactModeledTransfer> {
         let overlay = self.analyzer.semantic_model_overlay()?;
-        if operation == ExactModeledOperation::MoveConstructor {
+        if operation.is_move() {
             let owners = overlay.symbols_with_id(owner_id);
             let [owner] = owners.records.as_slice() else {
                 return None;
@@ -2397,22 +2458,81 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         })
     }
 
-    /// Select the canonical one-argument character-data constructor for a
-    /// narrow C++ string literal. Literal type classification is shared with
-    /// overload resolution so encoded wide strings and unsupported literal
-    /// forms cannot acquire the `char const*` operation by AST kind alone.
+    /// Whether an operand's value is narrow character data.
+    ///
+    /// A literal is classified by the shared overload-resolution helper, so an
+    /// encoded or wide literal never acquires the narrow operation by AST kind
+    /// alone. A bound object is decided on its parser-derived declared type,
+    /// which asks the same question of a name that the literal check asks of a
+    /// spelling; anything else is not character data as far as this adapter
+    /// can prove.
+    fn expression_is_narrow_character_data(&self, node: Node<'tree>) -> bool {
+        if let Some(literal) = cpp_literal_arg_type(node, self.source) {
+            return literal.name == "char"
+                && literal.unit.is_none()
+                && literal.indirection == 1
+                && literal.pointee_const;
+        }
+        let Some(identity) = self.expression_declared_type(node) else {
+            return false;
+        };
+        let Some(StructuredTypeNodeView::Pointer(pointee)) = identity.view(identity.root_id())
+        else {
+            return false;
+        };
+        matches!(
+            identity.view(pointee),
+            Some(StructuredTypeNodeView::Named(pointee))
+                if pointee.path() == ["char"] && pointee.lexical_scope().is_empty()
+        )
+    }
+
+    /// Read the exact declared type of a binding or resolved call result.
+    /// A user conversion is a separate operation; its result type cannot be
+    /// substituted for the type of the expression that precedes it.
+    fn expression_declared_type(&self, mut node: Node<'tree>) -> Option<StructuredTypeIdentity> {
+        while node.kind() == "parenthesized_expression" {
+            node = first_runtime_named_child(node)?;
+        }
+        match node.kind() {
+            "identifier" => {
+                let name = nonempty_node_text(self.source, node)?;
+                let value = self.binding_value(name, node.start_byte())?;
+                self.binding_type_identities.get(&value).cloned()
+            }
+            "call_expression" => {
+                let definition =
+                    self.exact_function_definition(node.child_by_field_name("function")?)?;
+                let metadata = self.analyzer.signature_metadata_limited(&definition, 2);
+                if !metadata.complete {
+                    return None;
+                }
+                let [signature] = metadata.rows.as_slice() else {
+                    return None;
+                };
+                signature.return_type_identity().cloned()
+            }
+            _ => None,
+        }
+    }
+
+    fn exact_modeled_receiver_argument(&self, owner_id: &str, argument: Node<'tree>) -> bool {
+        self.expression_is_narrow_character_data(argument)
+            || self
+                .expression_declared_type(argument)
+                .and_then(|identity| self.resolved_model_owner(&identity))
+                .is_some_and(|argument_owner| argument_owner.as_ref() == owner_id)
+    }
+
+    /// Select the canonical one-argument character-data constructor for narrow
+    /// character data.
     fn exact_modeled_character_data_construction(
         &self,
         owner_id: &str,
         source_node: Node<'tree>,
         source: ValueId,
     ) -> Option<ExactModeledTransfer> {
-        let literal = cpp_literal_arg_type(source_node, self.source)?;
-        if literal.name != "char"
-            || literal.unit.is_some()
-            || literal.indirection != 1
-            || !literal.pointee_const
-        {
+        if !self.expression_is_narrow_character_data(source_node) {
             return None;
         }
         self.exact_modeled_transfer_on_owner(
@@ -2420,6 +2540,237 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             owner_id,
             ExactModeledOperation::ValuePreservingConstructor,
         )
+    }
+
+    /// Publish the value fact for a member operation the source spells on an
+    /// exactly modeled receiver.
+    ///
+    /// The call site, its dispatch answer, and its gaps stay exactly what the
+    /// ordinary call lowering produced. This adds only what the active model
+    /// proved about the operation's effect on the receiver's and the result's
+    /// values, and it names the receiver's *binding* rather than the value the
+    /// call read out of it, so the fact is about the object the source named.
+    fn emit_exact_modeled_receiver_operation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        call_site: CallSiteId,
+        call: Node<'tree>,
+        arguments: &[ValueId],
+        result: ValueId,
+    ) -> Result<(), CppLoweringError> {
+        if call.kind() != "call_expression" {
+            return Ok(());
+        }
+        let function = required_field(call, "function")?;
+        let Some(receiver_node) = cpp_call_receiver(function) else {
+            return Ok(());
+        };
+        let Some(member) = function
+            .child_by_field_name("field")
+            .and_then(|field| nonempty_node_text(self.source, field))
+        else {
+            return Ok(());
+        };
+        let Some((receiver, owner_id)) = self.modeled_receiver_binding(receiver_node) else {
+            return Ok(());
+        };
+        let written_arguments = call_arguments(call);
+        if let [argument] = written_arguments.as_slice()
+            && !self.exact_modeled_receiver_argument(&owner_id, *argument)
+        {
+            return Ok(());
+        }
+        let Some(operation) =
+            self.exact_modeled_member_operation(&owner_id, member, arguments.len())
+        else {
+            return Ok(());
+        };
+        // The written argument count is part of the lookup, so a role only
+        // reaches the shape it was reviewed for. A pack that published a role
+        // on a differently shaped member is rejected by pack validation rather
+        // than reinterpreted here.
+        match (operation, arguments) {
+            (ExplicitValueOperation::ReceiverAssign, [argument]) => {
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::Assignment {
+                        target: receiver,
+                        value: *argument,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(ValueTransfer {
+                            kind: TransferKind::Copy,
+                            operation: TransferOperation::CallSite(call_site),
+                        }),
+                        source: *argument,
+                        target: receiver,
+                    },
+                )?;
+            }
+            (ExplicitValueOperation::ReceiverExtend, [argument]) => {
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: *argument,
+                        target: receiver,
+                    },
+                )?;
+            }
+            (ExplicitValueOperation::ReceiverProjection, []) => {
+                self.append_effect(
+                    builder,
+                    point,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::BackingStore {
+                            offset: BackingStoreOffset::Zero,
+                        },
+                        source: receiver,
+                        target: result,
+                    },
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The value operation an exact modeled owner performs for a member the
+    /// source names with this many written arguments.
+    ///
+    /// Nothing here interprets the member's spelling. The name and the written
+    /// argument count select declarations out of the active model, and the
+    /// model's reviewed role is the operation; a name the model does not
+    /// review, or whose declarations disagree, has no operation at all.
+    fn exact_modeled_member_operation(
+        &self,
+        owner_id: &str,
+        member: &str,
+        argument_count: usize,
+    ) -> Option<ExplicitValueOperation> {
+        let overlay = self.analyzer.semantic_model_overlay()?;
+        let matched = overlay.explicit_member_target_on_owner(owner_id, member, argument_count);
+        if matched.disposition != SemanticModelMemberTargetDisposition::Unique {
+            return None;
+        }
+        matched.operation
+    }
+
+    /// The bound object a written receiver names, together with the exact
+    /// modeled owner of its declared type.
+    fn modeled_receiver_binding(&self, receiver: Node<'tree>) -> Option<(ValueId, Box<str>)> {
+        if receiver.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.source, receiver)?;
+        let value = self.binding_value(name, receiver.start_byte())?;
+        let owner = self.binding_model_type_ids.get(&value)?;
+        Some((value, owner.clone()))
+    }
+
+    /// A relative namespace name can be rebound by a local namespace or
+    /// type alias. Inspect the enclosing declaration scopes before borrowing
+    /// the generated header's global owner. Explicit global qualification
+    /// bypasses those lexical declarations.
+    fn namespace_name_is_shadowed(&self, function: Node<'tree>, name: &str) -> bool {
+        let mut qualifier = function;
+        while let Some(scope) = qualifier.child_by_field_name("scope") {
+            qualifier = scope;
+        }
+        if qualifier.child(0).is_some_and(|child| child.kind() == "::") {
+            return false;
+        }
+        if self.binding_value(name, function.start_byte()).is_some() {
+            return true;
+        }
+        let mut current = self.ancestry.parent(function);
+        while let Some(scope) = current {
+            for declaration in named_children(scope) {
+                if declaration.start_byte() >= function.start_byte() {
+                    break;
+                }
+                if matches!(
+                    declaration.kind(),
+                    "namespace_alias_definition" | "alias_declaration"
+                ) && declaration
+                    .child_by_field_name("name")
+                    .and_then(|node| nonempty_node_text(self.source, node))
+                    == Some(name)
+                {
+                    return true;
+                }
+            }
+            current = self.ancestry.parent(scope);
+        }
+        false
+    }
+
+    /// The object operand of a written expiring-value cast such as
+    /// `std::move(source)`.
+    ///
+    /// The callee is proved through the active model rather than through its
+    /// spelling: the written namespace path must resolve to one exact
+    /// generated namespace the reached headers declare, and that namespace's
+    /// declarations of this member name at this arity must all carry the
+    /// expiring-cast role. A same-named user function, or the three-argument
+    /// `<algorithm>` overload, therefore reaches no operation here.
+    fn expiring_cast_operand(&self, call: Node<'tree>) -> Option<Node<'tree>> {
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        let path = cpp_structured_type_path(function, self.source)?;
+        let (member, namespace_path) = path.split_last()?;
+        let namespace = namespace_path.first()?;
+        if self.namespace_name_is_shadowed(function, namespace) {
+            return None;
+        }
+        let overlay = self.analyzer.semantic_model_overlay();
+        let owner_id = external_namespace_model_resolution(
+            self.analyzer,
+            overlay.as_deref(),
+            self.file,
+            namespace_path,
+        )?;
+        let arguments = call_arguments(call);
+        let [operand] = arguments.as_slice() else {
+            return None;
+        };
+        (self.exact_modeled_member_operation(&owner_id, member, 1)
+            == Some(ExplicitValueOperation::ArgumentExpiringCast))
+        .then_some(*operand)
+    }
+
+    /// Select an exact modeled move constructor for
+    /// `target = std::move(source)`.
+    ///
+    /// The cast leaves an expiring value that denotes `source`'s own object,
+    /// so overload resolution selects the move constructor with no elision
+    /// question to answer: initialization from an xvalue is never elided.
+    fn exact_modeled_move_initialization(
+        &self,
+        target: ValueId,
+        initializer: Node<'tree>,
+    ) -> Option<ExactModeledTransfer> {
+        let operand = self.expiring_cast_operand(initializer)?;
+        self.exact_modeled_transfer(target, operand, ExactModeledOperation::MoveConstructor)
+    }
+
+    /// Select an exact modeled move assignment for `target = std::move(source)`.
+    fn exact_modeled_move_assignment(
+        &self,
+        target: ValueId,
+        source: Node<'tree>,
+    ) -> Option<ExactModeledTransfer> {
+        let operand = self.expiring_cast_operand(source)?;
+        self.exact_modeled_transfer(target, operand, ExactModeledOperation::MoveAssignment)
     }
 
     /// Select an exact modeled copy constructor for `target = initializer`.
@@ -2453,19 +2804,45 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         &self,
         returned: Node<'tree>,
     ) -> Option<ExactModeledTransfer> {
+        let source = self.returned_binding_of_model_return_type(returned)?;
+        if !self.implicit_move_return_parameters.contains(&source) {
+            return None;
+        }
+        self.exact_modeled_transfer(source, returned, ExactModeledOperation::MoveConstructor)
+    }
+
+    /// Select the copy constructor for a by-value return whose operand names a
+    /// binding that C++ never treats as implicitly movable or elidable.
+    ///
+    /// The eligible shapes are fixed at binding time by
+    /// [`cpp_binding_return_selects_copy`]; this only adds the requirement
+    /// that the operand and the declared return type denote the same exact
+    /// modeled owner, so a conversion between two modeled types cannot borrow
+    /// the copy operation.
+    fn exact_modeled_copy_return(&self, returned: Node<'tree>) -> Option<ExactModeledTransfer> {
+        let source = self.returned_binding_of_model_return_type(returned)?;
+        if !self.exact_copy_return_bindings.contains(&source) {
+            return None;
+        }
+        let owner_id = self.binding_model_type_ids.get(&source)?;
+        self.exact_modeled_transfer_on_owner(
+            source,
+            owner_id,
+            ExactModeledOperation::CopyConstructor,
+        )
+    }
+
+    /// The bound object a `return` operand names, when it names one and its
+    /// declared type is the same exact modeled owner as the declared return
+    /// type.
+    fn returned_binding_of_model_return_type(&self, returned: Node<'tree>) -> Option<ValueId> {
         if returned.kind() != "identifier" {
             return None;
         }
         let name = nonempty_node_text(self.source, returned)?;
         let source = self.binding_value(name, returned.start_byte())?;
-        if !self.implicit_move_return_parameters.contains(&source) {
-            return None;
-        }
         let return_owner = self.return_model_type_id.as_ref()?;
-        if self.binding_model_type_ids.get(&source) != Some(return_owner) {
-            return None;
-        }
-        self.exact_modeled_transfer(source, returned, ExactModeledOperation::MoveConstructor)
+        (self.binding_model_type_ids.get(&source) == Some(return_owner)).then_some(source)
     }
 
     fn modeled_transfer_locator(
@@ -2492,7 +2869,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 | ExactModeledOperation::ValuePreservingConstructor => {
                     DeclarationSegmentKind::Constructor
                 }
-                ExactModeledOperation::CopyAssignment => DeclarationSegmentKind::Method,
+                ExactModeledOperation::CopyAssignment | ExactModeledOperation::MoveAssignment => {
+                    DeclarationSegmentKind::Method
+                }
             },
             transfer.member_id.to_string(),
             anchor,
@@ -2535,7 +2914,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | ExactModeledOperation::ValuePreservingConstructor => {
                 (CallableReferenceKind::Constructor, None)
             }
-            ExactModeledOperation::CopyAssignment => {
+            ExactModeledOperation::CopyAssignment | ExactModeledOperation::MoveAssignment => {
                 (CallableReferenceKind::BoundMethod, Some(target))
             }
         };
@@ -3393,8 +3772,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.exact_modeled_copy_initialization(target, initializer)
                 {
                     Some(transfer)
+                } else if let Some(transfer) =
+                    self.exact_modeled_move_initialization(target, initializer)
+                {
+                    Some(transfer)
                 } else if let Some(owner_id) = self.binding_model_type_ids.get(&target).cloned() {
-                    let source = self.source_value(
+                    // The operand's own cached expression value, not a fresh
+                    // one: a bound `const char *` reaches this construction
+                    // through the lexical read of its name, and a value minted
+                    // here would be one nothing ever flowed into.
+                    let source = self.expression_value(
                         builder,
                         initializer,
                         cpp_expression_value_kind(initializer),
@@ -3937,15 +4324,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         cpp_expression_value_kind(value_node),
                     )?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
-                    let exact_return_transfer = (node.kind() == "return_statement")
-                        .then(|| self.exact_modeled_parameter_return(value_node))
-                        .flatten()
-                        .or_else(|| {
-                            let owner_id = self.return_model_type_id.as_deref()?;
-                            self.exact_modeled_character_data_construction(
-                                owner_id, value_node, source,
-                            )
-                        });
+                    // Only a `return` whose declared return type introduces a
+                    // distinct result object can select an implicit operation:
+                    // a pointer or reference return names the operand's own
+                    // object, and a `co_return` operand is transferred by the
+                    // coroutine promise rather than by a constructor.
+                    let exact_return_transfer = (node.kind() == "return_statement"
+                        && !self.return_transfer_is_exact)
+                        .then(|| {
+                            self.exact_modeled_parameter_return(value_node)
+                                .or_else(|| self.exact_modeled_copy_return(value_node))
+                                .or_else(|| {
+                                    let owner_id = self.return_model_type_id.as_deref()?;
+                                    self.exact_modeled_character_data_construction(
+                                        owner_id, value_node, source,
+                                    )
+                                })
+                        })
+                        .flatten();
                     let expression_continuation = if let Some(transfer) = exact_return_transfer {
                         let transfer_point = self.point(builder, value_node, Vec::new())?;
                         let transferred =
@@ -5248,8 +5644,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .then(|| {
                         let name = nonempty_node_text(self.source, left)?;
                         let target = self.binding_value(name, left.start_byte())?;
-                        let transfer = self.exact_modeled_copy_assignment(target, right)?;
+                        let transfer = self
+                            .exact_modeled_copy_assignment(target, right)
+                            .or_else(|| self.exact_modeled_move_assignment(target, right))?;
                         Some((target, transfer))
+                    })
+                    .flatten();
+                // A compound assignment invokes an operator the source names,
+                // so it is bound the same way a named member call is: through
+                // the receiver's exact modeled owner and the operator member's
+                // reviewed role, never through the operator's spelling.
+                let exact_modeled_compound = (left.kind() == "identifier")
+                    .then(|| {
+                        let operator = assignment_operator(node)?;
+                        if operator == "=" {
+                            return None;
+                        }
+                        let (target, owner_id) = self.modeled_receiver_binding(left)?;
+                        if !self.exact_modeled_receiver_argument(&owner_id, right) {
+                            return None;
+                        }
+                        let member = format!("operator{operator}");
+                        (self.exact_modeled_member_operation(&owner_id, &member, 1)
+                            == Some(ExplicitValueOperation::ReceiverExtend))
+                        .then_some(target)
                     })
                     .flatten();
                 let exact_target = (assignment_operator(node) == Some("=")
@@ -5272,6 +5690,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                         Some(result),
                         transfer,
+                    )?;
+                } else if let Some(target) = exact_modeled_compound {
+                    // The operation adds the operand's value to what the
+                    // receiver already holds, so it publishes dependence
+                    // without replacing the receiver's value and without
+                    // claiming the receiver now has the operand's class.
+                    let value =
+                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source: value,
+                            target,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        assignment,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: target,
+                        },
                     )?;
                 } else if let Some((name, target)) = exact_target {
                     let value =
@@ -5823,8 +6265,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: argument_values
-                    .into_iter()
-                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+                    .iter()
+                    .map(|value| SemanticCallArgument::direct(*value, ArgumentDomain::Positional))
                     .collect(),
                 normal_results: Box::new([]),
                 result: Some(result),
@@ -5838,6 +6280,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
+        self.emit_exact_modeled_receiver_operation(
+            builder,
+            normal,
+            call_site,
+            node,
+            &argument_values,
+            result,
+        )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -6966,17 +7416,10 @@ fn cpp_declaration_binds_fundamental_value(declaration: Node<'_>) -> bool {
         .any(|declarator| cpp_binding_is_fundamental(declaration, declarator))
 }
 
-/// Whether one formal is eligible for the parameter arm of C++ implicit move.
-///
-/// The qualifier decision comes from tree-sitter's `type_qualifier` node, not
-/// from reparsing a rendered type. Pointer, reference, array, and function
-/// declarators are deliberately excluded because this tranche models only a
-/// by-value object parameter.
-fn cpp_parameter_is_nonconst_by_value(
-    declaration: Node<'_>,
-    declarator: Node<'_>,
-    source: &str,
-) -> bool {
+/// Whether one formal declares a by-value object, so the C++ rules for
+/// returning a parameter's name apply to its object rather than through a
+/// pointer, reference, array, or function declarator.
+fn cpp_parameter_declares_object_by_value(declaration: Node<'_>, declarator: Node<'_>) -> bool {
     matches!(
         declaration.kind(),
         "parameter_declaration" | "optional_parameter_declaration"
@@ -6984,9 +7427,61 @@ fn cpp_parameter_is_nonconst_by_value(
         && !cpp_declarator_contains_kind(declarator, "reference_declarator")
         && !cpp_declarator_contains_kind(declarator, "array_declarator")
         && !cpp_declarator_contains_kind(declarator, "function_declarator")
-        && !named_children(declaration).into_iter().any(|child| {
-            child.kind() == "type_qualifier" && node_text(source, child) == Some("const")
-        })
+}
+
+/// Whether a declaration writes the `const` qualifier on its declared type.
+///
+/// The decision comes from tree-sitter's `type_qualifier` node, not from
+/// reparsing a rendered type.
+fn cpp_declaration_is_const_qualified(declaration: Node<'_>, source: &str) -> bool {
+    named_children(declaration)
+        .into_iter()
+        .any(|child| child.kind() == "type_qualifier" && node_text(source, child) == Some("const"))
+}
+
+/// Whether one formal is eligible for the parameter arm of C++ implicit move.
+fn cpp_parameter_is_nonconst_by_value(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> bool {
+    cpp_parameter_declares_object_by_value(declaration, declarator)
+        && !cpp_declaration_is_const_qualified(declaration, source)
+}
+
+/// Whether returning this binding's name by value selects the copy
+/// constructor exactly.
+///
+/// A `return` copy-initializes the result object from the named operand
+/// unless that operand is an implicitly movable entity, in which case
+/// overload resolution first offers it as an rvalue and elision may remove
+/// the operation altogether. Two declared shapes are never implicitly movable
+/// and never elidable, so the copy constructor is the one selected operation:
+///
+/// - an lvalue reference binding, which names no automatic object of the
+///   returned type at all; and
+/// - a `const` by-value parameter, whose implicit-move overload resolution
+///   offers a `const T&&` argument that no move constructor accepts.
+///
+/// A non-const automatic object is excluded because NRVO and implicit move
+/// leave its selected operation and object identity conditional. An
+/// rvalue-reference binding is excluded because C++20 made it an implicitly
+/// movable entity while C++17 did not, and this adapter is not told which
+/// language standard the translation unit is compiled under.
+fn cpp_binding_return_selects_copy(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    identity: &StructuredTypeIdentity,
+    source: &str,
+) -> bool {
+    if matches!(
+        identity.view(identity.root_id()),
+        Some(StructuredTypeNodeView::Reference(_))
+    ) {
+        return true;
+    }
+    cpp_parameter_declares_object_by_value(declaration, declarator)
+        && cpp_declaration_is_const_qualified(declaration, source)
 }
 
 /// Whether a callable's return transfer reproduces the returned value exactly.

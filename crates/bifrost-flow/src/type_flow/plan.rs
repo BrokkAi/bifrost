@@ -22,9 +22,9 @@ use crate::analyzer::semantic::{
     CallGuardOutcome, CallSiteId, CancellationToken, ClassAtom, ClassIdentity, ClassSeed,
     DispatchReadAttribution, DispatchReadUnattributedReason, EvidenceCompleteness, GuardFact,
     GuardPredicate, LengthDelimitedDigest, MemberAccessKind, MemberAccessQuery, MemberLookup,
-    MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticLocator,
+    MemoryLocationId, MemoryLocationKind, NarrowingVerdict, ProcedureHandle, ProcedurePortHandle,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
+    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticLocator,
     SemanticProviderError, SemanticValueKind, SemanticWork, SourceSite, SourceSiteKind, SourceSpan,
     StableDigest, TypeFlowAdapter, UnknownReason, ValueFlowEndpoint, ValueFlowSnapshot, ValueId,
 };
@@ -133,11 +133,58 @@ pub struct TypeFlowPlan {
     field_slot_semantic_exhaustion: Option<SemanticBudgetExceeded>,
     discovery_failure: Option<UnknownReason>,
     field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
+    class_closed_load_refinements: Vec<(ProcedureHandle, ClassClosedLoadRefinement)>,
     refinement_budget_exhausted: bool,
     /// The first semantic charge a procedure-local refinement could not pay.
     refinement_exhaustion: Option<SemanticBudgetExceeded>,
     correlations: Vec<(ProcedureHandle, CorrelationAnalysis)>,
     guard_bindings: HashMap<DurableProcedureKey, GuardBindings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassClosedLoadRefinement {
+    point: ProgramPointId,
+    event: usize,
+    location: MemoryLocationId,
+    result: ValueId,
+    base: ValueId,
+}
+
+fn call_result_aliases(procedure: &ProcedureHandle) -> HashSet<ValueId> {
+    let mut aliases = procedure
+        .semantics()
+        .call_sites()
+        .iter()
+        .flat_map(SemanticCallSite::normal_result_values)
+        .collect::<HashSet<_>>();
+    let mut copies = HashMap::<ValueId, Vec<ValueId>>::default();
+    for point in procedure.semantics().points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::Assignment {
+                    target,
+                    value: source,
+                }
+                | SemanticEffect::ValueFlow {
+                    kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                    source,
+                    target,
+                } => {
+                    copies.entry(source).or_default().push(target);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut pending = aliases.iter().copied().collect::<Vec<_>>();
+    while let Some(source) = pending.pop() {
+        for &target in copies.get(&source).into_iter().flatten() {
+            if aliases.insert(target) {
+                pending.push(target);
+            }
+        }
+    }
+    aliases
 }
 
 fn closure_has_provider_failure(closure: &DiscoveredClosure) -> bool {
@@ -1393,6 +1440,7 @@ impl TypeFlowPlan {
         unmaterialized_external_targets.dedup();
         let mut tables = SeedTables::new();
         let mut field_refinements = Vec::new();
+        let mut class_closed_load_refinements = Vec::new();
         let mut refinement_exhaustion: Option<SemanticBudgetExceeded> = None;
         let mut correlations = Vec::new();
         let mut guard_bindings = HashMap::default();
@@ -1535,6 +1583,45 @@ impl TypeFlowPlan {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
             };
+            let call_result_aliases = call_result_aliases(procedure);
+            for point in procedure.semantics().points() {
+                for (event, effect) in point.events.iter().enumerate() {
+                    let SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } = effect.effect
+                    else {
+                        continue;
+                    };
+                    if closed_loads.contains(&(point.id, result)) {
+                        continue;
+                    }
+                    let Some(location_row) = procedure.semantics().memory_location(location) else {
+                        continue;
+                    };
+                    let MemoryLocationKind::Index {
+                        base,
+                        constant_index: Some(_),
+                        ..
+                    } = &location_row.kind
+                    else {
+                        continue;
+                    };
+                    if call_result_aliases.contains(base)
+                        && adapter.memory_load_supports_class_closure(location_row)
+                    {
+                        class_closed_load_refinements.push((
+                            procedure.clone(),
+                            ClassClosedLoadRefinement {
+                                point: point.id,
+                                event,
+                                location,
+                                result,
+                                base: *base,
+                            },
+                        ));
+                    }
+                }
+            }
             seed_procedure(
                 workspace,
                 adapter,
@@ -1675,6 +1762,7 @@ impl TypeFlowPlan {
             field_slot_semantic_exhaustion: field_slots.semantic_budget_exhaustion(),
             discovery_failure,
             field_refinements,
+            class_closed_load_refinements,
             refinement_budget_exhausted: refinement_exhaustion.is_some(),
             refinement_exhaustion,
             correlations,
@@ -1696,6 +1784,7 @@ impl TypeFlowPlan {
 
     pub(crate) fn needs_source_refinement(&self) -> bool {
         !self.correlations.is_empty()
+            || !self.class_closed_load_refinements.is_empty()
             || self.field_refinements.iter().any(|(_, field)| {
                 field
                     .alternatives
@@ -1738,6 +1827,10 @@ impl TypeFlowPlan {
         self.correlations
             .iter()
             .any(|(owner, _)| owner == procedure)
+            || self
+                .class_closed_load_refinements
+                .iter()
+                .any(|(owner, _)| owner == procedure)
             || self.field_refinements.iter().any(|(owner, field)| {
                 owner == procedure
                     && field.alternatives.iter().any(|alternative| {
@@ -1776,6 +1869,13 @@ impl TypeFlowPlan {
                     );
                 }
             }
+        }
+        for (procedure, load) in &self.class_closed_load_refinements {
+            points.insert(
+                procedure
+                    .point_handle(load.point)
+                    .expect("a class-refined load point is live"),
+            );
         }
         points
     }
@@ -1883,13 +1983,72 @@ impl TypeFlowPlan {
                 });
             }
         }
+        let mut class_closed_loads = HashSet::default();
+        for (procedure, load) in &self.class_closed_load_refinements {
+            if cancellation.is_cancelled() {
+                return Err(TypeFlowPlanError::Cancelled);
+            }
+            let point = procedure
+                .point_handle(load.point)
+                .expect("a class-refined load point is live");
+            let base = ValueFlowCarrier::Value(
+                procedure
+                    .value_handle(load.base)
+                    .expect("a class-refined load base is live"),
+            );
+            let Some(reaching) = evidence.before(
+                &self.value_flow,
+                &point,
+                load.event,
+                &base,
+                budget,
+                cancellation,
+            )?
+            else {
+                continue;
+            };
+            let mut classes = Vec::new();
+            let mut complete = !reaching.is_empty();
+            for (source, uncertain) in reaching {
+                let ClassAtom::Class(class) = self.atom(source) else {
+                    complete = false;
+                    break;
+                };
+                if uncertain {
+                    complete = false;
+                    break;
+                }
+                if !classes.contains(class) {
+                    classes.push(class.clone());
+                }
+            }
+            let location = procedure
+                .semantics()
+                .memory_location(load.location)
+                .expect("a class-refined load location is live");
+            if complete
+                && adapter
+                    .memory_load_is_closed_for_classes(workspace, procedure, location, &classes)
+            {
+                class_closed_loads.insert((procedure.durable_key(), load.point, load.result));
+            }
+        }
         let mut tables = SeedTables::new();
         for (id, spec) in self.value_flow.sources() {
             let replaced = self.field_refinements.iter().any(|(procedure, field)| {
                 spec.point().procedure() == procedure && spec.point().id() == field.point
                     && matches!(spec.carrier(), ValueFlowCarrier::Value(value) if value.id() == field.result)
             });
-            if !replaced && spec.activation_triggers().is_none() {
+            let class_closed = matches!(
+                self.atom(id),
+                ClassAtom::Unknown(UnknownReason::UnmodeledLoad)
+            ) && matches!(spec.carrier(), ValueFlowCarrier::Value(value)
+            if class_closed_loads.contains(&(
+                spec.point().procedure().durable_key(),
+                spec.point().id(),
+                value.id(),
+            )));
+            if !replaced && !class_closed && spec.activation_triggers().is_none() {
                 tables.sources.push((
                     spec.clone(),
                     self.atom(id).clone(),

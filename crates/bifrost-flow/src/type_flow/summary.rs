@@ -7385,7 +7385,7 @@ mod tests {
             "    if value is not None:\n        return value\n",
             "    return value\n",
             "def wrapper(value):\n    return guarded(value)\n",
-            "def root():\n    wrapper(A())\n    wrapper(None)\n",
+            "def root():\n    wrapper(A())\n    return wrapper(None)\n",
         ));
         let (plan, provider) = runtime_plan(&workspace, &slots, &procedures["root"]);
         let mut prepared = PreparedClassSetSummaries::new(

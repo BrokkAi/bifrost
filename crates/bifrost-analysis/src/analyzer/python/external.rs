@@ -1613,6 +1613,7 @@ fn member_fact(
         is_abstract: false,
         is_virtual: false,
         implicit_operation: None,
+        explicit_operation: None,
         callable_family_complete: false,
         signature,
         receiver: None,

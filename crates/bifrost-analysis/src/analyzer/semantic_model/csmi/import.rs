@@ -484,6 +484,7 @@ fn import_semantic_document(
             is_abstract: false,
             is_virtual: false,
             implicit_operation: None,
+            explicit_operation: None,
             callable_family_complete,
             signature: Some(signature),
             receiver: if matches!(

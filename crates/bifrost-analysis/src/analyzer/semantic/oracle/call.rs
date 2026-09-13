@@ -1,9 +1,9 @@
-use super::super::ids::ProgramPointId;
+use super::super::ids::{ProgramPointId, ValueId};
 use super::super::ir::ValueTransfer;
 use super::super::ir::{
     ArgumentDomain, CallArgumentExpansion, CallSiteHandle, CallerReceiverBinding,
-    FormalMultiplicity, ProcedureHandle, ProcedureReceiverBinding, ProofStatus, SemanticValueKind,
-    ValueHandle,
+    FormalMultiplicity, ProcedureHandle, ProcedureKind, ProcedureReceiverBinding,
+    ProcedureSemantics, ProofStatus, SemanticCallSite, SemanticValueKind, ValueHandle,
 };
 use super::dispatch::DispatchCandidate;
 use super::error::{OracleContractError, require_same_procedure};
@@ -475,6 +475,32 @@ fn validate_argument_endpoint(
     Ok(())
 }
 
+/// The result a receiver-less construction expression passes to its
+/// constructor and returns to its caller. A direct or type-qualified
+/// constructor invocation has a receiver binding and retains an ordinary
+/// return-value boundary. Share this exact structural interpretation between
+/// producer and validator. The resolved constructor candidate is the proof for
+/// cross-file calls whose caller-side lowering cannot publish an allocation.
+pub(crate) fn constructor_call_result(
+    caller: &ProcedureSemantics,
+    call: &SemanticCallSite,
+    callee: &ProcedureSemantics,
+) -> Option<ValueId> {
+    if callee.kind() != ProcedureKind::Constructor || call.receiver.is_some() {
+        return None;
+    }
+    let result = call.result?;
+    let has_allocation = caller
+        .allocations()
+        .iter()
+        .any(|allocation| allocation.result == result);
+    let receiverless = matches!(
+        caller.proven_caller_receiver_binding(call.id),
+        None | Some(CallerReceiverBinding::Absent)
+    );
+    (has_allocation || receiverless).then_some(result)
+}
+
 impl CallBindings {
     pub fn new<I>(
         call: CallSiteHandle,
@@ -514,6 +540,13 @@ impl CallBindings {
             .semantics()
             .call_site(call.id())
             .expect("call-site handles are validated at construction");
+        let constructed_result =
+            constructor_call_result(caller.semantics(), call_row, callee.semantics()).filter(
+                |_| {
+                    callee.semantics().properties().construction_return
+                        == super::super::ir::ConstructionReturn::PreservesAllocation
+                },
+            );
         let relation_owner = OracleRelationOwner::CallBinding {
             call: call.clone(),
             callee: callee.clone(),
@@ -576,12 +609,11 @@ impl CallBindings {
                                 || caller.semantics().value(actual.id()).is_some_and(|row| {
                                     row.kind == SemanticValueKind::Receiver { dispatch: true }
                                 })
-                                || (call_row.result == Some(actual.id())
-                                    && caller
-                                        .semantics()
-                                        .allocations()
-                                        .iter()
-                                        .any(|allocation| allocation.result == actual.id()))
+                                || constructor_call_result(
+                                    caller.semantics(),
+                                    call_row,
+                                    callee.semantics(),
+                                ) == Some(actual.id())
                         }
                     };
                     if !receiver_actual_matches || formal.kind() != ProcedurePortKind::Receiver {
@@ -805,6 +837,11 @@ impl CallBindings {
                     }
                     require_same_procedure(formal.procedure(), &callee)?;
                     require_same_procedure(result.procedure(), caller)?;
+                    if Some(result.id()) == constructed_result {
+                        return Err(OracleContractError::InvalidCallBinding(
+                            "a construction result cannot be bound to its initializer return",
+                        ));
+                    }
                     let return_matches = match formal.kind() {
                         ProcedurePortKind::NormalReturn => call_row.result == Some(result.id()),
                         ProcedurePortKind::IndexedNormalReturn { ordinal } => {
@@ -890,13 +927,21 @@ impl CallBindings {
                 || has_receiver;
             let returns_bound = if call_row.normal_results.is_empty() {
                 call_row.result.is_none()
+                    || call_row.result == constructed_result
                     || normal_return_bindings.contains(&ProcedurePortKind::NormalReturn)
             } else {
-                (0..call_row.normal_results.len()).all(|ordinal| {
-                    normal_return_bindings.contains(&ProcedurePortKind::IndexedNormalReturn {
-                        ordinal: ordinal as u32,
+                call_row
+                    .normal_results
+                    .iter()
+                    .enumerate()
+                    .all(|(ordinal, result)| {
+                        Some(*result) == constructed_result
+                            || normal_return_bindings.contains(
+                                &ProcedurePortKind::IndexedNormalReturn {
+                                    ordinal: ordinal as u32,
+                                },
+                            )
                     })
-                })
             };
             let throws_bound = call_row.thrown.is_none() || has_exceptional_return;
             if !all_actuals_bound

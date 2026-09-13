@@ -356,6 +356,27 @@ impl ProcedureReceiverBinding {
     }
 }
 
+/// Whether an initializer's normal return can replace the allocated instance.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConstructionReturn {
+    /// Return values retain their ordinary transport, including languages
+    /// whose constructors can return a replacement object.
+    #[default]
+    MayReplaceAllocation,
+    /// Construction yields the allocation; a direct initializer call still
+    /// yields the initializer's own normal return value.
+    PreservesAllocation,
+}
+
+impl ConstructionReturn {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MayReplaceAllocation => "may_replace_allocation",
+            Self::PreservesAllocation => "preserves_allocation",
+        }
+    }
+}
+
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
@@ -367,6 +388,7 @@ pub struct ProcedureProperties {
     pub dispatch_extensibility: DispatchExtensibility,
     pub call_boundary: ProcedureCallBoundary,
     pub receiver_binding: ProcedureReceiverBinding,
+    pub construction_return: ConstructionReturn,
 }
 
 /// The positional or keyword domain accepted or produced at a call boundary.
@@ -1697,6 +1719,29 @@ impl ValueTransfer {
                 | TransferKind::Move { .. }
                 | TransferKind::Conversion {
                     preservation: ValuePreservation::Identity
+                }
+        )
+    }
+
+    /// Whether the destination holds the same member contents as the source at
+    /// the moment of the transfer.
+    ///
+    /// This is a statement about contents, not about storage. Every
+    /// `TransferKind` separates storage identity, so a later write through one
+    /// side is never visible through the other; a duplicating transfer still
+    /// starts the destination out holding what the source held, which is what
+    /// lets a member read of the destination observe the source's member. A
+    /// boxing or unboxing operation restructures the value instead of
+    /// duplicating it, and a changing conversion does not preserve the value at
+    /// all, so neither carries the source's members.
+    pub const fn preserves_member_contents(self) -> bool {
+        matches!(
+            self.kind,
+            TransferKind::Copy
+                | TransferKind::AggregateCopy
+                | TransferKind::Move { .. }
+                | TransferKind::Conversion {
+                    preservation: ValuePreservation::Identity | ValuePreservation::Preserving
                 }
         )
     }

@@ -11976,6 +11976,13 @@ fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Option<Vec<CppStructure
             "array_declarator" | "abstract_array_declarator" => {
                 wrappers.push(CppStructuredTypeWrapper::Array)
             }
+            // An initializer and a grouping parenthesis are not type
+            // structure. Stopping at one of them dropped every wrapper an
+            // initialized or parenthesized declarator writes, so
+            // `std::string &alias = value;` reported the unqualified
+            // `std::string` while `const std::string &value` as a parameter
+            // reported the reference it shares.
+            "init_declarator" | "parenthesized_declarator" => {}
             _ => break,
         }
         let Some(child) = current
@@ -12023,7 +12030,13 @@ fn cpp_wrap_structured_type_node(
     }
 }
 
-fn cpp_structured_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+/// The dot-free name components a qualified C++ name node writes, outermost
+/// first.
+///
+/// The walk reads the grammar's `scope` and `name` fields rather than cutting
+/// a rendered spelling on `::`, so `std::move` yields `["std", "move"]` and a
+/// shape the grammar does not name yields nothing at all.
+pub fn cpp_structured_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut path = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {

@@ -239,8 +239,29 @@ pub(crate) fn drive_and_finish_procedure<I, F>(
     normal_exit: ProgramPointId,
     exceptional_exit: ProgramPointId,
     cancellation: &CancellationToken,
-    mut step: F,
+    step: F,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), ProcedureLoweringError>
+where
+    I: IntoIterator,
+    F: FnMut(
+        &mut ProcedureCfgBuilder,
+        I::Item,
+        &mut Vec<I::Item>,
+    ) -> Result<(), ProcedureLoweringError>,
+{
+    drive_procedure_work(&mut builder, initial, cancellation, step)?;
+    finish_procedure(builder, entry, normal_exit, exceptional_exit, cancellation)
+}
+
+/// Drive adapter-owned work without freezing the procedure. An adapter uses
+/// this split form when it must publish a synthetic effect only after the
+/// completed control graph proves that effect reachable.
+pub(crate) fn drive_procedure_work<I, F>(
+    builder: &mut ProcedureCfgBuilder,
+    initial: I,
+    cancellation: &CancellationToken,
+    mut step: F,
+) -> Result<(), ProcedureLoweringError>
 where
     I: IntoIterator,
     F: FnMut(
@@ -271,6 +292,18 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// Seal detached control regions and freeze a procedure whose adapter work is
+/// complete.
+pub(crate) fn finish_procedure(
+    mut builder: ProcedureCfgBuilder,
+    entry: ProgramPointId,
+    normal_exit: ProgramPointId,
+    exceptional_exit: ProgramPointId,
+    cancellation: &CancellationToken,
+) -> Result<(ProcedureSemanticsParts, SemanticWork), ProcedureLoweringError> {
     if builder
         .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
         .is_err()

@@ -8,11 +8,11 @@ use url::Url;
 use super::{
     ActivePackExtractionGap, ActiveSemanticModelShard, AmbientUseRole, AsciiTransform,
     CaptureBinding, CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness,
-    EmbeddedTypeFact, EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind,
-    ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact, MemberKind,
-    ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels, RuleEmission,
-    RuleTrigger, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure, RuntimeValuesPayload,
-    SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
+    EmbeddedTypeFact, EmittedDeclaration, ExplicitValueOperation, GeneratorRule, HierarchyFact,
+    HierarchyKind, ImplicitOperation, KeyedReadBehavior, KeyedReadObservation, Locator, MemberFact,
+    MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
+    RuleEmission, RuleTrigger, RuntimeGlobalBindingEvidence, RuntimeGlobalExposure,
+    RuntimeValuesPayload, SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
     StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
     TypeKind, TypeParameterConstraint, TypeRef, TypeRefReferenceKind, TypeValueSemantics,
     Visibility,
@@ -227,6 +227,10 @@ pub struct SemanticModelSymbol {
     pub receiver: Option<ReceiverFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub implicit_operation: Option<ImplicitOperation>,
+    /// The declaration's reviewed role in a value operation the call site
+    /// spells, carried through from the pack record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_operation: Option<ExplicitValueOperation>,
     /// The declaration's reviewed contextual role, carried through from the
     /// pack record. `None` means the producer did not review it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,6 +494,19 @@ pub enum SemanticModelMemberTargetDisposition {
 
 #[derive(Debug)]
 pub struct SemanticModelMemberTargetMatch<'a> {
+    pub records: Vec<&'a SemanticModelSymbol>,
+    pub disposition: SemanticModelMemberTargetDisposition,
+}
+
+/// The value operation an owner performs for one written member name and
+/// argument count, together with every declaration that performs it.
+///
+/// `operation` is present only on a `Unique` disposition. The records are
+/// retained on every disposition so a caller can report exactly which
+/// declarations disagreed or were incomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticModelExplicitOperationMatch<'a> {
+    pub operation: Option<ExplicitValueOperation>,
     pub records: Vec<&'a SemanticModelSymbol>,
     pub disposition: SemanticModelMemberTargetDisposition,
 }
@@ -1322,6 +1339,127 @@ impl SemanticModelOverlay {
         owner_id: &str,
         operation: &ImplicitOperation,
     ) -> SemanticModelMemberTargetMatch<'_> {
+        self.role_member_target_on_owner(owner_id, &|member: &SemanticModelSymbol| {
+            member.implicit_operation.as_ref() == Some(operation)
+        })
+    }
+
+    /// Resolve the value operation an exact modeled owner performs for one
+    /// member name written with one argument count.
+    ///
+    /// Because the call site spells the member, what has to be unique is the
+    /// *operation*, not the declaration: `append(const string&)` and
+    /// `append(const char*)` are two declarations of one operation, and a
+    /// consumer that required a single record would decline a name the model
+    /// answers completely. Every member of the owner with this name and
+    /// argument count must therefore carry the same reviewed role. One that
+    /// carries a different role, or none at all, leaves the operation
+    /// undecided and the answer `Incomplete`.
+    ///
+    /// The rest of the disposition contract is the implicit lookup's: a
+    /// complete owner that publishes no such member is `Incomplete` rather
+    /// than an absence claim, ambiguous provenance is a `Conflict`, and
+    /// partial provenance is never promoted.
+    pub fn explicit_member_target_on_owner(
+        &self,
+        owner_id: &str,
+        name: &str,
+        argument_count: usize,
+    ) -> SemanticModelExplicitOperationMatch<'_> {
+        let owners = self.symbols_with_id(owner_id);
+        if owners.disposition == SemanticModelOverlayDisposition::Conflict
+            || owners.records.len() > 1
+        {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Conflict,
+            };
+        }
+        let [owner] = owners.records.as_slice() else {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        };
+        if owner.owner_id.is_some() {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records: Vec::new(),
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+
+        let members = self.members_of(owner_id);
+        let mut records = members
+            .records
+            .into_iter()
+            .filter(|member| {
+                member.owner_id.as_deref() == Some(owner_id)
+                    && member.name == name
+                    && member
+                        .structured_signature
+                        .as_ref()
+                        .is_some_and(|signature| signature.parameters.len() == argument_count)
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let [first, rest @ ..] = records.as_slice() else {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        };
+        let Some(operation) = first.explicit_operation else {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        };
+        if rest
+            .iter()
+            .any(|member| member.explicit_operation != Some(operation))
+        {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+        if records.iter().any(|member| member.provenance.ambiguous) {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Conflict,
+            };
+        }
+        if owner.provenance.completeness != SemanticModelCompleteness::Complete
+            || records
+                .iter()
+                .any(|member| member.provenance.completeness != SemanticModelCompleteness::Complete)
+        {
+            return SemanticModelExplicitOperationMatch {
+                operation: None,
+                records,
+                disposition: SemanticModelMemberTargetDisposition::Incomplete,
+            };
+        }
+        SemanticModelExplicitOperationMatch {
+            operation: Some(operation),
+            records,
+            disposition: SemanticModelMemberTargetDisposition::Unique,
+        }
+    }
+
+    fn role_member_target_on_owner(
+        &self,
+        owner_id: &str,
+        selects: &dyn Fn(&SemanticModelSymbol) -> bool,
+    ) -> SemanticModelMemberTargetMatch<'_> {
         let owners = self.symbols_with_id(owner_id);
         if owners.disposition == SemanticModelOverlayDisposition::Conflict
             || owners.records.len() > 1
@@ -1359,10 +1497,7 @@ impl SemanticModelOverlay {
         let mut records = members
             .records
             .into_iter()
-            .filter(|member| {
-                member.owner_id.as_deref() == Some(owner_id)
-                    && member.implicit_operation.as_ref() == Some(operation)
-            })
+            .filter(|member| member.owner_id.as_deref() == Some(owner_id) && selects(member))
             .collect::<Vec<_>>();
         records.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -4403,6 +4538,7 @@ fn emit_rule_match(
                         embedded_types: Vec::new(),
                         receiver: None,
                         implicit_operation: None,
+                        explicit_operation: None,
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
                         locator_path: None,
@@ -4458,6 +4594,7 @@ fn emit_rule_match(
                             embedded_types: Vec::new(),
                             receiver: None,
                             implicit_operation: None,
+                            explicit_operation: None,
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
                             locator_path: None,
@@ -4866,6 +5003,7 @@ fn type_symbol(
         embedded_types: record.embedded_types.clone(),
         receiver: None,
         implicit_operation: None,
+        explicit_operation: None,
         ambient_use: record.ambient_use,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
@@ -4929,6 +5067,7 @@ fn member_symbol(
         embedded_types: Vec::new(),
         receiver: record.receiver,
         implicit_operation: record.implicit_operation.clone(),
+        explicit_operation: record.explicit_operation,
         ambient_use: record.ambient_use,
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
@@ -5613,6 +5752,7 @@ mod tests {
             embedded_types: Vec::new(),
             receiver: None,
             implicit_operation: None,
+            explicit_operation: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,
@@ -5731,6 +5871,7 @@ mod tests {
             embedded_types: Vec::new(),
             receiver: None,
             implicit_operation: None,
+            explicit_operation: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             locator_path: None,

@@ -10,11 +10,11 @@ use crate::analyzer::semantic_model::{
     Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryInformationalEvidence,
     DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
-    DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact,
-    HierarchyKind, ImplicitOperation, Locator, MemberFact, MemberIdentity, MemberKind,
-    NameSelector, Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency,
-    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, Signature,
-    StructuredTypeExpression, TypeCopySemantics, TypeFact, TypeIdentity, TypeKind,
+    DependencyPackProduction, ExactDependencyArtifact, ExplicitValueOperation,
+    ExternalArtifactKind, HierarchyFact, HierarchyKind, ImplicitOperation, Locator, MemberFact,
+    MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance, ReceiverFact,
+    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
+    Signature, StructuredTypeExpression, TypeCopySemantics, TypeFact, TypeIdentity, TypeKind,
     TypeMoveSemantics, TypeRef, TypeRefReferenceKind, TypeValueSemantics, Visibility,
     WildcardVariance, member_declaration_id, type_declaration_id,
 };
@@ -37,8 +37,9 @@ use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
 use brokk_bifrost_cpp::declarations::{CppComparableNode, CppComparableSlot, CppParameterType};
 use brokk_bifrost_cpp::external_declarations::{
     CppCallableExplicitness, CppExternalDeclarationCompleteness, CppExternalDeclarationLimits,
-    CppExternalMemberKind, CppExternalVisibility, external_angle_include_paths,
-    external_angle_include_paths_from_root, extract_external_declarations,
+    CppExternalMemberKind, CppExternalOwner, CppExternalTypeKind, CppExternalVisibility,
+    external_angle_include_paths, external_angle_include_paths_from_root,
+    extract_external_declarations,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -177,7 +178,7 @@ fn basic_string_constructor_role(
     member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
 ) -> Option<BasicStringConstructorRole> {
     if member.kind != CppExternalMemberKind::Function
-        || member.owner.as_deref() != Some(owner_name)
+        || member.owner.as_ref().and_then(CppExternalOwner::type_name) != Some(owner_name)
         || member.name != "basic_string"
         || member.return_type.is_some()
     {
@@ -240,6 +241,104 @@ fn basic_string_constructor_role(
         }
         _ => None,
     }
+}
+
+/// The exact `std::basic_string` members whose value operation the source
+/// spells out.
+///
+/// Each role is decided by the declaration's structured shape -- its owner
+/// template, its parameter and return identities, and its arity -- so a
+/// same-named member of another class or a differently shaped overload of the
+/// same name never acquires one.
+fn basic_string_explicit_role(
+    owner_name: &str,
+    type_parameters: &[String],
+    member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
+) -> Option<ExplicitValueOperation> {
+    if member.kind != CppExternalMemberKind::Function
+        || member.owner.as_ref().and_then(CppExternalOwner::type_name) != Some(owner_name)
+    {
+        return None;
+    }
+    let [character_parameter, _, _] = type_parameters else {
+        return None;
+    };
+    match member.name.as_str() {
+        "assign" | "append" | "operator+=" => {
+            let return_type = member.return_type.as_ref()?;
+            let Some(StructuredTypeNodeView::Reference(returned)) =
+                return_type.view(return_type.root_id())
+            else {
+                return None;
+            };
+            if !is_basic_string_self_type(return_type, returned) {
+                return None;
+            }
+            let [CppParameterType::Structured(identity)] = member.parameter_types.as_deref()?
+            else {
+                return None;
+            };
+            let accepts_value = match identity.view(identity.root_id())? {
+                StructuredTypeNodeView::Reference(inner) => {
+                    is_basic_string_self_type(identity, inner)
+                }
+                StructuredTypeNodeView::Pointer(inner) => {
+                    is_basic_string_type_parameter(identity, inner, character_parameter)
+                }
+                _ => false,
+            };
+            accepts_value.then(|| {
+                if member.name == "assign" {
+                    ExplicitValueOperation::ReceiverAssign
+                } else {
+                    ExplicitValueOperation::ReceiverExtend
+                }
+            })
+        }
+        "c_str" | "data" => {
+            let return_type = member.return_type.as_ref()?;
+            let Some(StructuredTypeNodeView::Pointer(pointee)) =
+                return_type.view(return_type.root_id())
+            else {
+                return None;
+            };
+            (member.parameter_types.as_deref() == Some(&[])
+                && is_basic_string_type_parameter(return_type, pointee, character_parameter))
+            .then_some(ExplicitValueOperation::ReceiverProjection)
+        }
+        _ => None,
+    }
+}
+
+/// Whether one namespace-scope declaration is the standard library's
+/// `std::move`.
+///
+/// `std::move` performs no operation: it produces an expiring value that
+/// denotes its argument's own object, and the operation the surrounding
+/// context then selects is what a consumer needs. The identification is
+/// structural -- the indexed declaration sits directly in namespace `std`,
+/// takes exactly one forwarding-reference parameter with no defaulted or
+/// repeated formals, and returns that parameter's type as an rvalue reference
+/// directly or through `remove_reference<T>::type` -- so the three-argument
+/// `<algorithm>` overload of the same name never qualifies.
+fn canonical_expiring_cast_role(
+    member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
+) -> Option<ExplicitValueOperation> {
+    if member.kind != CppExternalMemberKind::Function
+        || member.name != "move"
+        || !matches!(
+            member.owner.as_ref(),
+            Some(CppExternalOwner::Namespace(namespace)) if namespace == "std"
+        )
+        || !member.returns_forwarding_reference
+        || member.callable_arity
+            != Some(brokk_bifrost_core::analyzer::model::CallableArity::new(
+                1, 1, false,
+            ))
+    {
+        return None;
+    }
+    Some(ExplicitValueOperation::ArgumentExpiringCast)
 }
 
 fn is_const_pointer_to_basic_string_type_parameter(
@@ -306,7 +405,7 @@ fn basic_string_assignment_role(
     member: &brokk_bifrost_cpp::external_declarations::CppExternalMember,
 ) -> Option<BasicStringAssignmentRole> {
     if member.kind != CppExternalMemberKind::Function
-        || member.owner.as_deref() != Some(owner_name)
+        || member.owner.as_ref().and_then(CppExternalOwner::type_name) != Some(owner_name)
         || member.name != "operator="
     {
         return None;
@@ -466,6 +565,51 @@ pub(crate) fn external_structured_type_model_resolution(
         return CppExternalTypeModelResolution::Incomplete;
     }
     CppExternalTypeModelResolution::Unique(target.id.clone())
+}
+
+/// Resolve one written namespace path to the exact generated model namespace
+/// that a reached external header declares.
+///
+/// This is the namespace counterpart of
+/// [`external_structured_type_model_resolution`]: a C++ free function's owner
+/// is the namespace it is written in, and a consumer that wants that
+/// function's reviewed role needs the namespace's declaration id first. The
+/// same fail-closed rules apply -- the header closure must be known, exactly
+/// one complete, unambiguous, exactly-generated namespace record must match,
+/// and it must come from a header this file actually reaches.
+pub(crate) fn external_namespace_model_resolution(
+    analyzer: &CppAnalyzer,
+    overlay: Option<&SemanticModelOverlay>,
+    file: &ProjectFile,
+    namespace_path: &[String],
+) -> Option<String> {
+    if namespace_path.is_empty() {
+        return None;
+    }
+    let headers = directly_reached_external_headers(analyzer, file)?;
+    let headers = headers.headers()?;
+    let overlay = overlay?;
+    let qualified_name = namespace_path.join(".");
+    let matched = overlay.symbols_named(&qualified_name);
+    let mut records = matched
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.language == "cpp"
+                && symbol.owner_id.is_none()
+                && symbol.kind == SemanticModelSymbolKind::Module
+                && symbol.qualified_name == qualified_name
+                && symbol_is_in_headers(symbol, headers)
+                && symbol.provenance.origin == SemanticModelOriginKind::ExactGeneratedOutput
+                && !symbol.provenance.ambiguous
+                && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    let [record] = records.as_slice() else {
+        return None;
+    };
+    Some(record.id.clone())
 }
 
 pub(crate) fn external_member_resolution(
@@ -773,7 +917,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 member
                     .owner
                     .as_ref()
-                    .map(|owner| (owner.clone(), member.source_path.clone()))
+                    .map(|owner| (owner.name().to_owned(), member.source_path.clone()))
             })
             .collect::<crate::hash::HashSet<_>>();
         extracted_types.sort_by(|left, right| {
@@ -790,7 +934,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let basic_string_type_parameters = extracted_types
             .iter()
             .filter_map(|record| {
-                (!record.is_type_alias)
+                (record.kind == CppExternalTypeKind::Class)
                     .then(|| {
                         exact_basic_string_template_parameters(
                             &record.name,
@@ -821,6 +965,24 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 }
             }
         }
+        // An explicitly written operation keeps the role on every declaration
+        // that performs it: two overloads of `append` are two declarations of
+        // one operation, not competing answers. The consumer requires every
+        // same-name, same-arity member to agree before it binds one, which is
+        // the uniqueness that matters when the source names the member.
+        let explicit_roles_by_index = extracted_members
+            .iter()
+            .enumerate()
+            .filter_map(|(index, member)| {
+                basic_string_type_parameters
+                    .iter()
+                    .find_map(|(owner_name, parameters)| {
+                        basic_string_explicit_role(owner_name, parameters, member)
+                    })
+                    .or_else(|| canonical_expiring_cast_role(member))
+                    .map(|role| (index, role))
+            })
+            .collect::<HashMap<_, _>>();
         let unique_constructor_roles = constructor_candidates
             .into_iter()
             .filter_map(|((owner, role), indices)| {
@@ -858,10 +1020,10 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 ambient_use: None,
                 id: type_ids[&record.name].clone(),
                 name: record.name.clone(),
-                type_kind: if record.is_type_alias {
-                    TypeKind::TypeAlias
-                } else {
-                    TypeKind::Class
+                type_kind: match record.kind {
+                    CppExternalTypeKind::Class => TypeKind::Class,
+                    CppExternalTypeKind::Namespace => TypeKind::Module,
+                    CppExternalTypeKind::TypeAlias => TypeKind::TypeAlias,
                 },
                 visibility: match record.visibility {
                     CppExternalVisibility::Public => Visibility::Public,
@@ -912,7 +1074,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut emitted_constructor_ids =
             HashMap::<(String, BasicStringConstructorRole), String>::default();
         for (record_index, record) in extracted_members.into_iter().enumerate() {
-            let Some(owner_name) = record.owner.as_deref() else {
+            let Some(owner_name) = record.owner.as_ref().map(CppExternalOwner::name) else {
                 partial = true;
                 diagnostics.warning(
                     "cpp.member_owner_unavailable",
@@ -1020,6 +1182,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 implicit_operation: constructor_role
                     .map(BasicStringConstructorRole::operation)
                     .or_else(|| assignment_role.map(BasicStringAssignmentRole::operation)),
+                explicit_operation: explicit_roles_by_index.get(&record_index).copied(),
                 callable_family_complete: false,
                 signature,
                 receiver: Some(ReceiverFact { pointer: false }),
@@ -1646,8 +1809,9 @@ fn stable_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        SemanticBudget, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticOutcome,
-        SemanticRequest, TransferKind, TransferOperation, ValueFlowKind,
+        CallableTarget, CallableTargetResolution, DeclarationSegmentKind, ProcedureSemantics,
+        SemanticArtifact, SemanticBudget, SemanticCapability, SemanticEffect, SemanticGapImpact,
+        SemanticOutcome, SemanticRequest, TransferKind, TransferOperation, ValueFlowKind, ValueId,
     };
     use crate::analyzer::semantic_model::CompilerOptions;
     use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
@@ -1678,6 +1842,204 @@ mod tests {
             source,
             CppExternalDeclarationLimits::default(),
         )
+    }
+
+    /// How many adjacent `Assignment` then call-backed `Transfer` event pairs
+    /// of one transfer kind a procedure publishes.
+    ///
+    /// The adjacency, the shared source value, and the shared target value are
+    /// the contract an identity consumer reads: the transfer overrides the
+    /// assignment it follows at the same program point, and its operation
+    /// names the exact lowered call occurrence that performs it.
+    fn adjacent_call_backed_transfers(procedure: &ProcedureSemantics, kind: TransferKind) -> usize {
+        procedure
+            .points()
+            .iter()
+            .flat_map(|point| point.events.windows(2))
+            .filter(|events| {
+                matches!(
+                    (&events[0].effect, &events[1].effect),
+                    (
+                        SemanticEffect::Assignment { target, value },
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(transfer),
+                            source,
+                            target: flow_target,
+                        }
+                    ) if transfer.kind == kind
+                        && matches!(transfer.operation, TransferOperation::CallSite(_))
+                        && source == value
+                        && flow_target == target
+                )
+            })
+            .count()
+    }
+
+    /// One call-backed transfer as a consumer reads it: which exact modeled
+    /// operation performed it, and which two distinct value identities it
+    /// relates.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TransferWitness {
+        owner: String,
+        member: String,
+        member_kind: DeclarationSegmentKind,
+        source: ValueId,
+        target: ValueId,
+    }
+
+    /// One call-backed transfer whose operation the source spelled.
+    ///
+    /// The written call is the witness: it names the member in the source, the
+    /// object the operation ran on, and the arguments it was given, while the
+    /// transfer names the two value identities. Its dispatch answer stays the
+    /// ordinary one, because this model proves which operation runs, not which
+    /// body a translation unit links.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SpelledTransfer {
+        source: ValueId,
+        target: ValueId,
+        receiver: Option<ValueId>,
+        arguments: Vec<ValueId>,
+    }
+
+    fn spelled_transfers(
+        procedure: &ProcedureSemantics,
+        kind: TransferKind,
+    ) -> Vec<SpelledTransfer> {
+        procedure
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(transfer),
+                    source,
+                    target,
+                } = &event.effect
+                else {
+                    return None;
+                };
+                if transfer.kind != kind {
+                    return None;
+                }
+                let TransferOperation::CallSite(call_site) = transfer.operation else {
+                    return None;
+                };
+                let call_site = procedure
+                    .call_site(call_site)
+                    .expect("a transfer names a call site of its own procedure");
+                Some(SpelledTransfer {
+                    source: *source,
+                    target: *target,
+                    receiver: call_site.receiver,
+                    arguments: call_site
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.value)
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// Read every call-backed transfer of one kind whose call site proves one
+    /// exact external declaration.
+    ///
+    /// This is the shape an *implicit* operation publishes: the source spelled
+    /// no call, so the lowering minted one whose target is the declaration the
+    /// model selected. An operation the source did spell keeps the ordinary
+    /// dispatch answer its own call already had, and is read by
+    /// [`spelled_transfers`] instead.
+    fn transfer_witnesses(
+        procedure: &ProcedureSemantics,
+        kind: TransferKind,
+    ) -> Vec<TransferWitness> {
+        procedure
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Transfer(transfer),
+                    source,
+                    target,
+                } = &event.effect
+                else {
+                    return None;
+                };
+                if transfer.kind != kind {
+                    return None;
+                }
+                let TransferOperation::CallSite(call_site) = transfer.operation else {
+                    return None;
+                };
+                let call_site = procedure
+                    .call_site(call_site)
+                    .expect("a transfer names a call site of its own procedure");
+                assert_eq!(
+                    Some(*target),
+                    call_site.result,
+                    "the transfer's destination is the call's result object: {call_site:#?}",
+                );
+                assert_eq!(
+                    Some(*target),
+                    call_site.receiver,
+                    "the transfer's destination is the object the operation runs on: {call_site:#?}",
+                );
+                assert_eq!(
+                    vec![*source],
+                    call_site
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.value)
+                        .collect::<Vec<_>>(),
+                    "the transfer's origin is the operation's only argument: {call_site:#?}",
+                );
+                let CallableTargetResolution::Proven(CallableTarget::External(locator)) =
+                    &call_site.declared_targets
+                else {
+                    panic!("an exact modeled transfer proves one external target: {call_site:#?}");
+                };
+                let [owner, member] = locator.declaration().segments() else {
+                    panic!("an exact modeled transfer names an owner and a member: {locator:#?}");
+                };
+                assert_eq!(DeclarationSegmentKind::Type, owner.kind());
+                Some(TransferWitness {
+                    owner: owner.name().expect("owner segment is named").to_owned(),
+                    member: member.name().expect("member segment is named").to_owned(),
+                    member_kind: member.kind(),
+                    source: *source,
+                    target: *target,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a procedure still declines its by-value return transfer.
+    fn retains_return_transfer_gap(procedure: &ProcedureSemantics) -> bool {
+        procedure.gaps().iter().any(|gap| {
+            gap.capability == SemanticCapability::Values
+                && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+        })
+    }
+
+    fn named_procedure<'a>(
+        artifact: &'a crate::analyzer::semantic::SemanticArtifact,
+        name: &str,
+    ) -> &'a ProcedureSemantics {
+        artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("procedure `{name}` must be materialized"))
     }
 
     fn template_default(base: &str, parameter: &str) -> CppTemplateExpression {
@@ -1782,6 +2144,60 @@ mod tests {
     }
 
     #[test]
+    fn expiring_cast_role_requires_the_forwarded_parameters_exact_return_type() {
+        for (declaration, expected) in [
+            ("template<class T> T&& move(T&&);", true),
+            (
+                "template<class T> constexpr typename std::remove_reference<T>::type&& move(T&&) noexcept;",
+                true,
+            ),
+            (
+                "template<class T> typename std::remove_reference<T>::type&& move(T&&);",
+                true,
+            ),
+            (
+                "template<class T> typename remove_reference<T>::type&& move(T&&);",
+                true,
+            ),
+            ("template<class T> int move(T&&);", false),
+            ("template<class T> int&& move(T&&);", false),
+            ("int&& move(int&&);", false),
+            ("template<class T> T&& move(const T&&);", false),
+            ("template<class T> T&& move(volatile T&&);", false),
+            ("template<class T> const T&& move(T&&);", false),
+            ("template<class T, class U> U&& move(T&&);", false),
+            (
+                "template<class T, class U> typename std::remove_reference<U>::type&& move(T&&);",
+                false,
+            ),
+            (
+                "template<class T> typename std::remove_reference<const T>::type&& move(T&&);",
+                false,
+            ),
+            (
+                "template<class T> typename other::remove_reference<T>::type&& move(T&&);",
+                false,
+            ),
+        ] {
+            let declarations =
+                extract_test_declarations(&format!("namespace std {{ {declaration} }}"));
+            let members = declarations
+                .members
+                .iter()
+                .filter(|member| member.name == "move")
+                .collect::<Vec<_>>();
+            let [member] = members.as_slice() else {
+                panic!("one declaration for {declaration}: {declarations:#?}");
+            };
+            assert_eq!(
+                expected.then_some(ExplicitValueOperation::ArgumentExpiringCast),
+                canonical_expiring_cast_role(member),
+                "{declaration}: {member:#?}",
+            );
+        }
+    }
+
+    #[test]
     fn basic_string_character_data_role_requires_exact_defaulted_allocator_shape() {
         let declarations = extract_test_declarations(
             r#"
@@ -1799,7 +2215,9 @@ mod tests {
             .members
             .iter()
             .filter(|member| {
-                member.owner.as_deref() == Some("std.basic_string") && member.name == "basic_string"
+                member.owner.as_ref().and_then(CppExternalOwner::type_name)
+                    == Some("std.basic_string")
+                    && member.name == "basic_string"
             })
             .collect::<Vec<_>>();
 
@@ -1879,7 +2297,9 @@ mod tests {
             .members
             .iter()
             .filter(|member| {
-                member.owner.as_deref() == Some("std.basic_string") && member.name == "operator="
+                member.owner.as_ref().and_then(CppExternalOwner::type_name)
+                    == Some("std.basic_string")
+                    && member.name == "operator="
             })
             .collect::<Vec<_>>();
         assert_eq!(4, assignments.len(), "{declarations:#?}");
@@ -2977,45 +3397,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn activated_basic_string_pack_lowers_exact_copy_and_move_operations() {
+    /// The canonical declarations this suite's fake `<string>` header
+    /// publishes: the primary `std::basic_string` template with its exact
+    /// copy, move, and character-data constructors and assignment operators,
+    /// plus the ordinary `std::string` alias.
+    const CANONICAL_BASIC_STRING_HEADER: &str = concat!(
+        "namespace std {\n",
+        "template <class T> T&& move(T&& value) noexcept;\n",
+        "template <class It, class Out> Out move(It first, It last, Out result);\n",
+        "template <class C, class Traits = char_traits<C>, class Alloc = allocator<C>>\n",
+        "class basic_string { public: basic_string(); basic_string(const basic_string&); basic_string(basic_string&&); basic_string(const C*, const Alloc& = Alloc()); basic_string& operator=(const basic_string&); basic_string& operator=(basic_string&&); basic_string& assign(const basic_string&); basic_string& append(const basic_string&); basic_string& operator+=(const basic_string&); const C* c_str() const; };\n",
+        "using string = basic_string<char, char_traits<char>, allocator<char>>;\n",
+        "}\n",
+    );
+
+    /// Materialize one C++ translation unit with the generated C++ header
+    /// pack activated over the supplied `<string>` declarations.
+    fn materialize_with_cpp_header_pack(header: &str, source: &str) -> Arc<SemanticArtifact> {
         let temp = tempfile::tempdir().expect("temp root");
         let root = temp.path().canonicalize().expect("canonical root");
-        let source = concat!(
-            "#include <string>\n",
-            "std::string copy(std::string source) {\n",
-            "  std::string copied = source;\n",
-            "  std::string assigned;\n",
-            "  assigned = source;\n",
-            "  return copied;\n",
-            "}\n",
-            "std::string relay(std::string source) {\n",
-            "  return source;\n",
-            "}\n",
-            "std::string relay_local(std::string source) {\n",
-            "  std::string local = source;\n",
-            "  return local;\n",
-            "}\n",
-            "std::string relay_const(const std::string source) {\n",
-            "  return source;\n",
-            "}\n",
-            "std::string from_literal() {\n",
-            "  return \"tainted\";\n",
-            "}\n",
-            "std::string from_wide_literal() {\n",
-            "  return L\"tainted\";\n",
-            "}\n",
-        );
         let file = ProjectFile::new(root.clone(), "src/main.cpp");
         file.write(source).expect("source");
         ProjectFile::new(root.clone(), "fake/include/string")
-            .write(concat!(
-                "namespace std {\n",
-                "template <class C, class Traits = char_traits<C>, class Alloc = allocator<C>>\n",
-                "class basic_string { public: basic_string(); basic_string(const basic_string&); basic_string(basic_string&&); basic_string(const C*, const Alloc& = Alloc()); basic_string& operator=(const basic_string&); basic_string& operator=(basic_string&&); };\n",
-                "using string = basic_string<char, char_traits<char>, allocator<char>>;\n",
-                "}\n",
-            ))
+            .write(header)
             .expect("header");
         ProjectFile::new(root.clone(), "compile_commands.json")
             .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
@@ -3070,84 +3474,58 @@ mod tests {
         else {
             panic!("C++ semantic materialization must complete");
         };
-        let copy = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("copy")
-            })
-            .expect("copy procedure");
-        let transfers = copy
-            .points()
-            .iter()
-            .flat_map(|point| point.events.windows(2))
-            .filter(|events| {
-                matches!(
-                    (&events[0].effect, &events[1].effect),
-                    (
-                        SemanticEffect::Assignment { target, value },
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Transfer(transfer),
-                            source,
-                            target: flow_target,
-                        }
-                    ) if transfer.kind == TransferKind::Copy
-                        && matches!(transfer.operation, TransferOperation::CallSite(_))
-                        && source == value
-                        && flow_target == target
-                )
-            })
-            .count();
+        artifact
+    }
+
+    fn materialize_with_basic_string_pack(source: &str) -> Arc<SemanticArtifact> {
+        materialize_with_cpp_header_pack(CANONICAL_BASIC_STRING_HEADER, source)
+    }
+
+    #[test]
+    fn activated_basic_string_pack_lowers_exact_copy_and_move_operations() {
+        let source = concat!(
+            "#include <string>\n",
+            "std::string copy(std::string source) {\n",
+            "  std::string copied = source;\n",
+            "  std::string assigned;\n",
+            "  assigned = source;\n",
+            "  return copied;\n",
+            "}\n",
+            "std::string relay(std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string relay_local(std::string source) {\n",
+            "  std::string local = source;\n",
+            "  return local;\n",
+            "}\n",
+            "std::string relay_const(const std::string source) {\n",
+            "  return source;\n",
+            "}\n",
+            "std::string from_literal() {\n",
+            "  return \"tainted\";\n",
+            "}\n",
+            "std::string from_wide_literal() {\n",
+            "  return L\"tainted\";\n",
+            "}\n",
+        );
+        let artifact = materialize_with_basic_string_pack(source);
+
+        let copy = named_procedure(&artifact, "copy");
         assert_eq!(
-            2, transfers,
+            2,
+            adjacent_call_backed_transfers(copy, TransferKind::Copy),
             "exact copy construction and assignment must publish adjacent call-backed transfers: {copy:#?}",
         );
 
-        let relay = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("relay")
-            })
-            .expect("relay procedure");
-        let move_transfers = relay
-            .points()
-            .iter()
-            .flat_map(|point| point.events.windows(2))
-            .filter(|events| {
-                matches!(
-                    (&events[0].effect, &events[1].effect),
-                    (
-                        SemanticEffect::Assignment { target, value },
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Transfer(transfer),
-                            source,
-                            target: flow_target,
-                        }
-                    ) if transfer.kind
-                        == TransferKind::Move {
-                            invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
-                        }
-                        && matches!(transfer.operation, TransferOperation::CallSite(_))
-                        && source == value
-                        && flow_target == target
-                )
-            })
-            .count();
+        let relay = named_procedure(&artifact, "relay");
         assert_eq!(
-            1, move_transfers,
+            1,
+            adjacent_call_backed_transfers(
+                relay,
+                TransferKind::Move {
+                    invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+                },
+            ),
             "a by-value basic_string parameter return must publish one adjacent call-backed invalidating move: {relay:#?}",
         );
         assert_eq!(
@@ -3167,77 +3545,22 @@ mod tests {
             "the moved value must feed the procedure's normal return port: {relay:#?}",
         );
         assert!(
-            !relay.gaps().iter().any(|gap| {
-                gap.capability == SemanticCapability::Values
-                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-            }),
+            !retains_return_transfer_gap(relay),
             "an exact parameter move return must not retain a return-transfer gap: {relay:#?}",
         );
 
-        let relay_local = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("relay_local")
-            })
-            .expect("relay_local procedure");
-        let local_copy_transfers = relay_local
-            .points()
-            .iter()
-            .flat_map(|point| point.events.windows(2))
-            .filter(|events| {
-                matches!(
-                    (&events[0].effect, &events[1].effect),
-                    (
-                        SemanticEffect::Assignment { target, value },
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Transfer(transfer),
-                            source,
-                            target: flow_target,
-                        }
-                    ) if transfer.kind == TransferKind::Copy
-                        && matches!(transfer.operation, TransferOperation::CallSite(_))
-                        && source == value
-                        && flow_target == target
-                )
-            })
-            .count();
-        assert_eq!(
-            1, local_copy_transfers,
-            "named-local copy initialization remains an exact copy transfer: {relay_local:#?}",
-        );
+        let relay_local = named_procedure(&artifact, "relay_local");
         assert_eq!(
             1,
-            relay_local
-                .gaps()
-                .iter()
-                .filter(|gap| {
-                    gap.capability == SemanticCapability::Values
-                        && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-                })
-                .count(),
+            adjacent_call_backed_transfers(relay_local, TransferKind::Copy),
+            "named-local copy initialization remains an exact copy transfer: {relay_local:#?}",
+        );
+        assert!(
+            retains_return_transfer_gap(relay_local),
             "returning a named local must retain its typed return-transfer gap: {relay_local:#?}",
         );
 
-        let relay_const = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("relay_const")
-            })
-            .expect("relay_const procedure");
+        let relay_const = named_procedure(&artifact, "relay_const");
         assert!(
             !relay_const
                 .points()
@@ -3258,55 +3581,32 @@ mod tests {
                 })),
             "a const by-value parameter cannot select the move constructor: {relay_const:#?}",
         );
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(relay_const, TransferKind::Copy),
+            "a const by-value parameter return selects the copy constructor: {relay_const:#?}",
+        );
         assert!(
-            relay_const.gaps().iter().any(|gap| {
+            !relay_const.gaps().iter().any(|gap| {
                 gap.capability == SemanticCapability::Values
                     && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
             }),
-            "a const parameter return must retain typed return incompleteness: {relay_const:#?}",
+            "an exact copy-constructed return must not retain a return-transfer gap: {relay_const:#?}",
         );
 
-        let from_literal = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("from_literal")
-            })
-            .expect("from_literal procedure");
-        assert!(
-            from_literal.points().iter().any(|point| {
-                point.events.windows(2).any(|events| {
-                    matches!(
-                        (&events[0].effect, &events[1].effect),
-                        (
-                            SemanticEffect::Assignment { target, value },
-                            SemanticEffect::ValueFlow {
-                                kind: ValueFlowKind::Transfer(transfer),
-                                source,
-                                target: flow_target,
-                            }
-                        ) if transfer.kind == TransferKind::Conversion {
-                            preservation: crate::analyzer::semantic::ValuePreservation::Preserving,
-                        }
-                            && matches!(transfer.operation, TransferOperation::CallSite(_))
-                            && source == value
-                            && flow_target == target
-                    )
-                })
-            }),
+        let from_literal = named_procedure(&artifact, "from_literal");
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(
+                from_literal,
+                TransferKind::Conversion {
+                    preservation: crate::analyzer::semantic::ValuePreservation::Preserving,
+                },
+            ),
             "narrow character data must use the exact value-preserving constructor: {from_literal:#?}",
         );
         assert!(
-            !from_literal.gaps().iter().any(|gap| {
-                gap.capability == SemanticCapability::Values
-                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-            }),
+            !retains_return_transfer_gap(from_literal),
             "an exact character-data return must not retain a return-transfer gap: {from_literal:#?}",
         );
         assert_eq!(
@@ -3326,19 +3626,7 @@ mod tests {
             "the exact character-data construction must feed the normal return port: {from_literal:#?}",
         );
 
-        let from_wide_literal = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("from_wide_literal")
-            })
-            .expect("from_wide_literal procedure");
+        let from_wide_literal = named_procedure(&artifact, "from_wide_literal");
         assert!(
             !from_wide_literal
                 .points()
@@ -3355,12 +3643,415 @@ mod tests {
             "a wide literal must not acquire the narrow character-data constructor: {from_wide_literal:#?}",
         );
         assert!(
-            from_wide_literal.gaps().iter().any(|gap| {
-                gap.capability == SemanticCapability::Values
-                    && gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-            }),
+            retains_return_transfer_gap(from_wide_literal),
             "the rejected wide-literal return must retain typed incompleteness: {from_wide_literal:#?}",
         );
+    }
+
+    /// Replay of the shape that opens every frozen DataFlowBench v0.6.0 C++
+    /// case (tag `8b70fd39d4c8777af40adadd70c6d91467a7299e`): a `dfb_source`
+    /// returning `std::string` built from narrow character data, followed by
+    /// relays that return a `const std::string &` parameter by value.
+    ///
+    /// A returned name that is an lvalue reference binding or a `const`
+    /// by-value parameter is never an implicitly movable entity and is never
+    /// elidable, so the copy constructor is the one selected operation. An
+    /// rvalue-reference binding, a reference return, and a class this pack
+    /// does not model all stay on their existing answers.
+    #[test]
+    fn reference_bound_basic_string_returns_select_the_exact_copy_constructor() {
+        let artifact = materialize_with_basic_string_pack(concat!(
+            "#include <string>\n",
+            "struct Payload { };\n",
+            "std::string dfb_source() {\n",
+            "  return \"tainted\";\n",
+            "}\n",
+            "std::string relay_const_ref(const std::string &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "std::string relay_mutable_ref(std::string &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "std::string relay_reference_local(const std::string &value) {\n",
+            "  const std::string &alias = value;\n",
+            "  return alias;\n",
+            "}\n",
+            "std::string relay_by_value(std::string value) {\n",
+            "  return value;\n",
+            "}\n",
+            "std::string relay_rvalue_ref(std::string &&value) {\n",
+            "  return value;\n",
+            "}\n",
+            "const std::string &borrow(const std::string &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "Payload relay_unmodeled(const Payload &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "template <class T> T relay_template(const T &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "auto relay_deduced(const std::string &value) {\n",
+            "  return value;\n",
+            "}\n",
+            "struct Tag { operator std::string() const; };\n",
+            "std::string from_user_conversion(const Tag &tag) {\n",
+            "  return tag;\n",
+            "}\n",
+        ));
+
+        let dfb_source = named_procedure(&artifact, "dfb_source");
+        assert!(
+            !retains_return_transfer_gap(dfb_source),
+            "the frozen front-door source no longer declines its return transfer: {dfb_source:#?}",
+        );
+
+        let const_ref = named_procedure(&artifact, "relay_const_ref");
+        let const_ref_copies = transfer_witnesses(const_ref, TransferKind::Copy);
+        let [const_ref_witness] = const_ref_copies.as_slice() else {
+            panic!("a const-reference relay publishes exactly one copy: {const_ref:#?}");
+        };
+        assert_eq!(
+            DeclarationSegmentKind::Constructor,
+            const_ref_witness.member_kind
+        );
+        assert_ne!(
+            const_ref_witness.source, const_ref_witness.target,
+            "a copy relates two distinct value identities: {const_ref_witness:#?}",
+        );
+        assert!(
+            !retains_return_transfer_gap(const_ref),
+            "an exact copy-constructed return keeps no return-transfer gap: {const_ref:#?}",
+        );
+        assert_eq!(
+            1,
+            const_ref
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                ))
+                .count(),
+            "the copied object feeds the procedure's normal return port: {const_ref:#?}",
+        );
+
+        let mutable_ref = named_procedure(&artifact, "relay_mutable_ref");
+        assert_eq!(
+            vec![const_ref_witness.member.clone()],
+            transfer_witnesses(mutable_ref, TransferKind::Copy)
+                .into_iter()
+                .map(|witness| witness.member)
+                .collect::<Vec<_>>(),
+            "a non-const lvalue reference selects the same copy constructor: {mutable_ref:#?}",
+        );
+
+        let reference_local = named_procedure(&artifact, "relay_reference_local");
+        assert_eq!(
+            vec![const_ref_witness.member.clone()],
+            transfer_witnesses(reference_local, TransferKind::Copy)
+                .into_iter()
+                .map(|witness| witness.member)
+                .collect::<Vec<_>>(),
+            "binding a reference local stays aliasing while its by-value return copies: \
+             {reference_local:#?}",
+        );
+        assert_eq!(
+            1,
+            reference_local
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(_),
+                        ..
+                    }
+                ))
+                .count(),
+            "the alias declaration itself is not a transfer: {reference_local:#?}",
+        );
+
+        let by_value = named_procedure(&artifact, "relay_by_value");
+        let by_value_moves = transfer_witnesses(
+            by_value,
+            TransferKind::Move {
+                invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+            },
+        );
+        let [by_value_witness] = by_value_moves.as_slice() else {
+            panic!("a non-const by-value parameter return still moves: {by_value:#?}");
+        };
+        assert_eq!(
+            const_ref_witness.owner, by_value_witness.owner,
+            "both operations belong to the same exact modeled owner",
+        );
+        assert_ne!(
+            const_ref_witness.member, by_value_witness.member,
+            "copy and move are two distinct declared operations, not one relaxed transfer",
+        );
+
+        for (name, keeps_gap) in [
+            // C++20 made an rvalue-reference binding implicitly movable while
+            // C++17 did not, so its selected operation is not decided here.
+            ("relay_rvalue_ref", true),
+            // A reference return names the operand's own object, so nothing
+            // is constructed and nothing is declined.
+            ("borrow", false),
+            // A class the activated pack does not model publishes no exact
+            // operation to select.
+            ("relay_unmodeled", true),
+            // An unresolved template return type and a deduced return type
+            // both leave the destination type unknown.
+            ("relay_template", true),
+            ("relay_deduced", true),
+            // A user-defined conversion is a different operation on a
+            // different owner; it cannot inherit the modeled copy.
+            ("from_user_conversion", true),
+        ] {
+            let procedure = named_procedure(&artifact, name);
+            assert!(
+                !procedure.points().iter().any(|point| {
+                    point.events.iter().any(|event| {
+                        matches!(
+                            event.effect,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Transfer(_),
+                                ..
+                            }
+                        )
+                    })
+                }),
+                "`{name}` must not acquire a modeled transfer: {procedure:#?}",
+            );
+            assert_eq!(
+                keeps_gap,
+                retains_return_transfer_gap(procedure),
+                "`{name}` must keep its existing return-transfer answer: {procedure:#?}",
+            );
+        }
+    }
+
+    /// Selection is per operation, not per type. A header whose
+    /// `std::basic_string` declares a move constructor but no copy
+    /// constructor proves a by-value return of a non-const by-value
+    /// parameter, and declines the reference-bound return that would need the
+    /// copy constructor the header never declares.
+    #[test]
+    fn basic_string_returns_select_only_the_operations_the_header_declares() {
+        let artifact = materialize_with_cpp_header_pack(
+            concat!(
+                "namespace std {\n",
+                "template <class C, class Traits = char_traits<C>, class Alloc = allocator<C>>\n",
+                "class basic_string { public: basic_string(); basic_string(basic_string&&); basic_string& operator=(basic_string&&); };\n",
+                "using string = basic_string<char, char_traits<char>, allocator<char>>;\n",
+                "}\n",
+            ),
+            concat!(
+                "#include <string>\n",
+                "std::string relay_const_ref(const std::string &value) {\n",
+                "  return value;\n",
+                "}\n",
+                "std::string relay_by_value(std::string value) {\n",
+                "  return value;\n",
+                "}\n",
+            ),
+        );
+
+        let by_value = named_procedure(&artifact, "relay_by_value");
+        assert_eq!(
+            1,
+            adjacent_call_backed_transfers(
+                by_value,
+                TransferKind::Move {
+                    invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+                },
+            ),
+            "the declared move constructor still selects exactly: {by_value:#?}",
+        );
+
+        let const_ref = named_procedure(&artifact, "relay_const_ref");
+        assert!(
+            const_ref.points().iter().all(|point| {
+                point.events.iter().all(|event| {
+                    !matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(_),
+                            ..
+                        }
+                    )
+                })
+            }),
+            "an undeclared copy constructor cannot be borrowed from the move constructor: \
+             {const_ref:#?}",
+        );
+        assert!(
+            retains_return_transfer_gap(const_ref),
+            "the unselectable copy keeps typed return incompleteness: {const_ref:#?}",
+        );
+    }
+
+    /// The operations a `std::basic_string` call site spells are bound through
+    /// the receiver's exact modeled owner and the model's reviewed role, and
+    /// the expiring-value cast is bound through the exact namespace the
+    /// reached headers declare it in.
+    ///
+    /// Each publishes the fact its semantics require: `assign` replaces the
+    /// receiver's value and is therefore an identity-separating copy into the
+    /// receiver's own storage; `append` and `operator+=` add to what the
+    /// receiver already holds and therefore publish dependence without
+    /// replacing it; `c_str` exposes the receiver's own character storage and
+    /// therefore publishes a backing-store relation rather than a copy.
+    #[test]
+    fn spelled_basic_string_operations_bind_through_their_reviewed_roles() {
+        let artifact = materialize_with_basic_string_pack(concat!(
+            "#include <string>\n",
+            "void mutated(std::string sink, std::string source) {\n",
+            "  sink.assign(source);\n",
+            "  sink.append(source);\n",
+            "  sink += source;\n",
+            "}\n",
+            "const char* projected(std::string source) {\n",
+            "  return source.c_str();\n",
+            "}\n",
+            "std::string moved(std::string source) {\n",
+            "  std::string taken = std::move(source);\n",
+            "  std::string assigned;\n",
+            "  assigned = std::move(taken);\n",
+            "  return assigned;\n",
+            "}\n",
+        ));
+
+        let mutated = named_procedure(&artifact, "mutated");
+        let assign_copies = spelled_transfers(mutated, TransferKind::Copy);
+        let [assign_witness] = assign_copies.as_slice() else {
+            panic!("`assign` replaces the receiver's value exactly once: {mutated:#?}");
+        };
+        assert_ne!(
+            assign_witness.source, assign_witness.target,
+            "the receiver's storage stays distinct from the argument's: {assign_witness:#?}",
+        );
+        assert_eq!(
+            vec![assign_witness.source],
+            assign_witness.arguments,
+            "the replaced-in value is the operation's written argument: {assign_witness:#?}",
+        );
+        assert!(
+            assign_witness
+                .receiver
+                .is_some_and(|receiver| receiver != assign_witness.target),
+            "a spelled operation runs on the object the source read, while the fact names the binding it wrote: {assign_witness:#?}",
+        );
+        assert_eq!(
+            2,
+            mutated
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        ..
+                    }
+                ))
+                .count(),
+            "`append` and `operator+=` add to the receiver without replacing it: {mutated:#?}",
+        );
+
+        let projected = named_procedure(&artifact, "projected");
+        assert!(
+            projected.points().iter().any(|point| {
+                point.events.iter().any(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::BackingStore {
+                                offset: crate::analyzer::semantic::BackingStoreOffset::Zero,
+                            },
+                            ..
+                        }
+                    )
+                })
+            }),
+            "a read projection names the receiver's own character storage: {projected:#?}",
+        );
+
+        let moved = named_procedure(&artifact, "moved");
+        let moves = transfer_witnesses(
+            moved,
+            TransferKind::Move {
+                invalidation: crate::analyzer::semantic::MoveInvalidation::Invalidated,
+            },
+        );
+        assert_eq!(
+            2,
+            moves.len(),
+            "an expiring operand selects the move constructor and the move assignment: {moved:#?}",
+        );
+        assert_eq!(
+            2,
+            moves
+                .iter()
+                .map(|witness| witness.member.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "move construction and move assignment are two distinct declarations: {moves:?}",
+        );
+    }
+
+    /// None of the spelled operations may be reached by a member's name. A
+    /// same-named class in a user namespace publishes no role, a cast written
+    /// in another namespace is not the standard library's, and the
+    /// `<algorithm>` overload of the same name has another arity and another
+    /// meaning.
+    #[test]
+    fn spelled_basic_string_operations_reject_same_named_near_misses() {
+        let artifact = materialize_with_basic_string_pack(concat!(
+            "#include <string>\n",
+            "namespace decoy {\n",
+            "class basic_string { public: basic_string(const basic_string&); basic_string& assign(const basic_string&); basic_string& append(const basic_string&); const char* c_str() const; };\n",
+            "template <class T> T&& move(T&& value);\n",
+            "}\n",
+            "void decoy_members(decoy::basic_string sink, decoy::basic_string source) {\n",
+            "  sink.assign(source);\n",
+            "  sink.append(source);\n",
+            "}\n",
+            "std::string decoy_cast(std::string source) {\n",
+            "  std::string taken = decoy::move(source);\n",
+            "  return taken;\n",
+            "}\n",
+            "std::string range_overload(std::string first, std::string last, std::string out) {\n",
+            "  std::string taken = std::move(first, last, out);\n",
+            "  return taken;\n",
+            "}\n",
+        ));
+
+        for name in ["decoy_members", "decoy_cast", "range_overload"] {
+            let procedure = named_procedure(&artifact, name);
+            assert!(
+                !procedure.points().iter().any(|point| {
+                    point.events.iter().any(|event| {
+                        matches!(
+                            event.effect,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Transfer(_)
+                                    | ValueFlowKind::BackingStore { .. }
+                                    | ValueFlowKind::LanguageDefined,
+                                ..
+                            }
+                        )
+                    })
+                }),
+                "`{name}` must reach no modeled operation by spelling alone: {procedure:#?}",
+            );
+        }
     }
 
     #[test]

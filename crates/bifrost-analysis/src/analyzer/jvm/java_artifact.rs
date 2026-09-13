@@ -653,6 +653,7 @@ pub(super) fn java_api_facts(
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
                 implicit_operation: None,
+                explicit_operation: None,
                 callable_family_complete: member.callable_family_complete
                     && matches!(
                         member.member_kind,

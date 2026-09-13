@@ -5390,7 +5390,21 @@ fn propagate_memory_payload_identities(
             }
         }
     }
-    let mut answers = Vec::new();
+    // A field payload can be defined by a store whose own source is another
+    // field-load result: a Go by-value struct copy loads each field of the
+    // source aggregate and stores it into the destination's own field storage.
+    // Resolving those in one pass would depend on the order the loads happen to
+    // appear, so the definitions are collected first and equated to a fixed
+    // point, exactly as the indexed payloads below are.
+    struct PendingFieldPayload {
+        destination: LocalSynchronizationSubject,
+        source: Option<ReferenceIdentityUse>,
+    }
+    let field_payload_results = loads
+        .iter()
+        .map(|load| load.result.clone())
+        .collect::<HashSet<_>>();
+    let mut pending_field_payloads = Vec::with_capacity(loads.len());
     for load in loads {
         if request.cancellation.is_cancelled()
             || request
@@ -5410,6 +5424,10 @@ fn propagate_memory_payload_identities(
         else {
             continue;
         };
+        // A by-value aggregate copy's destination is the binding's own inline
+        // storage and has no allocation origin of its own; the copy chain below
+        // supplies one. Every other container without an origin stays outside
+        // this resolution.
         if container.storage_origin.is_none()
             && !matches!(
                 container.resolved.independent_storage,
@@ -5426,13 +5444,30 @@ fn propagate_memory_payload_identities(
             || declaration.is_none()
             || classes.member_reference_binding(&load.member) != Some(true)
         {
-            answers.push((load.result, None));
+            pending_field_payloads.push(PendingFieldPayload {
+                destination: load.result,
+                source: None,
+            });
             continue;
         }
         let mut observation = load.base.clone();
         let mut visited_copies = HashSet::default();
         let mut copy_complete = true;
-        while container.storage_origin.is_none() {
+        // A producer that states the copy's own member contents defines this
+        // member directly, so the chain below has nothing to recover: the
+        // ordinary store search resolves it, and a second store to the same
+        // member still disqualifies it there. Walking anyway would read the
+        // copy's own store as a competing later replacement.
+        let stated_directly = stores.iter().any(|store| {
+            classes
+                .member_declarations
+                .get(&member_locator_key(&store.member))
+                == declaration.as_ref()
+                && classes
+                    .canonical_backing_identity(store.base.clone())
+                    .is_some_and(|base| base.canonical() == container.canonical())
+        });
+        while !stated_directly && container.storage_origin.is_none() {
             if request.cancellation.is_cancelled()
                 || request
                     .budget
@@ -5519,7 +5554,10 @@ fn propagate_memory_payload_identities(
             observation = copy.source.clone();
         }
         if !copy_complete {
-            answers.push((load.result, None));
+            pending_field_payloads.push(PendingFieldPayload {
+                destination: load.result,
+                source: None,
+            });
             continue;
         }
         if request
@@ -5554,9 +5592,16 @@ fn propagate_memory_payload_identities(
                 {
                     matching.push(store)
                 }
+                // A base that names independent storage of its own cannot be
+                // this container when the two identities differ, even when it
+                // has no allocation origin: a by-value aggregate copy's
+                // destination is independent storage without being an
+                // allocation site.
                 Some(base)
-                    if base.storage_origin.is_some()
-                        && base.storage_origin != container.storage_origin => {}
+                    if base.canonical() != container.canonical()
+                        && ((base.storage_origin.is_some()
+                            && base.storage_origin != container.storage_origin)
+                            || base.resolved.independent_storage.is_some()) => {}
                 _ => complete = false,
             }
         }
@@ -5567,7 +5612,12 @@ fn propagate_memory_payload_identities(
             // that recursive subtree may still establish an invariant payload.
             && !recursive_roots.iter().any(|ancestor| invocations.contains(*ancestor, store.source.invocation))
             && reference_source_is_stable(classes, invocations, tasks, &load.base, request)
-            && reference_source_is_stable(classes, invocations, tasks, &store.source, request)
+            // A field-load result is an immutable value snapshot. Its pending
+            // equation proves the exact source; inspecting the mutable slot
+            // associated with that result would reject an otherwise exact
+            // multi-hop payload copy.
+            && (field_payload_results.contains(&store.source.subject)
+                || reference_source_is_stable(classes, invocations, tasks, &store.source, request))
             && field_container_is_unpublished(
                 classes,
                 invocations,
@@ -5605,28 +5655,59 @@ fn propagate_memory_payload_identities(
                 }
                 None => false,
             };
-            match classes.bound_canonical_identity(source.subject.clone()) {
-                ConcurrencyAnswer::Proven(Some(fact))
-                    if before
-                        && reference_allocations.contains(fact.canonical())
-                        && !classes.repeated_allocations.contains(fact.canonical())
-                        && fact.resolved.exact_candidate().is_some()
-                        && fact.storage_origin.as_ref() == Some(fact.canonical()) =>
-                {
-                    Some(fact)
-                }
-                _ => None,
-            }
+            before.then(|| source.clone())
         } else {
             None
         };
-        answers.push((load.result, fact));
+        pending_field_payloads.push(PendingFieldPayload {
+            destination: load.result,
+            source: fact,
+        });
     }
-    for (result, fact) in answers {
-        if let Some(fact) = fact {
-            classes.bind_canonical_value(result, fact);
-        } else {
-            classes.opaque_values.push(result);
+    let mut active = vec![true; pending_field_payloads.len()];
+    loop {
+        if request.cancellation.is_cancelled()
+            || request
+                .budget
+                .charge(crate::analyzer::semantic::SemanticWork {
+                    nested_entries: pending_field_payloads.len(),
+                    ..crate::analyzer::semantic::SemanticWork::default()
+                })
+                .is_err()
+        {
+            return Ok(false);
+        }
+        let mut changed = false;
+        for (index, pending) in pending_field_payloads.iter().enumerate() {
+            if !active[index] {
+                continue;
+            }
+            let Some(source) = &pending.source else {
+                continue;
+            };
+            let ConcurrencyAnswer::Proven(Some(fact)) =
+                classes.bound_canonical_identity(source.subject.clone())
+            else {
+                continue;
+            };
+            if !reference_allocations.contains(fact.canonical())
+                || classes.repeated_allocations.contains(fact.canonical())
+                || fact.resolved.exact_candidate().is_none()
+                || fact.storage_origin.as_ref() != Some(fact.canonical())
+            {
+                continue;
+            }
+            classes.bind_canonical_value(pending.destination.clone(), fact);
+            active[index] = false;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (pending, active) in pending_field_payloads.iter().zip(active) {
+        if active {
+            classes.opaque_values.push(pending.destination.clone());
         }
     }
 

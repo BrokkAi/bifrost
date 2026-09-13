@@ -1008,6 +1008,7 @@ fn produce_document(
             is_abstract: matches!(&item.inner, ItemEnum::Function(function) if !function.has_body),
             is_virtual: false,
             implicit_operation: None,
+            explicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver: has_receiver.then_some(ReceiverFact { pointer: false }),

@@ -536,6 +536,7 @@ fn scala_entry_facts(
                 && !is_static
                 && !scala_has_modifier(node, "final"),
             implicit_operation: None,
+            explicit_operation: None,
             callable_family_complete: false,
             signature,
             receiver: is_map_member.then_some(ReceiverFact { pointer: false }),
@@ -588,6 +589,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         is_abstract: false,
         is_virtual: false,
         implicit_operation: None,
+        explicit_operation: None,
         callable_family_complete: false,
         signature: Some(Signature {
             type_parameters: Vec::new(),

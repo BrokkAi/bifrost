@@ -1775,6 +1775,14 @@ pub struct MemberFact {
     /// The member's own stable `id` is the operation identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_operation: Option<ImplicitOperation>,
+    /// Reviewed role of this exact member in a value operation the call site
+    /// spells. The member's own stable `id` is the operation identity.
+    ///
+    /// Serialized only when reviewed, so adding the field leaves the
+    /// canonical bytes and content digest of every member that does not carry
+    /// a role unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_operation: Option<ExplicitValueOperation>,
     /// Whether importing this member can consume it without spelling its name.
     /// See [`AmbientUseRole`]; absence means the producer did not review the
     /// declaration, never that the declaration is ordinary.
@@ -1823,6 +1831,61 @@ pub enum ImplicitOperation {
     ConversionOperator {
         target: TypeRef,
     },
+}
+
+/// A declaration-level role for a value operation the call site writes out.
+///
+/// [`ImplicitOperation`] describes an operation a language rule selects for an
+/// expression nobody spelled. These roles are the opposite case: the source
+/// names the member, so a consumer binds it through the receiver's or
+/// argument's exact modeled type together with this member's own declaration
+/// id, never through a rendered member name.
+///
+/// Each role states only what the operation does to the values involved. It
+/// says nothing about the member's other behavior, and a member whose role
+/// the producer did not review carries no role at all rather than a neutral
+/// one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExplicitValueOperation {
+    /// The receiver's value becomes the first argument's value. The receiver
+    /// object is written, not replaced, so its storage identity is unchanged
+    /// and stays distinct from the argument's.
+    ReceiverAssign,
+    /// The first argument's value is added to what the receiver already holds.
+    /// The receiver keeps its previous value as well, so this states added
+    /// dependence rather than replacement.
+    ReceiverExtend,
+    /// The normal result reads the receiver's value out of the receiver's own
+    /// storage. The result is a view of that storage rather than an
+    /// independent object, so writing through it writes the receiver.
+    ReceiverProjection,
+    /// The normal result denotes the single argument's own object as an
+    /// expiring value. No operation runs and no storage is created; the result
+    /// exists so the surrounding context can select the operation it performs
+    /// on an expiring operand.
+    ArgumentExpiringCast,
+}
+
+impl ExplicitValueOperation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReceiverAssign => "receiver_assign",
+            Self::ReceiverExtend => "receiver_extend",
+            Self::ReceiverProjection => "receiver_projection",
+            Self::ArgumentExpiringCast => "argument_expiring_cast",
+        }
+    }
+
+    /// Whether the role describes an operation invoked on a receiver.
+    pub const fn has_receiver(self) -> bool {
+        match self {
+            Self::ReceiverAssign | Self::ReceiverExtend | Self::ReceiverProjection => true,
+            Self::ArgumentExpiringCast => false,
+        }
+    }
 }
 
 /// The condition under which one activation declares a record.

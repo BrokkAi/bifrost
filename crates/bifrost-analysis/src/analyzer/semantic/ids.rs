@@ -198,6 +198,8 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// selectors for runtime-global reads. Revision 23 adds saved definition-time
 /// default argument values, selected
 /// by conditional call bindings rather than executed in the callee body.
+/// Revision 31 distinguishes allocation-preserving initializers from
+/// constructors whose normal return can replace the allocated instance.
 /// Revision 30 adds the value-carrier adaptation transfer operation, which
 /// binds a transfer to the exact declaration/member/boundary witness a
 /// language adapter proved for a declared value type whose runtime carrier
@@ -215,7 +217,7 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// and every wire id derived from one rotates exactly once when this constant
 /// moves; that is a mechanical consequence of extending the IR, not a signal
 /// that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 30;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 31;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1348,10 +1350,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "6bdf1b527a53793b2724873874acc42b05ed8cc54eca2242d4123063379d2b64"
+            "9074976fbca060e512b4483b2cc5cdd6fa090d86111c95ea03573e94e3a140c0"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 30);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 31);
     }
 
     fn digest(label: &str) -> StableDigest {

@@ -29,7 +29,7 @@ use brokk_bifrost_python::imports::python_import_infos_from_node;
 use brokk_bifrost_python::syntax::{python_static_attribute_path, python_static_type_path};
 use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v26";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v29";
 
 const PYTHON_UNKNOWN_ITERATION_ELEMENT: &str = "python.unknown_iteration_element";
 const PYTHON_UNKNOWN_UNPACK_ELEMENT: &str = "python.unknown_unpack_element";
@@ -759,6 +759,11 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
+            construction_return: if kind == ProcedureKind::Constructor {
+                crate::analyzer::semantic::ConstructionReturn::PreservesAllocation
+            } else {
+                crate::analyzer::semantic::ConstructionReturn::MayReplaceAllocation
+            },
             dispatch_extensibility,
             call_boundary,
             receiver_binding: if formal_parameter_slots_for_owner(Language::Python, node, source)
@@ -1134,11 +1139,17 @@ fn lower_procedure<'tree, 'targets>(
     }
 
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
+    let mut fallthrough_return = None;
     let body_work = if spec.body.kind() == "block" {
+        // Only falling off the body returns this None. Explicit returns resolve
+        // to normal_exit directly and must never acquire a default alternative.
+        let fallthrough = context.point(&mut builder, spec.body, Vec::new())?;
+        context.edge(&mut builder, fallthrough, EdgeTarget::normal(normal_exit))?;
+        fallthrough_return = Some(fallthrough);
         Work::Statement {
             node: spec.body,
             entry: body_entry,
-            next: EdgeTarget::normal(normal_exit),
+            next: EdgeTarget::normal(fallthrough),
             scope: function_scope,
         }
     } else if !callable_returns_value(prepared.source(), spec) {
@@ -1150,23 +1161,9 @@ fn lower_procedure<'tree, 'targets>(
         }
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
-        let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
         let source =
             context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
-        context.append_effect(
-            &mut builder,
-            implicit_return,
-            SemanticEffect::ValueFlow {
-                kind: ValueFlowKind::Return,
-                source,
-                target: value,
-            },
-        )?;
-        context.append_effect(
-            &mut builder,
-            implicit_return,
-            SemanticEffect::ProcedureReturn { value: Some(value) },
-        )?;
+        context.publish_return(&mut builder, implicit_return, source)?;
         context.edge(
             &mut builder,
             implicit_return,
@@ -1182,15 +1179,24 @@ fn lower_procedure<'tree, 'targets>(
     let mut pending = vec![body_work];
     context.edge(&mut builder, entry, EdgeTarget::normal(body_entry))?;
 
-    drive_and_finish_procedure(
-        builder,
+    drive_procedure_work(
+        &mut builder,
         pending.drain(..).rev(),
-        entry,
-        normal_exit,
-        exceptional_exit,
         cancellation,
         |builder, work, stack| context.step(builder, work, stack),
-    )
+    )?;
+    let reachable = builder
+        .seal_unreachable_regions(entry, normal_exit, exceptional_exit, cancellation)
+        .map_err(|_| ProcedureLoweringError::Cancelled(Box::new(builder.prospective_work())))?;
+    if let Some(fallthrough) = fallthrough_return
+        && reachable[fallthrough.index()]
+    {
+        context.publish_none_return(&mut builder, fallthrough)?;
+    }
+    let work_before_freeze = builder.prospective_work();
+    builder
+        .finish_with_work()
+        .map_err(|error| ProcedureLoweringError::Budget(error, Box::new(work_before_freeze)))
 }
 
 struct HeapBindingProofs {
@@ -3321,43 +3327,65 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     self.point(builder, node, Vec::new())?
                 };
-                let value = (!values.is_empty())
-                    .then(|| self.value(builder, terminal, SemanticValueKind::Return))
-                    .transpose()?;
-                if let ([source_node], Some(target)) = (values.as_slice(), value) {
-                    let source = self.expression_value(
+                let route = builder
+                    .resolve_completion(
+                        scope,
+                        &CompletionRequest::new(CompletionKind::Return, None),
+                    )
+                    .ok_or_else(|| {
+                        PythonLoweringError::Invalid(
+                            "return completion has no matching structured continuation".into(),
+                        )
+                    })?;
+                // Evaluate the expression before cleanup, but publish its saved
+                // value only if cleanup preserves this return. An abrupt cleanup
+                // can replace or cancel it without reaching this continuation.
+                let completion = if route.cleanups().is_empty() {
+                    terminal
+                } else {
+                    self.point(builder, node, Vec::new())?
+                };
+                match values.as_slice() {
+                    [] => self.publish_none_return(builder, completion)?,
+                    [source_node] => {
+                        let source = self.expression_value(
+                            builder,
+                            *source_node,
+                            expression_value_kind(*source_node),
+                        )?;
+                        self.publish_return(builder, completion, source)?;
+                    }
+                    _ => {
+                        let value = self.value(builder, completion, SemanticValueKind::Return)?;
+                        self.add_gap(
+                            builder,
+                            terminal,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::ReturnFlow,
+                            SemanticGapKind::Unsupported,
+                            "Python tuple return identity is not decomposed into independent values",
+                        )?;
+                        self.append_effect(
+                            builder,
+                            completion,
+                            SemanticEffect::ProcedureReturn { value: Some(value) },
+                        )?;
+                    }
+                }
+                if completion == terminal {
+                    self.route(builder, terminal, &route, stack)?;
+                } else {
+                    self.edge(
                         builder,
-                        *source_node,
-                        expression_value_kind(*source_node),
-                    )?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Return,
-                            source,
-                            target,
+                        completion,
+                        EdgeTarget {
+                            point: route.destination().target(),
+                            kind: route.destination().edge_kind(),
                         },
                     )?;
-                } else if values.len() > 1 {
-                    self.add_gap(
-                        builder,
-                        terminal,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::ReturnFlow,
-                        SemanticGapKind::Unsupported,
-                        "Python tuple return identity is not decomposed into independent values",
-                    )?;
+                    let route = builder.redirect_completion(route, completion);
+                    self.route(builder, terminal, &route, stack)?;
                 }
-                self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
-                self.abrupt(
-                    builder,
-                    terminal,
-                    scope,
-                    CompletionKind::Return,
-                    None,
-                    stack,
-                )?;
                 if values.is_empty() {
                     Ok(())
                 } else {
@@ -4234,13 +4262,64 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(Some(point));
         }
         let mut previous = point;
+        let mut produced_sources = HashMap::default();
         for step in steps {
             match step {
-                AssignmentTargetStep::UnpackBoundary { target, may_fail } => {
+                AssignmentTargetStep::UnpackBoundary {
+                    target,
+                    source,
+                    outputs,
+                    may_fail,
+                } => {
                     let unpack_point = self.point(builder, target, Vec::new())?;
                     self.edge(builder, previous, EdgeTarget::normal(unpack_point))?;
                     if may_fail {
                         self.implicit_exception_gap(builder, unpack_point, target)?;
+                    }
+                    if !outputs.is_empty() {
+                        let base = match source {
+                            AssignmentSource::Expression(source) => self.expression_value(
+                                builder,
+                                source,
+                                expression_value_kind(source),
+                            )?,
+                            AssignmentSource::Produced(source) => *produced_sources
+                                .get(&source)
+                                .expect("an unpack element is produced before nested unpacking"),
+                            AssignmentSource::Unknown => {
+                                unreachable!("an unknown unpack source has no modeled outputs")
+                            }
+                        };
+                        for output in outputs {
+                            let index = self.value(
+                                builder,
+                                unpack_point,
+                                SemanticValueKind::UnsignedInteger(output.ordinal as u128),
+                            )?;
+                            let result =
+                                self.value(builder, unpack_point, SemanticValueKind::Temporary)?;
+                            let location = self.session.add_memory_location(
+                                builder,
+                                unpack_point,
+                                MemoryLocationKind::Index {
+                                    base,
+                                    index: Some(index),
+                                    constant_index: Some(output.ordinal as u128),
+                                    identity:
+                                        crate::analyzer::semantic::IndexedLocationIdentity::Element,
+                                },
+                            )?;
+                            self.append_effect(
+                                builder,
+                                unpack_point,
+                                SemanticEffect::MemoryLoad {
+                                    kind: MemoryAccessKind::Index,
+                                    location,
+                                    result,
+                                },
+                            )?;
+                            produced_sources.insert(output.id, result);
+                        }
                     }
                     previous = unpack_point;
                 }
@@ -4260,10 +4339,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         return Ok(None);
                     }
                     let value = match source {
-                        Some(source) => {
+                        AssignmentSource::Expression(source) => {
                             self.expression_value(builder, source, expression_value_kind(source))?
                         }
-                        None => self.unknown_target_value(builder, target, unknown_kind)?,
+                        AssignmentSource::Produced(source) => *produced_sources
+                            .get(&source)
+                            .expect("an unpack leaf is produced before it is assigned"),
+                        AssignmentSource::Unknown => {
+                            self.unknown_target_value(builder, target, unknown_kind)?
+                        }
                     };
                     self.append_target_assignment(builder, target_point, access, target, value)?;
                     match target.kind() {
@@ -6646,6 +6730,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.session.add_value(builder, point, kind)
     }
 
+    fn publish_none_return(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+    ) -> Result<(), PythonLoweringError> {
+        let source = self.value(builder, point, SemanticValueKind::Null)?;
+        self.publish_return(builder, point, source)
+    }
+
+    fn publish_return(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        source: ValueId,
+    ) -> Result<(), PythonLoweringError> {
+        let value = self.value(builder, point, SemanticValueKind::Return)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::ProcedureReturn { value: Some(value) },
+        )
+    }
+
     fn append_effect(
         &self,
         builder: &mut ProcedureCfgBuilder,
@@ -6920,14 +7036,28 @@ fn assignment_chain<'tree>(node: Node<'tree>) -> (Vec<Node<'tree>>, Option<Node<
     }
 }
 
+#[derive(Clone, Copy)]
+enum AssignmentSource<'tree> {
+    Expression(Node<'tree>),
+    Produced(usize),
+    Unknown,
+}
+
+struct UnpackOutput {
+    id: usize,
+    ordinal: usize,
+}
+
 enum AssignmentTargetStep<'tree> {
     UnpackBoundary {
         target: Node<'tree>,
+        source: AssignmentSource<'tree>,
+        outputs: Vec<UnpackOutput>,
         may_fail: bool,
     },
     Leaf {
         target: Node<'tree>,
-        source: Option<Node<'tree>>,
+        source: AssignmentSource<'tree>,
     },
 }
 
@@ -6936,7 +7066,11 @@ fn assignment_target_steps<'tree>(
     source: Option<Node<'tree>>,
 ) -> Vec<AssignmentTargetStep<'tree>> {
     let mut result = Vec::new();
-    let mut stack = vec![(target, source)];
+    let mut next_output = 0usize;
+    let mut stack = vec![(
+        target,
+        source.map_or(AssignmentSource::Unknown, AssignmentSource::Expression),
+    )];
     while let Some((target, source)) = stack.pop() {
         match target.kind() {
             "identifier" | "keyword_identifier" | "attribute" | "subscript" => {
@@ -6945,13 +7079,19 @@ fn assignment_target_steps<'tree>(
             "list_splat_pattern" => {
                 let children = named_children(target);
                 if let Some(child) = children.first().copied() {
-                    stack.push((child, None));
+                    stack.push((child, AssignmentSource::Unknown));
                 }
             }
             "pattern_list" | "tuple_pattern" | "list_pattern" => {
                 let targets = named_children(target);
-                let (sources, may_fail) = assignment_target_sources(&targets, source);
-                result.push(AssignmentTargetStep::UnpackBoundary { target, may_fail });
+                let (sources, outputs, may_fail) =
+                    assignment_target_sources(&targets, source, &mut next_output);
+                result.push(AssignmentTargetStep::UnpackBoundary {
+                    target,
+                    source,
+                    outputs,
+                    may_fail,
+                });
                 for (target, source) in targets.into_iter().zip(sources).rev() {
                     stack.push((target, source));
                 }
@@ -6959,7 +7099,7 @@ fn assignment_target_steps<'tree>(
             _ => {
                 let children = named_children(target);
                 for child in children.into_iter().rev() {
-                    stack.push((child, None));
+                    stack.push((child, AssignmentSource::Unknown));
                 }
             }
         }
@@ -6969,11 +7109,9 @@ fn assignment_target_steps<'tree>(
 
 fn assignment_target_sources<'tree>(
     targets: &[Node<'tree>],
-    source: Option<Node<'tree>>,
-) -> (Vec<Option<Node<'tree>>>, bool) {
-    let Some(sources) = source.and_then(unpack_source_children) else {
-        return (vec![None; targets.len()], true);
-    };
+    source: AssignmentSource<'tree>,
+    next_output: &mut usize,
+) -> (Vec<AssignmentSource<'tree>>, Vec<UnpackOutput>, bool) {
     let starred = targets
         .iter()
         .enumerate()
@@ -6981,31 +7119,84 @@ fn assignment_target_sources<'tree>(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if starred.len() > 1 {
-        return (vec![None; targets.len()], true);
+        return (
+            vec![AssignmentSource::Unknown; targets.len()],
+            Vec::new(),
+            true,
+        );
     }
+    if let AssignmentSource::Expression(source) = source
+        && let Some(sources) = unpack_source_children(source)
+    {
+        return literal_assignment_target_sources(targets, sources, &starred);
+    }
+    if !starred.is_empty() || matches!(source, AssignmentSource::Unknown) {
+        return (
+            vec![AssignmentSource::Unknown; targets.len()],
+            Vec::new(),
+            true,
+        );
+    }
+    let mut outputs = Vec::with_capacity(targets.len());
+    let sources = targets
+        .iter()
+        .enumerate()
+        .map(|(ordinal, _)| {
+            let id = *next_output;
+            *next_output += 1;
+            outputs.push(UnpackOutput { id, ordinal });
+            AssignmentSource::Produced(id)
+        })
+        .collect();
+    (sources, outputs, true)
+}
+
+fn literal_assignment_target_sources<'tree>(
+    targets: &[Node<'tree>],
+    sources: Vec<Node<'tree>>,
+    starred: &[usize],
+) -> (Vec<AssignmentSource<'tree>>, Vec<UnpackOutput>, bool) {
     let Some(&starred_index) = starred.first() else {
         return if sources.len() == targets.len() {
-            (sources.into_iter().map(Some).collect(), false)
+            (
+                sources
+                    .into_iter()
+                    .map(AssignmentSource::Expression)
+                    .collect(),
+                Vec::new(),
+                false,
+            )
         } else {
-            (vec![None; targets.len()], true)
+            (
+                vec![AssignmentSource::Unknown; targets.len()],
+                Vec::new(),
+                true,
+            )
         };
     };
 
     let fixed_count = targets.len().saturating_sub(1);
     if sources.len() < fixed_count {
-        return (vec![None; targets.len()], true);
+        return (
+            vec![AssignmentSource::Unknown; targets.len()],
+            Vec::new(),
+            true,
+        );
     }
     let suffix_count = targets.len() - starred_index - 1;
-    let mut result = vec![None; targets.len()];
+    let mut result = vec![AssignmentSource::Unknown; targets.len()];
     for (target, source) in result.iter_mut().zip(&sources).take(starred_index) {
-        *target = Some(*source);
+        *target = AssignmentSource::Expression(*source);
     }
     for index in 0..suffix_count {
         let target_index = starred_index + 1 + index;
         let source_index = sources.len() - suffix_count + index;
-        result[target_index] = sources.get(source_index).copied();
+        result[target_index] = sources
+            .get(source_index)
+            .copied()
+            .map_or(AssignmentSource::Unknown, AssignmentSource::Expression);
     }
-    (result, false)
+    (result, Vec::new(), false)
 }
 
 fn unpack_source_children<'tree>(source: Node<'tree>) -> Option<Vec<Node<'tree>>> {
@@ -7428,6 +7619,139 @@ mod tests {
     }
 
     #[test]
+    fn conditional_return_and_fallthrough_each_publish_one_value() {
+        let parts = lower_fixture_named(
+            "def pick(flag):\n    if flag:\n        return 1\n",
+            Some("pick"),
+        );
+        let entry = parts
+            .points
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Entry))
+            })
+            .expect("entry")
+            .id;
+        let mut pending = vec![(entry, Vec::new())];
+        let mut visited = HashSet::default();
+        let mut returned = Vec::new();
+        while let Some((point, mut values)) = pending.pop() {
+            if !visited.insert((point, values.clone())) {
+                continue;
+            }
+            for event in &parts.points[point.index()].events {
+                match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        source,
+                        ..
+                    } => {
+                        values.push(source);
+                        assert_eq!(values.len(), 1, "a normal path returns exactly once");
+                    }
+                    SemanticEffect::NormalExit => {
+                        assert_eq!(values.len(), 1, "fallthrough must return a value");
+                        returned.push(values[0]);
+                    }
+                    _ => {}
+                }
+            }
+            for edge in parts
+                .control_edges
+                .iter()
+                .filter(|edge| edge.source_point == point)
+            {
+                if matches!(
+                    edge.kind,
+                    ControlEdgeKind::Normal
+                        | ControlEdgeKind::ConditionalTrue
+                        | ControlEdgeKind::ConditionalFalse
+                ) {
+                    pending.push((edge.target_point, values.clone()));
+                }
+            }
+        }
+        assert_eq!(returned.len(), 2, "both runtime branches complete normally");
+        assert_eq!(
+            returned
+                .iter()
+                .filter(|value| matches!(parts.values[value.index()].kind, SemanticValueKind::Null))
+                .count(),
+            1
+        );
+        assert_eq!(
+            returned
+                .iter()
+                .filter(|value| matches!(
+                    parts.values[value.index()].kind,
+                    SemanticValueKind::Constant
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_runs_between_return_evaluation_and_publication() {
+        let source =
+            "def make():\n    try:\n        return evaluate()\n    finally:\n        cleanup()\n";
+        let parts = lower_fixture_named(source, Some("make"));
+        let mut current = parts
+            .points
+            .iter()
+            .find(|point| {
+                point
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.effect, SemanticEffect::Entry))
+            })
+            .expect("entry")
+            .id;
+        let mut visited = HashSet::default();
+        let mut actions = Vec::new();
+        loop {
+            assert!(
+                visited.insert(current),
+                "straight-line fixture must not cycle"
+            );
+            for event in &parts.points[current.index()].events {
+                match event.effect {
+                    SemanticEffect::Invoke { call_site } => {
+                        let call = &parts.call_sites[call_site.index()];
+                        let span = parts.source_mappings[call.source.index()]
+                            .locator
+                            .anchor()
+                            .span();
+                        actions.push(&source[span.start_byte() as usize..span.end_byte() as usize]);
+                    }
+                    SemanticEffect::ProcedureReturn { .. } => actions.push("return"),
+                    _ => {}
+                }
+            }
+            let successors = parts
+                .control_edges
+                .iter()
+                .filter(|edge| {
+                    edge.source_point == current
+                        && matches!(
+                            edge.kind,
+                            ControlEdgeKind::Normal | ControlEdgeKind::Cleanup
+                        )
+                })
+                .collect::<Vec<_>>();
+            match successors.as_slice() {
+                [] => break,
+                [edge] => current = edge.target_point,
+                _ => panic!("fixture has one normal continuation: {successors:?}"),
+            }
+        }
+        assert_eq!(actions, ["evaluate()", "cleanup()", "return"]);
+    }
+
+    #[test]
     fn continued_comparison_preserves_both_control_outcomes() {
         let parts = lower_fixture_named(
             "def compare(left, right):\n    return left == \\\n        right\n",
@@ -7768,6 +8092,59 @@ mod tests {
                         if target == second && value == right_source
                 ))
         );
+    }
+
+    #[test]
+    fn runtime_unpacking_publishes_ordered_index_loads() {
+        let parts = lower_fixture_named(
+            "def unpack():\n    first, second = make()\n    return first\n",
+            Some("unpack"),
+        );
+        let result = parts
+            .call_sites
+            .iter()
+            .find(|call| call.normal_result_values().next().is_some())
+            .and_then(|call| call.normal_result_values().next())
+            .expect("make() has a normal result");
+        let mut loads = parts
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| {
+                let SemanticEffect::MemoryLoad {
+                    location,
+                    result: loaded,
+                    ..
+                } = event.effect
+                else {
+                    return None;
+                };
+                let MemoryLocationKind::Index {
+                    base,
+                    constant_index,
+                    ..
+                } = parts.memory_locations[location.index()].kind
+                else {
+                    return None;
+                };
+                (base == result).then_some((constant_index, loaded))
+            })
+            .collect::<Vec<_>>();
+        loads.sort_unstable_by_key(|(index, _)| *index);
+        assert_eq!(
+            loads.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        let assigned = parts
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .filter_map(|event| match event.effect {
+                SemanticEffect::Assignment { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(loads.iter().all(|(_, value)| assigned.contains(value)));
     }
 
     #[test]

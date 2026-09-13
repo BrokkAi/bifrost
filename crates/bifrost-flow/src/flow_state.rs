@@ -12141,7 +12141,7 @@ package sample
 func first() error { return nil }
 func externalCall() error { return nil }
 
-func overwrite() {
+func overwrite(externalCall func() error) {
     err := first()
     err = externalCall()
     if err != nil { return }
@@ -12524,7 +12524,7 @@ type resource struct{}
 func acquire() *resource { return nil }
 func consume(*resource) {}
 
-func conversionAlias() any {
+func conversionAlias(acquire func() *resource) any {
 	source := acquire()
 	consume(source)
 	var converted any = source
@@ -12636,7 +12636,7 @@ type resource struct{}
 
 func acquire() *resource { return nil }
 
-func mayConversionAlias(change bool) any {
+func mayConversionAlias(change bool, acquire func() *resource) any {
 	source := acquire()
 	if change {
 		source = nil

@@ -703,6 +703,7 @@ fn entry_facts(
                 is_abstract,
                 is_virtual: kind == MemberKind::Method && !is_static && explicitly_virtual,
                 implicit_operation: None,
+                explicit_operation: None,
                 callable_family_complete: false,
                 signature,
                 receiver: None,

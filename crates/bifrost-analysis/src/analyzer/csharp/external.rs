@@ -1240,6 +1240,7 @@ impl CSharpAssemblyPackProducer {
                     is_abstract: member.is_abstract,
                     is_virtual: member.is_virtual,
                     implicit_operation: None,
+                    explicit_operation: None,
                     callable_family_complete: false,
                     signature: Some(Signature {
                         type_parameters: member.type_parameters.clone(),

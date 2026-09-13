@@ -1073,6 +1073,31 @@ pub trait TypeFlowAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether this memory-location shape can be closed after class refinement.
+    ///
+    /// This is a cheap structural filter. The plan calls the class-aware method
+    /// only for locations accepted here.
+    fn memory_load_supports_class_closure(&self, _location: &MemoryLocation) -> bool {
+        false
+    }
+
+    /// Whether an indexed load's retained memory location has the runtime
+    /// meaning modeled by the IR for every exact base class in `classes`.
+    ///
+    /// The caller supplies an exhaustive, uncertainty-free class set. An
+    /// adapter must keep subclasses and classes with overloadable access
+    /// protocols open. A positive answer removes only the synthetic unknown
+    /// load result; modeled stores and their ordinary value flow remain.
+    fn memory_load_is_closed_for_classes(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        _location: &MemoryLocation,
+        _classes: &[ClassIdentity],
+    ) -> bool {
+        false
+    }
+
     fn accessed_member(
         &self,
         workspace: &WorkspaceAnalyzer,

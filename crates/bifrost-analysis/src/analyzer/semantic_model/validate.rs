@@ -926,6 +926,43 @@ impl Validator {
                             _ => {}
                         }
                     }
+                    if let Some(operation) = fact.explicit_operation {
+                        if !matches!(fact.member_kind, MemberKind::Method) {
+                            self.error(
+                                "declaration.explicit_operation_requires_method",
+                                format!("{fact_path}.explicit_operation"),
+                                "an explicitly written value-operation role requires member_kind: method",
+                            );
+                        }
+                        // A consumer selects the role by the argument count the
+                        // source writes, so the role and the declared shape have
+                        // to agree here rather than at every call site.
+                        let expected_parameters = match operation {
+                            ExplicitValueOperation::ReceiverAssign
+                            | ExplicitValueOperation::ReceiverExtend
+                            | ExplicitValueOperation::ArgumentExpiringCast => 1,
+                            ExplicitValueOperation::ReceiverProjection => 0,
+                        };
+                        match fact.signature.as_ref() {
+                            None => self.error(
+                                "declaration.explicit_operation_requires_signature",
+                                format!("{fact_path}.explicit_operation"),
+                                "an explicitly written value-operation role requires a signature so a consumer can match the written argument count",
+                            ),
+                            Some(signature) if signature.parameters.len() != expected_parameters => {
+                                self.error(
+                                    "declaration.explicit_operation_parameter_count",
+                                    format!("{fact_path}.explicit_operation"),
+                                    format!(
+                                        "the `{}` role describes a member with {expected_parameters} parameter(s), not {}",
+                                        operation.label(),
+                                        signature.parameters.len()
+                                    ),
+                                );
+                            }
+                            Some(_) => {}
+                        }
+                    }
                     if fact.callable_family_complete {
                         if !matches!(
                             fact.member_kind,

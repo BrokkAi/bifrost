@@ -34,9 +34,9 @@ use crate::analyzer::semantic::type_flow::{
 };
 use crate::analyzer::semantic::{
     AdapterSemanticsVersion, AllocationSite, CandidateCoverage, GuardFact, GuardPredicate,
-    MemoryLocationKind, ProcedureHandle, ProcedureKind, ProgramPointId, SemanticCallSite,
-    SemanticEffect, SemanticValue, SemanticValueKind, SourceMappingKind, SourceSpan, ValueFlowKind,
-    ValueId,
+    IndexedLocationIdentity, MemoryLocation, MemoryLocationKind, ProcedureHandle, ProcedureKind,
+    ProgramPointId, SemanticCallSite, SemanticEffect, SemanticValue, SemanticValueKind,
+    SourceMappingKind, SourceSpan, ValueFlowKind, ValueId,
 };
 use crate::analyzer::semantic_model::{
     ProcedureSummaryMemberKey, SemanticModelCompleteness, SemanticModelMatchDisposition,
@@ -2017,7 +2017,7 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         // remainder.
         AdapterSemanticsVersion::hash_bytes(
             "python-type-flow",
-            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-v45",
+            b"python-type-flow-unmodeled-guards-scoped-dynamic-writes-subscripted-annotation-outer-class-class-object-reference-imports-unmodeled-predicate-type-is-guard-exact-binding-replacement-stable-receiver-entry-implicit-tuples-closed-native-members-sequence-initializers-module-binding-reuse-comprehension-scope-closed-sequence-loads-implicit-none-returns-returned-sequence-loads-v47",
         )
         .expect("adapter name is non-empty")
     }
@@ -2077,11 +2077,16 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
         procedure: &ProcedureHandle,
         value: &SemanticValue,
     ) -> ClassSeed {
-        if matches!(value.kind, SemanticValueKind::UnsignedInteger(_)) {
-            // Implicit initializer indices carry their magnitude in IR; their
-            // source anchor names the element, not an integer source token.
+        // Implicit scalars carry their value in IR. Their source anchors need
+        // not name a literal: fallthrough None names the completed body.
+        let implicit_class = match value.kind {
+            SemanticValueKind::Null => Some("types.NoneType"),
+            SemanticValueKind::UnsignedInteger(_) => Some("builtins.int"),
+            _ => None,
+        };
+        if let Some(name) = implicit_class {
             let mut cache = ExternalClassCache::default();
-            return external_seed(overlay_of(workspace).as_deref(), "builtins.int", &mut cache);
+            return external_seed(overlay_of(workspace).as_deref(), name, &mut cache);
         }
         let mapping = procedure
             .semantics()
@@ -2609,6 +2614,31 @@ impl TypeFlowAdapter for PythonTypeFlowAdapter {
                 .then_some((point, result))
             })
             .collect())
+    }
+
+    fn memory_load_is_closed_for_classes(
+        &self,
+        _workspace: &WorkspaceAnalyzer,
+        _procedure: &ProcedureHandle,
+        location: &MemoryLocation,
+        classes: &[ClassIdentity],
+    ) -> bool {
+        self.memory_load_supports_class_closure(location)
+            && !classes.is_empty()
+            && classes
+                .iter()
+                .all(|class| matches!(class.qualified_name(), "builtins.list" | "builtins.tuple"))
+    }
+
+    fn memory_load_supports_class_closure(&self, location: &MemoryLocation) -> bool {
+        matches!(
+            location.kind,
+            MemoryLocationKind::Index {
+                constant_index: Some(_),
+                identity: IndexedLocationIdentity::Element,
+                ..
+            }
+        )
     }
 
     fn accessed_member(

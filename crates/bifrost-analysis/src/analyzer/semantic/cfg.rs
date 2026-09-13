@@ -556,6 +556,17 @@ impl ProcedureCfgBuilder {
         )
     }
 
+    /// Preserve cleanup routing while inserting a final completion continuation.
+    pub(crate) fn redirect_completion(
+        &self,
+        mut route: CompletionRoute,
+        target: ProgramPointId,
+    ) -> CompletionRoute {
+        assert!(target.index() < self.points.len());
+        route.destination.target = target;
+        route
+    }
+
     /// Reserve or reuse the entry point for one cleanup body specialized to
     /// an exact abrupt destination and remaining outer-cleanup chain.
     pub(crate) fn cleanup_specialization_entry(
@@ -616,7 +627,7 @@ impl ProcedureCfgBuilder {
         normal_exit: ProgramPointId,
         exceptional_exit: ProgramPointId,
         cancellation: &super::CancellationToken,
-    ) -> Result<(), ReachabilitySealCancelled> {
+    ) -> Result<Box<[bool]>, ReachabilitySealCancelled> {
         let point_count = self.points.len();
         for (point, label) in [
             (entry, "entry"),
@@ -711,7 +722,7 @@ impl ProcedureCfgBuilder {
                 .checked_sub(removed)
                 .expect("each removed edge owned one reverse-adjacency entry");
         }
-        Ok(())
+        Ok(reachable.into_boxed_slice())
     }
 
     pub(crate) fn finish_with_work(

@@ -4089,7 +4089,7 @@ type Holder struct { resource *Resource }
 
 func OpenResource() *Resource { return &Resource{} }
 
-func assign(holder *Holder) {
+func assign(holder *Holder, OpenResource func() *Resource) {
     holder.resource = OpenResource()
     _ = holder.resource
 }

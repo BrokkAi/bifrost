@@ -314,7 +314,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
     if !state.writer.open_with(2, |writer| {
         write!(
             writer,
-            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {} :call-boundary {} :receiver-binding {}",
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {} :dispatch-extensibility {} :call-boundary {} :receiver-binding {} :construction-return {}",
             procedure.id(),
             quoted(procedure.kind().label()),
             optional_id(procedure.lexical_parent()),
@@ -331,6 +331,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
             quoted(properties.dispatch_extensibility.label()),
             quoted(properties.call_boundary.label()),
             quoted(properties.receiver_binding.label()),
+            quoted(properties.construction_return.label()),
         )
     }) {
         return false;

@@ -22,6 +22,9 @@ pub enum ValueFlowRelationKind {
     Assignment,
     Parameter,
     Receiver,
+    /// A returned value flows to its normal return port. A returned member
+    /// instead flows to the same selector path rooted at that port, retaining
+    /// the field identity for the caller's member reads.
     NormalReturn,
     ExceptionalReturn,
     Allocation,
@@ -304,6 +307,25 @@ fn is_container_collapse(relation: &ValueFlowRelation, defined: ValueId) -> bool
         && value_endpoint(&relation.target, defined)
 }
 
+/// A returned container member retains its selector path under the exact
+/// return port. The producer resolves containment and the returned prefix with
+/// the same structured origin walk used for container collapse; this validator
+/// checks the retained projection shape and the event's return-port identity.
+fn is_returned_member(relation: &ValueFlowRelation, kind: ProcedurePortKind) -> bool {
+    let (ValueFlowEndpoint::Location(source), ValueFlowEndpoint::Location(target)) =
+        (&relation.source, &relation.target)
+    else {
+        return false;
+    };
+    relation.kind == ValueFlowRelationKind::NormalReturn
+        && matches!(target.path().root(), AccessPathRoot::ProcedurePort(port) if port.kind() == kind)
+        && !target.path().selectors().is_empty()
+        && source
+            .path()
+            .selectors()
+            .ends_with(target.path().selectors())
+}
+
 /// A direct capture-slot access uses the same procedure port that a parent
 /// `CaptureBind` targets. This is the only memory row whose direct endpoint is
 /// a port rather than an abstract location.
@@ -508,19 +530,24 @@ fn relation_matches_event(
             source,
             ..
         } => {
-            relation.kind == ValueFlowRelationKind::NormalReturn
+            (relation.kind == ValueFlowRelationKind::NormalReturn
                 && value_endpoint(&relation.source, *source)
-                && port_endpoint(&relation.target, ProcedurePortKind::NormalReturn)
+                && port_endpoint(&relation.target, ProcedurePortKind::NormalReturn))
+                || is_returned_member(relation, ProcedurePortKind::NormalReturn)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::IndexedReturn { ordinal },
             source,
             ..
         } => {
-            relation.kind == ValueFlowRelationKind::NormalReturn
+            (relation.kind == ValueFlowRelationKind::NormalReturn
                 && value_endpoint(&relation.source, *source)
                 && port_endpoint(
                     &relation.target,
+                    ProcedurePortKind::IndexedNormalReturn { ordinal: *ordinal },
+                ))
+                || is_returned_member(
+                    relation,
                     ProcedurePortKind::IndexedNormalReturn { ordinal: *ordinal },
                 )
         }
