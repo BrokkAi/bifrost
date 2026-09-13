@@ -517,15 +517,31 @@ pub struct ConfigurationFeatureSemantics {
 }
 
 impl ConfigurationFeatureSemantics {
+    pub const fn new(
+        anchors: ConfigurationFeatureState,
+        aliases: ConfigurationFeatureState,
+        includes: ConfigurationFeatureState,
+        interpolation: ConfigurationFeatureState,
+        format_merge: ConfigurationFeatureState,
+    ) -> Self {
+        Self {
+            anchors,
+            aliases,
+            includes,
+            interpolation,
+            format_merge,
+        }
+    }
+
     /// States for a format in which the feature is absent by definition.
     pub const fn not_applicable() -> Self {
-        Self {
-            anchors: ConfigurationFeatureState::NotApplicable,
-            aliases: ConfigurationFeatureState::NotApplicable,
-            includes: ConfigurationFeatureState::NotApplicable,
-            interpolation: ConfigurationFeatureState::NotApplicable,
-            format_merge: ConfigurationFeatureState::NotApplicable,
-        }
+        Self::new(
+            ConfigurationFeatureState::NotApplicable,
+            ConfigurationFeatureState::NotApplicable,
+            ConfigurationFeatureState::NotApplicable,
+            ConfigurationFeatureState::NotApplicable,
+            ConfigurationFeatureState::NotApplicable,
+        )
     }
 
     pub const fn anchors(&self) -> &ConfigurationFeatureState {

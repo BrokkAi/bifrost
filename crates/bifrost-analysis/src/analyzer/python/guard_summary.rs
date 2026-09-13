@@ -6,6 +6,7 @@
 //! conservative.  All syntax access is through the prepared tree-sitter tree;
 //! there is no source-text parser here.
 
+use crate::analyzer::semantic_model::csmi::python::narrowing_annotation;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -513,28 +514,6 @@ fn predicate_target_symbol<'overlay, 'target>(
         return None;
     }
     Some((*symbol, arguments))
-}
-
-fn narrowing_annotation(returns: &TypeRef) -> Option<(CsmiConditionalTypeSemantics, &TypeRef)> {
-    let TypeRef::Named {
-        name,
-        arguments,
-        nullable: false,
-    } = returns
-    else {
-        return None;
-    };
-    let semantics = match name.as_str() {
-        "typing.TypeIs" | "typing_extensions.TypeIs" => CsmiConditionalTypeSemantics::Biconditional,
-        "typing.TypeGuard" | "typing_extensions.TypeGuard" => {
-            CsmiConditionalTypeSemantics::PositiveOnly
-        }
-        _ => return None,
-    };
-    let [target] = arguments.as_slice() else {
-        return None;
-    };
-    Some((semantics, target))
 }
 
 /// The external module member a callee names, proved through this file's

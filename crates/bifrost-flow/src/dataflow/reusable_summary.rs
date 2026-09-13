@@ -30,9 +30,9 @@ use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBeh
 ///
 /// This is deliberately independent from the authored model-pack wire
 /// contract. Embedded procedure summaries remain
-/// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; version 2 invalidates only
+/// `PROCEDURE_SUMMARY_CONTRACT_VERSION` 1; this revision invalidates only
 /// carriers whose keys embed this module's internal summary schema.
-pub const SUMMARY_SCHEMA_VERSION: u32 = 2;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 3;
 pub const MAX_SUMMARY_TRANSFERS: usize =
     crate::analyzer::semantic_model::MAX_PROCEDURE_SUMMARY_TRANSFERS;
 pub const MAX_SUMMARY_EFFECTS: usize =
@@ -1523,13 +1523,16 @@ pub enum SummaryConcurrencyEffectKind {
     },
     WaitGroupAdd {
         group: SummaryConcurrencyAccessPath,
-        delta: SummaryPort,
+        identity: SummaryConcurrencySubjectIdentity,
+        delta: SummaryConcurrencyInteger,
     },
     WaitGroupDone {
         group: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
     },
     WaitGroupWait {
         group: SummaryConcurrencyAccessPath,
+        identity: SummaryConcurrencySubjectIdentity,
     },
     Atomic {
         location: SummaryConcurrencyAccessPath,
@@ -1551,6 +1554,15 @@ pub enum SummaryConcurrencyEffectKind {
         value: SummaryConcurrencyAccessPath,
         destination: SummaryConcurrencyAccessPath,
     },
+}
+
+/// A stable scalar operand. Unknown is an explicit lack of a count proof,
+/// not a zero delta and not a missing modeled effect.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryConcurrencyInteger {
+    Port(SummaryPort),
+    Constant(i64),
+    Unknown,
 }
 
 /// Stable concurrency behavior projected at a procedure boundary.
@@ -3221,20 +3233,33 @@ fn substitute_concurrency_effect_kind(
                 operation: *operation,
             }
         }
-        SummaryConcurrencyEffectKind::WaitGroupAdd { group, delta } => {
-            SummaryConcurrencyEffectKind::WaitGroupAdd {
-                group: path(group)?,
-                delta: port(delta)?,
-            }
-        }
-        SummaryConcurrencyEffectKind::WaitGroupDone { group } => {
+        SummaryConcurrencyEffectKind::WaitGroupAdd {
+            group,
+            identity,
+            delta,
+        } => SummaryConcurrencyEffectKind::WaitGroupAdd {
+            group: path(group)?,
+            identity: *identity,
+            delta: match delta {
+                SummaryConcurrencyInteger::Port(input) => {
+                    SummaryConcurrencyInteger::Port(port(input)?)
+                }
+                SummaryConcurrencyInteger::Constant(value) => {
+                    SummaryConcurrencyInteger::Constant(*value)
+                }
+                SummaryConcurrencyInteger::Unknown => SummaryConcurrencyInteger::Unknown,
+            },
+        },
+        SummaryConcurrencyEffectKind::WaitGroupDone { group, identity } => {
             SummaryConcurrencyEffectKind::WaitGroupDone {
                 group: path(group)?,
+                identity: *identity,
             }
         }
-        SummaryConcurrencyEffectKind::WaitGroupWait { group } => {
+        SummaryConcurrencyEffectKind::WaitGroupWait { group, identity } => {
             SummaryConcurrencyEffectKind::WaitGroupWait {
                 group: path(group)?,
+                identity: *identity,
             }
         }
         SummaryConcurrencyEffectKind::Atomic {
@@ -4879,8 +4904,8 @@ fn concurrency_effect_heap_bytes(effect: &SummaryConcurrencyEffect) -> usize {
         }
         SummaryConcurrencyEffectKind::TaskJoin { group }
         | SummaryConcurrencyEffectKind::WaitGroupAdd { group, .. }
-        | SummaryConcurrencyEffectKind::WaitGroupDone { group }
-        | SummaryConcurrencyEffectKind::WaitGroupWait { group } => path_bytes(group),
+        | SummaryConcurrencyEffectKind::WaitGroupDone { group, .. }
+        | SummaryConcurrencyEffectKind::WaitGroupWait { group, .. } => path_bytes(group),
         SummaryConcurrencyEffectKind::ModeledCall { .. } => 0,
         SummaryConcurrencyEffectKind::Lock { lock, .. } => path_bytes(lock),
         SummaryConcurrencyEffectKind::Synchronize { subject, .. } => path_bytes(subject),

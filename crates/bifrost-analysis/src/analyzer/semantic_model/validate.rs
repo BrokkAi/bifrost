@@ -87,6 +87,9 @@ fn validate_pack_internal(
     validator.validate(pack);
     validator
         .diagnostics
+        .extend(super::csmi::python::validate_native_identities(pack));
+    validator
+        .diagnostics
         .sort_by(|left, right| (&left.path, &left.code).cmp(&(&right.path, &right.code)));
     validator.diagnostics
 }
@@ -3965,6 +3968,17 @@ impl Validator {
                 self.locator_path(&format!("{path}.path"), value);
                 self.text(&format!("{path}.symbol"), symbol);
             }
+            Locator::Interchange {
+                path: value,
+                symbol,
+                identity,
+            } => {
+                self.locator_path(&format!("{path}.path"), value);
+                self.text(&format!("{path}.symbol"), symbol);
+                if let Err(message) = super::csmi::python::validate_identity(identity) {
+                    self.error("locator.interchange_identity", path, message);
+                }
+            }
         }
     }
 
@@ -4405,7 +4419,12 @@ fn native_contract_model(pack: &AuthoredSemanticModelPack) -> super::csmi::CsmiS
             continue;
         };
         for ty in types {
-            let mut declaration = json!({"symbol":ty.id,"category":"type"});
+            let category = if ty.type_kind == TypeKind::Module {
+                "namespace"
+            } else {
+                "type"
+            };
+            let mut declaration = json!({"symbol":ty.id,"category":category});
             if let Some(binders) = generic_binders.get(&ty.id) {
                 declaration["genericParameters"] = native_generic_parameters(binders);
                 for symbol in binders {

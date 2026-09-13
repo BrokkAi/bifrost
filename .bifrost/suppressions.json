@@ -159,7 +159,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "464030cfb0dd2eb1d5a7b2b1cf69248ea8f9b5e2afda42c401c7d807bc469100",
+      "finding_id": "5aff88a08497c5ad2496a73078d9f0e6deed94297820297246212e1958b9eeec",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -171,7 +171,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "f161bb34e9a96cd61f35b2f63130be3485a6054666fd93e542c78e9f94a31fbb",
+      "finding_id": "cf60f4b18c2019ef01e01999484674b74fa08e65adce05c980b634c449536ae2",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -183,7 +183,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "710a29758026d00fb638e38901d4a38c6b142c91b367bf7392e363adb17daffc",
+      "finding_id": "e012302606bde57c495f5c92c0baba3444f8e8f67e6cc69cb10763d0caf432c4",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -195,7 +195,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "7f9c9c3438521ef434e4d768aab7413e0c2bafd7d463f0fc78204104939f2313",
+      "finding_id": "f795da77bdf2b281d60675f335ad2624b7ac3e7258fc6f609314932a43f1df83",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -375,7 +375,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "86b056aebbd2fd02c2652a90ca30a19760287b7149ac106975881e4cdb987f18",
+      "finding_id": "87881bf663f2d84e14e470380ad4e9431e14f5e4d89600882f45471cd63832aa",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -387,7 +387,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "e6133f23103c1a992e3eeb0281b866e0850746bf5616464dd9a966aec8a0f87d",
+      "finding_id": "861be6dbceca640801c23a3df13ef18cd50d0f2b7920761980d9b0aa81818983",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -399,7 +399,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "41596add9b6642df0481e9dd139cf3fe5fed9891d27a7e3740ef4f86a7868378",
+      "finding_id": "7b37948e423d2f61b09862a9777229d29331647d22f76ca8f4a5cb697b3545d9",
       "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",

@@ -430,9 +430,9 @@ const KNOWN_PROFILES: &[KnownProfile] = &[
         ],
     },
     KnownProfile {
-        identifier: "csmi.python",
-        version: "0.1.0",
-        schema: "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json",
+        identifier: CSMI_PYTHON_PROFILE_ID,
+        version: CSMI_PYTHON_PROFILE_VERSION,
+        schema: CSMI_PYTHON_PROFILE_SCHEMA,
         schema_json: PYTHON_SCHEMA_JSON,
         payload_definitions: &[
             "compatibility",
@@ -4978,7 +4978,7 @@ fn validate_runtime_values_semantics(
     valid
 }
 
-fn validate_selector(
+pub(super) fn validate_selector(
     selector: &CsmiArtifactSelector,
     path: &str,
     diagnostics: &mut Vec<CsmiDiagnostic>,

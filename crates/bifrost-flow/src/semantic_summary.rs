@@ -1195,6 +1195,10 @@ fn lower_concurrency_effect(
     let event = SummaryEventKey::from_digest(StableDigest::from_array(hasher.finish()));
     let lower = |input| lower_input(summary, binding, input);
     let path = |input| lower(input).map(SummaryConcurrencyAccessPath::port);
+    let identity = |input: &CompiledSummaryInput| match input {
+        CompiledSummaryInput::Receiver {} => SummaryConcurrencySubjectIdentity::Backing,
+        CompiledSummaryInput::Parameter { .. } => SummaryConcurrencySubjectIdentity::Value,
+    };
     let effect = match effect {
         CompiledConcurrencyEffect::Unsupported { protocol } => {
             SummaryConcurrencyEffectKind::Unsupported {
@@ -1215,12 +1219,7 @@ fn lower_concurrency_effect(
         | CompiledConcurrencyEffect::LockRelease { lock, mode } => {
             SummaryConcurrencyEffectKind::Lock {
                 lock: path(lock)?,
-                identity: match lock {
-                    CompiledSummaryInput::Receiver {} => SummaryConcurrencySubjectIdentity::Backing,
-                    CompiledSummaryInput::Parameter { .. } => {
-                        SummaryConcurrencySubjectIdentity::Value
-                    }
-                },
+                identity: identity(lock),
                 operation: match effect {
                     CompiledConcurrencyEffect::LockAcquire { .. } => {
                         SummaryConcurrencyLockOperation::Acquire
@@ -1239,17 +1238,20 @@ fn lower_concurrency_effect(
         CompiledConcurrencyEffect::WaitGroupAdd { group, delta } => {
             SummaryConcurrencyEffectKind::WaitGroupAdd {
                 group: path(group)?,
-                delta: lower(delta)?,
+                identity: identity(group),
+                delta: crate::dataflow::SummaryConcurrencyInteger::Port(lower(delta)?),
             }
         }
         CompiledConcurrencyEffect::WaitGroupDone { group } => {
             SummaryConcurrencyEffectKind::WaitGroupDone {
                 group: path(group)?,
+                identity: identity(group),
             }
         }
         CompiledConcurrencyEffect::WaitGroupWait { group } => {
             SummaryConcurrencyEffectKind::WaitGroupWait {
                 group: path(group)?,
+                identity: identity(group),
             }
         }
         CompiledConcurrencyEffect::Atomic {

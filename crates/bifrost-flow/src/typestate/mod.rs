@@ -49,8 +49,8 @@ pub use planned::{
 };
 pub(crate) use production::direct_publication_destination;
 pub(crate) use production::{
-    DirectConcurrencyPath, DirectScalarSource, direct_concurrency_path,
-    direct_concurrency_value_path, direct_scalar_source, direct_scalar_summary_port,
+    DirectConcurrencyPath, DirectScalarSource, direct_concurrency_modeled_subject_path,
+    direct_concurrency_path, direct_scalar_source, direct_scalar_summary_port,
 };
 pub use production::{
     ProductionSemanticSummaryAcquisition, ProductionSemanticSummaryAcquisitionKind,

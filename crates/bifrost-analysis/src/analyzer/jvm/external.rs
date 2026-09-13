@@ -2441,7 +2441,7 @@ fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
 fn scala_external_type(artifact_path: &Path, fact: TypeFact) -> Option<JvmExternalType> {
     let source_path = match fact.locator {
         Locator::Source { path, .. } => path,
-        Locator::Artifact { .. } => return None,
+        Locator::Artifact { .. } | Locator::Interchange { .. } => return None,
     };
     let name = fact.name;
     let (package_name, short_name) = name

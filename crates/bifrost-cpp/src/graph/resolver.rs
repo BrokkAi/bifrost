@@ -32,7 +32,7 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::prepared_syntax::{PreparedSourceOrigin, PreparedSyntaxSource};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::structural::adapter_helpers::field_name_in_parent;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::{field_name_in_parent, node_range};
 use brokk_bifrost_core::analyzer::tree_walk::{
     ParentIndex, WalkControl, children_iter, named_children_iter, node_for_exact_range,
     push_named_children_reversed, walk_named_tree_preorder,
@@ -14279,6 +14279,14 @@ pub struct RecoveredNamespaceRegion {
     /// The complete enclosing namespace path of the run, outermost first.
     /// This can be empty when a parsed namespace extends past its real close.
     pub components: Vec<String>,
+    /// The `namespace Name { ... }` construct that opens each of `components`,
+    /// parallel to it, from the `namespace` keyword through the matching close
+    /// the brace stack paired with its `{`. A level the file never closes
+    /// carries its head alone. This is the range the declaration walk records
+    /// for the Module, so a namespace whose head collapsed into an `ERROR`
+    /// reports where it is written rather than where its first member is
+    /// (#3309).
+    pub component_ranges: Vec<Range>,
 }
 
 /// The namespaces C++ parse recovery drops from a file's tree.
@@ -14312,12 +14320,30 @@ impl OrphanedNamespaceScopeIndex {
         if !root.has_error() {
             return Self::default();
         }
+        /// One namespace level open on the brace stack: the `namespace Name {`
+        /// head it is written as, and the `{`'s start byte, which is the
+        /// `brace_closes` key its close lands under. The close is not known
+        /// while the level is open, so the final ranges are assembled once the
+        /// walk has paired every brace.
+        #[derive(Clone, Copy)]
+        struct OpenHead {
+            head: Range,
+            open: usize,
+        }
+        /// A [`RecoveredNamespaceRegion`] whose levels still name their open
+        /// braces rather than their closes.
+        struct PendingRegion {
+            start: usize,
+            end: usize,
+            components: Vec<String>,
+            heads: Vec<OpenHead>,
+        }
         struct Frame<'tree> {
             node: Node<'tree>,
             children: Vec<Node<'tree>>,
             next: usize,
             parsed_scope: Vec<String>,
-            run: Option<RecoveredNamespaceRegion>,
+            run: Option<PendingRegion>,
         }
         fn frame<'tree>(
             node: Node<'tree>,
@@ -14348,6 +14374,11 @@ impl OrphanedNamespaceScopeIndex {
         // following children must see that removal immediately (#3087).
         let mut open = Vec::new();
         let mut lexical_scope = Vec::new();
+        // One head per entry of `lexical_scope`: `namespace a::b {` opens two
+        // levels and both are written by that one head, exactly as the
+        // ordinary namespace visit records one range for every level of the
+        // C++17 shorthand (#1878).
+        let mut lexical_heads: Vec<OpenHead> = Vec::new();
         let mut frames = vec![frame(root, Vec::new(), source)];
         // A frame's node is the previous frame's direct child, so the frame
         // below answers what Node::parent would without re-descending from the
@@ -14365,23 +14396,42 @@ impl OrphanedNamespaceScopeIndex {
             match child.kind() {
                 "{" if !child.is_missing() => {
                     regions.extend(current.run.take());
-                    let mut components = parent_node
-                        .map(|parent| namespace_body_name_components(parent, current.node, source))
-                        .unwrap_or_default();
-                    if components.is_empty() {
-                        components = recovered_namespace_open_components(
+                    // The head is the construct that writes the namespace: the
+                    // `namespace_definition` node when one survived, and the
+                    // bare `namespace` keyword when recovery collapsed the head
+                    // into flat `ERROR` children (#3084).
+                    let mut named = parent_node.and_then(|parent| {
+                        let components =
+                            namespace_body_name_components(parent, current.node, source);
+                        (!components.is_empty()).then_some((parent, components))
+                    });
+                    if named.is_none() {
+                        named = recovered_namespace_open_components(
                             &current.children[..current.next - 1],
                             source,
                         );
                     }
                     open.push((child.start_byte(), lexical_scope.len()));
-                    lexical_scope.extend(components);
+                    if let Some((written_at, components)) = named {
+                        let head = OpenHead {
+                            head: Range {
+                                start_byte: written_at.start_byte(),
+                                end_byte: child.end_byte(),
+                                start_line: written_at.start_position().row + 1,
+                                end_line: child.end_position().row + 1,
+                            },
+                            open: child.start_byte(),
+                        };
+                        lexical_heads.extend(std::iter::repeat_n(head, components.len()));
+                        lexical_scope.extend(components);
+                    }
                     continue;
                 }
                 "}" if !child.is_missing() => {
                     regions.extend(current.run.take());
                     if let Some((start, namespace_len)) = open.pop() {
                         lexical_scope.truncate(namespace_len);
+                        lexical_heads.truncate(namespace_len);
                         brace_closes.insert(
                             start,
                             Range {
@@ -14406,10 +14456,11 @@ impl OrphanedNamespaceScopeIndex {
                     Some(run) if run.components == lexical_scope => run.end = child.end_byte(),
                     run => {
                         regions.extend(run.take());
-                        *run = Some(RecoveredNamespaceRegion {
+                        *run = Some(PendingRegion {
                             start: child.start_byte(),
                             end: child.end_byte(),
                             components: lexical_scope.clone(),
+                            heads: lexical_heads.clone(),
                         });
                     }
                 }
@@ -14424,6 +14475,39 @@ impl OrphanedNamespaceScopeIndex {
                 frames.push(frame(child, parsed_scope, source));
             }
         }
+        // Every brace is paired now, so each level's head can grow to the
+        // construct it writes. A level whose `{` never closes keeps its head:
+        // the file ends inside the namespace and there is no real close to
+        // reach for.
+        let regions = regions
+            .into_iter()
+            .map(|region| {
+                debug_assert_eq!(
+                    region.components.len(),
+                    region.heads.len(),
+                    "every recovered namespace level carries the head that writes it: {:?}",
+                    region.components
+                );
+                RecoveredNamespaceRegion {
+                    start: region.start,
+                    end: region.end,
+                    component_ranges: region
+                        .heads
+                        .iter()
+                        .map(|level| match brace_closes.get(&level.open) {
+                            Some(close) => Range {
+                                start_byte: level.head.start_byte,
+                                end_byte: close.end_byte,
+                                start_line: level.head.start_line,
+                                end_line: close.end_line,
+                            },
+                            None => level.head,
+                        })
+                        .collect(),
+                    components: region.components,
+                }
+            })
+            .collect();
         Self {
             regions,
             brace_closes,
@@ -14448,6 +14532,7 @@ impl OrphanedNamespaceScopeIndex {
                 total
                     .saturating_add(std::mem::size_of::<RecoveredNamespaceRegion>())
                     .saturating_add(region.components.iter().map(String::len).sum::<usize>())
+                    .saturating_add(region.component_ranges.len() * std::mem::size_of::<Range>())
             },
         )
     }
@@ -14464,6 +14549,19 @@ impl OrphanedNamespaceScopeIndex {
     /// parse recovery dropped from its ancestor chain. The one answer both
     /// lookup directions and declaration collection use (issue #1537).
     pub fn enclosing_namespace_components(&self, node: Node<'_>, source: &str) -> Vec<String> {
+        self.enclosing_namespace_levels(node, source)
+            .into_iter()
+            .map(|(component, _)| component)
+            .collect()
+    }
+
+    /// [`Self::enclosing_namespace_components`] with the construct that writes
+    /// each level, for the declaration walk that has to record a range for it.
+    ///
+    /// A level the brace stack restored carries the range this index recorded
+    /// for its head; a surviving `namespace_definition` ancestor carries its own
+    /// node range, which is what the ordinary namespace visit records.
+    pub fn enclosing_namespace_levels(&self, node: Node<'_>, source: &str) -> Vec<(String, Range)> {
         let mut parsed = Vec::new();
         let mut current = node.parent();
         while let Some(parent) = current {
@@ -14472,13 +14570,27 @@ impl OrphanedNamespaceScopeIndex {
             {
                 let mut components = Vec::new();
                 if append_cpp_name_components(name, source, &mut components).is_some() {
-                    parsed.push((parent.start_byte(), components));
+                    let range = node_range(parent);
+                    parsed.push((
+                        parent.start_byte(),
+                        components
+                            .into_iter()
+                            .map(|component| (component, range))
+                            .collect(),
+                    ));
                 }
             }
             current = parent.parent();
         }
         parsed.reverse();
-        self.restore_enclosing_namespaces(parsed, node.start_byte())
+        self.splice_recovered_path(parsed, node.start_byte(), |region| {
+            region
+                .components
+                .iter()
+                .cloned()
+                .zip(region.component_ranges.iter().copied())
+                .collect()
+        })
     }
 
     /// [`Self::enclosing_namespace_components`] for a caller that has already
@@ -14491,28 +14603,37 @@ impl OrphanedNamespaceScopeIndex {
         parsed: Vec<(usize, Vec<String>)>,
         node_start: usize,
     ) -> Vec<String> {
+        self.splice_recovered_path(parsed, node_start, |region| region.components.clone())
+    }
+
+    /// Splice a node's parsed namespace ancestors onto the path a recovered
+    /// region restores. Outside every region the parsed chain is the whole
+    /// answer; inside one, the region supplies every namespace enclosing it and
+    /// only the parsed ancestors beginning inside it still apply. `recovered`
+    /// reads the region in whatever shape the caller needs its levels.
+    fn splice_recovered_path<T>(
+        &self,
+        parsed: Vec<(usize, Vec<T>)>,
+        node_start: usize,
+        recovered: impl FnOnce(&RecoveredNamespaceRegion) -> Vec<T>,
+    ) -> Vec<T> {
         let Some(region) = self.region_at(node_start) else {
-            return parsed
-                .into_iter()
-                .flat_map(|(_, components)| components)
-                .collect();
+            return parsed.into_iter().flat_map(|(_, levels)| levels).collect();
         };
-        region
-            .components
-            .iter()
-            .cloned()
+        recovered(region)
+            .into_iter()
             .chain(
                 parsed
                     .into_iter()
                     .filter(|(start, _)| *start >= region.start)
-                    .flat_map(|(_, components)| components),
+                    .flat_map(|(_, levels)| levels),
             )
             .collect()
     }
 }
 
-/// The name components of the namespace a stray `{` opens, or empty when `open`
-/// does not follow a namespace head.
+/// The `namespace` keyword and name components of the namespace a stray `{`
+/// opens, or `None` when the brace does not follow a namespace head.
 ///
 /// When a namespace body holds a construct tree-sitter cannot parse, recovery
 /// can collapse the whole `namespace Name { ... }` into one `ERROR` instead of
@@ -14526,7 +14647,10 @@ impl OrphanedNamespaceScopeIndex {
 /// `preceding` is the open brace's preceding siblings, nearest last. The
 /// caller already holds the container's child list; `Node::prev_sibling`
 /// would re-descend from the root for each step (#3141).
-fn recovered_namespace_open_components(preceding: &[Node<'_>], source: &str) -> Vec<String> {
+fn recovered_namespace_open_components<'tree>(
+    preceding: &[Node<'tree>],
+    source: &str,
+) -> Option<(Node<'tree>, Vec<String>)> {
     let mut head = Vec::new();
     for &sibling in preceding.iter().rev() {
         if sibling.kind() != "comment" {
@@ -14537,16 +14661,14 @@ fn recovered_namespace_open_components(preceding: &[Node<'_>], source: &str) -> 
         }
     }
     let [name, keyword] = head[..] else {
-        return Vec::new();
+        return None;
     };
     if keyword.kind() != "namespace" {
-        return Vec::new();
+        return None;
     }
     let mut components = Vec::new();
-    if append_cpp_name_components(name, source, &mut components).is_none() {
-        components.clear();
-    }
-    components
+    append_cpp_name_components(name, source, &mut components)?;
+    (!components.is_empty()).then_some((keyword, components))
 }
 
 /// The name components of the namespace whose body `body` is, or empty when
@@ -18301,6 +18423,19 @@ struct AfterAll {};
         assert_eq!(
             index.enclosing_namespace_components(target, source),
             ["app"]
+        );
+        assert_eq!(
+            index.enclosing_namespace_levels(target, source),
+            vec![(
+                "app".to_string(),
+                Range {
+                    start_byte: 0,
+                    end_byte: source.len() - 1,
+                    start_line: 1,
+                    end_line: 25,
+                },
+            )],
+            "the recovered namespace owns its full construct, not its first member or just its header"
         );
     }
 

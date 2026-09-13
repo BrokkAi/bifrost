@@ -2132,6 +2132,20 @@ impl SynchronizationSubjectClasses {
                     .into_iter()
                     .any(|candidate| self.backing_root(candidate) == cursor);
                 if captured_value || captured_location {
+                    // A captured cell names storage, not one stable pointee
+                    // across replacements. Without a reaching-store proof,
+                    // its name cannot identify the objects used by modeled
+                    // operations on opposite sides of a reassignment.
+                    let stores = self.location_stores.clone();
+                    if stores.into_iter().any(|(location, count)| {
+                        count > 1
+                            && self.backing_root(LocalSynchronizationSubject::Location(location))
+                                == cursor
+                    }) {
+                        self.identity_reasons
+                            .push(ConcurrencyOpenReason::UnknownLocation);
+                        return None;
+                    }
                     let canonical = match &cursor {
                         LocalSynchronizationSubject::Location(location) => {
                             canonical_local_location(location)
@@ -2761,6 +2775,9 @@ pub fn concurrent_access_conflicts(
                                             candidate_effect.kind(),
                                             SummaryConcurrencyEffectKind::Lock { .. }
                                                 | SummaryConcurrencyEffectKind::Atomic { .. }
+                                                | SummaryConcurrencyEffectKind::WaitGroupAdd { .. }
+                                                | SummaryConcurrencyEffectKind::WaitGroupDone { .. }
+                                                | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
                                         ) =>
                                 {
                                     Some((candidate_effect, candidate.evidence()))
@@ -2795,7 +2812,7 @@ pub fn concurrent_access_conflicts(
                                 context: context.clone(),
                                 effect: effect.clone(),
                             };
-                            match source_summary_modeled_effect(&pending, call) {
+                            match source_summary_modeled_effect(&pending, call, provider, request) {
                                 Ok(effect) => resolved.push(effect),
                                 Err(_) => {
                                     valid = false;
@@ -2880,7 +2897,10 @@ pub fn concurrent_access_conflicts(
             }
             if summary.effects().iter().any(|effect| {
                 matches!(effect.key(), SummaryEffectKey::Concurrency(effect)
-                    if matches!(effect.kind(), SummaryConcurrencyEffectKind::Lock { .. } | SummaryConcurrencyEffectKind::Atomic { .. })
+                    if matches!(effect.kind(), SummaryConcurrencyEffectKind::Lock { .. } | SummaryConcurrencyEffectKind::Atomic { .. }
+                        | SummaryConcurrencyEffectKind::WaitGroupAdd { .. }
+                        | SummaryConcurrencyEffectKind::WaitGroupDone { .. }
+                        | SummaryConcurrencyEffectKind::WaitGroupWait { .. })
                         && !replayed_summary_modeled_events.contains(&effect.event()))
             }) {
                 report
@@ -3377,11 +3397,25 @@ pub fn concurrent_access_conflicts(
                             synchronization_subjects
                                 .bind_canonical_value(target_subject.clone(), fact);
                         }
-                        if kind == crate::analyzer::semantic::ValueFlowKind::LanguageDefined {
+                        if kind == crate::analyzer::semantic::ValueFlowKind::LanguageDefined
+                            || matches!(
+                                kind,
+                                crate::analyzer::semantic::ValueFlowKind::Transfer(
+                                    crate::analyzer::semantic::ValueTransfer {
+                                        kind: crate::analyzer::semantic::TransferKind::Copy,
+                                        operation:
+                                            crate::analyzer::semantic::TransferOperation::None,
+                                    }
+                                )
+                            )
+                        {
                             // Dependence on a value does not preserve its object
                             // identity through an unspecified language operation.
                             // Keep the output opaque without poisoning the input
                             // or claiming a gap for unrelated scalar operations.
+                            // A bitwise nominal copy without an AggregateCopy
+                            // representation proof likewise cannot establish
+                            // the identity of its copied object or payload.
                             synchronization_subjects
                                 .opaque_values
                                 .push(target_subject.clone());
@@ -4879,7 +4913,13 @@ fn propagate_memory_payload_identities(
         let base = origin.base.clone();
         if classes
             .canonical_backing_identity(base)
-            .is_some_and(|fact| fact.storage_origin.is_some())
+            .is_some_and(|fact| {
+                fact.storage_origin.is_some()
+                    || matches!(
+                        fact.resolved.independent_storage,
+                        Some(ConcurrencyStorageFamily::InlineValue { .. })
+                    )
+            })
         {
             has_fresh_container = true;
             break;
@@ -5310,10 +5350,16 @@ fn propagate_memory_payload_identities(
         if classes.member_reference_binding(&load.member) == Some(false) {
             continue;
         }
-        let Some(container) = classes.canonical_backing_identity(load.base.subject.clone()) else {
+        let Some(mut container) = classes.canonical_backing_identity(load.base.subject.clone())
+        else {
             continue;
         };
-        if container.storage_origin.is_none() {
+        if container.storage_origin.is_none()
+            && !matches!(
+                container.resolved.independent_storage,
+                Some(ConcurrencyStorageFamily::InlineValue { .. })
+            )
+        {
             continue;
         }
         let declaration = classes
@@ -5324,6 +5370,99 @@ fn propagate_memory_payload_identities(
             || declaration.is_none()
             || classes.member_reference_binding(&load.member) != Some(true)
         {
+            answers.push((load.result, None));
+            continue;
+        }
+        let mut observation = load.base.clone();
+        let mut visited_copies = HashSet::default();
+        let mut copy_complete = true;
+        while container.storage_origin.is_none() {
+            if request.cancellation.is_cancelled()
+                || request
+                    .budget
+                    .charge(crate::analyzer::semantic::SemanticWork {
+                        nested_entries: aggregate_copies.len() + stores.len(),
+                        ..crate::analyzer::semantic::SemanticWork::default()
+                    })
+                    .is_err()
+            {
+                return Ok(false);
+            }
+            let mut matching = Vec::new();
+            for copy in &aggregate_copies {
+                match classes.canonical_backing_identity(copy.target_storage.clone()) {
+                    Some(target) if target.canonical() == container.canonical() => {
+                        matching.push(copy)
+                    }
+                    Some(target) if target.resolved.exact_candidate().is_some() => {}
+                    _ => copy_complete = false,
+                }
+            }
+            // A whole-value copy does not account for later field replacement.
+            // Until reaching stores are modeled, any possible store to this
+            // field prevents recovering its payload from the source aggregate.
+            for store in &stores {
+                if classes
+                    .member_declarations
+                    .get(&member_locator_key(&store.member))
+                    != declaration.as_ref()
+                {
+                    continue;
+                }
+                match classes.canonical_backing_identity(store.base.clone()) {
+                    Some(base)
+                        if base.resolved.exact_candidate().is_some()
+                            && base.canonical() != container.canonical() => {}
+                    _ => copy_complete = false,
+                }
+            }
+            let [copy] = matching.as_slice() else {
+                copy_complete = false;
+                break;
+            };
+            if !copy_complete
+                || !visited_copies.insert(copy.target.subject.clone())
+                || recursive_roots.iter().any(|ancestor| {
+                    invocations.contains(*ancestor, copy.source.invocation)
+                        || invocations.contains(*ancestor, copy.target.invocation)
+                })
+                || !reference_source_is_stable(classes, invocations, tasks, &copy.source, request)
+                || !reference_source_is_stable(classes, invocations, tasks, &copy.target, request)
+                || !field_container_is_unpublished(
+                    classes,
+                    invocations,
+                    callable_values,
+                    &container,
+                    request,
+                )
+            {
+                copy_complete = false;
+                break;
+            }
+            match identity_use_precedes(&copy.target, &observation, invocations, tasks, request) {
+                Ok(true) => {}
+                Ok(false) => {
+                    copy_complete = false;
+                    break;
+                }
+                Err(reason) => {
+                    classes.identity_reasons.push(reason);
+                    return Ok(false);
+                }
+            }
+            let Some(source) = classes.canonical_backing_identity(copy.source.subject.clone())
+            else {
+                copy_complete = false;
+                break;
+            };
+            if source.resolved.exact_candidate().is_none() {
+                copy_complete = false;
+                break;
+            }
+            container = source;
+            observation = copy.source.clone();
+        }
+        if !copy_complete {
             answers.push((load.result, None));
             continue;
         }
@@ -5388,17 +5527,17 @@ fn propagate_memory_payload_identities(
                 tasks,
                 invocations,
                 task,
-                (load.base.invocation, load.base.point),
+                (observation.invocation, observation.point),
             ) {
-                Some((observer, observation)) => {
-                    (source.invocation == load.base.invocation
-                        && source.point == load.base.point
-                        && source.event < load.base.event)
+                Some((observer, observation_point)) => {
+                    (source.invocation == observation.invocation
+                        && source.point == observation.point
+                        && source.event < observation.event)
                         || match invocations.required_points_before(
                             source.invocation,
                             HashSet::from_iter([source.point]),
                             observer,
-                            observation,
+                            observation_point,
                             request,
                         ) {
                             Ok(before) => before,
@@ -7753,7 +7892,9 @@ fn associate_wait_group_tasks(
         let exact_count = adds
             .iter()
             .try_fold(0_i64, |count, (_, delta)| {
-                delta.and_then(|delta| (delta > 0).then_some(count + delta))
+                delta
+                    .filter(|delta| *delta > 0)
+                    .and_then(|delta| count.checked_add(delta))
             })
             .is_some_and(|count| usize::try_from(count).ok() == Some(completions.len()));
         let mut exact_phase = structurally_one_phase && exact_count && waits.len() == 1;
@@ -9779,9 +9920,16 @@ fn source_summary_modeled_call(
 fn source_summary_modeled_effect(
     pending: &PendingSummaryEffect,
     expected_call: CallSiteId,
+    provider: &dyn ConcurrencyProvider,
+    request: &mut SemanticRequest<'_>,
 ) -> Result<ResolvedConcurrencyEffect, &'static str> {
     let (path, identity) = match pending.effect.kind() {
         SummaryConcurrencyEffectKind::Lock { lock, identity, .. } => (lock, *identity),
+        SummaryConcurrencyEffectKind::WaitGroupAdd {
+            group, identity, ..
+        }
+        | SummaryConcurrencyEffectKind::WaitGroupDone { group, identity }
+        | SummaryConcurrencyEffectKind::WaitGroupWait { group, identity } => (group, *identity),
         SummaryConcurrencyEffectKind::Atomic { location, .. } => {
             (location, SummaryConcurrencySubjectIdentity::Value)
         }
@@ -9805,26 +9953,30 @@ fn source_summary_modeled_effect(
     if call.point != point {
         return Err("summary modeled effect point does not match its invocation");
     }
-    let mut values = call
+    let mut values = Vec::new();
+    for value in call
         .receiver
         .into_iter()
         .chain(call.arguments.iter().map(|argument| argument.value))
-        .filter(|value| {
-            matches!(
-                crate::typestate::direct_concurrency_value_path(
-                    &pending.context.procedure,
-                    *value,
-                ),
-                crate::typestate::DirectConcurrencyPath::Boundary(ref candidate)
-                    if candidate == path
-            )
-        });
-    let value = values
-        .next()
-        .ok_or("summary modeled effect subject is unavailable")?;
-    if values.next().is_some()
-        || (identity == SummaryConcurrencySubjectIdentity::Backing && call.receiver != Some(value))
     {
+        let candidate = crate::typestate::direct_concurrency_modeled_subject_path(
+            &pending.context.procedure,
+            call,
+            value,
+            provider,
+            request,
+        )
+        .map_err(|_| "summary modeled subject path proof is unavailable")?;
+        if matches!(candidate, crate::typestate::DirectConcurrencyPath::Boundary(ref candidate) if candidate == path)
+        {
+            values.push(value);
+        }
+    }
+    let [value] = values.as_slice() else {
+        return Err("summary modeled effect subject is unavailable or ambiguous");
+    };
+    let value = *value;
+    if identity == SummaryConcurrencySubjectIdentity::Backing && call.receiver != Some(value) {
         return Err("summary modeled effect subject is ambiguous");
     }
     let subject = ResolvedConcurrencySubject {
@@ -9837,6 +9989,40 @@ fn source_summary_modeled_effect(
         },
     };
     Ok(match pending.effect.kind() {
+        SummaryConcurrencyEffectKind::WaitGroupAdd { delta, .. } => {
+            let delta = match delta {
+                crate::dataflow::SummaryConcurrencyInteger::Constant(delta) => {
+                    // The current producer resolves only literal integer inputs.
+                    // An exact stored count must still have that source witness.
+                    if !call.arguments.iter().any(|argument| {
+                        pending
+                            .context
+                            .procedure
+                            .semantics()
+                            .value(argument.value)
+                            .is_some_and(|value| {
+                                matches!(value.kind, crate::analyzer::semantic::SemanticValueKind::UnsignedInteger(value)
+                                if i64::try_from(value).ok() == Some(*delta))
+                            })
+                    }) {
+                        return Err("summary WaitGroup delta witness is unavailable");
+                    }
+                    Some(*delta)
+                }
+                crate::dataflow::SummaryConcurrencyInteger::Port(_)
+                | crate::dataflow::SummaryConcurrencyInteger::Unknown => None,
+            };
+            ResolvedConcurrencyEffect::WaitGroupAdd {
+                group: subject,
+                delta,
+            }
+        }
+        SummaryConcurrencyEffectKind::WaitGroupDone { .. } => {
+            ResolvedConcurrencyEffect::WaitGroupDone { group: subject }
+        }
+        SummaryConcurrencyEffectKind::WaitGroupWait { .. } => {
+            ResolvedConcurrencyEffect::WaitGroupWait { group: subject }
+        }
         SummaryConcurrencyEffectKind::Lock {
             operation, mode, ..
         } => {
@@ -9875,7 +10061,7 @@ fn source_summary_modeled_effect(
                 },
             }
         }
-        _ => unreachable!("only modeled locks and atomics have a replay subject"),
+        _ => unreachable!("only supported modeled effects have a replay subject"),
     })
 }
 

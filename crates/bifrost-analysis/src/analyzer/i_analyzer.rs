@@ -1534,11 +1534,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                     return SearchSymbolCandidates::incomplete(candidates, inspected);
                 }
                 inspected = inspected.saturating_add(1);
+                let ranges = self.ranges(&code_unit);
                 candidates.push(SearchSymbolCandidate {
-                    primary_range: self
-                        .ranges(&code_unit)
-                        .into_iter()
+                    primary_range: ranges
+                        .iter()
+                        .copied()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
+                    has_multiple_ranges: ranges.len() > 1,
+                    secondary_range: ranges.get(1).copied(),
+                    has_more_ranges: ranges.len() > 2,
+                    all_ranges_are_definitions: false,
                     // Structurally-evidenced suppression only: analyzers without a
                     // per-declaration taint surface default untainted here (path-based
                     // test filtering in `search_symbols` still applies), so production

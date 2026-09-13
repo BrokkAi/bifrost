@@ -153,13 +153,14 @@ pub fn census_identifier_ranges(
 /// grammar nodes that are simultaneous source references and binders, such as
 /// JS/TS shorthand destructuring properties (#2037), and the structured
 /// property-name nodes a language spells outside its identifier grammar, such
-/// as the string interior of a JS/TS `data["prop"]` subscript (#3215). Java
-/// (#2086), PHP (#1867) Scala (#2085), C++ (#2248) and JS/TS (#3215) membership
-/// also descends parser-recovery subtrees: valid inverse references stay backed
-/// without proposing recovery tokens as forward census sites. C++, PHP and
-/// Scala admit only the terminals whose reference role the grammar still
-/// states there; Java drops the declaration and label roles; JS/TS keeps the
-/// frontier it uses everywhere else, because recovery leaves its references no
+/// as the string interior of a JS/TS `data["prop"]` subscript (#3215). Membership
+/// for Java (#2086), C# (#3212), PHP (#1867), Scala (#2085), C++ (#2248), JS/TS
+/// (#3215), and Go (#3209) descends parser-recovery subtrees: valid inverse
+/// references stay backed without proposing recovery tokens as forward census
+/// sites. C++, PHP and Scala admit only the terminals whose reference role the
+/// grammar still states there; Java drops the declaration and label roles; C#
+/// drops the declaration and local-binder roles; JS/TS and Go keep the frontier
+/// they use everywhere else, because recovery leaves their references no
 /// structured parent to read a role from.
 ///
 /// Every one of those recovery tests belongs to recovery alone. Outside an ERROR
@@ -311,6 +312,8 @@ fn collect_candidate_ranges(
                 && !matches!(
                     language,
                     Language::Cpp
+                        | Language::CSharp
+                        | Language::Go
                         | Language::Java
                         | Language::JavaScript
                         | Language::Php
@@ -352,19 +355,27 @@ fn collect_candidate_ranges(
         // Inside recovery, C++ (#2248), PHP (#1867), and Scala (#2085) admit only the
         // terminals whose reference role the grammar still spells out, and Java
         // (#2086) admits its whole identifier frontier there minus the
-        // declaration and label roles. These tests are recovery's alone: outside
-        // an ERROR subtree the grammar still states every role, and dropping a
-        // role there costs membership occurrences the census itself proposes and
-        // grades (#2185).
+        // declaration and label roles. C# (#3212) takes Java's shape: the
+        // frontier minus the declaration and local-binder roles, which are the
+        // binder positions the usage extractor itself refuses -- a `$@"..."`
+        // verbatim interpolation or a `return ref *...` pointer dereference
+        // wraps following code in an ERROR node while leaving its invocations
+        // and member accesses intact, and the inverse scan proves those
+        // references there. C# statement labels need no dropping: they never
+        // enter membership on any frontier. These tests are recovery's alone:
+        // outside an ERROR subtree the grammar still states every role, and
+        // dropping a role there costs membership occurrences the census itself
+        // proposes and grades (#2185).
         //
-        // JS/TS (#3215) needs no such test, and would be wrong to have one:
-        // recovery leaves the reference no structured parent to read a role from
-        // -- a JSX element name derailed by a reserved-word attribute becomes a
-        // direct child of the ERROR node -- and the frontier already admits
-        // declaration names everywhere else, so there is no role for recovery to
-        // remove. What membership asserts is that the inverse hit landed on an
-        // identifier-class terminal the tree really holds, and recovery does not
-        // move those bytes.
+        // JS/TS (#3215) and Go (#3209) need no such test, and would be wrong to
+        // have one: recovery leaves the reference no structured parent to read a
+        // role from -- a JSX element name derailed by a reserved-word attribute
+        // becomes a direct child of the ERROR node, and so does the conversion
+        // type name in Go's `new(PackageURL(p))` -- and both frontiers already
+        // admit declaration names everywhere else, so there is no role for
+        // recovery to remove. What membership asserts is that the inverse hit
+        // landed on an identifier-class terminal the tree really holds, and
+        // recovery does not move those bytes.
         let candidate = candidate
             && (!inside_error
                 || !matches!(frontier, CandidateFrontier::CensusMembership)
@@ -372,6 +383,9 @@ fn collect_candidate_ranges(
                     Language::Cpp => {
                         is_cpp_template_argument_type_leaf(node)
                             || is_cpp_recovered_callable_declaration_reference(node)
+                    }
+                    Language::CSharp => {
+                        !csharp_is_declaration_name(node) && !csharp_local_binder_name(node)
                     }
                     Language::Java => !java_is_declaration_name(node) && !java_is_label_name(node),
                     Language::Php => php_is_recovered_membership_reference(node),
@@ -1080,6 +1094,161 @@ mod tests {
         );
     }
 
+    /// Go 1.26 spells `new(expr)`, but tree-sitter-go still parses the first
+    /// argument of `new` and `make` as a type (`special_argument_list`), so both
+    /// of #3209's witness shapes land under an ERROR node: the conversion type
+    /// name as a bare `identifier` child of the ERROR (trivy's
+    /// `new(PackageURL(p))`), and the following statement's field write dragged
+    /// in and re-read as a `qualified_type` (etcd's `bwal.ents = ...`). The
+    /// inverse scan resolves both, so membership must hold them while the
+    /// forward census keeps refusing to grade misparse fallout.
+    #[test]
+    fn go_census_membership_backs_recovered_references_without_proposing_them() {
+        let source = concat!(
+            "package purl\n",
+            "\n",
+            "type PackageURL struct {\n",
+            "\tName string\n",
+            "}\n",
+            "\n",
+            "type Row struct {\n",
+            "\tlimit int\n",
+            "\tents  []int\n",
+            "}\n",
+            "\n",
+            "func FromString(p PackageURL) *PackageURL {\n",
+            "\treturn new(PackageURL(p))\n",
+            "}\n",
+            "\n",
+            "func Len(r *Row) int { return len(r.ents) }\n",
+            "\n",
+            "func Build(rows []int, low int, high int) *Row {\n",
+            "\tr := &Row{}\n",
+            "\tr.limit = new(max(low, high))\n",
+            "\tr.ents = rows\n",
+            "\treturn r\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::Go, "purl.go", source);
+        let membership = census_membership_offsets(Language::Go, "purl.go", source);
+        let conversion = source.find("new(PackageURL(p))").expect("conversion call") + "new(".len();
+        let field_write = source.find("r.ents = rows").expect("recovered write") + "r.".len();
+        let intact_read = source.find("len(r.ents)").expect("intact read") + "len(r.".len();
+
+        for offset in [conversion, field_write] {
+            assert!(
+                !census.contains(&offset),
+                "recovery fallout must stay out of the graded census at {offset}: {census:?}"
+            );
+            assert!(
+                membership.contains(&offset),
+                "the recovered reference at {offset} must back an inverse hit: {membership:?}"
+            );
+        }
+        assert!(
+            census.contains(&intact_read) && membership.contains(&intact_read),
+            "the intact part of the file keeps both frontiers: {census:?} {membership:?}"
+        );
+    }
+
+    /// The C# recovery shapes from #3212. A `$@"..."` verbatim interpolation
+    /// (the Rebus `FormatObject` witness) and a `return ref *...` pointer
+    /// dereference (the ComputeSharp `this.pointer` witness) derail
+    /// tree-sitter-c-sharp, and the code that follows survives only below an
+    /// ERROR node. The calls and member reads in that code keep their
+    /// invocation and member-access structure, and the inverse usage scan
+    /// proves them there, so membership must hold them. The forward census
+    /// keeps refusing to propose a site it cannot grade, and an intact binder
+    /// the recovered tree still states (the typed lambda parameter) stays out,
+    /// matching the binder roles the usage extractor itself refuses.
+    #[test]
+    fn csharp_census_membership_backs_recovered_references_without_proposing_them() {
+        let source = concat!(
+            "class Logger {\n",
+            "    protected virtual string FormatObject(object obj, string format) {\n",
+            "        if (obj is string) {\n",
+            "            return $@\"\"\"{obj}\"\"\";\n",
+            "        }\n",
+            "        if (obj is System.Collections.IEnumerable enumerable) {\n",
+            "            var valueStrings = enumerable.Cast<object>().Select((object o) => FormatObject(o, format));\n",
+            "            return $\"[{string.Join(\", \", valueStrings)}]\";\n",
+            "        }\n",
+            "        return \"\";\n",
+            "    }\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::CSharp, "Logger.cs", source);
+        let membership = census_membership_offsets(Language::CSharp, "Logger.cs", source);
+        let recovered_call = source
+            .rfind("FormatObject(o, format)")
+            .expect("recovered call");
+        let recovered_binder = source
+            .rfind("(object o) =>")
+            .map(|offset| offset + "(object ".len())
+            .expect("recovered lambda binder");
+        let declaration = source.find("FormatObject(object").expect("declaration");
+
+        assert!(
+            !census.contains(&recovered_call) && !census.contains(&recovered_binder),
+            "the forward census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&recovered_call),
+            "the recovered implicit-this call must back inverse precision: {membership:?}"
+        );
+        assert!(
+            !membership.contains(&recovered_binder),
+            "an intact binder inside recovery is not a reference: {membership:?}"
+        );
+        assert!(
+            census.contains(&declaration) && membership.contains(&declaration),
+            "the intact declaration keeps both frontiers: {census:?} {membership:?}"
+        );
+
+        let pointer = concat!(
+            "unsafe class TextureView {\n",
+            "    private readonly byte* pointer;\n",
+            "    public ref int this[int x, int y] {\n",
+            "        get {\n",
+            "            return ref *((int*)((byte*)this.pointer + (y * 2)) + x);\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::CSharp, "TextureView.cs", pointer);
+        let membership = census_membership_offsets(Language::CSharp, "TextureView.cs", pointer);
+        let recovered_member =
+            pointer.find("this.pointer").expect("recovered member") + "this.".len();
+
+        assert!(
+            !census.contains(&recovered_member),
+            "the forward census must keep excluding the ERROR subtree: {census:?}"
+        );
+        assert!(
+            membership.contains(&recovered_member),
+            "the recovered `this` member read must back inverse precision: {membership:?}"
+        );
+    }
+
+    /// Control: outside recovery the C# membership frontier is exactly the
+    /// forward census frontier, so nothing about an ordinary file moved (#3212).
+    #[test]
+    fn csharp_census_membership_matches_the_census_without_recovery() {
+        let source = concat!(
+            "class Logger {\n",
+            "    protected virtual string FormatObject(object obj, string format) {\n",
+            "        return FormatObject(obj, format);\n",
+            "    }\n",
+            "}\n",
+        );
+        let census = census_offsets(Language::CSharp, "Logger.cs", source);
+        let membership = census_membership_offsets(Language::CSharp, "Logger.cs", source);
+        assert_eq!(
+            census, membership,
+            "an error-free C# file must keep one identifier frontier"
+        );
+    }
+
     #[test]
     fn cpp_census_membership_backs_only_structured_template_types_inside_recovery() {
         let source = concat!(
@@ -1263,6 +1432,77 @@ class Result {
         assert!(
             !membership.contains(&arbitrary_recovery),
             "arbitrary recovery leaves are not membership references: {membership:?}"
+        );
+    }
+
+    /// #3167: a PHP 8.5 clone-with pair list recovers as ERROR under the
+    /// bundled grammar, and the grammar keeps the member-name field of plain
+    /// member access and call expressions inside that recovery -- the same
+    /// structured reference role the nullsafe and static-scope shapes state.
+    /// Membership must back inverse hits on those terminals
+    /// (`$result->input`, `$validator->getName()` in Respect Validation's
+    /// src/Result.php), while arbitrary recovery leaves stay excluded and the
+    /// forward census keeps refusing to propose the ERROR subtree.
+    #[test]
+    fn php_census_membership_backs_recovered_plain_member_references() {
+        let source = r#"<?php
+namespace App\Demo;
+
+class Result {
+    public ?Result $adjacent;
+    public mixed $input;
+    public ?string $name;
+    public function withInput(): self { return $this; }
+    public function asAdjacentOf(Result $result): self {
+        return clone ($this, [
+            'input' => $result->input,
+            'next' => $this->adjacent?->withInput(),
+        ]);
+    }
+    public function withNameFrom(Nameable $validator): self {
+        return clone($this, [
+            'noise' => unknown_token,
+            'name' => $this->name ?? $validator->getName(),
+            'adjacent' => $this->adjacent?->withInput(),
+        ]);
+    }
+}
+"#;
+        let census = census_offsets(Language::Php, "Result.php", source);
+        let membership = census_membership_offsets(Language::Php, "Result.php", source);
+        let member_access =
+            source.find("$result->input,").expect("plain member access") + "$result->".len();
+        let member_call = source
+            .find("$validator->getName()")
+            .expect("plain member call")
+            + "$validator->".len();
+        let this_member = source
+            .find("$this->name ??")
+            .expect("same-owner member access")
+            + "$this->".len();
+        let escaped_pair = source
+            .find("'next' => $this->adjacent?->withInput()")
+            .expect("pair surviving outside recovery")
+            + "'next' => $this->adjacent?->".len();
+        let arbitrary_recovery = source.find("unknown_token").expect("recovery noise");
+
+        for recovered in [member_access, member_call, this_member] {
+            assert!(
+                !census.contains(&recovered),
+                "the forward census must keep excluding the ERROR subtree at {recovered}: {census:?}"
+            );
+            assert!(
+                membership.contains(&recovered),
+                "the structured member reference at {recovered} must back inverse precision: {membership:?}"
+            );
+        }
+        assert!(
+            census.contains(&escaped_pair) && membership.contains(&escaped_pair),
+            "the pair surviving outside recovery keeps both frontiers: {census:?} {membership:?}"
+        );
+        assert!(
+            !membership.contains(&arbitrary_recovery),
+            "an arbitrary recovery leaf is not a membership reference: {membership:?}"
         );
     }
 

@@ -6807,6 +6807,141 @@ func unknownGroupCount(delta int) int {
     return value
 }
 
+func overflowingGroupCount() int {
+    group := &sync.WaitGroup{}
+    value := 0
+    group.Add(9223372036854775807)
+    group.Add(9223372036854775807)
+    group.Add(3)
+    go func() {
+        defer group.Done()
+        value = 1
+    }()
+    group.Wait()
+    return value
+}
+
+func summarizedJoinedGroup() int {
+    return summarizedJoinedGroupBody(&sync.WaitGroup{})
+}
+func summarizedJoinedGroupBody(group *sync.WaitGroup) int {
+    value := 0
+    group.Add(1)
+    go func() {
+        value = 1
+        group.Done()
+    }()
+    group.Wait()
+    return value
+}
+func summarizedUnknownGroup(count int) int {
+    return summarizedUnknownGroupBody(&sync.WaitGroup{}, count)
+}
+func summarizedLocalGroup() int {
+    return summarizedLocalGroupBody()
+}
+func summarizedLocalGroupBody() int {
+    group := new(sync.WaitGroup)
+    alias := group
+    value := 0
+    alias.Add(1)
+    go func() {
+        value = 1
+        group.Done()
+    }()
+    alias.Wait()
+    return value
+}
+func summarizedLocalDistinctGroup() int {
+    return summarizedLocalDistinctGroupBody()
+}
+func summarizedLocalDistinctGroupBody() int {
+    first := &sync.WaitGroup{}
+    second := &sync.WaitGroup{}
+    value := 0
+    first.Add(1)
+    go func() {
+        value = 1
+        second.Done()
+    }()
+    first.Wait()
+    return value
+}
+func summarizedLocalLiteralGroup() int {
+    return summarizedLocalLiteralGroupBody()
+}
+func summarizedLocalLiteralGroupBody() int {
+    group := &sync.WaitGroup{}
+    alias := group
+    value := 0
+    alias.Add(1)
+    go func() { value = 1; group.Done() }()
+    alias.Wait()
+    return value
+}
+func summarizedLocalCopiedGroup() int {
+    return summarizedLocalCopiedGroupBody()
+}
+func summarizedLocalCopiedGroupBody() int {
+    group := sync.WaitGroup{}
+    copied := group
+    value := 0
+    group.Add(1)
+    go func() { value = 1; copied.Done() }()
+    group.Wait()
+    return value
+}
+func summarizedLocalReassignedGroup() int {
+    return summarizedLocalReassignedGroupBody()
+}
+func summarizedLocalReassignedGroupBody() int {
+    group := &sync.WaitGroup{}
+    original := group
+    group = &sync.WaitGroup{}
+    value := 0
+    original.Add(1)
+    go func() { value = 1; group.Done() }()
+    original.Wait()
+    return value
+}
+func summarizedUnknownGroupBody(group *sync.WaitGroup, count int) int {
+    value := 0
+    group.Add(count)
+    go func() {
+        value = 1
+        group.Done()
+    }()
+    group.Wait()
+    return value
+}
+
+func summarizedCopiedGroup() int {
+    return summarizedCopiedGroupBody(&sync.WaitGroup{})
+}
+func summarizedCopiedGroupBody(group *sync.WaitGroup) int {
+    value := 0
+    group.Add(1)
+    go func(copied sync.WaitGroup) {
+        value = 1
+        copied.Done()
+    }(*group)
+    group.Wait()
+    return value
+}
+func summarizedDistinctGroup() int {
+    return summarizedDistinctGroupBody(&sync.WaitGroup{}, &sync.WaitGroup{})
+}
+func summarizedDistinctGroupBody(first, second *sync.WaitGroup) int {
+    value := 0
+    first.Add(1)
+    go func() {
+        value = 1
+        second.Done()
+    }()
+    first.Wait()
+    return value
+}
+
 func summarizedAtomicOnly() {
     var value int64
     go func() { atomic.StoreInt64(&value, 1) }()
@@ -7259,6 +7394,15 @@ func unsupportedOnce() int {
         procedure("summarizedMixedAtomic"),
         procedure("summarizedDistinctAtomic"),
         procedure("summarizedAtomicCopy"),
+        procedure("summarizedJoinedGroup"),
+        procedure("summarizedUnknownGroup"),
+        procedure("summarizedCopiedGroup"),
+        procedure("summarizedDistinctGroup"),
+        procedure("summarizedLocalGroup"),
+        procedure("summarizedLocalDistinctGroup"),
+        procedure("summarizedLocalLiteralGroup"),
+        procedure("summarizedLocalCopiedGroup"),
+        procedure("summarizedLocalReassignedGroup"),
     ];
     let direct_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
         &workspace,
@@ -7286,6 +7430,18 @@ func unsupportedOnce() int {
     assert_eq!(
         atomic_count, 6,
         "all six atomic calls must retain witnessed effects"
+    );
+    let wait_group_count = summaries.summaries().iter().flat_map(|summary| summary.effects())
+        .filter(|effect| matches!(effect.key(),
+            brokk_bifrost_flow::dataflow::SummaryEffectKey::Concurrency(effect)
+                if matches!(effect.kind(),
+                    brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::WaitGroupAdd { .. }
+                    | brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::WaitGroupDone { .. }
+                    | brokk_bifrost_flow::dataflow::SummaryConcurrencyEffectKind::WaitGroupWait { .. })
+        )).count();
+    assert_eq!(
+        wait_group_count, 23,
+        "complete reference inventories and captured Done rows must be retained"
     );
     let projected_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
         &workspace,
@@ -7351,7 +7507,8 @@ func unsupportedOnce() int {
             retained, direct,
             "atomic route {index} must agree under summary replay"
         );
-        if index < 2 {
+        // Copied and reassigned locals intentionally lack complete inventories.
+        if !matches!(index, 2 | 3 | 11 | 12) {
             let mut budget = crate::analyzer::semantic::SemanticBudget::default();
             let replay_only = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
                 &without_models,
@@ -7369,6 +7526,20 @@ func unsupportedOnce() int {
             .iter()
             .filter(|conflict| {
                 conflict.ordering == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+            })
+            .collect::<Vec<_>>();
+        let read_pairs = retained
+            .conflicts
+            .iter()
+            .filter(|conflict| {
+                // Captured group-pointer reads observe initialization before
+                // spawning. The phase assertion concerns the parent's read
+                // of the shared lexical value after Wait instead.
+                [&conflict.first, &conflict.second].iter().any(|site| {
+                    site.mode == brokk_bifrost_flow::concurrency::ConcurrentAccessMode::Read
+                        && site.access_kind
+                            == crate::analyzer::semantic::MemoryAccessKind::LexicalCell
+                })
             })
             .collect::<Vec<_>>();
         match index {
@@ -7394,6 +7565,31 @@ func unsupportedOnce() int {
                 unordered.iter().all(|conflict| !conflict.proven),
                 "copied values cannot prove a shared atomic access: {retained:#?}"
             ),
+            4 | 8 | 10 => assert!(
+                read_pairs.iter().any(|conflict| conflict.proven
+                    && conflict.exhaustive
+                    && conflict.ordering
+                        == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore),
+                "an exact summarized phase must order the child write before the read: {retained:#?}"
+            ),
+            5 => assert!(
+                read_pairs.iter().any(|conflict| !conflict.proven
+                    && conflict.ordering
+                        == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Open),
+                "an unknown summarized count must retain its open phase: {retained:#?}"
+            ),
+            6 | 7 | 9 | 11 | 12 => {
+                assert!(
+                    !read_pairs.is_empty(),
+                    "the value access pair must remain visible: {retained:#?}"
+                );
+                assert!(
+                    read_pairs.iter().all(|conflict| !conflict.proven
+                        || conflict.ordering
+                            != brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore),
+                    "route {index}: a copied or distinct group cannot complete the original phase: {retained:#?}"
+                );
+            }
             _ => unreachable!(),
         }
     }
@@ -7976,6 +8172,31 @@ func unsupportedOnce() int {
 
     let query = CodeQuery::from_json(&json!({
         "languages": ["go"],
+        "match": { "kind": "function", "name": "overflowingGroupCount" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "concurrent_access_conflicts" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("overflowing WaitGroup count concurrent access query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let value = find_concurrent_relation(&result, |value| {
+        value.verdict == "conflict" && value.proof == "open"
+    });
+    assert_eq!(
+        (value.ordering, value.proof, value.coverage),
+        ("open", "open", "open"),
+        "overflow cannot prove a completed WaitGroup phase: {result:#?}"
+    );
+    assert_eq!(value.reasons, ["ambiguous_synchronization"], "{result:#?}");
+
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["go"],
         "match": { "kind": "function", "name": "oneSidedLock" },
         "steps": [
             { "op": "procedure_of" },
@@ -8472,6 +8693,7 @@ fn go_container_copies_keep_backing_and_value_copies_do_not() {
         "arrayPointerElementCompositeLiteral",
         "arrayPointerElementKeyedCompositeLiteral",
         "structPointerFieldCopy",
+        "structPointerFieldCopyChain",
     ] {
         let result = heap_identity_conflicts(&workspace, route);
         assert_proven_unordered_unprotected_conflict(
@@ -8486,6 +8708,8 @@ fn go_container_copies_keep_backing_and_value_copies_do_not() {
         "arrayValueCompositeLiteralCopy",
         "arrayPointerElementReplacedAfterCopy",
         "arrayPointerElementSourceReplacedAfterCopy",
+        "structPointerFieldReplacedAfterCopy",
+        "structPointerFieldSourceReplacedAfterCopy",
     ] {
         let result = heap_identity_conflicts(&workspace, route);
         assert_no_proven_conflicts_with_explicit_evidence(&result);
@@ -9230,12 +9454,27 @@ fn go_channel_backing_transport_publishes_slice_and_map_storage() {
 #[test]
 fn go_channel_transport_does_not_fabricate_payload_identity() {
     let (_project, workspace) = heap_identity_workspace();
+    for root in ["channelStructValueCopy", "channelHelperValueCopy"] {
+        let result = heap_identity_conflicts(&workspace, root);
+        assert_no_proven_conflicts_with_explanation(&result);
+        assert_eq!(
+            result.completion(),
+            CodeQueryCompletion::Complete,
+            "{root}: {result:#?}"
+        );
+        assert!(result.diagnostics.is_empty(), "{root}: {result:#?}");
+        assert!(
+            result.results.iter().all(|item| {
+                matches!(&item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+                if value.task_relation != "siblings")
+            }),
+            "a copied scalar field has distinct storage: {root}: {result:#?}"
+        );
+    }
     for root in [
-        "channelStructValueCopy",
         "channelMultipleSends",
         "channelInterfacePayload",
         "channelParameterPayload",
-        "channelHelperValueCopy",
         "channelReassignedHelper",
         "channelLoopSend",
         "channelCloseAlternative",
@@ -10102,6 +10341,33 @@ func structPointerFieldCopy() {
     c := &cell{}
     v := wrap{c: c}
     w := v
+    go func() { w.c.n = 1 }()
+    go func() { v.c.n = 2 }()
+}
+
+func structPointerFieldCopyChain() {
+    c := &cell{}
+    v := wrap{c: c}
+    w := v
+    x := w
+    go func() { x.c.n = 1 }()
+    go func() { v.c.n = 2 }()
+}
+
+func structPointerFieldReplacedAfterCopy() {
+    c := &cell{}
+    v := wrap{c: c}
+    w := v
+    w.c = &cell{}
+    go func() { w.c.n = 1 }()
+    go func() { v.c.n = 2 }()
+}
+
+func structPointerFieldSourceReplacedAfterCopy() {
+    c := &cell{}
+    v := wrap{c: c}
+    w := v
+    v.c = &cell{}
     go func() { w.c.n = 1 }()
     go func() { v.c.n = 2 }()
 }
@@ -11643,19 +11909,11 @@ func valueRoot() {
     assert_proven_exhaustive_sibling_conflicts(&pointer, 1);
     assert_no_proven_conflicts_with_explicit_evidence(&value);
     assert!(
-        value.results.iter().any(|item| {
-            let CodeQueryResultValue::ConcurrentAccessConflict { value } = &item.value else {
-                panic!("concurrent_access_conflicts returns a typed row: {item:#?}");
-            };
-            value.task_relation == "siblings"
-                && value.ordering == "unordered"
-                && value.proof == "open"
-                && value
-                    .reasons
-                    .iter()
-                    .any(|reason| reason == "recursive_expansion")
-        }),
-        "a value-copy payload must not acquire pointer identity: {value:#?}"
+        value
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("RecursiveExpansion")),
+        "distinct copied field storage must not hide incomplete recursive coverage: {value:#?}"
     );
 }
 

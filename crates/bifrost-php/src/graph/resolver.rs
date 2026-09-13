@@ -305,16 +305,20 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
 /// reference role suitable for inverse-membership backing.
 ///
 /// This is deliberately narrower than the ordinary PHP reference frontier.
-/// The grammar retains the static scope and nullsafe member-name fields even
-/// when newer surrounding syntax recovers as ERROR. Arbitrary recovery leaves
-/// and dynamic names remain excluded.
+/// The grammar retains the member-name field of plain and nullsafe member
+/// access and call expressions and the static scope envelope even when newer
+/// surrounding syntax recovers as ERROR. Arbitrary recovery leaves and dynamic
+/// names remain excluded.
 pub fn is_recovered_membership_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
     if matches!(
         parent.kind(),
-        "nullsafe_member_access_expression" | "nullsafe_member_call_expression"
+        "member_access_expression"
+            | "member_call_expression"
+            | "nullsafe_member_access_expression"
+            | "nullsafe_member_call_expression"
     ) && parent.child_by_field_name("name") == Some(node)
     {
         return node.kind() == "name";

@@ -957,7 +957,7 @@ pub fn carried_source_paths(shards: &[AuthoredShard]) -> Vec<String> {
                 .chain(members.iter().map(|fact| &fact.locator))
                 .filter_map(|locator| match locator {
                     Locator::Source { path, .. } => Some(path.clone()),
-                    Locator::Artifact { .. } => None,
+                    Locator::Artifact { .. } | Locator::Interchange { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             AuthoredPayload::GeneratorRules { .. } | AuthoredPayload::ProcedureSummaries { .. } => {
@@ -2255,6 +2255,13 @@ pub enum Locator {
     Artifact {
         path: String,
         symbol: String,
+    },
+    /// The path and local symbol locate the imported declaration. Only the
+    /// structured identity carries its portable artifact and ownership key.
+    Interchange {
+        path: String,
+        symbol: String,
+        identity: Box<super::csmi::CsmiPortableSymbolIdentity>,
     },
 }
 

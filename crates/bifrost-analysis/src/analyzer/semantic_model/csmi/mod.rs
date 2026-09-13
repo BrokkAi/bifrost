@@ -10,6 +10,7 @@ mod identity;
 mod import;
 mod model;
 mod pack;
+pub(crate) mod python;
 mod validate;
 
 #[cfg(test)]

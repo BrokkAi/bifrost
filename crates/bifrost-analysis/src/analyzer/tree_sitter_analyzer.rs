@@ -11384,7 +11384,15 @@ where
                     let is_type_alias = row.candidate.flags.is_type_alias;
                     (
                         row.candidate,
-                        (row.primary_range, row.in_test_region, is_type_alias),
+                        (
+                            row.primary_range,
+                            row.has_multiple_ranges,
+                            row.secondary_range,
+                            row.has_more_ranges,
+                            row.all_ranges_are_definitions,
+                            row.in_test_region,
+                            is_type_alias,
+                        ),
                     )
                 }),
                 cancellation,
@@ -11393,7 +11401,19 @@ where
         inspected = inspected.saturating_add(resolved.inspected);
         complete &= resolved.complete;
         let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, in_test_region, is_type_alias)) in resolved.rows {
+        for (
+            code_unit,
+            (
+                primary_range,
+                has_multiple_ranges,
+                secondary_range,
+                has_more_ranges,
+                all_ranges_are_definitions,
+                in_test_region,
+                is_type_alias,
+            ),
+        ) in resolved.rows
+        {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
                 break;
@@ -11405,6 +11425,10 @@ where
                     .or_insert(SearchSymbolCandidate {
                         code_unit,
                         primary_range,
+                        has_multiple_ranges,
+                        secondary_range,
+                        has_more_ranges,
+                        all_ranges_are_definitions,
                         in_test_region,
                         is_type_alias,
                     });
@@ -11424,17 +11448,22 @@ where
                 complete = false;
                 break;
             }
-            candidates
-                .entry(code_unit.clone())
-                .or_insert_with(|| SearchSymbolCandidate {
-                    primary_range: self
-                        .ranges(&code_unit)
-                        .into_iter()
+            candidates.entry(code_unit.clone()).or_insert_with(|| {
+                let ranges = self.ranges(&code_unit);
+                SearchSymbolCandidate {
+                    primary_range: ranges
+                        .iter()
+                        .copied()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
+                    has_multiple_ranges: ranges.len() > 1,
+                    secondary_range: ranges.get(1).copied(),
+                    has_more_ranges: ranges.len() > 2,
+                    all_ranges_are_definitions: false,
                     in_test_region: self.in_test_region(&code_unit),
                     is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
-                });
+                }
+            });
         }
 
         let synthetic = self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
@@ -11449,17 +11478,22 @@ where
                 break;
             }
             inspected = inspected.saturating_add(1);
-            candidates
-                .entry(code_unit.clone())
-                .or_insert_with(|| SearchSymbolCandidate {
-                    primary_range: self
-                        .ranges(&code_unit)
-                        .into_iter()
+            candidates.entry(code_unit.clone()).or_insert_with(|| {
+                let ranges = self.ranges(&code_unit);
+                SearchSymbolCandidate {
+                    primary_range: ranges
+                        .iter()
+                        .copied()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
+                    has_multiple_ranges: ranges.len() > 1,
+                    secondary_range: ranges.get(1).copied(),
+                    has_more_ranges: ranges.len() > 2,
+                    all_ranges_are_definitions: false,
                     in_test_region: self.in_test_region(&code_unit),
                     is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
-                });
+                }
+            });
         }
 
         let candidates = candidates.into_values().collect();

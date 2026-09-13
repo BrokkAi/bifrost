@@ -4949,14 +4949,16 @@ fn member_symbol(
 
 fn locator_path(locator: &Locator) -> &str {
     match locator {
-        Locator::Source { path, .. } | Locator::Artifact { path, .. } => path,
+        Locator::Source { path, .. }
+        | Locator::Artifact { path, .. }
+        | Locator::Interchange { path, .. } => path,
     }
 }
 
 fn locator_symbol(locator: &Locator) -> Option<&str> {
     match locator {
         Locator::Source { symbol, .. } => symbol.as_deref(),
-        Locator::Artifact { symbol, .. } => Some(symbol),
+        Locator::Artifact { symbol, .. } | Locator::Interchange { symbol, .. } => Some(symbol),
     }
 }
 
@@ -5189,6 +5191,7 @@ fn origin(shard: &ActiveSemanticModelShard, locator: Option<&Locator>) -> Semant
         CatalogPackSourceKind::Installed => match locator {
             Some(Locator::Source { .. }) => SemanticModelOriginKind::DependencySource,
             Some(Locator::Artifact { .. }) => SemanticModelOriginKind::DependencyBinary,
+            Some(Locator::Interchange { .. }) => SemanticModelOriginKind::DeclarativeModel,
             None => SemanticModelOriginKind::PrebuiltApiIndex,
         },
         CatalogPackSourceKind::PreShipped => SemanticModelOriginKind::PrebuiltApiIndex,

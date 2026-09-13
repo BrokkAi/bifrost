@@ -20,6 +20,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentityBuilder, StructuredTypeName, StructuredTypeNodeId,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::adapter_helpers::node_range;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     GenerationKind, MaterializationRecord,
 };
@@ -5325,17 +5326,18 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    /// Declare one Module per namespace level of `components` under
-    /// `package_name`, and return the innermost level's package name and
-    /// Module. A level an earlier definition already declared is reused.
+    /// Declare one Module per namespace level of `levels` under `package_name`,
+    /// each recording the range of the construct that writes it, and return the
+    /// innermost level's package name and Module. A level an earlier definition
+    /// already declared is reused, which is also how a reopened namespace keeps
+    /// the range of the definition that first declared it.
     fn declare_namespace_levels(
         &mut self,
         mut package_name: String,
-        components: Vec<String>,
-        node: Node<'_>,
+        levels: Vec<(String, Range)>,
     ) -> (String, Option<CodeUnit>) {
         let mut module = None;
-        for component in components {
+        for (component, range) in levels {
             let full_name = if package_name.is_empty() {
                 component
             } else {
@@ -5349,7 +5351,7 @@ impl<'a> CppVisitor<'a> {
                 cpp_namespace_fq(&full_name),
             );
             if !self.parsed.contains_declaration(&level) {
-                self.add_declaration(level.clone(), node, None, None);
+                self.add_declaration_with_range(level.clone(), range, None, None);
             }
             package_name = full_name;
             module = Some(level);
@@ -5367,14 +5369,23 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
     ) -> Option<ScopeInfo> {
         self.orphaned_namespaces.region_at(node.start_byte())?;
-        let components = self
+        // Each level carries the `namespace Name { ... }` construct that writes
+        // it. Declaring them at `node` instead recorded the range of whichever
+        // member the walk happened to reach first, so a namespace whose head
+        // collapsed into an ERROR reported its first inner declaration's lines
+        // as its own (#3309).
+        let levels = self
             .orphaned_namespaces
-            .enclosing_namespace_components(node, self.source);
-        let package_name = components.join(CPP_PACKAGE_SEPARATOR);
+            .enclosing_namespace_levels(node, self.source);
+        let package_name = levels
+            .iter()
+            .map(|(component, _)| component.as_str())
+            .collect::<Vec<_>>()
+            .join(CPP_PACKAGE_SEPARATOR);
         if package_name == scope.package_name {
             return None;
         }
-        let (package_name, module) = self.declare_namespace_levels(String::new(), components, node);
+        let (package_name, module) = self.declare_namespace_levels(String::new(), levels);
         Some(ScopeInfo {
             package_name,
             module,
@@ -5431,7 +5442,14 @@ impl<'a> CppVisitor<'a> {
         } else {
             scope.package_name.clone()
         };
-        let (package_name, module) = self.declare_namespace_levels(package_name, components, node);
+        let definition = node_range(node);
+        let (package_name, module) = self.declare_namespace_levels(
+            package_name,
+            components
+                .into_iter()
+                .map(|component| (component, definition))
+                .collect(),
+        );
 
         let namespace_scope = ScopeInfo {
             package_name,

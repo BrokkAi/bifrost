@@ -1840,6 +1840,55 @@ fn configuration_json_fixture(body: &str) -> (tempfile::TempDir, TypescriptAnaly
     (temp, analyzer, body.to_string())
 }
 
+fn configuration_xml_fixture(body: &str) -> (tempfile::TempDir, TypescriptAnalyzer, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "server.xml")
+        .write(body)
+        .expect("write configuration");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    (temp, analyzer, body.to_string())
+}
+
+fn xml_configuration_policy_source(role: &str) -> String {
+    format!(
+        r#"(policy
+      :id "test.xml-configuration-fact"
+      :name "XML configuration fact"
+      :message "Matched XML server host"
+      :severity warning
+      :analysis (analysis
+        :type match
+        :selector (rql (configuration-facts
+          :format xml
+          :node-kind member
+          :role {role}
+          :key "host"
+          :route [[(key "server") (key "host")]]))))"#
+    )
+}
+
+fn evaluate_xml_configuration_selector_policy(
+    analyzer: &TypescriptAnalyzer,
+    source: &str,
+) -> PolicyRun {
+    let registry = policy_registry("test:xml-configuration-fact", source);
+    let policy = registry.policies().next().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+    };
+    let mut budget = PolicyBudget::default();
+    DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut budget)
+        .unwrap()
+}
+
 fn configuration_enabled_query() -> CodeQuery {
     CodeQuery::from_json(&json!({
         "configuration_facts": {
@@ -2057,4 +2106,64 @@ fn configuration_fact_recovered_document_stays_typed_incomplete() {
             "{candidate:#?}"
         );
     }
+}
+
+#[test]
+fn xml_configuration_selector_policy_matches_elements_and_excludes_role_near_miss() {
+    let source = r#"<server>
+  <host>primary.example</host>
+  <host>backup.example</host>
+  <hostname>near-miss.example</hostname>
+</server>
+"#;
+    let (_temp, analyzer, _source) = configuration_xml_fixture(source);
+    let element_run = evaluate_xml_configuration_selector_policy(
+        &analyzer,
+        &xml_configuration_policy_source("xml_element"),
+    );
+    assert_eq!(
+        element_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{element_run:#?}"
+    );
+    assert_eq!(element_run.findings().len(), 2, "{element_run:#?}");
+    assert!(
+        element_run
+            .findings()
+            .windows(2)
+            .all(|pair| pair[0].id() != pair[1].id())
+    );
+    assert!(
+        element_run
+            .findings()
+            .iter()
+            .all(|finding| finding.primary().path().ends_with("server.xml"))
+    );
+
+    let attribute_run = evaluate_xml_configuration_selector_policy(
+        &analyzer,
+        &xml_configuration_policy_source("xml_attribute"),
+    );
+    assert_eq!(
+        attribute_run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{attribute_run:#?}"
+    );
+    assert!(attribute_run.findings().is_empty(), "{attribute_run:#?}");
+}
+
+#[test]
+fn xml_configuration_recovered_document_stays_typed_incomplete() {
+    let (_temp, analyzer, _source) =
+        configuration_xml_fixture("<server><host>primary.example</host>");
+    let run = evaluate_xml_configuration_selector_policy(
+        &analyzer,
+        &xml_configuration_policy_source("xml_element"),
+    );
+
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{run:#?}"
+    );
+    assert!(!run.diagnostics().is_empty(), "{run:#?}");
 }

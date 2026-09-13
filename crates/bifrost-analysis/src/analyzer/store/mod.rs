@@ -1493,6 +1493,10 @@ fn insert_workspace_file_projection_rows(
 pub struct SearchCandidateRow<I = FqIdentityHeader> {
     pub candidate: CandidateRow<I>,
     pub primary_range: Option<Range>,
+    pub has_multiple_ranges: bool,
+    pub secondary_range: Option<Range>,
+    pub has_more_ranges: bool,
+    pub all_ranges_are_definitions: bool,
     /// Per-declaration test-region taint (issue #1102): true when this specific
     /// unit is inside a structurally-evidenced test region, replacing the old
     /// file-level `contains_tests` replication so production symbols in a file
@@ -11338,6 +11342,10 @@ impl CandidateRowContainer for SearchCandidateRow {
         SearchCandidateRow {
             candidate: candidate_with_hydrated_fq(self.candidate, fq),
             primary_range: self.primary_range,
+            has_multiple_ranges: self.has_multiple_ranges,
+            secondary_range: self.secondary_range,
+            has_more_ranges: self.has_more_ranges,
+            all_ranges_are_definitions: self.all_ranges_are_definitions,
             in_test_region: self.in_test_region,
         }
     }
@@ -11665,25 +11673,19 @@ fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFac
 
 fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchCandidateRow> {
     let candidate = candidate_row_from_row(row)?;
-    // The relational FQ header occupies 12..=18; `in_test_region` is 19 and
-    // the primary-range columns are 20..=23.
-    let primary_range = match (
-        row.get::<_, Option<i64>>(20)?,
-        row.get::<_, Option<i64>>(21)?,
-        row.get::<_, Option<i64>>(22)?,
-        row.get::<_, Option<i64>>(23)?,
-    ) {
-        (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
-            start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
-            end_byte: i64_to_usize(end_byte).map_err(rusqlite_error_from_store)?,
-            start_line: i64_to_usize(start_line).map_err(rusqlite_error_from_store)?,
-            end_line: i64_to_usize(end_line).map_err(rusqlite_error_from_store)?,
-        }),
-        _ => None,
-    };
+    // The relational FQ header occupies 12..=18; `in_test_region` is 19,
+    // the primary-range columns are 20..=23, the second range is 24..=27,
+    // column 28 says whether another range follows, and 29 proves complete
+    // callable occurrence metadata with no prototypes.
+    let primary_range = primary_range_from_row(row, 20)?;
+    let secondary_range = primary_range_from_row(row, 24)?;
     Ok(SearchCandidateRow {
         candidate,
         primary_range,
+        has_multiple_ranges: secondary_range.is_some(),
+        secondary_range,
+        has_more_ranges: row.get::<_, Option<i64>>(28)?.is_some(),
+        all_ranges_are_definitions: row.get::<_, i64>(29)? != 0,
         in_test_region: row.get::<_, i64>(19)? != 0,
     })
 }
@@ -11723,7 +11725,29 @@ fn search_candidate_projection_sql(prefix: &str, from: &str, predicate: &str) ->
                 units.exact_fqn_tail, units.fq_segment_bytes,
                 units.normalized_fqn_tail, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
-                primary_range.start_line, primary_range.end_line
+                primary_range.start_line, primary_range.end_line,
+                secondary_range.start_byte, secondary_range.end_byte,
+                secondary_range.start_line, secondary_range.end_line,
+                further_range.ordinal,
+                CASE
+                  WHEN units.kind = 1
+                   AND (SELECT COUNT(*)
+                        FROM unit_signature_metadata AS occurrence_metadata
+                        WHERE occurrence_metadata.blob_id = units.blob_id
+                          AND occurrence_metadata.unit_key = units.unit_key)
+                       = (SELECT COUNT(*)
+                          FROM unit_ranges AS occurrence_ranges
+                          WHERE occurrence_ranges.blob_id = units.blob_id
+                            AND occurrence_ranges.unit_key = units.unit_key)
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM unit_signature_metadata AS prototype_metadata
+                       WHERE prototype_metadata.blob_id = units.blob_id
+                         AND prototype_metadata.unit_key = units.unit_key
+                         AND prototype_metadata.declaration_only = 1
+                   )
+                  THEN 1 ELSE 0
+                END
          {from}
          WHERE {predicate} AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}"
@@ -11741,7 +11765,15 @@ fn search_candidate_sql(predicate: &str) -> String {
          LEFT JOIN unit_ranges AS primary_range
            ON primary_range.blob_id = units.blob_id
           AND primary_range.unit_key = units.unit_key
-          AND primary_range.ordinal = 0",
+          AND primary_range.ordinal = 0
+         LEFT JOIN unit_ranges AS secondary_range
+           ON secondary_range.blob_id = units.blob_id
+          AND secondary_range.unit_key = units.unit_key
+          AND secondary_range.ordinal = 1
+         LEFT JOIN unit_ranges AS further_range
+           ON further_range.blob_id = units.blob_id
+          AND further_range.unit_key = units.unit_key
+          AND further_range.ordinal = 2",
         predicate,
     )
 }
@@ -11783,7 +11815,15 @@ fn search_candidate_key_set_sql(padded_arity: usize) -> String {
          LEFT JOIN unit_ranges AS primary_range
            ON primary_range.blob_id = units.blob_id
           AND primary_range.unit_key = units.unit_key
-          AND primary_range.ordinal = 0",
+          AND primary_range.ordinal = 0
+         LEFT JOIN unit_ranges AS secondary_range
+           ON secondary_range.blob_id = units.blob_id
+          AND secondary_range.unit_key = units.unit_key
+          AND secondary_range.ordinal = 1
+         LEFT JOIN unit_ranges AS further_range
+           ON further_range.blob_id = units.blob_id
+          AND further_range.unit_key = units.unit_key
+          AND further_range.ordinal = 2",
         "1 = 1",
     )
 }
@@ -17591,6 +17631,78 @@ mod tests {
                 "fixture should retain declaration range"
             );
         }
+    }
+
+    #[test]
+    fn search_candidate_projection_marks_only_multiple_physical_ranges() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/functions.cpp",
+            "int declared_once();\n\nint defined_twice();\nint defined_twice() { return 1; }\n",
+        );
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+            .unwrap();
+
+        let candidates = store.search_candidate_rows_by_lang("cpp").unwrap();
+        let declared_once = candidates
+            .iter()
+            .find(|row| row.candidate.short_name == "declared_once")
+            .expect("single-occurrence function");
+        let defined_twice = candidates
+            .iter()
+            .find(|row| row.candidate.short_name == "defined_twice")
+            .expect("prototype and definition function");
+
+        assert!(!declared_once.has_multiple_ranges, "{declared_once:#?}");
+        assert!(
+            !declared_once.all_ranges_are_definitions,
+            "{declared_once:#?}"
+        );
+        assert!(defined_twice.has_multiple_ranges, "{defined_twice:#?}");
+        assert!(
+            !defined_twice.all_ranges_are_definitions,
+            "{defined_twice:#?}"
+        );
+        assert_eq!(
+            declared_once.primary_range.map(|range| range.start_line),
+            Some(1)
+        );
+        assert_eq!(
+            defined_twice.primary_range.map(|range| range.start_line),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn search_candidate_projection_proves_repeated_callable_definitions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/conditional.cpp",
+            "#if FIRST\nint selected() { return 1; }\n#else\nlong selected() { return 2; }\n#endif\n",
+        );
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+            .unwrap();
+
+        let candidates = store.search_candidate_rows_by_lang("cpp").unwrap();
+        let selected = candidates
+            .iter()
+            .find(|row| row.candidate.short_name == "selected")
+            .expect("repeated conditional definition");
+
+        assert!(selected.has_multiple_ranges, "{selected:#?}");
+        assert!(selected.all_ranges_are_definitions, "{selected:#?}");
+        assert_eq!(
+            selected.primary_range.map(|range| range.start_line),
+            Some(2)
+        );
     }
 
     #[test]

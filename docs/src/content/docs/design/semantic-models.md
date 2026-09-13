@@ -105,6 +105,21 @@ around the neutral pack format. A schema-valid pack can still be semantically
 invalid, inapplicable to the current artifact, or unsupported by a consumer
 profile.
 
+Python predicate refinements use the same branch semantics whether they come
+from resolved native `TypeIs`/`TypeGuard` annotations or the standard CSMI
+conditional-type-refinement profile. `TypeIs` intersects on true and excludes
+on false; `TypeGuard` replaces on true and leaves false unchanged. Application
+requires an exact callee and argument binding with complete, agreeing evidence.
+Structured generic targets survive transport; a target the class domain cannot
+interpret remains explicitly uncertain.
+
+The Python declaration adapter currently supports exact runtime artifact keys
+with the standard Python identity profile. It retains artifact digests and
+structured ownership descriptors through import and export. Distribution import
+bindings, stub-to-runtime correspondence, and unsupported declaration shapes
+return an unsupported result. Native declarations without portable identity
+evidence cannot acquire that identity merely from their display names.
+
 An interoperability test needs the exact artifact emitted by an independent
 producer and the analysis difference with that pack disabled and enabled. A
 hand-authored approximation cannot establish producer interoperability.

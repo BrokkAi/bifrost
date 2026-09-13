@@ -445,26 +445,6 @@ pub(super) fn search_symbols_with_cap(
             if !seen.insert(candidate.code_unit.clone()) {
                 continue;
             }
-            // The persisted primary range is ordinal zero, which is the
-            // prototype when one C++ callable has a same-file prototype and a
-            // later body, and the forward declaration when a C++ class has one
-            // (#3297). Use the same structured occurrence classification as
-            // forward navigation so symbol search offers the physical
-            // definition without changing the declarations the pattern named.
-            let selected_range = if language_for_target(&candidate.code_unit) == Language::Cpp
-                && (candidate.code_unit.is_callable() || candidate.code_unit.is_class())
-            {
-                cpp_identity
-                    .primary_range(analyzer, &candidate.code_unit)
-                    .or(candidate.primary_range)
-            } else {
-                candidate
-                    .primary_range
-                    .or_else(|| primary_range(analyzer, &candidate.code_unit))
-            };
-            let Some(range) = selected_range else {
-                continue;
-            };
             // Symbol-level test filtering (#1102): a declaration is treated as
             // a test symbol only when it is itself in a structurally-evidenced
             // test region, or lives under a test-tree path. The old whole-file
@@ -475,9 +455,49 @@ pub(super) fn search_symbols_with_cap(
                     &rel_path_string(candidate.code_unit.source()),
                     language_for_file(candidate.code_unit.source()),
                 );
-            if params.include_tests || !is_test {
-                filtered.push((candidate.code_unit, range, is_test, candidate.is_type_alias));
+            if !params.include_tests && is_test {
+                continue;
             }
+            // The persisted primary range is ordinal zero, which can be a C++
+            // prototype or forward declaration (#1650, #3297). Run the
+            // structured occurrence classifier only when persistence proves
+            // there is another physical occurrence to choose from. A single
+            // occurrence cannot be ambiguous, so its projected range is exact
+            // without hydrating and parsing the complete source file (#3310).
+            let is_cpp_identity_target = language_for_target(&candidate.code_unit) == Language::Cpp
+                && (candidate.code_unit.is_callable() || candidate.code_unit.is_class());
+            let selected_range = if is_cpp_identity_target
+                && candidate.has_multiple_ranges
+                && !candidate.all_ranges_are_definitions
+            {
+                if candidate.code_unit.is_callable()
+                    && !candidate.has_more_ranges
+                    && let (Some(primary), Some(secondary)) =
+                        (candidate.primary_range, candidate.secondary_range)
+                {
+                    cpp_identity
+                        .primary_range_from_projected_pair(
+                            analyzer,
+                            &candidate.code_unit,
+                            primary,
+                            secondary,
+                        )
+                        .or_else(|| cpp_identity.primary_range(analyzer, &candidate.code_unit))
+                        .or(candidate.primary_range)
+                } else {
+                    cpp_identity
+                        .primary_range(analyzer, &candidate.code_unit)
+                        .or(candidate.primary_range)
+                }
+            } else {
+                candidate
+                    .primary_range
+                    .or_else(|| primary_range(analyzer, &candidate.code_unit))
+            };
+            let Some(range) = selected_range else {
+                continue;
+            };
+            filtered.push((candidate.code_unit, range, is_test, candidate.is_type_alias));
         }
         filtered
     };

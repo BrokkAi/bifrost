@@ -3619,6 +3619,17 @@ pub struct SummaryFileProjection {
 pub struct SearchSymbolCandidate {
     pub code_unit: CodeUnit,
     pub primary_range: Option<Range>,
+    /// Whether the declaration has another persisted physical occurrence.
+    /// This lets consumers avoid loading every range merely to distinguish
+    /// the overwhelmingly common single-occurrence case.
+    pub has_multiple_ranges: bool,
+    /// The second persisted physical occurrence, when present.
+    pub secondary_range: Option<Range>,
+    /// Whether persisted occurrences continue beyond `secondary_range`.
+    pub has_more_ranges: bool,
+    /// Whether complete per-occurrence signature metadata proves that every
+    /// physical range is a callable definition rather than a prototype.
+    pub all_ranges_are_definitions: bool,
     /// Whether the persisted declaration represents a type alias. This keeps
     /// `search_symbols` rendering out of the complete file-state path.
     pub is_type_alias: bool,

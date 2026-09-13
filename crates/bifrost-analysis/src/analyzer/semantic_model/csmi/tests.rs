@@ -2275,3 +2275,68 @@ fn conditional_type_refinement_round_trip_retains_target_arguments() {
         );
     }
 }
+
+#[test]
+fn python_native_annotation_exports_the_standard_refinement_with_exact_identity() {
+    use crate::analyzer::semantic_model::TypeRef;
+    let artifact = CsmiArtifactEvidence::new(
+        "pkg:generic/python-runtime@3.12.0?component=stdlib&implementation=cpython",
+        "a".repeat(64),
+    );
+    let mut support = CsmiVocabularySupport::support(
+        CSMI_PYTHON_PROFILE_ID,
+        CSMI_PYTHON_PROFILE_VERSION,
+        CSMI_PYTHON_PROFILE_SCHEMA,
+    );
+    support.add(
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION,
+        CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_SCHEMA,
+    );
+    let portable =
+        logical_pack_from_semantic(include_bytes!("fixtures/python-runtime-refinement.json"));
+    let imported = import_logical_csmi_pack(&portable, &support, &CompilerOptions::default())
+        .expect("exact Python runtime pack imports");
+    assert_eq!(imported.pack.language, "python");
+    let original = imported.pack.shards[0]
+        .conditional_type_refinements
+        .clone()
+        .unwrap();
+    let mut native = imported.pack;
+    for shard in &mut native.shards {
+        shard.conditional_type_refinements = None;
+        if let AuthoredPayload::DeclarationFacts { members, .. } = &mut shard.payload {
+            for member in members {
+                member.signature.as_mut().unwrap().returns = Some(TypeRef::Named {
+                    name: "typing.TypeIs".to_owned(),
+                    arguments: vec![TypeRef::Named {
+                        name: "builtins.type".to_owned(),
+                        arguments: vec![TypeRef::Named {
+                            name: "builtins.object".to_owned(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        }],
+                        nullable: false,
+                    }],
+                    nullable: false,
+                });
+            }
+        }
+    }
+    let exported = export_authored_csmi_pack(&native, &artifact, &CsmiExportOptions::default())
+        .expect("native annotation exports through the standard profile");
+    let restored = import_logical_csmi_pack(&exported, &support, &CompilerOptions::default())
+        .expect("exported Python pack imports");
+    let restored_facts = restored.pack.shards[0]
+        .conditional_type_refinements
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        restored_facts.refinements[0].payload,
+        original.refinements[0].payload
+    );
+    assert_eq!(
+        restored_facts.refinements[0].coverage,
+        original.refinements[0].coverage
+    );
+}

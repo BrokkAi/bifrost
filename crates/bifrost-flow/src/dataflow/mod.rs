@@ -86,7 +86,7 @@ pub use reusable_summary::{
     SummaryCompleteness, SummaryCompositionError, SummaryCompositionRootFingerprint,
     SummaryConcurrencyAccessMode, SummaryConcurrencyAccessPath, SummaryConcurrencyAccessSelector,
     SummaryConcurrencyAtomicOperation, SummaryConcurrencyEffect, SummaryConcurrencyEffectKind,
-    SummaryConcurrencyExecution, SummaryConcurrencyExecutionCardinality,
+    SummaryConcurrencyExecution, SummaryConcurrencyExecutionCardinality, SummaryConcurrencyInteger,
     SummaryConcurrencyLockMode, SummaryConcurrencyLockOperation, SummaryConcurrencyLockRequirement,
     SummaryConcurrencySourceWitness, SummaryConcurrencySubjectIdentity,
     SummaryConcurrencySynchronizationOperation, SummaryConcurrencyTargetCoverage,

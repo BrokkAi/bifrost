@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v66";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v67";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -3724,9 +3724,9 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     /// Slice lengths and capacities proven directly by structured literals or
     /// builtin `make` arguments, retained only through exact slice operations.
     exact_slice_shapes: HashMap<ValueId, ExactSliceShape>,
-    /// Fresh array literals whose first binding establishes local storage
-    /// rather than copying an already-owned array value.
-    fresh_array_values: HashSet<ValueId>,
+    /// Fresh aggregate or converted values whose first binding consumes the
+    /// completed construction rather than copying an already-owned value.
+    fresh_binding_values: HashSet<ValueId>,
     /// Every `(struct type, field)` declaration this file states, shared by
     /// every procedure lowered from it.
     struct_field_anchors: &'tree HashMap<(usize, Box<str>), SourceAnchor>,
@@ -3953,7 +3953,7 @@ fn lower_procedure<'tree>(
         channel_payload_copies: HashMap::default(),
         channel_payload_types: HashMap::default(),
         exact_slice_shapes: HashMap::default(),
-        fresh_array_values: HashSet::default(),
+        fresh_binding_values: HashSet::default(),
         struct_field_anchors,
         field_locators: HashMap::default(),
         static_locations: HashMap::default(),
@@ -5083,13 +5083,68 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 Some(GoStorageKind::Slice | GoStorageKind::Map) => ValueFlowKind::BackingStore {
                     offset: BackingStoreOffset::Zero,
                 },
-                Some(GoStorageKind::Array) if !self.fresh_array_values.contains(&value) => {
+                Some(GoStorageKind::Array) if !self.fresh_binding_values.contains(&value) => {
                     // A Go array assignment duplicates the whole aggregate
                     // bitwise; no distinct operation runs.
                     ValueFlowKind::Transfer(ValueTransfer {
                         kind: TransferKind::AggregateCopy,
                         operation: TransferOperation::None,
                     })
+                }
+                None if !self.fresh_binding_values.contains(&value)
+                    && self.value_types.get(&value).is_some_and(|identity| {
+                        identity.pointer_depth == 0
+                            && (identity.declaration.is_some()
+                                || !is_predeclared_go_type(&identity.name))
+                    }) =>
+                {
+                    let identity = &self.value_types[&value];
+                    let definition = identity.declaration.and_then(|declaration| {
+                        self.named_type_definitions
+                            .get(&identity.name)?
+                            .iter()
+                            .find(|definition| definition.declaration == declaration)
+                    });
+                    let interface = definition.is_some_and(|definition| {
+                        go_file_underlying_type(
+                            definition.underlying,
+                            self.prepared.source(),
+                            self.named_type_definitions,
+                            definition.visible_from,
+                        )
+                        .is_some_and(|underlying| underlying.kind() == "interface_type")
+                    });
+                    let copy = definition.map_or(MemoryValueCopy::Unknown, |definition| {
+                        go_memory_value_copy_from_type(
+                            definition.underlying,
+                            self.prepared.source(),
+                            self.named_type_definitions,
+                            definition.visible_from,
+                        )
+                    });
+                    match copy {
+                        // Copying an interface descriptor preserves its boxed
+                        // payload relation. The wrapper remains separate from
+                        // the pointee through the explicit boxing edge.
+                        MemoryValueCopy::Unknown if interface => kind,
+                        MemoryValueCopy::Reference => kind,
+                        MemoryValueCopy::BackingStore { .. } => ValueFlowKind::BackingStore {
+                            offset: BackingStoreOffset::Zero,
+                        },
+                        MemoryValueCopy::Value | MemoryValueCopy::Unknown => {
+                            // A nominal binding copy is not an object alias.
+                            // Unknown representation preserves dependence and
+                            // runtime class, but cannot certify inline storage.
+                            ValueFlowKind::Transfer(ValueTransfer {
+                                kind: if copy == MemoryValueCopy::Value {
+                                    TransferKind::AggregateCopy
+                                } else {
+                                    TransferKind::Copy
+                                },
+                                operation: TransferOperation::None,
+                            })
+                        }
+                    }
                 }
                 Some(GoStorageKind::Array) | None => kind,
                 Some(GoStorageKind::Channel) => kind,
@@ -5106,6 +5161,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 target,
             },
         )?;
+        // The cell receives the post-transfer value. Storing the original
+        // source would bypass the copy's identity boundary through captures.
+        let stored_value = if matches!(kind, ValueFlowKind::Transfer(_)) {
+            target
+        } else {
+            value
+        };
         if let Some((location, kind)) = self.shared_binding_locations.get(&target).copied() {
             self.append_effect(
                 builder,
@@ -5113,7 +5175,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 SemanticEffect::MemoryStore {
                     kind,
                     location,
-                    value,
+                    value: stored_value,
                 },
             )?;
         }
@@ -5134,6 +5196,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         )?;
         self.session
             .append_language_defined_value_flows(builder, point, [source], converted)?;
+        self.fresh_binding_values.insert(converted);
         Ok(converted)
     }
 
@@ -5162,6 +5225,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 target: boxed,
             },
         )?;
+        self.fresh_binding_values.insert(boxed);
         Ok(boxed)
     }
 
@@ -5324,11 +5388,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
         if let Some(storage) = self.expression_storage_kind(node, node.start_byte()) {
             self.value_storage_kinds.insert(value, storage);
-            if storage == GoStorageKind::Array
-                && transparent_parenthesized_expression(node).kind() == "composite_literal"
-            {
-                self.fresh_array_values.insert(value);
-            }
+        }
+        if transparent_parenthesized_expression(node).kind() == "composite_literal" {
+            self.fresh_binding_values.insert(value);
         }
         let index_value_copy = self.expression_index_value_copy(node, node.start_byte());
         if index_value_copy != MemoryValueCopy::Unknown {
@@ -8162,7 +8224,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     if let Some(storage) = self.value_storage_kinds.get(&target).copied() {
                         self.value_storage_kinds.insert(zero, storage);
                         if storage == GoStorageKind::Array {
-                            self.fresh_array_values.insert(zero);
+                            self.fresh_binding_values.insert(zero);
                         }
                     }
                     if let Some(copy) = self.index_value_copies.get(&target).copied() {
@@ -18495,6 +18557,74 @@ func shadowed(make func([]int, int) []int) {
             shadowed.allocations.is_empty(),
             "a rebound make identifier must remain an ordinary call: {shadowed:#?}"
         );
+    }
+
+    #[test]
+    fn nominal_binding_copies_preserve_class_without_inventing_object_aliases() {
+        let procedures = lower_fixture(
+            r#"package main
+import "sync"
+type Cell struct{}
+type Ptr *Cell
+type Table map[string]Cell
+type Face interface{}
+type int struct{}
+func unknown() { original := sync.WaitGroup{}; copied := original; go func() { _ = copied }() }
+func value() { original := Cell{}; copied := original; go func() { _ = copied }() }
+func pointer() { var original Ptr = &Cell{}; copied := original; _ = copied }
+func descriptor() { original := Table{}; copied := original; _ = copied }
+func interfaceDescriptor() { var original Face = &Cell{}; copied := original; _ = copied }
+func shadowed() { original := int{}; copied := original; _ = copied }
+"#,
+        );
+        for (name, expected) in [
+            ("unknown", Some(TransferKind::Copy)),
+            ("value", Some(TransferKind::AggregateCopy)),
+            ("pointer", None),
+            ("descriptor", None),
+            ("interfaceDescriptor", None),
+            ("shadowed", Some(TransferKind::AggregateCopy)),
+        ] {
+            let procedure = named_procedure(&procedures, name);
+            let mut transfers = Vec::new();
+            for point in &procedure.points {
+                for (index, event) in point.events.iter().enumerate() {
+                    if let SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Transfer(transfer),
+                        source,
+                        target,
+                    } = event.effect
+                    {
+                        assert!(transfer.preserves_runtime_class(), "{name}: {transfer:?}");
+                        assert_eq!(transfer.operation, TransferOperation::None);
+                        assert!(
+                            index > 0
+                                && matches!(point.events[index - 1].effect,
+                            SemanticEffect::Assignment { target: assigned, value }
+                                if assigned == target && value == source),
+                            "{name}: {point:#?}"
+                        );
+                        transfers.push(transfer.kind);
+                        for location in &procedure.memory_locations {
+                            if matches!(location.kind, MemoryLocationKind::LexicalCell { binding } if binding == target)
+                            {
+                                assert!(
+                                    point.events.iter().any(|event| matches!(event.effect,
+                                    SemanticEffect::MemoryStore { location: stored, value, .. }
+                                        if stored == location.id && value == target)),
+                                    "{name}: captured cells must store the post-copy value: {point:#?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                transfers,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{name}: {procedure:#?}"
+            );
+        }
     }
 
     #[test]

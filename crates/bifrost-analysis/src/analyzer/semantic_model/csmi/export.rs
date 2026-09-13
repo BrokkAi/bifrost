@@ -119,6 +119,10 @@ pub fn export_csmi_pack(
         .map(|shard| decode_shard(&shard.descriptor, &shard.bytes, &DecodeLimits::default()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
+    if pack.manifest.language == "python" && decoded.iter().any(|shard| matches!(shard.payload(), CompiledPayload::DeclarationFacts { types, members, .. } if !types.is_empty() || !members.is_empty())) {
+        let (semantic, provenance) = super::python::export_document(&pack.manifest, &decoded, artifact, options)?;
+        return logical_pack(semantic, provenance, &pack.manifest.license, options);
+    }
     let (semantic, provenance) = export_semantic_document(
         &pack.manifest.producer,
         &pack.manifest.provenance,
@@ -358,12 +362,14 @@ fn export_semantic_document<'a>(
             category: CsmiDeclarationCategory::Callable,
             owner: Some(owner_id.clone()),
             generic_parameters: Vec::new(),
-            callable: Some(callable_shape(
-                fact,
-                &type_names_by_id,
-                &symbol_by_bifrost_id,
-                !cpp_keys.is_empty(),
-            )?),
+            callable: Some(callable_shape(fact, &|value| {
+                core_type_expression(
+                    value,
+                    &type_names_by_id,
+                    &symbol_by_bifrost_id,
+                    !cpp_keys.is_empty(),
+                )
+            })?),
             alias_target: None,
             provenance: vec![options.provenance_id.clone()],
             extensions: Vec::new(),
@@ -924,13 +930,24 @@ fn export_semantic_document<'a>(
     retained_runtime_provenance.extend(
         extension_facts
             .iter()
-            .filter(|fact| fact.vocabulary == CSMI_COLLECTION_FLOW_PROFILE_ID)
+            .filter(|fact| {
+                matches!(
+                    fact.vocabulary.as_str(),
+                    CSMI_COLLECTION_FLOW_PROFILE_ID | CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID
+                )
+            })
             .flat_map(|fact| fact.provenance.iter())
             .chain(
                 completeness_statements
                     .iter()
                     .filter(|statement| {
-                        statement.vocabulary.as_deref() == Some(CSMI_COLLECTION_FLOW_PROFILE_ID)
+                        matches!(
+                            statement.vocabulary.as_deref(),
+                            Some(
+                                CSMI_COLLECTION_FLOW_PROFILE_ID
+                                    | CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID
+                            )
+                        )
                     })
                     .flat_map(|statement| statement.provenance.iter()),
             )
@@ -1080,6 +1097,11 @@ fn logical_pack(
         .map_err(|error| CsmiExportError::Canonical(error.to_string()))?;
     let mut support = CsmiVocabularySupport::empty();
     support.add(
+        CSMI_PYTHON_PROFILE_ID,
+        CSMI_PYTHON_PROFILE_VERSION,
+        CSMI_PYTHON_PROFILE_SCHEMA,
+    );
+    support.add(
         CSMI_VALUE_TRANSFER_PROFILE_ID,
         CSMI_VALUE_TRANSFER_PROFILE_VERSION,
         CSMI_VALUE_TRANSFER_PROFILE_SCHEMA,
@@ -1186,7 +1208,7 @@ fn export_collection_flows(
     Ok(())
 }
 
-fn export_conditional_type_refinements(
+pub(super) fn export_conditional_type_refinements(
     refinements: &ConditionalTypeRefinementsPayload,
     options: &CsmiExportOptions,
     symbols: &HashMap<String, String>,
@@ -1207,7 +1229,11 @@ fn export_conditional_type_refinements(
                 })
         })?;
         let scope = json!({"callable": payload.callable, "subject": payload.subject});
-        let provenance = vec![options.provenance_id.clone()];
+        let provenance = if refinement.provenance.is_empty() {
+            vec![options.provenance_id.clone()]
+        } else {
+            refinement.provenance.clone()
+        };
         facts.push(CsmiExtensionFact {
             vocabulary: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_ID.to_owned(),
             version: CSMI_CONDITIONAL_TYPE_REFINEMENT_PROFILE_VERSION.to_owned(),
@@ -2117,11 +2143,9 @@ pub(crate) fn csmi_cpp_signature(
     })
 }
 
-fn callable_shape(
+pub(super) fn callable_shape(
     member: &MemberFact,
-    type_names_by_id: &HashMap<String, String>,
-    symbol_by_bifrost_id: &HashMap<String, String>,
-    cpp_identity: bool,
+    resolve_type: &dyn Fn(&TypeRef) -> Result<CsmiTypeExpression, CsmiExportError>,
 ) -> Result<CsmiCallableShape, CsmiExportError> {
     let signature = member
         .signature
@@ -2146,12 +2170,7 @@ fn callable_shape(
             } else {
                 CsmiReceiverKind::Instance
             },
-            receiver_type: Some(core_type_expression(
-                receiver_type,
-                type_names_by_id,
-                symbol_by_bifrost_id,
-                cpp_identity,
-            )?),
+            receiver_type: Some(resolve_type(receiver_type)?),
             extensions: Vec::new(),
         })
     } else {
@@ -2163,7 +2182,13 @@ fn callable_shape(
         .enumerate()
         .map(|(position, parameter)| {
             let binding = if parameter.variadic {
-                CsmiParameterBinding::VariadicPositional
+                if parameter.passing_mode
+                    == crate::analyzer::semantic_model::ParameterPassingMode::NamedOnly
+                {
+                    CsmiParameterBinding::VariadicNamed
+                } else {
+                    CsmiParameterBinding::VariadicPositional
+                }
             } else {
                 match parameter.passing_mode {
                     crate::analyzer::semantic_model::ParameterPassingMode::PositionalOnly => {
@@ -2177,12 +2202,7 @@ fn callable_shape(
                     }
                 }
             };
-            let parameter_type = core_type_expression(
-                &parameter.r#type,
-                type_names_by_id,
-                symbol_by_bifrost_id,
-                cpp_identity,
-            )?;
+            let parameter_type = resolve_type(&parameter.r#type)?;
             Ok(CsmiParameter {
                 position: position as u32,
                 binding,
@@ -2202,19 +2222,15 @@ fn callable_shape(
             Ok(CsmiResult {
                 position: position as u32,
                 label: None,
-                result_type: Some(core_type_expression(
-                    result,
-                    type_names_by_id,
-                    symbol_by_bifrost_id,
-                    cpp_identity,
-                )?),
+                result_type: Some(resolve_type(result)?),
                 extensions: Vec::new(),
             })
         })
         .collect::<Result<Vec<_>, CsmiExportError>>()?;
     let kind = match member.member_kind {
         MemberKind::Constructor => CsmiCallableKind::Constructor,
-        MemberKind::Method | MemberKind::Function | MemberKind::Static => CsmiCallableKind::Method,
+        MemberKind::Function => CsmiCallableKind::Function,
+        MemberKind::Method | MemberKind::Static => CsmiCallableKind::Method,
         MemberKind::Property
         | MemberKind::Macro
         | MemberKind::Event

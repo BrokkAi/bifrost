@@ -8,6 +8,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const CSMI_PYTHON_PROFILE_ID: &str = "csmi.python";
+pub const CSMI_PYTHON_PROFILE_VERSION: &str = "0.1.0";
+pub const CSMI_PYTHON_PROFILE_SCHEMA: &str =
+    "https://csmi.brokk.ai/schema/profiles/python/0.1/schema.json";
+
 pub const CSMI_SCHEMA_URI: &str = "https://csmi.brokk.ai/schema/0.1/schema.json";
 pub const CSMI_SEMANTIC_MODEL_VERSION: &str = "0.1";
 pub const CSMI_SERIALIZATION_VERSION: &str = "0.1-json";
@@ -1113,7 +1118,7 @@ pub struct CsmiProvenanceInput {
     pub semantic_document_digest: Option<CsmiContentDigest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CsmiArtifactSelector {
     pub purl: String,
@@ -1127,7 +1132,7 @@ pub struct CsmiArtifactSelector {
     pub digests: Vec<CsmiArtifactDigest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CsmiArtifactDigest {
     pub algorithm: CsmiDigestAlgorithm,
@@ -1137,7 +1142,7 @@ pub struct CsmiArtifactDigest {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum CsmiDigestAlgorithm {
     #[serde(rename = "sha-256")]
     Sha256,
@@ -1166,6 +1171,18 @@ pub struct CsmiCompatibilityConstraint {
     pub vocabulary: String,
     pub version: String,
     pub value: CsmiJson,
+}
+
+/// Effective portable identity of one declaration, independent of its local
+/// handle and display metadata. Native interchange locators retain this key
+/// so an exporter never reconstructs ownership from a rendered name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CsmiPortableSymbolIdentity {
+    pub artifact_selectors: Vec<CsmiArtifactSelector>,
+    pub scheme: String,
+    pub scheme_version: String,
+    pub descriptors: Vec<CsmiDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1239,7 +1256,7 @@ pub enum CsmiSymbolOrigin {
     Local,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CsmiDescriptor {
     pub role: CsmiDescriptorRole,
@@ -1249,7 +1266,7 @@ pub struct CsmiDescriptor {
     pub disambiguator: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum CsmiDescriptorRole {
     Namespace,

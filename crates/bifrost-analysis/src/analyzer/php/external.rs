@@ -768,7 +768,8 @@ fn merge_type(
 fn locator_path(locator: &crate::analyzer::semantic_model::Locator) -> String {
     match locator {
         crate::analyzer::semantic_model::Locator::Source { path, .. }
-        | crate::analyzer::semantic_model::Locator::Artifact { path, .. } => path.clone(),
+        | crate::analyzer::semantic_model::Locator::Artifact { path, .. }
+        | crate::analyzer::semantic_model::Locator::Interchange { path, .. } => path.clone(),
     }
 }
 

@@ -252,7 +252,26 @@ fn import_semantic_document(
         && model.symbols.iter().all(|symbol| {
             symbol.scheme == JVM_IDENTITY_SCHEME && symbol.scheme_version == JVM_IDENTITY_VERSION
         });
-    if !cpp_identity && !jvm_identity && !runtime_only {
+    let python_identity = !runtime_only
+        && !model.symbols.is_empty()
+        && model.symbols.iter().all(|symbol| {
+            symbol.scheme == CSMI_PYTHON_PROFILE_ID
+                && symbol.scheme_version == CSMI_PYTHON_PROFILE_VERSION
+        });
+    if python_identity {
+        if requested_language.is_some_and(|language| language != "python") {
+            return Err(CsmiImportError::Unsupported {
+                path: "semanticModels[0]".to_owned(),
+                semantic: "Python declaration identities cannot activate as another language"
+                    .to_owned(),
+            });
+        }
+        super::python::validate_model(model).map_err(|semantic| CsmiImportError::Unsupported {
+            path: "semanticModels[0]".to_owned(),
+            semantic,
+        })?;
+    }
+    if !cpp_identity && !jvm_identity && !python_identity && !runtime_only {
         return Err(CsmiImportError::Unsupported {
             path: "symbols".to_owned(),
             semantic: "all symbols must use one supported exact identity scheme".to_owned(),
@@ -278,12 +297,42 @@ fn import_semantic_document(
     } else {
         HashMap::new()
     };
+    let python_keys = if python_identity {
+        model
+            .symbols
+            .iter()
+            .map(|symbol| {
+                Ok((
+                    symbol.id.clone(),
+                    super::python::identity_from_symbol(symbol, &model.artifact_selectors)
+                        .map_err(CsmiImportError::Identity)?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, CsmiImportError>>()?
+    } else {
+        HashMap::new()
+    };
     let mut symbols = HashMap::new();
     let mut types = Vec::new();
     let mut type_ids = HashMap::new();
     for symbol in &model.symbols {
-        if let Some(name) = type_name(symbol) {
-            let native_id = if cpp_identity {
+        let name = if let Some(key) = python_keys.get(&symbol.id) {
+            key.descriptors
+                .last()
+                .filter(|descriptor| {
+                    matches!(
+                        descriptor.role,
+                        CsmiDescriptorRole::Namespace | CsmiDescriptorRole::Type
+                    )
+                })
+                .map(|_| super::python::qualified_name(key))
+        } else {
+            type_name(symbol)
+        };
+        if let Some(name) = name {
+            let native_id = if let Some(key) = python_keys.get(&symbol.id) {
+                super::python::native_id(key)
+            } else if cpp_identity {
                 cpp_native_ids[&symbol.id].clone()
             } else {
                 type_symbol_id(&name)
@@ -294,10 +343,11 @@ fn import_semantic_document(
         }
     }
     for declaration in &model.declarations {
-        if !matches!(
+        if !(matches!(
             declaration.category,
             CsmiDeclarationCategory::Type | CsmiDeclarationCategory::TypeAlias
-        ) {
+        ) || (python_identity && declaration.category == CsmiDeclarationCategory::Namespace))
+        {
             continue;
         }
         let Some(symbol) = model
@@ -310,8 +360,11 @@ fn import_semantic_document(
                 declaration.symbol
             )));
         };
-        let name = type_name(symbol).ok_or_else(|| {
-            CsmiImportError::Identity(format!("symbol {} has no JVM type descriptor", symbol.id))
+        let name = symbols.get(&symbol.id).cloned().ok_or_else(|| {
+            CsmiImportError::Identity(format!(
+                "symbol {} has no supported declaration descriptor",
+                symbol.id
+            ))
         })?;
         let id = type_ids
             .get(&symbol.id)
@@ -321,7 +374,11 @@ fn import_semantic_document(
             ambient_use: None,
             id: id.clone(),
             name: name.clone(),
-            type_kind: if declaration.category == CsmiDeclarationCategory::TypeAlias {
+            type_kind: if python_identity
+                && declaration.category == CsmiDeclarationCategory::Namespace
+            {
+                TypeKind::Module
+            } else if declaration.category == CsmiDeclarationCategory::TypeAlias {
                 TypeKind::TypeAlias
             } else {
                 TypeKind::Class
@@ -339,9 +396,17 @@ fn import_semantic_document(
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
             guard: None,
-            locator: Locator::Artifact {
-                path: format!("csmi/{pack_digest}.json"),
-                symbol: name,
+            locator: if let Some(key) = python_keys.get(&symbol.id) {
+                Locator::Interchange {
+                    path: format!("csmi/{pack_digest}.json"),
+                    symbol: symbol.id.clone(),
+                    identity: Box::new(key.clone()),
+                }
+            } else {
+                Locator::Artifact {
+                    path: format!("csmi/{pack_digest}.json"),
+                    symbol: name,
+                }
             },
         });
     }
@@ -385,7 +450,9 @@ fn import_semantic_document(
             .unwrap_or_else(|| {
                 type_symbol_id(&owner_name).unwrap_or_else(|_| owner_symbol.clone())
             });
-        let member_id = if cpp_identity {
+        let member_id = if let Some(key) = python_keys.get(&declaration.symbol) {
+            super::python::native_id(key)
+        } else if cpp_identity {
             cpp_native_ids[&declaration.symbol].clone()
         } else {
             format!("member.{}", sha256_hex(declaration.symbol.as_bytes()))
@@ -434,9 +501,17 @@ fn import_semantic_document(
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             guard: None,
-            locator: Locator::Artifact {
-                path: format!("csmi/{pack_digest}.json"),
-                symbol: symbol.id.clone(),
+            locator: if let Some(key) = python_keys.get(&symbol.id) {
+                Locator::Interchange {
+                    path: format!("csmi/{pack_digest}.json"),
+                    symbol: symbol.id.clone(),
+                    identity: Box::new(key.clone()),
+                }
+            } else {
+                Locator::Artifact {
+                    path: format!("csmi/{pack_digest}.json"),
+                    symbol: symbol.id.clone(),
+                }
             },
         });
     }
@@ -461,13 +536,17 @@ fn import_semantic_document(
                 && statement.vocabulary.is_none()
                 && statement.version.is_none()
                 && statement.scope.get("scheme").and_then(Value::as_str)
-                    == Some(if cpp_identity {
+                    == Some(if python_identity {
+                        CSMI_PYTHON_PROFILE_ID
+                    } else if cpp_identity {
                         CSMI_CPP_DECLARATION_IDENTITY_SCHEME
                     } else {
                         JVM_IDENTITY_SCHEME
                     })
                 && statement.scope.get("schemeVersion").and_then(Value::as_str)
-                    == Some(if cpp_identity {
+                    == Some(if python_identity {
+                        CSMI_PYTHON_PROFILE_VERSION
+                    } else if cpp_identity {
                         CSMI_CPP_DECLARATION_IDENTITY_SCHEME_VERSION
                     } else {
                         JVM_IDENTITY_VERSION
@@ -543,7 +622,9 @@ fn import_semantic_document(
         .as_ref()
         .map(|payload| runtime_pack_identity(payload, requested_language))
         .transpose()?;
-    let declaration_identity = if cpp_identity {
+    let declaration_identity = if python_identity {
+        Some(("python".to_owned(), "python".to_owned()))
+    } else if cpp_identity {
         Some(("cpp".to_owned(), "cpp-headers".to_owned()))
     } else if jvm_identity {
         Some(("java".to_owned(), "maven".to_owned()))

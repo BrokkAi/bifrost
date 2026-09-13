@@ -431,6 +431,48 @@ impl CppIdentityRenderCache {
         primary_range_with_cpp_classifier(analyzer, unit, classifier)
     }
 
+    pub(super) fn primary_range_from_projected_pair(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        primary: Range,
+        secondary: Range,
+    ) -> Option<Range> {
+        let content = analyzer.indexed_source(unit.source())?;
+        let start = primary.start_byte.min(secondary.start_byte);
+        let end = primary.end_byte.max(secondary.end_byte);
+        let slice = content.get(start..end)?;
+        let prefix = "namespace bifrost_search_range {\n";
+        let local_source = format!("{prefix}{slice}\n}}");
+        let classifier = crate::analyzer::CppOccurrenceClassifier::new(&local_source)?;
+        let adjusted = |range: Range| -> Option<Range> {
+            Some(Range {
+                start_byte: prefix
+                    .len()
+                    .checked_add(range.start_byte.checked_sub(start)?)?,
+                end_byte: prefix
+                    .len()
+                    .checked_add(range.end_byte.checked_sub(start)?)?,
+                start_line: range.start_line,
+                end_line: range.end_line,
+            })
+        };
+        let mut definitions = [primary, secondary].into_iter().filter(|range| {
+            adjusted(*range).is_some_and(|adjusted| {
+                classifier.classify(unit, &adjusted)
+                    == crate::analyzer::CppOccurrenceRole::Definition
+            })
+        });
+        let selected = definitions.next()?;
+        Some(definitions.fold(selected, |earliest, range| {
+            if (range.start_line, range.start_byte) < (earliest.start_line, earliest.start_byte) {
+                range
+            } else {
+                earliest
+            }
+        }))
+    }
+
     /// The physical declaration ranges to render for `unit`. A C++ class with
     /// a forward declaration above its definition carries both as declaration
     /// ranges (#3297); the definition is the one `get_symbol_sources` renders,

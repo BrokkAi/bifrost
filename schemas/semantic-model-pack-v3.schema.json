@@ -2180,12 +2180,137 @@
         "volatile"
       ]
     },
+    "CsmiArtifactDigest": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/CsmiDigestAlgorithm"
+        },
+        "canonicalization": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "coverage",
+        "value"
+      ]
+    },
+    "CsmiArtifactSelector": {
+      "type": "object",
+      "properties": {
+        "digests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiArtifactDigest"
+          }
+        },
+        "purl": {
+          "type": "string"
+        },
+        "versionRange": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "purl"
+      ]
+    },
     "CsmiCoverageStatus": {
       "type": "string",
       "enum": [
         "unknown",
         "partial",
         "complete"
+      ]
+    },
+    "CsmiDescriptor": {
+      "type": "object",
+      "properties": {
+        "disambiguator": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/CsmiDescriptorRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role"
+      ]
+    },
+    "CsmiDescriptorRole": {
+      "type": "string",
+      "enum": [
+        "namespace",
+        "type",
+        "term",
+        "callable",
+        "type-parameter",
+        "value-parameter",
+        "meta"
+      ]
+    },
+    "CsmiDigestAlgorithm": {
+      "type": "string",
+      "enum": [
+        "sha-256",
+        "sha-384",
+        "sha-512"
+      ]
+    },
+    "CsmiPortableSymbolIdentity": {
+      "description": "Effective portable identity of one declaration, independent of its local\nhandle and display metadata. Native interchange locators retain this key\nso an exporter never reconstructs ownership from a rendered name.",
+      "type": "object",
+      "properties": {
+        "artifactSelectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiArtifactSelector"
+          }
+        },
+        "descriptors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CsmiDescriptor"
+          }
+        },
+        "scheme": {
+          "type": "string"
+        },
+        "schemeVersion": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifactSelectors",
+        "scheme",
+        "schemeVersion",
+        "descriptors"
       ]
     },
     "DeclarationGuard": {
@@ -2813,6 +2938,32 @@
             "kind",
             "path",
             "symbol"
+          ]
+        },
+        {
+          "description": "The path and local symbol locate the imported declaration. Only the\nstructured identity carries its portable artifact and ownership key.",
+          "type": "object",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/CsmiPortableSymbolIdentity"
+            },
+            "kind": {
+              "type": "string",
+              "const": "interchange"
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path",
+            "symbol",
+            "identity"
           ]
         }
       ]

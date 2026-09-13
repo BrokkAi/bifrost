@@ -79,7 +79,7 @@ use super::{
     solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v15";
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v18";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_PUBLICATION_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-publication-behavior-v1";
@@ -1725,6 +1725,9 @@ fn project_modeled_call_effects(
         let subject = match &effect {
             ResolvedConcurrencyEffect::LockAcquire { lock, .. }
             | ResolvedConcurrencyEffect::LockRelease { lock, .. } => lock,
+            ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
+            | ResolvedConcurrencyEffect::WaitGroupDone { group }
+            | ResolvedConcurrencyEffect::WaitGroupWait { group } => group,
             ResolvedConcurrencyEffect::Atomic { location, .. }
                 if location.identity == ConcurrencySubjectIdentity::Value =>
             {
@@ -1732,8 +1735,13 @@ fn project_modeled_call_effects(
             }
             _ => return Ok(()),
         };
-        let DirectConcurrencyPath::Boundary(path) =
-            direct_concurrency_value_path(procedure, subject.value)
+        let DirectConcurrencyPath::Boundary(path) = direct_concurrency_modeled_subject_path(
+            procedure,
+            call,
+            subject.value,
+            provider,
+            request,
+        )?
         else {
             return Ok(());
         };
@@ -1742,6 +1750,28 @@ fn project_modeled_call_effects(
             ConcurrencySubjectIdentity::Backing => SummaryConcurrencySubjectIdentity::Backing,
         };
         let kind = match effect {
+            ResolvedConcurrencyEffect::WaitGroupAdd { delta, .. } => {
+                SummaryConcurrencyEffectKind::WaitGroupAdd {
+                    group: path,
+                    identity,
+                    delta: delta.map_or(
+                        crate::dataflow::SummaryConcurrencyInteger::Unknown,
+                        crate::dataflow::SummaryConcurrencyInteger::Constant,
+                    ),
+                }
+            }
+            ResolvedConcurrencyEffect::WaitGroupDone { .. } => {
+                SummaryConcurrencyEffectKind::WaitGroupDone {
+                    group: path,
+                    identity,
+                }
+            }
+            ResolvedConcurrencyEffect::WaitGroupWait { .. } => {
+                SummaryConcurrencyEffectKind::WaitGroupWait {
+                    group: path,
+                    identity,
+                }
+            }
             ResolvedConcurrencyEffect::LockAcquire { mode, .. }
             | ResolvedConcurrencyEffect::LockRelease { mode, .. } => {
                 SummaryConcurrencyEffectKind::Lock {
@@ -1774,7 +1804,7 @@ fn project_modeled_call_effects(
                     },
                 }
             }
-            _ => unreachable!("only locks and value-identity atomics passed subject selection"),
+            _ => unreachable!("only supported modeled effects passed subject selection"),
         };
         if stable.contains(&kind) {
             return Ok(());
@@ -2169,6 +2199,144 @@ pub(crate) fn direct_concurrency_value_path(
     direct_concurrency_path_from(procedure, DirectPathCursor::Value(value))
 }
 
+pub(crate) fn direct_concurrency_modeled_subject_path(
+    procedure: &ProcedureHandle,
+    call: &SemanticCallSite,
+    subject: ValueId,
+    provider: &dyn ConcurrencyProvider,
+    request: &mut SemanticRequest<'_>,
+) -> Result<DirectConcurrencyPath, ProductionSummaryProjectionError> {
+    let direct = direct_concurrency_value_path(procedure, subject);
+    if matches!(direct, DirectConcurrencyPath::Boundary(_)) {
+        return Ok(direct);
+    }
+    let semantics = procedure.semantics();
+    let mut before_point = call.point;
+    let mut before_index = semantics
+        .point(call.point)
+        .expect("validated call retains its point")
+        .events
+        .iter()
+        .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
+        .expect("validated call retains its invocation event");
+    let mut cursor = DirectPathCursor::Value(subject);
+    let mut visited = crate::hash::HashSet::default();
+    while visited.insert(cursor.clone()) {
+        let mut predecessors = Vec::new();
+        let mut terminal_allocation = None;
+        for point in semantics.points() {
+            for (event_index, event) in point.events.iter().enumerate() {
+                let predecessor = match (&cursor, &event.effect) {
+                    (DirectPathCursor::Value(value), SemanticEffect::Allocation { allocation })
+                        if semantics
+                            .allocation(*allocation)
+                            .is_some_and(|row| row.result == *value) =>
+                    {
+                        if provider.allocation_binds_by_reference(procedure, *allocation)
+                            != Some(true)
+                        {
+                            return Ok(direct);
+                        }
+                        None
+                    }
+                    (
+                        DirectPathCursor::Value(value),
+                        SemanticEffect::ValueFlow {
+                            target,
+                            source,
+                            kind,
+                        },
+                    ) if target == value => {
+                        // Dependence through a copy, view, computation, or wrapper
+                        // is insufficient for this reference-object certificate.
+                        if *kind != ValueFlowKind::Local {
+                            return Ok(direct);
+                        }
+                        Some(DirectPathCursor::Value(*source))
+                    }
+                    (
+                        DirectPathCursor::Value(value),
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    ) if target == value => Some(DirectPathCursor::Value(*source)),
+                    (
+                        DirectPathCursor::Value(value),
+                        SemanticEffect::MemoryLoad {
+                            result, location, ..
+                        },
+                    ) if result == value => Some(DirectPathCursor::Location(*location)),
+                    (
+                        DirectPathCursor::Location(location),
+                        SemanticEffect::MemoryStore {
+                            location: target,
+                            value,
+                            ..
+                        },
+                    ) if target == location => Some(DirectPathCursor::Value(*value)),
+                    _ => continue,
+                };
+                let evidence = semantics
+                    .evidence_row(event.evidence)
+                    .expect("validated modeled subject retains evidence");
+                let before = if point.id == before_point {
+                    event_index < before_index
+                } else {
+                    production_point_dominates(procedure, point.id, before_point, request)?
+                };
+                if evidence.proof != ProofStatus::Proven
+                    || evidence.completeness != EvidenceCompleteness::Complete
+                    || !before
+                {
+                    return Ok(direct);
+                }
+                if let Some(predecessor) = predecessor {
+                    predecessors.push((predecessor, point.id, event_index));
+                } else if let SemanticEffect::Allocation { allocation } = event.effect {
+                    terminal_allocation = Some(allocation);
+                }
+            }
+        }
+        if let Some(allocation) = terminal_allocation {
+            return Ok(if predecessors.is_empty() {
+                DirectConcurrencyPath::Boundary(crate::concurrency::source_allocation_summary_path(
+                    procedure, allocation,
+                ))
+            } else {
+                direct
+            });
+        }
+        if let DirectPathCursor::Location(location) = cursor {
+            let MemoryLocationKind::LexicalCell { binding } = semantics
+                .memory_location(location)
+                .expect("validated modeled load retains its location")
+                .kind
+            else {
+                return Ok(direct);
+            };
+            if predecessors.is_empty() {
+                cursor = DirectPathCursor::Value(binding);
+                continue;
+            }
+        }
+        let Some((predecessor, point, index)) = predecessors.first() else {
+            return Ok(direct);
+        };
+        // Assignment and its matching Local row describe one definition.
+        // Multiple definition points or different sources cannot certify it.
+        if predecessors.iter().any(|(candidate, candidate_point, _)| {
+            candidate != predecessor || candidate_point != point
+        }) {
+            return Ok(direct);
+        }
+        before_point = *point;
+        before_index = *index;
+        cursor = predecessor.clone();
+    }
+    Ok(direct)
+}
+
 fn direct_concurrency_synchronization_path(
     procedure: &ProcedureHandle,
     point: ProgramPointId,
@@ -2422,7 +2590,22 @@ fn direct_concurrency_path_from(
                         let predecessor = match event.effect {
                             SemanticEffect::MemoryLoad {
                                 location, result, ..
-                            } if result == value => Some(DirectPathCursor::Location(location)),
+                            } if result == value => {
+                                let location_row = semantics
+                                    .memory_location(location)
+                                    .expect("validated load retains its location");
+                                Some(match location_row.kind {
+                                    // A load observes the binding's value, not the
+                                    // lexical cell's storage. Only an unchanged
+                                    // binding can supply one stable value path.
+                                    MemoryLocationKind::LexicalCell { binding }
+                                        if !direct_value_is_reassigned(semantics, binding) =>
+                                    {
+                                        DirectPathCursor::Value(binding)
+                                    }
+                                    _ => DirectPathCursor::Location(location),
+                                })
+                            }
                             SemanticEffect::ValueFlow {
                                 source,
                                 target,
@@ -2465,6 +2648,30 @@ fn direct_summary_port(
     }
 }
 
+fn direct_value_is_reassigned(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    value: ValueId,
+) -> bool {
+    semantics
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .any(|event| match event.effect {
+            SemanticEffect::Assignment { target, .. } => target == value,
+            SemanticEffect::MemoryStore { location, .. } => semantics
+                .memory_location(location)
+                .is_some_and(|location| match location.kind {
+                    MemoryLocationKind::LexicalCell { binding } => binding == value,
+                    MemoryLocationKind::Capture {
+                        binding: Some(binding),
+                        ..
+                    } => binding == value,
+                    _ => false,
+                }),
+            _ => false,
+        })
+}
+
 /// The exact boundary or literal source of one immutable scalar snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectScalarSource {
@@ -2490,24 +2697,7 @@ pub(crate) fn direct_scalar_source(
         if !visited.insert(value) {
             return None;
         }
-        let reassigned = semantics
-            .points()
-            .iter()
-            .flat_map(|point| &point.events)
-            .any(|event| match event.effect {
-                SemanticEffect::Assignment { target, .. } => target == value,
-                SemanticEffect::MemoryStore { location, .. } => semantics
-                    .memory_location(location)
-                    .is_some_and(|location| match location.kind {
-                        MemoryLocationKind::LexicalCell { binding } => binding == value,
-                        MemoryLocationKind::Capture {
-                            binding: Some(binding),
-                            ..
-                        } => binding == value,
-                        _ => false,
-                    }),
-                _ => false,
-            });
+        let reassigned = direct_value_is_reassigned(semantics, value);
         if reassigned {
             return None;
         }
