@@ -24,7 +24,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v70";
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v73";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -95,18 +95,21 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
         };
 
         let import_bindings = go_import_bindings(prepared.tree().root_node(), prepared.source());
-        let package_functions = specs
-            .iter()
-            .filter(|spec| {
-                spec.lexical_parent.is_none() && spec.callable.kind() == "function_declaration"
-            })
-            .filter_map(|spec| {
-                spec.callable
-                    .child_by_field_name("name")
-                    .and_then(|name| nonempty_node_text(prepared.source(), name))
-                    .map(|name| (Box::<str>::from(name), spec.callable))
-            })
-            .collect::<HashMap<_, _>>();
+        let mut package_functions = HashMap::<Box<str>, Option<(ProcedureId, Node<'_>)>>::default();
+        for spec in specs.iter().filter(|spec| {
+            spec.lexical_parent.is_none() && spec.callable.kind() == "function_declaration"
+        }) {
+            if let Some(name) = spec
+                .callable
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(prepared.source(), name))
+            {
+                package_functions
+                    .entry(name.into())
+                    .and_modify(|target| *target = None)
+                    .or_insert(Some((spec.id, spec.callable)));
+            }
+        }
         let procedure_targets = specs
             .iter()
             .map(|spec| {
@@ -784,6 +787,265 @@ struct ProcedureEnumerationFrame<'tree> {
     direct_struct_owner: Option<Node<'tree>>,
     named_result_owner: Option<ProcedureId>,
     entry_precharged: bool,
+}
+
+/// Query assertion compatibility against the workspace's exact current source.
+/// Source acquisition and semantic work are charged to `request` here.
+pub fn workspace_reference_assertion_accepts_payload(
+    workspace: &crate::analyzer::WorkspaceAnalyzer,
+    assertion: &ValueHandle,
+    payload: &ValueHandle,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SemanticOutcome<bool>, SemanticProviderError> {
+    use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope, resolve_analyzer};
+
+    let unknown = || SemanticOutcome::Unknown {
+        partial: None,
+        work: SemanticWork::default(),
+    };
+    if request.cancellation.is_cancelled() {
+        return Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: SemanticWork::default(),
+        });
+    }
+    if assertion.procedure().artifact().key() != payload.procedure().artifact().key() {
+        return Ok(unknown());
+    }
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(workspace.analyzer()) else {
+        return Ok(unknown());
+    };
+    let span = |handle: &ValueHandle| {
+        let semantics = handle.procedure().semantics();
+        let value = semantics
+            .value(handle.id())
+            .expect("validated value handle");
+        let mapping = semantics.source_mapping(value.source)?;
+        let span = mapping.locator.anchor().span();
+        Some(span.start_byte() as usize..span.end_byte() as usize)
+    };
+    let (Some(assertion_span), Some(payload_span)) = (span(assertion), span(payload)) else {
+        return Ok(unknown());
+    };
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let limit = request.budget.remaining().source_bytes;
+    let Some((file, source)) =
+        crate::analyzer::semantic::workspace_oracle::exact_source_for_procedure(
+            workspace,
+            assertion.procedure(),
+            limit,
+        )?
+    else {
+        let work = SemanticWork {
+            source_bytes: limit.saturating_add(1),
+            ..SemanticWork::default()
+        };
+        let exceeded = request
+            .budget
+            .check(work)
+            .expect_err("source limit exceeded");
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work,
+        });
+    };
+    let source_work = SemanticWork {
+        source_bytes: source.len(),
+        ..SemanticWork::default()
+    };
+    request
+        .budget
+        .charge(source_work)
+        .expect("bounded exact source fits its budget");
+    let prepared = match go.inner.prepared_syntax_limited_cancellable(
+        scope.token(),
+        &file,
+        source.len(),
+        Some(request.cancellation),
+    ) {
+        PreparedSyntaxLimitedOutcome::Available(_, prepared)
+            if prepared.source() == source.as_ref() =>
+        {
+            prepared
+        }
+        PreparedSyntaxLimitedOutcome::Cancelled => {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: source_work,
+            });
+        }
+        // A changed or unavailable snapshot supplies no type certificate.
+        _ => {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work: source_work,
+            });
+        }
+    };
+    let mut outcome = reference_assertion_payload_type_is_exact(
+        &file,
+        &prepared,
+        assertion_span,
+        payload_span,
+        request.budget,
+        request.cancellation,
+    )?;
+    if let Err(exceeded) = request.budget.charge(outcome.work()) {
+        return Ok(SemanticOutcome::ExceededBudget {
+            partial: None,
+            exceeded,
+            work: source_work.conservative_add(outcome.work()),
+        });
+    }
+    let work = match &mut outcome {
+        SemanticOutcome::Complete { work, .. }
+        | SemanticOutcome::Ambiguous { work, .. }
+        | SemanticOutcome::Unknown { work, .. }
+        | SemanticOutcome::Unsupported { work, .. }
+        | SemanticOutcome::Unproven { work, .. }
+        | SemanticOutcome::ExceededBudget { work, .. }
+        | SemanticOutcome::Cancelled { work, .. } => work,
+    };
+    *work = source_work.conservative_add(*work);
+    Ok(outcome)
+}
+
+/// Positive same-source type evidence for an invocation-proven boxed payload.
+/// The caller separately proves that `payload` is the stable value in the box.
+/// False means no certificate, not a proof that the assertion must fail.
+/// Parsing belongs to the caller; all inventory and type-comparison work is
+/// reported against its semantic budget. No interface initializer is assumed.
+pub fn reference_assertion_payload_type_is_exact(
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    assertion: std::ops::Range<usize>,
+    payload: std::ops::Range<usize>,
+    budget: &SemanticBudget,
+    cancellation: &CancellationToken,
+) -> Result<SemanticOutcome<bool>, SemanticProviderError> {
+    let (facts, previous_work) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+        ProcedureEnumeration::Complete {
+            value,
+            inventory_work,
+            ..
+        } => (value, inventory_work),
+        ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+            return Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            });
+        }
+        ProcedureEnumeration::Cancelled { work } => {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            });
+        }
+    };
+    let root = prepared.tree().root_node();
+    let mut inventory = ProcedureInventoryBuilder::new(
+        file,
+        prepared.dialect(),
+        root,
+        "go-assertion-payload",
+        budget,
+    )?;
+    let proof = (|| -> Result<bool, GoInventoryPrepassStop> {
+        inventory
+            .observe_additional_work(previous_work)
+            .map_err(GoInventoryPrepassStop::Budget)?;
+        let exact_node = |range: &std::ops::Range<usize>| {
+            root.named_descendant_for_byte_range(range.start, range.end)
+                .filter(|node| node.start_byte() == range.start && node.end_byte() == range.end)
+        };
+        let Some(assertion) =
+            exact_node(&assertion).filter(|node| node.kind() == "type_assertion_expression")
+        else {
+            return Ok(false);
+        };
+        let Some(payload) = exact_node(&payload) else {
+            return Ok(false);
+        };
+        let Some(asserted) = assertion.child_by_field_name("type") else {
+            return Ok(false);
+        };
+        let Some((owner, _)) = facts
+            .specs
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| {
+                spec.body.start_byte() <= payload.start_byte()
+                    && payload.end_byte() <= spec.body.end_byte()
+            })
+            .min_by_key(|(_, spec)| spec.body.end_byte() - spec.body.start_byte())
+        else {
+            return Ok(false);
+        };
+        if !go_type_is_reference(
+            asserted,
+            prepared.source(),
+            &facts.named_type_definitions,
+            asserted.start_byte(),
+        ) {
+            return Ok(false);
+        }
+        let mut bindings = Vec::with_capacity(facts.specs.len());
+        for spec in &facts.specs {
+            bindings.push(go_callable_lexical_bindings(
+                spec,
+                prepared.source(),
+                &facts.named_type_definitions,
+                &mut inventory,
+                cancellation,
+            )?);
+        }
+        let mut context = GoAssertionProofContext {
+            specs: &facts.specs,
+            bindings: &bindings,
+            mutated: &HashSet::default(),
+            source: prepared.source(),
+            named_types: &facts.named_type_definitions,
+            package_shadowing: facts.package_shadowing,
+            inventory: &mut inventory,
+            cancellation,
+        };
+        let Some(payload_type) = context.static_type(owner, payload)? else {
+            return Ok(false);
+        };
+        go_assertion_types_match(
+            payload_type,
+            asserted,
+            prepared.source(),
+            &facts.named_type_definitions,
+            &mut inventory,
+            cancellation,
+        )
+    })();
+    match proof {
+        Ok(value) => Ok(SemanticOutcome::Complete {
+            value,
+            work: inventory.observed_work(),
+        }),
+        Err(GoInventoryPrepassStop::Cancelled) => Ok(SemanticOutcome::Cancelled {
+            partial: None,
+            work: inventory.observed_work(),
+        }),
+        Err(GoInventoryPrepassStop::Budget(stop)) => {
+            let ProcedureInventoryOutcome::ExceededBudget { exceeded, work } =
+                stop.into_outcome::<bool>()
+            else {
+                unreachable!("budget stop has one outcome");
+            };
+            Ok(SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            })
+        }
+    }
 }
 
 fn enumerate_procedures<'tree>(
@@ -2008,6 +2270,11 @@ fn go_prepass_expression_receiver_type(
                 };
                 dereference_depth = depth;
                 node = operand;
+            }
+            "unary_expression" if unary_operator_kind(node) == Some("<-") => {
+                break node.child_by_field_name("operand").and_then(|channel| {
+                    go_prepass_channel_payload_type(channel, bindings, source, named_types, byte)
+                });
             }
             "composite_literal" | "type_assertion_expression" => {
                 break node.child_by_field_name("type").and_then(|type_node| {
@@ -3840,7 +4107,7 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     omitted_capture_names: &'procedure [Box<str>],
     call_exposure_origins: &'procedure [GoCallExposureOrigin],
     import_bindings: &'imports HashMap<Box<str>, Box<str>>,
-    package_functions: &'imports HashMap<Box<str>, Node<'tree>>,
+    package_functions: &'imports HashMap<Box<str>, Option<(ProcedureId, Node<'tree>)>>,
     package_values: &'imports HashSet<Box<str>>,
     package_value_locators: &'imports HashMap<Box<str>, SemanticLocator>,
     method_inventory: &'imports GoMethodInventory,
@@ -4031,7 +4298,7 @@ fn lower_procedure<'tree>(
     direct_struct_fields: &DirectStructFields,
     named_type_definitions: &GoNamedTypeDefinitions<'tree>,
     import_bindings: &HashMap<Box<str>, Box<str>>,
-    package_functions: &HashMap<Box<str>, Node<'tree>>,
+    package_functions: &HashMap<Box<str>, Option<(ProcedureId, Node<'tree>)>>,
     method_inventory: &GoMethodInventory,
     procedure_targets: &HashMap<usize, GoProcedureTarget>,
     indirect_callable_targets: &HashMap<usize, usize>,
@@ -5027,6 +5294,29 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         )
     }
 
+    fn package_function_target(&self, node: Node<'tree>) -> Option<ProcedureId> {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), node)?;
+        if self.binding_value(name, node.start_byte()).is_some()
+            || self
+                .omitted_capture_names
+                .iter()
+                .any(|captured| captured.as_ref() == name)
+            || self.package_values.contains(name)
+            || self.import_bindings.contains_key(name)
+            || visible_go_named_type(self.named_type_definitions, name, node.start_byte()).is_some()
+        {
+            return None;
+        }
+        self.package_functions
+            .get(name)
+            .copied()
+            .flatten()
+            .map(|(id, _)| id)
+    }
+
     fn identifier_is_shared_or_call_exposed(&self, node: Node<'tree>) -> bool {
         let Some(name) = node_text(self.prepared.source(), node) else {
             return true;
@@ -5854,7 +6144,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         if self.binding_value(name, function.start_byte()).is_some() {
             return None;
         }
-        let declaration = *self.package_functions.get(name)?;
+        let (_, declaration) = self.package_functions.get(name).copied().flatten()?;
         if declaration.child_by_field_name("type_parameters").is_some() {
             return None;
         }
@@ -7490,7 +7780,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     fn expression_value_kind(&self, node: Node<'tree>) -> SemanticValueKind {
         if self.is_context_done_on_formal(node) {
             SemanticValueKind::LanguageDefined("go.context_done_formal_channel".into())
-        } else if node.kind() == "func_literal"
+        } else if self.package_function_target(node).is_some()
+            || node.kind() == "func_literal"
             || node.parent().is_some_and(|parent| {
                 parent.kind() == "call_expression"
                     && field_matches(parent, "function", node)
@@ -9693,7 +9984,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             },
         );
         let has_default = clauses.iter().any(|clause| clause.kind() == "default_case");
-        if !has_default {
+        // With no alternatives the boundary has no successor: select {} blocks
+        // forever. Readiness is uncertain only when communication can proceed.
+        if !has_default && !clauses.is_empty() {
             self.add_retained_control_topology_gap(
                 builder,
                 boundary,
@@ -10427,6 +10720,23 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             })?;
         if is_go_binding_reference_kind(node.kind()) && !self.is_go_constant_value(node) {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
+        if let Some(target) = self.package_function_target(node) {
+            let metadata = self.metadata(entry)?;
+            self.append_effect(
+                builder,
+                entry,
+                SemanticEffect::CallableReference {
+                    result,
+                    callable: CallableValue {
+                        kind: CallableReferenceKind::Function,
+                        targets: CallableTargetResolution::Proven(CallableTarget::Local(target)),
+                        target_evidence: metadata.evidence,
+                        bound_receiver: None,
+                        environment: None,
+                    },
+                },
+            )?;
         }
         match node.kind() {
             "type_conversion_expression" | "call_expression"
@@ -15004,6 +15314,58 @@ func copyArrayField() {
     }
 
     #[test]
+    fn assertion_payload_type_query_requires_exact_reference_compatibility() {
+        for (asserted, expected) in [
+            ("*Cell", true),
+            ("*Alias", true),
+            ("*Other", false),
+            ("Cell", false),
+            ("**Cell", false),
+        ] {
+            let assertion = format!("boxed.({asserted})");
+            let source = format!(
+                "package p\ntype Cell struct {{ n int }}\ntype Other struct {{ n int }}\ntype Alias = Cell\nfunc f() {{ shared := &Cell{{}}; var boxed any = shared; sink(shared); _ = {assertion} }}\n"
+            );
+            let prepared = prepared_fixture(&source);
+            let file = ProjectFile::new(std::env::temp_dir(), "assertion.go");
+            let assertion_start = source.find(&assertion).unwrap();
+            let payload_start = source.find("sink(shared)").unwrap() + "sink(".len();
+            let query = |budget: &SemanticBudget, cancellation: &CancellationToken| {
+                reference_assertion_payload_type_is_exact(
+                    &file,
+                    &prepared,
+                    assertion_start..assertion_start + assertion.len(),
+                    payload_start..payload_start + "shared".len(),
+                    budget,
+                    cancellation,
+                )
+                .unwrap()
+            };
+            let SemanticOutcome::Complete { value, .. } =
+                query(&SemanticBudget::default(), &CancellationToken::default())
+            else {
+                panic!("bounded fixture completes");
+            };
+            assert_eq!(value, expected, "{asserted}");
+            let mut limits = SemanticBudget::default().limits();
+            limits.nested_entries = 1;
+            assert!(matches!(
+                query(
+                    &SemanticBudget::new(limits).unwrap(),
+                    &CancellationToken::default()
+                ),
+                SemanticOutcome::ExceededBudget { .. }
+            ));
+            let cancelled = CancellationToken::default();
+            cancelled.cancel();
+            assert!(matches!(
+                query(&SemanticBudget::default(), &cancelled),
+                SemanticOutcome::Cancelled { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn type_assertion_flow_tracks_stable_and_replaced_interface_bindings() {
         const SOURCE: &str = r#"package main
 func stable() {
@@ -16337,6 +16699,51 @@ func run() {
             gap.subject != SemanticGapSubject::CallSite(call.id)
                 || gap.capability != SemanticCapability::DynamicDispatch
         }));
+    }
+
+    #[test]
+    fn named_function_arguments_retain_exact_callable_identity() {
+        const SOURCE: &str = r#"package main
+func helper() {}
+func consume(f func()) {}
+func direct() { consume(helper) }
+func shadowed(helper func()) { consume(helper) }
+func local() { helper := func() {}; consume(helper) }
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let helper = named_procedure(&procedures, "helper").id;
+        for (name, expected) in [("direct", true), ("shadowed", false), ("local", false)] {
+            let procedure = named_procedure(&procedures, name);
+            let argument = procedure
+                .call_sites
+                .iter()
+                .find(|call| {
+                    source_text(SOURCE, value_source_span(procedure, call.callee)) == "consume"
+                })
+                .expect("consume call")
+                .arguments[0]
+                .value;
+            let references = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter_map(|event| match &event.effect {
+                    SemanticEffect::CallableReference { result, callable }
+                        if *result == argument =>
+                    {
+                        Some(&callable.targets)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                references.contains(&&CallableTargetResolution::Proven(CallableTarget::Local(
+                    helper
+                ))),
+                expected,
+                "{name}: {references:?}"
+            );
+        }
     }
 
     #[test]

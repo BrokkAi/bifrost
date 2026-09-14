@@ -46,7 +46,9 @@ use crate::value_flow::{
 use crate::{ProcedureSummaryBindingError, bind_active_unmaterialized_procedure_summaries};
 
 use super::binding_refinement::{self, GuardBindings};
-use super::correlations::{CorrelationAnalysis, CorrelationError, analyze_correlations};
+use super::correlations::{
+    CorrelationAnalysis, CorrelationError, analyze_correlations_with_boolean_bindings,
+};
 use super::field_refinement::{self, FieldLoadRefinement, FieldVersion};
 use super::field_slots::{FieldSlotIndex, MemberStoreEvidence, receiver_values};
 use super::refinement_sources::DefinitionSources;
@@ -150,6 +152,27 @@ struct ClassClosedLoadRefinement {
     base: ValueId,
 }
 
+fn local_copy_edges(procedure: &ProcedureHandle) -> Vec<(ValueId, ValueId)> {
+    procedure
+        .semantics()
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .filter_map(|event| match event.effect {
+            SemanticEffect::Assignment {
+                target,
+                value: source,
+            }
+            | SemanticEffect::ValueFlow {
+                kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                source,
+                target,
+            } => Some((source, target)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn call_result_aliases(procedure: &ProcedureHandle) -> HashSet<ValueId> {
     let mut aliases = procedure
         .semantics()
@@ -158,23 +181,8 @@ fn call_result_aliases(procedure: &ProcedureHandle) -> HashSet<ValueId> {
         .flat_map(SemanticCallSite::normal_result_values)
         .collect::<HashSet<_>>();
     let mut copies = HashMap::<ValueId, Vec<ValueId>>::default();
-    for point in procedure.semantics().points() {
-        for event in &point.events {
-            match event.effect {
-                SemanticEffect::Assignment {
-                    target,
-                    value: source,
-                }
-                | SemanticEffect::ValueFlow {
-                    kind: crate::analyzer::semantic::ValueFlowKind::Local,
-                    source,
-                    target,
-                } => {
-                    copies.entry(source).or_default().push(target);
-                }
-                _ => {}
-            }
-        }
+    for (source, target) in local_copy_edges(procedure) {
+        copies.entry(source).or_default().push(target);
     }
     let mut pending = aliases.iter().copied().collect::<Vec<_>>();
     while let Some(source) = pending.pop() {
@@ -185,6 +193,85 @@ fn call_result_aliases(procedure: &ProcedureHandle) -> HashSet<ValueId> {
         }
     }
     aliases
+}
+
+/// Values whose classes can affect behavior outside a chain of ordinary local
+/// copies. Class-driven load refinement cannot affect a result when that result
+/// and all its copies are dead, so exclude those loads before asking the
+/// reaching-definition oracle about their bases.
+fn observable_value_dependencies(procedure: &ProcedureHandle) -> HashSet<ValueId> {
+    let semantics = procedure.semantics();
+    let mut relevant = HashSet::default();
+    for call in semantics.call_sites() {
+        relevant.insert(call.callee);
+        relevant.extend(call.receiver);
+        relevant.extend(call.arguments.iter().map(|argument| argument.value));
+    }
+    for location in semantics.memory_locations() {
+        match location.kind {
+            MemoryLocationKind::Field { base, .. } | MemoryLocationKind::Property { base, .. } => {
+                relevant.insert(base);
+            }
+            MemoryLocationKind::Index { base, index, .. } => {
+                relevant.insert(base);
+                relevant.extend(index);
+            }
+            MemoryLocationKind::LexicalCell { binding } => {
+                relevant.insert(binding);
+            }
+            MemoryLocationKind::Capture { binding, .. } => {
+                relevant.extend(binding);
+            }
+            MemoryLocationKind::Static { .. } => {}
+        }
+    }
+    for point in semantics.points() {
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::AggregateInitializer { value, .. }
+                | SemanticEffect::ValueUse { value, .. }
+                | SemanticEffect::MemoryStore { value, .. } => {
+                    relevant.insert(value);
+                }
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                } if kind != crate::analyzer::semantic::ValueFlowKind::Local => {
+                    relevant.insert(source);
+                    relevant.insert(target);
+                }
+                SemanticEffect::ProcedureReturn { value }
+                | SemanticEffect::Throw { value }
+                | SemanticEffect::AsyncSuspend { awaited: value, .. } => {
+                    relevant.extend(value);
+                }
+                SemanticEffect::CaptureBind { capture } => {
+                    let binding = semantics
+                        .capture(capture)
+                        .expect("a capture-bind effect has a live capture");
+                    if let crate::analyzer::semantic::CaptureSource::Value(value) = binding.captured
+                    {
+                        relevant.insert(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut reverse = HashMap::<ValueId, Vec<ValueId>>::default();
+    for (source, target) in local_copy_edges(procedure) {
+        reverse.entry(target).or_default().push(source);
+    }
+    let mut pending = relevant.iter().copied().collect::<Vec<_>>();
+    while let Some(target) = pending.pop() {
+        for &source in reverse.get(&target).into_iter().flatten() {
+            if relevant.insert(source) {
+                pending.push(source);
+            }
+        }
+    }
+    relevant
 }
 
 fn closure_has_provider_failure(closure: &DiscoveredClosure) -> bool {
@@ -1454,45 +1541,72 @@ impl TypeFlowPlan {
                     binding_refinement::derive(workspace, adapter, procedure, budget, cancellation)
                 },
             );
-            match bindings {
+            let correlation_bindings = match bindings {
                 Ok(bindings) => {
+                    let correlation_bindings = bindings.correlation_bindings().to_vec();
+                    let data_bindings = bindings.data_bindings().to_vec();
+                    let open_bindings = bindings.open_bindings().clone();
+                    let correlation_events = bindings.correlation_events().to_vec();
                     guard_bindings.insert(procedure.durable_key(), bindings);
+                    Some((
+                        correlation_bindings,
+                        data_bindings,
+                        open_bindings,
+                        correlation_events,
+                    ))
                 }
                 Err(CorrelationError::Budget(exceeded)) => {
                     refinement_exhaustion.get_or_insert(exceeded);
+                    None
                 }
                 Err(CorrelationError::Cancelled { .. }) => {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
-            }
-            let correlation = reused_or_derived(
-                &mut refinements.correlations,
-                procedure_semantics_identity(b"bifrost-type-flow-correlations-v1", procedure)
-                    .finish(),
-                semantic_budget,
-                |budget| {
-                    let mut analysis = analyze_correlations(procedure, budget, Some(cancellation))?;
-                    // Only an exclusion with an incompatible definition can
-                    // remove a source, so the rest is state the cache would
-                    // carry for nothing.
-                    analysis
-                        .guard_edge_exclusions
-                        .retain(|candidate| !candidate.incompatible_data_defs.is_empty());
-                    Ok(analysis)
+            };
+            let correlation = correlation_bindings.map(
+                |(correlation_bindings, data_bindings, open_bindings, correlation_events)| {
+                    reused_or_derived(
+                        &mut refinements.correlations,
+                        procedure_semantics_identity(
+                            b"bifrost-type-flow-correlations-v1",
+                            procedure,
+                        )
+                        .finish(),
+                        semantic_budget,
+                        |budget| {
+                            let mut analysis = analyze_correlations_with_boolean_bindings(
+                                procedure,
+                                &correlation_bindings,
+                                &data_bindings,
+                                &open_bindings,
+                                &correlation_events,
+                                budget,
+                                Some(cancellation),
+                            )?;
+                            // Only an exclusion with an incompatible definition can
+                            // remove a source, so the rest is state the cache would
+                            // carry for nothing.
+                            analysis
+                                .guard_edge_exclusions
+                                .retain(|candidate| !candidate.incompatible_data_defs.is_empty());
+                            Ok(analysis)
+                        },
+                    )
                 },
             );
             match correlation {
-                Ok(analysis) => {
+                Some(Ok(analysis)) => {
                     if !analysis.guard_edge_exclusions.is_empty() {
                         correlations.push((procedure.clone(), analysis));
                     }
                 }
-                Err(CorrelationError::Budget(exceeded)) => {
+                Some(Err(CorrelationError::Budget(exceeded))) => {
                     refinement_exhaustion.get_or_insert(exceeded);
                 }
-                Err(CorrelationError::Cancelled { .. }) => {
+                Some(Err(CorrelationError::Cancelled { .. })) => {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
+                None => {}
             }
             let fields = if let Some(class) = adapter.enclosing_class(workspace, procedure) {
                 let snapshot = closure
@@ -1584,6 +1698,7 @@ impl TypeFlowPlan {
                 }
             };
             let call_result_aliases = call_result_aliases(procedure);
+            let observable_values = observable_value_dependencies(procedure);
             for point in procedure.semantics().points() {
                 for (event, effect) in point.events.iter().enumerate() {
                     let SemanticEffect::MemoryLoad {
@@ -1593,6 +1708,9 @@ impl TypeFlowPlan {
                         continue;
                     };
                     if closed_loads.contains(&(point.id, result)) {
+                        continue;
+                    }
+                    if !observable_values.contains(&result) {
                         continue;
                     }
                     let Some(location_row) = procedure.semantics().memory_location(location) else {

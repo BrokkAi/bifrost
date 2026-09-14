@@ -24,6 +24,7 @@ use crate::analyzer::store::class_set_field_slots::{
 };
 use crate::analyzer::{AnalyzerQueryScope, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
+use crate::value_flow::ValueFlowCache;
 
 use super::dynamic_stores::{DynamicWriteEvidence, PendingDynamicWrite, ScopedDynamicWrite};
 use super::plan::TypeFlowPlanError;
@@ -298,6 +299,7 @@ impl FieldSlotIndex {
         provider_behavior: IcfgProviderBehaviorIdentity,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
         cache: &FieldSlotIndexCache,
+        value_flow_cache: ValueFlowCache,
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<FieldSlotIndexAcquisition, TypeFlowPlanError> {
@@ -316,7 +318,13 @@ impl FieldSlotIndex {
             active_semantic_model_snapshot.as_deref(),
         ) else {
             return Ok(FieldSlotIndexAcquisition {
-                index: Self::build_checked(workspace, adapter, semantic_budget, cancellation)?,
+                index: Self::build_checked(
+                    workspace,
+                    adapter,
+                    value_flow_cache,
+                    semantic_budget,
+                    cancellation,
+                )?,
                 kind: FieldSlotIndexAcquisitionKind::Built,
                 miss_reason: Some(FieldSlotIndexMissReason::NoSemanticKey),
                 published: false,
@@ -343,7 +351,13 @@ impl FieldSlotIndex {
                     return Err(TypeFlowPlanError::Cancelled);
                 }
                 Ok(FieldSlotIndexAcquisition {
-                    index: Self::build_checked(workspace, adapter, semantic_budget, cancellation)?,
+                    index: Self::build_checked(
+                        workspace,
+                        adapter,
+                        value_flow_cache,
+                        semantic_budget,
+                        cancellation,
+                    )?,
                     kind: FieldSlotIndexAcquisitionKind::Built,
                     miss_reason: Some(FieldSlotIndexMissReason::MemoryReplayBudget),
                     published: false,
@@ -351,7 +365,13 @@ impl FieldSlotIndex {
             }
             CompleteValueAcquisition::Cancelled => Err(TypeFlowPlanError::Cancelled),
             CompleteValueAcquisition::Rejected => Ok(FieldSlotIndexAcquisition {
-                index: Self::build_checked(workspace, adapter, semantic_budget, cancellation)?,
+                index: Self::build_checked(
+                    workspace,
+                    adapter,
+                    value_flow_cache,
+                    semantic_budget,
+                    cancellation,
+                )?,
                 kind: FieldSlotIndexAcquisitionKind::Built,
                 miss_reason: Some(FieldSlotIndexMissReason::StoreFailure),
                 published: false,
@@ -420,7 +440,13 @@ impl FieldSlotIndex {
                     }
                 }
 
-                let index = Self::build_checked(workspace, adapter, semantic_budget, cancellation)?;
+                let index = Self::build_checked(
+                    workspace,
+                    adapter,
+                    value_flow_cache,
+                    semantic_budget,
+                    cancellation,
+                )?;
                 // Stage from the post-build ledger: the losing work was
                 // performed and remains charged. Its paid-artifact set turns
                 // winner hydration into repeat charges instead of charging
@@ -545,6 +571,22 @@ impl FieldSlotIndex {
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Self, TypeFlowPlanError> {
+        Self::build_with_value_flow_cache(
+            workspace,
+            adapter,
+            ValueFlowCache::default(),
+            semantic_budget,
+            cancellation,
+        )
+    }
+
+    fn build_with_value_flow_cache(
+        workspace: &WorkspaceAnalyzer,
+        adapter: &dyn TypeFlowAdapter,
+        value_flow_cache: ValueFlowCache,
+        semantic_budget: &mut SemanticBudget,
+        cancellation: &crate::analyzer::semantic::CancellationToken,
+    ) -> Result<Self, TypeFlowPlanError> {
         let files = workspace
             .analyzer()
             .project()
@@ -618,6 +660,7 @@ impl FieldSlotIndex {
                     &provisional,
                     &procedures,
                     &collected.dynamic_writes,
+                    value_flow_cache.clone(),
                     semantic_budget,
                     &mut solver_budget,
                     cancellation,
@@ -664,10 +707,17 @@ impl FieldSlotIndex {
     fn build_checked(
         workspace: &WorkspaceAnalyzer,
         adapter: &dyn TypeFlowAdapter,
+        value_flow_cache: ValueFlowCache,
         semantic_budget: &mut SemanticBudget,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Result<Arc<Self>, TypeFlowPlanError> {
-        let index = Self::build(workspace, adapter, semantic_budget, cancellation)?;
+        let index = Self::build_with_value_flow_cache(
+            workspace,
+            adapter,
+            value_flow_cache,
+            semantic_budget,
+            cancellation,
+        )?;
         if cancellation.is_cancelled() {
             return Err(TypeFlowPlanError::Cancelled);
         }
@@ -2225,6 +2275,7 @@ mod tests {
             WorkspaceIcfgProvider::new(workspace).behavior_identity(),
             None,
             cache,
+            ValueFlowCache::default(),
             budget,
             cancellation,
         )
@@ -2507,6 +2558,7 @@ mod tests {
             &slots,
             std::slice::from_ref(caller),
             &collected.dynamic_writes,
+            ValueFlowCache::default(),
             &mut budget,
             &mut SolverBudget::default(),
             &cancellation,
@@ -2606,6 +2658,7 @@ mod tests {
                 &slots,
                 std::slice::from_ref(root),
                 &collected.dynamic_writes,
+                ValueFlowCache::default(),
                 &mut budget,
                 &mut SolverBudget::default(),
                 &cancellation,
@@ -2730,6 +2783,7 @@ mod tests {
                 &slots,
                 &roots,
                 &collected.dynamic_writes,
+                ValueFlowCache::default(),
                 &mut SemanticBudget::default(),
                 &mut SolverBudget::default(),
                 &cancellation,
@@ -3234,6 +3288,7 @@ mod tests {
                     provider,
                     None,
                     &cache,
+                    ValueFlowCache::default(),
                     &mut local_budget,
                     &cancellation,
                 )
@@ -3344,6 +3399,7 @@ mod tests {
             cold_behavior,
             None,
             &cache,
+            ValueFlowCache::default(),
             &mut cold_budget,
             &cancellation,
         )
@@ -3367,6 +3423,7 @@ mod tests {
             warm_behavior,
             None,
             &warm_cache,
+            ValueFlowCache::default(),
             &mut warm_budget,
             &cancellation,
         )
@@ -3731,6 +3788,7 @@ mod tests {
             provider.behavior_identity(),
             None,
             &FieldSlotIndexCache::default(),
+            ValueFlowCache::default(),
             &mut warm_budget,
             &cancellation,
         )

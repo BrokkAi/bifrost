@@ -3145,6 +3145,9 @@ pub(super) fn render_concurrent_access_conflict(
         ConcurrencyOpenReason::UnsupportedSynchronization(protocol) => {
             format!("unsupported_synchronization:{protocol}")
         }
+        ConcurrencyOpenReason::IncompleteControlFlow(detail) => {
+            format!("incomplete_control_flow:{detail}")
+        }
         ConcurrencyOpenReason::RecursiveExpansion => "recursive_expansion".to_owned(),
         ConcurrencyOpenReason::BudgetExhausted => "budget_exhausted".to_owned(),
         ConcurrencyOpenReason::UnmodeledMemory(capability) => {

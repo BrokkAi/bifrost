@@ -855,6 +855,71 @@ impl<'a> WorkspaceConcurrencyProvider<'a> {
 }
 
 impl ConcurrencyProvider for WorkspaceConcurrencyProvider<'_> {
+    fn reference_assertion_accepts_payload(
+        &self,
+        assertion: &ValueHandle,
+        payload: &ValueHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<bool>, SemanticProviderError> {
+        let outcome = crate::analyzer::workspace_reference_assertion_accepts_payload(
+            self.workspace,
+            assertion,
+            payload,
+            request,
+        )?;
+        Ok(match outcome {
+            SemanticOutcome::Complete { value: true, .. } => ConcurrencyAnswer::Proven(true),
+            SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. } => {
+                ConcurrencyAnswer::Open {
+                    partial: false,
+                    reasons: vec![ConcurrencyOpenReason::BudgetExhausted],
+                }
+            }
+            _ => ConcurrencyAnswer::Open {
+                partial: false,
+                reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+            },
+        })
+    }
+
+    fn continuation_projection(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Option<brokk_bifrost_flow::flow_state::ProcedureContinuationProjection> {
+        use crate::analyzer::semantic::SemanticBudget;
+        use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget;
+
+        // Keep discovery and graph visits inside the same outer request while
+        // preserving already-paid artifact identities in the child ledger.
+        let mut limits = request.budget.remaining();
+        let cfg_visits = limits.nested_entries / 4;
+        limits.nested_entries -= 2 * cfg_visits;
+        let mut semantic_budget =
+            SemanticBudget::new_child(limits, &request.budget.scope_snapshot());
+        let mut cfg_budget = CfgAlgorithmBudget::uniform(cfg_visits);
+        let provider =
+            crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                self.workspace,
+                self.active_models.clone(),
+            );
+        let projection = brokk_bifrost_flow::flow_state::procedure_continuation_projection(
+            &provider,
+            procedure,
+            &mut semantic_budget,
+            &mut cfg_budget,
+            request.cancellation,
+        );
+        let mut work = semantic_budget.used();
+        let cfg_work = cfg_budget.used();
+        work.nested_entries += cfg_work.node_visits + cfg_work.edge_visits;
+        request
+            .budget
+            .apply_child_charge(work, semantic_budget.into_child_charge())
+            .expect("partitioned continuation work fits the outer request budget");
+        Some(projection)
+    }
+
     fn summary_behavior_identity(
         &self,
     ) -> Option<crate::analyzer::semantic::IcfgProviderBehaviorIdentity> {

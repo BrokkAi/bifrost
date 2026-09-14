@@ -150,41 +150,41 @@ impl From<SemanticBudgetExceeded> for CorrelationError {
 /// charge follows the state the analysis holds rather than the procedure's
 /// length.  If either lane is exhausted, or cancellation is observed, the
 /// function returns an error and no partial relation is exposed.
-pub fn analyze_correlations(
+pub(super) fn analyze_correlations_with_boolean_bindings(
     procedure: &ProcedureHandle,
+    bool_bindings: &[ValueId],
+    data_bindings: &[ValueId],
+    open_bindings: &HashSet<ValueId>,
+    correlation_events: &[Vec<usize>],
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<CorrelationAnalysis, CorrelationError> {
     check_cancelled(cancellation)?;
     let semantics = procedure.semantics();
-    charge_preprocessing_inputs(semantics, budget)?;
-    check_cancelled(cancellation)?;
-    let data_bindings = tracked_data_bindings(semantics.values());
-    let bool_bindings = tested_boolean_bindings(semantics, budget, cancellation)?;
-    check_cancelled(cancellation)?;
     if bool_bindings.is_empty() || data_bindings.is_empty() {
         return Ok(CorrelationAnalysis {
             definitions: Vec::new(),
             guard_edge_exclusions: Vec::new(),
         });
     }
-    let open_bindings = open_bindings(semantics);
+    charge_reused_preprocessing_inputs(semantics, budget)?;
     check_cancelled(cancellation)?;
 
     // Index every definition needed by the surviving relational question.
     let mut definitions = DefinitionTable::new();
     definitions.index_entry_definitions(
         semantics.entry_point(),
-        &data_bindings,
-        &bool_bindings,
+        data_bindings,
+        bool_bindings,
         budget,
         cancellation,
     )?;
     definitions.index_event_definitions(
         semantics,
-        &data_bindings,
-        &bool_bindings,
-        &open_bindings,
+        data_bindings,
+        bool_bindings,
+        open_bindings,
+        correlation_events,
         budget,
         cancellation,
     )?;
@@ -195,14 +195,15 @@ pub fn analyze_correlations(
     let carried = carried_points(
         semantics,
         &successors,
-        &data_bindings,
-        &bool_bindings,
-        &open_bindings,
+        data_bindings,
+        bool_bindings,
+        open_bindings,
+        correlation_events,
         cancellation,
     )?;
     let carried_successors = carried_successors(&successors, &carried, budget, cancellation)?;
 
-    let initial = FlowState::entry(&data_bindings, &bool_bindings, &definitions, budget)?;
+    let initial = FlowState::entry(data_bindings, bool_bindings, &definitions, budget)?;
     let point_count = semantics.points().len();
     let mut states = vec![FlowState::default(); point_count];
     let mut exits = vec![FlowState::default(); point_count];
@@ -224,9 +225,10 @@ pub fn analyze_correlations(
             point_id,
             entry_state,
             &definitions,
-            &bool_bindings,
-            &data_bindings,
-            &open_bindings,
+            bool_bindings,
+            data_bindings,
+            open_bindings,
+            correlation_events,
             budget,
             cancellation,
         )?;
@@ -259,7 +261,7 @@ pub fn analyze_correlations(
             (guard.false_edge, true_fact.opposite()),
         ] {
             let Some(edge) = edge else { continue };
-            for &data_binding in &data_bindings {
+            for &data_binding in data_bindings {
                 let pairs = state.pairs(data_binding, bool_binding);
                 let candidate = make_candidate(
                     edge,
@@ -321,6 +323,7 @@ fn component_writes(
     data_bindings: &[ValueId],
     bool_bindings: &[ValueId],
     open_bindings: &HashSet<ValueId>,
+    event_indices: &[usize],
 ) -> Vec<ComponentWrite> {
     fn push(
         writes: &mut Vec<ComponentWrite>,
@@ -346,7 +349,8 @@ fn component_writes(
         }
     }
     let mut writes = Vec::new();
-    for (event_index, event) in point.events.iter().enumerate() {
+    for &event_index in event_indices {
+        let event = &point.events[event_index];
         match &event.effect {
             SemanticEffect::Assignment { target, value } => push(
                 &mut writes,
@@ -414,6 +418,7 @@ fn carried_points(
     data_bindings: &[ValueId],
     bool_bindings: &[ValueId],
     open_bindings: &HashSet<ValueId>,
+    correlation_events: &[Vec<usize>],
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<bool>, CorrelationError> {
     let point_count = successors.len();
@@ -435,6 +440,7 @@ fn carried_points(
                 data_bindings,
                 bool_bindings,
                 open_bindings,
+                &correlation_events[point.id.index()],
             )
             .is_empty()
         {
@@ -547,44 +553,18 @@ fn charge_pairs(budget: &mut SemanticBudget, count: usize) -> Result<(), Correla
     Ok(())
 }
 
-fn charge_preprocessing_inputs(
+fn charge_reused_preprocessing_inputs(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     budget: &mut SemanticBudget,
 ) -> Result<(), CorrelationError> {
-    let event_count = semantics
-        .points()
-        .iter()
-        .map(|point| point.events.len())
-        .fold(0, usize::saturating_add);
     budget.charge(SemanticWork {
         values: semantics.values().len(),
         memory_locations: semantics.memory_locations().len(),
         captures: semantics.captures().len(),
-        events: event_count,
         nested_entries: semantics.guard_facts().len(),
         ..SemanticWork::default()
     })?;
     Ok(())
-}
-
-fn tracked_data_bindings(values: &[crate::analyzer::semantic::SemanticValue]) -> Vec<ValueId> {
-    let mut bindings = values
-        .iter()
-        .filter(|value| is_binding_kind(&value.kind))
-        .map(|value| value.id)
-        .collect::<Vec<_>>();
-    bindings.sort_unstable();
-    bindings.dedup();
-    bindings
-}
-
-fn is_binding_kind(kind: &SemanticValueKind) -> bool {
-    matches!(
-        kind,
-        SemanticValueKind::Local
-            | SemanticValueKind::Parameter { .. }
-            | SemanticValueKind::Receiver { .. }
-    )
 }
 
 /// Return bindings whose storage can be changed by a call, continuation, or
@@ -592,16 +572,13 @@ fn is_binding_kind(kind: &SemanticValueKind) -> bool {
 /// absent: an ordinary call does not rebind its caller-local slot.  Address
 /// values and mutable/shared capture cells are the structured evidence that a
 /// callee can observe or change the binding itself.
-pub(super) fn open_bindings(
+pub(super) fn open_bindings_from_copy_graph(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    binding_values: &HashSet<ValueId>,
+    reverse_copies: &HashMap<ValueId, Vec<ValueId>>,
+    address_sources: &HashSet<ValueId>,
 ) -> HashSet<ValueId> {
-    let binding_values = semantics
-        .values()
-        .iter()
-        .filter(|value| is_binding_kind(&value.kind))
-        .map(|value| value.id)
-        .collect::<HashSet<_>>();
-    let mut open_values = HashSet::default();
+    let mut open_values = address_sources.clone();
 
     for location in semantics.memory_locations() {
         match &location.kind {
@@ -644,43 +621,9 @@ pub(super) fn open_bindings(
         }
     }
 
-    // An address target publishes the source value in the IR. Propagate this
-    // evidence backwards through validated identity-preserving copies so an
-    // address of a temporary still reopens its local/parameter carrier.
-    let mut reverse_copies = HashMap::<ValueId, Vec<ValueId>>::default();
-    for point in semantics.points() {
-        for event in &point.events {
-            match &event.effect {
-                SemanticEffect::Assignment { target, value }
-                    if semantics
-                        .value(*target)
-                        .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
-                {
-                    open_values.insert(*value);
-                    reverse_copies.entry(*target).or_default().push(*value);
-                }
-                SemanticEffect::Assignment { target, value } => {
-                    reverse_copies.entry(*target).or_default().push(*value);
-                }
-                SemanticEffect::ValueFlow { source, target, .. }
-                    if semantics
-                        .value(*target)
-                        .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
-                {
-                    open_values.insert(*source);
-                    reverse_copies.entry(*target).or_default().push(*source);
-                }
-                SemanticEffect::ValueFlow {
-                    source,
-                    target,
-                    kind,
-                } if kind.preserves_runtime_class() => {
-                    reverse_copies.entry(*target).or_default().push(*source);
-                }
-                _ => {}
-            }
-        }
-    }
+    // Address sources and mutable cells publish a value. Propagate that
+    // evidence backwards through the complete class-preserving copy graph
+    // retained by binding refinement.
     let mut worklist = open_values.iter().copied().collect::<VecDeque<_>>();
     while let Some(target) = worklist.pop_front() {
         if let Some(sources) = reverse_copies.get(&target) {
@@ -697,14 +640,12 @@ pub(super) fn open_bindings(
         .collect()
 }
 
-/// Collect guard values and every structured copy source that can feed one.
-///
-/// The closure is deliberately backwards over semantic value-flow rows.  It
-/// resolves a temporary produced by a read/copy without treating all values
-/// in a procedure as interchangeable, and it stays independent of source
-/// spelling and evaluation order.
-fn tested_boolean_bindings(
+/// Collect guard values and every structured copy source that can feed one
+/// from the copy graph binding refinement already built.
+pub(super) fn tested_boolean_bindings_from_copy_graph(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    reverse_copies: &HashMap<ValueId, Vec<ValueId>>,
+    forward_copies: &HashMap<ValueId, Vec<ValueId>>,
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<ValueId>, CorrelationError> {
@@ -727,36 +668,6 @@ fn tested_boolean_bindings(
             | GuardPredicate::ExactClass { .. }
             | GuardPredicate::HasMember { .. }
             | GuardPredicate::Opaque { .. } => {}
-        }
-    }
-
-    // Build both directions of the identity graph once. Correlation can only
-    // authorize a kill when a tested value has a possible literal boolean
-    // definition. Restricting the seeds to the forward literal closure
-    // avoids carrying every unrelated truthiness subject through the product
-    // of data and boolean definitions.  The reverse closure below retains the
-    // intermediate copies that connect that literal to the guard.
-    let mut reverse_copies = HashMap::<ValueId, Vec<ValueId>>::default();
-    let mut forward_copies = HashMap::<ValueId, Vec<ValueId>>::default();
-    for point in semantics.points() {
-        check_cancelled(cancellation)?;
-        for event in &point.events {
-            check_cancelled(cancellation)?;
-            budget.charge(SemanticWork {
-                events: 1,
-                ..SemanticWork::default()
-            })?;
-            let (source, target) = match &event.effect {
-                SemanticEffect::Assignment { target, value } => (*value, *target),
-                SemanticEffect::ValueFlow {
-                    source,
-                    target,
-                    kind,
-                } if kind.preserves_runtime_class() => (*source, *target),
-                _ => continue,
-            };
-            reverse_copies.entry(target).or_default().push(source);
-            forward_copies.entry(source).or_default().push(target);
         }
     }
 
@@ -1189,29 +1100,33 @@ impl DefinitionTable {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_event_definitions(
         &mut self,
         semantics: &crate::analyzer::semantic::ProcedureSemantics,
         data_bindings: &[ValueId],
         bool_bindings: &[ValueId],
         open_bindings: &HashSet<ValueId>,
+        correlation_events: &[Vec<usize>],
         budget: &mut SemanticBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<(), CorrelationError> {
         for point in semantics.points() {
             check_cancelled(cancellation)?;
-            budget.charge(SemanticWork {
-                events: point.events.len(),
-                ..SemanticWork::default()
-            })?;
             for write in component_writes(
                 semantics,
                 point,
                 data_bindings,
                 bool_bindings,
                 open_bindings,
+                &correlation_events[point.id.index()],
             ) {
                 check_cancelled(cancellation)?;
+                // The candidate event scan was shared with binding
+                // refinement. What this pass retains is one definition per
+                // component write, so charge that state instead of charging
+                // every source event a second time.
+                charge_pairs(budget, 1)?;
                 match write {
                     ComponentWrite::Data {
                         binding,
@@ -1291,6 +1206,7 @@ fn transfer_point(
     bool_bindings: &[ValueId],
     data_bindings: &[ValueId],
     open_bindings: &HashSet<ValueId>,
+    correlation_events: &[Vec<usize>],
     budget: &mut SemanticBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<FlowState, CorrelationError> {
@@ -1301,6 +1217,7 @@ fn transfer_point(
         data_bindings,
         bool_bindings,
         open_bindings,
+        &correlation_events[point_id.index()],
     ) {
         check_cancelled(cancellation)?;
         match write {
@@ -1556,6 +1473,27 @@ pub(super) fn produced_value(effect: &SemanticEffect) -> Option<ValueId> {
         } => Some(*result),
         _ => None,
     }
+}
+
+/// Whether an event can replace a component retained by correlation analysis.
+/// Binding refinement records these indices during its existing event walk so
+/// correlation does not scan unrelated effects again.
+pub(super) fn correlation_event_candidate(effect: &SemanticEffect) -> bool {
+    matches!(
+        effect,
+        SemanticEffect::Assignment { .. }
+            | SemanticEffect::ValueFlow { .. }
+            | SemanticEffect::MemoryStore { .. }
+            | SemanticEffect::Invoke { .. }
+            | SemanticEffect::CallContinuation { .. }
+            | SemanticEffect::AsyncSuspend { .. }
+            | SemanticEffect::AsyncResume { .. }
+            | SemanticEffect::Synchronization { .. }
+            | SemanticEffect::Gap { .. }
+            | SemanticEffect::MemoryLoad { .. }
+            | SemanticEffect::CallableCreation { .. }
+            | SemanticEffect::CallableReference { .. }
+    )
 }
 
 fn make_candidate(

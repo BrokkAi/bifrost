@@ -306,6 +306,7 @@ fn solve_language(
         provider.behavior_identity(),
         active_semantic_model_snapshot.clone(),
         &summary_state.field_slot_indexes(),
+        value_flow_cache.clone(),
         &mut field_slot_budget,
         cancellation,
     )?

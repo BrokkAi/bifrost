@@ -13,7 +13,8 @@
 use std::collections::VecDeque;
 
 use super::correlations::{
-    CorrelationError, open_bindings, produced_value, unknown_write_bindings,
+    CorrelationError, correlation_event_candidate, open_bindings_from_copy_graph, produced_value,
+    tested_boolean_bindings_from_copy_graph, unknown_write_bindings,
 };
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::semantic::{
@@ -33,6 +34,19 @@ pub(super) struct GuardBindings {
     queried: HashSet<ValueId>,
     /// The points a query may name.  See [`queried_points`].
     retained: HashSet<ProgramPointId>,
+    /// Values on a structured identity path from a boolean literal to a guard
+    /// that correlation analysis can refine. This reuses the copy graph the
+    /// binding analysis already built instead of rescanning every event.
+    correlation_bindings: Vec<ValueId>,
+    /// Every local whose storage an opaque effect can replace. Correlation
+    /// refinement consumes the same inventory, so retain it with the copy
+    /// graph result instead of rescanning the procedure's events.
+    open_bindings: HashSet<ValueId>,
+    /// Every local/parameter/receiver binding in deterministic order.
+    data_bindings: Vec<ValueId>,
+    /// Event indices that can replace a data or boolean component, grouped by
+    /// dense program-point index.
+    correlation_events: Vec<Vec<usize>>,
 }
 
 impl GuardBindings {
@@ -63,6 +77,22 @@ impl GuardBindings {
             .get(&point)
             .and_then(|state| state.current.get(&subject))
             .copied()
+    }
+
+    pub(super) fn correlation_bindings(&self) -> &[ValueId] {
+        &self.correlation_bindings
+    }
+
+    pub(super) fn open_bindings(&self) -> &HashSet<ValueId> {
+        &self.open_bindings
+    }
+
+    pub(super) fn data_bindings(&self) -> &[ValueId] {
+        &self.data_bindings
+    }
+
+    pub(super) fn correlation_events(&self) -> &[Vec<usize>] {
+        &self.correlation_events
     }
 }
 
@@ -161,8 +191,22 @@ pub(super) fn derive(
     check_cancelled(cancellation)?;
     charge_entries(budget, bindings.len().saturating_add(1))?;
     let queried = queried_values(workspace, adapter, procedure, budget, cancellation)?;
-    let tracked = tracked_values(semantics, &bindings, &queried, budget, cancellation)?;
-    let open = open_bindings(semantics);
+    let TrackedValues {
+        values: tracked,
+        reverse_copies,
+        forward_copies,
+        address_sources,
+        correlation_events,
+    } = tracked_values(semantics, &bindings, &queried, budget, cancellation)?;
+    let correlation_bindings = tested_boolean_bindings_from_copy_graph(
+        semantics,
+        &reverse_copies,
+        &forward_copies,
+        budget,
+        Some(cancellation),
+    )?;
+    let open =
+        open_bindings_from_copy_graph(semantics, &bindings, &reverse_copies, &address_sources);
     check_cancelled(cancellation)?;
     charge_entries(budget, open.len().saturating_add(1))?;
 
@@ -238,11 +282,17 @@ pub(super) fn derive(
         by_guard.push(binding);
     }
 
+    let mut data_bindings = bindings.into_iter().collect::<Vec<_>>();
+    data_bindings.sort_unstable();
     Ok(GuardBindings {
         by_guard,
         exits,
         queried,
         retained,
+        correlation_bindings,
+        open_bindings: open,
+        data_bindings,
+        correlation_events,
     })
 }
 
@@ -385,35 +435,78 @@ fn queried_points(
 /// answer at a queried value and needs no state.  The closure ignores CFG
 /// order on purpose: taking every copy event in the procedure over-covers any
 /// one path through it.
+struct TrackedValues {
+    values: HashSet<ValueId>,
+    reverse_copies: HashMap<ValueId, Vec<ValueId>>,
+    forward_copies: HashMap<ValueId, Vec<ValueId>>,
+    address_sources: HashSet<ValueId>,
+    correlation_events: Vec<Vec<usize>>,
+}
+
 fn tracked_values(
     semantics: &ProcedureSemantics,
     bindings: &HashSet<ValueId>,
     queried: &HashSet<ValueId>,
     budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
-) -> Result<HashSet<ValueId>, CorrelationError> {
+) -> Result<TrackedValues, CorrelationError> {
     let mut sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
+    let mut correlation_sources_of = HashMap::<ValueId, Vec<ValueId>>::default();
+    let mut correlation_targets_of = HashMap::<ValueId, Vec<ValueId>>::default();
+    let mut address_sources = HashSet::default();
+    let mut correlation_events = vec![Vec::new(); semantics.points().len()];
     for point in semantics.points() {
         check_cancelled(cancellation)?;
         charge_entries(budget, point.events.len().saturating_add(1))?;
         for (event_index, event) in point.events.iter().enumerate() {
-            let (source, target) = match &event.effect {
-                SemanticEffect::Assignment { target, value } => (*value, *target),
+            if correlation_event_candidate(&event.effect) {
+                correlation_events[point.id.index()].push(event_index);
+            }
+            match &event.effect {
+                SemanticEffect::Assignment { target, value }
+                | SemanticEffect::ValueFlow {
+                    source: value,
+                    target,
+                    ..
+                } if semantics
+                    .value(*target)
+                    .is_some_and(|target| target.kind == SemanticValueKind::Address) =>
+                {
+                    address_sources.insert(*value);
+                }
+                _ => {}
+            }
+            let (source, target, binding_copy) = match &event.effect {
+                SemanticEffect::Assignment { target, value } => (*value, *target, true),
                 SemanticEffect::ValueFlow {
                     kind,
                     source,
                     target,
                 } => {
-                    if !is_identity_flow(*kind)
-                        || is_assignment_transfer_marker(point, event_index, *source, *target)
-                    {
+                    if !kind.preserves_runtime_class() {
                         continue;
                     }
-                    (*source, *target)
+                    (
+                        *source,
+                        *target,
+                        is_identity_flow(*kind)
+                            && !is_assignment_transfer_marker(point, event_index, *source, *target),
+                    )
                 }
                 _ => continue,
             };
-            if source == target || bindings.contains(&target) {
+            if source == target {
+                continue;
+            }
+            correlation_sources_of
+                .entry(target)
+                .or_default()
+                .push(source);
+            correlation_targets_of
+                .entry(source)
+                .or_default()
+                .push(target);
+            if bindings.contains(&target) || !binding_copy {
                 continue;
             }
             sources_of.entry(target).or_default().push(source);
@@ -434,7 +527,13 @@ fn tracked_values(
             }
         }
     }
-    Ok(tracked)
+    Ok(TrackedValues {
+        values: tracked,
+        reverse_copies: correlation_sources_of,
+        forward_copies: correlation_targets_of,
+        address_sources,
+        correlation_events,
+    })
 }
 
 fn is_binding_kind(kind: &SemanticValueKind) -> bool {
@@ -504,10 +603,12 @@ fn charge_edges(budget: &mut SemanticBudget, count: usize) -> Result<(), Correla
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        CancellationToken, ProcedureHandle, SemanticBudget, SemanticRequest, type_flow_adapter,
+        CancellationToken, ProcedureHandle, SemanticBudget, SemanticRequest, SemanticWork,
+        type_flow_adapter,
     };
     use crate::analyzer::{AnalyzerConfig, Language, WorkspaceAnalyzer};
     use crate::inline_project::InlineTestProject;
+    use crate::type_flow::correlations::analyze_correlations_with_boolean_bindings;
 
     const SOURCE: &str = concat!(
         "class Thing:\n",
@@ -597,6 +698,85 @@ mod tests {
         assert!(
             !bindings.queried.contains(&spare),
             "an unqueried parameter is not a query subject"
+        );
+    }
+
+    #[test]
+    fn correlation_reuses_the_binding_event_inventory() {
+        let source = concat!(
+            "def correlate(condition):\n",
+            "    flag = False\n",
+            "    value = []\n",
+            "    if condition:\n",
+            "        flag = True\n",
+            "        value = {}\n",
+            "    if flag:\n",
+            "        return value.index\n",
+            "    return None\n",
+        );
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("app.py", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("app.py"),
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("the fixture materializes")
+            .available_value()
+            .cloned()
+            .expect("the fixture stays available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("correlate")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("the fixture declares `correlate`");
+        let adapter = type_flow_adapter(Language::Python).expect("Python has a type-flow adapter");
+        let mut derivation_budget = SemanticBudget::default();
+        let bindings = derive(
+            &workspace,
+            adapter,
+            &procedure,
+            &mut derivation_budget,
+            &cancellation,
+        )
+        .expect("binding refinement completes");
+        assert!(
+            !bindings.correlation_bindings().is_empty(),
+            "the literal-backed flag activates correlation"
+        );
+
+        let mut correlation_budget = SemanticBudget::new(SemanticWork {
+            events: 1,
+            ..SemanticWork::default_limits()
+        })
+        .expect("the event limit is positive");
+        analyze_correlations_with_boolean_bindings(
+            &procedure,
+            bindings.correlation_bindings(),
+            bindings.data_bindings(),
+            bindings.open_bindings(),
+            bindings.correlation_events(),
+            &mut correlation_budget,
+            Some(&cancellation),
+        )
+        .expect("correlation consumes the prepared event inventory");
+        assert_eq!(
+            correlation_budget.used().events,
+            0,
+            "correlation does not rescan semantic events"
         );
     }
 }

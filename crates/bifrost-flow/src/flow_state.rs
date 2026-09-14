@@ -76,7 +76,7 @@ macro_rules! with_control_graph {
             let $graph = semantics;
             $body
         } else {
-            let masked_graph = MaskedProcedureGraph::new(semantics, mask);
+            let masked_graph = ProjectedProcedureGraph::new(semantics, mask);
             let $graph = &masked_graph;
             $body
         }
@@ -3529,6 +3529,7 @@ fn normal_continuation_absence_accepts_written_or_implicit_receiver(
 
 #[derive(Default)]
 struct ModeledControlProjectionDerivation {
+    nonreturning_procedures: HashSet<ProcedureId>,
     omissions: Vec<FlowControlEdgeOmission>,
     file_reasons: Vec<FlowStateIncompleteReason>,
     procedure_reasons: HashMap<ProcedureId, Vec<FlowStateIncompleteReason>>,
@@ -3550,6 +3551,8 @@ impl ModeledControlProjectionDerivation {
     }
 
     fn extend(&mut self, other: Self) {
+        self.nonreturning_procedures
+            .extend(other.nonreturning_procedures);
         self.omissions.extend(other.omissions);
         self.file_reasons.extend(other.file_reasons);
         for (procedure, reasons) in other.procedure_reasons {
@@ -4160,14 +4163,33 @@ fn evaluate_workspace_nonreturn_procedure(
         }
     }
     let mask = ControlEdgeMask::new(semantics, omitted);
-    with_control_graph!(semantics, &mask, |graph| {
+    evaluate_projected_nonreturn(
+        &handle,
+        &mask,
+        &procedure.exact_call_resolutions,
+        &mut procedure.abort_path_user_code,
+        cfg_budget,
+        cancellation,
+    )
+}
+
+fn evaluate_projected_nonreturn(
+    handle: &ProcedureHandle,
+    mask: &ControlEdgeMask,
+    exact_call_resolutions: &HashSet<CallSiteId>,
+    abort_path_user_code: &mut WorkspaceAbortPathUserCode,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+) -> WorkspaceNonreturnEvaluation {
+    let semantics = handle.semantics();
+    with_control_graph!(semantics, mask, |graph| {
         let mut algorithm_request = CfgAlgorithmRequest::new(cfg_budget, cancellation);
         let reachable =
             match forward_reachability(graph, semantics.entry_point(), &mut algorithm_request) {
                 Ok(reachable) => reachable,
                 Err(error) => {
                     return match workspace_nonreturn_cfg_interruption(
-                        &handle,
+                        handle,
                         "fixed-point reachability",
                         error,
                     ) {
@@ -4185,7 +4207,7 @@ fn evaluate_workspace_nonreturn_procedure(
         }
 
         let relevant_implicit_abort_gap_is_reachable = !matches!(
-            procedure.abort_path_user_code,
+            *abort_path_user_code,
             WorkspaceAbortPathUserCode::NotRelevant
         ) && semantics.gaps().iter().any(|gap| {
             gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
@@ -4198,7 +4220,7 @@ fn evaluate_workspace_nonreturn_procedure(
         let abort_paths_run_user_code = if !relevant_implicit_abort_gap_is_reachable {
             false
         } else {
-            match procedure.abort_path_user_code {
+            match *abort_path_user_code {
                 WorkspaceAbortPathUserCode::NotRelevant => false,
                 WorkspaceAbortPathUserCode::Computed(runs_user_code) => runs_user_code,
                 WorkspaceAbortPathUserCode::Uncomputed => {
@@ -4208,13 +4230,13 @@ fn evaluate_workspace_nonreturn_procedure(
                         &mut algorithm_request,
                     ) {
                         Ok(runs_user_code) => {
-                            procedure.abort_path_user_code =
+                            *abort_path_user_code =
                                 WorkspaceAbortPathUserCode::Computed(runs_user_code);
                             runs_user_code
                         }
                         Err(error) => {
                             return match workspace_nonreturn_cfg_interruption(
-                                &handle,
+                                handle,
                                 "abort-path classification",
                                 error,
                             ) {
@@ -4240,14 +4262,14 @@ fn evaluate_workspace_nonreturn_procedure(
                 && !normal_return_gap_is_discharged(
                     semantics,
                     gap,
-                    &procedure.exact_call_resolutions,
+                    exact_call_resolutions,
                     abort_paths_run_user_code,
                 )
         });
         if has_undischarged_gap {
-            // A later callee proof may remove the only route to this gap.
-            // Keep it pending; the reverse-dependency queue will revisit this
-            // procedure only when one of its candidate callees changes state.
+            // A reachable undischarged gap invalidates this candidate. Later
+            // removal of candidate callees can only restore more paths, so
+            // it cannot make this incomplete body non-returning.
             WorkspaceNonreturnEvaluation::Pending
         } else {
             WorkspaceNonreturnEvaluation::Proven
@@ -4289,6 +4311,257 @@ fn derive_workspace_nonreturn_projection(
                 .expect("a validated artifact owns every procedure it lists")
         })
         .collect::<Vec<_>>();
+    derive_nonreturn_projection(
+        &provider,
+        artifact,
+        roots,
+        semantic_budget,
+        cfg_budget,
+        cancellation,
+    )
+}
+
+/// Exact, request-local absent normal continuations for one immutable procedure.
+/// An empty edge inventory is not a proof that every call returns. Consumers
+/// must retain the incomplete reasons when discovery could not finish.
+#[derive(Debug, Clone)]
+pub struct ProcedureContinuationProjection {
+    procedure: ProcedureHandle,
+    normal_return_absent: bool,
+    mask: ControlEdgeMask,
+    reasons: Vec<FlowStateIncompleteReason>,
+}
+
+impl ProcedureContinuationProjection {
+    /// Test providers that stipulate returning calls still use the production
+    /// graph representation. This is not a source-analysis fallback.
+    #[cfg(test)]
+    pub(crate) fn returning_call_fixture(procedure: &ProcedureHandle) -> Self {
+        Self {
+            procedure: procedure.clone(),
+            mask: ControlEdgeMask::default(),
+            normal_return_absent: false,
+            reasons: Vec::new(),
+        }
+    }
+
+    pub fn procedure(&self) -> &ProcedureHandle {
+        &self.procedure
+    }
+
+    pub fn reasons(&self) -> &[FlowStateIncompleteReason] {
+        &self.reasons
+    }
+
+    /// Positive whole-procedure proof for this source or specialized invocation.
+    /// Absence of this certificate does not establish that a body returns.
+    pub fn normal_return_is_absent(&self) -> bool {
+        self.normal_return_absent
+    }
+
+    /// Specialize one invocation using its exact, exhaustive source dispatch
+    /// set. The caller owns the dispatch witness for this call occurrence.
+    /// The returned graph is a separate value; the source projection and any
+    /// other invocation of the same procedure retain their own continuations.
+    pub fn with_nonreturning_source_call(
+        &self,
+        call: &CallSiteHandle,
+        targets: &[&Self],
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Self>, FlowStateIncompleteReason> {
+        assert_eq!(
+            call.procedure(),
+            &self.procedure,
+            "call and projection share exact artifact identity"
+        );
+        if request.cancellation.is_cancelled() {
+            return Err(FlowStateIncompleteReason::Cancelled);
+        }
+        request
+            .budget
+            .charge(SemanticWork {
+                nested_entries: 1 + targets.len(),
+                ..SemanticWork::default()
+            })
+            .map_err(
+                |error| FlowStateIncompleteReason::ModeledControlProjectionIncomplete {
+                    detail: format!(
+                        "contextual continuation target proof exhausted its budget: {error:?}"
+                    ),
+                },
+            )?;
+        let row = self
+            .procedure
+            .semantics()
+            .call_site(call.id())
+            .expect("scoped call exists");
+        if row.invocation_mode != CallInvocationMode::Ordinary
+            || row.execution_timing != crate::analyzer::semantic::ExecutionTiming::SameEvaluation
+            || targets.is_empty()
+            || targets
+                .iter()
+                .any(|target| !target.normal_return_is_absent())
+        {
+            return Ok(None);
+        }
+        request
+            .budget
+            .charge(SemanticWork {
+                nested_entries: self.mask.omitted.len()
+                    + self.reasons.len()
+                    + 2 * self.procedure.semantics().points().len()
+                    + self.procedure.semantics().control_edges().len(),
+                ..SemanticWork::default()
+            })
+            .map_err(
+                |error| FlowStateIncompleteReason::ModeledControlProjectionIncomplete {
+                    detail: format!(
+                        "contextual continuation graph exhausted its budget: {error:?}"
+                    ),
+                },
+            )?;
+        let edge = modeled_normal_control_edge(self.procedure.semantics(), call.id()).map_err(
+            |detail| FlowStateIncompleteReason::ModeledControlProjectionIncomplete { detail },
+        )?;
+        let Some(edge) = edge else {
+            return Ok(None);
+        };
+        // Retain only an already-established whole-body certificate. A new
+        // contextual body proof needs the same return-gap checks as the source
+        // fixed point; graph reachability alone is insufficient.
+        Ok(Some(Self {
+            procedure: self.procedure.clone(),
+            normal_return_absent: self.normal_return_absent,
+            reasons: self.reasons.clone(),
+            mask: ControlEdgeMask::new(
+                self.procedure.semantics(),
+                self.mask.omitted.iter().copied().chain([edge]),
+            ),
+        }))
+    }
+
+    /// Certify this invocation's whole body after contextual call masking.
+    /// The caller supplies exact, exhaustive dispatch witnesses for these
+    /// same-instance calls. Reachable return gaps and exceptional user code
+    /// use the same checks as source fixed-point evaluation.
+    pub fn certify_normal_return_absence(
+        &mut self,
+        exact_calls: &[CallSiteHandle],
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, FlowStateIncompleteReason> {
+        request
+            .budget
+            .charge(SemanticWork {
+                nested_entries: exact_calls.len() + self.procedure.semantics().gaps().len() + 1,
+                ..SemanticWork::default()
+            })
+            .map_err(
+                |error| FlowStateIncompleteReason::ModeledControlProjectionIncomplete {
+                    detail: format!("contextual return proof exhausted its budget: {error:?}"),
+                },
+            )?;
+        let exact = exact_calls
+            .iter()
+            .map(|call| {
+                assert_eq!(
+                    call.procedure(),
+                    &self.procedure,
+                    "exact call belongs to this invocation's artifact"
+                );
+                call.id()
+            })
+            .collect::<HashSet<_>>();
+        let mut cfg_budget =
+            CfgAlgorithmBudget::uniform(request.budget.remaining().nested_entries / 2);
+        let result = evaluate_projected_nonreturn(
+            &self.procedure,
+            &self.mask,
+            &exact,
+            &mut workspace_abort_path_user_code_state(self.procedure.semantics()),
+            &mut cfg_budget,
+            request.cancellation,
+        );
+        let used = cfg_budget.used();
+        request
+            .budget
+            .charge(SemanticWork {
+                nested_entries: used.node_visits + used.edge_visits,
+                ..SemanticWork::default()
+            })
+            .expect("CFG work fits the reserved semantic budget");
+        match result {
+            WorkspaceNonreturnEvaluation::Proven => {
+                self.normal_return_absent = true;
+                Ok(true)
+            }
+            WorkspaceNonreturnEvaluation::Pending => Ok(self.normal_return_absent),
+            WorkspaceNonreturnEvaluation::Cancelled => Err(FlowStateIncompleteReason::Cancelled),
+            WorkspaceNonreturnEvaluation::Incomplete(detail) => Err(
+                FlowStateIncompleteReason::ModeledControlProjectionIncomplete {
+                    detail: detail.to_string(),
+                },
+            ),
+        }
+    }
+
+    /// The same validated control view serves reachability, dominance, loops,
+    /// and lock dataflow without changing source artifact identity.
+    pub fn graph(&self) -> ProjectedProcedureGraph<'_> {
+        ProjectedProcedureGraph::new(self.procedure.semantics(), &self.mask)
+    }
+}
+
+/// Derive source and active-model non-return facts without requiring an external
+/// terminator model to activate source discovery. Both work ledgers belong to
+/// the caller. The provider supplies the caller's captured model snapshot.
+pub fn procedure_continuation_projection(
+    provider: &WorkspaceIcfgProvider<'_>,
+    procedure: &ProcedureHandle,
+    semantic_budget: &mut SemanticBudget,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+) -> ProcedureContinuationProjection {
+    let mut derived = derive_nonreturn_projection(
+        provider,
+        procedure.artifact(),
+        vec![procedure.clone()],
+        semantic_budget,
+        cfg_budget,
+        cancellation,
+    );
+    let mut reasons = derived.file_reasons;
+    reasons.extend(
+        derived
+            .procedure_reasons
+            .remove(&procedure.id())
+            .unwrap_or_default(),
+    );
+    if cancellation.is_cancelled() {
+        reasons.push(FlowStateIncompleteReason::Cancelled);
+    }
+    ProcedureContinuationProjection {
+        procedure: procedure.clone(),
+        normal_return_absent: derived.nonreturning_procedures.contains(&procedure.id()),
+        mask: ControlEdgeMask::new(
+            procedure.semantics(),
+            derived
+                .omissions
+                .into_iter()
+                .filter(|omission| omission.procedure == procedure.id())
+                .map(|omission| omission.edge),
+        ),
+        reasons,
+    }
+}
+
+fn derive_nonreturn_projection(
+    provider: &WorkspaceIcfgProvider<'_>,
+    artifact: &Arc<SemanticArtifact>,
+    roots: Vec<ProcedureHandle>,
+    semantic_budget: &mut SemanticBudget,
+    cfg_budget: &mut CfgAlgorithmBudget,
+    cancellation: &CancellationToken,
+) -> ModeledControlProjectionDerivation {
     let mut scheduled = roots.iter().cloned().collect::<HashSet<_>>();
     let mut pending = roots.into_iter().collect::<VecDeque<_>>();
     let mut procedures = Vec::new();
@@ -4297,7 +4570,7 @@ fn derive_workspace_nonreturn_projection(
             return ModeledControlProjectionDerivation::default();
         }
         let (procedure, callees) = match discover_workspace_nonreturn_procedure(
-            &provider,
+            provider,
             artifact,
             handle,
             semantic_budget,
@@ -4332,8 +4605,17 @@ fn derive_workspace_nonreturn_projection(
         }
     }
 
-    let mut proven = HashSet::default();
-    let mut incomplete = HashSet::default();
+    // Normal termination requires a finite return derivation. Its complement
+    // is a greatest fixed point: begin with candidate non-returning bodies,
+    // then remove any body with a returning path or an incomplete proof.
+    // Removing a callee restores its callers' normal call edges, so every
+    // affected caller must be rechecked. Only the stable set is published.
+    // This proves a recursive group without a base case while preserving any
+    // group from which a normal return or unresolved boundary remains possible.
+    let mut nonreturn = procedures
+        .iter()
+        .map(|procedure| procedure.handle.clone())
+        .collect::<HashSet<_>>();
     let mut incomplete_reasons: HashMap<ProcedureHandle, HashSet<Box<str>>> = HashMap::default();
     let mut evaluation_pending = (0..procedures.len()).collect::<VecDeque<_>>();
     let mut evaluation_queued = vec![true; procedures.len()];
@@ -4343,37 +4625,39 @@ fn derive_workspace_nonreturn_projection(
             return ModeledControlProjectionDerivation::default();
         }
         let handle = procedures[index].handle.clone();
-        if proven.contains(&handle) || incomplete.contains(&handle) {
+        if !nonreturn.contains(&handle) {
             continue;
         }
         match evaluate_workspace_nonreturn_procedure(
             &mut procedures[index],
-            &proven,
+            &nonreturn,
             cfg_budget,
             cancellation,
         ) {
-            WorkspaceNonreturnEvaluation::Proven => {
-                proven.insert(handle.clone());
-                for caller in callers.get(&handle).into_iter().flatten().copied() {
-                    if !evaluation_queued[caller] {
-                        evaluation_queued[caller] = true;
-                        evaluation_pending.push_back(caller);
-                    }
-                }
-            }
+            WorkspaceNonreturnEvaluation::Proven => continue,
             WorkspaceNonreturnEvaluation::Pending => {}
             WorkspaceNonreturnEvaluation::Incomplete(detail) => {
-                incomplete.insert(handle.clone());
-                incomplete_reasons.entry(handle).or_default().insert(detail);
+                incomplete_reasons
+                    .entry(handle.clone())
+                    .or_default()
+                    .insert(detail);
             }
             WorkspaceNonreturnEvaluation::Cancelled => {
                 return ModeledControlProjectionDerivation::default();
+            }
+        }
+        assert!(nonreturn.remove(&handle), "evaluated candidate is present");
+        for caller in callers.get(&handle).into_iter().flatten().copied() {
+            if !evaluation_queued[caller] {
+                evaluation_queued[caller] = true;
+                evaluation_pending.push_back(caller);
             }
         }
     }
     if cancellation.is_cancelled() {
         return ModeledControlProjectionDerivation::default();
     }
+    let proven = nonreturn;
 
     // A dependency failure matters only to callers whose own non-return proof
     // did not complete. Carry the original bounded failure back through those
@@ -4414,6 +4698,11 @@ fn derive_workspace_nonreturn_projection(
     {
         if cancellation.is_cancelled() {
             return ModeledControlProjectionDerivation::default();
+        }
+        if proven.contains(&procedure.handle) {
+            derived
+                .nonreturning_procedures
+                .insert(procedure.handle.id());
         }
         if let Some(reasons) = incomplete_reasons.get(&procedure.handle) {
             let mut reasons = reasons
@@ -5090,7 +5379,7 @@ fn materialize_property_reaching(
     let result = if control_edge_mask.is_empty() {
         provider.property_reaching(snapshot, limits, request.cancellation)
     } else {
-        let graph = MaskedProcedureGraph::new(procedure.semantics(), control_edge_mask);
+        let graph = ProjectedProcedureGraph::new(procedure.semantics(), control_edge_mask);
         derive_property_reaching_over_graph(
             snapshot,
             &graph,
@@ -5526,7 +5815,7 @@ fn derive_relations(
             relations,
         );
     }
-    let graph = MaskedProcedureGraph::new(procedure, control_edge_mask);
+    let graph = ProjectedProcedureGraph::new(procedure, control_edge_mask);
     derive_control_relations(
         &graph,
         procedure,
@@ -5659,22 +5948,18 @@ impl ControlEdgeMask {
     }
 }
 
-struct MaskedProcedureGraph<'a> {
+pub struct ProjectedProcedureGraph<'a> {
     procedure: &'a ProcedureSemantics,
     mask: &'a ControlEdgeMask,
 }
 
-impl<'a> MaskedProcedureGraph<'a> {
+impl<'a> ProjectedProcedureGraph<'a> {
     fn new(procedure: &'a ProcedureSemantics, mask: &'a ControlEdgeMask) -> Self {
-        assert!(
-            !mask.is_empty(),
-            "an empty mask uses the raw procedure graph"
-        );
         Self { procedure, mask }
     }
 }
 
-impl DenseBidirectionalGraph for MaskedProcedureGraph<'_> {
+impl DenseBidirectionalGraph for ProjectedProcedureGraph<'_> {
     type Node = ProgramPointId;
     type Edge = ControlEdgeId;
 
@@ -5697,7 +5982,11 @@ impl DenseBidirectionalGraph for MaskedProcedureGraph<'_> {
         RetainedEdges::new(
             DenseBidirectionalGraph::successors(self.procedure, node),
             &self.mask.omitted,
-            self.mask.omitted_outgoing[node.index()],
+            if self.mask.is_empty() {
+                0
+            } else {
+                self.mask.omitted_outgoing[node.index()]
+            },
         )
     }
 
@@ -5708,7 +5997,11 @@ impl DenseBidirectionalGraph for MaskedProcedureGraph<'_> {
         RetainedEdges::new(
             DenseBidirectionalGraph::predecessors(self.procedure, node),
             &self.mask.omitted,
-            self.mask.omitted_incoming[node.index()],
+            if self.mask.is_empty() {
+                0
+            } else {
+                self.mask.omitted_incoming[node.index()]
+            },
         )
     }
 
@@ -6551,7 +6844,7 @@ func choose(flag bool) int {
             .into_iter()
             .collect::<HashSet<_>>();
         let mask = ControlEdgeMask::new(semantics, omitted.iter().copied());
-        let graph = MaskedProcedureGraph::new(semantics, &mask);
+        let graph = ProjectedProcedureGraph::new(semantics, &mask);
 
         for index in 0..semantics.points().len() {
             let point = ProgramPointId::try_from_index(index).expect("fixture point index fits");
@@ -10900,7 +11193,7 @@ func spawnedDie() {
             ("conditional.value", "conditionalDie(err != nil)", false),
             ("returning.value", "returns()", false),
             ("functionValue.value", "callFunction(fn)", false),
-            ("recursive.value", "recurse()", false),
+            ("recursive.value", "recurse()", true),
             ("spawned.value", "spawnedDie()", false),
         ] {
             let raw_derivation = procedure_containing(&raw, |event| {
@@ -10924,6 +11217,244 @@ func spawnedDie() {
                 projected_derivation.completeness
             );
         }
+    }
+
+    #[test]
+    fn source_continuation_projection_preserves_returning_paths_and_interruptions() {
+        const SOURCE: &str = r#"package sample
+func never() { for {} }
+func returns() {}
+func dead() { never(); value := 1; _ = value }
+func live() { returns(); value := 1; _ = value }
+func cycle() { cycle() }
+func first() { second() }
+func second() { first() }
+func recursiveReturns(stop bool) { if stop { return }; recursiveReturns(stop) }
+func deadCycle() { cycle(); value := 1; _ = value }
+func deadMutual() { first(); value := 1; _ = value }
+func liveCycle(stop bool) { recursiveReturns(stop); value := 1; _ = value }
+func baseFirst(stop bool) { baseSecond(stop) }
+func baseSecond(stop bool) { if stop { return }; baseFirst(stop) }
+func liveMutual(stop bool) { baseFirst(stop); value := 1; _ = value }
+"#;
+        let fixture = Fixture::new(Language::Go, &[("main.go", SOURCE)]);
+        let artifact = fixture.materialized(0).available_value().cloned().unwrap();
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        let cancellation = CancellationToken::default();
+        for (name, call_spelling, absent) in [
+            ("dead", "never()", true),
+            ("live", "returns()", false),
+            ("deadCycle", "cycle()", true),
+            ("deadMutual", "first()", true),
+            ("liveCycle", "recursiveReturns(stop)", false),
+            ("liveMutual", "baseFirst(stop)", false),
+        ] {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap();
+            let call = call_handle_spelled(&procedure, SOURCE, call_spelling);
+            let normal_edge = normal_edge_for_call(&procedure, &call);
+            let projection = procedure_continuation_projection(
+                &provider,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &mut CfgAlgorithmBudget::default(),
+                &cancellation,
+            );
+            assert_eq!(projection.procedure, procedure);
+            assert_eq!(
+                projection.mask.omitted.contains(&normal_edge),
+                absent,
+                "source-only call completion for {name}: {projection:?}"
+            );
+            assert!(projection.reasons.is_empty(), "{projection:?}");
+            let graph = projection.graph();
+            let reachable = forward_reachability(
+                &graph,
+                procedure.semantics().entry_point(),
+                &mut CfgAlgorithmRequest::new(&mut CfgAlgorithmBudget::default(), &cancellation),
+            )
+            .unwrap();
+            assert_eq!(
+                reachable.contains(&graph, procedure.semantics().normal_exit_point()),
+                !absent,
+                "projected reachability must agree with normal completion in {name}"
+            );
+            let dominance = dominators(
+                &graph,
+                procedure.semantics().entry_point(),
+                &mut CfgAlgorithmRequest::new(&mut CfgAlgorithmBudget::default(), &cancellation),
+            )
+            .unwrap();
+            assert_eq!(
+                dominance.dominates(
+                    &graph,
+                    procedure.semantics().entry_point(),
+                    procedure.semantics().normal_exit_point()
+                ),
+                !absent,
+                "dominance must use the same reachable control view in {name}"
+            );
+            let starved = procedure_continuation_projection(
+                &provider,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &mut CfgAlgorithmBudget::uniform(0),
+                &cancellation,
+            );
+            assert!(starved.mask.omitted.is_empty());
+            assert!(
+                !starved.reasons.is_empty(),
+                "budget exhaustion must remain explicit"
+            );
+            let cancelled = CancellationToken::default();
+            cancelled.cancel();
+            let interrupted = procedure_continuation_projection(
+                &provider,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &mut CfgAlgorithmBudget::default(),
+                &cancelled,
+            );
+            assert!(interrupted.mask.omitted.is_empty());
+            assert!(
+                interrupted
+                    .reasons
+                    .contains(&FlowStateIncompleteReason::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_continuation_specialization_keeps_other_calls_reachable() {
+        const SOURCE: &str = r#"package sample
+func never() { for {} }
+func returns() {}
+func invoke(helper func()) { helper() }
+func detached(helper func()) { go helper() }
+"#;
+        let fixture = Fixture::new(Language::Go, &[("main.go", SOURCE)]);
+        let artifact = fixture.materialized(0).available_value().cloned().unwrap();
+        let provider =
+            WorkspaceIcfgProvider::with_active_semantic_model_snapshot(&fixture.workspace, None);
+        let cancellation = CancellationToken::default();
+        let projection = |name: &str| {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap();
+            procedure_continuation_projection(
+                &provider,
+                &procedure,
+                &mut SemanticBudget::default(),
+                &mut CfgAlgorithmBudget::default(),
+                &cancellation,
+            )
+        };
+        let base = projection("invoke");
+        let never = projection("never");
+        let returning = projection("returns");
+        assert!(never.normal_return_is_absent());
+        assert!(!returning.normal_return_is_absent());
+        assert!(!base.normal_return_is_absent());
+        let call = call_handle_spelled(base.procedure(), SOURCE, "helper()");
+        let specialized = base
+            .with_nonreturning_source_call(
+                &call,
+                &[&never],
+                &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+            )
+            .unwrap()
+            .expect("this invocation's exact helper never returns");
+        let mut certified = specialized.clone();
+        assert!(
+            certified
+                .certify_normal_return_absence(
+                    std::slice::from_ref(&call),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                )
+                .unwrap()
+        );
+        assert!(certified.normal_return_is_absent());
+        assert!(!specialized.normal_return_is_absent());
+        let mut returning_context = base.clone();
+        assert!(
+            !returning_context
+                .certify_normal_return_absence(
+                    std::slice::from_ref(&call),
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation),
+                )
+                .unwrap()
+        );
+        for (view, reaches_exit) in [(&specialized, false), (&base, true)] {
+            let graph = view.graph();
+            let reachable = forward_reachability(
+                &graph,
+                view.procedure().semantics().entry_point(),
+                &mut CfgAlgorithmRequest::new(&mut CfgAlgorithmBudget::default(), &cancellation),
+            )
+            .unwrap();
+            assert_eq!(
+                reachable.contains(&graph, view.procedure().semantics().normal_exit_point()),
+                reaches_exit
+            );
+        }
+        for targets in [vec![&returning], vec![&never, &returning], Vec::new()] {
+            assert!(
+                base.with_nonreturning_source_call(
+                    &call,
+                    &targets,
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation)
+                )
+                .unwrap()
+                .is_none(),
+                "every target must carry a nonreturn proof"
+            );
+        }
+        let detached = projection("detached");
+        let spawn = call_handle_spelled(detached.procedure(), SOURCE, "helper()");
+        assert!(
+            detached
+                .with_nonreturning_source_call(
+                    &spawn,
+                    &[&never],
+                    &mut SemanticRequest::new(&mut SemanticBudget::default(), &cancellation)
+                )
+                .unwrap()
+                .is_none(),
+            "a detached callee does not remove its parent's continuation"
+        );
+        assert!(
+            base.with_nonreturning_source_call(
+                &call,
+                &[&never],
+                &mut SemanticRequest::new(&mut SemanticBudget::uniform(1).unwrap(), &cancellation)
+            )
+            .is_err(),
+            "specialization must obey the outer work budget"
+        );
     }
 
     #[test]
@@ -11249,7 +11780,7 @@ func spawnedDie() {
                 .omitted
                 .contains(&inspect_omitted)
         );
-        let masked = MaskedProcedureGraph::new(semantics, &projected_inspect.control_edge_mask);
+        let masked = ProjectedProcedureGraph::new(semantics, &projected_inspect.control_edge_mask);
         for (index, edge) in semantics.control_edges().iter().enumerate() {
             let edge_id = ControlEdgeId::try_from_index(index).expect("fixture edge index fits");
             let expected =

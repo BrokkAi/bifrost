@@ -22,8 +22,9 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
     ClassIdentity, DeclarationSegmentKind, IcfgProvider, IcfgProviderBehaviorIdentity,
     LengthDelimitedDigest, ProcedureHandle, SemanticBudget, SemanticBudgetDimension,
-    SemanticIrVersion, SemanticWork, SourceSpan, StableDigest, TypeFlowAdapter, UnknownReason,
-    WorkspaceIcfgProvider, WorkspaceRelativePath, type_flow_adapter,
+    SemanticBudgetScopeSnapshot, SemanticIrVersion, SemanticWork, SourceSpan, StableDigest,
+    TypeFlowAdapter, UnknownReason, WorkspaceIcfgProvider, WorkspaceRelativePath,
+    type_flow_adapter,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
@@ -97,6 +98,16 @@ enum CachedTypeFlowAnalysis {
     Failed,
 }
 
+#[derive(Clone)]
+struct QueryFieldSlots {
+    index: Arc<FieldSlotIndex>,
+    /// Paid artifact identities from the independently bounded workspace
+    /// prepass and every root solved since it. The query-wide scalar ledger
+    /// can be narrower than that prepass and reject its aggregate charge; root
+    /// children still must not pay those same artifact censuses again.
+    semantic_scope: SemanticBudgetScopeSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootResultPublicationOutcome {
     Continued,
@@ -108,7 +119,7 @@ pub(super) struct TypeFlowQueryState {
     summary_state: brokk_bifrost_flow::type_flow::TypeFlowSummaryState,
     provider_stats_baseline: ValueFlowCacheStatsSnapshot,
     cache: HashMap<TypeFlowCacheKey, CachedTypeFlowAnalysis>,
-    field_slots: HashMap<FieldSlotCacheKey, Option<Arc<FieldSlotIndex>>>,
+    field_slots: HashMap<FieldSlotCacheKey, Option<QueryFieldSlots>>,
     witness_projection_cache:
         HashMap<AbsentMemberWitnessProjectionKey, Option<AbsentMemberWitnessValue>>,
     diagnostics: Vec<CodeQueryDiagnostic>,
@@ -526,7 +537,7 @@ impl TypeFlowQueryState {
             language,
             provider_behavior,
         };
-        let field_slots = match self.field_slots.get(&field_slot_key).cloned() {
+        let query_field_slots = match self.field_slots.get(&field_slot_key).cloned() {
             Some(Some(index)) => index,
             Some(None) => return None,
             None => {
@@ -547,9 +558,15 @@ impl TypeFlowQueryState {
                     provider_behavior,
                     active_semantic_model_snapshot.clone(),
                     &field_slot_cache,
+                    self.value_flow_cache.clone(),
                     &mut field_slot_budget,
                     cancellation,
                 );
+                // Capture the paid identities before consuming the child
+                // charge. Applying its scalar work below can fail when the
+                // query's aggregate accounting limit is intentionally smaller
+                // than this independently bounded whole-workspace prepass.
+                let field_slot_scope = field_slot_budget.scope_snapshot();
                 if semantic_budget
                     .apply_child_charge(
                         SemanticWork::default(),
@@ -619,9 +636,13 @@ impl TypeFlowQueryState {
                                 ),
                             );
                         }
+                        let cached = QueryFieldSlots {
+                            index,
+                            semantic_scope: field_slot_scope,
+                        };
                         self.field_slots
-                            .insert(field_slot_key, Some(Arc::clone(&index)));
-                        index
+                            .insert(field_slot_key.clone(), Some(cached.clone()));
+                        cached
                     }
                     Err(error) => {
                         let code = if matches!(error, TypeFlowPlanError::Cancelled) {
@@ -639,6 +660,7 @@ impl TypeFlowQueryState {
                 }
             }
         };
+        let field_slots = Arc::clone(&query_field_slots.index);
         let cache_key = TypeFlowCacheKey {
             root: procedure.handle.clone(),
             provider_behavior,
@@ -726,9 +748,10 @@ impl TypeFlowQueryState {
                 // semantic budget: the child inherits the artifact identities
                 // the query already paid but starts its scalar ledger at
                 // zero, so one root cannot starve the next.
-                let parent_scope = semantic_budget.scope_snapshot();
-                let mut child_budget =
-                    SemanticBudget::new_child(semantic_budget.limits(), &parent_scope);
+                let mut child_budget = SemanticBudget::new_child(
+                    semantic_budget.limits(),
+                    &query_field_slots.semantic_scope,
+                );
                 let outcome = solve_type_flow_for_root(
                     workspace,
                     adapter,
@@ -742,6 +765,10 @@ impl TypeFlowQueryState {
                     &mut child_budget,
                     &mut request,
                 );
+                // A later root inherits both the workspace census paid by the
+                // prepass and any additional complete artifacts paid here,
+                // even if the query-wide scalar accounting fold is saturated.
+                let root_scope = child_budget.scope_snapshot();
                 // Fold the root's spend back into the query-wide ledger so
                 // later roots inherit the artifact identities this root paid
                 // (the child's charge carries them) and the profile's work
@@ -761,6 +788,13 @@ impl TypeFlowQueryState {
                 {
                     // Accounting-only ceiling saturated; see above.
                 }
+                self.field_slots.insert(
+                    field_slot_key,
+                    Some(QueryFieldSlots {
+                        index: Arc::clone(&field_slots),
+                        semantic_scope: root_scope,
+                    }),
+                );
                 match outcome {
                     Ok(result) => {
                         self.work.summary_cache_hits = self

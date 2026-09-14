@@ -146,6 +146,7 @@ pub(super) fn survey(
     slots: &FieldSlotIndex,
     procedures: &[ProcedureHandle],
     writes: &[PendingDynamicWrite],
+    value_flow_cache: ValueFlowCache,
     budget: &mut SemanticBudget,
     solver_budget: &mut SolverBudget,
     cancellation: &CancellationToken,
@@ -154,7 +155,7 @@ pub(super) fn survey(
     let discovery = WorkspaceValueFlowProvider::with_oracle(
         provider.oracle().clone(),
         provider.behavior_identity(),
-        ValueFlowCache::default(),
+        value_flow_cache,
     );
     let mut effects = writes
         .iter()

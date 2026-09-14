@@ -60,6 +60,9 @@ use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::{GoMemoCaches, GoWorkspaceIndexes};
 use clones::build_go_clone_candidate_data;
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
+pub use semantic::{
+    reference_assertion_payload_type_is_exact, workspace_reference_assertion_accepts_payload,
+};
 pub use type_identity_proof::{
     GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
     GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS,

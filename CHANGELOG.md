@@ -35,6 +35,10 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Python type-flow queries reuse semantic artifacts prepared by field-slot
+  surveys. Binding and correlation refinement share their copy, open-binding,
+  and relevant-event inventories, allowing more fixed-budget analyses to
+  complete without weakening correlated guard results.
 - Local literal tuple index reads retain element classes through aliases.
   Proven tuple mutations evaluate their operands and then follow exceptional
   control flow, preserving handlers and cleanup without impossible stores.

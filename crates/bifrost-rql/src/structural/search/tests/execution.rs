@@ -4133,6 +4133,114 @@ func storeIndex(target []*os.File, path string) {
 }
 
 #[test]
+fn go_assertion_payload_workspace_proof_requires_current_source_and_budget() {
+    use crate::analyzer::semantic::{SemanticOutcome, TransferKind, ValueTransfer};
+    use crate::analyzer::workspace_reference_assertion_accepts_payload;
+
+    for (asserted, expected) in [("*Cell", true), ("*Other", false)] {
+        let source = format!(
+            "package p\ntype Cell struct {{ n int }}\ntype Other struct {{ n int }}\nfunc f() {{ shared := &Cell{{}}; var boxed any = shared; _ = boxed.({asserted}); boxed = &Other{{}} }}\n"
+        );
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", &source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("main.go");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Go artifact");
+        let artifact = outcome.available_value().expect("available artifact");
+        let mut payload = None;
+        let mut assertion = None;
+        for procedure in artifact.procedures() {
+            let handle = artifact.procedure_handle(procedure.id()).unwrap();
+            for event in procedure.points().iter().flat_map(|point| &point.events) {
+                match event.effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceBoxing,
+                        source,
+                        ..
+                    } if payload.is_none() => {
+                        payload = handle.value_handle(source);
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind:
+                            ValueFlowKind::Transfer(ValueTransfer {
+                                kind: TransferKind::Unboxing,
+                                ..
+                            }),
+                        target,
+                        ..
+                    } => assertion = handle.value_handle(target),
+                    _ => {}
+                }
+            }
+        }
+        let payload = payload.expect("boxed payload");
+        let assertion = assertion.expect("mutable-interface assertion requires a query");
+        let mut budget = SemanticBudget::default();
+        let outcome = workspace_reference_assertion_accepts_payload(
+            &workspace,
+            &assertion,
+            &payload,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, SemanticOutcome::Complete { value, .. } if value == expected),
+            "{outcome:?}"
+        );
+        assert_eq!(budget.used(), outcome.work(), "all query work is charged");
+        assert_eq!(outcome.work().source_bytes, source.len());
+        assert!(outcome.work().nested_entries > 0);
+
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = 1;
+        let mut bounded = SemanticBudget::new(limits).unwrap();
+        assert!(matches!(
+            workspace_reference_assertion_accepts_payload(
+                &workspace,
+                &assertion,
+                &payload,
+                &mut SemanticRequest::new(&mut bounded, &cancellation),
+            )
+            .unwrap(),
+            SemanticOutcome::ExceededBudget { .. }
+        ));
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            workspace_reference_assertion_accepts_payload(
+                &workspace,
+                &assertion,
+                &payload,
+                &mut SemanticRequest::new(&mut budget, &cancelled),
+            )
+            .unwrap(),
+            SemanticOutcome::Cancelled { .. }
+        ));
+
+        file.write("package p\nfunc replacement() {}\n").unwrap();
+        let changed_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        assert!(
+            workspace_reference_assertion_accepts_payload(
+                &changed_workspace,
+                &assertion,
+                &payload,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .is_err(),
+            "stale handles must not read the new source at old offsets"
+        );
+    }
+}
+
+#[test]
 fn go_defer_capture_is_not_a_direct_assignment_conversion() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -7024,6 +7132,235 @@ func summarizedRecursiveAtomic() {
     go recursiveAtomicWrite(&value, 3)
     _ = atomic.LoadInt64(&value)
 }
+func effectFreeRecursiveLeaf() {}
+func effectFreeRecursiveHelper() { effectFreeRecursiveLeaf() }
+func recursiveAtomicWithHelper(value *int64, depth int) {
+    effectFreeRecursiveHelper()
+    effectFreeRecursiveHelper()
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWithHelper(value, depth-1) }
+}
+func summarizedRecursiveAtomicWithHelper() {
+    var value int64
+    go recursiveAtomicWithHelper(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+type continuationCell struct { value int }
+func returningContinuationWrite(cell *continuationCell) {
+    effectFreeRecursiveHelper()
+    cell.value = 1
+}
+func nonReturningContinuationWrite(cell *continuationCell) {
+    nonReturningRecursiveHelper()
+    cell.value = 1
+}
+func returningContinuationRoot() {
+    cell := &continuationCell{}
+    go returningContinuationWrite(cell)
+    _ = cell.value
+}
+func nonReturningContinuationRoot() {
+    cell := &continuationCell{}
+    go nonReturningContinuationWrite(cell)
+    _ = cell.value
+}
+func earlyContinuationWrite(cell *continuationCell) {
+    cell.value = 1
+    nonReturningRecursiveHelper()
+}
+func earlyContinuationRoot() {
+    cell := &continuationCell{}
+    go earlyContinuationWrite(cell)
+    _ = cell.value
+}
+func unreachableSpawnContinuationRoot() {
+    cell := &continuationCell{}
+    nonReturningRecursiveHelper()
+    go returningContinuationWrite(cell)
+    _ = cell.value
+}
+func conditionalContinuationWrite(cell *continuationCell, stop bool) {
+    if stop { nonReturningRecursiveHelper() }
+    cell.value = 1
+}
+func conditionalContinuationRoot(stop bool) {
+    cell := &continuationCell{}
+    go conditionalContinuationWrite(cell, stop)
+    _ = cell.value
+}
+func cyclicContinuationWrite(cell *continuationCell) {
+    cyclicEmptyHelper()
+    cell.value = 1
+}
+func cyclicContinuationRoot() {
+    cell := &continuationCell{}
+    go cyclicContinuationWrite(cell)
+    _ = cell.value
+}
+func callbackContinuationWrite(cell *continuationCell, helper func()) {
+    helper()
+    cell.value = 1
+}
+func callbackReturningContinuationRoot() {
+    cell := &continuationCell{}
+    go callbackContinuationWrite(cell, effectFreeRecursiveHelper)
+    _ = cell.value
+}
+func callbackMixedContinuationRoot() {
+    cell := &continuationCell{}
+    go callbackContinuationWrite(cell, nonReturningRecursiveHelper)
+    go callbackContinuationWrite(cell, effectFreeRecursiveHelper)
+    _ = cell.value
+}
+func callbackNonReturningContinuationRoot() {
+    cell := &continuationCell{}
+    go callbackContinuationWrite(cell, nonReturningRecursiveHelper)
+    _ = cell.value
+}
+func invokeContinuationHelper(helper func()) { helper() }
+func wrappedCallbackContinuationWrite(cell *continuationCell, helper func()) {
+    invokeContinuationHelper(helper)
+    cell.value = 1
+}
+func wrappedCallbackReturningContinuationRoot() {
+    cell := &continuationCell{}
+    go wrappedCallbackContinuationWrite(cell, effectFreeRecursiveHelper)
+    _ = cell.value
+}
+func wrappedCallbackNonReturningContinuationRoot() {
+    cell := &continuationCell{}
+    go wrappedCallbackContinuationWrite(cell, nonReturningRecursiveHelper)
+    _ = cell.value
+}
+func wrappedCallbackMixedContinuationRoot() {
+    cell := &continuationCell{}
+    go wrappedCallbackContinuationWrite(cell, nonReturningRecursiveHelper)
+    go wrappedCallbackContinuationWrite(cell, effectFreeRecursiveHelper)
+    _ = cell.value
+}
+func replacedCallbackContinuationWrite(cell *continuationCell, helper func()) {
+    helper = effectFreeRecursiveHelper
+    invokeContinuationHelper(helper)
+    cell.value = 1
+}
+func replacedCallbackContinuationRoot() {
+    cell := &continuationCell{}
+    go replacedCallbackContinuationWrite(cell, nonReturningRecursiveHelper)
+    _ = cell.value
+}
+func callbackLoopSpawn(cell *continuationCell, helper func()) {
+    for {
+        go func() { cell.value = 1 }()
+        helper()
+    }
+}
+func callbackReturningLoopSpawnRoot() {
+    cell := &continuationCell{}
+    go callbackLoopSpawn(cell, effectFreeRecursiveHelper)
+}
+func callbackNonReturningLoopSpawnRoot() {
+    cell := &continuationCell{}
+    go callbackLoopSpawn(cell, nonReturningRecursiveHelper)
+}
+type continuationHolder struct { child *continuationCell }
+func unreachableFieldReplacementRoot() {
+    shared := &continuationCell{}
+    holder := &continuationHolder{child: shared}
+    go func() { holder.child.value = 1 }()
+    _ = shared.value
+    nonReturningRecursiveHelper()
+    holder.child = &continuationCell{}
+}
+func unreachableFieldAliasRoot() {
+    shared := &continuationCell{}
+    holder := &continuationHolder{child: &continuationCell{}}
+    go func() { holder.child.value = 1 }()
+    _ = shared.value
+    nonReturningRecursiveHelper()
+    holder.child = shared
+}
+func unreachableBoxReplacementRoot() {
+    shared := &continuationCell{}
+    var boxed any = shared
+    go func() { boxed.(*continuationCell).value = 1 }()
+    _ = shared.value
+    nonReturningRecursiveHelper()
+    boxed = &continuationCell{}
+}
+func unreachableBoxAliasRoot() {
+    shared := &continuationCell{}
+    var boxed any = &continuationCell{}
+    go func() { boxed.(*continuationCell).value = 1 }()
+    _ = shared.value
+    nonReturningRecursiveHelper()
+    boxed = shared
+}
+func nonReturningRecursiveHelper() { for {} }
+func recursiveAtomicAfterNonReturningHelper(value *int64, depth int) {
+    nonReturningRecursiveHelper()
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicAfterNonReturningHelper(value, depth-1) }
+}
+func summarizedRecursiveNonReturningHelper() {
+    var value int64
+    go recursiveAtomicAfterNonReturningHelper(&value, 3)
+    _ = value
+}
+func cyclicEmptyHelper() { cyclicEmptyHelper() }
+func recursiveAtomicAfterCyclicHelper(value *int64, depth int) {
+    cyclicEmptyHelper()
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicAfterCyclicHelper(value, depth-1) }
+}
+func summarizedRecursiveCyclicHelper() {
+    var value int64
+    go recursiveAtomicAfterCyclicHelper(&value, 3)
+    _ = value
+}
+func mutatingRecursiveHelper(value *int64) { *value = 2 }
+func recursiveAtomicWithMutatingHelper(value *int64, depth int) {
+    mutatingRecursiveHelper(value)
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWithMutatingHelper(value, depth-1) }
+}
+func summarizedRecursiveAtomicWithMutatingHelper() {
+    var value int64
+    go recursiveAtomicWithMutatingHelper(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+func unresolvedRecursiveHelper() { missingRecursiveHelper() }
+func recursiveAtomicWithUnknownHelper(value *int64, depth int) {
+    unresolvedRecursiveHelper()
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWithUnknownHelper(value, depth-1) }
+}
+func summarizedRecursiveAtomicWithUnknownHelper() {
+    var value int64
+    go recursiveAtomicWithUnknownHelper(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+func recursiveAtomicWithDeferredHelper(value *int64, depth int) {
+    defer effectFreeRecursiveHelper()
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWithDeferredHelper(value, depth-1) }
+}
+func summarizedRecursiveAtomicWithDeferredHelper() {
+    var value int64
+    go recursiveAtomicWithDeferredHelper(&value, 3)
+    _ = atomic.LoadInt64(&value)
+}
+func publishingRecursiveHelper(value *int64, queue chan *int64) { queue <- value }
+func recursiveAtomicWithPublishingHelper(value *int64, queue chan *int64, depth int) {
+    publishingRecursiveHelper(value, queue)
+    atomic.StoreInt64(value, 1)
+    if depth > 0 { recursiveAtomicWithPublishingHelper(value, queue, depth-1) }
+}
+func summarizedRecursiveAtomicWithPublishingHelper() {
+    var value int64
+    queue := make(chan *int64, 4)
+    go recursiveAtomicWithPublishingHelper(&value, queue, 3)
+    _ = atomic.LoadInt64(&value)
+}
 func summarizedRecursiveMixedAtomic() {
     var value int64
     go recursiveAtomicWrite(&value, 3)
@@ -7518,7 +7855,7 @@ func unsupportedOnce() int {
             &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
         )
         .expect("atomic wrappers project");
-    let recursive_root = procedure("summarizedRecursiveAtomic");
+    let recursive_root = procedure("summarizedRecursiveAtomicWithHelper");
     let mut address_mutex_budget = crate::analyzer::semantic::SemanticBudget::default();
     let address_mutex_report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
         &direct_provider,
@@ -7686,9 +8023,19 @@ func unsupportedOnce() int {
     );
     for (name, expected_protection) in [
         (
+            "summarizedRecursiveAtomic",
+            Some(brokk_bifrost_flow::concurrency::ConcurrentProtection::AtomicOnly),
+        ),
+        (
             "summarizedRecursiveMixedAtomic",
             Some(brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected),
         ),
+        ("summarizedRecursiveNonReturningHelper", None),
+        ("summarizedRecursiveCyclicHelper", None),
+        ("summarizedRecursiveAtomicWithMutatingHelper", None),
+        ("summarizedRecursiveAtomicWithPublishingHelper", None),
+        ("summarizedRecursiveAtomicWithUnknownHelper", None),
+        ("summarizedRecursiveAtomicWithDeferredHelper", None),
         ("summarizedRecursiveChangingAtomic", None),
         ("summarizedRecursiveUnknownAtomic", None),
     ] {
@@ -7727,7 +8074,15 @@ func unsupportedOnce() int {
                             == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
                         && conflict.protection == protection
                 }),
-                "atomic recursion does not protect an ordinary read in {name}: {report:#?}"
+                "recursive inventory must close with {protection:?} protection in {name}: {report:#?}"
+            );
+        } else if matches!(
+            name,
+            "summarizedRecursiveNonReturningHelper" | "summarizedRecursiveCyclicHelper"
+        ) {
+            assert!(
+                report.conflicts.is_empty() && report.reasons.is_empty(),
+                "unreachable recursive accesses require no conflict or missing inventory: {report:#?}"
             );
         } else {
             assert!(
@@ -7736,6 +8091,113 @@ func unsupportedOnce() int {
                 ) && report.conflicts.iter().all(|conflict| !conflict.exhaustive),
                 "changing objects or unresolved calls cannot use an invariant certificate in {name}: {report:#?}"
             );
+        }
+    }
+    for (name, expected_race) in [
+        ("returningContinuationRoot", true),
+        ("nonReturningContinuationRoot", false),
+        ("earlyContinuationRoot", true),
+        ("unreachableSpawnContinuationRoot", false),
+        ("conditionalContinuationRoot", true),
+        ("cyclicContinuationRoot", false),
+        ("callbackReturningContinuationRoot", true),
+        ("callbackMixedContinuationRoot", true),
+        ("callbackNonReturningContinuationRoot", false),
+        ("wrappedCallbackReturningContinuationRoot", true),
+        ("wrappedCallbackNonReturningContinuationRoot", false),
+        ("wrappedCallbackMixedContinuationRoot", true),
+        ("replacedCallbackContinuationRoot", true),
+        ("callbackReturningLoopSpawnRoot", true),
+        ("callbackNonReturningLoopSpawnRoot", false),
+        ("unreachableFieldReplacementRoot", true),
+        ("unreachableFieldAliasRoot", false),
+        ("unreachableBoxReplacementRoot", true),
+        ("unreachableBoxAliasRoot", false),
+    ] {
+        let root = procedure(name);
+        let projection =
+            brokk_bifrost_flow::concurrency::ConcurrencyProvider::continuation_projection(
+                &direct_provider,
+                &root,
+                &mut crate::analyzer::semantic::SemanticRequest::new(
+                    &mut crate::analyzer::semantic::SemanticBudget::default(),
+                    &cancellation,
+                ),
+            )
+            .expect("workspace provider supplies control projection");
+        assert_eq!(projection.procedure(), &root);
+        assert!(projection.reasons().is_empty(), "{projection:?}");
+        let projected_summaries =
+            brokk_bifrost_flow::typestate::project_production_semantic_summaries_with_concurrency(
+                std::slice::from_ref(&root),
+                &icfg,
+                &direct_provider,
+                &mut crate::analyzer::semantic::SemanticRequest::new(
+                    &mut crate::analyzer::semantic::SemanticBudget::default(),
+                    &cancellation,
+                ),
+            )
+            .expect("continuation control summaries project");
+        let summary_provider = super::super::concurrency::WorkspaceConcurrencyProvider::new(
+            &workspace,
+            Some(snapshot.clone()),
+            Some(projected_summaries),
+        );
+        for provider in [&summary_provider, &direct_provider] {
+            let mut control_budget = crate::analyzer::semantic::SemanticBudget::default();
+            let report = brokk_bifrost_flow::concurrency::concurrent_access_conflicts(
+                provider,
+                &root,
+                &mut crate::analyzer::semantic::SemanticRequest::new(
+                    &mut control_budget,
+                    &cancellation,
+                ),
+            )
+            .expect("call-continuation control computes");
+            if matches!(
+                name,
+                "callbackMixedContinuationRoot" | "wrappedCallbackMixedContinuationRoot"
+            ) {
+                assert_eq!(
+                    report.conflicts.len(),
+                    1,
+                    "only the returning invocation writes the shared field: {report:#?}"
+                );
+            }
+            if matches!(
+                name,
+                "unreachableFieldAliasRoot" | "unreachableBoxAliasRoot"
+            ) {
+                assert!(report.reasons.is_empty() && report.conflicts.iter().all(|conflict|
+                    conflict.proven && conflict.exhaustive && conflict.ordering == brokk_bifrost_flow::concurrency::ConcurrentOrdering::HappensBefore
+                ), "an unreachable store must not alias distinct objects: {report:#?}");
+                continue;
+            }
+            if name == "replacedCallbackContinuationRoot" {
+                assert!(
+                    !report.conflicts.is_empty(),
+                    "replacing the helper must not reuse its incoming nonreturn proof: {report:#?}"
+                );
+                continue;
+            }
+            if expected_race {
+                assert!(
+                    report.conflicts.iter().any(|conflict| {
+                        conflict.proven
+                        && conflict.exhaustive
+                        && conflict.ordering
+                            == brokk_bifrost_flow::concurrency::ConcurrentOrdering::Unordered
+                        && conflict.protection
+                            == brokk_bifrost_flow::concurrency::ConcurrentProtection::Unprotected
+                    }),
+                    "returning helper preserves the reachable race in {name}: {report:#?}"
+                );
+            } else {
+                assert!(
+                    report.conflicts.is_empty() && report.reasons.is_empty(),
+                    "a write after a non-returning helper is unreachable in {name}: {report:#?}"
+                );
+            }
         }
     }
     let atomic_count = summaries.summaries().iter().flat_map(|summary| summary.effects())
@@ -9533,6 +9995,93 @@ fn go_heap_identity_keeps_alternative_unknown_inputs_open() {
     assert_no_proven_conflicts_with_explicit_evidence(&result);
 }
 
+#[test]
+fn go_heap_identity_uses_invocation_control_for_reference_results() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func never() { for {} }
+func neverSelect() { select {} }
+func defaultSelect() { select { default: } }
+func resultDefaultSelect(stop bool) {
+    shared := &cell{}
+    chosen := selectShared(stop, defaultSelect, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func resultReceivingSelect(stop bool, ready <-chan int) {
+    shared := &cell{}
+    chosen := selectShared(stop, func() { select { case <-ready: } }, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func selectShared(stop bool, wait func(), shared *cell) *cell {
+    if stop { wait(); return &cell{} }
+    return shared
+}
+func selectDistinct(stop bool, wait func(), shared *cell) *cell {
+    if stop { wait(); return shared }
+    return &cell{}
+}
+func resultReachableShared(stop bool) {
+    shared := &cell{}
+    chosen := selectShared(stop, never, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func resultReachableDistinct(stop bool) {
+    shared := &cell{}
+    chosen := selectDistinct(stop, never, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func selectReachableShared(stop bool) {
+    shared := &cell{}
+    chosen := selectShared(stop, neverSelect, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func selectReachableDistinct(stop bool) {
+    shared := &cell{}
+    chosen := selectDistinct(stop, neverSelect, shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+func selectOnlyShared(shared *cell) *cell { return shared }
+func resultSharedControl() {
+    shared := &cell{}
+    chosen := selectOnlyShared(shared)
+    go func() { chosen.n = 1 }()
+    shared.n = 2
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let control = go_invocation_conflicts(&workspace, "resultSharedControl");
+    assert_proven_unordered_unprotected_conflict(&control, "simple pointer-return control");
+    let distinct = go_invocation_conflicts(&workspace, "resultReachableDistinct");
+    assert_no_proven_unordered_unprotected_conflicts(&distinct);
+    let select_distinct = go_invocation_conflicts(&workspace, "selectReachableDistinct");
+    assert_no_proven_unordered_unprotected_conflicts(&select_distinct);
+    for name in ["resultDefaultSelect", "resultReceivingSelect"] {
+        let returning = go_invocation_conflicts(&workspace, name);
+        assert_no_proven_conflicts_with_explicit_evidence(&returning);
+    }
+    let select_shared = go_invocation_conflicts(&workspace, "selectReachableShared");
+    assert_proven_unordered_unprotected_conflict(
+        &select_shared,
+        "an empty select never resumes the competing return",
+    );
+    let shared = go_invocation_conflicts(&workspace, "resultReachableShared");
+    assert_proven_unordered_unprotected_conflict(
+        &shared,
+        "a return after the bound nonreturning callback cannot compete with the shared result",
+    );
+}
+
 /// Each repeated child calls the factory for its own cell before writing it.
 /// The result allocations must stay disjoint; an unresolved result may remain
 /// open, but a result-identity mistake must not become a proven race.
@@ -9733,6 +10282,141 @@ fn go_channel_transport_publishes_its_payload() {
         }),
         "a pointer sent through a channel is the same object on both sides: {result:#?}"
     );
+}
+
+#[test]
+fn go_channel_transport_ignores_only_unreachable_publication() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func never() { for {} }
+func publish(ch chan *cell)
+func maybePublish(stop bool, wait func(), ch chan *cell) {
+    if stop { wait(); publish(ch) }
+}
+func sharedControl() {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    ch <- shared
+    go func() { chosen := <-ch; chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func unreachablePublication(stop bool) {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    maybePublish(stop, never, ch)
+    ch <- shared
+    go func() { chosen := <-ch; chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func distinctAfterUnreachablePublication(stop bool) {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    maybePublish(stop, never, ch)
+    ch <- &cell{}
+    go func() { chosen := <-ch; chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func rootUnreachablePublication(stop bool) {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    if stop { never(); publish(ch) }
+    ch <- shared
+    go func() { chosen := <-ch; chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func rootReachablePublication(stop bool) {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    if stop { publish(ch) }
+    ch <- shared
+    go func() { chosen := <-ch; chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let control = go_invocation_conflicts(&workspace, "sharedControl");
+    assert_proven_unordered_unprotected_conflict(&control, "closed channel transport control");
+    for root in [
+        "rootReachablePublication",
+        "distinctAfterUnreachablePublication",
+    ] {
+        let negative = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_unordered_unprotected_conflicts(&negative);
+    }
+    for root in ["rootUnreachablePublication", "unreachablePublication"] {
+        let positive = go_invocation_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(
+            &positive,
+            "a publication after a proven nonreturning call cannot escape the channel",
+        );
+    }
+}
+
+#[test]
+fn go_channel_received_capture_preserves_payload_type_and_identity() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"package main
+type cell struct { n int }
+func write(c *cell) { c.n = 1 }
+func parameterControl() {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    ch <- shared
+    chosen := <-ch
+    go write(chosen)
+    go func() { shared.n = 2 }()
+}
+func inferredCapture() {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    ch <- shared
+    chosen := <-ch
+    go func() { chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func typedCapture() {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    ch <- shared
+    var chosen *cell = <-ch
+    go func() { chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func distinctCapture() {
+    shared := &cell{}
+    ch := make(chan *cell, 1)
+    ch <- &cell{}
+    chosen := <-ch
+    go func() { chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+func valueCapture() {
+    shared := cell{}
+    ch := make(chan cell, 1)
+    ch <- shared
+    chosen := <-ch
+    go func() { chosen.n = 1 }()
+    go func() { shared.n = 2 }()
+}
+"#,
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for root in ["distinctCapture", "valueCapture"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_no_proven_unordered_unprotected_conflicts(&result);
+    }
+    for root in ["parameterControl", "typedCapture", "inferredCapture"] {
+        let result = go_invocation_conflicts(&workspace, root);
+        assert_proven_unordered_unprotected_conflict(&result, root);
+    }
 }
 
 #[test]
@@ -12795,6 +13479,11 @@ func callerAfter(cb func()) {
     go func() { func() { n = 1 }(); cb() }()
     go func() { func() { n = 2 }(); cb() }()
 }
+func mixedLocalPoints(cb func()) {
+    n := 0
+    go func() { n = 1; invoke(cb); _ = n }()
+    go func() { n = 2; invoke(cb); _ = n }()
+}
 "#,
         )
         .build();
@@ -12827,6 +13516,32 @@ func callerAfter(cb func()) {
             "retain the open conflict and its source uncertainty: {name}: {result:#?}"
         );
     }
+    let mixed = go_invocation_conflicts(&workspace, "mixedLocalPoints");
+    assert!(
+        mixed.results.iter().any(|item| matches!(
+            &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.verdict == "conflict" && value.proof == "proven"
+                && value.first_access == "write" && value.second_access == "write"
+        )),
+        "writes before the callback remain proven: {mixed:#?}"
+    );
+    assert!(
+        mixed.results.iter().any(|item| matches!(
+            &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.verdict == "conflict" && value.proof == "open"
+                && (value.first_access == "read" || value.second_access == "read")
+                && value.reasons.iter().any(|reason| reason == "unresolved_target")
+        )),
+        "later reads in the same activation retain unknown effects: {mixed:#?}"
+    );
+    assert!(
+        !mixed.results.iter().any(|item| matches!(
+            &item.value, CodeQueryResultValue::ConcurrentAccessConflict { value }
+            if value.verdict == "conflict" && value.proof == "proven"
+                && (value.first_access == "read" || value.second_access == "read")
+        )),
+        "common caller reuse must not reuse an earlier local access point: {mixed:#?}"
+    );
 }
 
 #[test]
@@ -18029,6 +18744,107 @@ fn class_set_roots_do_not_inherit_each_others_semantic_spend() {
     let type_flow = profile.work.semantic.type_flow;
     assert_eq!(type_flow.solves, 2, "{type_flow:#?}");
     assert_eq!(type_flow.failed_solves, 0, "{type_flow:#?}");
+}
+
+/// The whole-workspace field-slot prepass has its own finite budget and can
+/// pay artifacts that the query's selected structural rows did not visit. If
+/// its aggregate scalar charge is larger than the query ledger, the root must
+/// still inherit those paid identities instead of buying the same artifact
+/// census again from its smaller child budget.
+#[test]
+fn class_set_root_inherits_artifacts_paid_by_the_field_slot_prepass() {
+    let unrelated = (0..128)
+        .map(|index| format!("def unrelated_{index}():\n    return {index}\n"))
+        .collect::<String>();
+    let helper = format!(
+        "def mutate(value, name):\n    setattr(value, name, 1)\n\n\
+         def normalize(value):\n    return value.strip()\n{unrelated}"
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            concat!(
+                "from helper import mutate, normalize\n\n",
+                "def read_config():\n",
+                "    value = 123\n",
+                "    mutate(value, 'extra')\n",
+                "    return normalize(value)\n",
+            ),
+        )
+        .file("helper.py", &helper)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    activate_type_flow_builtins(&workspace);
+
+    let cancellation = CancellationToken::default();
+    let mut measurement_budget = SemanticBudget::default();
+    let helper_artifact = workspace
+        .materialize_program_semantics(
+            &project.file("helper.py"),
+            &mut SemanticRequest::new(&mut measurement_budget, &cancellation),
+        )
+        .expect("helper semantics materialize")
+        .available_value()
+        .cloned()
+        .expect("helper artifact remains available");
+    let event_cap = helper_artifact
+        .work()
+        .events
+        .checked_sub(1)
+        .expect("inflated helper owns more than one event");
+
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "languages": ["python"],
+        "where": ["app.py"],
+        "match": { "kind": "function", "name": "read_config" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "class_set" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("profile query");
+    let response = execute_workspace_request_with_limits(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+        CodeQueryExecutionLimits {
+            semantic: CodeQuerySemanticLimits {
+                rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                    if dimension == SemanticBudgetDimension::Events {
+                        event_cap
+                    } else {
+                        1 << 20
+                    }
+                })),
+                ..CodeQuerySemanticLimits::default()
+            },
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let CodeQueryResponse::Profile(profile) = response else {
+        panic!("a profile-mode query returns its profile: {response:#?}");
+    };
+    assert!(
+        profile.result.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        }),
+        "the root does not repay the helper artifact: {profile:#?}"
+    );
+    assert!(
+        profile.result.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::ClassSetRow { value }
+                if value.member == "strip"
+                    && value.class.as_deref() == Some("builtins.int")
+                    && value.status == "known")
+        }),
+        "the bounded root still classifies its cross-file receiver: {profile:#?}"
+    );
+    assert!(
+        profile.work.semantic.type_flow.snapshot_cache_hits > 0,
+        "the root reuses snapshots prepared by the dynamic-write prepass: {profile:#?}"
+    );
 }
 
 /// #2956: a root whose own child ledger cannot fund its solve reports the

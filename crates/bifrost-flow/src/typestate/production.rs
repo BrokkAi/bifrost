@@ -1387,6 +1387,10 @@ fn project_production_semantic_summaries_with_behavior<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
+    // One control-query ledger spans the whole projection. Recreating it for
+    // each source dominance question discards the complete graph facts.
+    let mut control_request = crate::concurrency::SolveRequest::raw(request);
+    let request = &mut control_request;
     let publication_mode = if publication_provider.is_some() {
         ProductionPublicationMode::Witnessed
     } else {
@@ -1703,7 +1707,7 @@ fn project_modeled_call_effects(
     procedure: &ProcedureHandle,
     call: &SemanticCallSite,
     provider: &dyn ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut crate::concurrency::SolveRequest<'_, '_>,
     effects: &mut Vec<SummaryEffect>,
 ) -> Result<(), ProductionSummaryProjectionError> {
     if call.execution_timing != crate::analyzer::semantic::ExecutionTiming::SameEvaluation {
@@ -1930,7 +1934,7 @@ fn project_direct_concurrency_effects(
     procedure: &ProcedureHandle,
     publication_provider: Option<&dyn HeapOracle>,
     behavior: SummaryBehaviorKey,
-    request: &mut SemanticRequest<'_>,
+    request: &mut crate::concurrency::SolveRequest<'_, '_>,
 ) -> Result<Vec<SummaryEffect>, ProductionSummaryProjectionError> {
     let semantics = procedure.semantics();
     let mut effects = Vec::new();
@@ -2271,7 +2275,7 @@ pub(crate) fn direct_concurrency_modeled_subject_path(
     call: &SemanticCallSite,
     subject: ValueId,
     provider: &dyn ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut crate::concurrency::SolveRequest<'_, '_>,
 ) -> Result<DirectConcurrencyPath, ProductionSummaryProjectionError> {
     let direct = direct_concurrency_value_path(procedure, subject);
     if matches!(direct, DirectConcurrencyPath::Boundary(_)) {
@@ -2410,7 +2414,7 @@ fn direct_concurrency_synchronization_path(
     event_index: usize,
     subject: ValueId,
     operation: SynchronizationOperation,
-    request: &mut SemanticRequest<'_>,
+    request: &mut crate::concurrency::SolveRequest<'_, '_>,
 ) -> Result<DirectConcurrencyPath, ProductionSummaryProjectionError> {
     let direct = direct_concurrency_value_path(procedure, subject);
     // Parameter and receiver subjects already have stable boundary ports. A
@@ -2514,7 +2518,7 @@ fn production_point_dominates(
     procedure: &ProcedureHandle,
     candidate: ProgramPointId,
     target: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut crate::concurrency::SolveRequest<'_, '_>,
 ) -> Result<bool, ProductionSummaryProjectionError> {
     match crate::concurrency::point_dominates(procedure, candidate, target, request) {
         Ok(dominates) => Ok(dominates),

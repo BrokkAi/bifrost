@@ -4,8 +4,10 @@
 //! heap, and reviewed API-model answers enter through [`ConcurrencyProvider`]
 //! so this crate does not depend on an analyzer implementation.
 
+mod control;
 mod publication;
 
+use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 
@@ -15,7 +17,7 @@ use crate::analyzer::semantic::{
     IndexedLocationIdentity, MemoryAccessKind, MemoryLocationId, MemoryLocationKind,
     MemoryValueCopy, ProcedureHandle, ProgramPointId, SemanticEffect, SemanticGap,
     SemanticGapImpact, SemanticProviderError, SemanticRequest, SourceMappingId,
-    SynchronizationPayload, SynchronizationPayloadCopy, ValueId,
+    SynchronizationPayload, SynchronizationPayloadCopy, ValueHandle, ValueId,
 };
 use crate::dataflow::validate_recursive_summary_batch;
 use crate::dataflow::{
@@ -452,6 +454,7 @@ pub enum ConcurrencyOpenReason {
     UnknownPublication,
     AmbiguousSynchronization,
     UnsupportedSynchronization(Box<str>),
+    IncompleteControlFlow(Box<str>),
     RecursiveExpansion,
     BudgetExhausted,
     /// A producer walked this procedure and recorded that it did not model
@@ -557,6 +560,16 @@ pub struct ResolvedMemberDeclaration {
 
 /// Exact workspace answers consumed by the task-slice solver.
 pub trait ConcurrencyProvider {
+    /// Exact absent continuations for the requested immutable procedure.
+    /// Unavailable control coverage is distinct from an empty projection.
+    fn continuation_projection(
+        &self,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Option<crate::flow_state::ProcedureContinuationProjection> {
+        None
+    }
+
     /// Exact behavior identity of the ICFG provider whose active model
     /// snapshot this provider consumes. Production summary projection accepts
     /// modeled effects only when both providers name the same behavior.
@@ -695,6 +708,23 @@ pub trait ConcurrencyProvider {
         _ordinal: u32,
     ) -> Option<bool> {
         None
+    }
+
+    /// Positive type evidence for extracting `payload` through `assertion`.
+    /// Both handles name exact source expressions. The solver must separately
+    /// establish that this payload is the unique stable contents of the box;
+    /// type compatibility alone does not establish a runtime alias. Missing
+    /// metadata and interrupted queries must remain open, never a certificate.
+    fn reference_assertion_accepts_payload(
+        &self,
+        _assertion: &ValueHandle,
+        _payload: &ValueHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ConcurrencyAnswer<bool>, SemanticProviderError> {
+        Ok(ConcurrencyAnswer::Open {
+            partial: false,
+            reasons: vec![ConcurrencyOpenReason::UnknownLocation],
+        })
     }
 
     /// A complete stable source summary for `procedure`, when the workspace
@@ -951,7 +981,7 @@ impl Invocations {
         task: TaskId,
         procedure: ProcedureHandle,
         caller: Option<(InvocationId, CallSiteId)>,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<ContextKey, ConcurrencyOpenReason> {
         let invocation = InvocationId(
             u32::try_from(self.entries.len()).expect("bounded invocation IDs fit u32"),
@@ -968,7 +998,7 @@ impl Invocations {
                 .call_site(call)
                 .expect("invocation caller owns its call site")
                 .point;
-            if point_is_cyclic(semantics, point, request)? {
+            if point_is_cyclic(&parent.context, point, request)? {
                 Some(invocation)
             } else {
                 parent.repetition
@@ -1002,7 +1032,7 @@ impl Invocations {
         &self,
         ancestor: InvocationId,
         descendant: InvocationId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
         let mut visit_result = Ok(());
         let contains = self.contains_with(ancestor, descendant, || {
@@ -1058,7 +1088,7 @@ impl Invocations {
         caller: InvocationId,
         call: CallSiteId,
         target: &ProcedureHandle,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
         let caller_procedure = &self.entries[caller.0 as usize].context.procedure;
         let mut current = caller;
@@ -1094,7 +1124,7 @@ impl Invocations {
         &self,
         origin: InvocationId,
         point: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<HashMap<InvocationId, ProgramPointId>, ConcurrencyOpenReason> {
         self.ancestry_points_with(origin, point, || {
             charge_concurrency_work(request, 1).is_ok()
@@ -1144,7 +1174,7 @@ impl Invocations {
         first_point: ProgramPointId,
         second: InvocationId,
         second_point: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<Option<(&ContextKey, ProgramPointId, ProgramPointId)>, ConcurrencyOpenReason> {
         let mut visit_result = Ok(());
         let points = self.common_points_with(first, first_point, second, second_point, || {
@@ -1205,7 +1235,7 @@ impl Invocations {
         required: HashSet<ProgramPointId>,
         target: InvocationId,
         target_point: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
         let ancestors = self.ancestry_points_bounded(target, target_point, request)?;
         let mut common = source;
@@ -1238,7 +1268,7 @@ impl Invocations {
         mut source: InvocationId,
         mut required: HashSet<ProgramPointId>,
         target: InvocationId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<Option<HashSet<ProgramPointId>>, ConcurrencyOpenReason> {
         let task = self.entries[target.0 as usize].context.task;
         loop {
@@ -2415,7 +2445,7 @@ impl SynchronizationSubjectClasses {
             .any(|candidate| self.backing_root(candidate) == root)
     }
 
-    fn propagate_opaque_values(&mut self, request: &mut SemanticRequest<'_>) -> bool {
+    fn propagate_opaque_values(&mut self, request: &mut SolveRequest<'_, '_>) -> bool {
         if self.opaque_values.is_empty() {
             return true;
         }
@@ -2500,10 +2530,284 @@ impl LocationClasses {
 /// candidates. The existing semantic request owns cancellation and all work
 /// limits; each retained procedure/event/call/location is charged to its
 /// corresponding shared dimension.
+/// Per-solve projection ownership. Reference counting here avoids copying a
+/// validated graph mask when a CFG query also mutably debits the request.
+pub(crate) struct SolveRequest<'a, 'b> {
+    semantic: &'a mut SemanticRequest<'b>,
+    provider: Option<&'a dyn ConcurrencyProvider>,
+    projections: HashMap<
+        ProcedureHandle,
+        Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>,
+    >,
+    invocation_projections:
+        HashMap<ContextKey, std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>,
+    invocation_reachability: HashMap<ContextKey, std::rc::Rc<HashSet<ProgramPointId>>>,
+    prepared_callback_targets: HashMap<(ContextKey, CallSiteId), Vec<ProcedureHandle>>,
+    callable_projections: HashMap<
+        control::CallableContext,
+        std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>,
+    >,
+    control_reasons: Vec<ConcurrencyOpenReason>,
+    /// Positive type certificates only, owned by this solve's exact handles.
+    /// Runtime box stability is checked separately for every invocation.
+    assertion_payload_types: HashSet<(ValueHandle, ValueHandle)>,
+    control_queries: HashMap<ControlScopeKey, ControlQueries>,
+}
+
+/// Completed answers belong to one immutable graph projection. Holding its Rc
+/// prevents an old projection's identity from being reused after replacement.
+struct ControlQueries {
+    projection: Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>,
+    reaches: HashMap<ProgramPointId, HashSet<ProgramPointId>>,
+    avoiding: HashMap<Vec<ProgramPointId>, HashSet<ProgramPointId>>,
+    dominators: Option<crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>>,
+}
+
+impl<'a, 'b> SolveRequest<'a, 'b> {
+    pub(crate) fn raw(semantic: &'a mut SemanticRequest<'b>) -> Self {
+        Self {
+            semantic,
+            provider: None,
+            projections: HashMap::default(),
+            invocation_projections: HashMap::default(),
+            invocation_reachability: HashMap::default(),
+            prepared_callback_targets: HashMap::default(),
+            callable_projections: HashMap::default(),
+            control_reasons: Vec::new(),
+            assertion_payload_types: HashSet::default(),
+            control_queries: HashMap::default(),
+        }
+    }
+
+    fn control_queries(
+        &mut self,
+        scope: &impl ControlScope,
+    ) -> Result<&mut ControlQueries, ConcurrencyOpenReason> {
+        let projection = scope.projection(self);
+        charge_concurrency_work(self, 1)?;
+        let key = scope.key();
+        let current = self.control_queries.get(&key).is_some_and(|cached| {
+            match (&cached.projection, &projection) {
+                (Some(previous), Some(current)) => std::rc::Rc::ptr_eq(previous, current),
+                (None, None) => true,
+                _ => false,
+            }
+        });
+        if !current {
+            charge_concurrency_work(self, 1)?;
+            self.control_queries.insert(
+                key.clone(),
+                ControlQueries {
+                    projection,
+                    reaches: HashMap::default(),
+                    avoiding: HashMap::default(),
+                    dominators: None,
+                },
+            );
+        }
+        Ok(self
+            .control_queries
+            .get_mut(&key)
+            .expect("current graph was installed"))
+    }
+
+    fn projection(
+        &mut self,
+        procedure: &ProcedureHandle,
+    ) -> Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>> {
+        if let Some(cached) = self.projections.get(procedure) {
+            return cached.clone();
+        }
+        let projection = self
+            .provider
+            .and_then(|provider| provider.continuation_projection(procedure, self.semantic));
+        if let Some(projection) = &projection {
+            assert_eq!(
+                projection.procedure(),
+                procedure,
+                "control projection belongs to the requested artifact instance"
+            );
+            self.control_reasons
+                .extend(projection.reasons().iter().map(|reason| {
+                    ConcurrencyOpenReason::IncompleteControlFlow(format!("{reason:?}").into())
+                }));
+        } else if self.provider.is_some()
+            && procedure.semantics().call_sites().iter().any(|call| {
+                call.invocation_mode == CallInvocationMode::Ordinary
+                    && call.execution_timing == ExecutionTiming::SameEvaluation
+            })
+        {
+            self.control_reasons
+                .push(ConcurrencyOpenReason::IncompleteControlFlow(
+                    "call continuation facts unavailable".into(),
+                ));
+        }
+        let projection = projection.map(std::rc::Rc::new);
+        self.projections
+            .insert(procedure.clone(), projection.clone());
+        projection
+    }
+}
+
+impl<'b> std::ops::Deref for SolveRequest<'_, 'b> {
+    type Target = SemanticRequest<'b>;
+    fn deref(&self) -> &Self::Target {
+        self.semantic
+    }
+}
+impl std::ops::DerefMut for SolveRequest<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.semantic
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ControlScopeKey {
+    Unprojected(ProcedureHandle),
+    Source(ProcedureHandle),
+    Invocation(ContextKey),
+}
+
+trait ControlScope {
+    fn procedure(&self) -> &ProcedureHandle;
+    fn key(&self) -> ControlScopeKey;
+    fn projection(
+        &self,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>>;
+}
+
+/// Summary source witnesses use the original language CFG, independently of
+/// source/model or invocation continuation projections in a direct solve.
+struct UnprojectedProcedure<'a>(&'a ProcedureHandle);
+
+impl ControlScope for UnprojectedProcedure<'_> {
+    fn procedure(&self) -> &ProcedureHandle {
+        self.0
+    }
+    fn key(&self) -> ControlScopeKey {
+        ControlScopeKey::Unprojected(self.0.clone())
+    }
+    fn projection(
+        &self,
+        _request: &mut SolveRequest<'_, '_>,
+    ) -> Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>> {
+        None
+    }
+}
+
+impl ControlScope for ProcedureHandle {
+    fn procedure(&self) -> &ProcedureHandle {
+        self
+    }
+    fn key(&self) -> ControlScopeKey {
+        ControlScopeKey::Source(self.clone())
+    }
+    fn projection(
+        &self,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>> {
+        request.projection(self)
+    }
+}
+
+impl ControlScope for ContextKey {
+    fn procedure(&self) -> &ProcedureHandle {
+        &self.procedure
+    }
+    fn key(&self) -> ControlScopeKey {
+        ControlScopeKey::Invocation(self.clone())
+    }
+    fn projection(
+        &self,
+        request: &mut SolveRequest<'_, '_>,
+    ) -> Option<std::rc::Rc<crate::flow_state::ProcedureContinuationProjection>> {
+        request
+            .invocation_projections
+            .get(self)
+            .cloned()
+            .or_else(|| request.projection(&self.procedure))
+    }
+}
+
+macro_rules! with_concurrency_graph {
+    ($request:expr, $scope:expr, |$graph:ident| $body:block) => {{
+        let scope = $scope;
+        let projection = ControlScope::projection(scope, $request);
+        if let Some(projection) = projection {
+            let projected = projection.graph();
+            let $graph = &projected;
+            $body
+        } else {
+            let $graph = ControlScope::procedure(scope).semantics();
+            $body
+        }
+    }};
+}
+
+fn invocation_reachable_points(
+    context: &ContextKey,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<std::rc::Rc<HashSet<ProgramPointId>>, ConcurrencyOpenReason> {
+    if let Some(points) = request.invocation_reachability.get(context) {
+        return Ok(points.clone());
+    }
+    use crate::analyzer::semantic::cfg_algorithms::forward_reachability;
+    let points = with_concurrency_graph!(request, context, |graph| {
+        bounded_cfg_query(request, |cfg_request| {
+            forward_reachability(
+                graph,
+                context.procedure.semantics().entry_point(),
+                cfg_request,
+            )
+            .map(|reachable| reachable.iter(graph).collect::<HashSet<_>>())
+        })
+    })?;
+    let points = std::rc::Rc::new(points);
+    request
+        .invocation_reachability
+        .insert(context.clone(), points.clone());
+    Ok(points)
+}
+
 pub fn concurrent_access_conflicts(
     provider: &impl ConcurrencyProvider,
     root: &ProcedureHandle,
     request: &mut SemanticRequest<'_>,
+) -> Result<ConcurrentAccessReport, SemanticProviderError> {
+    let mut solve = SolveRequest::raw(request);
+    solve.provider = Some(provider);
+    let mut report = solve_concurrent_access_conflicts(provider, root, &mut solve)?;
+    if !solve.control_reasons.is_empty() {
+        for conflict in &mut report.conflicts {
+            conflict.proven = false;
+            conflict.exhaustive = false;
+            conflict
+                .reasons
+                .extend(solve.control_reasons.iter().cloned());
+            conflict.reasons.sort();
+            conflict.reasons.dedup();
+        }
+        report.reasons.extend(solve.control_reasons);
+        report.reasons.sort();
+        report.reasons.dedup();
+    }
+    Ok(report)
+}
+
+pub(crate) fn point_dominates(
+    procedure: &ProcedureHandle,
+    candidate: ProgramPointId,
+    target: ProgramPointId,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    projected_point_dominates(&UnprojectedProcedure(procedure), candidate, target, request)
+}
+
+fn solve_concurrent_access_conflicts(
+    provider: &impl ConcurrencyProvider,
+    root: &ProcedureHandle,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrentAccessReport, SemanticProviderError> {
     let mut invocations = Invocations::default();
     let root_context = invocations
@@ -2595,6 +2899,123 @@ pub fn concurrent_access_conflicts(
             report.reasons.dedup();
             return Ok(report);
         }
+        for call in semantics.call_sites() {
+            if let Some(target) = incoming_callable_target(
+                &context,
+                call,
+                &callable_values,
+                &mut synchronization_subjects,
+                &invocations,
+                &tasks,
+                request,
+            ) {
+                callable_values.insert(
+                    (
+                        context.task,
+                        context.invocation,
+                        context.procedure.clone(),
+                        call.callee,
+                    ),
+                    target,
+                );
+            }
+        }
+        if let Some(mut projection) = request.projection(&context.procedure) {
+            for call in semantics.call_sites().iter().filter(|call| {
+                call.invocation_mode == CallInvocationMode::Ordinary
+                    && call.execution_timing == ExecutionTiming::SameEvaluation
+            }) {
+                if let Err(reason) = charge_concurrency_work(request, 1) {
+                    report.reasons.push(reason);
+                    return Ok(report);
+                }
+                let ConcurrencyAnswer::Proven(targets) = resolve_targets(
+                    provider,
+                    &mut synchronization_subjects,
+                    &invocations,
+                    &tasks,
+                    context.task,
+                    context.invocation,
+                    &context.procedure,
+                    call.id,
+                    &callable_values,
+                    request,
+                )?
+                else {
+                    continue;
+                };
+                let inputs = callable_values
+                    .iter()
+                    .filter_map(|((task, invocation, procedure, value), target)| {
+                        (*task == context.task
+                            && *invocation == context.invocation
+                            && *procedure == context.procedure)
+                            .then_some((*value, target.clone()))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let mut target_projections = Some(Vec::new());
+                for target in &targets {
+                    let projection = control::target_projection(
+                        provider,
+                        &context.procedure,
+                        call,
+                        &inputs,
+                        target,
+                        request,
+                    )?;
+                    match (target_projections.as_mut(), projection) {
+                        (Some(projections), Some(projection)) => projections.push(projection),
+                        _ => {
+                            target_projections = None;
+                            break;
+                        }
+                    }
+                }
+                if let Some(target_projections) = target_projections {
+                    let proofs = target_projections
+                        .iter()
+                        .map(|projection| projection.as_ref())
+                        .collect::<Vec<_>>();
+                    let handle = context
+                        .procedure
+                        .call_site_handle(call.id)
+                        .expect("owned callback call");
+                    match projection.with_nonreturning_source_call(&handle, &proofs, request) {
+                        Ok(Some(specialized)) => projection = std::rc::Rc::new(specialized),
+                        Ok(None) => {}
+                        Err(reason) => request.control_reasons.push(
+                            ConcurrencyOpenReason::IncompleteControlFlow(
+                                format!("{reason:?}").into(),
+                            ),
+                        ),
+                    }
+                }
+                request
+                    .prepared_callback_targets
+                    .insert((context.clone(), call.id), targets);
+            }
+            request
+                .invocation_projections
+                .insert(context.clone(), projection);
+            request.invocation_reachability.remove(&context);
+        }
+        let reachable_points = invocation_reachable_points(&context, request);
+        let reachable_points = match reachable_points {
+            Ok(points) => points,
+            Err(reason) => {
+                report.reasons.push(reason);
+                return Ok(report);
+            }
+        };
+        let unreachable_events = semantics
+            .points()
+            .iter()
+            .flat_map(|point| point.events.iter().map(move |event| (point.id, event)))
+            .enumerate()
+            .filter(|(_, (point, _))| !reachable_points.contains(point))
+            .map(|(ordinal, (_, event))| summary_event_key(semantics, event.source, ordinal))
+            .collect::<HashSet<_>>();
+
         // A closure that captures a parameter or receiver makes the producer
         // hold it in a lexical cell, and where the body never assigns that
         // formal the cell's only write is the call that bound it. A binding
@@ -2661,6 +3082,14 @@ pub fn concurrent_access_conflicts(
             HashMap::<CallSiteId, Vec<SummaryDependencyKey>>::default();
         if let Some(summary) = summary {
             for summary_effect in summary.effects() {
+                let event = match summary_effect.key() {
+                    SummaryEffectKey::Call { event, .. } => Some(*event),
+                    SummaryEffectKey::Concurrency(effect) => Some(effect.event()),
+                    _ => None,
+                };
+                if event.is_some_and(|event| unreachable_events.contains(&event)) {
+                    continue;
+                }
                 let effect = match summary_effect.key() {
                     SummaryEffectKey::Call {
                         event,
@@ -2951,6 +3380,7 @@ pub fn concurrent_access_conflicts(
                         | SummaryConcurrencyEffectKind::WaitGroupWait { .. }
                         | SummaryConcurrencyEffectKind::TaskSpawn { .. }
                         | SummaryConcurrencyEffectKind::TaskJoin { .. })
+                        && !unreachable_events.contains(&effect.event())
                         && !replayed_summary_modeled_events.contains(&effect.event()))
             }) {
                 report
@@ -3009,7 +3439,12 @@ pub fn concurrent_access_conflicts(
         // memory accesses says so here. Omitting the access it never formed
         // and still calling the answer clean is the false clean this analysis
         // exists to avoid, so the gap becomes an open reason.
-        for gap in semantics.gaps() {
+        for gap in semantics.gaps().iter().filter(|gap| {
+            matches!(
+                gap.subject,
+                crate::analyzer::semantic::SemanticGapSubject::Procedure
+            ) || reachable_points.contains(&gap.point)
+        }) {
             // `Assignments` is the capability Go falls short of when it says
             // "indirect assignment write is not yet lowered", which is the
             // write this analysis would otherwise omit in silence.
@@ -3037,6 +3472,7 @@ pub fn concurrent_access_conflicts(
         let has_aggregate_copy = semantics
             .points()
             .iter()
+            .filter(|point| reachable_points.contains(&point.id))
             .flat_map(|point| &point.events)
             .any(|event| {
                 matches!(
@@ -3073,7 +3509,9 @@ pub fn concurrent_access_conflicts(
             None
         } else {
             use crate::analyzer::semantic::cfg_algorithms::loop_regions;
-            match bounded_cfg_query(request, |request| loop_regions(semantics, request)) {
+            match with_concurrency_graph!(request, &context, |graph| {
+                bounded_cfg_query(request, |request| loop_regions(graph, request))
+            }) {
                 Ok(regions) => Some(
                     regions
                         .regions
@@ -3096,6 +3534,7 @@ pub fn concurrent_access_conflicts(
         let aggregate_copies = semantics
             .points()
             .iter()
+            .filter(|point| reachable_points.contains(&point.id))
             .flat_map(|point| point.events.iter())
             .filter_map(|event| match event.effect {
                 SemanticEffect::ValueFlow {
@@ -3121,6 +3560,7 @@ pub fn concurrent_access_conflicts(
         let identity_transfers = semantics
             .points()
             .iter()
+            .filter(|point| reachable_points.contains(&point.id))
             .flat_map(|point| &point.events)
             .filter_map(|event| match event.effect {
                 SemanticEffect::ValueFlow {
@@ -3235,6 +3675,9 @@ pub fn concurrent_access_conflicts(
             for (event_position, event) in point.events.iter().enumerate() {
                 let event_ordinal = summary_event_ordinal;
                 summary_event_ordinal = summary_event_ordinal.saturating_add(1);
+                if !reachable_points.contains(&point.id) {
+                    continue;
+                }
                 match event.effect {
                     SemanticEffect::CallableReference {
                         result,
@@ -3475,9 +3918,9 @@ pub fn concurrent_access_conflicts(
                             crate::analyzer::semantic::ValueFlowKind::Transfer(
                                 crate::analyzer::semantic::ValueTransfer {
                                     kind: crate::analyzer::semantic::TransferKind::Unboxing,
-                                    ..
+                                    operation,
                                 }
-                            )
+                            ) if operation != crate::analyzer::semantic::TransferOperation::None
                         ) {
                             synchronization_subjects
                                 .opaque_values
@@ -3818,7 +4261,11 @@ pub fn concurrent_access_conflicts(
             "every validated source allocation is present in the direct event inventory"
         );
 
-        for call in semantics.call_sites() {
+        for call in semantics
+            .call_sites()
+            .iter()
+            .filter(|call| reachable_points.contains(&call.point))
+        {
             let call_handle = context
                 .procedure
                 .call_site_handle(call.id)
@@ -3835,6 +4282,27 @@ pub fn concurrent_access_conflicts(
                 &callable_values,
                 request,
             )?;
+            if call.invocation_mode == CallInvocationMode::Ordinary
+                && call.execution_timing == ExecutionTiming::SameEvaluation
+                && !matches!(call.declared_targets, CallableTargetResolution::Proven(_))
+                && callable_values.contains_key(&(
+                    context.task,
+                    context.invocation,
+                    context.procedure.clone(),
+                    call.callee,
+                ))
+                && let ConcurrencyAnswer::Proven(targets) = &resolved_targets
+                && request
+                    .prepared_callback_targets
+                    .get(&(context.clone(), call.id))
+                    != Some(targets)
+            {
+                request
+                    .control_reasons
+                    .push(ConcurrencyOpenReason::IncompleteControlFlow(
+                        "callback target binding changed after control preparation".into(),
+                    ));
+            }
             let modeled_answer =
                 if let Some(effects) = replayed_summary_modeled_calls.remove(&call.id) {
                     ConcurrencyAnswer::Proven(effects)
@@ -4052,10 +4520,12 @@ pub fn concurrent_access_conflicts(
                         let effect_free = match effect_free_closures.entry(target.clone()) {
                             Entry::Occupied(entry) => *entry.get(),
                             Entry::Vacant(entry) => {
-                                match source_closure_has_no_effects(provider, &target, request) {
-                                    Ok(empty) => *entry.insert(empty),
-                                    Err(reason) => {
-                                        report.reasons.push(reason);
+                                match source_closure_has_no_effects(provider, &target, request)? {
+                                    ConcurrencyAnswer::Proven(closure) => {
+                                        *entry.insert(closure.is_some())
+                                    }
+                                    ConcurrencyAnswer::Open { reasons, .. } => {
+                                        report.reasons.extend(reasons);
                                         report.reasons.sort();
                                         report.reasons.dedup();
                                         return Ok(report);
@@ -4210,7 +4680,7 @@ pub fn concurrent_access_conflicts(
         &closed_recursive_calls,
         provider,
         request,
-    );
+    )?;
     for (location, bound_formal) in &written_once {
         let stored = match bound_formal {
             Some(formal) => Some(formal.clone()),
@@ -4284,7 +4754,7 @@ pub fn concurrent_access_conflicts(
                 request,
             )
         });
-        let covered = ancestor.flatten().is_some_and(|ancestor| {
+        let covered = if let Some(ancestor) = ancestor.flatten() {
             recursive_access_summaries_cover_call(
                 provider,
                 &mut synchronization_subjects,
@@ -4296,8 +4766,10 @@ pub fn concurrent_access_conflicts(
                 &omitted.target,
                 ancestor,
                 request,
-            )
-        });
+            )?
+        } else {
+            false
+        };
         if !covered {
             omitted_recursive_effects = true;
             report
@@ -4320,7 +4792,7 @@ pub fn concurrent_access_conflicts(
             &closed_recursive_calls,
             provider,
             request,
-        );
+        )?;
         synchronization_subjects.connect_stable_backing_stores();
         if !synchronization_subjects.propagate_opaque_values(request) {
             report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
@@ -4386,8 +4858,8 @@ pub fn concurrent_access_conflicts(
         &mut accesses,
         &mut report,
     );
-    let entry_locks = must_entry_locks(&modeled_by_context, &synchronous_calls);
-    let lock_states = must_lock_states(&accesses, &modeled_by_context, &entry_locks);
+    let entry_locks = must_entry_locks(&modeled_by_context, &synchronous_calls, request);
+    let lock_states = must_lock_states(&accesses, &modeled_by_context, &entry_locks, request);
     let synchronizations = resolve_intrinsic_synchronizations(
         provider,
         &mut synchronization_subjects,
@@ -4476,6 +4948,15 @@ pub fn concurrent_access_conflicts(
     let mut private_synchronization_by_task = HashMap::default();
     // CFG topology is immutable across invocations of the same artifact.
     let mut points_before_calls = HashMap::default();
+    // The invocation tree is complete here. A common caller and any lifted
+    // call points depend only on the two activations, not their local sites.
+    struct CommonCaller {
+        invocation: InvocationId,
+        access_lifted: Option<ProgramPointId>,
+        call_lifted: Option<ProgramPointId>,
+    }
+    let mut common_callers: HashMap<(InvocationId, InvocationId), Option<CommonCaller>> =
+        HashMap::default();
     for access in &mut accesses {
         if let Some(reasons) = model_reasons_by_task.get(&access.site.task) {
             for OpenCallEffects {
@@ -4498,34 +4979,47 @@ pub fn concurrent_access_conflicts(
                 // Unknown effects can survive a synchronous return or enter a
                 // later callee. Compare both sites in their common invocation;
                 // source target identity alone does not close body effects.
-                let mut exhausted = false;
-                let projected = invocations.common_points_with(
-                    access.site.invocation,
-                    access.site.point,
-                    *origin,
-                    *call,
-                    || {
-                        if request.cancellation.is_cancelled()
-                            || request
-                                .budget
-                                .charge(crate::analyzer::semantic::SemanticWork {
-                                    nested_entries: 1,
-                                    ..crate::analyzer::semantic::SemanticWork::default()
-                                })
-                                .is_err()
-                        {
-                            exhausted = true;
-                            return false;
+                let projected = (|| -> Result<_, ConcurrencyOpenReason> {
+                    charge_concurrency_work(request, 1)?;
+                    match common_callers.entry((access.site.invocation, *origin)) {
+                        Entry::Occupied(entry) => Ok(entry.get().as_ref().map(|shared| {
+                            (
+                                &invocations.entries[shared.invocation.0 as usize].context,
+                                shared.access_lifted.unwrap_or(access.site.point),
+                                shared.call_lifted.unwrap_or(*call),
+                            )
+                        })),
+                        Entry::Vacant(entry) => {
+                            let projected = invocations.common_points_bounded(
+                                access.site.invocation,
+                                access.site.point,
+                                *origin,
+                                *call,
+                                request,
+                            )?;
+                            charge_concurrency_work(request, 1)?;
+                            entry.insert(projected.map(|(context, access_point, call_point)| {
+                                CommonCaller {
+                                    invocation: context.invocation,
+                                    access_lifted: (context.invocation != access.site.invocation)
+                                        .then_some(access_point),
+                                    call_lifted: (context.invocation != *origin)
+                                        .then_some(call_point),
+                                }
+                            }));
+                            Ok(projected)
                         }
-                        true
-                    },
-                );
-                if exhausted {
-                    report.reasons.push(ConcurrencyOpenReason::BudgetExhausted);
-                    report.reasons.sort();
-                    report.reasons.dedup();
-                    return Ok(report);
-                }
+                    }
+                })();
+                let projected = match projected {
+                    Ok(projected) => projected,
+                    Err(reason) => {
+                        report.reasons.push(reason);
+                        report.reasons.sort();
+                        report.reasons.dedup();
+                        return Ok(report);
+                    }
+                };
                 let precedes = if let Some((context, access_point, call_point)) = projected {
                     let before =
                         match points_before_calls.entry((context.procedure.clone(), call_point)) {
@@ -4660,7 +5154,7 @@ fn retained_callable_creation(
     invocations: &Invocations,
     tasks: &[Task],
     invocation: &Invocation,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Option<(ContextKey, ValueId)> {
     use crate::analyzer::semantic::{SemanticValueKind, ValueFlowKind};
     let (caller, call_id) = invocation.caller?;
@@ -4776,7 +5270,7 @@ fn retained_callable_creation(
             let precedes = if defined == point {
                 position < event
             } else {
-                match point_dominates(&context.procedure, defined, point, request) {
+                match projected_point_dominates(&context.procedure, defined, point, request) {
                     Ok(before) => before,
                     Err(reason) => {
                         classes.identity_reasons.push(reason);
@@ -4790,7 +5284,7 @@ fn retained_callable_creation(
         }
         if let Some((defined, _)) = creation {
             if definition.is_some()
-                || (match point_is_cyclic(semantics, defined, request) {
+                || (match point_is_cyclic(&context, defined, request) {
                     Ok(cyclic) => cyclic,
                     Err(reason) => {
                         classes.identity_reasons.push(reason);
@@ -4875,7 +5369,7 @@ fn identity_use_precedes(
     observation: &ReferenceIdentityUse,
     invocations: &Invocations,
     tasks: &[Task],
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     let task = invocations.entries[source.invocation.0 as usize]
         .context
@@ -4919,7 +5413,7 @@ fn propagate_memory_payload_identities(
     reference_allocations: &HashSet<CanonicalConcurrencyLocation>,
     callable_values: &HashMap<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>,
     provider: &impl ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, SemanticProviderError> {
     use crate::analyzer::semantic::{
         SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
@@ -5023,6 +5517,13 @@ fn propagate_memory_payload_identities(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
+        let reachable = match invocation_reachable_points(context, request) {
+            Ok(points) => points,
+            Err(reason) => {
+                classes.identity_reasons.push(reason);
+                return Ok(false);
+            }
+        };
         name_member_declarations(
             classes,
             provider,
@@ -5069,6 +5570,9 @@ fn propagate_memory_payload_identities(
         // gap, blocks a payload snapshot. Uncertain loads are still collected.
         closed &= reference_control_is_complete(&context.procedure)
             && !semantics.gaps().iter().any(|gap| {
+                if !matches!(gap.subject, SemanticGapSubject::Procedure) && !reachable.contains(&gap.point) {
+                    return false;
+                }
                 // These front-end boundaries are discharged by the exact
                 // call/capture closure below, the retained abort topology,
                 // or a workspace-resolved field declaration respectively.
@@ -5157,7 +5661,11 @@ fn propagate_memory_payload_identities(
                     || gap.impacts.contains(SemanticGapImpact::Aliasing)
                     || gap.capability == SemanticCapability::Captures
             });
-        for call in semantics.call_sites() {
+        for call in semantics
+            .call_sites()
+            .iter()
+            .filter(|call| reachable.contains(&call.point))
+        {
             // Closure is a prerequisite for every payload proof below. Once
             // an unmodeled boundary defeats it, further dispatch resolution
             // cannot restore it. Still collect loads so their payloads remain
@@ -5232,7 +5740,11 @@ fn propagate_memory_payload_identities(
             procedure: context.procedure.clone(),
             value,
         };
-        for point in semantics.points() {
+        for point in semantics
+            .points()
+            .iter()
+            .filter(|point| reachable.contains(&point.id))
+        {
             for (position, event) in point.events.iter().enumerate() {
                 if let SemanticEffect::AggregateInitializer {
                     aggregate,
@@ -5994,7 +6506,7 @@ fn recursive_call_preserves_inputs(
     call: &crate::analyzer::semantic::SemanticCallSite,
     target: &ProcedureHandle,
     provider: &impl ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Option<InvocationId> {
     use crate::analyzer::semantic::SemanticValueKind;
     enum RecursiveInputIdentity {
@@ -6119,7 +6631,7 @@ fn field_container_is_unpublished(
     invocations: &Invocations,
     callable_values: &HashMap<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>,
     container: &ConcurrencyIdentityFact,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> bool {
     use crate::analyzer::semantic::ValueFlowKind;
     // Charge the publication inventory when it is actually inspected, after
@@ -6174,6 +6686,13 @@ fn field_container_is_unpublished(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
+        let reachable = match invocation_reachable_points(context, request) {
+            Ok(points) => points,
+            Err(reason) => {
+                classes.identity_reasons.push(reason);
+                return false;
+            }
+        };
         let subject = |value| LocalSynchronizationSubject::Value {
             task: context.task,
             invocation: context.invocation,
@@ -6214,7 +6733,11 @@ fn field_container_is_unpublished(
                 classes.root(subject(capture.callable)),
             ));
         }
-        for point in semantics.points() {
+        for point in semantics
+            .points()
+            .iter()
+            .filter(|point| reachable.contains(&point.id))
+        {
             for event in &point.events {
                 match event.effect {
                     SemanticEffect::Assignment {
@@ -6335,7 +6858,7 @@ fn channel_transport_is_retained(
     closed_recursive_calls: &HashSet<(InvocationId, CallSiteId)>,
     channel: LocalSynchronizationSubject,
     provider: &impl ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> bool {
     use crate::analyzer::semantic::{
         SemanticCapability, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject,
@@ -6433,7 +6956,20 @@ fn channel_transport_is_retained(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
-        for call in semantics.call_sites() {
+        let reachable = match charge_concurrency_work(request, 1)
+            .and_then(|()| invocation_reachable_points(context, request))
+        {
+            Ok(reachable) => reachable,
+            Err(reason) => {
+                classes.identity_reasons.push(reason);
+                return false;
+            }
+        };
+        for call in semantics
+            .call_sites()
+            .iter()
+            .filter(|call| reachable.contains(&call.point))
+        {
             let owns = |value| owns_value(context.invocation, &context.procedure, value);
             let channel_arguments = call
                 .arguments
@@ -6517,7 +7053,9 @@ fn channel_transport_is_retained(
                 }
             }
         }
-        for gap in semantics.gaps() {
+        for gap in semantics.gaps().iter().filter(|gap| {
+            matches!(gap.subject, SemanticGapSubject::Procedure) || reachable.contains(&gap.point)
+        }) {
             if gap.capability == SemanticCapability::ConcurrentSpawn
                 && gap.discharge == SemanticGapDischarge::RetainedControlTopology
             {
@@ -6568,7 +7106,11 @@ fn channel_transport_is_retained(
                 return false;
             }
         }
-        for point in semantics.points() {
+        for point in semantics
+            .points()
+            .iter()
+            .filter(|point| reachable.contains(&point.id))
+        {
             for event in &point.events {
                 let complete = reference_evidence_is_complete(semantics, event.evidence);
                 let retained = match &event.effect {
@@ -6749,9 +7291,11 @@ fn propagate_reference_identities(
     effect_free_call_targets: &HashMap<(InvocationId, CallSiteId), ProcedureHandle>,
     closed_recursive_calls: &HashSet<(InvocationId, CallSiteId)>,
     provider: &impl ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
-) {
-    use crate::analyzer::semantic::ValueFlowKind;
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<(), SemanticProviderError> {
+    use crate::analyzer::semantic::{
+        TransferKind, TransferOperation, ValueFlowKind, ValueTransfer,
+    };
 
     let exact_calls = calls
         .iter()
@@ -6771,6 +7315,13 @@ fn propagate_reference_identities(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
+        let reachable = match invocation_reachable_points(context, request) {
+            Ok(points) => points,
+            Err(reason) => {
+                classes.identity_reasons.push(reason);
+                return Ok(());
+            }
+        };
         if request.cancellation.is_cancelled()
             || request
                 .budget
@@ -6787,7 +7338,7 @@ fn propagate_reference_identities(
             classes
                 .identity_reasons
                 .push(ConcurrencyOpenReason::BudgetExhausted);
-            return;
+            return Ok(());
         }
         let subject = |value| LocalSynchronizationSubject::Value {
             task: context.task,
@@ -6795,7 +7346,11 @@ fn propagate_reference_identities(
             procedure: context.procedure.clone(),
             value,
         };
-        for point in semantics.points() {
+        for point in semantics
+            .points()
+            .iter()
+            .filter(|point| reachable.contains(&point.id))
+        {
             for (event, row) in point.events.iter().enumerate() {
                 let SemanticEffect::ValueFlow {
                     kind,
@@ -6807,7 +7362,12 @@ fn propagate_reference_identities(
                 };
                 if !matches!(
                     kind,
-                    ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing
+                    ValueFlowKind::ReferenceBoxing
+                        | ValueFlowKind::ReferenceUnboxing
+                        | ValueFlowKind::Transfer(ValueTransfer {
+                            kind: TransferKind::Unboxing,
+                            operation: TransferOperation::None,
+                        })
                 ) {
                     continue;
                 }
@@ -6818,6 +7378,16 @@ fn propagate_reference_identities(
                     event,
                 };
                 let target = subject(target);
+                let assertion = (kind != ValueFlowKind::ReferenceUnboxing
+                    && kind != ValueFlowKind::ReferenceBoxing)
+                    .then(|| match &target {
+                        LocalSynchronizationSubject::Value {
+                            procedure, value, ..
+                        } => procedure
+                            .value_handle(*value)
+                            .expect("owned assertion result"),
+                        _ => unreachable!("value flow target is a value"),
+                    });
                 if kind == ValueFlowKind::ReferenceBoxing {
                     boxed_payloads
                         .entry(classes.root(target))
@@ -6831,6 +7401,7 @@ fn propagate_reference_identities(
                         target,
                         source,
                         reference_evidence_is_complete(semantics, row.evidence),
+                        assertion,
                     ));
                 }
             }
@@ -6864,7 +7435,7 @@ fn propagate_reference_identities(
         }
     }
     let mut payload_destinations = HashSet::default();
-    for (destination, wrapper, complete) in extractions {
+    for (destination, wrapper, complete, assertion) in extractions {
         let mut root = classes.root(wrapper.subject.clone());
         let mut visited = HashSet::default();
         while !boxed_payloads.contains_key(&root) && visited.insert(root.clone()) {
@@ -6880,26 +7451,64 @@ fn propagate_reference_identities(
                 classes
                     .identity_reasons
                     .push(ConcurrencyOpenReason::BudgetExhausted);
-                return;
+                return Ok(());
             }
             let Some(Some(source)) = wrapper_cells.get(&root) else {
                 break;
             };
             root = source.clone();
         }
-        let sources = boxed_payloads
+        let mut source = boxed_payloads
             .get(&root)
             .and_then(|sources| match sources.as_slice() {
                 [Some(source)] if complete => Some(source.clone()),
                 _ => None,
             })
             .filter(|_| !classes.identity_is_opaque(wrapper.subject.clone()))
-            .filter(|_| reference_source_is_stable(classes, invocations, tasks, &wrapper, request))
-            .map(|source| vec![source]);
+            .filter(|_| reference_source_is_stable(classes, invocations, tasks, &wrapper, request));
+        if let (Some(assertion), Some(payload)) = (&assertion, &source) {
+            let LocalSynchronizationSubject::Value {
+                procedure, value, ..
+            } = &payload.subject
+            else {
+                unreachable!("boxing source is a value");
+            };
+            let payload = procedure.value_handle(*value).expect("owned boxing source");
+            if request.cancellation.is_cancelled()
+                || request
+                    .budget
+                    .charge(crate::analyzer::semantic::SemanticWork {
+                        nested_entries: 1,
+                        ..crate::analyzer::semantic::SemanticWork::default()
+                    })
+                    .is_err()
+            {
+                classes
+                    .identity_reasons
+                    .push(ConcurrencyOpenReason::BudgetExhausted);
+                return Ok(());
+            }
+            let key = (assertion.clone(), payload.clone());
+            let answer = if request.assertion_payload_types.contains(&key) {
+                ConcurrencyAnswer::Proven(true)
+            } else {
+                provider.reference_assertion_accepts_payload(assertion, &payload, request)?
+            };
+            match answer {
+                ConcurrencyAnswer::Proven(true) => {
+                    request.assertion_payload_types.insert(key);
+                }
+                ConcurrencyAnswer::Proven(false) => source = None,
+                ConcurrencyAnswer::Open { reasons, .. } => {
+                    classes.identity_reasons.extend(reasons);
+                    source = None;
+                }
+            }
+        }
         payload_destinations.insert(destination.clone());
         pending.push(PendingReferenceIdentity {
             destination,
-            sources,
+            sources: source.map(|source| vec![source]),
         });
     }
     // A receive is a must-equal payload only when one exact send can supply
@@ -6935,11 +7544,7 @@ fn propagate_reference_identities(
                 if owner.repetition.is_some() {
                     false
                 } else {
-                    match point_is_cyclic(
-                        owner.context.procedure.semantics(),
-                        allocation.point,
-                        request,
-                    ) {
+                    match point_is_cyclic(&owner.context, allocation.point, request) {
                         Ok(cyclic) => !cyclic,
                         Err(reason) => {
                             classes.identity_reasons.push(reason);
@@ -6987,14 +7592,17 @@ fn propagate_reference_identities(
                 closed_or_incomplete = true;
                 continue;
             }
-            let cyclic =
-                match point_is_cyclic(candidate.procedure.semantics(), candidate.point, request) {
-                    Ok(cyclic) => cyclic,
-                    Err(reason) => {
-                        classes.identity_reasons.push(reason);
-                        true
-                    }
-                };
+            let cyclic = match point_is_cyclic(
+                &invocations.entries[candidate.invocation.0 as usize].context,
+                candidate.point,
+                request,
+            ) {
+                Ok(cyclic) => cyclic,
+                Err(reason) => {
+                    classes.identity_reasons.push(reason);
+                    true
+                }
+            };
             if cyclic {
                 closed_or_incomplete = true;
                 continue;
@@ -7262,7 +7870,7 @@ fn propagate_reference_identities(
             classes
                 .identity_reasons
                 .push(ConcurrencyOpenReason::BudgetExhausted);
-            return;
+            return Ok(());
         }
         let mut changed = false;
         for (index, item) in pending.iter().enumerate() {
@@ -7328,12 +7936,13 @@ fn propagate_reference_identities(
                 .push(ConcurrencyOpenReason::UnknownLocation);
         }
     }
+    Ok(())
 }
 
 fn reference_result_sources(
     context: &ContextKey,
     ordinal: u32,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Option<Vec<ReferenceIdentityUse>>, ConcurrencyOpenReason> {
     use crate::analyzer::semantic::{SemanticCapability, SemanticValueKind, ValueFlowKind};
 
@@ -7353,18 +7962,8 @@ fn reference_result_sources(
             .events
             .iter()
             .any(|event| matches!(event.effect, SemanticEffect::ProcedureReturn { .. }))
-            || !point_reaches(
-                &context.procedure,
-                semantics.entry_point(),
-                point.id,
-                request,
-            )?
-            || !point_reaches(
-                &context.procedure,
-                point.id,
-                semantics.normal_exit_point(),
-                request,
-            )?
+            || !point_reaches(context, semantics.entry_point(), point.id, request)?
+            || !point_reaches(context, point.id, semantics.normal_exit_point(), request)?
         {
             continue;
         }
@@ -7417,13 +8016,9 @@ fn reference_result_sources(
             event,
         });
     }
-    Ok(all_paths_cross_points(
-        &context.procedure,
-        semantics.normal_exit_point(),
-        &terminals,
-        request,
-    )?
-    .then_some(sources))
+    let crosses =
+        all_paths_cross_points(context, semantics.normal_exit_point(), &terminals, request)?;
+    Ok(crosses.then_some(sources))
 }
 
 fn reference_evidence_is_complete(
@@ -7491,7 +8086,7 @@ fn reference_source_is_stable(
     invocations: &Invocations,
     tasks: &[Task],
     source: &ReferenceIdentityUse,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> bool {
     use crate::analyzer::semantic::{SemanticCapability, SemanticGapImpact, SemanticValueKind};
 
@@ -7510,6 +8105,13 @@ fn reference_source_is_stable(
     for entry in &invocations.entries {
         let context = &entry.context;
         let semantics = context.procedure.semantics();
+        let reachable = match invocation_reachable_points(context, request) {
+            Ok(points) => points,
+            Err(reason) => {
+                classes.identity_reasons.push(reason);
+                return false;
+            }
+        };
         let mut values = semantics
             .values()
             .iter()
@@ -7560,6 +8162,13 @@ fn reference_source_is_stable(
         }
         if !reference_control_is_complete(&context.procedure)
             || semantics.gaps().iter().any(|gap| {
+                if !matches!(
+                    gap.subject,
+                    crate::analyzer::semantic::SemanticGapSubject::Procedure
+                ) && !reachable.contains(&gap.point)
+                {
+                    return false;
+                }
                 gap.capability == SemanticCapability::Captures
                     || (gap.capability == SemanticCapability::Assignments
                         && gap.impacts.contains(SemanticGapImpact::HeapWrite))
@@ -7663,7 +8272,11 @@ fn reference_source_is_stable(
             }
         }
         let mut assignments = HashMap::<ValueId, usize>::default();
-        for point in semantics.points() {
+        for point in semantics
+            .points()
+            .iter()
+            .filter(|point| reachable.contains(&point.id))
+        {
             for (position, event) in point.events.iter().enumerate() {
                 let dependency = match event.effect {
                     SemanticEffect::Assignment { target, value } => {
@@ -7838,7 +8451,7 @@ fn reference_source_is_stable(
 fn reference_captures_are_read_only(
     owner: &ProcedureHandle,
     owner_binding: ValueId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     use crate::analyzer::semantic::{SemanticCapability, SemanticGapImpact};
     let mut pending = vec![(owner.clone(), owner_binding)];
@@ -7921,7 +8534,7 @@ fn associate_wait_group_tasks(
     tasks: &mut [Task],
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     synchronous_calls: &[SynchronousCall],
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), ConcurrencyOpenReason> {
     #[derive(Debug, Clone)]
     struct Completion {
@@ -8041,12 +8654,22 @@ fn associate_wait_group_tasks(
         if exact_phase {
             'phase: for completion in &completions {
                 for (add, _) in &adds {
-                    if !point_dominates(&spawn_procedure, *add, completion.spawn_point, request)? {
+                    if !projected_point_dominates(
+                        &spawn_procedure,
+                        *add,
+                        completion.spawn_point,
+                        request,
+                    )? {
                         exact_phase = false;
                         break 'phase;
                     }
                 }
-                if !point_dominates(&spawn_procedure, completion.spawn_point, waits[0], request)? {
+                if !projected_point_dominates(
+                    &spawn_procedure,
+                    completion.spawn_point,
+                    waits[0],
+                    request,
+                )? {
                     exact_phase = false;
                     break;
                 }
@@ -8058,7 +8681,7 @@ fn associate_wait_group_tasks(
             task.repetitions_serialized = task.repetition.is_some()
                 && !parent_repeats
                 && exact_phase
-                && point_is_cyclic(spawn_procedure.semantics(), completion.spawn_point, request)?
+                && point_is_cyclic(&spawn_procedure, completion.spawn_point, request)?
                 && all_recurrences_cross_points(
                     &spawn_procedure,
                     completion.spawn_point,
@@ -8122,12 +8745,14 @@ fn associate_wait_group_tasks(
                     ResolvedConcurrencyEffect::WaitGroupAdd { group, .. }
                         if !has_add && exact_subject(group) == Some(canonical) =>
                     {
-                        has_add = point_dominates(spawn_procedure, *point, spawn, request)?;
+                        has_add =
+                            projected_point_dominates(spawn_procedure, *point, spawn, request)?;
                     }
                     ResolvedConcurrencyEffect::WaitGroupWait { group }
                         if !has_wait && exact_subject(group) == Some(canonical) =>
                     {
-                        has_wait = point_dominates(spawn_procedure, spawn, *point, request)?;
+                        has_wait =
+                            projected_point_dominates(spawn_procedure, spawn, *point, request)?;
                     }
                     _ => {}
                 }
@@ -8158,7 +8783,7 @@ type CompletionEffects = HashMap<(InvocationId, ProgramPointId), ResolvedConcurr
 fn must_completion_effects(
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     synchronous_calls: &[SynchronousCall],
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<HashMap<ContextKey, CompletionEffects>, ConcurrencyOpenReason> {
     let mut summaries = HashMap::default();
     for (context, effects) in modeled {
@@ -8172,7 +8797,7 @@ fn must_completion_effects(
                 continue;
             };
             if exact_subject(group).is_some()
-                && point_dominates(
+                && projected_point_dominates(
                     &context.procedure,
                     *point,
                     context.procedure.semantics().normal_exit_point(),
@@ -8193,7 +8818,7 @@ fn must_completion_effects(
             else {
                 continue;
             };
-            if !point_dominates(
+            if !projected_point_dominates(
                 &edge.caller.procedure,
                 edge.point,
                 edge.caller.procedure.semantics().normal_exit_point(),
@@ -8497,6 +9122,109 @@ fn collect_local_callable_targets(
     }
 }
 
+/// Follow exact lexical reads back to an invocation's incoming callable.
+/// Source point storage order is not evaluation order; require each read to
+/// dominate its use before preparing a control graph from the binding.
+#[allow(clippy::too_many_arguments)]
+fn incoming_callable_target(
+    context: &ContextKey,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+    callable_values: &HashMap<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>,
+    classes: &mut SynchronizationSubjectClasses,
+    invocations: &Invocations,
+    tasks: &[Task],
+    request: &mut SolveRequest<'_, '_>,
+) -> Option<ProcedureHandle> {
+    let semantics = context.procedure.semantics();
+    let mut value = call.callee;
+    let mut use_point = call.point;
+    let mut use_event = semantics.point(call.point).expect("owned call point").events.iter()
+        .position(|event| matches!(event.effect, SemanticEffect::Invoke { call_site } if call_site == call.id))
+        .expect("call invocation event");
+    let mut visited = HashSet::default();
+    loop {
+        if !visited.insert(value) {
+            return None;
+        }
+        if let Some(target) = callable_values.get(&(
+            context.task,
+            context.invocation,
+            context.procedure.clone(),
+            value,
+        )) {
+            return Some(target.clone());
+        }
+        let mut input = None;
+        for point in semantics.points() {
+            for (position, event) in point.events.iter().enumerate() {
+                if let Err(reason) = charge_concurrency_work(request, 1) {
+                    request.control_reasons.push(reason);
+                    return None;
+                }
+                match event.effect {
+                    SemanticEffect::Assignment { target, .. } if target == value => return None,
+                    SemanticEffect::MemoryLoad { result, .. } if result == value => return None,
+                    SemanticEffect::ValueFlow {
+                        source,
+                        target,
+                        kind,
+                    } if target == value => {
+                        if input.is_some()
+                            || !matches!(
+                                kind,
+                                crate::analyzer::semantic::ValueFlowKind::Local
+                                    | crate::analyzer::semantic::ValueFlowKind::Parameter
+                                    | crate::analyzer::semantic::ValueFlowKind::Receiver
+                            )
+                            || !reference_evidence_is_complete(semantics, event.evidence)
+                        {
+                            return None;
+                        }
+                        input = Some((source, point.id, position));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (source, point, position) = input?;
+        let precedes = if point == use_point {
+            position < use_event
+        } else {
+            match projected_point_dominates(context, point, use_point, request) {
+                Ok(precedes) => precedes,
+                Err(reason) => {
+                    request.control_reasons.push(reason);
+                    return None;
+                }
+            }
+        };
+        if !precedes
+            || !reference_source_is_stable(
+                classes,
+                invocations,
+                tasks,
+                &ReferenceIdentityUse {
+                    subject: LocalSynchronizationSubject::Value {
+                        task: context.task,
+                        invocation: context.invocation,
+                        procedure: context.procedure.clone(),
+                        value: source,
+                    },
+                    invocation: context.invocation,
+                    point,
+                    event: position,
+                },
+                request,
+            )
+        {
+            return None;
+        }
+        value = source;
+        use_point = point;
+        use_event = position;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_targets(
     provider: &impl ConcurrencyProvider,
@@ -8508,11 +9236,8 @@ fn resolve_targets(
     procedure: &ProcedureHandle,
     call: CallSiteId,
     callable_values: &HashMap<(TaskId, InvocationId, ProcedureHandle, ValueId), ProcedureHandle>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<Vec<ProcedureHandle>>, SemanticProviderError> {
-    if let Some(targets) = provider.complete_call_targets(procedure, call) {
-        return Ok(ConcurrencyAnswer::Proven(targets.to_vec()));
-    }
     let row = procedure
         .semantics()
         .call_site(call)
@@ -8560,6 +9285,9 @@ fn resolve_targets(
             return Ok(ConcurrencyAnswer::Proven(vec![target.clone()]));
         }
     }
+    if let Some(targets) = provider.complete_call_targets(procedure, call) {
+        return Ok(ConcurrencyAnswer::Proven(targets.to_vec()));
+    }
     let handle = procedure
         .call_site_handle(call)
         .expect("validated call belongs to its procedure");
@@ -8571,7 +9299,7 @@ fn canonicalize_access(
     context: &ContextKey,
     point: ProgramPointId,
     location: MemoryLocationId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<CanonicalizedAccess, SemanticProviderError> {
     let row = context
         .procedure
@@ -9275,22 +10003,22 @@ fn recursive_access_summaries_cover_call(
     call: &crate::analyzer::semantic::SemanticCallSite,
     target: &ProcedureHandle,
     ancestor: InvocationId,
-    request: &mut SemanticRequest<'_>,
-) -> bool {
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, SemanticProviderError> {
     if call.invocation_mode != CallInvocationMode::Ordinary
         || call.execution_timing != ExecutionTiming::SameEvaluation
     {
-        return false;
+        return Ok(false);
     }
     let Some(target_summary) = provider.complete_summary(target) else {
-        return false;
+        return Ok(false);
     };
     let Some(group) = target_summary.recursive_group() else {
-        return false;
+        return Ok(false);
     };
     let ancestor_context = &invocations.entries[ancestor.0 as usize].context;
     if ancestor_context.procedure != *target || ancestor_context.task != caller.task {
-        return false;
+        return Ok(false);
     }
 
     let mut member_contexts = Vec::new();
@@ -9298,14 +10026,14 @@ fn recursive_access_summaries_cover_call(
     loop {
         let entry = &invocations.entries[cursor.0 as usize];
         if entry.context.task != caller.task {
-            return false;
+            return Ok(false);
         }
         member_contexts.push(&entry.context);
         if cursor == ancestor {
             break;
         }
         let Some((parent, _)) = entry.caller else {
-            return false;
+            return Ok(false);
         };
         cursor = parent;
     }
@@ -9314,12 +10042,12 @@ fn recursive_access_summaries_cover_call(
     let mut member_summaries = Vec::with_capacity(member_contexts.len());
     for context in &member_contexts {
         let Some(summary) = provider.complete_summary(&context.procedure) else {
-            return false;
+            return Ok(false);
         };
         if summary.recursive_group() != Some(group)
             || !member_identities.insert(summary.key().identity().clone())
         {
-            return false;
+            return Ok(false);
         }
         member_summaries.push(summary);
     }
@@ -9327,7 +10055,7 @@ fn recursive_access_summaries_cover_call(
         || !validate_recursive_summary_batch(&member_summaries)
             .is_ok_and(|validated| validated.group == group)
     {
-        return false;
+        return Ok(false);
     }
 
     let mut dynamic_index_ports = HashSet::default();
@@ -9360,24 +10088,46 @@ fn recursive_access_summaries_cover_call(
         if summary.composition_root() != summary.key()
             || !summary.completeness().is_complete()
             || !summary.transfers().is_empty()
-            || summary.dependencies().len() != 1
-            || !matches!(&summary.dependencies()[0], SummaryDependencyKey::Recursive(identity)
-                if member_identities.contains(identity.as_ref()))
         {
-            return false;
+            return Ok(false);
         }
-        let mut source_calls = context
-            .procedure
-            .semantics()
-            .call_sites()
-            .iter()
-            .filter(|call| effect_free_call_targets.contains_key(&(context.invocation, call.id)));
-        let Some(member_call) = source_calls.next() else {
-            return false;
+        let mut recursive_call = None;
+        let mut empty_helpers = HashMap::default();
+        for source_call in context.procedure.semantics().call_sites() {
+            let Some(source_target) =
+                effect_free_call_targets.get(&(context.invocation, source_call.id))
+            else {
+                continue;
+            };
+            let Some(source_summary) = provider.complete_summary(source_target) else {
+                return Ok(false);
+            };
+            if member_identities.contains(source_summary.key().identity()) {
+                if recursive_call.replace(source_call).is_some() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            // Exact dispatch closes only the call boundary. Omitting a repeated
+            // helper requires an independently empty, complete source closure.
+            if source_call.invocation_mode != CallInvocationMode::Ordinary
+                || source_call.execution_timing != ExecutionTiming::SameEvaluation
+            {
+                return Ok(false);
+            }
+            match source_closure_has_no_effects(provider, source_target, request)? {
+                ConcurrencyAnswer::Proven(Some(closure)) if closure.returns_normally => {}
+                ConcurrencyAnswer::Proven(_) => return Ok(false),
+                ConcurrencyAnswer::Open { reasons, .. } => {
+                    classes.identity_reasons.extend(reasons);
+                    return Ok(false);
+                }
+            }
+            empty_helpers.insert(source_call.id, source_target);
+        }
+        let Some(member_call) = recursive_call else {
+            return Ok(false);
         };
-        if source_calls.next().is_some() {
-            return false;
-        }
         let certificates = summary
             .effects()
             .iter()
@@ -9388,10 +10138,11 @@ fn recursive_access_summaries_cover_call(
             .count();
         // Account for the certificate scan and each complete effect inventory.
         // Saturation makes an oversized request exhaust its budget, not wrap.
-        let inventory_work = summary
-            .effects()
-            .len()
-            .saturating_mul(certificates.saturating_add(2));
+        let inventory_work = summary.effects().len().saturating_mul(
+            certificates
+                .saturating_add(summary.dependencies().len())
+                .saturating_add(2),
+        );
         if request.cancellation.is_cancelled()
             || request
                 .budget
@@ -9404,22 +10155,24 @@ fn recursive_access_summaries_cover_call(
             classes
                 .identity_reasons
                 .push(ConcurrencyOpenReason::BudgetExhausted);
-            return false;
+            return Ok(false);
         }
         let Some(atomic_calls) =
             recursive_atomic_call_inventory(provider, context, summary, member_call, request)
         else {
-            return false;
+            return Ok(false);
         };
-        if context.procedure.semantics().call_sites().len() != 1 + atomic_calls.len() {
-            return false;
+        if context.procedure.semantics().call_sites().len()
+            != 1 + atomic_calls.len() + empty_helpers.len()
+        {
+            return Ok(false);
         }
         let Some(live_target) = effect_free_call_targets.get(&(context.invocation, member_call.id))
         else {
-            return false;
+            return Ok(false);
         };
         let Some(live_target_summary) = provider.complete_summary(live_target) else {
-            return false;
+            return Ok(false);
         };
         let target_group_mismatch = live_target_summary.recursive_group() != Some(group);
         let target_member_missing =
@@ -9427,17 +10180,22 @@ fn recursive_access_summaries_cover_call(
         let dynamic_index_mismatch = dynamic_index_ports.iter().any(|port| {
             !recursive_scalar_port_is_invariant(context.procedure.semantics(), member_call, port)
         });
+        let covered_calls = atomic_calls
+            .keys()
+            .chain(empty_helpers.keys())
+            .copied()
+            .collect::<HashSet<_>>();
         let source_gaps_open = !recursive_access_source_gaps_are_closed(
             &context.procedure,
             member_call,
-            &atomic_calls,
+            &covered_calls,
         );
         if target_group_mismatch
             || target_member_missing
             || dynamic_index_mismatch
             || source_gaps_open
         {
-            return false;
+            return Ok(false);
         }
         let Some(result_transition) = recursive_result_transition(
             provider,
@@ -9449,18 +10207,18 @@ fn recursive_access_summaries_cover_call(
             live_target,
             request,
         ) else {
-            return false;
+            return Ok(false);
         };
         match &result_transition {
             RecursiveResultTransition::None => {
                 if recursive_result_ordinals.is_some() {
-                    return false;
+                    return Ok(false);
                 }
                 saw_no_result = true;
             }
             RecursiveResultTransition::InvariantReferences { bases } => {
                 if saw_no_result {
-                    return false;
+                    return Ok(false);
                 }
                 let ordinals = bases
                     .iter()
@@ -9470,7 +10228,7 @@ fn recursive_access_summaries_cover_call(
                     .as_ref()
                     .is_some_and(|expected| expected != &ordinals)
                 {
-                    return false;
+                    return Ok(false);
                 }
                 recursive_result_ordinals = Some(ordinals);
                 for (ordinal, base) in bases {
@@ -9481,7 +10239,7 @@ fn recursive_access_summaries_cover_call(
                         .get(ordinal)
                         .is_some_and(|existing| existing != base)
                     {
-                        return false;
+                        return Ok(false);
                     }
                     recursive_result_bases.insert(*ordinal, base.clone());
                 }
@@ -9489,6 +10247,7 @@ fn recursive_access_summaries_cover_call(
         }
 
         let mut saw_call = false;
+        let mut witnessed_helpers = HashSet::default();
         let mut summarized_accesses = HashSet::default();
         let mut summarized_synchronization_events = HashSet::default();
         let mut summarized_synchronizations = Vec::new();
@@ -9508,14 +10267,14 @@ fn recursive_access_summaries_cover_call(
                 effect: concurrency.clone(),
             };
             let Ok(allocation) = source_summary_unpublished(&pending) else {
-                return false;
+                return Ok(false);
             };
             if concurrency.execution().timing() != ExecutionTiming::SameEvaluation
                 || !effect.evidence().is_proven()
                 || !effect.evidence().is_complete()
                 || !unpublished_allocations.insert(allocation)
             {
-                return false;
+                return Ok(false);
             }
         }
         let mut summarized_allocations = HashSet::default();
@@ -9533,7 +10292,7 @@ fn recursive_access_summaries_cover_call(
                 continue;
             }
             if !effect.evidence().is_proven() || !effect.evidence().is_complete() {
-                return false;
+                return Ok(false);
             }
             match effect.key() {
                 SummaryEffectKey::Call {
@@ -9541,13 +10300,24 @@ fn recursive_access_summaries_cover_call(
                     callee,
                     witness,
                 } => {
+                    let source_call = live_summary_call(&context.procedure, *event, *witness);
+                    if let Some((id, helper)) =
+                        source_call.and_then(|id| empty_helpers.get(&id).map(|helper| (id, helper)))
+                    {
+                        if !summary_dependency_matches_target(provider, callee, helper)
+                            || !witnessed_helpers.insert(id)
+                        {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
                     if saw_call
                         || callee.identity() != live_target_summary.key().identity()
                         || !matches!(callee.as_ref(), SummaryDependencyKey::Recursive(_))
                         || live_summary_call(&context.procedure, *event, *witness)
                             != Some(member_call.id)
                     {
-                        return false;
+                        return Ok(false);
                     }
                     saw_call = true;
                 }
@@ -9559,7 +10329,7 @@ fn recursive_access_summaries_cover_call(
                                 .values()
                                 .any(|event| *event == concurrency.event())
                         {
-                            return false;
+                            return Ok(false);
                         }
                         if matches!(
                             concurrency.kind(),
@@ -9578,7 +10348,7 @@ fn recursive_access_summaries_cover_call(
                             effect: concurrency.clone(),
                         };
                         let Ok(source) = source_summary_access(&pending) else {
-                            return false;
+                            return Ok(false);
                         };
                         if concurrency.execution().timing() != ExecutionTiming::SameEvaluation
                             || !must_hold.is_empty()
@@ -9597,7 +10367,7 @@ fn recursive_access_summaries_cover_call(
                             )
                             || !summarized_accesses.insert(concurrency.event())
                         {
-                            return false;
+                            return Ok(false);
                         }
                     }
                     SummaryConcurrencyEffectKind::Allocation { .. } => {
@@ -9606,13 +10376,13 @@ fn recursive_access_summaries_cover_call(
                             effect: concurrency.clone(),
                         };
                         let Ok(allocation) = source_summary_allocation(&pending) else {
-                            return false;
+                            return Ok(false);
                         };
                         if concurrency.execution().timing() != ExecutionTiming::SameEvaluation
                             || !unpublished_allocations.contains(&allocation)
                             || !summarized_allocations.insert(allocation)
                         {
-                            return false;
+                            return Ok(false);
                         }
                     }
                     SummaryConcurrencyEffectKind::Unpublished { .. } => {}
@@ -9622,7 +10392,7 @@ fn recursive_access_summaries_cover_call(
                             effect: concurrency.clone(),
                         };
                         let Ok(synchronization) = source_summary_synchronization(&pending) else {
-                            return false;
+                            return Ok(false);
                         };
                         if concurrency.execution().timing() != ExecutionTiming::SameEvaluation
                             || !synchronization.complete
@@ -9631,18 +10401,18 @@ fn recursive_access_summaries_cover_call(
                             || synchronization.payload.is_none()
                             || !summarized_synchronization_events.insert(concurrency.event())
                         {
-                            return false;
+                            return Ok(false);
                         }
                         summarized_synchronizations.push(synchronization);
                     }
-                    _ => return false,
+                    _ => return Ok(false),
                 },
-                _ => return false,
+                _ => return Ok(false),
             }
         }
         if !summarized_synchronizations.is_empty() {
             if group.member_count() != 1 {
-                return false;
+                return Ok(false);
             }
             match recursive_synchronization_executes_exactly_once(
                 invocations,
@@ -9652,14 +10422,21 @@ fn recursive_access_summaries_cover_call(
                 request,
             ) {
                 Ok(true) => {}
-                Ok(false) => return false,
+                Ok(false) => return Ok(false),
                 Err(reason) => {
                     classes.identity_reasons.push(reason);
-                    return false;
+                    return Ok(false);
                 }
             }
         }
         if !saw_call
+            || witnessed_helpers.len() != empty_helpers.len()
+            || summary.dependencies().iter().any(|dependency| {
+                !summary.effects().iter().any(|effect| {
+                    matches!(effect.key(), SummaryEffectKey::Call { callee, .. }
+                        if callee.as_ref() == dependency)
+                })
+            })
             || summarized_allocations != unpublished_allocations
             || !recursive_access_source_inventory_is_closed(
                 &context.procedure,
@@ -9668,10 +10445,10 @@ fn recursive_access_summaries_cover_call(
                 &summarized_allocations,
                 &summarized_synchronization_events,
                 &result_transition,
-                &atomic_calls,
+                &covered_calls,
             )
         {
-            return false;
+            return Ok(false);
         }
         access_count = access_count.saturating_add(summarized_accesses.len());
         private_allocation_count =
@@ -9679,12 +10456,14 @@ fn recursive_access_summaries_cover_call(
         synchronization_count =
             synchronization_count.saturating_add(summarized_synchronizations.len());
     }
-    (access_count > 0 || private_allocation_count > 0 || synchronization_count > 0)
-        && recursive_result_ordinals.as_ref().is_none_or(|ordinals| {
-            ordinals
-                .iter()
-                .all(|ordinal| recursive_result_bases.contains_key(ordinal))
-        })
+    Ok(
+        (access_count > 0 || private_allocation_count > 0 || synchronization_count > 0)
+            && recursive_result_ordinals.as_ref().is_none_or(|ordinals| {
+                ordinals
+                    .iter()
+                    .all(|ordinal| recursive_result_bases.contains_key(ordinal))
+            }),
+    )
 }
 
 fn recursive_atomic_call_inventory(
@@ -9692,7 +10471,7 @@ fn recursive_atomic_call_inventory(
     context: &ContextKey,
     summary: &SemanticProcedureSummary,
     recursive_call: &crate::analyzer::semantic::SemanticCallSite,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Option<HashMap<CallSiteId, SummaryEventKey>> {
     let mut calls = HashMap::default();
     for effect in summary.effects() {
@@ -9768,7 +10547,7 @@ fn recursive_synchronization_executes_exactly_once(
     context: &ContextKey,
     recursive_call: &crate::analyzer::semantic::SemanticCallSite,
     synchronizations: &[PendingIntrinsicSynchronization],
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     let [synchronization] = synchronizations else {
         return Ok(false);
@@ -9779,12 +10558,8 @@ fn recursive_synchronization_executes_exactly_once(
         || synchronization.operation
             != crate::analyzer::semantic::SynchronizationOperation::ChannelSend
         || synchronization.payload.is_none()
-        || point_is_cyclic(context.procedure.semantics(), recursive_call.point, request)?
-        || point_is_cyclic(
-            context.procedure.semantics(),
-            synchronization.point,
-            request,
-        )?
+        || point_is_cyclic(context, recursive_call.point, request)?
+        || point_is_cyclic(context, synchronization.point, request)?
     {
         return Ok(false);
     }
@@ -9897,30 +10672,32 @@ fn scalar_paths_cross_point(
     derivation: &ScalarStateDerivation,
     required: ProgramPointId,
     endpoint: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     if !derivation.is_reachable(required) || !derivation.is_reachable(endpoint) {
         return Ok(false);
     }
-    let semantics = procedure.semantics();
-    let mut pending = VecDeque::from([semantics.entry_point()]);
-    let mut visited = HashSet::default();
-    while let Some(point) = pending.pop_front() {
-        charge_concurrency_work(request, 1)?;
-        if point == required || !visited.insert(point) {
-            continue;
+    with_concurrency_graph!(request, procedure, |graph| {
+        let semantics = procedure.semantics();
+        let mut pending = VecDeque::from([semantics.entry_point()]);
+        let mut visited = HashSet::default();
+        while let Some(point) = pending.pop_front() {
+            charge_concurrency_work(request, 1)?;
+            if point == required || !visited.insert(point) {
+                continue;
+            }
+            if point == endpoint {
+                return Ok(false);
+            }
+            pending.extend(
+                graph
+                    .successors(point)
+                    .filter(|(edge, _)| derivation.edge_is_feasible(*edge))
+                    .map(|(_, target)| target),
+            );
         }
-        if point == endpoint {
-            return Ok(false);
-        }
-        pending.extend(
-            semantics
-                .successor_edges(point)
-                .filter(|(edge, _)| derivation.edge_is_feasible(*edge))
-                .map(|(_, edge)| edge.target_point),
-        );
-    }
-    Ok(true)
+        Ok(true)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9947,7 +10724,7 @@ fn recursive_result_transition(
     context: &ContextKey,
     call: &crate::analyzer::semantic::SemanticCallSite,
     target: &ProcedureHandle,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Option<RecursiveResultTransition> {
     use crate::analyzer::semantic::ValueFlowKind;
 
@@ -10056,20 +10833,20 @@ fn recursive_result_transition(
 fn recursive_access_source_gaps_are_closed(
     target: &ProcedureHandle,
     call: &crate::analyzer::semantic::SemanticCallSite,
-    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
+    covered_calls: &HashSet<CallSiteId>,
 ) -> bool {
     target
         .semantics()
         .gaps()
         .iter()
-        .all(|gap| recursive_access_source_gap_is_closed(target, gap, call, atomic_calls))
+        .all(|gap| recursive_access_source_gap_is_closed(target, gap, call, covered_calls))
 }
 
 fn recursive_access_source_gap_is_closed(
     target: &ProcedureHandle,
     gap: &crate::analyzer::semantic::SemanticGap,
     call: &crate::analyzer::semantic::SemanticCallSite,
-    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
+    covered_calls: &HashSet<CallSiteId>,
 ) -> bool {
     use crate::analyzer::semantic::{SemanticCapability, SemanticGapDischarge, SemanticGapSubject};
 
@@ -10096,14 +10873,14 @@ fn recursive_access_source_gap_is_closed(
                 })
         }
         (SemanticCapability::Calls, SemanticGapSubject::CallSite(candidate)) => {
-            candidate == call.id || atomic_calls.contains_key(&candidate)
+            candidate == call.id || covered_calls.contains(&candidate)
         }
         (SemanticCapability::DynamicDispatch, SemanticGapSubject::CallSite(candidate)) => {
-            candidate == call.id || atomic_calls.contains_key(&candidate)
+            candidate == call.id || covered_calls.contains(&candidate)
         }
         (SemanticCapability::CallableReferences, SemanticGapSubject::Value(candidate)) => {
             candidate == call.callee
-                || atomic_calls.keys().any(|id| {
+                || covered_calls.iter().any(|id| {
                     target
                         .semantics()
                         .call_site(*id)
@@ -10131,7 +10908,7 @@ fn recursive_access_source_inventory_is_closed(
     summarized_allocations: &HashSet<AllocationId>,
     summarized_synchronizations: &HashSet<SummaryEventKey>,
     result_transition: &RecursiveResultTransition,
-    atomic_calls: &HashMap<CallSiteId, SummaryEventKey>,
+    covered_calls: &HashSet<CallSiteId>,
 ) -> bool {
     use crate::analyzer::semantic::{SemanticEffect, ValueFlowKind};
 
@@ -10170,7 +10947,7 @@ fn recursive_access_source_inventory_is_closed(
             SemanticEffect::ValueFlow { .. } => true,
             SemanticEffect::CallableReference { result, .. } => {
                 result == call.callee
-                    || atomic_calls.keys().any(|id| {
+                    || covered_calls.iter().any(|id| {
                         semantics
                             .call_site(*id)
                             .is_some_and(|call| call.callee == result)
@@ -10178,10 +10955,10 @@ fn recursive_access_source_inventory_is_closed(
             }
             SemanticEffect::Invoke { call_site }
             | SemanticEffect::CallContinuation { call_site, .. } => {
-                call_site == call.id || atomic_calls.contains_key(&call_site)
+                call_site == call.id || covered_calls.contains(&call_site)
             }
             SemanticEffect::Gap { gap } => semantics.gap(gap).is_some_and(|gap| {
-                recursive_access_source_gap_is_closed(target, gap, call, atomic_calls)
+                recursive_access_source_gap_is_closed(target, gap, call, covered_calls)
             }),
             SemanticEffect::Allocation { allocation } => {
                 summarized_allocations.contains(&allocation)
@@ -10338,7 +11115,7 @@ fn source_summary_modeled_subject(
     path: &SummaryConcurrencyAccessPath,
     identity: SummaryConcurrencySubjectIdentity,
     provider: &dyn ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ResolvedConcurrencySubject, &'static str> {
     let mut values = Vec::new();
     for value in call
@@ -10377,7 +11154,7 @@ fn source_summary_modeled_effect(
     pending: &PendingSummaryEffect,
     expected_call: CallSiteId,
     provider: &dyn ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ResolvedConcurrencyEffect, &'static str> {
     let Some((point, _, event)) = live_summary_event(pending) else {
         return Err("summary modeled effect witness is unavailable");
@@ -10786,7 +11563,7 @@ fn append_summary_accesses(
     classes: &mut SynchronizationSubjectClasses,
     pending: Vec<PendingSummaryAccess>,
     accesses: &mut Vec<Access>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), SemanticProviderError> {
     for pending in pending {
         let local_location = LocalLocation {
@@ -11041,7 +11818,7 @@ fn bind_call_inputs(
     target: &ProcedureHandle,
     task_transfer: bool,
     provider: &impl ConcurrencyProvider,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), SemanticProviderError> {
     for formal in target.semantics().values() {
         let dispatch_receiver = matches!(
@@ -11240,6 +12017,11 @@ fn bind_call_inputs(
     Ok(())
 }
 
+struct EffectFreeSourceClosure {
+    // Positive completion evidence is separate from an empty effect inventory.
+    returns_normally: bool,
+}
+
 /// Traverse the exact source dependency closure before certifying that no
 /// omitted invocation can contribute memory or synchronization effects. The
 /// IR retains typed dispatch gaps even after source targets are resolved, so
@@ -11247,32 +12029,38 @@ fn bind_call_inputs(
 fn source_closure_has_no_effects(
     provider: &impl ConcurrencyProvider,
     root: &ProcedureHandle,
-    request: &mut SemanticRequest<'_>,
-) -> Result<bool, ConcurrencyOpenReason> {
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<ConcurrencyAnswer<Option<EffectFreeSourceClosure>>, SemanticProviderError> {
     use crate::analyzer::semantic::{SemanticCapability, SemanticGapSubject, SemanticWork};
+    let budget_exhausted = || ConcurrencyAnswer::Open {
+        partial: None,
+        reasons: vec![ConcurrencyOpenReason::BudgetExhausted],
+    };
+    let mut returns_normally = true;
     let mut pending = vec![root.clone()];
     let mut visited = HashSet::default();
     while let Some(procedure) = pending.pop() {
         if request.cancellation.is_cancelled() {
-            return Err(ConcurrencyOpenReason::BudgetExhausted);
+            return Ok(budget_exhausted());
         }
-        request
+        if request
             .budget
             .charge(SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
             })
-            .map_err(|_| ConcurrencyOpenReason::BudgetExhausted)?;
+            .is_err()
+        {
+            return Ok(budget_exhausted());
+        }
         if !visited.insert(procedure.clone()) {
             continue;
         }
-        if provider.complete_summary(&procedure).is_none()
-            || !reference_control_is_complete(&procedure)
-        {
-            return Ok(false);
+        if !reference_control_is_complete(&procedure) {
+            return Ok(ConcurrencyAnswer::Proven(None));
         }
         let semantics = procedure.semantics();
-        request
+        if request
             .budget
             .charge(SemanticWork {
                 nested_entries: semantics.gaps().len() * (1 + semantics.call_sites().len())
@@ -11284,7 +12072,10 @@ fn source_closure_has_no_effects(
                     + semantics.call_sites().len(),
                 ..SemanticWork::default()
             })
-            .map_err(|_| ConcurrencyOpenReason::BudgetExhausted)?;
+            .is_err()
+        {
+            return Ok(budget_exhausted());
+        }
         if semantics
             .gaps()
             .iter()
@@ -11317,32 +12108,92 @@ fn source_closure_has_no_effects(
                     )
                 })
         {
-            return Ok(false);
+            return Ok(ConcurrencyAnswer::Proven(None));
+        }
+        // Effect absence alone permits an infinite loop or a recursive
+        // call cycle. A caller may omit such a closure's memory effects, but
+        // cannot use it to certify accesses after the call executes.
+        if returns_normally {
+            let completion = (|| {
+                if provider
+                    .complete_summary(&procedure)
+                    .is_none_or(|summary| summary.recursive_group().is_some())
+                    || !point_reaches(
+                        &procedure,
+                        semantics.entry_point(),
+                        semantics.normal_exit_point(),
+                        request,
+                    )?
+                {
+                    return Ok(false);
+                }
+                for point in semantics.points() {
+                    if point_reaches(&procedure, semantics.entry_point(), point.id, request)?
+                        && point_is_cyclic(&procedure, point.id, request)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })();
+            match completion {
+                Ok(complete) => returns_normally = complete,
+                Err(reason) => {
+                    return Ok(ConcurrencyAnswer::Open {
+                        partial: None,
+                        reasons: vec![reason],
+                    });
+                }
+            }
         }
         for call in semantics.call_sites() {
             if call.invocation_mode != CallInvocationMode::Ordinary
                 || call.execution_timing != ExecutionTiming::SameEvaluation
             {
-                return Ok(false);
+                return Ok(ConcurrencyAnswer::Proven(None));
             }
-            let Some(targets) = provider.complete_call_targets(&procedure, call.id) else {
-                return Ok(false);
+            let resolved;
+            let targets = if let Some(targets) = provider.complete_call_targets(&procedure, call.id)
+            {
+                targets
+            } else {
+                let handle = procedure
+                    .call_site_handle(call.id)
+                    .expect("validated call belongs to the current procedure");
+                resolved = match provider.resolve_call(&handle, request)? {
+                    ConcurrencyAnswer::Proven(targets) => targets,
+                    ConcurrencyAnswer::Open { mut reasons, .. } => {
+                        if reasons.is_empty() {
+                            reasons.push(ConcurrencyOpenReason::UnresolvedTarget);
+                        }
+                        return Ok(ConcurrencyAnswer::Open {
+                            partial: None,
+                            reasons,
+                        });
+                    }
+                };
+                resolved.as_slice()
             };
             // No source body at an external boundary does not mean no effects.
             if targets.is_empty() {
-                return Ok(false);
+                return Ok(ConcurrencyAnswer::Proven(None));
             }
-            request
+            if request
                 .budget
                 .charge(SemanticWork {
                     nested_entries: targets.len(),
                     ..SemanticWork::default()
                 })
-                .map_err(|_| ConcurrencyOpenReason::BudgetExhausted)?;
+                .is_err()
+            {
+                return Ok(budget_exhausted());
+            }
             pending.extend(targets.iter().cloned());
         }
     }
-    Ok(true)
+    Ok(ConcurrencyAnswer::Proven(Some(EffectFreeSourceClosure {
+        returns_normally,
+    })))
 }
 
 fn resolve_intrinsic_synchronizations(
@@ -11350,7 +12201,7 @@ fn resolve_intrinsic_synchronizations(
     classes: &mut SynchronizationSubjectClasses,
     pending: Vec<PendingIntrinsicSynchronization>,
     task_local_allocations: &HashMap<TaskId, HashSet<CanonicalConcurrencyLocation>>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Vec<IntrinsicSynchronization>, SemanticProviderError> {
     let mut resolved = Vec::new();
     for event in pending {
@@ -11420,62 +12271,28 @@ fn resolve_intrinsic_synchronizations(
 }
 
 fn point_is_cyclic(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    scope: &impl ControlScope,
     point: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
-    charge_concurrency_work(request, 1)?;
-    let mut queue = VecDeque::from([point]);
-    let mut visited = HashSet::default();
-    while let Some(current) = queue.pop_front() {
-        charge_concurrency_work(request, 1)?;
-        for (_, successor) in
-            crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph::successors(
-                semantics, current,
-            )
-        {
-            charge_concurrency_work(request, 1)?;
-            if successor == point {
-                return Ok(true);
-            }
-            if visited.insert(successor) {
-                queue.push_back(successor);
-            }
-        }
-    }
-    Ok(false)
+    point_reaches(scope, point, point, request)
 }
 
 fn all_recurrences_cross_points(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     origin: ProgramPointId,
     required: &HashSet<ProgramPointId>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
-    charge_concurrency_work(request, 1)?;
-    if required.is_empty() {
-        return Ok(false);
-    }
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::default();
-    for (_, edge) in procedure.semantics().successor_edges(origin) {
+    with_concurrency_graph!(request, scope, |graph| {
         charge_concurrency_work(request, 1)?;
-        let successor = edge.target_point;
-        if required.contains(&successor) {
-            continue;
-        }
-        if successor == origin {
+        if required.is_empty() {
             return Ok(false);
         }
-        if visited.insert(successor) {
-            queue.push_back(successor);
-        }
-    }
-    while let Some(point) = queue.pop_front() {
-        charge_concurrency_work(request, 1)?;
-        for (_, edge) in procedure.semantics().successor_edges(point) {
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::default();
+        for (_, successor) in graph.successors(origin) {
             charge_concurrency_work(request, 1)?;
-            let successor = edge.target_point;
             if required.contains(&successor) {
                 continue;
             }
@@ -11486,8 +12303,23 @@ fn all_recurrences_cross_points(
                 queue.push_back(successor);
             }
         }
-    }
-    Ok(true)
+        while let Some(point) = queue.pop_front() {
+            charge_concurrency_work(request, 1)?;
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if required.contains(&successor) {
+                    continue;
+                }
+                if successor == origin {
+                    return Ok(false);
+                }
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
+            }
+        }
+        Ok(true)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -11510,7 +12342,7 @@ fn compare_accesses(
     evidence: AccessComparisonEvidence<'_>,
     accesses: Vec<Access>,
     report: &mut ConcurrentAccessReport,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) {
     let AccessComparisonEvidence {
         invocations,
@@ -11810,7 +12642,7 @@ fn repetition_orders_access(
     access: &Access,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     channel_barriers: &mut ChannelCompletionBarriers<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let task = &tasks[access.site.task.0 as usize];
     let mut reasons = Vec::new();
@@ -12112,15 +12944,15 @@ fn access_is_local_to_invocation(
 #[derive(Default)]
 struct AccessControlCache {
     reachability: HashMap<
-        (ProcedureHandle, ProgramPointId),
+        (ControlScopeKey, ProgramPointId),
         (
             crate::analyzer::semantic::cfg_algorithms::Reachability<ProgramPointId>,
             crate::analyzer::semantic::cfg_algorithms::Reachability<ProgramPointId>,
         ),
     >,
-    cyclic_points: HashMap<ProcedureHandle, HashSet<ProgramPointId>>,
+    cyclic_points: HashMap<ControlScopeKey, HashSet<ProgramPointId>>,
     dominators: HashMap<
-        ProcedureHandle,
+        ControlScopeKey,
         crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>,
     >,
 }
@@ -12130,22 +12962,25 @@ impl AccessControlCache {
     /// of complete CFG traversals centered on `point`.
     fn relation(
         &mut self,
-        procedure: &ProcedureHandle,
+        scope: &impl ControlScope,
         point: ProgramPointId,
         other: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<(bool, bool), ConcurrencyOpenReason> {
         use crate::analyzer::semantic::cfg_algorithms::{
             forward_reachability, reverse_reachability,
         };
 
+        let procedure = scope.procedure();
         charge_concurrency_work(request, 0)?;
-        let key = (procedure.clone(), point);
+        let key = (scope.key(), point);
         if !self.reachability.contains_key(&key) {
             let semantics = procedure.semantics();
-            let reachability = bounded_cfg_query(request, |cfg_request| {
-                reverse_reachability(semantics, point, cfg_request).and_then(|before| {
-                    forward_reachability(semantics, point, cfg_request).map(|after| (before, after))
+            let reachability = with_concurrency_graph!(request, scope, |graph| {
+                bounded_cfg_query(request, |cfg_request| {
+                    reverse_reachability(graph, point, cfg_request).and_then(|before| {
+                        forward_reachability(graph, point, cfg_request).map(|after| (before, after))
+                    })
                 })
             })?;
             charge_concurrency_work(request, 1 + 2 * semantics.points().len())?;
@@ -12163,16 +12998,17 @@ impl AccessControlCache {
 
     fn is_cyclic(
         &mut self,
-        procedure: &ProcedureHandle,
+        scope: &impl ControlScope,
         point: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
         charge_concurrency_work(request, 0)?;
-        if !self.cyclic_points.contains_key(procedure) {
+        let key = scope.key();
+        if !self.cyclic_points.contains_key(&key) {
             use crate::analyzer::semantic::cfg_algorithms::loop_regions;
 
-            let regions = bounded_cfg_query(request, |cfg_request| {
-                loop_regions(procedure.semantics(), cfg_request)
+            let regions = with_concurrency_graph!(request, scope, |graph| {
+                bounded_cfg_query(request, |cfg_request| loop_regions(graph, cfg_request))
             })?;
             let mut points = HashSet::default();
             for member in regions
@@ -12184,36 +13020,40 @@ impl AccessControlCache {
                 points.insert(member);
             }
             charge_concurrency_work(request, 1)?;
-            self.cyclic_points.insert(procedure.clone(), points);
+            self.cyclic_points.insert(key.clone(), points);
         }
         Ok(self
             .cyclic_points
-            .get(procedure)
+            .get(&key)
             .expect("the cyclic-point entry was inserted")
             .contains(&point))
     }
 
     fn dominates(
         &mut self,
-        procedure: &ProcedureHandle,
+        scope: &impl ControlScope,
         candidate: ProgramPointId,
         target: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
+        let procedure = scope.procedure();
         charge_concurrency_work(request, 0)?;
-        if !self.dominators.contains_key(procedure) {
+        let key = scope.key();
+        if !self.dominators.contains_key(&key) {
             use crate::analyzer::semantic::cfg_algorithms::dominators;
 
             let semantics = procedure.semantics();
-            let result = bounded_cfg_query(request, |cfg_request| {
-                dominators(semantics, semantics.entry_point(), cfg_request)
+            let result = with_concurrency_graph!(request, scope, |graph| {
+                bounded_cfg_query(request, |cfg_request| {
+                    dominators(graph, semantics.entry_point(), cfg_request)
+                })
             })?;
             charge_concurrency_work(request, 1 + semantics.points().len())?;
-            self.dominators.insert(procedure.clone(), result);
+            self.dominators.insert(key.clone(), result);
         }
         Ok(self
             .dominators
-            .get(procedure)
+            .get(&key)
             .expect("the dominator entry was inserted")
             .dominates(procedure.semantics(), candidate, target))
     }
@@ -12226,7 +13066,7 @@ fn tasks_may_parallel(
     second: &Access,
     allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
     control: &mut AccessControlCache,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     let first_task = &tasks[first.site.task.0 as usize];
     let second_task = &tasks[second.site.task.0 as usize];
@@ -12259,7 +13099,6 @@ fn tasks_may_parallel(
         else {
             return Ok(None);
         };
-        let procedure = &context.procedure;
         let fresh_in_common = access_is_local_to_invocation(
             invocations,
             allocation_origins,
@@ -12272,7 +13111,7 @@ fn tasks_may_parallel(
             context.invocation,
         );
         let (parent_reaches_spawn, spawn_reaches_parent) =
-            control.relation(procedure, spawn, parent_point, request)?;
+            control.relation(context, spawn, parent_point, request)?;
         Ok(Some(
             (invocations.entries[context.invocation.0 as usize]
                 .repetition
@@ -12326,7 +13165,6 @@ fn tasks_may_parallel(
         else {
             return Ok(true);
         };
-        let procedure = &context.procedure;
         let fresh_in_common = access_is_local_to_invocation(
             invocations,
             allocation_origins,
@@ -12339,7 +13177,7 @@ fn tasks_may_parallel(
             context.invocation,
         );
         let (second_reaches_first, first_reaches_second) =
-            control.relation(procedure, first_spawn, second_spawn, request)?;
+            control.relation(context, first_spawn, second_spawn, request)?;
         return Ok((invocations.entries[context.invocation.0 as usize]
             .repetition
             .is_some()
@@ -12377,7 +13215,7 @@ fn ordering(
     channel_barriers: &mut ChannelCompletionBarriers<'_>,
     allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
     control: &mut AccessControlCache,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(ConcurrentOrdering, Vec<ConcurrencyOpenReason>), ConcurrencyOpenReason> {
     if first.site.task == second.site.task {
         let first = repetition_orders_access(
@@ -12570,7 +13408,7 @@ fn ordering(
                     };
                     let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
                     if let Some(birth_point) = birth_point
-                        && point_is_cyclic(procedure.semantics(), birth_point, request)?
+                        && point_is_cyclic(procedure, birth_point, request)?
                         && (birth_point == point
                             || (point_reaches(procedure, point, birth_point, request)?
                                 && point_reaches(procedure, birth_point, point, request)?))
@@ -12681,7 +13519,7 @@ impl CompletionBarrier {
         tasks: &[Task],
         invocations: &Invocations,
         after: (InvocationId, ProgramPointId),
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
         let task = invocations.entries[self.invocation.0 as usize].context.task;
         let Some((target, point)) =
@@ -12704,10 +13542,10 @@ impl CompletionBarrier {
         invocations: &Invocations,
         invocation: InvocationId,
         point: ProgramPointId,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<bool, ConcurrencyOpenReason> {
-        let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
-        assert!(point_is_cyclic(procedure.semantics(), point, request)?);
+        let context = &invocations.entries[invocation.0 as usize].context;
+        assert!(point_is_cyclic(context, point, request)?);
         charge_concurrency_work(request, self.points.len())?;
         let Some(points) = invocations.required_points_in(
             self.invocation,
@@ -12720,7 +13558,7 @@ impl CompletionBarrier {
         };
         // A lifted call point can itself contain the mandatory wait.
         Ok(points.contains(&point)
-            || all_recurrences_cross_points(procedure, point, &points, request)?)
+            || all_recurrences_cross_points(context, point, &points, request)?)
     }
 }
 
@@ -12729,7 +13567,7 @@ fn completed_before_point(
     invocations: &Invocations,
     barriers: &[CompletionBarrier],
     after: (InvocationId, ProgramPointId),
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let mut reasons = Vec::new();
     for barrier in barriers {
@@ -12758,7 +13596,7 @@ fn synchronized_before_point(
     before: &Access,
     after: (InvocationId, ProgramPointId),
     channel_barriers: &mut ChannelCompletionBarriers<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let barriers = channel_barriers.for_access(before, request)?;
     completed_before_point(tasks, invocations, barriers.as_ref(), after, request)
@@ -12807,7 +13645,7 @@ impl<'index, 'event> Iterator for SynchronizationCandidates<'index, 'event> {
 impl<'a> SynchronizationIndex<'a> {
     fn build(
         synchronizations: &'a [IntrinsicSynchronization],
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<Self, ConcurrencyOpenReason> {
         let mut index = Self {
             send_closes: Vec::new(),
@@ -12847,7 +13685,7 @@ impl<'a> SynchronizationIndex<'a> {
     fn retain_send_close_by_invocation(
         &mut self,
         event: &'a IntrinsicSynchronization,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<(), ConcurrencyOpenReason> {
         // Retained reference in the invocation bucket.
         charge_concurrency_work(request, 1)?;
@@ -12866,7 +13704,7 @@ impl<'a> SynchronizationIndex<'a> {
     fn retain_send_close_by_subject(
         &mut self,
         event: &'a IntrinsicSynchronization,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<(), ConcurrencyOpenReason> {
         if let Some(subject) = event.subject.as_ref() {
             // Retained reference in the known-subject bucket.
@@ -12890,7 +13728,7 @@ impl<'a> SynchronizationIndex<'a> {
     fn retain_receive_by_subject(
         &mut self,
         event: &'a IntrinsicSynchronization,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<(), ConcurrencyOpenReason> {
         if let Some(subject) = event.subject.as_ref() {
             // Retained reference in the known-subject bucket.
@@ -12989,7 +13827,7 @@ impl ChannelCompletionBarriers<'_> {
     fn for_access(
         &mut self,
         access: &Access,
-        request: &mut SemanticRequest<'_>,
+        request: &mut SolveRequest<'_, '_>,
     ) -> Result<std::borrow::Cow<'_, [CompletionBarrier]>, ConcurrencyOpenReason> {
         if request.cancellation.is_cancelled() {
             return Err(ConcurrencyOpenReason::BudgetExhausted);
@@ -13034,7 +13872,7 @@ impl ChannelCompletionBarriers<'_> {
 fn group_channel_receivers_by_invocation<'a>(
     sender: &IntrinsicSynchronization,
     index: &SynchronizationIndex<'a>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<HashMap<InvocationId, Vec<&'a IntrinsicSynchronization>>, ConcurrencyOpenReason> {
     let mut grouped: HashMap<InvocationId, Vec<&IntrinsicSynchronization>> = HashMap::default();
     for receive in index.possible_receives_for(sender) {
@@ -13061,7 +13899,7 @@ fn group_channel_receivers_by_invocation<'a>(
 fn channel_has_unique_signal(
     sender: &IntrinsicSynchronization,
     index: &SynchronizationIndex<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     let mut count = 0usize;
     for candidate in index.possible_send_closes_for(sender) {
@@ -13084,7 +13922,7 @@ fn channel_has_competing_signal(
     sender: &IntrinsicSynchronization,
     original_senders: &[&IntrinsicSynchronization],
     index: &SynchronizationIndex<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     for candidate in index.possible_send_closes_for(sender) {
         charge_concurrency_work(request, 1)?;
@@ -13112,7 +13950,7 @@ fn channel_has_competing_signal(
 fn push_initial_channel_barrier(
     barriers: &mut Vec<CompletionBarrier>,
     barrier: CompletionBarrier,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), ConcurrencyOpenReason> {
     charge_concurrency_work(request, 1 + barrier.points.len() + barrier.reasons.len())?;
     barriers.push(barrier);
@@ -13125,7 +13963,7 @@ fn push_initial_channel_barrier(
 fn push_extended_channel_barrier(
     barriers: &mut Vec<CompletionBarrier>,
     barrier: CompletionBarrier,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), ConcurrencyOpenReason> {
     for existing in barriers.iter() {
         charge_concurrency_work(request, 1)?;
@@ -13167,7 +14005,7 @@ fn channel_completion_barriers(
     before: &Access,
     invocations: &Invocations,
     index: &SynchronizationIndex<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Vec<CompletionBarrier>, ConcurrencyOpenReason> {
     // Seed the access invocation bucket. Keep every sender record for later
     // mandatory point sets and pointer-identity competitor exclusion; only the
@@ -13371,7 +14209,7 @@ fn extend_channel_completion_barriers(
     tasks: &[Task],
     invocations: &Invocations,
     index: &SynchronizationIndex<'_>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<(), ConcurrencyOpenReason> {
     let mut next = 0;
     while next < barriers.len() {
@@ -13438,10 +14276,7 @@ fn extend_channel_completion_barriers(
                 for point in &before.points {
                     charge_concurrency_work(request, 1)?;
                     if point_is_cyclic(
-                        invocations.entries[before.invocation.0 as usize]
-                            .context
-                            .procedure
-                            .semantics(),
+                        &invocations.entries[before.invocation.0 as usize].context,
                         *point,
                         request,
                     )? {
@@ -13452,7 +14287,11 @@ fn extend_channel_completion_barriers(
             }
             if !ambiguous {
                 charge_concurrency_work(request, 1)?;
-                ambiguous = point_is_cyclic(sender.procedure.semantics(), sender.point, request)?;
+                ambiguous = point_is_cyclic(
+                    &invocations.entries[sender.invocation.0 as usize].context,
+                    sender.point,
+                    request,
+                )?;
             }
             if ambiguous {
                 base_reasons.push(ConcurrencyOpenReason::AmbiguousSynchronization);
@@ -13463,10 +14302,6 @@ fn extend_channel_completion_barriers(
                 charge_concurrency_work(request, 1)?;
                 charge_concurrency_work(request, base_reasons.len())?;
                 let mut reasons = base_reasons.clone();
-                let semantics = invocations.entries[invocation.0 as usize]
-                    .context
-                    .procedure
-                    .semantics();
                 let contexts = [before.invocation, sender.invocation, invocation];
                 let mut local_to_repetitions = true;
                 for context in contexts {
@@ -13496,7 +14331,11 @@ fn extend_channel_completion_barriers(
                     reasons.extend(receive.reasons.iter().cloned());
                     if receive.subject.is_none()
                         || receive.subject != sender.subject
-                        || point_is_cyclic(semantics, receive.point, request)?
+                        || point_is_cyclic(
+                            &invocations.entries[invocation.0 as usize].context,
+                            receive.point,
+                            request,
+                        )?
                     {
                         candidate_ambiguous = true;
                     }
@@ -13538,7 +14377,7 @@ fn observation_in_task_bounded(
     invocations: &Invocations,
     observer: TaskId,
     site: (InvocationId, ProgramPointId),
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Option<(InvocationId, ProgramPointId)>, ConcurrencyOpenReason> {
     let mut visit_result = Ok(());
     let point = observation_in_task_with(tasks, invocations, observer, site, || {
@@ -13593,7 +14432,7 @@ fn channel_is_local_to_repetition(
     repetition: InvocationId,
     invocations: &Invocations,
     contexts: &[InvocationId],
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
     let Some(ConcurrencyStorageFamily::Allocation {
         invocation: birth, ..
@@ -13626,85 +14465,134 @@ fn synchronization_subjects_may_match(
 }
 
 fn all_paths_cross_points(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     target: ProgramPointId,
     required: &HashSet<ProgramPointId>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
-    charge_concurrency_work(request, 1)?;
-    if required.is_empty() {
-        return Ok(false);
-    }
-    let entry = procedure.semantics().entry_point();
-    if target == entry || !point_reaches(procedure, entry, target, request)? {
+    use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
+
+    charge_concurrency_work(request, required.len() + 1)?;
+    let entry = scope.procedure().semantics().entry_point();
+    if required.is_empty() || target == entry || !point_reaches(scope, entry, target, request)? {
         return Ok(false);
     }
     if required.contains(&entry) {
         return Ok(true);
     }
-    let mut queue = VecDeque::from([entry]);
-    let mut visited = HashSet::default();
-    visited.insert(entry);
-    while let Some(point) = queue.pop_front() {
-        charge_concurrency_work(request, 1)?;
-        for (_, edge) in procedure.semantics().successor_edges(point) {
+    let mut key = required.iter().copied().collect::<Vec<_>>();
+    key.sort_unstable();
+    if let Some(reachable) = request.control_queries(scope)?.avoiding.get(&key) {
+        return Ok(!reachable.contains(&target));
+    }
+    let reachable = with_concurrency_graph!(request, scope, |graph| {
+        let mut queue = VecDeque::from([entry]);
+        let mut visited = HashSet::from_iter([entry]);
+        while let Some(point) = queue.pop_front() {
             charge_concurrency_work(request, 1)?;
-            let successor = edge.target_point;
-            if required.contains(&successor) {
-                continue;
-            }
-            if successor == target {
-                return Ok(false);
-            }
-            if visited.insert(successor) {
-                queue.push_back(successor);
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if !required.contains(&successor) && visited.insert(successor) {
+                    queue.push_back(successor);
+                }
             }
         }
-    }
-    Ok(true)
+        visited
+    });
+    charge_concurrency_work(request, key.len() + reachable.len() + 1)?;
+    let answer = !reachable.contains(&target);
+    request
+        .control_queries(scope)?
+        .avoiding
+        .insert(key, reachable);
+    Ok(answer)
+}
+
+#[cfg(test)]
+fn all_paths_cross_points_uncached(
+    scope: &impl ControlScope,
+    target: ProgramPointId,
+    required: &HashSet<ProgramPointId>,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    let procedure = scope.procedure();
+    with_concurrency_graph!(request, scope, |graph| {
+        charge_concurrency_work(request, 1)?;
+        if required.is_empty() {
+            return Ok(false);
+        }
+        let entry = procedure.semantics().entry_point();
+        if target == entry || !point_reaches_uncached(scope, entry, target, request)? {
+            return Ok(false);
+        }
+        if required.contains(&entry) {
+            return Ok(true);
+        }
+        let mut queue = VecDeque::from([entry]);
+        let mut visited = HashSet::default();
+        visited.insert(entry);
+        while let Some(point) = queue.pop_front() {
+            charge_concurrency_work(request, 1)?;
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if required.contains(&successor) {
+                    continue;
+                }
+                if successor == target {
+                    return Ok(false);
+                }
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
+            }
+        }
+        Ok(true)
+    })
 }
 
 fn all_exit_paths_cross_points(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     origin: ProgramPointId,
     required: &HashSet<ProgramPointId>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
-    charge_concurrency_work(request, 1)?;
-    if required.is_empty() {
-        return Ok(false);
-    }
-    if required.contains(&origin) {
-        return Ok(true);
-    }
-    let semantics = procedure.semantics();
-    let exits = [
-        semantics.normal_exit_point(),
-        semantics.exceptional_exit_point(),
-    ];
-    if exits.contains(&origin) {
-        return Ok(false);
-    }
-    let mut queue = VecDeque::from([origin]);
-    let mut visited = HashSet::default();
-    visited.insert(origin);
-    while let Some(point) = queue.pop_front() {
+    let procedure = scope.procedure();
+    with_concurrency_graph!(request, scope, |graph| {
         charge_concurrency_work(request, 1)?;
-        for (_, edge) in semantics.successor_edges(point) {
+        if required.is_empty() {
+            return Ok(false);
+        }
+        if required.contains(&origin) {
+            return Ok(true);
+        }
+        let semantics = procedure.semantics();
+        let exits = [
+            semantics.normal_exit_point(),
+            semantics.exceptional_exit_point(),
+        ];
+        if exits.contains(&origin) {
+            return Ok(false);
+        }
+        let mut queue = VecDeque::from([origin]);
+        let mut visited = HashSet::default();
+        visited.insert(origin);
+        while let Some(point) = queue.pop_front() {
             charge_concurrency_work(request, 1)?;
-            let successor = edge.target_point;
-            if required.contains(&successor) {
-                continue;
-            }
-            if exits.contains(&successor) {
-                return Ok(false);
-            }
-            if visited.insert(successor) {
-                queue.push_back(successor);
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if required.contains(&successor) {
+                    continue;
+                }
+                if exits.contains(&successor) {
+                    return Ok(false);
+                }
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
             }
         }
-    }
-    Ok(true)
+        Ok(true)
+    })
 }
 
 fn access_before_spawn(
@@ -13714,7 +14602,7 @@ fn access_before_spawn(
     child: &Access,
     allocation_origins: &HashMap<CanonicalConcurrencyLocation, AllocationOrigin>,
     control: &mut AccessControlCache,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Option<Vec<(InvocationId, ProgramPointId)>>, ConcurrencyOpenReason> {
     let mut descendant = child.site.task;
     loop {
@@ -13748,7 +14636,7 @@ fn access_before_spawn(
             };
             let procedure = &context.procedure;
             let (parent_reaches_spawn, spawn_reaches_parent) =
-                control.relation(procedure, spawn, parent_point, request)?;
+                control.relation(context, spawn, parent_point, request)?;
             // Ordering an observed access does not require that access to
             // execute on every branch. An acyclic conditional store can
             // precede a spawn whenever it occurs, without dominating it.
@@ -13758,7 +14646,7 @@ fn access_before_spawn(
                 || !((reference_control_is_complete(procedure)
                     && parent_reaches_spawn
                     && !spawn_reaches_parent)
-                    || control.dominates(procedure, parent_point, spawn, request)?)
+                    || control.dominates(context, parent_point, spawn, request)?)
             {
                 return Ok(None);
             }
@@ -13800,15 +14688,15 @@ fn access_before_spawn(
                 let Some(spawn_point) = spawn_points.get(&invocation) else {
                     continue;
                 };
-                let procedure = &invocations.entries[invocation.0 as usize].context.procedure;
+                let context = &invocations.entries[invocation.0 as usize].context;
                 let spawn_reaches_parent = if parent_point == *spawn_point {
                     true
                 } else {
                     control
-                        .relation(procedure, *spawn_point, parent_point, request)?
+                        .relation(context, *spawn_point, parent_point, request)?
                         .1
                 };
-                if control.is_cyclic(procedure, parent_point, request)? && spawn_reaches_parent {
+                if control.is_cyclic(context, parent_point, request)? && spawn_reaches_parent {
                     recurrences.push((invocation, parent_point));
                 }
             }
@@ -13825,7 +14713,7 @@ fn completion_orders_access(
     tasks: &[Task],
     invocations: &Invocations,
     access: &Access,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let Some((completion, completion_point)) = tasks[access.site.task.0 as usize].completion else {
         return Ok(ConcurrencyAnswer::Proven(true));
@@ -13839,12 +14727,12 @@ fn completion_orders_access(
     )? && access_point != completion_point
     {
         let procedure = &context.procedure;
-        if point_dominates(procedure, access_point, completion_point, request)?
+        if projected_point_dominates(procedure, access_point, completion_point, request)?
             && !point_reaches(procedure, completion_point, access_point, request)?
         {
             return Ok(ConcurrencyAnswer::Proven(true));
         }
-        if point_dominates(procedure, completion_point, access_point, request)?
+        if projected_point_dominates(procedure, completion_point, access_point, request)?
             && !point_reaches(procedure, access_point, completion_point, request)?
         {
             return Ok(ConcurrencyAnswer::Proven(false));
@@ -13862,7 +14750,7 @@ fn joined_before_point(
     child: &Access,
     after: (InvocationId, ProgramPointId),
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<ConcurrencyAnswer<bool>, ConcurrencyOpenReason> {
     let barriers = join_completion_barriers(tasks, invocations, child, modeled, request)?;
     completed_before_point(tasks, invocations, &barriers, after, request)
@@ -13873,7 +14761,7 @@ fn join_completion_barriers(
     invocations: &Invocations,
     child: &Access,
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<Vec<CompletionBarrier>, ConcurrencyOpenReason> {
     let task = &tasks[child.site.task.0 as usize];
     let (Some(parent), Some(task_group)) = (task.parent, task.group.as_ref()) else {
@@ -14011,6 +14899,7 @@ impl MustLockSet {
 fn must_entry_locks(
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     synchronous_calls: &[SynchronousCall],
+    request: &mut SolveRequest<'_, '_>,
 ) -> HashMap<ContextKey, MustLockSet> {
     let targets = synchronous_calls
         .iter()
@@ -14041,7 +14930,7 @@ fn must_entry_locks(
             .iter()
             .filter(|call| call.caller == context)
         {
-            let candidate = must_locks_by_point(&context.procedure, effects, entry.clone())
+            let candidate = must_locks_by_point(&context, effects, entry.clone(), request)
                 .remove(&call.point)
                 .unwrap_or_default();
             match entries.entry(call.target.clone()) {
@@ -14066,6 +14955,7 @@ fn must_lock_states(
     accesses: &[Access],
     modeled: &HashMap<ContextKey, Vec<(ProgramPointId, ResolvedConcurrencyEffect)>>,
     entry_locks: &HashMap<ContextKey, MustLockSet>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> HashMap<ContextKey, HashMap<ProgramPointId, MustLockSet>> {
     accesses
         .iter()
@@ -14079,7 +14969,7 @@ fn must_lock_states(
         .map(|context| {
             let effects = modeled.get(&context).map(Vec::as_slice).unwrap_or(&[]);
             let entry = entry_locks.get(&context).cloned().unwrap_or_default();
-            let states = must_locks_by_point(&context.procedure, effects, entry);
+            let states = must_locks_by_point(&context, effects, entry, request);
             (context, states)
         })
         .collect()
@@ -14101,63 +14991,67 @@ fn must_locks_at<'a>(
 }
 
 fn must_locks_by_point(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     effects: &[(ProgramPointId, ResolvedConcurrencyEffect)],
     entry: MustLockSet,
+    request: &mut SolveRequest<'_, '_>,
 ) -> HashMap<ProgramPointId, MustLockSet> {
-    let semantics = procedure.semantics();
-    let mut incoming = HashMap::<ProgramPointId, Option<MustLockSet>>::default();
-    for point in semantics.points() {
-        incoming.insert(point.id, None);
-    }
-    incoming.insert(semantics.entry_point(), Some(entry));
-
-    // Must facts form a descending finite lattice. Starting non-entry points
-    // at top (`None`) and intersecting predecessor outputs reaches the exact
-    // locks held on every path, including loops, without depending on call-row
-    // storage order.
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let procedure = scope.procedure();
+    with_concurrency_graph!(request, scope, |graph| {
+        let semantics = procedure.semantics();
+        let mut incoming = HashMap::<ProgramPointId, Option<MustLockSet>>::default();
         for point in semantics.points() {
-            if point.id == semantics.entry_point() {
-                continue;
-            }
-            let predecessors = semantics
-                .predecessor_edges(point.id)
-                .map(|(_, edge)| edge.source_point)
-                .collect::<Vec<_>>();
-            if predecessors.is_empty() {
-                continue;
-            }
-            let mut candidate: Option<MustLockSet> = None;
-            for predecessor in predecessors {
-                let Some(mut state) = incoming.get(&predecessor).cloned().flatten() else {
-                    // `None` is lattice top, not an empty lock set. Ignoring it
-                    // lets an entry predecessor initialize a loop header; when
-                    // the backedge becomes reachable its facts can only shrink
-                    // the intersection toward the greatest fixed point.
+            incoming.insert(point.id, None);
+        }
+        incoming.insert(semantics.entry_point(), Some(entry));
+
+        // Must facts form a descending finite lattice. Starting non-entry points
+        // at top (`None`) and intersecting predecessor outputs reaches the exact
+        // locks held on every path, including loops, without depending on call-row
+        // storage order.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for point in semantics.points() {
+                if point.id == semantics.entry_point() {
                     continue;
-                };
-                apply_lock_effects_at(predecessor, effects, &mut state);
-                candidate = Some(match candidate {
-                    None => state,
-                    Some(mut intersection) => {
-                        intersection.intersect_with(&state);
-                        intersection
-                    }
-                });
-            }
-            if incoming.get(&point.id) != Some(&candidate) {
-                incoming.insert(point.id, candidate);
-                changed = true;
+                }
+                let predecessors = graph
+                    .predecessors(point.id)
+                    .map(|(_, source)| source)
+                    .collect::<Vec<_>>();
+                if predecessors.is_empty() {
+                    continue;
+                }
+                let mut candidate: Option<MustLockSet> = None;
+                for predecessor in predecessors {
+                    let Some(mut state) = incoming.get(&predecessor).cloned().flatten() else {
+                        // `None` is lattice top, not an empty lock set. Ignoring it
+                        // lets an entry predecessor initialize a loop header; when
+                        // the backedge becomes reachable its facts can only shrink
+                        // the intersection toward the greatest fixed point.
+                        continue;
+                    };
+                    apply_lock_effects_at(predecessor, effects, &mut state);
+                    candidate = Some(match candidate {
+                        None => state,
+                        Some(mut intersection) => {
+                            intersection.intersect_with(&state);
+                            intersection
+                        }
+                    });
+                }
+                if incoming.get(&point.id) != Some(&candidate) {
+                    incoming.insert(point.id, candidate);
+                    changed = true;
+                }
             }
         }
-    }
-    incoming
-        .into_iter()
-        .map(|(point, locks)| (point, locks.unwrap_or_default()))
-        .collect()
+        incoming
+            .into_iter()
+            .map(|(point, locks)| (point, locks.unwrap_or_default()))
+            .collect()
+    })
 }
 
 fn apply_lock_effects_at(
@@ -14206,21 +15100,29 @@ fn exact_subject(subject: &ResolvedConcurrencySubject) -> Option<&CanonicalConcu
         .flatten()
 }
 
-pub(crate) fn point_dominates(
-    procedure: &ProcedureHandle,
+fn projected_point_dominates(
+    scope: &impl ControlScope,
     candidate: ProgramPointId,
     target: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
+    let procedure = scope.procedure();
     use crate::analyzer::semantic::cfg_algorithms::dominators;
-    bounded_cfg_query(request, |request| {
-        dominators(
-            procedure.semantics(),
-            procedure.semantics().entry_point(),
-            request,
-        )
-        .map(|dominators| dominators.dominates(procedure.semantics(), candidate, target))
-    })
+    if request.control_queries(scope)?.dominators.is_none() {
+        let result = with_concurrency_graph!(request, scope, |graph| {
+            bounded_cfg_query(request, |request| {
+                dominators(graph, procedure.semantics().entry_point(), request)
+            })
+        })?;
+        charge_concurrency_work(request, 1 + procedure.semantics().points().len())?;
+        request.control_queries(scope)?.dominators = Some(result);
+    }
+    Ok(request
+        .control_queries(scope)?
+        .dominators
+        .as_ref()
+        .expect("complete dominators were retained")
+        .dominates(procedure.semantics(), candidate, target))
 }
 
 /// CFG algorithms use the solve's cancellation token and debit their actual
@@ -14270,10 +15172,11 @@ fn bounded_cfg_query<T>(
 
 /// Reusable ordering proof for one call in an immutable procedure artifact.
 fn points_strictly_before_call(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     call: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<HashSet<ProgramPointId>, ConcurrencyOpenReason> {
+    let procedure = scope.procedure();
     use crate::analyzer::semantic::cfg_algorithms::{forward_reachability, reverse_reachability};
     use crate::analyzer::semantic::{SemanticGapDischarge, SemanticWork, SourceMappingKind};
 
@@ -14307,9 +15210,10 @@ fn points_strictly_before_call(
     // comparison is independent of the evaluation order within that region
     // only when both endpoints are outside it. Keep the global control check
     // conservative for heap-state consumers, which ask different questions.
+    let cancellation = request.cancellation;
     let outside_regions = |point| {
         reorder_regions.iter().all(|gap| {
-            if request.cancellation.is_cancelled() || point == gap.point {
+            if cancellation.is_cancelled() || point == gap.point {
                 return false;
             }
             let Some(region) = semantics.source_mapping(gap.source) else {
@@ -14324,7 +15228,7 @@ fn points_strictly_before_call(
             std::iter::once(point.source)
                 .chain(point.events.iter().map(|event| event.source))
                 .all(|source| {
-                    if request.cancellation.is_cancelled() {
+                    if cancellation.is_cancelled() {
                         return false;
                     }
                     let Some(endpoint) = semantics.source_mapping(source) else {
@@ -14373,9 +15277,11 @@ fn points_strictly_before_call(
             ..SemanticWork::default()
         })
         .map_err(|_| ConcurrencyOpenReason::BudgetExhausted)?;
-    let result = bounded_cfg_query(request, |cfg_request| {
-        reverse_reachability(semantics, call, cfg_request).and_then(|before| {
-            forward_reachability(semantics, call, cfg_request).map(|after| (before, after))
+    let result = with_concurrency_graph!(request, scope, |graph| {
+        bounded_cfg_query(request, |cfg_request| {
+            reverse_reachability(graph, call, cfg_request).and_then(|before| {
+                forward_reachability(graph, call, cfg_request).map(|after| (before, after))
+            })
         })
     });
     match result {
@@ -14414,29 +15320,67 @@ fn points_strictly_before_call(
 }
 
 fn point_reaches(
-    procedure: &ProcedureHandle,
+    scope: &impl ControlScope,
     origin: ProgramPointId,
     target: ProgramPointId,
-    request: &mut SemanticRequest<'_>,
+    request: &mut SolveRequest<'_, '_>,
 ) -> Result<bool, ConcurrencyOpenReason> {
-    charge_concurrency_work(request, 1)?;
-    let mut queue = VecDeque::from([origin]);
-    let mut visited = HashSet::default();
-    visited.insert(origin);
-    while let Some(point) = queue.pop_front() {
-        charge_concurrency_work(request, 1)?;
-        for edge in procedure.semantics().successor_edges(point) {
+    use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
+
+    if let Some(reachable) = request.control_queries(scope)?.reaches.get(&origin) {
+        return Ok(reachable.contains(&target));
+    }
+    let reachable = with_concurrency_graph!(request, scope, |graph| {
+        let mut queue = VecDeque::from([origin]);
+        // The relation requires a positive-length path. The origin enters the
+        // set only when an actual back edge reaches it, never by reflexivity.
+        let mut visited = HashSet::default();
+        while let Some(point) = queue.pop_front() {
             charge_concurrency_work(request, 1)?;
-            let successor = edge.1.target_point;
-            if successor == target {
-                return Ok(true);
-            }
-            if visited.insert(successor) {
-                queue.push_back(successor);
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
             }
         }
-    }
-    Ok(false)
+        visited
+    });
+    charge_concurrency_work(request, reachable.len() + 1)?;
+    let answer = reachable.contains(&target);
+    request
+        .control_queries(scope)?
+        .reaches
+        .insert(origin, reachable);
+    Ok(answer)
+}
+
+#[cfg(test)]
+fn point_reaches_uncached(
+    scope: &impl ControlScope,
+    origin: ProgramPointId,
+    target: ProgramPointId,
+    request: &mut SolveRequest<'_, '_>,
+) -> Result<bool, ConcurrencyOpenReason> {
+    use crate::analyzer::semantic::cfg_algorithms::DenseBidirectionalGraph;
+    with_concurrency_graph!(request, scope, |graph| {
+        charge_concurrency_work(request, 1)?;
+        let mut queue = VecDeque::from([origin]);
+        let mut visited = HashSet::from_iter([origin]);
+        while let Some(point) = queue.pop_front() {
+            charge_concurrency_work(request, 1)?;
+            for (_, successor) in graph.successors(point) {
+                charge_concurrency_work(request, 1)?;
+                if successor == target {
+                    return Ok(true);
+                }
+                if visited.insert(successor) {
+                    queue.push_back(successor);
+                }
+            }
+        }
+        Ok(false)
+    })
 }
 
 fn charge_concurrency_work(
@@ -14458,6 +15402,159 @@ fn charge_concurrency_work(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn control_query_reuse_tracks_invocation_projection_and_cancellation() {
+        let fixture =
+            Fixture::new("package sample\nfunc root() { never() }\nfunc never() { for {} }\n");
+        let artifact = fixture.artifact();
+        let procedure = artifact
+            .procedure_handle(artifact.procedures()[0].id())
+            .unwrap();
+        let context = ContextKey {
+            task: TaskId(0),
+            invocation: InvocationId(0),
+            procedure: procedure.clone(),
+        };
+        let entry = procedure.semantics().entry_point();
+        let exit = procedure.semantics().normal_exit_point();
+        let required = HashSet::from_iter([procedure.semantics().call_sites()[0].point]);
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        assert!(point_reaches(&context, entry, exit, &mut request).unwrap());
+        assert!(projected_point_dominates(&context, entry, exit, &mut request).unwrap());
+        assert!(all_paths_cross_points(&context, exit, &required, &mut request).unwrap());
+        let cold_work = request.budget.used().nested_entries;
+        assert!(point_reaches(&context, entry, exit, &mut request).unwrap());
+        assert!(projected_point_dominates(&context, entry, exit, &mut request).unwrap());
+        assert!(all_paths_cross_points(&context, exit, &required, &mut request).unwrap());
+        assert!(request.budget.used().nested_entries - cold_work < cold_work);
+
+        let provider =
+            crate::analyzer::semantic::WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+                &fixture.workspace,
+                None,
+            );
+        let projection = crate::flow_state::procedure_continuation_projection(
+            &provider,
+            &procedure,
+            &mut SemanticBudget::default(),
+            &mut crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget::default(),
+            &cancellation,
+        );
+        assert!(projection.normal_return_is_absent());
+        assert!(projection.reasons().is_empty());
+        let projection = std::rc::Rc::new(projection);
+        request
+            .invocation_projections
+            .insert(context.clone(), projection.clone());
+        assert!(!point_reaches(&context, entry, exit, &mut request).unwrap());
+        assert!(!projected_point_dominates(&context, entry, exit, &mut request).unwrap());
+        assert!(!all_paths_cross_points(&context, exit, &required, &mut request).unwrap());
+        assert!(point_reaches(&procedure, entry, exit, &mut request).unwrap());
+        assert!(projected_point_dominates(&procedure, entry, exit, &mut request).unwrap());
+        request.invocation_projections.remove(&context);
+        assert!(point_reaches(&context, entry, exit, &mut request).unwrap());
+        assert!(projected_point_dominates(&context, entry, exit, &mut request).unwrap());
+        assert!(all_paths_cross_points(&context, exit, &required, &mut request).unwrap());
+
+        request
+            .projections
+            .insert(procedure.clone(), Some(projection));
+        assert!(!projected_point_dominates(&procedure, entry, exit, &mut request).unwrap());
+        assert!(point_dominates(&procedure, entry, exit, &mut request).unwrap());
+        let before = request.budget.used().nested_entries;
+        assert!(point_dominates(&procedure, entry, exit, &mut request).unwrap());
+        assert!(request.budget.used().nested_entries - before < cold_work);
+
+        cancellation.cancel();
+        assert_eq!(
+            point_dominates(&procedure, entry, exit, &mut request),
+            Err(ConcurrencyOpenReason::BudgetExhausted)
+        );
+        assert_eq!(
+            projected_point_dominates(&context, entry, exit, &mut request),
+            Err(ConcurrencyOpenReason::BudgetExhausted)
+        );
+        assert_eq!(
+            point_reaches(&context, entry, exit, &mut request),
+            Err(ConcurrencyOpenReason::BudgetExhausted)
+        );
+        assert_eq!(
+            all_paths_cross_points(&context, exit, &required, &mut request),
+            Err(ConcurrencyOpenReason::BudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn cached_reachability_agrees_with_traversal_including_cycles() {
+        let fixture = Fixture::new(
+            "package sample\nfunc root(flag bool) { if flag { for flag { flag = false } } }\n",
+        );
+        let artifact = fixture.artifact();
+        let procedure = artifact
+            .procedure_handle(artifact.procedures()[0].id())
+            .unwrap();
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        use crate::analyzer::semantic::cfg_algorithms::{
+            CfgAlgorithmBudget, CfgAlgorithmRequest, dominators,
+        };
+        let oracle = dominators(
+            procedure.semantics(),
+            procedure.semantics().entry_point(),
+            &mut CfgAlgorithmRequest::new(&mut CfgAlgorithmBudget::default(), &cancellation),
+        )
+        .unwrap();
+        for origin in procedure.semantics().points() {
+            for target in procedure.semantics().points() {
+                assert_eq!(
+                    projected_point_dominates(&procedure, origin.id, target.id, &mut request)
+                        .unwrap(),
+                    oracle.dominates(procedure.semantics(), origin.id, target.id),
+                );
+                let expected =
+                    point_reaches_uncached(&procedure, origin.id, target.id, &mut request).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        point_reaches(&procedure, origin.id, target.id, &mut request).unwrap(),
+                        expected
+                    );
+                }
+                let required = HashSet::from_iter([origin.id]);
+                let expected =
+                    all_paths_cross_points_uncached(&procedure, target.id, &required, &mut request)
+                        .unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        all_paths_cross_points(&procedure, target.id, &required, &mut request)
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+        let mut tiny = SemanticBudget::uniform(1).unwrap();
+        let mut semantic = SemanticRequest::new(&mut tiny, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        assert_eq!(
+            point_reaches(
+                &procedure,
+                procedure.semantics().entry_point(),
+                procedure.semantics().normal_exit_point(),
+                &mut request
+            ),
+            Err(ConcurrencyOpenReason::BudgetExhausted)
+        );
+        assert!(
+            request.control_queries.is_empty(),
+            "an interrupted lookup publishes no answer"
+        );
+    }
+
+    #[test]
     fn dominance_uses_the_solve_budget_and_cancellation() {
         let fixture = Fixture::new("package sample\nfunc root() { n := 1; _ = n }\n");
         let artifact = fixture.artifact();
@@ -14473,7 +15570,7 @@ mod tests {
                 &procedure,
                 entry,
                 exit,
-                &mut SemanticRequest::new(&mut budget, &cancellation)
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation))
             )
             .unwrap()
         );
@@ -14482,7 +15579,7 @@ mod tests {
                 &procedure,
                 exit,
                 entry,
-                &mut SemanticRequest::new(&mut budget, &cancellation)
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation))
             )
             .unwrap()
         );
@@ -14497,7 +15594,7 @@ mod tests {
                 &procedure,
                 entry,
                 exit,
-                &mut SemanticRequest::new(&mut tiny, &cancellation)
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut tiny, &cancellation))
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -14509,7 +15606,7 @@ mod tests {
                 &procedure,
                 entry,
                 exit,
-                &mut SemanticRequest::new(&mut budget, &cancelled)
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancelled))
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -14581,7 +15678,10 @@ mod tests {
                 TaskId(0),
                 root.clone(),
                 None,
-                &mut SemanticRequest::new(&mut generous_budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(
+                    &mut generous_budget,
+                    &cancellation,
+                )),
             )
             .unwrap();
         let tasks = vec![Task {
@@ -14618,7 +15718,10 @@ mod tests {
         ];
         let index = SynchronizationIndex::build(
             &synchronizations,
-            &mut SemanticRequest::new(&mut generous_budget, &cancellation),
+            &mut SolveRequest::raw(&mut SemanticRequest::new(
+                &mut generous_budget,
+                &cancellation,
+            )),
         )
         .expect("generous budget indexes the synchronization inventory");
         // Differential oracle: indexed candidates must preserve the complete
@@ -14636,7 +15739,10 @@ mod tests {
         }
         let oracle_index = SynchronizationIndex::build(
             &inventory,
-            &mut SemanticRequest::new(&mut generous_budget, &cancellation),
+            &mut SolveRequest::raw(&mut SemanticRequest::new(
+                &mut generous_budget,
+                &cancellation,
+            )),
         )
         .unwrap();
         for event in &inventory {
@@ -14684,7 +15790,10 @@ mod tests {
             &tasks,
             &invocations,
             &index,
-            &mut SemanticRequest::new(&mut generous_budget, &cancellation),
+            &mut SolveRequest::raw(&mut SemanticRequest::new(
+                &mut generous_budget,
+                &cancellation,
+            )),
         )
         .expect("generous budget reaches the transitive receiver barrier");
         assert!(
@@ -14702,7 +15811,7 @@ mod tests {
                 &tasks,
                 &invocations,
                 &index,
-                &mut SemanticRequest::new(&mut tiny_budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut tiny_budget, &cancellation)),
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -14722,7 +15831,10 @@ mod tests {
                 &tasks,
                 &invocations,
                 &index,
-                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(
+                    &mut cancelled_budget,
+                    &cancelled
+                )),
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -14751,6 +15863,20 @@ mod tests {
     }
 
     impl ConcurrencyProvider for AtomicReplayProvider {
+        // These effect/identity fixtures stipulate returning call boundaries.
+        // Non-returning behavior is tested through the real workspace provider.
+        fn continuation_projection(
+            &self,
+            procedure: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Option<crate::flow_state::ProcedureContinuationProjection> {
+            Some(
+                crate::flow_state::ProcedureContinuationProjection::returning_call_fixture(
+                    procedure,
+                ),
+            )
+        }
+
         fn lexical_cell_cardinality(
             &self,
             procedure: &ProcedureHandle,
@@ -14868,14 +15994,14 @@ mod tests {
                 TaskId(0),
                 procedure,
                 None,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
             )
             .unwrap();
         assert!(
             publication::private_storage_in_slice(
                 &invocations,
                 &HashSet::default(),
-                &mut SemanticRequest::new(&mut budget, &cancellation)
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation))
             )
             .unwrap()
             .is_none(),
@@ -14970,7 +16096,7 @@ func root() {
                 let report = concurrent_access_conflicts(
                     &provider,
                     &root,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap();
                 if atomic_identity.is_none() {
@@ -15708,6 +16834,20 @@ func root() {
     struct LocalProvider;
 
     impl ConcurrencyProvider for LocalProvider {
+        // These effect/identity fixtures stipulate returning call boundaries.
+        // Non-returning behavior is tested through the real workspace provider.
+        fn continuation_projection(
+            &self,
+            procedure: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Option<crate::flow_state::ProcedureContinuationProjection> {
+            Some(
+                crate::flow_state::ProcedureContinuationProjection::returning_call_fixture(
+                    procedure,
+                ),
+            )
+        }
+
         fn lexical_cell_cardinality(
             &self,
             _procedure: &ProcedureHandle,
@@ -15788,6 +16928,20 @@ func root() {
     }
 
     impl ConcurrencyProvider for ExternalEffectsProvider {
+        // These effect/identity fixtures stipulate returning call boundaries.
+        // Non-returning behavior is tested through the real workspace provider.
+        fn continuation_projection(
+            &self,
+            procedure: &ProcedureHandle,
+            _request: &mut SemanticRequest<'_>,
+        ) -> Option<crate::flow_state::ProcedureContinuationProjection> {
+            Some(
+                crate::flow_state::ProcedureContinuationProjection::returning_call_fixture(
+                    procedure,
+                ),
+            )
+        }
+
         fn lexical_cell_cardinality(
             &self,
             procedure: &ProcedureHandle,
@@ -15919,7 +17073,7 @@ func root() {
             let report = concurrent_access_conflicts(
                 &provider,
                 &root,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
             )
             .unwrap();
 
@@ -16073,7 +17227,7 @@ func f(n int) int {
             let before = points_strictly_before_call(
                 &procedure,
                 call.id,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
             )
             .unwrap();
             for access in procedure.semantics().points() {
@@ -16081,14 +17235,14 @@ func f(n int) int {
                     &procedure,
                     access.id,
                     call.id,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap();
                 let call_reaches_access = point_reaches(
                     &procedure,
                     call.id,
                     access.id,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap();
                 let expected = access.id != call.id && access_reaches_call && !call_reaches_access;
@@ -16105,7 +17259,10 @@ func f(n int) int {
                             &procedure,
                             call.id,
                             access.id,
-                            &mut SemanticRequest::new(&mut budget, &cancellation),
+                            &mut SolveRequest::raw(&mut SemanticRequest::new(
+                                &mut budget,
+                                &cancellation
+                            )),
                         )
                         .unwrap(),
                     (
@@ -16124,13 +17281,16 @@ func f(n int) int {
                     .is_cyclic(
                         &procedure,
                         point.id,
-                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                        &mut SolveRequest::raw(&mut SemanticRequest::new(
+                            &mut budget,
+                            &cancellation
+                        )),
                     )
                     .unwrap(),
                 point_is_cyclic(
-                    procedure.semantics(),
+                    &procedure,
                     point.id,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap(),
                 "cached cyclic membership for {:?}",
@@ -16142,14 +17302,17 @@ func f(n int) int {
                         &procedure,
                         procedure.semantics().entry_point(),
                         point.id,
-                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                        &mut SolveRequest::raw(&mut SemanticRequest::new(
+                            &mut budget,
+                            &cancellation
+                        )),
                     )
                     .unwrap(),
                 point_dominates(
                     &procedure,
                     procedure.semantics().entry_point(),
                     point.id,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap(),
                 "cached dominance for {:?}",
@@ -16161,7 +17324,7 @@ func f(n int) int {
             points_strictly_before_call(
                 &procedure,
                 procedure.semantics().entry_point(),
-                &mut SemanticRequest::new(&mut exhausted, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut exhausted, &cancellation)),
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -16173,7 +17336,10 @@ func f(n int) int {
                 &procedure,
                 procedure.semantics().entry_point(),
                 procedure.semantics().normal_exit_point(),
-                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(
+                    &mut cancelled_budget,
+                    &cancelled
+                )),
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted),
             "a cached control fact must still honor later cancellation"
@@ -16207,7 +17373,7 @@ func f(n int) int {
                 .workspace
                 .materialize_program_semantics(
                     &self.file,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .expect("Go semantics materialize");
             Arc::clone(
@@ -16237,7 +17403,7 @@ func f(n int) int {
             concurrent_access_conflicts(
                 provider,
                 &root,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
             )
             .unwrap()
         }
@@ -16263,7 +17429,14 @@ func unresolved() {}
         let report = fixture.analyze_with(&OpenModelProvider);
         assert!(
             report.conflicts.iter().any(|conflict| {
-                !conflict.proven && conflict.reasons == [ConcurrencyOpenReason::UnresolvedTarget]
+                !conflict.proven
+                    && !conflict.exhaustive
+                    && conflict
+                        .reasons
+                        .contains(&ConcurrencyOpenReason::UnresolvedTarget)
+                    && conflict.reasons.iter().any(|reason| {
+                        matches!(reason, ConcurrencyOpenReason::IncompleteControlFlow(_))
+                    })
             }),
             "report: {report:#?}"
         );
@@ -16584,7 +17757,7 @@ func root() {
                     TaskId(0),
                     root.clone(),
                     None,
-                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                    &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
                 )
                 .unwrap();
             let tasks = vec![Task {
@@ -16781,8 +17954,9 @@ func root() {
                 &HashMap::default(),
                 &HashSet::default(),
                 &LocalProvider,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            );
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
+            )
+            .expect("reference identity propagation");
             let terminal_fact = match classes
                 .bound_canonical_identity(LocalSynchronizationSubject::Location(terminal_cell))
             {
@@ -16867,7 +18041,11 @@ func unlocked() { helper() }
             target: helper_context.clone(),
         };
 
-        let locked_only = must_entry_locks(&modeled, &[call(locked_context.clone())]);
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
+        let locked_only = must_entry_locks(&modeled, &[call(locked_context.clone())], &mut request);
         assert_eq!(
             locked_only
                 .get(&helper_context)
@@ -16876,7 +18054,11 @@ func unlocked() { helper() }
             "an exact synchronous callee inherits its caller's must-held lock"
         );
 
-        let mixed = must_entry_locks(&modeled, &[call(locked_context), call(unlocked_context)]);
+        let mixed = must_entry_locks(
+            &modeled,
+            &[call(locked_context), call(unlocked_context)],
+            &mut request,
+        );
         assert!(
             mixed
                 .get(&helper_context)
@@ -16956,7 +18138,7 @@ func helper() {}
         let report = concurrent_access_conflicts(
             &LocalProvider,
             &root,
-            &mut SemanticRequest::new(&mut budget, &cancellation),
+            &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
         )
         .unwrap();
         assert_eq!(report.reasons, [ConcurrencyOpenReason::BudgetExhausted]);
@@ -16975,7 +18157,8 @@ func helper() {}
         assert_eq!(calls.len(), 2);
         let cancellation = crate::cancellation::CancellationToken::default();
         let mut budget = SemanticBudget::default();
-        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut semantic = SemanticRequest::new(&mut budget, &cancellation);
+        let mut request = SolveRequest::raw(&mut semantic);
         let mut invocations = Invocations::default();
         let parent = invocations
             .push(TaskId(0), root.clone(), None, &mut request)
@@ -17022,7 +18205,7 @@ func helper() {}
                 first.invocation,
                 calls[1].id,
                 &root,
-                &mut SemanticRequest::new(&mut bounded, &cancellation),
+                &mut SolveRequest::raw(&mut SemanticRequest::new(&mut bounded, &cancellation)),
             ),
             Err(ConcurrencyOpenReason::BudgetExhausted)
         );
@@ -17059,7 +18242,7 @@ func recursive() {
         let report = concurrent_access_conflicts(
             &SelfCallProvider,
             &root,
-            &mut SemanticRequest::new(&mut budget, &cancellation),
+            &mut SolveRequest::raw(&mut SemanticRequest::new(&mut budget, &cancellation)),
         )
         .unwrap();
         assert_eq!(report.reasons, [ConcurrencyOpenReason::RecursiveExpansion]);
@@ -17067,7 +18250,7 @@ func recursive() {
     }
 
     #[test]
-    fn recursive_synchronous_expansion_remains_typed_open() {
+    fn effect_free_recursion_preserves_unavailable_continuation_coverage() {
         let fixture = Fixture::new(
             r#"package sample
 
@@ -17077,11 +18260,19 @@ func recursive() {
 "#,
         );
         let report = fixture.analyze_with(&SelfCallProvider);
+        assert!(report.conflicts.is_empty(), "report: {report:#?}");
+        assert!(
+            !report
+                .reasons
+                .contains(&ConcurrencyOpenReason::RecursiveExpansion),
+            "an exact effect-free closure needs no omitted-effect frontier: {report:#?}"
+        );
         assert!(
             report
                 .reasons
-                .contains(&ConcurrencyOpenReason::RecursiveExpansion),
-            "report: {report:#?}"
+                .iter()
+                .any(|reason| matches!(reason, ConcurrencyOpenReason::IncompleteControlFlow(_))),
+            "this test provider has no continuation certificate: {report:#?}"
         );
     }
 
