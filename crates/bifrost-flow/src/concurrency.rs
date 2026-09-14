@@ -3978,7 +3978,7 @@ fn solve_concurrent_access_conflicts(
                                 synchronization_subjects
                                     .bind_canonical_value(target_subject.clone(), canonical);
                             }
-                            if binding_location(semantics, target).is_none() {
+                            if semantics.binding_memory_location(target).is_none() {
                                 synchronization_subjects.union(source_subject, target_subject);
                             }
                         } else {
@@ -4044,7 +4044,7 @@ fn solve_concurrent_access_conflicts(
                             continue;
                         }
                         let (crate::analyzer::semantic::SemanticValueKind::Address, Some(location)) =
-                            (&target_row.kind, binding_location(semantics, value))
+                            (&target_row.kind, semantics.binding_memory_location(value))
                         else {
                             continue;
                         };
@@ -5333,29 +5333,6 @@ fn retained_callable_creation(
     }
 }
 
-fn binding_location(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    binding: ValueId,
-) -> Option<MemoryLocationId> {
-    let mut matching = semantics.memory_locations().iter().filter_map(|location| {
-        matches!(
-            location.kind,
-            MemoryLocationKind::LexicalCell { binding: candidate }
-                | MemoryLocationKind::Capture {
-                    binding: Some(candidate),
-                    ..
-                } if candidate == binding
-        )
-        .then_some(location.id)
-    });
-    let location = matching.next()?;
-    assert!(
-        matching.next().is_none(),
-        "one semantic binding cannot own multiple local memory cells"
-    );
-    Some(location)
-}
-
 #[derive(Debug, Clone)]
 struct ReferenceIdentityUse {
     subject: LocalSynchronizationSubject,
@@ -5783,7 +5760,7 @@ fn propagate_memory_payload_identities(
                     target,
                 } = event.effect
                 {
-                    let target_storage = binding_location(semantics, target).map_or_else(
+                    let target_storage = semantics.binding_memory_location(target).map_or_else(
                         || subject(target),
                         |location| {
                             LocalSynchronizationSubject::Location(LocalLocation {
@@ -8477,7 +8454,7 @@ fn reference_captures_are_read_only(
         {
             return Err(ConcurrencyOpenReason::BudgetExhausted);
         }
-        let location = binding_location(semantics, binding);
+        let location = semantics.binding_memory_location(binding);
         if (procedure != *owner || binding != owner_binding)
             && (!reference_control_is_complete(&procedure)
                 || semantics.gaps().iter().any(|gap| {
@@ -11862,7 +11839,7 @@ fn bind_call_inputs(
             procedure: target.clone(),
             value: formal_value,
         };
-        let formal_cell = binding_location(target.semantics(), formal_value);
+        let formal_cell = target.semantics().binding_memory_location(formal_value);
         let reassigned = target.semantics().points().iter().any(|point| {
             point.events.iter().any(|event| match event.effect {
                 SemanticEffect::Assignment { target, .. } => target == formal_value,
@@ -17851,7 +17828,7 @@ func root() {
                             {
                                 classes.bind_canonical_value(target_subject.clone(), canonical);
                             }
-                            if binding_location(root.semantics(), target).is_none() {
+                            if root.semantics().binding_memory_location(target).is_none() {
                                 classes.union(source, target_subject);
                             }
                         }

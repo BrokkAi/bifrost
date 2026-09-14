@@ -2810,7 +2810,7 @@ mod row_schema_listing_cli_tests {
             assert_eq!(
                 run_error(&args),
                 "--list-row-schemas cannot be combined with --explain-finding, \
-                 --explain-candidate, or --explain-near-misses",
+                 --explain-candidate, --explain-near-misses, or --explain-generation",
                 "{question:?} must be refused beside the listing"
             );
         }

@@ -8,9 +8,9 @@
 use crate::analyzer::semantic::MoveInvalidation;
 use crate::analyzer::semantic::{
     CallSiteId, CaptureSource, ControlEdgeId, GuardPredicate, IntegerComparison,
-    MemoryLocationKind, ProcedureHandle, ProcedureId, ProgramPointId, SemanticCapability,
-    SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticValueKind,
-    TransferKind, TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
+    MemoryLocationKind, ProcedureHandle, ProcedureId, ProgramPointId, SemanticEffect,
+    SemanticGapDischarge, SemanticGapImpact, SemanticGapSubject, SemanticValueKind, TransferKind,
+    TransferOperation, ValueFlowKind, ValueId, ValuePreservation, ValueTransfer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::cmp::Ordering;
@@ -583,13 +583,6 @@ fn closed_scalar_cells(
     modeled_address_calls: &[CallSiteId],
 ) -> HashSet<ValueId> {
     let semantics = procedure.semantics();
-    if semantics.gaps().iter().any(|gap| {
-        (gap.impacts.contains(SemanticGapImpact::HeapWrite)
-            && gap.discharge != SemanticGapDischarge::NonRejoiningExceptionalExit)
-            || gap.capability == SemanticCapability::Captures
-    }) {
-        return HashSet::default();
-    }
     semantics
         .memory_locations()
         .iter()
@@ -598,13 +591,66 @@ fn closed_scalar_cells(
                 return None;
             };
             if semantics.captures().iter().any(|capture| {
-            matches!(capture.captured, CaptureSource::Location(captured) if captured == location.id)
-                || matches!(capture.captured, CaptureSource::Value(value) if value == binding)
-        }) {
-            return None;
-        }
+                matches!(capture.captured, CaptureSource::Location(captured) if captured == location.id)
+                    || matches!(capture.captured, CaptureSource::Value(value) if value == binding)
+            }) {
+                return None;
+            }
             let aliases =
                 crate::flow_state::address_alias_values(semantics, &HashSet::from_iter([binding]));
+            let call_names_alias = |call_site| {
+                semantics.call_site(call_site).is_none_or(|call| {
+                    aliases.contains(&call.callee)
+                        || call
+                            .receiver
+                            .is_some_and(|receiver| aliases.contains(&receiver))
+                        || call
+                            .arguments
+                            .iter()
+                            .any(|argument| aliases.contains(&argument.value))
+                })
+            };
+            if semantics.gaps().iter().any(|gap| {
+                if !gap.impacts.contains(SemanticGapImpact::HeapWrite)
+                    || gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+                {
+                    return false;
+                }
+                match gap.subject {
+                    SemanticGapSubject::Procedure
+                    | SemanticGapSubject::Point
+                    | SemanticGapSubject::AsyncContinuation { .. } => true,
+                    SemanticGapSubject::Value(value) => {
+                        value == binding || aliases.contains(&value)
+                    }
+                    SemanticGapSubject::MemoryLocation(candidate) => {
+                        candidate == location.id
+                            || semantics
+                                .memory_location(candidate)
+                                .is_none_or(|candidate| {
+                                    aliases
+                                        .iter()
+                                        .any(|alias| candidate.kind.uses_value(*alias))
+                                })
+                    }
+                    SemanticGapSubject::Capture(capture) => semantics
+                        .capture(capture)
+                        .is_none_or(|capture| match capture.captured {
+                            CaptureSource::Value(value) => {
+                                value == binding || aliases.contains(&value)
+                            }
+                            CaptureSource::Location(candidate) => candidate == location.id,
+                        }),
+                    SemanticGapSubject::CallSite(call_site) => {
+                        !modeled_address_calls.contains(&call_site) && call_names_alias(call_site)
+                    }
+                    SemanticGapSubject::CallContinuation { call_site, .. } => {
+                        !modeled_address_calls.contains(&call_site) && call_names_alias(call_site)
+                    }
+                }
+            }) {
+                return None;
+            }
             crate::flow_state::address_escape_points(semantics, &aliases, modeled_address_calls)
                 .is_empty()
                 .then_some(binding)

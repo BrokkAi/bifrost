@@ -183,7 +183,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "e012302606bde57c495f5c92c0baba3444f8e8f67e6cc69cb10763d0caf432c4",
+      "finding_id": "e664e88395b284b9c9ff7e59527be4f5acd320a2c066a92670403eb5a85c7994",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -195,7 +195,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "f795da77bdf2b281d60675f335ad2624b7ac3e7258fc6f609314932a43f1df83",
+      "finding_id": "daae3b0c5046f71f11d69353ab77014ec79bd871f0f38d3374e45b32d65d22f4",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -351,7 +351,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "711698cb1d3fcd287aae559212725532468a05f3553b93c4b950222e74271d8a",
+      "finding_id": "bdc84acf9cb36ddd18c9dbfe4400d38472f1f40b5b79604204fb5fe1050233fb",
       "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",

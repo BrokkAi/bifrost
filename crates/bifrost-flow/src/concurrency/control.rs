@@ -67,7 +67,7 @@ fn callable_at(
         if !visited.insert(value) {
             return None;
         }
-        let location = binding_location(semantics, value);
+        let location = semantics.binding_memory_location(value);
         if !crate::flow_state::address_alias_values(semantics, &HashSet::from_iter([value]))
             .is_empty()
         {

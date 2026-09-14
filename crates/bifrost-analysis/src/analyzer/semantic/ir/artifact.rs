@@ -920,6 +920,27 @@ impl ProcedureSemantics {
         self.memory_locations.get(id.index())
     }
 
+    /// Return the unique local storage owned by one lexical binding.
+    pub fn binding_memory_location(&self, binding: ValueId) -> Option<MemoryLocationId> {
+        let mut matching = self.memory_locations.iter().filter_map(|location| {
+            matches!(
+                location.kind,
+                MemoryLocationKind::LexicalCell { binding: candidate }
+                    | MemoryLocationKind::Capture {
+                        binding: Some(candidate),
+                        ..
+                    } if candidate == binding
+            )
+            .then_some(location.id)
+        });
+        let location = matching.next()?;
+        assert!(
+            matching.next().is_none(),
+            "one semantic binding cannot own multiple local memory cells"
+        );
+        Some(location)
+    }
+
     pub fn capture(&self, id: CaptureId) -> Option<&CaptureBinding> {
         self.captures.get(id.index())
     }

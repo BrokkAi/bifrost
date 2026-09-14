@@ -75,6 +75,13 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Go value flow now tracks address-taken cell values again, restoring flows
+  lost to the address-cell regression.
+- Go data-race analysis now infers captured channel receive types from
+  structured channel payloads and restricts channel escape checks to
+  reachable invocation effects.
+- Go analysis preserves exact nonreturning control for empty selects and
+  collects reference result identities through invocation control.
 - Python semantic analysis now follows synchronous comprehension loops and
   filters, preserves comprehension-local targets and enclosing walrus writes,
   and keeps unmodeled collection contents and mutable captures explicit.

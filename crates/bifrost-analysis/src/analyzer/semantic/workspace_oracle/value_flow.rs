@@ -1628,8 +1628,25 @@ fn procedure_value_facts(
                 ..SemanticWork::default()
             })?;
             let origin = match event.effect {
-                SemanticEffect::Assignment { target, value }
-                | SemanticEffect::ValueFlow {
+                SemanticEffect::Assignment { target, value } => {
+                    charge(SemanticWork {
+                        values: 2,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    let origin = if semantics
+                        .value(target)
+                        .is_some_and(|target| target.kind == SemanticValueKind::Address)
+                    {
+                        semantics
+                            .binding_memory_location(value)
+                            .map_or(LoadOrigin::Value(value), LoadOrigin::Unique)
+                    } else {
+                        LoadOrigin::Value(value)
+                    };
+                    Some((target, origin))
+                }
+                SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Local,
                     target,
                     source: value,
