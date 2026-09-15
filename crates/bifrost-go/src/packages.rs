@@ -409,8 +409,10 @@ pub fn invalidate_nearest_go_module_cache() {
 }
 
 #[cfg(test)]
-static GO_MOD_PROBE_ATTEMPTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+fn go_mod_probe_attempts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ATTEMPTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| Mutex::new(HashMap::default()))
+}
 
 fn nearest_go_module_anchor(dir: &Path, root: &Path) -> GoModuleLookup<GoModuleAnchor> {
     let cache = nearest_go_module_cache();
@@ -428,7 +430,13 @@ fn nearest_go_module_anchor(dir: &Path, root: &Path) -> GoModuleLookup<GoModuleA
         }
         visited.push(key);
         #[cfg(test)]
-        GO_MOD_PROBE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            *go_mod_probe_attempts()
+                .lock()
+                .expect("go module probe count mutex")
+                .entry(root.to_path_buf())
+                .or_default() += 1;
+        }
         match std::fs::read_to_string(cursor.join("go.mod")) {
             Ok(contents) => {
                 break match go_module_path_from_source(&contents) {
@@ -702,8 +710,8 @@ fn is_windows_reserved_name(prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GO_MOD_PROBE_ATTEMPTS, GoWorkspacePathIndex, canonical_go_package_name,
-        canonical_go_workspace_package_name, go_module_path_from_source, go_vendor_package_alias,
+        GoWorkspacePathIndex, canonical_go_package_name, canonical_go_workspace_package_name,
+        go_mod_probe_attempts, go_module_path_from_source, go_vendor_package_alias,
         invalidate_nearest_go_module_cache,
     };
     use crate::declarations::go_package_fq;
@@ -755,9 +763,12 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
-    fn reset_cache_probe_count() {
+    fn reset_cache_probe_count(root: &Path) {
         invalidate_nearest_go_module_cache();
-        GO_MOD_PROBE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        go_mod_probe_attempts()
+            .lock()
+            .expect("go module probe count mutex")
+            .remove(root);
     }
 
     #[test]
@@ -766,7 +777,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let file = ProjectFile::new(repo.path().to_path_buf(), "pkg/file.go");
 
-        reset_cache_probe_count();
+        reset_cache_probe_count(repo.path());
         assert_eq!(
             canonical_go_workspace_package_name(&file, "pkg"),
             Some("pkg".to_owned())
@@ -1030,7 +1041,7 @@ mod tests {
     fn sibling_files_reuse_the_cached_go_mod_walk() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
-        reset_cache_probe_count();
+        reset_cache_probe_count(repo.path());
         write_file(repo.path(), "go.mod", "module example.com/repo\n");
 
         for name in ["a.go", "b.go", "c.go"] {
@@ -1045,7 +1056,9 @@ mod tests {
         }
 
         assert_eq!(
-            GO_MOD_PROBE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            go_mod_probe_attempts()
+                .lock()
+                .expect("go module probe count mutex")[repo.path()],
             5
         );
     }
@@ -1054,7 +1067,7 @@ mod tests {
     fn invalidation_refreshes_an_edited_module_path() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
-        reset_cache_probe_count();
+        reset_cache_probe_count(repo.path());
         write_file(repo.path(), "go.mod", "module example.com/old\n");
         let file = ProjectFile::new(repo.path().to_path_buf(), "pkg/foo.go");
 
@@ -1078,7 +1091,7 @@ mod tests {
     fn cache_keeps_project_root_boundaries_distinct() {
         let _guard = CACHE_TEST_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
-        reset_cache_probe_count();
+        reset_cache_probe_count(repo.path());
         write_file(repo.path(), "go.mod", "module example.com/outer\n");
         let nested_root = repo.path().join("nested");
         std::fs::create_dir_all(nested_root.join("pkg")).unwrap();
