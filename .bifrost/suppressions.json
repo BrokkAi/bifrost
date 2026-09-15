@@ -159,7 +159,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "5aff88a08497c5ad2496a73078d9f0e6deed94297820297246212e1958b9eeec",
+      "finding_id": "dc30842b42793b975f0e3339c0a04879fcabd4491d330102e611c44489d2f498",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -171,7 +171,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "cf60f4b18c2019ef01e01999484674b74fa08e65adce05c980b634c449536ae2",
+      "finding_id": "25ba2094524d1c9b4dadc10aa1268b63cbe1c2d9c4d80d67ebb29d30d925cc69",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -183,7 +183,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "e664e88395b284b9c9ff7e59527be4f5acd320a2c066a92670403eb5a85c7994",
+      "finding_id": "4460f31b91f8260a2a78b5fef286a611d847eae4cb806352bc947623b5748535",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -195,7 +195,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "daae3b0c5046f71f11d69353ab77014ec79bd871f0f38d3374e45b32d65d22f4",
+      "finding_id": "97f94e114cb17abd7b8058fe7e7e3edb3e66052e3a4b983b0c9209c510188c68",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -207,7 +207,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "cde81aea652e98768a08c976b537de46caa55f4ca1e1dec7b8fa3e41b88075f9",
+      "finding_id": "3b279d61f1e28270b733a8f6b275843dec2f6409fffd25e2c25a397704f4d96a",
       "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -219,7 +219,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "dedef44aca710a929edcb249ac047e95b0bf6ad96edb35e82c0382c98b748434",
+      "finding_id": "0d5d8a16cb11578c7792c5ff9f3b6c597741f706ad73205db4af30ac2cf4d9b0",
       "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -231,7 +231,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "848c5f242e92a3690efbc9dff5d5abaf9457acbe256b2bab0df43883a7d7731f",
+      "finding_id": "12864289d56ce088d4046edce75b10b5df16a9f7304f38fdb0197b53defe1cdd",
       "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -243,7 +243,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "cfd902fb267d5f2fe40cb9b39c904d27de2dfb903ea81abcee1bf7040629d37d",
+      "finding_id": "2a0b986155d8a8d38064195f5763ef14d349d71aff5b2ca97d09f8ad6a2c7ae7",
       "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -255,7 +255,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "5d78c0d252e81b289eb2cb7b9f01438cbd6138c9ccd202727742f8b1d5a60fc0",
+      "finding_id": "7ab4162481847f676e197c7ecde7103b3f356880a2a553f604dbbca30e2ed2b0",
       "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -267,7 +267,7 @@
     },
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "c38d89c961a105f90b4baedf10f4d96aab37eb5c48a053f76ffc85579e69f2bf",
+      "finding_id": "525471a8653482b554b8a8271a2d5484f0470dbfa03b2e1493cb66f9b9e302f5",
       "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -279,7 +279,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "e867576f82f7533abdc01305d86de900b1ebaf47bb46166b583921f252fb20cf",
+      "finding_id": "0b0837bdcd26e08170ef38a0e084e513acd9d6488bf750c6012233a1934eff79",
       "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -351,7 +351,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "bdc84acf9cb36ddd18c9dbfe4400d38472f1f40b5b79604204fb5fe1050233fb",
+      "finding_id": "a3de48cb75f4d8293103851238afc6a66bfc3fbe36c3648d0d0b9fdec0b08269",
       "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -375,7 +375,7 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "87881bf663f2d84e14e470380ad4e9431e14f5e4d89600882f45471cd63832aa",
+      "finding_id": "ffb26dc45c7f8fcc81e4c063699a1ed7341798bd7b9ef7a328b1b1454183c4a4",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -387,7 +387,7 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "861be6dbceca640801c23a3df13ef18cd50d0f2b7920761980d9b0aa81818983",
+      "finding_id": "d3a24b01590ba9ab08652116d04a0b07c72a32b9457d11c0fae200452b23bb2d",
       "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
